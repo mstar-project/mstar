@@ -89,8 +89,13 @@ interactive shell and check GPU access:
      -v /dev/dri/by-path:/dev/dri/by-path:ro \
      -p 8000:8000 \
      -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+     -v mstar-cache:/root/.cache/mstar \
      mstar:xpu
    python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
+
+The ``mstar-cache`` volume keeps compiled kernels across containers. It is a named volume
+rather than ``$HOME/.cache/mstar`` because the container runs as root, and root-owned files
+there would stop a later native run from writing its cache.
 
 Inside the container, serve BAGEL using the TP2 deployment with three Intel GPUs:
 one for the encoders and decoder, and two for the LLM.
@@ -149,6 +154,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
+   * - ``.[glm]``
+     - GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
+       (speeds up the JIT build of the vendored MoE align kernel).
    * - ``.[waypoint]``
      - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
        and ``tensordict`` for reference validation. The pinned TAEHV implementation
@@ -486,8 +495,15 @@ runs on the pure-Python paths as before. Migrated so far (see
   wherever that holds, so on a machine with the extension built, installing
   it is what moves a worker onto the Rust runtime.
 
-Build the extension into your environment with `maturin
-<https://www.maturin.rs>`_ (needs a Rust toolchain; ``rustup`` works):
+The Linux wheels of ``mstar-ai`` on PyPI (x86_64 and aarch64, CPython 3.12 to
+3.14) carry the extension, so ``pip install mstar-ai`` there gets it; other
+platforms get the pure-Python wheel. The extension statically links libzmq
+4.3.4, under LGPL-3.0-or-later with its static-linking exception; its source is
+the upstream `v4.3.4 release <https://github.com/zeromq/libzmq/releases/tag/v4.3.4>`_.
+Elsewhere, or to build from a checkout, build the extension into your
+environment with `maturin <https://www.maturin.rs>`_ (needs `rustup
+<https://rustup.rs>`_, which installs the compiler version pinned in
+``rust-toolchain.toml``):
 
 .. code-block:: bash
 
@@ -495,7 +511,11 @@ Build the extension into your environment with `maturin
    maturin develop --release -m rust/Cargo.toml
 
 Build with ``--release`` — an unoptimized debug build (maturin's default)
-costs real latency on the hot receive path. Verify with:
+costs real latency on the hot receive path. If ``mstar-ai`` came from a Linux
+wheel that carries the extension, this build (a separate ``mstar-rust``
+distribution) takes precedence over the wheel's copy in the same environment;
+``pip uninstall mstar-rust`` goes back to the wheel's, and neither uninstall
+removes the other's files. Verify with:
 
 .. code-block:: bash
 
@@ -505,25 +525,28 @@ costs real latency on the hot receive path. Verify with:
 ``test/rust`` is skipped wholesale when the extension is not importable, so
 a green run there without the build above proves nothing.
 
-The Rust-side tests need one extra flag. The crate's default features turn on
-``pyo3/extension-module``, which tells pyo3 *not* to link libpython — right
+The Rust-side tests need different features. The crate's default features turn
+on ``pyo3/extension-module``, which tells pyo3 *not* to link libpython — right
 for the cdylib, which resolves CPython symbols from the interpreter that
 imports it, wrong for ``cargo test``, which is an executable and has to link
-it itself. Without this the link fails on ``undefined symbol:
-PyEval_RestoreThread``:
+it itself. Without ``--no-default-features`` the link fails on ``undefined
+symbol: PyEval_RestoreThread``; ``--features python`` keeps the bindings and
+the graph runtime, whose tests need them:
 
 .. code-block:: bash
 
    export LD_LIBRARY_PATH="$(python -c 'import sysconfig
    print(sysconfig.get_config_var("LIBDIR"))')"
-   cargo test --release --no-default-features --manifest-path rust/Cargo.toml
+   cargo test --release --no-default-features --features python --manifest-path rust/Cargo.toml
 
 Optional: the Rust HTTP frontend
 --------------------------------
 
 ``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. Build and opt in:
+keeping preprocessing and the conductor protocol. A Linux wheel that carries
+the extension also installs the binary next to ``mstar-serve``; otherwise build
+it. Then opt in:
 
 .. code-block:: bash
 
@@ -532,8 +555,8 @@ keeping preprocessing and the conductor protocol. Build and opt in:
    # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
 
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
-``$PATH`` / the in-repo build. Its knobs are listed in
-:doc:`environment_variables`.
+the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
+are listed in :doc:`environment_variables`.
 
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
