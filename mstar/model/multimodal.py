@@ -278,6 +278,29 @@ def check_plan(plan: list[PromptPart], spans: list[MediaSpan], n_text: int) -> N
         )
 
 
+def as_uint8_chw(image) -> torch.Tensor:
+    """``(3, H, W)`` uint8 RGB on the CPU from what the data worker sends: a
+    ``(C, H, W)`` tensor, float in [0, 1] (rounded to the nearest level) or
+    uint8; or a PIL image or ``(H, W[, C])`` numpy array. A tensor's layout is
+    taken as given, not guessed from its shape. Alpha is dropped, gray
+    repeated."""
+    if not torch.is_tensor(image):
+        import numpy as np
+
+        if not isinstance(image, np.ndarray):  # a PIL image
+            image = np.asarray(image.convert("RGB"))
+        image = torch.from_numpy(np.ascontiguousarray(image))
+        if image.dim() == 2:
+            image = image[..., None]
+        image = image.permute(2, 0, 1)
+    if image.dtype.is_floating_point:
+        image = (image * 255.0).round().clamp(0, 255).to(torch.uint8)
+    image = image.cpu()
+    if image.shape[0] == 1:
+        image = image.expand(3, -1, -1)
+    return image[:3].contiguous()
+
+
 class MediaPads(NamedTuple):
     """A prompt with each media placeholder expanded to its tokens, and where
     each expanded run sits. The lists run in prompt order, one entry a run."""

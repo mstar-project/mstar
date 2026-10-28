@@ -237,7 +237,7 @@ LAYOUTS = {
 
 def run_both(model, processor, layout: str):
     """mstar's `process_prompt` and the transformers processor on one prompt."""
-    from mstar.model.qwen3_5.qwen3_5_model import _as_hwc_uint8
+    from mstar.model.multimodal import as_uint8_chw
 
     modalities, video_names = LAYOUTS[layout]
     texts = [f"Question {i}: what happens?" for i in range(modalities.count(TEXT))]
@@ -263,7 +263,7 @@ def run_both(model, processor, layout: str):
     )
     ref = processor(
         text=[text],
-        images=[_as_hwc_uint8(i) for i in images] or None,
+        images=[as_uint8_chw(i).permute(1, 2, 0).numpy() for i in images] or None,
         videos=[v for v, _ in videos] or None,
         video_metadata=[{"total_num_frames": v.shape[0], "fps": fps} for v, fps in videos] or None,
         return_tensors="pt",

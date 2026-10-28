@@ -1,0 +1,16 @@
+model: "muse_glimmer"
+max_seq_len: 32768
+node_groups:
+  # Text and images. ~60 GB of bf16 weights: one 141 GB GPU (H200), or
+  # muse_glimmer_tp2.yaml on two 80 GB ones. Colocated: the encoder runs once
+  # per request, then idles.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+
+warmup_requests:
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
+    model_kwargs: {max_output_tokens: 4}
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    model_kwargs: {max_output_tokens: 4}

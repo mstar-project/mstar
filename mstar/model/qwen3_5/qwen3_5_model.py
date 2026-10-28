@@ -19,10 +19,16 @@ from mstar.engine.resources.linear_attn.config import (
 )
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
-from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.model.base import ForwardPassArgs, ProcessPromptOutput, TensorAndMetadata
-from mstar.model.multimodal import VIDEO, PromptPart, messages_from_parts, vision_encoder
+from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
+from mstar.model.multimodal import (
+    VIDEO,
+    PromptPart,
+    as_uint8_chw,
+    messages_from_parts,
+    vision_encoder,
+)
 from mstar.model.multimodal_decoder import (
     MIXED_SPLIT,
     MediaIntake,
@@ -52,23 +58,6 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
-
-def _as_hwc_uint8(image: torch.Tensor):
-    """What the HF image processor expects, from what the data worker sends.
-
-    Images arrive ``(C, H, W)`` float32 in [0, 1] on the GPU. The processor
-    defaults to ``do_rescale=True``, so floats would be rescaled twice and the
-    model would silently see a near-black image.
-    """
-    if image.dtype.is_floating_point:
-        image = (image * 255.0).clamp(0, 255).to(torch.uint8)
-    if image.dim() == 3 and image.shape[0] == 4:
-        # the processor refuses a 4-channel (RGBA) tensor, so drop alpha
-        image = image[:3]
-    if image.dim() == 3 and image.shape[0] in (1, 3):
-        image = image.permute(1, 2, 0)
-    return image.cpu().contiguous().numpy()
-
 
 # TODO: implement MoE variants
 class Qwen3_5DenseModel(MultimodalDecoderModel):
@@ -347,7 +336,11 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def _image_intake(self, image: torch.Tensor, metadata: dict) -> PreparedMedia:
         merge = self._merge()
-        out = self.image_processor(images=[_as_hwc_uint8(image)], return_tensors="pt")
+        # uint8, HWC: the processor rescales by default, so floats would be
+        # rescaled twice and the model would see a near-black image
+        out = self.image_processor(
+            images=[as_uint8_chw(image).permute(1, 2, 0).numpy()], return_tensors="pt",
+        )
         grid = out["image_grid_thw"][0]
         return PreparedMedia({"pixel_values": out["pixel_values"]}, [int(grid.prod()) // merge ** 2], [grid])
 
@@ -389,23 +382,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
         )
         return super().kv_layout(layout, length, advance)
-
-    # ------------------------------------------------------------------
-    # Model ABC: per-request resource configs
-    # ------------------------------------------------------------------
-
-    def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
-        model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
-        return {
-            SAMPLER: SamplingReqConfig(
-                **{k: model_kwargs[k] for k in keys if k in model_kwargs}
-            )
-        }
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

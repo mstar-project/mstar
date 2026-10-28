@@ -2356,11 +2356,12 @@ which declares the walks (``media_walks(max_iters, encoders)`` and
 through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, and owns
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, which is
 also the request's output budget), the KV label and its one-span layout (``kv_labels``,
-``kv_layout``), sharding, the submodule cache and where the files come from. A model
-sets ``NAME`` and ``METADATA_FILES`` and writes ``__init__`` (setting ``config``,
-``tokenizer`` and ``media``), its resources (``MIXED_SPLIT`` is the attention resources'
-split of a mixed step), ``_prompt_ids``, ``get_request_resource_configs`` and
-``_create_submodule``. ``media`` holds a ``MediaIntake`` per attachment modality: its
+``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
+the request's ``SAMPLING_KEYS`` over the model's ``sampling_defaults``), sharding, the
+submodule cache and where the files come from. A model sets ``NAME`` and
+``METADATA_FILES`` and writes ``__init__`` (setting ``config``, ``tokenizer``, ``media``
+and any ``sampling_defaults``), its resources (``MIXED_SPLIT`` is the attention
+resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``. ``media`` holds a ``MediaIntake`` per attachment modality: its
 ``MediaEncoder`` (modalities may share one), its placeholder ``pad`` id, the sentinels
 a template leaves to its processor, how many placeholders an attachment fills
 (``runs``, one by default; a Qwen3.5 video fills one per temporal group), and

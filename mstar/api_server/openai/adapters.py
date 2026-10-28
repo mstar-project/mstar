@@ -508,6 +508,18 @@ class Qwen3_5Adapter(OpenAIAdapter):
         )
 
 
+class MuseGlimmerAdapter(Qwen3_5Adapter):
+    """Muse Glimmer: text-and-image chat, text out.
+
+    Chat only, tool calls refused (no ATEM parser yet). Sampling keys as
+    Qwen3.5, defaulting to the checkpoint's own (temperature 1, top_p 0.95,
+    top_k 64); ``reasoning_effort`` (low / medium / high / xhigh, default
+    high) sets the template's reasoning strength. The reply is the raw
+    channel stream: reasoning under ``to=self``, the answer under
+    ``to=user``.
+    """
+
+
 class OrpheusAdapter(OpenAIAdapter):
     """Orpheus: text-to-speech (audio out only). ``temperature`` / ``top_p`` /
     ``seed`` map directly; ``top_k``, ``repetition_penalty`` and
@@ -1478,6 +1490,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
     "glm52": TextChatAdapter(),
+    "muse_glimmer": MuseGlimmerAdapter(),
 }
 
 # One key per size; every size takes the same adapter.
