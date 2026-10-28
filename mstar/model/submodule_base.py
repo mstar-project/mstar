@@ -838,7 +838,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         reads it, so a forward (and its captured graphs) can keep a fixed width
         and still emit a length known only on the device, without a host read.
         The cut is a view, and a row whose span covers its whole output is left
-        as it is.
+        as it is. A row whose span is empty (``end <= start``) has no output
+        under the name: nothing is stored or routed for it, and a streaming
+        edge gets no item.
 
         The engine-side ``postprocess`` and ``batch_postprocess`` see the
         uncut output. A spanned output must not feed a node this worker

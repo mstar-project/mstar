@@ -16,6 +16,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from mstar.communication.communicator import BaseCommunicator  # noqa: E402
+from mstar.communication.tensors import SharedMemoryCommunicationManager  # noqa: E402
 from mstar.distributed.communication import WorkerParallelGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import (  # noqa: E402
@@ -27,6 +29,7 @@ from mstar.engine.resources import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop  # noqa: E402
+from mstar.graph.runtime.base import FreedTensors, RouteOutput  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 from mstar.worker.engine_manager import _refuse_speculated_spans  # noqa: E402
@@ -108,7 +111,8 @@ class _SpanningVocoder(NodeSubmodule):
         return self._output(engine_inputs.request_ids, padded)
 
     def check_stop(self, request_id, request_info, outputs):
-        self.stop_check_lengths[request_id] = outputs["audio"][0].shape[-1]
+        if "audio" in outputs:
+            self.stop_check_lengths[request_id] = outputs["audio"][0].shape[-1]
         return set()
 
 
@@ -247,6 +251,131 @@ def test_a_span_without_a_row_per_request_fails_the_step():
     engine.prepare_inputs(batch)
     with pytest.raises(ValueError, match=r"not \[2, 2\]"):
         engine.exec_and_postprocess(batch)
+
+
+class _SilenceIsNoAudio(_SpanningVocoder):
+    """A row without a single loud sample gets an empty span."""
+
+    def _output(self, rids, padded):
+        out = super()._output(rids, padded)
+        span = out.output_spans["audio"]
+        silent = (padded == 0).all(dim=1, keepdim=True)
+        out.output_spans["audio"] = torch.where(silent, torch.zeros_like(span), span)
+        return out
+
+
+@pytest.mark.parametrize("batched", [True, False], ids=["forward_batched", "per_request"])
+def test_an_empty_span_leaves_the_row_out_of_the_store(batched):
+    silent = 4
+    sub = _SilenceIsNoAudio(batched=batched)
+    stored, _, _ = _run_step(sub, {**SAMPLES, silent: torch.zeros(5)})
+    # no audio at all for that row (not a zero-width tensor), and the stop
+    # check saw none either; its unspanned output is still there
+    assert "audio" not in stored[silent] and silent not in sub.stop_check_lengths
+    assert stored[silent]["level"][0].shape == (1,)
+    for rid, expected in EXPECTED.items():
+        assert stored[rid]["audio"][0].tolist() == pytest.approx(expected), rid
+        assert sub.stop_check_lengths[rid] == len(expected)
+
+
+class _Communicator(BaseCommunicator):
+    def send(self, entity_id, msg):
+        pass
+
+    def get_all_new_messages(self):
+        return []
+
+
+class _RecordingRuntime:
+    """Records what the worker asks it to route."""
+
+    supports_inline_emit = False
+
+    def __init__(self):
+        self.routes = []
+
+    def cleanup_consumed_inputs(self, *args):
+        return FreedTensors.none()
+
+    def clear_pending_loop_stops(self):
+        pass
+
+    def stop_loops_batched(self, **kwargs):
+        return []
+
+    def update_dynamic_loop_iters(self, per_request_info, partition):
+        pass
+
+    def send_outputs(self, send_input):
+        return []
+
+    def complete_and_route_batch(self, route_input):
+        self.routes.append(route_input)
+        return RouteOutput(
+            completion_id=len(self.routes), register_uuids=[], register_rids=[],
+            new_token_output_idxs=[], local_streaming_by_signal={},
+        )
+
+
+def test_the_route_counts_no_tensor_for_an_empty_span(tmp_path):
+    """Through the real store, the row's name routes zero tensors: all either
+    graph runtime sees, so a streaming edge gets no item for that row."""
+    keep, drop = 1, 2
+    w = Worker.__new__(Worker)
+    w._phase_period = 0
+    w.enable_nvtx = w.enable_prof = False
+    w.device = torch.device("cpu")
+    w._last_active = {}
+    w._innermost_loop_by_node = {}
+    w._graph_runtime = _RecordingRuntime()
+    w.scheduler = SimpleNamespace(failed_rids=set())
+    w.tensor_manager = SharedMemoryCommunicationManager(
+        my_entity_id="worker_0", hostname="localhost", device="cpu",
+        communicator=_Communicator(), shm_dir=str(tmp_path),
+    )
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        check_stop_for_batch=lambda batch, outputs, host_rows=None: {},
+        extend_prefix_chains=lambda batch, outputs, **kwargs: None,
+        materialize_publish=lambda batch, rids: None,
+    ))
+    w.request_state = SimpleNamespace(
+        per_request_info={},
+        buffer_publish_info=lambda *args: None,
+        get_fwd_info=lambda rid, partition: None,
+        get_pending_publish_info=lambda rid, partition: {},
+    )
+    # on CPU the stop check reads the outputs themselves
+    w._prematerialize_for_check_stop = (
+        lambda outputs, completion_event, request_ids=None: (outputs.per_rid_outputs, None)
+    )
+    pending = SimpleNamespace(
+        batch=ScheduledBatch(
+            node_name=NODE, graph_walk=WALK, request_to_worker_graph={keep: 0, drop: 0},
+            output_signals=["token", "frame"],
+        ),
+        node_batch=ExecutingBatch(
+            node_name=NODE, per_request_info={keep: SimpleNamespace(), drop: SimpleNamespace()},
+            step_context=StepContext(request_ids=(keep, drop), graph_walk=WALK, slot=0, capture=False),
+        ),
+        node_name=NODE, partition="default", graph_walk=WALK, loop_name=None,
+        speculative_new_iter=False,
+    )
+    outputs = BatchedModelOutput(
+        per_rid_outputs={
+            keep: {"token": [torch.tensor(3)], "frame": [torch.tensor([3, 0])]},
+            drop: {"token": [torch.tensor(9)], "frame": [torch.tensor([9, 0])]},
+        },
+        output_spans={"frame": torch.tensor([[0, 2], [2, 2]])},
+        span_request_ids=(keep, drop),
+    )
+
+    Worker._postprocess_batch(w, pending, outputs)
+
+    (route,) = w._graph_runtime.routes
+    assert list(route.wg_ids.keys) == [keep, drop]
+    # (keep: token, frame), (drop: token, frame)
+    assert route.num_tensors == [1, 1, 1, 0]
+    assert len(route.tensors) == 3
 
 
 def test_spans_are_merged_in_request_order():
