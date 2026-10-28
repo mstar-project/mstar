@@ -1,4 +1,10 @@
 # Carry the default deployment configs into the sdist so a wheel built from it
 # can copy them into mstar/default_configs/ (see setup.py).
 graft configs
+# rust/ and the pinned toolchain, so the Rust wheels can be built from the
+# sdist too (setup.py compiles them under CIBUILDWHEEL=1).
+graft rust
+prune rust/target
+prune rust/server/target
+include rust-toolchain.toml
 global-exclude __pycache__ *.py[cod]
