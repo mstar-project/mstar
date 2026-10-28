@@ -81,7 +81,14 @@ def pixels_to_uint8(image: torch.Tensor) -> torch.Tensor:
     return (image * 255).round().to(torch.uint8)
 
 
-PNG_WORKERS = min(8, usable_cpus())
+def png_workers(cpus: int | None = None) -> int:
+    """Threads one PNG deflates on: up to 8, within the CPUs the process may use."""
+    if cpus is None:
+        cpus = usable_cpus()
+    return min(8, cpus)
+
+
+PNG_WORKERS = png_workers()
 
 
 def uint8_to_png(

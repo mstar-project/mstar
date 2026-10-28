@@ -12,6 +12,7 @@ import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState, encode_workers
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.model.components.diffusion.image_io import png_workers
 from mstar.streaming.topology import PartitionTopology
 
 
@@ -134,6 +135,11 @@ def _pass_until(wt, n: int, timeout_s: float = 5.0) -> list:
 def test_the_pool_times_a_pngs_own_threads_fits_the_cpus(cpus, workers):
     assert encode_workers(cpus, png_workers=8) == workers
     assert workers * 8 <= max(cpus, 8)
+
+
+@pytest.mark.parametrize("cpus", [1, 4, 7, 8, 15, 16, 24, 32, 40, 256])
+def test_the_pool_times_a_pngs_threads_stays_within_the_cpus(cpus):
+    assert encode_workers(cpus, png_workers=png_workers(cpus)) * png_workers(cpus) <= cpus
 
 
 def test_a_whole_video_is_pooled_and_a_loops_frames_stay_inline(worker):
