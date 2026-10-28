@@ -13,7 +13,6 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
-    BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.resources import (
@@ -28,6 +27,7 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
     draft_verify_step,
+    verify_captures,
     with_draft_verify,
 )
 from mstar.model.components.draft_model import DraftLLMProposer
@@ -99,15 +99,15 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
         if self._policy is None:
             configs = super().get_accelerator_graph_configs(device, tp_world_size)
         else:
-            # a verify step of a block a row, the drafter's passes and the verdict in one graph
-            configs = [BatchedAcceleratorGraphConfig(
-                capture_graph_walk=DECODE_WALK,
-                single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(self._carry, dtype=torch.long, device=device),
-                    input_seq_len=self._policy.block,
+            # a verify step of a block a row, the drafter's passes and the verdict in one graph;
+            # an adaptive walk also captures its block of no drafts
+            configs = verify_captures(
+                self._policy, DECODE_WALK,
+                lambda block: ARNodeInputs(
+                    input_ids=torch.zeros(self._carry, dtype=torch.long, device=device), input_seq_len=block,
                 ),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            )]
+                self.DECODE_CAPTURE_BATCH_SIZES,
+            )
         if self.prefill_token_buckets:
             configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,

@@ -370,9 +370,13 @@ step's next tokens from the request's own prompt and reply, and verifies them
 in the same forward (see `Draft-verify decoding` in :doc:`adding_models`).
 Output is unchanged: greedy requests emit what plain decoding emits, and
 sampled ones are distributed as plain sampling. It pays where replies copy
-their prompt (code edits, refactors: 2.6-4.6x plain decode on Qwen3.5-0.8B and
-4B) and costs elsewhere (chat at about 0.5-0.7x plain), so it is opt-in per
-deployment. Under it the
+their prompt (code edits, refactors: 2.8-5.4x plain decode on Qwen3.5-0.8B and
+4B). Elsewhere each step chooses: under ``adaptive`` (on by default) a step
+drafts only when its rows are expected to keep ``min_gain`` drafts each (0.5 a
+row at one row, rising to 1.0 at 32), and otherwise runs one token a row, so
+chat and reasoning run level with plain decode on Qwen3.5-4B and at 0.8-1.0x on
+0.8B, whose short steps show the verify path's host work. It is opt-in per
+deployment: on where replies copy prompts or traffic mixes code and chat. Under it the
 mixed prefill-and-decode walk is off, ``repetition_penalty`` and ``min_tokens``
 are refused, and ``sampled_verify: false`` serves temperature 0 only, skipping
 the per-step filtering a sampled verify does. ``max_ngram`` and ``min_ngram``

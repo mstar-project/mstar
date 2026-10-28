@@ -35,6 +35,7 @@ from mstar.engine.resources.draft_verify.config import (
     DraftConfig,
     DraftPolicy,
     ProposeStep,
+    verify_captures,
     with_draft_verify,
 )
 from mstar.engine.resources.draft_verify.drafter import draft_verify_step
@@ -200,10 +201,22 @@ class LLMSubmodule(ARNodeSubmodule):
             )
 
         policy = self._draft_policy
-        decode_row = dummy(1) if policy is None else ARNodeInputs(
-            # one token in, the last emitted: the step verifies it and the drafts
-            input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=policy.block,
-        )
+        if policy is None:
+            decode = [BatchedAcceleratorGraphConfig(
+                capture_graph_walk="decode",
+                single_request_inputs=dummy(1),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            )]
+        else:
+            # one token in, the last emitted: the step verifies it and its drafts; an adaptive
+            # walk also captures its block of no drafts
+            decode = verify_captures(
+                policy, "decode",
+                lambda block: ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=block,
+                ),
+                self.DECODE_CAPTURE_BATCH_SIZES,
+            )
         mixed = [] if policy is not None else [
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=LLM_MIXED,
@@ -215,11 +228,7 @@ class LLMSubmodule(ARNodeSubmodule):
             ),
         ]
         return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk="decode",
-                single_request_inputs=decode_row,
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            ),
+            *decode,
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -362,8 +371,11 @@ class LLMSubmodule(ARNodeSubmodule):
             return ARNodeInputs(input_seq_len=1)
         input_ids = inputs["text_inputs"][0]
         if graph_walk == "decode" and self._draft_policy is not None:
-            # the last emitted token, which the step verifies with its drafts
-            return ARNodeInputs(input_ids=input_ids.reshape(-1)[-1:], input_seq_len=self._draft_policy.block)
+            # the last emitted token, which the step verifies with its drafts (the loop-back is
+            # that token already; a view only when it isn't)
+            if input_ids.dim() != 1 or input_ids.shape[0] != 1:
+                input_ids = input_ids.reshape(-1)[-1:]
+            return ARNodeInputs(input_ids=input_ids, input_seq_len=self._draft_policy.block)
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
     def uniform_row_inputs(

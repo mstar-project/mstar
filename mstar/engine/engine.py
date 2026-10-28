@@ -36,6 +36,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.draft_verify.resource import PLAIN_TOKENS
 from mstar.engine.resources.draft_verify.startup import VerifyWalk, verify_walk
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -331,6 +332,11 @@ class ExecutingBatch:
     failed_resource: str | None = None
     # a verify step's stops, settled with its emitted tokens (see `Engine._emit_verified`)
     verify_stops: dict[int, set[str]] | None = None
+    # an adaptive verifying walk's drafts for this step, decided once (`Engine._step_drafts`)
+    verify_drafts: int | None = None
+    # a step of no drafts, counted at its commit, whose tokens the stop check reads
+    # (`Engine._emit_plain`): (its VerifyWalk, its PlainStep)
+    verify_plain: tuple | None = None
 
     # Every output signal of this step stays on the device (the node's
     # ``device_loopback_signals``): collect builds no per-request output
@@ -1022,6 +1028,7 @@ class Engine:
                 # return an equal one each time (128 calls at a full decode
                 # batch, on the gpu thread before the launch)
                 node_inputs = [uniform] * len(batch.request_ids)
+                self._set_verify_block(batch, node_inputs)
                 batch.register_prepare_batch(node_inputs)
                 batch.running_batched = submodule.can_batch(
                     batch=batch, model_inputs=node_inputs
@@ -1058,11 +1065,40 @@ class Engine:
             else:
                 node_inputs.append(req_inputs)
 
+        self._set_verify_block(batch, node_inputs)
         batch.register_prepare_batch(node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
         )
+
+    def _adaptive_walk(self, batch: ExecutingBatch) -> VerifyWalk | None:
+        """The batch's walk, when it verifies drafts under an adaptive policy."""
+        mgmt = self._submodules[batch.node_name]
+        if not getattr(mgmt, "declares_drafts", False):
+            return None
+        verifying = self._verify_walk(batch.node_name, mgmt, batch.step_context.graph_walk)
+        return verifying if verifying is not None and verifying.policy.adaptive else None
+
+    def _step_drafts(self, batch: ExecutingBatch, verifying: VerifyWalk) -> int:
+        """The drafts this batch's step runs, decided the first time it is asked: when its slot
+        is reserved (the plan thread, ahead) or its inputs prepared, whichever comes first. Both
+        follow the commit of the step before and precede this one's, between which the
+        proposer's predictions don't move, so the choice is the same on every rank and on
+        every path the step takes, and its lease, template rows and declaration agree."""
+        if batch.verify_drafts is None:
+            batch.verify_drafts = verifying.resource.choose_drafts(batch.request_ids, verifying.policy)
+        return batch.verify_drafts
+
+    def _set_verify_block(self, batch: ExecutingBatch, node_inputs: list[NodeInputs]) -> None:
+        """Each row of an adaptive verify step spans the block its step runs (``drafts + 1``)."""
+        verifying = self._adaptive_walk(batch)
+        if verifying is None:
+            return
+        span = self._step_drafts(batch, verifying) + 1
+        for inp in node_inputs:
+            if inp.input_seq_len != span:
+                inp.input_seq_len = span
 
     def _loopback_rows(self, batch: ExecutingBatch) -> list[bool] | None:
         """Per row, whether its input token is on the device (see
@@ -1104,11 +1140,18 @@ class Engine:
     def inline_client_signals(
         self, node_name: str, graph_walk: str,
     ) -> dict[str, str]:
-        """The node's client signals that can ride inline this walk."""
+        """The node's client signals that can ride inline this walk. An adaptive verifying
+        walk's emit signal rides inline on its steps of no drafts (one token a row), whose host
+        rows carry ``PLAIN_TOKENS``; a verify step's runs go as tensors (it has no such rows)."""
         mgmt = self._submodules.get(node_name)
         if mgmt is None:
             return {}
-        return mgmt.submodule.inline_client_signals(graph_walk)
+        signals = mgmt.submodule.inline_client_signals(graph_walk)
+        if getattr(mgmt, "declares_drafts", False):
+            verifying = self._verify_walk(node_name, mgmt, graph_walk)
+            if verifying is not None and verifying.policy.adaptive:
+                signals = {**signals, verifying.policy.emit: PLAIN_TOKENS}
+        return signals
 
     def device_loopback_signals(
         self, node_name: str, graph_walk: str,
@@ -1335,28 +1378,74 @@ class Engine:
 
     def _emit_verified(self, batch: ExecutingBatch, verifying: VerifyWalk) -> None:
         """A verify step's emitted tokens as each request's ``policy.emit`` output, and its
-        stops. Waits for the step's verdict, which the next step's rewinds wait for too."""
+        stops. Waits for the step's verdict, which the next step's rewinds wait for too. A step
+        of no drafts is only counted here, without waiting: the stop check emits its tokens
+        (`_emit_plain`), after the worker has waited for the step, so the gpu thread can launch
+        the next step while this one runs, as plain decode does."""
         rids = batch.request_ids
         info = batch.per_request_info_wrapped
-        sampler = verifying.sampler
-        rows = verifying.resource.emitted_rows(
-            rids,
-            [info[rid].max_tokens for rid in rids],
-            [
-                getattr(info[rid].resource_configs.get(sampler), "ignore_eos", False) or False
-                for rid in rids
-            ],
-            verifying.policy,
+        dv = verifying.resource
+        batch.verify_plain = None
+        # the step's stop is the engine's: nothing for the worker's stop check to copy to the host
+        batch.outputs.check_stop_buffers = {}
+        if dv.ran_plain():
+            plain = dv.count_plain(rids, [info[rid].max_tokens for rid in rids], verifying.policy)
+            batch.verify_plain = (verifying, plain)
+            tokens = dv.plain_tokens(plain)
+            if tokens is not None:
+                # One token a row, as plain decode emits: the client edge can ride inline off
+                # these host rows (`inline_client_signals`), which the step's own forward fills
+                batch.outputs.host_rows = HostRows(plain.request_ids, {PLAIN_TOKENS: tokens})
+            return
+        rows = dv.emitted_rows(rids, [info[rid].max_tokens for rid in rids], self._ignore_eos(batch, verifying, rids),
+                               verifying.policy)
+        self._emit_rows(batch, verifying, rows)
+
+    def _emit_plain(self, batch: ExecutingBatch) -> None:
+        """A step of no drafts' tokens and stops, at its stop check: the step has landed."""
+        verifying, plain = batch.verify_plain
+        batch.verify_plain = None
+        rows = verifying.resource.plain_rows(
+            plain, self._ignore_eos(batch, verifying, plain.request_ids), verifying.policy,
         )
-        emit = verifying.policy.emit
-        per_rid = batch.outputs.per_rid_outputs
-        # numpy gives an empty mask result a stride of 0, which the transport can't view as bytes
-        emitted = torch.from_numpy(rows.tokens) if rows.tokens.size else torch.empty(0, dtype=torch.long)
-        for rid, tokens in zip(rids, emitted.split(rows.counts.tolist()), strict=True):
-            per_rid.setdefault(rid, {})[emit] = [tokens]
+        host = batch.outputs.host_rows
+        inline = host is not None and PLAIN_TOKENS in host.buffers
+        if inline and not rows.counts.all():
+            # a row that emits nothing this step (past its max_tokens, or after its stop):
+            # every row's token goes as a tensor, cut as the rows say
+            del host.buffers[PLAIN_TOKENS]
+            inline = False
+        # A runtime that sends the tokens inline needs no tensor of them; one that can't
+        # (`supports_inline_emit`) sends these
+        inline = inline and getattr(self._graph_runtime, "supports_inline_emit", False)
+        self._emit_rows(batch, verifying, rows, send_tokens=not inline)
+
+    @staticmethod
+    def _ignore_eos(batch: ExecutingBatch, verifying: VerifyWalk, rids) -> list[bool]:
+        info = batch.per_request_info_wrapped
+        sampler = verifying.sampler
+        return [
+            getattr(info[rid].resource_configs.get(sampler), "ignore_eos", False) or False
+            for rid in rids
+        ]
+
+    def _emit_rows(self, batch: ExecutingBatch, verifying: VerifyWalk, rows, send_tokens: bool = True) -> None:
+        """``rows`` as each request's ``policy.emit`` output (unless ``send_tokens`` is False:
+        they ride inline), and the step's stops. Rows the batch has dropped since the step ran
+        (the worker drops a request whose loop stopped) get nothing."""
+        if send_tokens:
+            emit = verifying.policy.emit
+            per_rid = batch.outputs.per_rid_outputs
+            running = batch.request_ids
+            # numpy gives an empty mask result a stride of 0, which the transport can't view as bytes
+            emitted = torch.from_numpy(rows.tokens) if rows.tokens.size else torch.empty(0, dtype=torch.long)
+            kept = None if tuple(running) == rows.request_ids else set(running)
+            for rid, tokens in zip(rows.request_ids, emitted.split(rows.counts.tolist()), strict=True):
+                if kept is None or rid in kept:
+                    per_rid.setdefault(rid, {})[emit] = [tokens]
         loops = {verifying.policy.loop}
         batch.verify_stops = {
-            rid: set(loops) for rid, done in zip(rids, rows.done.tolist(), strict=True) if done
+            rid: set(loops) for rid, done in zip(rows.request_ids, rows.done.tolist(), strict=True) if done
         }
 
     def _exec_single(
@@ -1914,6 +2003,8 @@ class Engine:
         if it raises, the per-request path runs so a failure lands on its own
         request.
         """
+        if getattr(batch, "verify_plain", None) is not None:
+            self._emit_plain(batch)
         stops = getattr(batch, "verify_stops", None)
         if stops is not None:
             # settled with the step's emitted tokens; the engine owns a verify step's stop
@@ -2388,10 +2479,15 @@ class Engine:
         # business (bagel: guidance on/off) — and the lease is taken before the
         # step is declared, so the submodule is asked directly. It answers from
         # the same per-request facts its `declare_step` stamps on the step.
-        batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
-            batch.step_context.graph_walk, batch.per_request_info_wrapped,
-            per_request_input_metadata=batch.per_request_input_metadata,
-        )
+        verifying = self._adaptive_walk(batch)
+        if verifying is not None:
+            # an adaptive verifying walk is captured once per block (`verify_captures`)
+            batch.cg_key_info = verifying.policy.capture_key(self._step_drafts(batch, verifying))
+        else:
+            batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
+                batch.step_context.graph_walk, batch.per_request_info_wrapped,
+                per_request_input_metadata=batch.per_request_input_metadata,
+            )
         lease = cg_runner.lease_slot(
             graph_walk=batch.step_context.graph_walk,
             bs=len(batch.request_ids),

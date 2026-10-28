@@ -4,7 +4,9 @@ Greedy decode with drafts must emit what plain greedy decode emits: every verify
 the trunk over a block of tokens (attention over the paged KV, the gated delta rule from each
 slot's state without writing it), keeps the drafts the model agrees with, rewinds the KV and
 positions past them and settles each GDN layer's state and conv window after the kept prefix.
-Code-editing prompts, whose replies copy their prompt, so most steps keep drafts.
+Code-editing prompts, whose replies copy their prompt, so most steps keep drafts. Adaptive (the
+default for prompt lookup), a step whose rows aren't expected to keep enough drafts runs one
+token a row instead, from its own capture: a request's first decode step always does.
 
 bf16 reductions over a block of rows tile differently from one row, so a token whose top two
 logits tie in plain decode (bf16 holds a logit near 16 to 1/16) can come out the other way.
@@ -17,6 +19,7 @@ Needs CUDA, FlashInfer and the cached Qwen/Qwen3.5-0.8B checkpoint.
 
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 
@@ -206,8 +209,15 @@ def _decode(draft, captured):
         stats = serve.eng._resources[DRAFT_VERIFY], serve.eng._resources[NGRAM]
     leases = serve.leases[len(PROMPTS):]
     del serve
-    torch.cuda.empty_cache()
+    _release()
     return out, stats, leases
+
+
+def _release() -> None:
+    """Free an engine dropped by the caller: its reference cycles would keep its KV cache and
+    graphs on the device until a full collection, and the next test's engine would not fit."""
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="module")
@@ -231,11 +241,14 @@ def plain():
     return out, margins
 
 
+@pytest.mark.parametrize("adaptive", [False, True], ids=["every_step", "adaptive"])
 @pytest.mark.parametrize("captured", [False, True], ids=["eager", "captured"])
 @pytest.mark.parametrize("k", [2, 4])
-def test_ngram_greedy_emits_what_plain_greedy_emits(k, captured, plain):
+def test_ngram_greedy_emits_what_plain_greedy_emits(k, captured, adaptive, plain):
     streams, margins = plain
-    out, (dv, prop), leases = _decode({"method": "ngram", "max_drafts": k, "sampled_verify": False}, captured)
+    out, (dv, prop), leases = _decode(
+        {"method": "ngram", "max_drafts": k, "sampled_verify": False, "adaptive": adaptive}, captured,
+    )
     if captured:
         assert leases and all(lease is not None for lease in leases), "a decode step ran eager"
     for rid, want in streams.items():
@@ -249,3 +262,6 @@ def test_ngram_greedy_emits_what_plain_greedy_emits(k, captured, plain):
     # the replies copy their prompts: most verify steps keep a draft
     assert dv.drafts_accepted > 0.5 * dv.rows_verified, dv.stats()
     assert prop.rows_matched > 0
+    assert (dv.steps_plain > 0) == adaptive, dv.stats()
+    if captured and adaptive:
+        assert {lease.bucket.cg_key_info.drafts for lease in leases} == {0, k}

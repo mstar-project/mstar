@@ -9,6 +9,11 @@ instead of its head): greedy verify emits exactly what plain greedy decode emits
 history is the prompt and the emitted tokens, and it is purged with the request. At
 temperature > 0 the stream follows the target (the check of ``test_draft_verify_sampled.py``
 with n-gram drafts).
+
+Adaptive (``DraftPolicy.adaptive``): a step drafts only when the proposer expects its rows to
+keep enough drafts, else runs one token a row; the streams are plain decode's whichever steps
+draft, the choice moves only at a commit, and a step of no drafts leaves its verdict unread
+until the stop check (its tokens) and the row's next commit (the proposer's history).
 """
 
 from __future__ import annotations
@@ -184,12 +189,56 @@ def test_a_preplan_is_promoted_only_for_its_own_step():
     assert prop.propose([2], 1)[0].tolist() == [[8, 9]]
 
 
+def test_a_row_that_keeps_missing_looks_up_less_often(monkeypatch):
+    """On steps of no drafts, a row whose lookups find nothing backs off (1, 3, then 7 steps
+    between lookups), its verdicts waiting for the next one; a match resets it. Deterministic:
+    it moves only at the commits that call ``predict``."""
+    prop = NgramProposer(CPU, max_drafts=3, min_ngram=2, max_ngram=3)
+    prop.ingest_request(0)
+    prop.commit(ProposeStep(history={0: torch.tensor([90, 91, 92, 93])}), _ctx([0]))
+    looked = []
+    real = NgramIndex.locate
+
+    def counting(self, history):
+        looked.append(len(history.tokens))
+        return real(self, history)
+
+    monkeypatch.setattr(NgramIndex, "locate", counting)
+    for step in range(20):
+        prop.observe(0, np.array([0, 5, 100 + step]))
+        prop.predict([0], 0)
+    # the step each lookup ran at, from its history's length (the prompt and the prefill's
+    # token, then a token a step)
+    steps = [n - 6 for n in looked]
+    assert steps == [0, 1, 3, 7, 15], steps
+    assert prop._histories[0].predicted == 0.0
+    # the prompt's start comes back: the row's next lookup (step 23) finds it, and the backoff
+    # resets
+    for step in range(20, 24):
+        prop.observe(0, np.array([0, 5, (77, 90, 91, 92)[step - 20]]))
+        prop.predict([0], 0)
+    assert [n - 6 for n in looked][5:] == [23]
+    history = prop._histories[0]
+    assert history.follow >= 0 and history.misses == 0 and history.predicted > 0
+
+
 def test_draft_config_from_yaml_kwargs():
     assert DraftConfig.from_kwargs(None) is None
     assert DraftConfig.from_kwargs({}) is None
     cfg = DraftConfig.from_kwargs({"method": "ngram", "max_drafts": 3, "max_ngram": 5})
     policy = cfg.policy(stop_ids={2})
-    assert policy == DraftPolicy(max_drafts=3, stop_ids=frozenset({2}), proposer=NGRAM)
+    # prompt lookup decides each step by default, against a gain that grows with the batch
+    assert policy == DraftPolicy(
+        max_drafts=3, stop_ids=frozenset({2}), proposer=NGRAM, adaptive=True, min_gain=((1, 0.5), (32, 1.0)),
+    )
+    assert policy.draft_options == (0, 3)
+    assert (policy.gain_needed(1), policy.gain_needed(32), policy.gain_needed(64)) == (0.5, 32.0, 64.0)
+    assert policy.gain_needed(9) == pytest.approx(9 * (0.5 + 0.5 * 8 / 31))
+    fixed = DraftConfig.from_kwargs({"method": "ngram", "adaptive": False, "min_gain": 2}).policy()
+    assert not fixed.adaptive and fixed.draft_options == (4,) and fixed.gain_needed(3) == 6.0
+    # a YAML list of [rows, gain] points
+    listed = DraftConfig.from_kwargs({"method": "ngram", "min_gain": [[16, 1.0], [1, 0.25]]})
+    assert listed.min_gain == ((1, 0.25), (16, 1.0)) and listed.policy().gain_needed(100) == 100.0
     specs = cfg.resources({"LLM"})
     assert [type(s).__name__ for s in specs] == ["DraftVerifySpec", "NgramSpec"]
     with pytest.raises(ValueError, match="unknown draft settings"):
@@ -201,11 +250,16 @@ def test_draft_config_from_yaml_kwargs():
     # a draft model drafts in the forward: no engine-side proposer, no NgramSpec
     cfg = DraftConfig.from_kwargs({"method": "draft_model", "model": "Qwen/Qwen3-0.6B", "max_drafts": 4})
     assert cfg.policy().proposer is None and cfg.policy().lookahead == 9
+    # a draft model drafts every step: it predicts nothing to decide one by
+    assert not cfg.adaptive
     assert [type(s).__name__ for s in cfg.resources({"LLM"})] == ["DraftVerifySpec"]
     bad_configs = ({"method": "draft_model"}, {"method": "ngram", "model": "x"},
-                   {"method": "ngram", "draft_sample": True})
+                   {"method": "ngram", "draft_sample": True},
+                   {"method": "draft_model", "model": "x", "adaptive": True},
+                   {"method": "ngram", "min_gain": -1}, {"method": "ngram", "min_gain": [[0, 1.0]]},
+                   {"method": "ngram", "min_gain": "high"})
     for bad in bad_configs:
-        with pytest.raises(ValueError, match="draft"):
+        with pytest.raises(ValueError, match="(?i)draft"):
             DraftConfig.from_kwargs(bad)
 
 
@@ -220,9 +274,16 @@ PROMPTS = [
 ]
 
 
+# prompts whose suffix never occurred earlier: nothing to draft from at first
+FRESH = [
+    [44, 1, 30, 2, 61, 17, 8, 50],
+    [12, 55, 7, 33, 21],
+]
+
+
 def _run(k: int, batched: bool = True, prompts=PROMPTS, max_tokens: int = MAX_TOKENS,
-         ignore_eos: bool = False, seed: int = toy.SEED, **ngram):
-    sub = toy.ToySubmodule(k=k, seed=seed, proposer=NGRAM)
+         ignore_eos: bool = False, seed: int = toy.SEED, adaptive: bool = False, min_gain: float = 0.5, **ngram):
+    sub = toy.ToySubmodule(k=k, seed=seed, proposer=NGRAM, adaptive=adaptive, min_gain=min_gain)
     eng = toy.engine(sub, CPU, ngram={"max_drafts": k, **ngram})
     drv = toy.Driver(eng, sub)
     for rid, prompt in enumerate(prompts):
@@ -247,14 +308,161 @@ def test_greedy_ngram_emits_what_plain_decode_emits(k, batched):
     assert 0 < prop.rows_matched <= prop.rows_proposed
 
 
+@pytest.mark.parametrize("batched", [True, False], ids=["batched", "one_per_step"])
+@pytest.mark.parametrize("k", [2, 4])
+@pytest.mark.parametrize("min_gain", [0.5, 0.0, 1e9], ids=["adaptive", "always_drafts", "never_drafts"])
+def test_adaptive_steps_emit_what_plain_decode_emits(k, batched, min_gain):
+    """Whichever steps draft, and in whatever mix, the streams are plain greedy decode's: a step
+    of no drafts emits its one token a row and leaves nothing to rewind, and a verify step after
+    it drafts from a history that holds that token."""
+    prompts = PROMPTS + FRESH
+    out, eng, drv = _run(k, batched=batched, prompts=prompts, adaptive=True, min_gain=min_gain)
+    assert out == _reference(prompts)
+    dv = eng._resources[toy.DV]
+    kinds = {drafts for drafts in drv.step_drafts if drafts is not None}
+    if min_gain == 0.0:
+        assert kinds == {k} and dv.steps_plain == 0
+    elif min_gain == 1e9:
+        assert kinds == {0} and dv.rows_verified == 0
+    else:
+        # a request's first step has no prediction yet, and the repeating prompts keep drafts
+        assert kinds == {0, k} and dv.drafts_accepted > 0, dv.stats()
+    assert dv.steps_plain + dv.steps_verified == len(drv.step_drafts)
+
+
+def test_the_choice_moves_only_at_a_commit(monkeypatch):
+    """The plan thread chooses a step's drafts while the gpu thread finishes the step before it
+    and the main loop runs its stop check: reading that step's verdicts early, or emitting its
+    tokens, must not change what the predictions say, or two paths (or two ranks) could choose
+    apart."""
+    sub = toy.ToySubmodule(k=3, proposer=NGRAM, adaptive=True)
+    eng = toy.engine(sub, CPU)
+    drv = toy.Driver(eng, sub)
+    prompts = PROMPTS + FRESH
+    for rid, prompt in enumerate(prompts):
+        drv.add(rid, prompt, MAX_TOKENS)
+    dv, prop, policy = eng._resources[toy.DV], eng._resources[NGRAM], sub.get_draft_policy("decode")
+    real = eng.check_stop_for_batch
+    seen = []
+
+    def checking(batch, outputs, host_rows=None):
+        rids = list(batch.request_ids)
+        before = (dv.choose_drafts(rids, policy), prop.expected_gain(rids))
+        # a pre-plan's read of the verdicts, ahead of the next commit
+        dv.harvest(rids)
+        stops = real(batch, outputs, host_rows)
+        seen.append((before, (dv.choose_drafts(rids, policy), prop.expected_gain(rids))))
+        return stops
+
+    monkeypatch.setattr(eng, "check_stop_for_batch", checking)
+    out = drv.run(list(range(len(prompts))))
+    assert out == _reference(prompts)
+    assert len(seen) > 5 and all(before == after for before, after in seen), seen
+    assert {choice for (choice, _), _ in seen} == {0, 3}
+
+
+def test_a_step_of_no_drafts_is_emitted_at_its_stop_check():
+    """The gpu thread doesn't wait for a step of no drafts: it counts the step's tokens and
+    leaves its verdict pending; the stop check (after the worker waited for the step) emits
+    them, and the rows' next commit hands the verdict to the proposer."""
+    sub = toy.ToySubmodule(k=3, proposer=NGRAM, adaptive=True, min_gain=1e9)
+    eng = toy.engine(sub, CPU)
+    drv = toy.Driver(eng, sub)
+    drv.add(0, FRESH[0], MAX_TOKENS)
+    dv, prop = eng._resources[toy.DV], eng._resources[NGRAM]
+    real = eng.check_stop_for_batch
+    states = []
+
+    def checking(batch, outputs, host_rows=None):
+        states.append((0 in dv._pending, "new_token" in outputs.get(0, {}), batch.verify_plain is not None))
+        return real(batch, outputs, host_rows)
+
+    eng.check_stop_for_batch = checking
+    drv.decode([0])
+    assert states == [(True, False, True)]
+    # its token rides inline to the client: host rows the step's forward filled
+    from mstar.engine.resources.draft_verify.resource import PLAIN_TOKENS
+
+    assert eng.inline_client_signals(toy.NODE, "decode") == {"new_token": PLAIN_TOKENS}
+    assert eng.inline_client_signals(toy.NODE, "prefill") == {}
+    assert len(drv.emitted[0]) == 2 and not prop._verdicts
+    history = list(prop._histories[0].tokens)
+    drv.decode([0])
+    # the first step's verdict, read at the second's commit: the prefill's token and its own
+    assert prop._histories[0].tokens == FRESH[0] + drv.emitted[0][:2]
+    assert history == FRESH[0]
+
+
+def test_a_step_with_a_row_past_its_cap_sends_its_tokens_as_tensors():
+    """A step of no drafts whose every row emits its token hands the worker host rows to send
+    them inline; one with a row that emits nothing (the async worker's step after a
+    ``max_tokens`` stop) doesn't, and the rows go as tensors, cut."""
+    from mstar.engine.resources.draft_verify.resource import PLAIN_TOKENS
+
+    sub = toy.ToySubmodule(k=3, proposer=NGRAM, adaptive=True, min_gain=1e9)
+    eng = toy.engine(sub, CPU)
+    drv = toy.Driver(eng, sub)
+    drv.add(0, FRESH[0], 3)
+    inline = []
+    real = eng.check_stop_for_batch
+
+    def checking(batch, outputs, host_rows=None):
+        stops = real(batch, outputs, host_rows)
+        inline.append(PLAIN_TOKENS in batch.outputs.host_rows.buffers)
+        return stops
+
+    eng.check_stop_for_batch = checking
+    drv.run([0])
+    drv.decode([0])
+    assert inline == [True, True, False]
+    assert drv.emitted[0] == toy.reference(FRESH[0], 3)
+
+
+def test_a_runtime_that_inlines_gets_no_tensor_of_a_plain_steps_tokens():
+    """Under a graph runtime that sends a client signal inline, a step of no drafts emits no
+    tensor of its tokens (the worker sends them off the host rows); a verify step still does.
+    The two together are the stream plain decode emits."""
+    from types import SimpleNamespace
+
+    from mstar.engine.resources.draft_verify.resource import PLAIN_TOKENS
+
+    sub = toy.ToySubmodule(k=3, proposer=NGRAM, adaptive=True)
+    eng = toy.engine(sub, CPU)
+    eng._graph_runtime = SimpleNamespace(supports_inline_emit=True)
+    drv = toy.Driver(eng, sub)
+    prompt = PROMPTS[0]
+    drv.add(0, prompt, MAX_TOKENS)
+    emitted, kinds = list(drv.emitted[0]), []
+    real = eng.check_stop_for_batch
+
+    def checking(batch, outputs, host_rows=None):
+        stops = real(batch, outputs, host_rows)
+        host = batch.outputs.host_rows
+        inline = host is not None and PLAIN_TOKENS in host.buffers
+        kinds.append((batch.verify_drafts, inline, "new_token" in outputs[0]))
+        emitted.extend(host.buffers[PLAIN_TOKENS].tolist() if inline else outputs[0]["new_token"][0].tolist())
+        return stops
+
+    eng.check_stop_for_batch = checking
+    for _ in range(MAX_TOKENS):
+        out = drv._step("decode", {0: drv.next[0]})
+        drv.next[0] = out[0]["text_inputs"][0]
+        if drv.stops:
+            break
+    assert emitted == toy.reference(prompt, MAX_TOKENS)
+    # a plain step's tokens ride inline, with no tensor; a verify step's are tensors
+    assert {kind for kind in kinds} == {(0, True, False), (3, False, True)}
+
+
 @pytest.mark.parametrize("max_ngram", [1, 3, 6])
 def test_ngram_sizes_and_ignore_eos(max_ngram):
     out, _, _ = _run(3, ignore_eos=True, min_ngram=1, max_ngram=max_ngram)
     assert out == _reference(ignore_eos=True)
 
 
-def test_the_history_is_the_prompt_and_what_was_emitted():
-    out, eng, _ = _run(3)
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_the_history_is_the_prompt_and_what_was_emitted(adaptive):
+    out, eng, _ = _run(3, adaptive=adaptive)
     prop = eng._resources[NGRAM]
     for rid, prompt in enumerate(PROMPTS):
         history = prop._histories[rid].tokens
@@ -275,18 +483,22 @@ def test_an_unknown_proposer_or_a_mismatched_one_refuses_to_load():
         toy.engine(sub, CPU, ngram={"max_drafts": 2})
 
 
-def test_sampled_ngram_streams_follow_the_target(monkeypatch):
+@pytest.mark.parametrize("mode", ["every_step", "adaptive", "no_drafts"])
+def test_sampled_ngram_streams_follow_the_target(monkeypatch, mode):
     """``test_draft_verify_sampled``'s joint check of the two tokens after the prefill's, with
     the n-gram proposer drafting (point-mass drafts) from a prompt that ends in the cycle the
-    toy's greedy streams settle into, so its guesses are often in the target's top k."""
+    toy's greedy streams settle into, so its guesses are often in the target's top k. Adaptive,
+    the first of the two comes from a step of no drafts (a request's first step has no
+    prediction) and the second from a verify step; ``no_drafts`` draws both one at a time."""
     prompt = [3, 9, 12, 40, 17, 37, 40, 17, 37, 40]
     monkeypatch.setattr(sampled, "PROMPT", prompt)
     real = toy.ToySubmodule
+    adaptive = {"every_step": {}, "adaptive": {"adaptive": True}, "no_drafts": {"adaptive": True, "min_gain": 1e9}}
 
     def ngram_sub(**kwargs):
         kwargs.pop("corrupt", None)
         kwargs.pop("sampled_drafts", None)
-        return real(proposer=NGRAM, **kwargs)
+        return real(proposer=NGRAM, **adaptive[mode], **kwargs)
 
     monkeypatch.setattr(toy, "ToySubmodule", ngram_sub)
     n = 1536
@@ -295,4 +507,9 @@ def test_sampled_ngram_streams_follow_the_target(monkeypatch):
     assert sampled._chi2(counts, sampled._expected(t1, n)) > sampled.P_MIN, counts
     rows = sum(eng._resources[toy.DV].rows_verified for eng in engines)
     accepted = sum(eng._resources[toy.DV].drafts_accepted for eng in engines)
-    assert 0 < accepted < 3 * rows
+    plain = sum(eng._resources[toy.DV].rows_plain for eng in engines)
+    if mode == "no_drafts":
+        assert rows == 0 and plain == 2 * n
+    else:
+        assert 0 < accepted < 3 * rows
+        assert plain == (n if mode == "adaptive" else 0)

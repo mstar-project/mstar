@@ -620,13 +620,24 @@ class SamplerResource(Resource):
         (``sampler.verify.chain_verify``) against the target filtered as each request samples;
         ``draft_probs`` ``[n, k, V]`` are the distributions the drafts were drawn from
         (``draft_sample``), and None takes each draft as certain. A greedy row comes out as
-        under the greedy verify.
+        under the greedy verify. A block of no drafts (``[n, 1]``) emits one token a row, as a
+        plain step samples it.
 
         On a lockstep instance every rank keeps rank 0's: each rank rewinds its cache and feeds
         its next step by the verdict, so a draw or an argmax near-tie read apart on two ranks
         would leave their streams apart."""
         n, width = block.shape
-        if self._sampled_verify:
+        if self._sampled_verify and width == 1:
+            # a block of no drafts (an adaptive walk's plain step): one draw from the target,
+            # filtered as the request samples
+            params = self._draw_params(request_ids, logits.device, 1)
+            probs = filtered_probs(
+                logits.reshape(n, -1), params.temperature, params.top_k, params.top_p, params.min_p, params.order,
+            )
+            target = draw(probs, params.seed, params.offset).view(n, 1)
+            accepted = torch.zeros(n, dtype=torch.long, device=target.device)
+            self._advance_in_graph(1)
+        elif self._sampled_verify:
             stride = verify_stride(width - 1)
             params = self._draw_params(request_ids, logits.device, stride)
             rows = params.repeat(width)

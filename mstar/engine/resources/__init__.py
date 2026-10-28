@@ -36,7 +36,9 @@ from mstar.engine.resources.draft_verify.config import (
     DraftPolicy,
     DraftVerifySpec,
     ProposeStep,
+    VerifyKey,
     VerifyStep,
+    verify_captures,
     with_draft_verify,
 )
 from mstar.engine.resources.draft_verify.drafter import Drafter, Drafts, draft_verify_step
@@ -147,11 +149,13 @@ __all__ = [
     "StepContext",
     "StepRunner",
     "SubmoduleStep",
+    "VerifyKey",
     "VerifyStep",
     "apply_yaml_overrides",
     "cross_label",
     "draft_verify_step",
     "resolve_spec_dependencies",
     "topo_sort",
+    "verify_captures",
     "with_draft_verify",
 ]

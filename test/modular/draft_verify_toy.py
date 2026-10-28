@@ -10,7 +10,8 @@ a test controls where verify steps reject; ``oracle``, one request's whole strea
 drafts every token right. With ``sampled_drafts`` the head samples its drafts instead
 (``draft_sample``) and hands verify the distributions they came from. With ``proposer="ngram"``
 the head is unused: the engine's n-gram proposer drafts (``DraftVerifyResource.propose``), from
-the prompts the prefill steps declare.
+the prompts the prefill steps declare; with ``adaptive`` too, a step drafts only when the
+proposer expects its rows to keep ``min_gain`` drafts a row, else runs one token a row.
 
 ``ToyAttention`` is a dense reference over the KV resource's pages for CPU runs; on a GPU the
 toy runs the FlashInfer attention resource, which a graph can capture.
@@ -52,6 +53,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
     draft_verify_step,
+    verify_captures,
     with_draft_verify,
 )
 from mstar.engine.resources.base import AttentionResource, RewindKind
@@ -165,7 +167,7 @@ class ToySubmodule(ARNodeSubmodule):
 
     def __init__(self, k: int = 3, corrupt: int = 0, skew: int = 0, attn_scale: float = 0.6,
                  seed: int = SEED, capture_batch_sizes=(1, 2, 4), sampled_drafts: bool = False,
-                 proposer: str | None = None):
+                 proposer: str | None = None, adaptive: bool = False, min_gain: float = 0.5):
         super().__init__()
         gen = torch.Generator().manual_seed(seed)
         self.embed = nn.Embedding(VOCAB, HIDDEN)
@@ -178,6 +180,7 @@ class ToySubmodule(ARNodeSubmodule):
         self.k, self.corrupt, self.skew = k, corrupt, skew
         self.sampled_drafts = sampled_drafts
         self.proposer = proposer
+        self.adaptive, self.min_gain = adaptive, min_gain
         self.rank = 0
         self.logit_skew = 0.0
         self.oracle: torch.Tensor | None = None
@@ -197,7 +200,10 @@ class ToySubmodule(ARNodeSubmodule):
     def get_draft_policy(self, graph_walk):
         if graph_walk != "decode" or not self.k:
             return None
-        return DraftPolicy(max_drafts=self.k, stop_ids=frozenset({STOP}), proposer=self.proposer)
+        return DraftPolicy(
+            max_drafts=self.k, stop_ids=frozenset({STOP}), proposer=self.proposer,
+            adaptive=self.adaptive, min_gain=self.min_gain,
+        )
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
         ids = inputs["text_inputs"][0].reshape(-1).to(torch.long)
@@ -284,12 +290,13 @@ class ToySubmodule(ARNodeSubmodule):
         n = input_ids.shape[0]
         if graph_walk == "decode" and self.k:
             dv = res[DV]
-            positions = pos[: n * self.block].view(n, self.block)
             rids = list(engine_inputs.request_ids)
             if self.proposer is not None:
-                # an engine-side proposer drafts; the shared step takes its block
-                target = lambda ids: self._skewed(self._trunk(ids, positions.reshape(-1)))  # noqa: E731
+                # an engine-side proposer drafts; the shared step takes its block (under an
+                # adaptive policy, of the step's own width)
+                target = lambda ids: self._skewed(self._trunk(ids, pos[: ids.shape[0]]))  # noqa: E731
                 return BatchedModelOutput(row_outputs={"text_inputs": draft_verify_step(dv, rids, input_ids, target)})
+            positions = pos[: n * self.block].view(n, self.block)
             drafts, draft_probs = self._draft(input_ids, positions, dv, rids)
             block = dv.block_ids(input_ids, dv.agree(drafts))
             logits = self._skewed(self._trunk(block.view(-1), positions.reshape(-1)))
@@ -302,6 +309,15 @@ class ToySubmodule(ARNodeSubmodule):
         return BatchedModelOutput(row_outputs={"new_token": tokens, "text_inputs": tokens})
 
     def get_accelerator_graph_configs(self, device, tp_world_size=1):
+        policy = self.get_draft_policy("decode")
+        if policy is not None:
+            return verify_captures(
+                policy, "decode",
+                lambda block: ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=block,
+                ),
+                self.capture_batch_sizes,
+            )
         return [BatchedAcceleratorGraphConfig(
             capture_graph_walk="decode",
             single_request_inputs=ARNodeInputs(
@@ -433,6 +449,8 @@ class Driver:
         # committed, before anything reads its verdict, on a slot of its own
         self.plan_ahead = plan_ahead
         self.planned_ahead = 0
+        # each decode step's drafts, as the engine chose them (None: the walk always drafts)
+        self.step_drafts: list[int | None] = []
 
     def add(self, rid: int, prompt: list[int], max_tokens: int, ignore_eos: bool = False,
             seed: int = 0, **sampling):
@@ -475,6 +493,8 @@ class Driver:
         outputs = self.eng.exec_and_postprocess(batch)
         assert batch.admit_error is None, batch.admit_error
         self.leases.append(batch.step_context.slot_lease)
+        if walk == "decode":
+            self.step_drafts.append(batch.verify_drafts)
         self.stops = self.eng.check_stop_for_batch(batch, outputs.per_rid_outputs)
         if walk == "decode" and not self.sub.k:
             # plain decode: the toy's own stop, as a model's check_stop would say it

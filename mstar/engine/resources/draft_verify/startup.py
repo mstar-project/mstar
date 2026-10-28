@@ -69,6 +69,10 @@ def verify_walk(
                 f"{where} with {policy.max_drafts} drafts a step, but its proposer "
                 f"{policy.proposer!r} drafts {proposer.max_drafts}"
             )
+        if policy.adaptive and not proposer.predicts:
+            raise ValueError(
+                f"{where} adaptively, but its proposer {policy.proposer!r} predicts nothing to decide a step by"
+            )
     if walk in combined_walks:
         raise ValueError(
             f"{where}, which a combined walk batches with others; a verify row needs a step of its own walk"

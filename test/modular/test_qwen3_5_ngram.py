@@ -20,7 +20,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_qwen3_5_video import write_synthetic_checkpoint  # noqa: E402
 
-from mstar.engine.resources import NGRAM, DraftConfig, DraftVerifySpec, ProposeStep, VerifyStep  # noqa: E402
+from mstar.engine.resources import (  # noqa: E402
+    NGRAM,
+    DraftConfig,
+    DraftVerifySpec,
+    ProposeStep,
+    VerifyKey,
+    VerifyStep,
+)
 from mstar.engine.resources.draft_verify.config import DRAFT_VERIFY  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.qwen3_5.config import ATTN, KV_CACHE, LINEAR_ATTN, LLM_MIXED, SAMPLER  # noqa: E402
@@ -104,3 +111,21 @@ def test_decode_verifies_and_prefill_hands_over_the_prompt():
     history = step.steps[NGRAM]
     assert isinstance(history, ProposeStep) and history.drafts == 0 and history.history[3] is prompt
     assert not step.steps[LINEAR_ATTN].verify
+
+
+def test_an_adaptive_decode_step_runs_a_block_or_one_token():
+    """Prompt lookup decides each decode step (``adaptive``, its default): the engine sets a
+    row's span to the step's block, and a step of one token takes the plain GDN path, keyed to
+    its own capture."""
+    llm = _submodule()
+    assert llm.get_draft_policy("decode").adaptive
+    rows = [ARNodeInputs(input_ids=torch.tensor([t]), input_seq_len=1) for t in (11, 12)]
+    step = llm.declare_step("decode", [0, 1], rows)
+    assert step.steps[DRAFT_VERIFY].drafts == 0 and step.steps[NGRAM].drafts == 0
+    assert not step.steps[LINEAR_ATTN].verify and step.cg_key_info == VerifyKey(0)
+    rows = [ARNodeInputs(input_ids=torch.tensor([t]), input_seq_len=4) for t in (11, 12)]
+    assert llm.declare_step("decode", [0, 1], rows).cg_key_info == VerifyKey(3)
+    configs = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu")) if c.capture_graph_walk == "decode"]
+    assert [(c.single_request_inputs.input_seq_len, c.additional_key_info) for c in configs] == [
+        (1, VerifyKey(0)), (4, VerifyKey(3)),
+    ]

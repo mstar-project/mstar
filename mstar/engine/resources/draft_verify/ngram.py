@@ -16,6 +16,12 @@ n-grams are indexed in a dict, n-gram -> where it last ended, and only when it l
 that follows its stretch needs no lookup, so its tokens wait. Inserting the tokens appended
 since is one ``dict.update`` over tuples built in C, so the work is in the tokens appended, not
 the history; a step's other work is a few list operations per row.
+
+For an adaptive walk the proposer also predicts, at each step's commit, how many drafts a row
+would keep at its next step (``expected_gain``): none without a stretch to draft from, else
+``p + p^2 + .. + p^k`` for ``p`` the rate at which the row's tokens have followed its
+stretches lately (each verify step's kept drafts, and whether a plain step's one token
+continued the stretch the row would have drafted from).
 """
 
 from __future__ import annotations
@@ -41,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 # what a row with no match drafts: any token is safe (the verify keeps what it emits exact)
 _FILLER = 0
+# how much of a row's past follow rate each new step leaves (a weight of 1 / (1 - DECAY) steps)
+_DECAY = 0.8
+# A row whose lookups keep finding nothing looks up less often on steps of no drafts: after
+# its second miss in a row it skips 1 step, then 3, then 7 at most, so a chat row costs a
+# lookup every 8 steps and a copy that starts mid-reply is found within 8 tokens.
+_MAX_SKIP = 7
 
 
 @dataclass
@@ -58,7 +70,7 @@ class NgramSpec(NodeResourceSpec):
 class History:
     """One request's tokens, and where each of its n-grams last ended."""
 
-    __slots__ = ("tokens", "fresh", "follow", "indexed", "ends")
+    __slots__ = ("tokens", "fresh", "follow", "indexed", "ends", "hits", "trials", "predicted", "misses", "skip")
 
     def __init__(self):
         self.tokens: list[int] = []
@@ -71,6 +83,15 @@ class History:
         self.indexed = 0
         # n-gram (of any size) -> the position after its last earlier end
         self.ends: dict[tuple[int, ...], int] = {}
+        # decayed counts of drafts kept (or, on a plain step, of a token that continued the
+        # stretch) and of drafts tried, while the row had a stretch to draft from
+        self.hits = 0.0
+        self.trials = 0.0
+        # the drafts its next step is expected to keep, as of its last commit
+        self.predicted = 0.0
+        # lookups in a row that found nothing, and the steps of no drafts left to skip one on
+        self.misses = 0
+        self.skip = 0
 
 
 class NgramIndex:
@@ -121,16 +142,14 @@ class NgramIndex:
             ))
         history.indexed = end
 
-    def propose(self, history: History) -> list[int] | None:
-        """``k`` drafts, or None when nothing matched. They follow the last earlier end of the
-        longest suffix that has one; past the history's end they repeat the stretch since that
-        end, as a sequence that just repeated would. A fresh row's next input (the prefill's
-        token) isn't in its history yet: its drafts take that token to be the one the match
-        continues with, and follow it."""
-        h = history.tokens
-        length = len(h)
+    def locate(self, history: History) -> int:
+        """Where the row's next token is expected in its history (``history.follow``): the
+        stretch it follows, or the last earlier end of its longest suffix that has one; -1 when
+        nothing matched."""
         best = history.follow
         if best < 0:
+            h = history.tokens
+            length = len(h)
             self._index(history)
             ends = history.ends
             for n in reversed(self.sizes):
@@ -140,8 +159,19 @@ class NgramIndex:
                         best = found
                         break
             history.follow = best
+        return best
+
+    def propose(self, history: History) -> list[int] | None:
+        """``k`` drafts, or None when nothing matched. They follow the last earlier end of the
+        longest suffix that has one; past the history's end they repeat the stretch since that
+        end, as a sequence that just repeated would. A fresh row's next input (the prefill's
+        token) isn't in its history yet: its drafts take that token to be the one the match
+        continues with, and follow it."""
+        best = self.locate(history)
         if best < 0:
             return None
+        h = history.tokens
+        length = len(h)
         skip = 1 if history.fresh else 0
         if best + skip + self.k <= length:
             return h[best + skip:best + skip + self.k]
@@ -155,6 +185,14 @@ class _Pending(NamedTuple):
     event: torch.Event | None
 
 
+def expected_kept(history: History, k: int) -> float:
+    """The drafts of ``k`` a row with a stretch to draft from is expected to keep: each one
+    kept with the row's follow rate (Laplace-smoothed, so a row with no record keeps about one)
+    given the ones before it were."""
+    p = (history.hits + 1.0) / (history.trials + 2.0)
+    return p * (1.0 - p ** k) / (1.0 - p)
+
+
 class NgramProposer(DraftProposer):
     """``NgramIndex`` behind the resource lifecycle: a ``History`` per request handle, the
     prompts copied to the host at the prefill's commit, the verdicts noted by ``observe``, and
@@ -162,6 +200,9 @@ class NgramProposer(DraftProposer):
     the next step's plan never writes the buffer a replay in flight reads).
 
     The maps are keyed by the worker's request handle and cleared at ingest and removal."""
+
+    # its lookups say whether a row has drafts at all, and its verdicts how many stick
+    predicts = True
 
     def __init__(self, device: torch.device, max_drafts: int, min_ngram: int, max_ngram: int):
         self._device = torch.device(device)
@@ -179,6 +220,8 @@ class NgramProposer(DraftProposer):
         self._buffers: dict[tuple, torch.Tensor] = {}
         self._cg_rows = 0
         self._current: torch.Tensor | None = None
+        # rows -> the drafts of a step that runs none
+        self._no_drafts: dict[int, torch.Tensor] = {}
         # a pre-plan's drafts, staged for the step it was planned for: (key, drafts)
         self._staged: tuple[tuple, torch.Tensor] | None = None
         self.rows_proposed = 0
@@ -224,8 +267,8 @@ class NgramProposer(DraftProposer):
                 self._verdicts.setdefault(rid, []).append(row)
 
     def _take_in(self, history: History, rid: int) -> None:
-        """Append the request's prompt and the verdicts that came in since its last step.
-        Under the lock."""
+        """Append the request's prompt and the verdicts that came in since its last step, and
+        count how far each followed the stretch the row had then. Under the lock."""
         for pending in self._prompts.pop(rid, ()):
             if pending.event is not None:
                 pending.event.synchronize()  # copied behind the prefill, which has run
@@ -233,8 +276,17 @@ class NgramProposer(DraftProposer):
         for verdict in self._verdicts.pop(rid, ()):
             # [accepted, input, t_0 .. t_k]: it emitted t_0 .. t_accepted; a fresh row takes in
             # its input too (the prefill's token)
-            self._index.extend(history, verdict[1 if history.fresh else 2:3 + int(verdict[0])].tolist())
+            accepted = int(verdict[0])
+            drafts = len(verdict) - 3
+            following = history.follow >= 0
+            self._index.extend(history, verdict[1 if history.fresh else 2:3 + accepted].tolist())
             history.fresh = False
+            if following:
+                # a verify step tried its drafts until one failed; a plain step's token tried
+                # the stretch's next one
+                kept = accepted if drafts else float(history.follow >= 0)
+                history.hits = _DECAY * history.hits + kept
+                history.trials = _DECAY * history.trials + kept + (kept < max(drafts, 1))
 
     # step
 
@@ -261,6 +313,13 @@ class NgramProposer(DraftProposer):
 
     def plan(self, step: ProposeStep, ctx: StepContext) -> None:
         if not step.drafts:
+            if step.verify and not ctx.is_preplan:
+                # an adaptive walk's plain step: a block of no drafts
+                rows = len(ctx.padded_request_ids)
+                empty = self._no_drafts.get(rows)
+                if empty is None:
+                    empty = self._no_drafts[rows] = torch.empty(rows, 0, dtype=torch.int64, device=self._device)
+                self._current = empty
             return  # a step that adds history does so at its commit
         if step.drafts != self.max_drafts:
             raise ValueError(f"a verify step of {step.drafts} drafts from an n-gram proposer of {self.max_drafts}")
@@ -340,6 +399,42 @@ class NgramProposer(DraftProposer):
                     event.record(torch.accelerator.current_stream(ids.device))
                     pending = _Pending(host, event)
                 self._prompts.setdefault(rid, []).append(pending)
+
+    def predict(self, request_ids: Sequence[int], drafts: int) -> None:
+        """At a verify-walk step's commit: each row's expected kept drafts for its next step.
+        A step that drafted looked its rows up in its plan, from every verdict before it; a step
+        of no drafts takes those verdicts in and looks up now. The next step's drafts are
+        decided from these, so they change only here."""
+        k = self.max_drafts
+        with self._lock:
+            histories, waiting = self._histories, self._prompts or self._verdicts
+            for rid in request_ids:
+                history = histories.get(rid)
+                if history is None:
+                    continue
+                if not drafts:
+                    if history.skip:
+                        # no stretch, and none found lately: its verdicts wait for a later lookup
+                        history.skip -= 1
+                        history.predicted = 0.0
+                        continue
+                    if waiting:
+                        self._take_in(history, rid)
+                    if self._index.locate(history) < 0:
+                        history.misses += 1
+                        history.skip = min((1 << history.misses >> 1) - 1, _MAX_SKIP)
+                    else:
+                        history.misses = 0
+                elif history.follow >= 0:
+                    # a verify step's lookup found a stretch
+                    history.misses = history.skip = 0
+                history.predicted = expected_kept(history, k) if history.follow >= 0 else 0.0
+
+    def expected_gain(self, request_ids: Sequence[int]) -> float:
+        """The drafts these rows are expected to keep at their next step, summed."""
+        with self._lock:
+            histories = self._histories
+            return sum(h.predicted for rid in request_ids if (h := histories.get(rid)) is not None)
 
     # forward side
 

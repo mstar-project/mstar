@@ -7,7 +7,8 @@ must equal the same steps run eager and plain greedy decode, the padding rows mu
 verdict behind, and the KV must stay inside its layout. At temperature > 0 (a sampled verify,
 drafts the head's argmax or sampled), the replayed streams must equal the eager ones drawn
 from the same seeds. With the n-gram proposer drafting, the drafts it stages per capture slot
-replay as the eager steps' do. Skips without CUDA.
+replay as the eager steps' do; adaptive, its steps of no drafts replay their own captures
+beside the verify steps', on the same slots. Skips without CUDA.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import draft_verify_toy as toy  # noqa: E402
 
+from mstar.engine.resources import VerifyKey  # noqa: E402
 from mstar.engine.resources.kv import manager as kv_manager  # noqa: E402
 
 GPU = torch.device("cuda", 0)
@@ -34,12 +36,15 @@ MAX_TOKENS = 20
 
 
 def _run(k: int, corrupt: int, captured: bool, prompts=PROMPTS, batched=True, sampled: str | None = None,
-         proposer: str | None = None):
+         proposer: str | None = None, adaptive: bool = False, min_gain: float = 0.5):
     """``sampled``: None decodes greedily; "argmax" or "sampled" (the drafter) verifies at
     temperature 0.8, top-k 8, each request its own seed. The prefill's token is then the
     argmax, so it draws nothing: the eager and the captured verify start from the same RNG
     offsets (main keeps an eager draw's offsets apart from the slot masters a replay reads)."""
-    sub = toy.ToySubmodule(k=k, corrupt=corrupt, sampled_drafts=sampled == "sampled", proposer=proposer)
+    sub = toy.ToySubmodule(
+        k=k, corrupt=corrupt, sampled_drafts=sampled == "sampled", proposer=proposer, adaptive=adaptive,
+        min_gain=min_gain,
+    )
     # an fp32 trunk over an fp16 KV, which FlashInfer needs: the toy's margins hold there
     eng = toy.engine(
         sub, GPU, attn="flashinfer", warmup=captured, dtype=torch.float32, kv_dtype=torch.float16,
@@ -134,3 +139,37 @@ def test_one_request_replays_in_the_bucket_of_one(plain):
     out, _, drv = _run(3, 2, captured=True, prompts=PROMPTS[:1])
     assert all(lease is not None and lease.bucket.bs == 1 for lease in drv.leases[1:])
     assert out[0] == plain[0]
+
+
+# a repeating prompt, which the lookup drafts from, one too short to, and one that doesn't repeat
+ADAPTIVE_PROMPTS = [[3, 9, 12, 40, 7, 3, 9, 12, 40], [5, 11], [44, 1, 30, 2, 61, 17]]
+
+
+@pytest.mark.parametrize("sampled", [None, "argmax"], ids=["greedy", "sampled"])
+def test_adaptive_steps_replay_both_blocks(sampled, monkeypatch):
+    monkeypatch.setattr(kv_manager, "_DEBUG_ASSERTS", True)
+    # sampled replies repeat less: any expected gain drafts (a request's first step has none)
+    min_gain = 0.5 if sampled is None else 1e-6
+    out, eng, drv = _run(3, 0, captured=True, prompts=ADAPTIVE_PROMPTS, sampled=sampled, proposer="ngram",
+                         adaptive=True, min_gain=min_gain)
+    decode_leases = drv.leases[len(ADAPTIVE_PROMPTS):]
+    assert decode_leases and all(lease is not None for lease in decode_leases), "a decode step ran eager"
+    # both blocks replayed, each from its own capture: a step of no drafts, then verify steps
+    assert {lease.bucket.cg_key_info for lease in decode_leases} == {VerifyKey(0), VerifyKey(3)}
+    for lease, drafts in zip(decode_leases, drv.step_drafts, strict=True):
+        assert lease.bucket.cg_key_info == VerifyKey(drafts)
+        assert lease.bucket.num_tokens == lease.bucket.bs * (drafts + 1)
+    eager, eager_eng, eager_drv = _run(3, 0, captured=False, prompts=ADAPTIVE_PROMPTS, sampled=sampled,
+                                       proposer="ngram", adaptive=True, min_gain=min_gain)
+    assert out == eager and drv.step_drafts == eager_drv.step_drafts
+    if sampled is None:
+        assert out == {rid: toy.reference(prompt, MAX_TOKENS) for rid, prompt in enumerate(ADAPTIVE_PROMPTS)}
+    dv = eng._resources[toy.DV]
+    assert dv.steps_plain > 0 and dv.rows_verified > 0
+    assert (dv.drafts_accepted > 0) or sampled
+    assert dv.drafts_accepted == eager_eng._resources[toy.DV].drafts_accepted
+    assert all(rid >= 0 for rid in dv._pending) and all(rid >= 0 for rid in dv._settled)
+    kv = eng._resources[toy.KV]
+    for rid in out:
+        stream = kv._streams[rid]["main"]
+        assert len(stream.page_indices) <= stream.footprint

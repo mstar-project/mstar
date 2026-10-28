@@ -1,6 +1,7 @@
 """The draft-verify resource on its own: a verify step's verdict from the forward's staging to
 the rewinds and the emitted tokens, the slots its mirrors live in, the greedy verify, the
-runner's rewind hook, and the declarations a walk makes."""
+runner's rewind hook, and the declarations a walk makes; an adaptive walk's steps of no drafts
+and the choice between the two."""
 
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from mstar.engine.resources import (
     with_draft_verify,
 )
 from mstar.engine.resources.base import RewindKind
-from mstar.engine.resources.draft_verify.config import VerdictBatch
+from mstar.engine.resources.draft_verify.config import VerdictBatch, VerifyKey, verify_captures
 from mstar.engine.resources.draft_verify.resource import DraftVerifyResource
 from mstar.engine.resources.draft_verify.startup import verify_walk
 from mstar.engine.resources.kv import manager as kv_manager
@@ -34,10 +35,12 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import BucketKey, SlotLease
+from mstar.model.submodule_base import ARNodeInputs
 
 K = 3
 CPU = torch.device("cpu")
 POLICY = DraftPolicy(max_drafts=K, stop_ids=frozenset({9}))
+ADAPTIVE = DraftPolicy(max_drafts=K, stop_ids=frozenset({9}), proposer="ngram", adaptive=True)
 
 
 class _Sampler:
@@ -55,6 +58,28 @@ def _resource():
     sampler = _Sampler()
     res.bind_sampler(sampler)
     return res, sampler
+
+
+class _Proposer:
+    """Records what the draft-verify resource hands an engine-side proposer; predicts what a
+    test sets."""
+
+    predicts = True
+    max_drafts = K
+
+    def __init__(self):
+        self.observed: list[tuple[int, list[int]]] = []
+        self.predicted: list[tuple[list[int], int]] = []
+        self.gain: dict[int, float] = {}
+
+    def observe(self, rid, row):
+        self.observed.append((rid, row.tolist()))
+
+    def predict(self, request_ids, drafts):
+        self.predicted.append((list(request_ids), drafts))
+
+    def expected_gain(self, request_ids):
+        return sum(self.gain.get(rid, 0.0) for rid in request_ids)
 
 
 def _ctx(rids, padded=None, slot=None, capture=False):
@@ -146,7 +171,7 @@ def test_an_overwritten_verdict_is_an_error():
     res, sampler = _resource()
     res.ingest_request(1)
     _verify_step(res, sampler, [1], accepted=[0], slot=0)
-    res._mirrors[0].seq_np[0] += 1
+    res._mirrors[(0, K + 3)].seq_np[0] += 1
     with pytest.raises(RuntimeError, match="overwritten"):
         res.settle([1])
 
@@ -278,6 +303,158 @@ def test_one_step_per_request_emits_in_the_batch_order():
         res.commit(step, ctx)
     rows = res.emitted_rows([0, 1], [10, 10], [False, False], POLICY)
     assert rows.tokens.tolist() == [3, 3, 7, 7]
+
+
+# ── an adaptive walk's steps of no drafts ──
+
+
+def test_a_step_of_no_drafts_is_counted_at_commit_and_read_at_the_stop_check():
+    res, sampler = _resource()
+    for rid in (0, 1, 2):
+        res.ingest_request(rid)
+    _verify_step(res, sampler, [0, 1, 2], accepted=[0, 0, 0], tokens=[[4], [9], [6]], drafts=0)
+    assert res.ran_plain()
+    # counted without its tokens: one a row; row 2 reaches its max_tokens of 2 (the prefill
+    # emitted one)
+    plain = res.count_plain([0, 1, 2], [10, 10, 2], ADAPTIVE)
+    assert plain.counts.tolist() == [1, 1, 1] and plain.capped.tolist() == [False, False, True]
+    # nothing for a rewind to wait for, so nothing read yet
+    assert res.settle([0, 1, 2]) is None
+    assert set(res._pending) == {0, 1, 2}
+    # the tokens the worker inlines to the client, off the mirror the forward filled
+    assert res.plain_tokens(plain).tolist() == [4, 9, 6]
+    rows = res.plain_rows(plain, [False, False, False], ADAPTIVE)
+    assert rows.tokens.tolist() == [4, 9, 6] and rows.counts.tolist() == [1, 1, 1]
+    # 9 is a stop id
+    assert rows.done.tolist() == [False, True, True]
+    assert res.stats().endswith("0 verify steps, 1 steps of no drafts (3 rows)")
+    # the counts carry over to the rows' next step: row 1 has 2 of 2 now
+    _verify_step(res, sampler, [1], accepted=[0], tokens=[[7]], drafts=0)
+    plain = res.count_plain([1], [2], ADAPTIVE)
+    assert plain.counts.tolist() == [0] and plain.capped.tolist() == [True]
+    assert res.plain_rows(plain, [False], ADAPTIVE).tokens.tolist() == []
+
+
+def test_a_step_of_no_drafts_after_a_stop_emits_nothing():
+    res, sampler = _resource()
+    for rid in (0, 1):
+        res.ingest_request(rid)
+    ctx = _ctx([0, 1])
+    step = VerifyStep(segments=(Segment(0, "main", 1), Segment(1, "main", 1)), drafts=0)
+    res.plan(step, ctx)
+    sampler.next = (torch.tensor([[4], [5]]), torch.tensor([0, 0]))
+    # both rows' input is the stop id: the reply ended a step earlier, unless it ignores eos
+    res.verify([0, 1], torch.tensor([[9], [9]]), torch.zeros(2, 4))
+    res.commit(step, ctx)
+    rows = res.plain_rows(res.count_plain([0, 1], [10, 10], ADAPTIVE), [False, True], ADAPTIVE)
+    assert rows.counts.tolist() == [0, 1] and rows.done.tolist() == [True, False]
+
+
+def test_a_plain_steps_verdict_is_read_at_the_rows_next_commit():
+    """Nothing reads a step of no drafts' verdict for a rewind, so the rows' next commit does,
+    behind the forward it just launched, before its own takes its place: the proposer has every
+    verdict before a step when it predicts from it."""
+    res, sampler = _resource()
+    prop = _Proposer()
+    res.bind_proposer(prop)
+    for rid in (0, 1):
+        res.ingest_request(rid)
+    _verify_step(res, sampler, [0, 1], accepted=[0, 0], tokens=[[4], [6]], drafts=0)
+    assert prop.observed == [] and prop.predicted == [([0, 1], 0)]
+    _verify_step(res, sampler, [0, 1], accepted=[2, 0], drafts=K)
+    # [accepted, input, t_0]: the block's input was 5
+    assert prop.observed == [(0, [0, 5, 4]), (1, [0, 5, 6])]
+    assert prop.predicted[-1] == ([0, 1], K)
+    # a verify step's verdict waits for the rewind; a request verified again before it is a bug
+    assert res.settle([0, 1]) == VerdictBatch([0, 1], ["main", "main"], [1, 3])
+    _verify_step(res, sampler, [0], accepted=[0], drafts=K)
+    with pytest.raises(RuntimeError, match="before its last verdict was rewound"):
+        _verify_step(res, sampler, [0], accepted=[0], drafts=0)
+
+
+def test_the_two_blocks_keep_their_own_mirrors():
+    """Both blocks of an adaptive walk replay on the same capture slots, each graph reading its
+    own verdict rows in place."""
+    res, sampler = _resource()
+    res.build_accelerator_graph_buffers([], max_bs=2, max_seq_len=64)
+    for rid in (1, 2):
+        res.ingest_request(rid)
+    _verify_step(res, sampler, [1, 2], accepted=[1, 2], slot=0)
+    res.settle([1, 2])
+    _verify_step(res, sampler, [1, 2], accepted=[0, 0], slot=0, drafts=0, tokens=[[3], [4]])
+    assert set(res._mirrors) == {(0, K + 3), (0, 3)}
+    assert res._mirrors[(0, 3)].width == 3 and res._mirrors[(0, K + 3)].width == K + 3
+
+
+def test_an_adaptive_step_drafts_when_its_rows_should_keep_enough():
+    res, _ = _resource()
+    prop = _Proposer()
+    res.bind_proposer(prop)
+    prop.gain = {0: 2.0}
+    assert res.choose_drafts([0], ADAPTIVE) == K
+    # 2.0 kept across four rows pays min_gain 0.5 a row; across five it doesn't
+    assert res.choose_drafts([0, 1, 2, 3], ADAPTIVE) == K
+    assert res.choose_drafts([0, 1, 2, 3, 4], ADAPTIVE) == 0
+    assert res.choose_drafts([1, 2], ADAPTIVE) == 0
+    # a walk that always drafts doesn't ask
+    assert res.choose_drafts([1], POLICY) == K
+
+
+def test_an_adaptive_walk_verifies_a_block_or_runs_one_token():
+    def step(*spans):
+        return SubmoduleStep(
+            steps={"kv": KVStep(), "lin": LinearAttnStep()},
+            segments=[Segment(rid, "main", span) for rid, span in enumerate(spans)],
+        )
+
+    one = with_draft_verify(step(1, 1), ADAPTIVE, "dv")
+    assert one.get("dv").drafts == 0 and one.cg_key_info == VerifyKey(0)
+    # the plain paths: no host write slots, no state left for a settle
+    assert not one.get("kv").verify and not one.get("lin").verify
+    assert one.get("ngram").drafts == 0 and one.get("ngram").verify and one.get("sampler").verify
+    full = with_draft_verify(step(K + 1, K + 1), ADAPTIVE, "dv")
+    assert full.get("dv").drafts == K and full.cg_key_info == VerifyKey(K) and full.get("lin").verify
+    for spans in ((2, 2), (1, K + 1)):
+        with pytest.raises(ValueError, match="span one block"):
+            with_draft_verify(step(*spans), ADAPTIVE, "dv")
+    # a walk that always drafts runs no step of one token, and keeps its one capture
+    with pytest.raises(ValueError, match="span one block"):
+        with_draft_verify(step(1), POLICY, "dv")
+    assert with_draft_verify(step(K + 1), POLICY, "dv").cg_key_info is None
+    keyed = SubmoduleStep(steps={"kv": KVStep()}, segments=[Segment(0, "main", 1)], cg_key_info="cfg")
+    with pytest.raises(ValueError, match="capture key is the engine's"):
+        with_draft_verify(keyed, ADAPTIVE, "dv")
+
+    def row(block):
+        return ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=block)
+
+    configs = verify_captures(ADAPTIVE, "decode", row, [1, 2])
+    assert [(c.single_request_inputs.input_seq_len, c.additional_key_info) for c in configs] == [
+        (1, VerifyKey(0)), (K + 1, VerifyKey(K)),
+    ]
+    assert [c.additional_key_info for c in verify_captures(POLICY, "decode", row, [1])] == [None]
+    with pytest.raises(ValueError, match="needs an engine-side proposer"):
+        DraftPolicy(max_drafts=K, adaptive=True)
+
+
+def test_an_adaptive_walk_needs_a_proposer_that_predicts():
+    from mstar.engine.resources.draft_verify.ngram import NgramProposer
+
+    class Sub:
+        def get_draft_policy(self, walk):
+            return ADAPTIVE
+
+        def device_loopback_signals(self, walk):
+            return frozenset()
+
+    dv = DraftVerifyResource(CPU)
+    sampler = SamplerResource(vocab_size=8, enable_repetion_penalty=False, device=CPU, draft_verify=True)
+    prop = NgramProposer(CPU, max_drafts=K, min_ngram=2, max_ngram=3)
+    resources = {"draft_verify": dv, "sampler": sampler, "ngram": prop}
+    assert verify_walk("llm", Sub(), resources, "decode").policy is ADAPTIVE
+    prop.predicts = False
+    with pytest.raises(ValueError, match="predicts nothing"):
+        verify_walk("llm", Sub(), resources, "decode")
 
 
 def test_greedy_verify_accepts_the_leading_drafts_the_target_agrees_with():

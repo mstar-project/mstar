@@ -8,7 +8,9 @@ they keep rank 0's drafts (``agree``) and rank 0's verdict (the sampler's ``veri
 either, the ranks come apart, which shows the test can tell. The same holds at temperature
 > 0, with drafts sampled from distributions rank 1 reads differently: each rank draws its own
 verdict, and rank 0's is the one kept. With the n-gram proposer drafting instead, each rank
-looks drafts up in a history it builds from the same verdicts, so the ranks draft alike.
+looks drafts up in a history it builds from the same verdicts, so the ranks draft alike; and
+adaptive, each rank chooses every step's drafts alike (a step of no drafts or a verify block),
+from predictions it makes from those verdicts at the same commits, so their collectives match.
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ import draft_verify_toy as toy  # noqa: E402
 from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
 
 PROMPTS = [[3, 9, 12, 40], [5, 11], [20, 21, 22, 23, 24, 25]]
+# repeating prompts, which the n-gram proposer drafts from, and one that doesn't repeat
+FRESH = [[3, 9, 12, 40, 7, 3, 9, 12, 40], [44, 1, 30, 2, 61, 17]]
 WORLD = 2
 
 
@@ -54,8 +58,8 @@ def _entry(rank, store, out, mode):
 def _run(rank: int, mode: str) -> dict:
     cpu = torch.device("cpu")
     sampled = mode.startswith("sampled")
-    if mode == "ngram":
-        sub = toy.ToySubmodule(k=3, proposer="ngram")
+    if mode.startswith("ngram"):
+        sub = toy.ToySubmodule(k=3, proposer="ngram", adaptive=mode == "ngram_adaptive")
     elif sampled:
         # rank 1 reads both the draft head's logits and the target's differently, so it draws
         # other drafts from other distributions, and verifies them differently
@@ -71,10 +75,11 @@ def _run(rank: int, mode: str) -> dict:
     elif mode in ("no_verdict_broadcast", "sampled_no_verdict_broadcast"):
         eng._resources[toy.SAMPLER]._comm_group = None
     drv = toy.Driver(eng, sub)
-    rids = list(range(len(PROMPTS)))
-    stopping = mode in ("both", "sampled", "ngram")
+    stopping = mode in ("both", "sampled", "ngram", "ngram_adaptive")
     sampling = {"temperature": 0.9, "top_k": 12} if sampled else {}
-    for rid, prompt in enumerate(PROMPTS):
+    prompts = PROMPTS + FRESH if mode == "ngram_adaptive" else PROMPTS
+    rids = list(range(len(prompts)))
+    for rid, prompt in enumerate(prompts):
         drv.add(rid, prompt, 16, ignore_eos=not stopping, seed=7 + rid, **sampling)
     lengths = []
     if stopping:
@@ -102,8 +107,11 @@ def _run(rank: int, mode: str) -> dict:
             kv.layer_view(layer)[pages].transpose(0, 1).reshape(2, -1, toy.HEADS, toy.HEAD_DIM)[:, :stream.stored_len]
             for layer in range(toy.LAYERS)
         ])
-    out = {"emitted": dict(drv.emitted), "lengths": lengths, "rows": rows, "accepted": dv.drafts_accepted}
-    if mode == "ngram":
+    out = {
+        "emitted": dict(drv.emitted), "lengths": lengths, "rows": rows, "accepted": dv.drafts_accepted,
+        "step_drafts": list(drv.step_drafts),
+    }
+    if mode.startswith("ngram"):
         prop = eng._resources["ngram"]
         out["history"] = {rid: list(prop._histories[rid].tokens) for rid in rids}
     return out
@@ -138,6 +146,18 @@ def test_ngram_ranks_draft_alike_from_the_same_verdicts(tmp_path):
     assert _rows_equal(r0["rows"], r1["rows"])
     assert r0["history"] == r1["history"]
     assert r0["accepted"] == r1["accepted"] > 0
+
+
+def test_adaptive_ranks_choose_every_steps_drafts_alike(tmp_path):
+    r0, r1 = _both(tmp_path, "ngram_adaptive")
+    prompts = PROMPTS + FRESH
+    ref = {rid: toy.reference(prompt, 16) for rid, prompt in enumerate(prompts)}
+    assert r0["emitted"] == r1["emitted"] == ref
+    assert r0["step_drafts"] == r1["step_drafts"]
+    assert set(r0["step_drafts"]) == {0, 3}, r0["step_drafts"]
+    assert r0["lengths"] == r1["lengths"]
+    assert _rows_equal(r0["rows"], r1["rows"])
+    assert r0["history"] == r1["history"]
 
 
 def test_at_temperature_the_ranks_keep_rank_zeros_sampled_verdicts(tmp_path):

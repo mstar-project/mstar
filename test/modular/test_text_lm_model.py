@@ -260,6 +260,11 @@ def test_prompt_lookup_drafting_declares_a_verifying_node(tmp_path):
     assert step.steps["draft_verify"].drafts == 3 and step.steps[NGRAM].drafts == 3
     prefill = sub.declare_step(PREFILL_WALK, ["a"], [ARNodeInputs(input_seq_len=3, input_ids=torch.arange(3))])
     assert set(prefill.steps[NGRAM].history) == {"a"} and not prefill.steps[SAMPLER].apply_penalty
+    # adaptive by default: decode is captured at both blocks, and a step of one token drafts nothing
+    decode = [c for c in sub.get_accelerator_graph_configs(torch.device("cpu")) if c.capture_graph_walk == DECODE_WALK]
+    assert [c.single_request_inputs.input_seq_len for c in decode] == [1, 4]
+    row.input_seq_len = 1
+    assert sub.declare_step(DECODE_WALK, ["a"], [row]).steps["draft_verify"].drafts == 0
 
 
 def test_a_draft_model_declares_its_own_resources_and_layout(tmp_path):

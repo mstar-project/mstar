@@ -1,8 +1,9 @@
 # qwen3_5_0.8b.yaml with prompt-lookup speculative decoding: each decode step runs the last
 # token and up to `max_drafts` tokens copied from the request's own prompt and reply, and keeps
 # the ones the model agrees with (exact: greedy and sampled output are unchanged). Pays where
-# replies repeat their prompt (code edits, refactors, summaries); costs where they don't (chat
-# runs at about 0.5-0.7x plain decode). Off: drop `draft`.
+# replies repeat their prompt (code edits, refactors, summaries); elsewhere a step drafts only
+# when its rows should keep enough (`adaptive`), and chat runs at 0.8-1.0x plain decode on this
+# size (level on 4B). Off: drop `draft`.
 model: "qwen3_5_0.8b"
 max_seq_len: 32768
 node_groups:
@@ -22,6 +23,10 @@ model_kwargs:
     # serve temperature > 0 by rejection sampling; false serves temperature 0 only, and
     # saves filtering every row of each block
     sampled_verify: true
+    # a step drafts only when its rows are expected to keep min_gain drafts each, else runs
+    # one token a row; min_gain is a number or [rows, gain] points (default 0.5 at 1 row,
+    # 1.0 at 32)
+    adaptive: true
 
 warmup_requests:
   - text: What is in this image?

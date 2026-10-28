@@ -33,6 +33,9 @@ class DraftProposer(Resource):
 
     # the drafts a row takes from it, which the walk's policy asks for
     max_drafts: int
+    # it predicts what a row's next step keeps (`predict`, `expected_gain`), so an adaptive
+    # walk (``DraftPolicy.adaptive``) can draft with it
+    predicts: bool = False
     # the node's draft-verify resource, which hands it the verdicts; bound by the engine at load
     _verifier: DraftVerifyResource | None = None
 
@@ -46,6 +49,19 @@ class DraftProposer(Resource):
         block, so the request emitted ``t_0 .. t_accepted``. Called once per verdict, on the
         thread that read it (plan thread or gpu thread), under the draft-verify resource's
         lock: no more than a note to take it in at the next plan."""
+
+    def predict(self, request_ids: Sequence[int], drafts: int) -> None:
+        """At the commit of a step of these rows (``drafts`` each, 0 for a step that drafted
+        nothing), on the gpu thread, after every verdict before the step was handed to
+        ``observe``: note what each row's next step is expected to keep, for
+        ``expected_gain``. Only a proposer that ``predicts`` is asked."""
+        del request_ids, drafts
+
+    def expected_gain(self, request_ids: Sequence[int]) -> float:
+        """The drafts these rows' next step is expected to keep, summed, as of their last
+        ``predict``: what ``DraftVerifyResource.choose_drafts`` weighs against the policy's
+        ``min_gain``."""
+        raise NotImplementedError(f"{type(self).__name__} predicts nothing")
 
     @abstractmethod
     def propose(self, request_ids: Sequence[int], rows: int) -> tuple[torch.Tensor, torch.Tensor | None]:

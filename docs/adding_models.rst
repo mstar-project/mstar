@@ -1353,7 +1353,8 @@ out of every resource, the tokens each request emits, and the stop.
   once per walk, when the engine loads the node.
 - ``prepare_inputs`` gives a decode row ``input_seq_len = policy.block`` (``k + 1``) and
   one input id, the last emitted token. The capture config does the same, so a decode
-  bucket holds ``block`` tokens per row.
+  bucket holds ``block`` tokens per row: ``verify_captures(policy, walk, make_row,
+  capture_batch_sizes)`` builds it (``make_row(block)`` is a template row of that span).
 - ``declare_step`` wraps the decode step in ``with_draft_verify(step, policy)``, which adds
   the ``VerifyStep`` and the sampler's step (``sampler=`` names the sampler, ``"sampler"``
   by default). The model declares no ``SamplerStep`` on a verify step.
@@ -1424,8 +1425,30 @@ logits) and ``verify``; it returns the next step's inputs.
   rows, so the verdict takes back the same rows from both. Each of the ``k`` draft passes
   runs the whole block under the step's one causal attention plan and reads its own row.
 
+An engine-side proposer that predicts what its drafts will keep (the n-gram proposer does)
+lets a walk draft only when that pays: ``DraftPolicy(adaptive=True, min_gain=...)``. The
+engine chooses each step's drafts before the step is declared, from the proposer's
+predictions for its rows (``DraftProposer.expected_gain``): ``max_drafts`` when the rows are
+expected to keep at least ``min_gain`` drafts a row (what a verify row costs over a row of one
+token, in tokens; a number, or ``(rows, gain)`` points interpolated by the step's rows, since
+the block costs more as the batch grows), else none, a step of one token a row. It sets each row's
+``input_seq_len`` to the chosen block, and ``verify_captures`` captures both blocks per
+bucket, keyed by ``VerifyKey(drafts)`` (``policy.capture_key``); ``with_draft_verify``
+derives the drafts from the rows' span and declares a step of none on the plain paths (no
+``verify`` set on the other steps, nothing for a settle). The forward is the same code: the
+block is ``[n, 1]`` and the verdict keeps the target's token. The predictions move only at a
+step's commit (``DraftProposer.predict``), so the plan thread and the gpu thread, and every
+rank of a lockstep instance, choose alike. A step of no drafts rejects nothing, so no rewind
+waits for its verdict: the engine counts its tokens at the commit, emits them at the stop
+check, once the worker has waited for the step, and the row's next commit hands the verdict
+to the proposer; the gpu thread launches the next step while it runs, as plain decode does.
+Its tokens go to the client inline off host rows its forward filled, under a graph runtime
+that sends a client signal inline.
+
 ``DraftConfig.from_kwargs(model_kwargs["draft"])`` reads a deployment's ``draft:`` settings
-for either (``method: ngram``, or ``method: draft_model`` with the drafter's ``model``), and
+for either (``method: ngram``, adaptive unless ``adaptive: false``, its ``min_gain`` by default
+0.5 a row at one row rising to 1.0 at 32; or ``method: draft_model`` with the drafter's
+``model``, which drafts every step), and
 its ``policy`` and ``resources`` give the walk's policy and the specs to declare; read the
 layouts' lookahead off ``policy().lookahead`` rather than repeating its formula. The toys in
 ``test/modular/draft_verify_toy.py`` (both kinds) and ``draft_model_toy.py`` are the CPU

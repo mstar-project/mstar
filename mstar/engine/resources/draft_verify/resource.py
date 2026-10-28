@@ -18,6 +18,11 @@ resource carries it across:
 - ``emitted_rows``, from the engine after the commit, cuts each row's tokens at a stop id and
   at ``max_tokens`` and says which rows stop.
 
+A step of no drafts (an adaptive walk's plain step, ``choose_drafts``) keeps every row it
+runs, so nothing waits for its verdict: ``count_plain`` counts its tokens on the gpu thread
+without them, ``plain_rows`` reads them at the stop check, once the step has landed, and the
+request's next step reads the verdict at its commit, behind the forward it just launched.
+
 The maps are keyed by the worker's request handle; ``ingest_request`` and ``remove_request``
 clear them.
 """
@@ -51,6 +56,8 @@ WAIT_TIMEOUT_S = 120.0
 _LOG_EVERY = 4096
 # `_harvest`'s "every slot" default
 _ANY_SLOT = object()
+# the host rows a step of no drafts hands the worker (``plain_tokens``): its token per row
+PLAIN_TOKENS = "__verify_plain_tokens__"
 
 
 class VerdictTensors(NamedTuple):
@@ -58,6 +65,14 @@ class VerdictTensors(NamedTuple):
     tokens: torch.Tensor  # [n, k + 1]: the target's token at each row of the block
     accepted: torch.Tensor  # [n]: leading drafts equal to it; a row emits tokens[:accepted + 1]
     next_inputs: torch.Tensor  # [n, 1]: tokens[accepted], the next step's input
+
+
+class PlainStep(NamedTuple):
+    """A step of no drafts, counted at its commit (``count_plain``), its tokens still to read."""
+    steps: list
+    request_ids: tuple[int, ...]
+    counts: np.ndarray  # the token each row emits, or none past its max_tokens
+    capped: np.ndarray  # the row reached its max_tokens
 
 
 class EmittedRows(NamedTuple):
@@ -88,7 +103,7 @@ class _Mirror:
 
 class _Pending(NamedTuple):
     seq: int
-    slot: int | None
+    mirror: tuple  # (slot, width): the mirror holding its row
     row: int
     label: str
     drafts: int
@@ -96,9 +111,10 @@ class _Pending(NamedTuple):
 
 class _StepRecord(NamedTuple):
     seq: int
-    slot: int | None
+    mirror: tuple
     rows: tuple[int, ...]  # the real rows' handles
     positions: tuple[int, ...]  # and their rows in the mirror
+    drafts: int
 
 
 class DraftVerifyResource(Resource):
@@ -124,12 +140,13 @@ class DraftVerifyResource(Resource):
         self._proposer: DraftProposer | None = None
         # the node's resources that `verify` settles on the device (RewindKind.DEVICE)
         self._settlers: list[Resource] = []
-        # capture slot (None: eager) -> its mirror
-        self._mirrors: dict[int | None, _Mirror] = {}
+        # (capture slot (None: eager), row width) -> its mirror: an adaptive walk's two blocks
+        # replay on the same slots
+        self._mirrors: dict[tuple, _Mirror] = {}
         self._cg_rows = 0
         self._seq = 0
-        # (seq, slot, drafts, label) of the step planned last, until its commit
-        self._planned: tuple[int, int | None, int, str] | None = None
+        # (seq, mirror, drafts, label) of the step planned last, until its commit
+        self._planned: tuple[int, tuple, int, str] | None = None
         # the step an eager forward last staged; a replay runs no Python
         self._verified = 0
         # The plan thread settles a step ahead while the gpu thread commits and emits, so
@@ -146,6 +163,10 @@ class DraftVerifyResource(Resource):
         self._steps: list[_StepRecord] = []
         self.rows_verified = 0
         self.drafts_accepted = 0
+        # an adaptive walk's steps of no drafts, and their rows
+        self.steps_plain = 0
+        self.rows_plain = 0
+        self.steps_verified = 0
         # rows by how many drafts they accepted, which separates a weak first draft from a
         # chain that degrades
         self.accepted_hist = np.zeros(1, dtype=np.int64)
@@ -220,20 +241,20 @@ class DraftVerifyResource(Resource):
                 )
             label = next(iter(labels), label)
         lease = ctx.slot_lease
-        slot = None if lease is None else lease.slot
-        # this step's forward writes the slot's mirror: read the rows still pending there first
-        self._harvest(slot=slot)
-        mirror = self._mirror(slot, len(ctx.padded_request_ids), step.drafts + 3, lease is not None)
+        key = (None if lease is None else lease.slot, step.drafts + 3)
+        # this step's forward writes the mirror: read the rows still pending there first
+        self._harvest(mirror=key)
+        mirror = self._mirror(key, len(ctx.padded_request_ids), lease is not None)
         self._seq += 1
         # a kernel argument, not a host buffer, so no later plan can change it under the step
         mirror.seq_dev.fill_(self._seq)
-        self._planned = (self._seq, slot, step.drafts, label)
+        self._planned = (self._seq, key, step.drafts, label)
 
     def commit(self, step: VerifyStep, ctx: StepContext) -> None:
         planned, self._planned = self._planned, None
         if planned is None:
             return
-        seq, slot, drafts, _ = planned
+        seq, key, drafts, _ = planned
         if ctx.slot_lease is None and self._verified != seq:
             raise RuntimeError("the forward of a verify step did not call DraftVerifyResource.verify")
         if ctx.capture:
@@ -241,19 +262,33 @@ class DraftVerifyResource(Resource):
         labels = {segment.request_id: segment.label for segment in step.segments}
         rows: list[int] = []
         positions: list[int] = []
+        plain: list[int] = []
         with self._lock:
             for row, rid in enumerate(ctx.padded_request_ids):
                 if ctx.is_padding_row(rid):
                     continue
-                if rid in self._pending or rid in self._settled:
+                pending = self._pending.get(rid)
+                if (pending is not None and pending.drafts) or rid in self._settled:
                     # the runner rewinds a request's last verdict before its next step admits
                     raise RuntimeError(
                         f"draft-verify: request {rid} verified again before its last verdict was rewound"
                     )
-                self._pending[rid] = _Pending(seq, slot, row, labels[rid], drafts)
+                if pending is not None:
+                    plain.append(rid)
                 rows.append(rid)
                 positions.append(row)
-            self._steps.append(_StepRecord(seq, slot, tuple(rows), tuple(positions)))
+        if plain:
+            # Their last steps drafted nothing, so no rewind read them. Behind this step's
+            # launch, which runs after those steps on the stream: the wait is theirs.
+            self._harvest(rids=plain)
+        with self._lock:
+            for rid, row in zip(rows, positions, strict=True):
+                self._pending[rid] = _Pending(seq, key, row, labels[rid], drafts)
+            self._steps.append(_StepRecord(seq, key, tuple(rows), tuple(positions), drafts))
+        if self._proposer is not None:
+            # what each row is expected to keep at its next step, from the verdicts read by now
+            # (every one before this step's), for the step after this one to be decided by
+            self._proposer.predict(rows, drafts)
 
     # ── forward side; capturable ──
 
@@ -320,18 +355,20 @@ class DraftVerifyResource(Resource):
             raise RuntimeError("DraftVerifyResource.verify outside a planned verify step")
         if self._sampler is None:
             raise RuntimeError("DraftVerifyResource has no sampler bound; the engine binds it at load")
-        seq, slot, drafts, label = self._planned
+        seq, key, drafts, label = self._planned
         if block.shape[1] != drafts + 1:
             raise ValueError(f"a verify block of {block.shape[1]} tokens where the step declared {drafts} drafts")
         tokens, accepted = self._sampler.verify(request_ids, block, logits, draft_probs)
         n = tokens.shape[0]
-        mirror = self._mirrors[slot]
+        mirror = self._mirrors[key]
         mirror.dev[:n].copy_(torch.cat([accepted[:, None], block[:, :1], tokens], 1))
         mirror.host[:n].copy_(mirror.dev[:n], non_blocking=True)
         # after the rows, on the same stream: the number lands last
         mirror.seq_host.copy_(mirror.seq_dev, non_blocking=True)
-        for resource in self._settlers:
-            resource.settle_verify(accepted, label)
+        if drafts:
+            # a step of no drafts ran the plain paths, which keep every row
+            for resource in self._settlers:
+                resource.settle_verify(accepted, label)
         self._verified = seq
         return VerdictTensors(tokens, accepted, tokens.gather(1, accepted[:, None]))
 
@@ -339,13 +376,14 @@ class DraftVerifyResource(Resource):
 
     def settle(self, request_ids: Sequence[int]) -> VerdictBatch | None:
         """The rejected rows of these requests' last verify steps that no rewind has taken yet,
-        each handed out once; None when there are none. Waits for a verdict that hasn't landed.
-        A fact about an earlier step, so a discarded pre-plan doesn't give it back."""
+        each handed out once; None when there are none. Waits for a verdict that hasn't landed,
+        unless its step drafted nothing (it rejected nothing). A fact about an earlier step, so
+        a discarded pre-plan doesn't give it back."""
         pending, settled = self._pending, self._settled
         if not pending and not settled:
             return None
         with self._lock:
-            want = [rid for rid in request_ids if rid in pending or rid in settled]
+            want = [rid for rid in request_ids if rid in settled or (p := pending.get(rid)) is not None and p.drafts]
         if not want:
             return None
         self._harvest(rids=want)
@@ -359,6 +397,17 @@ class DraftVerifyResource(Resource):
                     out.rejected.append(verdict[1])
         return out if out.request_ids else None
 
+    def choose_drafts(self, request_ids: Sequence[int], policy: DraftPolicy) -> int:
+        """The drafts the next step of these rows runs: ``max_drafts``, or under an adaptive
+        policy none when the rows aren't expected to keep ``min_gain`` drafts a row. The
+        proposer's predictions change only at a commit, and the engine asks between the commit
+        of the step before and this step's own, so every rank of a lockstep instance, and the
+        plan thread and the gpu thread of one, decide alike."""
+        if not policy.adaptive:
+            return policy.max_drafts
+        gain = self._proposer.expected_gain(request_ids)
+        return policy.max_drafts if gain >= policy.gain_needed(len(request_ids)) else 0
+
     def emitted_rows(
         self, request_ids: Sequence[int], max_tokens: Sequence[int],
         ignore_eos: Sequence[bool], policy: DraftPolicy,
@@ -371,19 +420,7 @@ class DraftVerifyResource(Resource):
         steps, self._steps = self._steps, []
         rids = tuple(request_ids)
         n = len(rids)
-        last = steps[-1] if steps else None
-        if last is not None and last.rows == rids and last.positions == tuple(range(n)):
-            self._wait(last.slot, last.seq)
-            table = self._mirrors[last.slot].host_np[:n].copy()
-        else:
-            # a per-request exec ran a step per row, each over the last one's mirror rows
-            ran = {rid for record in steps for rid in record.rows}
-            missing = [rid for rid in rids if rid not in ran]
-            if missing:
-                raise RuntimeError(f"draft-verify: no verify step of requests {missing} to emit")
-            self._harvest(rids=rids)
-            with self._lock:
-                table = np.stack([self._rows[rid] for rid in rids])
+        table = self._table(steps, rids)
         width = table.shape[1] - 2
         accepted, inputs, tokens = table[:, 0], table[:, 1], table[:, 2:]
         with self._lock:
@@ -411,6 +448,7 @@ class DraftVerifyResource(Resource):
                 if rid in emitted:
                     emitted[rid] = value
         self.rows_verified += n
+        self.steps_verified += 1
         self.drafts_accepted += int(accepted.sum())
         counts_by_accepted = np.bincount(accepted, minlength=width)
         grow = counts_by_accepted.shape[0] - self.accepted_hist.shape[0]
@@ -424,6 +462,79 @@ class DraftVerifyResource(Resource):
             rids, tokens[np.arange(width) < counts[:, None]], counts, stopped | (total >= limit),
         )
 
+    def ran_plain(self) -> bool:
+        """Whether the step committed last drafted nothing (``count_plain`` emits it)."""
+        return bool(self._steps) and self._steps[-1].drafts == 0
+
+    def count_plain(self, request_ids: Sequence[int], max_tokens: Sequence[int], policy: DraftPolicy) -> PlainStep:
+        """The tokens a step of no drafts emits, counted on the gpu thread after its commit in
+        step order, as ``emitted_rows`` counts a verify step's, without waiting for them: one
+        a row, none past ``max_tokens``. ``plain_rows`` reads them."""
+        steps, self._steps = self._steps, []
+        rids = tuple(request_ids)
+        n = len(rids)
+        with self._lock:
+            emitted = self._emitted
+            before = np.fromiter(
+                (policy.emitted_before if (e := emitted.get(rid)) is None else e for rid in rids), np.int64, n,
+            )
+            limit = np.asarray(max_tokens, dtype=np.int64)
+            counts = (before < limit).astype(np.int64)
+            total = before + counts
+            for rid, value in zip(rids, total.tolist(), strict=True):
+                if rid in emitted:
+                    emitted[rid] = value
+        self.rows_plain += n
+        self.steps_plain += 1
+        return PlainStep(steps, rids, counts, total >= limit)
+
+    def plain_rows(self, plain: PlainStep, ignore_eos: Sequence[bool], policy: DraftPolicy) -> EmittedRows:
+        """A step of no drafts' tokens, at the stop check, once the step has landed: each row's
+        token unless its count was none, and the rows that stop (a stop id, or its input one:
+        the reply ended a step earlier; or ``max_tokens``)."""
+        rids = plain.request_ids
+        n = len(rids)
+        table = self._table(plain.steps, rids)
+        inputs, tokens = table[:, 1], table[:, 2]
+        counts = plain.counts.copy()
+        stopped = np.zeros(n, dtype=bool)
+        if policy.stop_ids:
+            keep = ~np.asarray(ignore_eos, dtype=bool)
+            stop_ids = np.fromiter(policy.stop_ids, np.int64, len(policy.stop_ids))
+            ended = np.isin(inputs, stop_ids) & keep
+            counts[ended] = 0
+            stopped = (np.isin(tokens, stop_ids) & keep & (counts > 0)) | ended
+        return EmittedRows(rids, tokens[counts > 0], counts, stopped | plain.capped)
+
+    def plain_tokens(self, plain: PlainStep) -> torch.Tensor | None:
+        """``[n]``: a step of no drafts' token per row, a view of the pinned host mirror its
+        forward copies the verdict into (read it once the step has landed; the mirror's next
+        step is two steps later). None for a per-request exec, whose rows are in several."""
+        n = len(plain.request_ids)
+        if len(plain.steps) != 1:
+            return None
+        (record,) = plain.steps
+        if record.rows != plain.request_ids or record.positions != tuple(range(n)):
+            return None
+        return self._mirrors[record.mirror].host[:n, 2]
+
+    def _table(self, steps: list[_StepRecord], rids: tuple[int, ...]) -> np.ndarray:
+        """The verdict rows of ``rids``, in order, from ``steps``: ``[accepted, input, t_0 ..]``
+        each. Waits for them."""
+        n = len(rids)
+        last = steps[-1] if steps else None
+        if last is not None and last.rows == rids and last.positions == tuple(range(n)):
+            self._wait(last.mirror, last.seq)
+            return self._mirrors[last.mirror].host_np[:n].copy()
+        # a per-request exec ran a step per row, each over the last one's mirror rows
+        ran = {rid for record in steps for rid in record.rows}
+        missing = [rid for rid in rids if rid not in ran]
+        if missing:
+            raise RuntimeError(f"draft-verify: no verify step of requests {missing} to emit")
+        self._harvest(rids=rids)
+        with self._lock:
+            return np.stack([self._rows[rid] for rid in rids])
+
     def stats(self) -> str:
         """Rows verified, drafts accepted per row, and the rate at which each draft is
         accepted given the ones before it were."""
@@ -432,21 +543,28 @@ class DraftVerifyResource(Resource):
         rates = " ".join(
             f"{reached[i] / reached[i - 1]:.2f}" if reached[i - 1] else "-" for i in range(1, len(reached))
         )
-        return (
+        out = (
             f"{self.rows_verified} verify rows, {mean:.2f} drafts accepted per row "
             f"({mean + 1:.2f} tokens per step); accepted by position {rates or '-'}"
         )
+        if self.steps_plain:
+            out += (
+                f"; {self.steps_verified} verify steps, {self.steps_plain} steps of no drafts "
+                f"({self.rows_plain} rows)"
+            )
+        return out
 
     # ── mirrors ──
 
-    def _mirror(self, slot: int | None, rows: int, width: int, captured: bool) -> _Mirror:
-        mirror = self._mirrors.get(slot)
-        if mirror is not None and mirror.rows >= rows and mirror.width == width:
+    def _mirror(self, key: tuple, rows: int, captured: bool) -> _Mirror:
+        slot, width = key
+        mirror = self._mirrors.get(key)
+        if mirror is not None and mirror.rows >= rows:
             return mirror
         if mirror is not None and mirror.captured:
             raise RuntimeError(
-                f"draft-verify: slot {slot}'s verdict mirror holds {mirror.rows} rows of {mirror.width}, "
-                f"a step needs {rows} of {width}, and graphs captured against it read it in place"
+                f"draft-verify: slot {slot}'s verdict mirror of width {width} holds {mirror.rows} rows, "
+                f"a step needs {rows}, and graphs captured against it read it in place"
             )
         if captured:
             rows = max(rows, self._cg_rows)
@@ -456,36 +574,45 @@ class DraftVerifyResource(Resource):
         host = torch.zeros(rows, width, dtype=torch.long, pin_memory=self._pin)
         seq_dev = torch.zeros(1, dtype=torch.long, device=self._device)
         seq_host = torch.zeros(1, dtype=torch.long, pin_memory=self._pin)
-        mirror = self._mirrors[slot] = _Mirror(
+        mirror = self._mirrors[key] = _Mirror(
             rows, width, dev, host, host.numpy(), seq_dev, seq_host, seq_host.numpy(), captured,
         )
         return mirror
 
-    def _harvest(self, rids: Sequence[int] | None = None, slot=_ANY_SLOT) -> None:
+    def _harvest(self, rids: Sequence[int] | None = None, mirror=_ANY_SLOT) -> None:
         """Read pending verdicts out of the mirrors (these requests', or every one in
-        ``slot``), waiting for their steps to stage them."""
+        ``mirror``), waiting for their steps to stage them."""
         with self._lock:
             if rids is None:
-                entries = [(rid, p) for rid, p in self._pending.items() if slot is _ANY_SLOT or p.slot == slot]
+                entries = [(rid, p) for rid, p in self._pending.items() if mirror is _ANY_SLOT or p.mirror == mirror]
             else:
                 entries = [(rid, self._pending[rid]) for rid in rids if rid in self._pending]
         if not entries:
             return
-        newest: dict[int | None, int] = {}
+        newest: dict[tuple, int] = {}
         for _, p in entries:
-            newest[p.slot] = max(newest.get(p.slot, 0), p.seq)
-        for s, seq in newest.items():
-            self._wait(s, seq)
+            newest[p.mirror] = max(newest.get(p.mirror, 0), p.seq)
+        for key, seq in newest.items():
+            self._wait(key, seq)
         with self._lock:
             proposer = self._proposer
+            pending = self._pending
+            by_mirror: dict[tuple, list] = {}
             for rid, p in entries:
-                if self._pending.get(rid) is not p:
-                    continue  # read by another thread, or removed
-                del self._pending[rid]
-                row = self._rows[rid] = self._mirrors[p.slot].host_np[p.row].copy()
-                self._settled[rid] = (p.label, p.drafts - int(row[0]))
-                if proposer is not None:
-                    proposer.observe(rid, row)
+                # skip one read by another thread, or removed
+                if pending.get(rid) is p:
+                    by_mirror.setdefault(p.mirror, []).append((rid, p))
+            for key, group in by_mirror.items():
+                # one copy of the rows of a mirror, which the next step there overwrites
+                table = self._mirrors[key].host_np[[p.row for _, p in group]]
+                for (rid, p), row in zip(group, table, strict=True):
+                    del pending[rid]
+                    self._rows[rid] = row
+                    if p.drafts:
+                        # a step of no drafts keeps every row: nothing for a rewind
+                        self._settled[rid] = (p.label, p.drafts - int(row[0]))
+                    if proposer is not None:
+                        proposer.observe(rid, row)
 
     def harvest(self, request_ids: Sequence[int]) -> None:
         """Read these requests' pending verdicts, waiting for their steps to stage them: a
@@ -493,10 +620,12 @@ class DraftVerifyResource(Resource):
         if self._pending:
             self._harvest(rids=request_ids)
 
-    def _wait(self, slot: int | None, seq: int) -> None:
-        """Until the verdict of step ``seq`` is in ``slot``'s mirror. A host spin, so the
-        thread waiting is the plan thread or the gpu thread, never the main loop."""
-        flag = self._mirrors[slot].seq_np
+    def _wait(self, key: tuple, seq: int) -> None:
+        """Until the verdict of step ``seq`` is in mirror ``key``. A host spin, so the thread
+        waiting is the plan thread or the gpu thread, or the main loop once the step's
+        completion event has passed (a step of no drafts' tokens)."""
+        slot = key[0]
+        flag = self._mirrors[key].seq_np
         if self._async and flag[0] < seq:
             deadline = time.monotonic() + WAIT_TIMEOUT_S
             while flag[0] < seq:
