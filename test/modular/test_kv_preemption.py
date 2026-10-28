@@ -79,7 +79,7 @@ def _offload(kv, rid: str) -> int:
 
 
 def _queue(kv) -> list[str]:
-    return _runner(kv)._queues["kv"]
+    return _runner(kv)._admission._queues["kv"]
 
 
 def _step(kv, rid: str, tokens: int) -> AdmitOutcome:
@@ -227,11 +227,11 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
 
     _remove(kv, gone)
 
-    runner = _runner(kv)
+    admission = _runner(kv)._admission
     left = [
         state for state in (
             kv._earmarks, kv._victims, kv._short, kv._ran_short, kv._asks, kv._dropped, kv._allotments,
-            runner._waiting, runner._admitted, runner._arrival, runner._queues["kv"],
+            admission._waiting, admission._admitted, admission._arrival, admission._queues["kv"],
         ) if gone in state
     ]
     assert not left and not kv._earmarks and not kv._victims, f"{gone} left preemption state behind"
