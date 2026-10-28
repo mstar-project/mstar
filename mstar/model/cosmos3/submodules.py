@@ -162,19 +162,11 @@ REASONER_LABEL = "main"
 
 def denoise_compile_kwargs(mode: str) -> dict:
     """``torch.compile`` arguments for the denoise step; see
-    ``Cosmos3Config.denoise_compile_mode``."""
-    kwargs: dict = {"fullgraph": False, "dynamic": False}
-    if mode == "level":
-        from mstar.engine.accelerator_graph_runner import compile_kwargs
+    ``Cosmos3Config.denoise_compile_mode``. "deterministic" and "default" are
+    the engine's compile modes of those names, "level" its -O level."""
+    from mstar.engine.accelerator_graph_runner import compile_kwargs
 
-        return compile_kwargs(None)
-    if mode == "deterministic":
-        import torch._inductor.config as inductor_config
-
-        # torch builds without the mode compile with the defaults
-        if hasattr(inductor_config, "deterministic"):
-            kwargs["options"] = {"deterministic": True}
-    return kwargs
+    return compile_kwargs(None if mode == "level" else mode)
 
 
 def latent_frames(num_frames: int, config) -> int:

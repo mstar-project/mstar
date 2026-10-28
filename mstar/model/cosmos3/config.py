@@ -503,11 +503,13 @@ class Cosmos3Config:
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
     compile_denoise: bool = True
-    # How the denoise step compiles: "deterministic" is Inductor's defaults in
-    # its deterministic mode (kernel configs picked by rule, so every server
-    # process runs the same kernels and one seed gives one video); "default" is
-    # torch.compile's defaults, which time some kernel configs on first use;
-    # "level" takes the ``mstar serve -O`` level's options (-O2: max-autotune).
+    # How the denoise step compiles, as the engine's compile modes of the same
+    # names (``accelerator_graph_runner.compile_kwargs``): "deterministic" is
+    # Inductor's defaults in its deterministic mode (kernel configs picked by
+    # rule, so every server process runs the same kernels and one seed gives
+    # one video); "default" is torch.compile's defaults, which time some kernel
+    # configs on first use; "level" takes the ``mstar serve -O`` level's
+    # options (-O2: max-autotune).
     denoise_compile_mode: str = "deterministic"
     # Compile the cross-request denoise step (two or more requests in one
     # forward) too, with the same mode: the video, image and sound steps; the
