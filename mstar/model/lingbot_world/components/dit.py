@@ -422,9 +422,10 @@ class LingBotCausalDiT(nn.Module):
         where eager does (``emulate_precision_casts``): by default Inductor's
         defaults in its deterministic mode, so every process compiles the same
         kernels; with ``autotune`` the -O level's options, whose kernel picks
-        are per process. The cache write and both attentions stay eager
-        (``ChunkWindow``, the ragged callables), so a block traces once
-        for every chunk."""
+        are per process. The cache write and window attention (``ChunkWindow``)
+        and a ragged text attention stay eager, so a block traces once for
+        every chunk; the reference's text attention (``REFERENCE_ATTENTION``)
+        is not disabled and compiles with the block."""
         from mstar.model.components.diffusion.compile_utils import with_inductor_rounding
 
         if autotune:

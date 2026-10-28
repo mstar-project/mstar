@@ -420,8 +420,8 @@ class LingBotWorldModel(Model):
         return None
 
     def _load_vae(self) -> torch.nn.Module:
-        """A fresh fp32 Wan2.1 VAE per use: the decoder may switch its copy to
-        channels-last, which the encoder must not see."""
+        """A fresh fp32 Wan2.1 VAE per use: the decoder casts its copy to bf16
+        unless ``vae_decode_fp32``, which the encoder must not see."""
         from diffusers import AutoencoderKLWan
 
         return AutoencoderKLWan.from_pretrained(

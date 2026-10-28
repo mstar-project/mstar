@@ -172,12 +172,13 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
        rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
        through the engine's ragged attention resource; ``model_kwargs: {reference_attention: true}``
-       runs the reference's FlashAttention-2 instead (bit-identical to the reference, needs ``flash-attn``).
+       runs the reference's FlashAttention-2 instead (needs ``flash-attn``).
        The DiT blocks are compiled (``dit_compile``), the condition encode runs channels-last
        (``vae_encode_channels_last``), and the VAE decode is bf16, channels-last and compiled by
        default (frames 51 dB from the fp32 decode); ``vae_decode_fp32``, ``vae_decode_channels_last``
        and ``vae_decode_compile`` set it. ``REFERENCE_MODEL_KWARGS`` in ``lingbot_world_model.py``
-       lists the settings that are bit-identical to the reference. ``lingbot_world_1_3b_fast.yaml``
+       lists the settings that are bit-identical to the reference; bit-identity takes all of them, not
+       ``reference_attention`` alone. ``lingbot_world_1_3b_fast.yaml``
        compiles the DiT with autotuned kernels (``dit_compile_autotune``): ~5% faster, but the
        rollout for a seed then differs from one server process to the next.
        The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it

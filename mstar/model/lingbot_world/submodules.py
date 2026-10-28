@@ -24,7 +24,7 @@ whose step pairs the chunk's queries with its K/V window and with the text.
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
-runs fp32 as the reference does.
+encode runs fp32 as the reference does; the decode runs bf16 unless ``vae_decode_fp32``.
 """
 
 import functools
@@ -188,7 +188,8 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     ``image`` arrives resized and normalized to [-1, 1] by
     ``LingBotWorldModel.process_prompt``, which runs the reference's CPU bicubic
     resize so the pixels match it exactly. ``encoder_vae`` is its own Wan2.1
-    VAE: the decoder's copy may be switched to channels-last.
+    VAE: the decoder's copy may be cast to bf16. Each copy's own path may be
+    switched to channels-last.
     """
 
     disable_torch_compile = True

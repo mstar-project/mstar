@@ -9,7 +9,7 @@ max_seq_len: 512
 # reference_attention: true (FA2, needs flash-attn), an eager DiT, the contiguous
 # encode and the fp32, contiguous, eager decode; with all of them the rollout is
 # bit-identical to the reference's. The compiled DiT and decode are compiled at
-# load for 480x832.
+# load for 464x832, the output size of a 480x832 image (LingBotWorldModel.geometry).
 # model_kwargs:
 #   reference_attention: false
 #   dit_compile: true
