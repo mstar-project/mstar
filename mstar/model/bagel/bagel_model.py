@@ -1462,6 +1462,8 @@ class BagelModel(Model):
 
         sample_prefill_token = (think_mode or target_output != "image") and len(schedule) == 1
         step_metadata["sample_prefill_token"] = sample_prefill_token
+        # a text reply has no walk after decode, so a stop at its first token ends it
+        step_metadata["prefill_stop_ends"] = sample_prefill_token and target_output == "text"
 
         inputs = self._get_fwd_pass_inputs(
             full_metadata, input_signals
@@ -1544,6 +1546,9 @@ class BagelModel(Model):
 
         step_metadata =  self._get_step_metadata(metadata)
         step_metadata["sample_prefill_token"] = sample_prefill_token
+        step_metadata["prefill_stop_ends"] = (
+            sample_prefill_token and metadata.kwargs["target_output"] == "text"
+        )
         inputs = self._get_fwd_pass_inputs(
             metadata, persist_signals
         )
