@@ -414,6 +414,7 @@
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="current reference internal" href="#">mstar.utils</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.cache_home.html">mstar.utils.cache_home</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.device.html">mstar.utils.device</a></li>
@@ -673,58 +674,61 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.adarms_norm.html#module-mstar.utils.adarms_norm" title="mstar.utils.adarms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">adarms_norm</span></code></a></p></td>
 <td><p>Fused AdaRMS normalisation + scale/shift/gate Triton kernel.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.client_errors.html#module-mstar.utils.client_errors" title="mstar.utils.client_errors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">client_errors</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.cache_home.html#module-mstar.utils.cache_home" title="mstar.utils.cache_home"><code class="xref py py-obj docutils literal notranslate"><span class="pre">cache_home</span></code></a></p></td>
+<td><p>The user's cache root, which M*'s on-disk caches (compiled kernels, downloaded checkpoints) live under.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.client_errors.html#module-mstar.utils.client_errors" title="mstar.utils.client_errors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">client_errors</span></code></a></p></td>
 <td><p>Client-visible text for an exception raised while serving a request.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.containers.html#module-mstar.utils.containers" title="mstar.utils.containers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">containers</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.containers.html#module-mstar.utils.containers" title="mstar.utils.containers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">containers</span></code></a></p></td>
 <td><p>Small generic containers with no engine or worker knowledge</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.device.html#module-mstar.utils.device" title="mstar.utils.device"><code class="xref py py-obj docutils literal notranslate"><span class="pre">device</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.device.html#module-mstar.utils.device" title="mstar.utils.device"><code class="xref py py-obj docutils literal notranslate"><span class="pre">device</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.exitcode.html#module-mstar.utils.exitcode" title="mstar.utils.exitcode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">exitcode</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.exitcode.html#module-mstar.utils.exitcode" title="mstar.utils.exitcode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">exitcode</span></code></a></p></td>
 <td><p>Words for a child process's exit status, for log lines and error messages.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.fast_tokenize.html#module-mstar.utils.fast_tokenize" title="mstar.utils.fast_tokenize"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fast_tokenize</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.fast_tokenize.html#module-mstar.utils.fast_tokenize" title="mstar.utils.fast_tokenize"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fast_tokenize</span></code></a></p></td>
 <td><p>Tokenize a long prompt as parallel chunks, byte-identical to one encode.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.fp8_block.html#module-mstar.utils.fp8_block" title="mstar.utils.fp8_block"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fp8_block</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.fp8_block.html#module-mstar.utils.fp8_block" title="mstar.utils.fp8_block"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fp8_block</span></code></a></p></td>
 <td><p>FP8 block-scale checkpoints: the <code class="docutils literal notranslate"><span class="pre">quantization_config</span></code> they declare, and their weights dequantized.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.gc_freeze.html#module-mstar.utils.gc_freeze" title="mstar.utils.gc_freeze"><code class="xref py py-obj docutils literal notranslate"><span class="pre">gc_freeze</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.gc_freeze.html#module-mstar.utils.gc_freeze" title="mstar.utils.gc_freeze"><code class="xref py py-obj docutils literal notranslate"><span class="pre">gc_freeze</span></code></a></p></td>
 <td><p>Move a process's set-up heap out of the garbage collector's reach.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.generation_kwargs.html#module-mstar.utils.generation_kwargs" title="mstar.utils.generation_kwargs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">generation_kwargs</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.generation_kwargs.html#module-mstar.utils.generation_kwargs" title="mstar.utils.generation_kwargs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">generation_kwargs</span></code></a></p></td>
 <td><p>The client-facing generation knobs, checked once where every endpoint submits.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.h2d.html#module-mstar.utils.h2d" title="mstar.utils.h2d"><code class="xref py py-obj docutils literal notranslate"><span class="pre">h2d</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.h2d.html#module-mstar.utils.h2d" title="mstar.utils.h2d"><code class="xref py py-obj docutils literal notranslate"><span class="pre">h2d</span></code></a></p></td>
 <td><p>Copy-only host-to-device staging, for work that runs beside a live CUDA graph.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.hf_snapshot.html#module-mstar.utils.hf_snapshot" title="mstar.utils.hf_snapshot"><code class="xref py py-obj docutils literal notranslate"><span class="pre">hf_snapshot</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.hf_snapshot.html#module-mstar.utils.hf_snapshot" title="mstar.utils.hf_snapshot"><code class="xref py py-obj docutils literal notranslate"><span class="pre">hf_snapshot</span></code></a></p></td>
 <td><p>Resolving a Hugging Face repo id to a local snapshot directory.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.ipc_format.html#module-mstar.utils.ipc_format" title="mstar.utils.ipc_format"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ipc_format</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.ipc_format.html#module-mstar.utils.ipc_format" title="mstar.utils.ipc_format"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ipc_format</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.knobs.html#module-mstar.utils.knobs" title="mstar.utils.knobs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">knobs</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.knobs.html#module-mstar.utils.knobs" title="mstar.utils.knobs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">knobs</span></code></a></p></td>
 <td><p>Engine knobs read by more than one package.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.logging_config.html#module-mstar.utils.logging_config" title="mstar.utils.logging_config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">logging_config</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.logging_config.html#module-mstar.utils.logging_config" title="mstar.utils.logging_config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">logging_config</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.orphan.html#module-mstar.utils.orphan" title="mstar.utils.orphan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">orphan</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.orphan.html#module-mstar.utils.orphan" title="mstar.utils.orphan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">orphan</span></code></a></p></td>
 <td><p>Watchdog that leaves once the process that spawned this one is gone.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.profiler.html#module-mstar.utils.profiler" title="mstar.utils.profiler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">profiler</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.profiler.html#module-mstar.utils.profiler" title="mstar.utils.profiler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">profiler</span></code></a></p></td>
 <td><p>Utilities for NVTX range annotations for profiling with nsys.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.socket_prefix.html#module-mstar.utils.socket_prefix" title="mstar.utils.socket_prefix"><code class="xref py py-obj docutils literal notranslate"><span class="pre">socket_prefix</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.socket_prefix.html#module-mstar.utils.socket_prefix" title="mstar.utils.socket_prefix"><code class="xref py py-obj docutils literal notranslate"><span class="pre">socket_prefix</span></code></a></p></td>
 <td><p>Default IPC socket prefixes for the server entry points.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.streams.html#module-mstar.utils.streams" title="mstar.utils.streams"><code class="xref py py-obj docutils literal notranslate"><span class="pre">streams</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.streams.html#module-mstar.utils.streams" title="mstar.utils.streams"><code class="xref py py-obj docutils literal notranslate"><span class="pre">streams</span></code></a></p></td>
 <td><p>CUDA stream state a worker has to manage.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.utf8_stream.html#module-mstar.utils.utf8_stream" title="mstar.utils.utf8_stream"><code class="xref py py-obj docutils literal notranslate"><span class="pre">utf8_stream</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.utf8_stream.html#module-mstar.utils.utf8_stream" title="mstar.utils.utf8_stream"><code class="xref py py-obj docutils literal notranslate"><span class="pre">utf8_stream</span></code></a></p></td>
 <td><p>Decode a model's text chunks without splitting characters.</p></td>
 </tr>
 </tbody>

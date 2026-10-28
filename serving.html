@@ -418,6 +418,7 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.cache_home.html">mstar.utils.cache_home</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
@@ -672,6 +673,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#api-key">API key</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#config-files">Config files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#restarts-and-the-compile-cache">Restarts and the compile cache</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-profiling">Request profiling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics">Metrics</a></li>
@@ -1262,6 +1264,39 @@ Pi0.5 DROID variant fixes the action horizon:</p>
 <p>Per-request knobs (<code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">voice</span></code>, <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, …) are sent by the
 client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>.</p>
 </section>
+<section id="restarts-and-the-compile-cache">
+<h2>Restarts and the compile cache<a class="headerlink" href="#restarts-and-the-compile-cache" title="Link to this heading">#</a></h2>
+<p>On a first start Inductor compiles every capture bucket (tuning it at <code class="docutils literal notranslate"><span class="pre">-O1</span></code> and
+<code class="docutils literal notranslate"><span class="pre">-O2</span></code>), and FlashInfer JIT-builds its kernels. Both cache the results, and a
+start that finds them skips that work. Qwen3.5-0.8B on an H200 took 320 s to start with an
+empty cache at the default <code class="docutils literal notranslate"><span class="pre">-O1</span></code> (1,294 s at <code class="docutils literal notranslate"><span class="pre">-O2</span></code>); a warm start skips Inductor’s
+compile and tuning. torch’s default cache in <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> already survives a process restart on
+the same host; M*’s default keeps it across a new container or a reboot that clears <code class="docutils literal notranslate"><span class="pre">/tmp</span></code>.</p>
+<p>To keep it, persist these (all under <code class="docutils literal notranslate"><span class="pre">~/.cache</span></code> by default):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">$XDG_CACHE_HOME/mstar/torchinductor</span></code>: Inductor’s compiled graphs and autotune picks
+(<code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code>), and in its <code class="docutils literal notranslate"><span class="pre">triton</span></code> subdirectory Triton’s compiled kernels,
+Inductor’s and others’ alike (<code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">~/.cache/flashinfer</span></code>: FlashInfer’s JIT builds (it follows <code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code>,
+default home, not <code class="docutils literal notranslate"><span class="pre">$XDG_CACHE_HOME</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">$HF_HOME</span></code>: the weights (<code class="docutils literal notranslate"><span class="pre">$XDG_CACHE_HOME/huggingface</span></code> by default)</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">$XDG_CACHE_HOME</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">~/.cache</span></code>. M* sets both variables unless you export them,
+and <code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code> follows an exported <code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code>.</p>
+<p>In a container, mount these from a volume rather than only <code class="docutils literal notranslate"><span class="pre">~/.cache/huggingface</span></code>.
+Inductor keys compiled graphs and <code class="docutils literal notranslate"><span class="pre">-O1</span></code>’s picks on the torch build. On CUDA and ROCm,
+compiled graphs (and <code class="docutils literal notranslate"><span class="pre">-O2</span></code>’s GEMM timings) also key on the Triton build, the device (its
+name on CUDA, its gfx arch on ROCm) and the CUDA or HIP version; on XPU, on none of those.
+<code class="docutils literal notranslate"><span class="pre">-O1</span></code>’s picks key on the kernel source, which names the compute capability and SM count but
+not the GPU model, so give each GPU model (or each ROCm card sharing an arch) its own cache
+if one home serves several. Neither key covers the <code class="docutils literal notranslate"><span class="pre">ptxas</span></code> that built a kernel or the driver: after changing
+either, delete the cache or set torch’s <code class="docutils literal notranslate"><span class="pre">TORCH_COMPILE_CACHE_KEY_TAG</span></code> to a new value.</p>
+<p>The default trades torch’s node-local <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> for home. Nothing prunes the cache, and every
+upgrade, <code class="docutils literal notranslate"><span class="pre">-O</span></code> level and changed graph adds to it; it is safe to delete, which costs only the
+next start’s compile. On a quota-limited or network-mounted home (NFS), or a volume that
+concurrent jobs on several hosts share, export <code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code> to a node-local
+path and copy a warm cache in at job start.</p>
+</section>
 <section id="tensor-transport">
 <span id="id3"></span><h2>Tensor transport<a class="headerlink" href="#tensor-transport" title="Link to this heading">#</a></h2>
 <p>Workers route tensors directly to one another using one of three transports, selected with
@@ -1614,6 +1649,7 @@ curl<span class="w"> </span>-s<span class="w"> </span>localhost:8000/metrics<spa
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#api-key">API key</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#config-files">Config files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#restarts-and-the-compile-cache">Restarts and the compile cache</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-profiling">Request profiling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics">Metrics</a></li>

@@ -418,6 +418,7 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.cache_home.html">mstar.utils.cache_home</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
@@ -1450,6 +1451,25 @@ show <code class="docutils literal notranslate"><span class="pre">hit</span> <sp
 <code class="docutils literal notranslate"><span class="pre">0</span></code>: torch.compile’s default mode. <code class="docutils literal notranslate"><span class="pre">1</span></code>: coordinate descent tuning.
 <code class="docutils literal notranslate"><span class="pre">2</span></code>: <code class="docutils literal notranslate"><span class="pre">max-autotune-no-cudagraphs</span></code>. A capture config that names its
 own <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> keeps it.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">$XDG_CACHE_HOME/mstar/torchinductor</span></code> (<code class="docutils literal notranslate"><span class="pre">~/.cache/mstar/torchinductor</span></code> when unset)</p></td>
+<td><p>torch’s own variable; M* sets this default when importing
+<a class="reference internal" href="_autosummary/mstar.engine.html#module-mstar.engine" title="mstar.engine"><code class="xref py py-mod docutils literal notranslate"><span class="pre">mstar.engine</span></code></a> (<code class="docutils literal notranslate"><span class="pre">_default_compile_caches</span></code>), so compiled graphs and
+autotune picks survive a restart that keeps the cache directory. An exported
+value wins, and a home that can’t be written keeps torch’s
+<code class="docutils literal notranslate"><span class="pre">/tmp/torchinductor_&lt;user&gt;</span></code>. Point it at an empty directory to measure a cold
+start (Triton’s kernels follow it unless <code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code> is exported;
+FlashInfer’s JIT cache stays warm). See
+<a class="reference internal" href="serving.html#restarts-and-the-compile-cache"><span class="std std-ref">Restarts and the compile cache</span></a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">$TORCHINDUCTOR_CACHE_DIR/triton</span></code></p></td>
+<td><p>Triton’s own variable, defaulted by the same function once
+<code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code> is resolved (exported or M*’s default; left unset
+when that falls back to torch’s). An exported value wins. Holds Triton’s compiled
+kernels, Inductor’s and those compiled outside it; without it, where a kernel
+lands depends on whether Inductor compiled first.</p></td>
 </tr>
 </tbody>
 </table>

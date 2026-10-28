@@ -30,6 +30,7 @@
    adarms_norm
    add_layernorm
    attention
+   cache_home
    causal_conv1d
    client_errors
    containers
