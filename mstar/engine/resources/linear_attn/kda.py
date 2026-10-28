@@ -1,14 +1,15 @@
 """Kimi delta attention planned against the recurrent state pool.
 
 Same shape as ``gdn.py``: the pool's addressing arrives through
-``ctx.plan_results`` and its per-layer blocks as plain tensors to ``run``. The
-math is a kernel bundle's: ``kda_triton.TritonKDAKernels`` on CUDA, or one a
-model installs with ``set_kernels`` (its torch reference off-GPU). A bundle
-implements ``layout(spans, num_tokens, fixed)``, the token layout its prefill
-reads on device (or None), ``run_paged(qkv, g, beta, plan, conv, state,
-params, gate=None)``, and for a speculative step ``run_verify`` with the
-layer's ``SpecBlocks`` after the state. The plan stages the layout, into
-buffers that stay put under CUDA-graph capture.
+``ctx.plan_results`` and its per-layer blocks as plain tensors to ``run``, which a
+layer calls through ``convenience.KDACallable`` rather than naming the blocks.
+The math is a kernel bundle's: ``kda_triton.TritonKDAKernels`` on CUDA at a head
+dim it is validated for, ``kda_torch.TorchKDAKernels`` elsewhere, or one installed
+with ``set_kernels``. A bundle implements ``layout(spans, num_tokens, fixed)``,
+the token layout its prefill reads on device (or None), ``run_paged(qkv, g,
+beta, plan, conv, state, params, gate=None)``, and for a speculative step
+``run_verify`` with the layer's ``SpecBlocks`` after the state. The plan stages
+the layout, into buffers that stay put under CUDA-graph capture.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
-from mstar.engine.resources.linear_attn import kda_triton
+from mstar.engine.resources.linear_attn import kda_torch, kda_triton
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
@@ -102,10 +103,10 @@ class KDAPlan:
 
 
 def _default_kernels(device: torch.device, head_dim: int):
-    """The fused Triton bundle on CUDA at a head dim it is validated for;
-    elsewhere None, for a model to fill."""
+    """The fused Triton bundle on CUDA at a head dim it is validated for; the
+    torch reference elsewhere."""
     if device.type != "cuda" or not kda_triton._HAS_TRITON or not kda_triton.supported(head_dim):
-        return None
+        return kda_torch.TorchKDAKernels()
     return kda_triton.TritonKDAKernels()
 
 
@@ -151,7 +152,8 @@ class KDAManager(LinearAttnManager):
         self._cached_plan_output: dict[str, KDAPlan] | None = None
 
     def set_kernels(self, kernels) -> None:
-        """Install the bundle every layer runs; see the module docstring."""
+        """Install the bundle every layer runs in place of the default; see the
+        module docstring."""
         self.kernels = kernels
 
     def depends_on(self) -> set[str]:
@@ -313,13 +315,11 @@ class KDAManager(LinearAttnManager):
         sigmoid, and ``g`` the forget gate before its activation: ``[T, H, D]``,
         or its low-rank factor ``[T, D]`` with ``params.f_b``. ``conv_layer``
         and ``state_layer`` are this layer's ``pool.block`` views, updated in
-        place, and ``spec`` its speculative blocks, which a verify step needs.
-        Returns ``[T, H, D]``, or the gated-normed ``[T, P]`` when ``gate``,
-        the output gate's low-rank factor, comes with ``params.g_b``.
+        place, and ``spec`` its speculative blocks, which a verify step needs;
+        ``KDACallable`` resolves all three. Returns ``[T, H, D]``, or the
+        gated-normed ``[T, P]`` when ``gate``, the output gate's low-rank
+        factor, comes with ``params.g_b``.
         """
-        assert self.kernels is not None, (
-            "no KDA kernels: off-GPU the model installs its reference with set_kernels"
-        )
         plan = self.current_plan(label)
         if plan.is_verify:
             if spec is None:
@@ -330,21 +330,6 @@ class KDAManager(LinearAttnManager):
         return self.kernels.run_paged(
             qkv, g, beta, plan, conv_layer, state_layer, params, gate=gate,
         )
-
-    @torch.compiler.disable
-    def set_prefix_len(
-        self, spec: SpecBlocks, accepted: torch.Tensor, label: str | None = None,
-    ) -> None:
-        """After a verify step: each row's first ``accepted + 1`` tokens (the
-        accepted drafts and the token after them) are the prefix the next step
-        replays, from the side this step wrote. Device ops only, so a captured
-        step records them; padding rows write the sink."""
-        plan = self.current_plan(label)
-        rows = plan.num_rows
-        slots = plan.slot_ids[:rows].long()
-        count = (accepted[:rows] + 1).to(torch.int32).unsqueeze(1)
-        spec.prefix_len.index_copy_(0, slots, count)
-        spec.side.index_copy_(0, slots, 1 - spec.side.index_select(0, slots))
 
     # Engine lifecycle
 
