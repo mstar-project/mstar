@@ -230,11 +230,9 @@ class RecurrentStatePool(Resource):
         self._snap_writes: dict[tuple[str, str, int], SnapshotWrite] = {}
         self._decode: dict[tuple[str, str], DecodeSnapshot] = {}
         self._unkeyed: set[tuple[str, str]] = set()
-        # what admits took for prefix reuse, for `rollback_admit`, and the
-        # part of it the pre-plan pass took, for `clear_preplan`
+        # what admits took for prefix reuse, for `rollback_admit`
         self._admit_restores: list[tuple[str, str]] = []
         self._admit_snaps: list[tuple[str, str, int]] = []
-        self._preplan_prefix: set[tuple] = set()
 
         # from the blocks, not the config: a dtype=None block is sized as resolved
         total_bytes = sum(t.nbytes for t in self._blocks.values())
@@ -425,12 +423,6 @@ class RecurrentStatePool(Resource):
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
                     return self._out_of_slots(rid, to_label)
-        if ctx.is_preplan and (self._admit_restores or self._admit_snaps):
-            with self._lock:
-                self._preplan_prefix = {
-                    k for k in (*self._admit_restores, *self._admit_snaps)
-                    if ctx.is_real_row(k[0])
-                }
         return ADMIT_OK
 
     def rollback_admit(self, step: RecurrentStep, ctx: StepContext) -> None:
@@ -507,24 +499,17 @@ class RecurrentStatePool(Resource):
             "planning a different step ahead"
         )
         if self._preplanned:
-            # Promotion: apply the fork copies and restores staging left
-            # undone; see `_pending_fork_state`.
+            # Promotion: apply the fork copies staging left undone; see
+            # `_pending_fork_state`.
             self._current = self._cached_plan_output
             self._maybe_apply_forks(step, ctx)
-            self._apply_restores(step)
             self._drop_stage()
-            self._preplan_prefix = set()
             return self._current
 
         # Forks run ahead of the addressing, which records `has_state`; staging
         # only reads the flag the fork will land.
         if ctx.is_preplan:
             pending = self._pending_fork_state(step)
-            if self._restores:
-                # a restore lands at promotion too, and its slot then holds state
-                rids = {seg.request_id for seg in step.segments or ()}
-                with self._lock:
-                    pending.update({key: True for key in self._restores if key[0] in rids})
         else:
             pending = {}
             self._maybe_apply_forks(step, ctx)
@@ -541,11 +526,8 @@ class RecurrentStatePool(Resource):
         return self._current
 
     def clear_preplan(self):
-        """Drop the staged plan, and give back the restores and snapshot slots
-        its pre-plan pass took. Staging touched no other live state."""
+        """Drop the staged plan; staging touched no live state, so nothing to rewind."""
         self._drop_stage()
-        with self._lock:
-            self._undo_prefix_admit(self._preplan_prefix.__contains__)
 
     def _drop_stage(self) -> None:
         self._preplanned = False
@@ -877,7 +859,6 @@ class RecurrentStatePool(Resource):
         if gone:
             self._admit_restores = [k for k in self._admit_restores if k not in gone]
             self._admit_snaps = [k for k in self._admit_snaps if k not in gone]
-            self._preplan_prefix -= gone
 
     # Addressing
 

@@ -84,8 +84,8 @@ def _pool(prefix_slots: int = 2, world_size: int = 1, prefix_cache: bool = True)
     return pool
 
 
-def _ctx(rid: str, preplan: bool = False) -> StepContext:
-    return StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False, is_preplan=preplan)
+def _ctx(rid: str) -> StepContext:
+    return StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False)
 
 
 def _step(rid: str, span: int) -> RecurrentStep:
@@ -195,36 +195,6 @@ def test_a_refused_admit_turns_the_restore_back_into_a_lease():
     assert pool._leases["b"].tokens == 8 and not pool._restores
     assert pool.cap_cached_prefix("b", NODE, WALK, CachedPrefix("main", 8, 8)).tokens == 8
     assert pool._snap_refs == {pool._leases["b"].slot: 1}, "the re-probe took a second reference"
-
-
-def test_dropping_a_pre_plan_gives_back_only_what_its_pass_took():
-    pool = _pool()
-    _snapshot(pool, "a", A, 8, 1.0)
-    for rid in ("b", "c"):
-        _probe(pool, rid, A[:12], hit=8)
-    assert pool.admit(_step("b", 4), _ctx("b")).ok
-    staged, ctx = _step("c", 4), _ctx("c", preplan=True)
-    assert pool.admit(staged, ctx).ok
-    pool.plan(staged, ctx)
-    pool.clear_preplan()
-    assert set(pool._restores) == {("b", "main")}, "the live step lost its restore"
-    assert pool._leases["c"].tokens == 8 and "b" not in pool._leases
-
-
-def test_a_pre_planned_restore_lands_when_its_plan_is_promoted():
-    """Staging must leave the slot alone, since the step in flight may still read it, but the
-    staged step's addressing already reads the slot as holding state."""
-    pool = _pool()
-    _snapshot(pool, "a", A, 8, 2.0)
-    _probe(pool, "b", A[:12], hit=8)
-    step, ahead = _step("b", 4), _ctx("b", preplan=True)
-    assert pool.admit(step, ahead).ok
-    assert bool(pool.plan(step, ahead)["main"].has_state[0]), "the staged step would read zeros"
-    slot = pool._slots["b"]["main"]
-    assert not slot.has_state
-    pool.plan(step, _ctx("b"))
-    assert slot.has_state and slot.tokens == 8
-    assert bool((_state(pool, "b") == 2.0).all()), "promotion skipped the restore"
 
 
 class _StubHit(Resource):
@@ -457,7 +427,7 @@ def test_a_prefill_hands_its_kept_states_to_the_backend_and_commit_files_them():
     assert pool._slots["a"]["main"].tokens == 19, "later boundaries would be placed from the wrong length"
 
 
-@pytest.mark.parametrize("release", ["rollback", "clear_preplan", "removal"])
+@pytest.mark.parametrize("release", ["rollback", "removal"])
 def test_a_prefill_that_never_commits_gives_its_snapshot_slots_back(release):
     """A forward that raises gets neither commit nor rollback, only the request's removal.
     Each path returns what admit reserved, or prefix reuse stops once every slot is gone."""
@@ -465,13 +435,10 @@ def test_a_prefill_that_never_commits_gives_its_snapshot_slots_back(release):
     pool.ingest_request("a")
     pool._kv.add("a", A[:19])
     pool.resolve_cached_prefix("a", NODE, WALK, None)
-    step, ctx = _step("a", 19), _ctx("a", preplan=release == "clear_preplan")
+    step, ctx = _step("a", 19), _ctx("a")
     assert pool.admit(step, ctx).ok
     if release == "rollback":
         pool.rollback_admit(step, ctx)
-    elif release == "clear_preplan":
-        pool.plan(step, ctx)
-        pool.clear_preplan()
     else:
         pool.plan(step, ctx)
         pool.remove_request("a")
