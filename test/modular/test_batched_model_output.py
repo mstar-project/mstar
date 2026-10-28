@@ -225,6 +225,7 @@ class _StagingWorker(_StubWorker):
     _host_rows_slot = 0
     _d2h_stream = None
     _stage_host_rows = Worker._stage_host_rows
+    _copy_to_pinned = Worker._copy_to_pinned
     _prematerialize_for_check_stop = Worker._prematerialize_for_check_stop
 
     def __init__(self, device=torch.device("cpu")):

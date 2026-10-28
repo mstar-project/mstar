@@ -46,6 +46,7 @@ import weakref
 from concurrent.futures import Future
 from typing import NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.communication.communicator import BaseCommunicator
@@ -878,13 +879,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         )
                         self.tensor_store.increment_ref(info.uuid, 1)
                         continue
-                    if self.tensor_store.check_uuid_presence(info.uuid):
-                        self.tensor_store.increment_ref(info.uuid, 1)
+                    producer_uuid = info.uuid
+                    if self._take_cached_read(request_id, info):
                         continue
                     if info.shm_segment is None:
                         # Spilled at the producer (arena saturated): read the
                         # per-uuid file, the old protocol's path.
-                        path = self._shm_path(info.source_entity, info.uuid)
+                        path = self._shm_path(info.source_entity, producer_uuid)
                         with open(path, "rb") as f:
                             f.seek(info.offset)
                             data = f.read(info.nbytes)
@@ -971,14 +972,27 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             return t.to(self.device) if self.device != "cpu" else t
         view = self._peer_view(info.shm_segment)
         start = info.shm_offset + info.offset  # offset = TP-shard read offset
+        if self.device == "cpu":
+            # A CPU consumer owns a copy past reclaim. numpy copies with one
+            # memcpy; clone() would split it over torch's intra-op pool.
+            flat = torch.from_numpy(np.frombuffer(
+                view, dtype=np.uint8, count=info.nbytes, offset=start).copy())
+            return flat.view(info.dtype).reshape(info.dims)
         flat = torch.frombuffer(
             view[start:start + info.nbytes], dtype=torch.uint8)
         t = flat.view(info.dtype).reshape(info.dims)
-        if self.device != "cpu":
-            return t.to(self.device, non_blocking=True)
-        return t.clone()  # CPU consumer: own the bytes past reclaim
+        return t.to(self.device, non_blocking=True)
 
     # -- reclaim ----------------------------------------------------------
+
+    def unlink_owned_files(self) -> None:
+        """The spill files, then this arena's own segments, for a process that
+        is stopping: its exit-time finalizer never runs when a hung teardown
+        ends in SIGKILL or the watchdog's hard exit. Peers keep the mappings
+        they have; the finalizer still runs at a normal exit and finds them
+        gone, and unlinks any segment grown after this call."""
+        super().unlink_owned_files()
+        _unlink_paths(list(self._own_segment_paths))
 
     def close(self) -> None:
         """Stop the wake watcher and unregister every pinned segment (the

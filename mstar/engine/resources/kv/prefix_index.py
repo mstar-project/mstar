@@ -33,6 +33,8 @@ class PrefixIndex:
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
         self._evictable: set[int] = set()
+        # pages ever inserted, which a request waiting for room is measured against
+        self.filed = 0
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
@@ -66,6 +68,7 @@ class PrefixIndex:
         if parent is not None and self._arena.index is self and self._arena.num_owners[parent] == 1:
             parent = None
         self._clock += 1
+        self.filed += 1
         self._by_key[key] = page
         self._key[page] = key
         self._parent[page] = parent

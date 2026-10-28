@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -23,6 +23,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    ASKS,
     AdmitOutcome,
     AllocationFailed,
     Segment,
@@ -58,12 +59,14 @@ class RecurrentAddressing:
     """
 
     slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
-    has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
-    num_rows: int               # real rows, before a capture bucket's padding
+    has_state: torch.Tensor     # [rows] bool, False for a slot with no saved state (fresh, or the sink)
+    num_rows: int               # the rows the step declared, a replay's padding rows included
     # The same two on the host, as built: a backend that splits rows between
     # kernels by them must not read the device copies back
     host_slot_indices: Sequence[int] | None = None
     host_has_state: Sequence[bool] | None = None
+    # scatter_'s int64 copy of slot_indices, keyed by whether a graph capture made it
+    scatter_index: dict[bool, torch.Tensor] = field(default_factory=dict, compare=False, repr=False)
 
 
 class RecurrentStatePool(Resource):
@@ -74,11 +77,22 @@ class RecurrentStatePool(Resource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
-        return cls(device=info.device, config=config)
+        world_size = 1 if info.joint_comm_group is None else info.joint_comm_group.world_size
+        # resolved here, not written back: the config is the model's, shared by its specs
+        return cls(
+            device=info.device, config=config, name=spec.resource_key, kv_dtype=info.kv_dtype,
+            world_size=world_size,
+        )
 
-    def __init__(self, device: torch.device, config: RecurrentStateConfig):
+    def __init__(
+        self, device: torch.device, config: RecurrentStateConfig, name: str = "recurrent_state",
+        kv_dtype: torch.dtype | None = None, world_size: int = 1,
+    ):
+        """``kv_dtype`` (the engine's) stands in for a block's ``dtype=None``."""
         self._device = device
         self.config = config
+        # the resource key, for errors
+        self._name = name
 
         # One [num_layers, max_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
@@ -86,7 +100,7 @@ class RecurrentStatePool(Resource):
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
                 (config.num_layers, config.max_slots, *block.shape),
-                dtype=block.dtype,
+                dtype=block.resolved_dtype(kv_dtype),
                 device=device,
             )
             for name, block in config.blocks.items()
@@ -101,10 +115,17 @@ class RecurrentStatePool(Resource):
             assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
         # guards `_slots`/`_free` across threads; see `KVManager._lock`
         self._lock = threading.RLock()
-        # (rid, label) -> slot the live admit took fresh, for `rollback_admit`.
-        # Per row like `KVManager._admit_reserved_pages`, and handle-keyed the
-        # same way, so a released request's entries are purged with it.
-        self._admit_taken: dict[tuple[str, str], int] = {}
+        # (rid, label) -> slot the live admit took fresh, and whether it took the
+        # request's reservation, for `rollback_admit`. Per row like
+        # `KVManager._admit_reserved_pages`, and handle-keyed the same way, so a
+        # released request's entries are purged with it.
+        self._admit_taken: dict[tuple[str, str], tuple[int, bool]] = {}
+        # Admission, as `KVManager` decides it: only at one rank, since a
+        # reservation held on rank 0 alone would make the ranks refuse different
+        # allocations. `_reserved` holds the requests admitted for a slot they
+        # haven't taken yet.
+        self._decides = world_size == 1
+        self._reserved: set[str] = set()
 
         self._cg_max_bs = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
@@ -123,12 +144,14 @@ class RecurrentStatePool(Resource):
         self._preplanned = False
         self._cached_plan_output: dict[str, RecurrentAddressing] | None = None
 
+        # from the blocks, not the config: a dtype=None block is sized as resolved
+        total_bytes = sum(t.nbytes for t in self._blocks.values())
         logger.info(
             "recurrent state pool: %d usable slots (+%d sink) x %d layers, "
             "%.2f MiB (%.2f KiB/slot), blocks=%s",
             config.usable_slots, config.max_slots - config.usable_slots,
             config.num_layers,
-            config.total_bytes / 2**20, config.slot_bytes / 2**10,
+            total_bytes / 2**20, total_bytes / config.max_slots / 2**10,
             {n: tuple(b.shape) for n, b in config.blocks.items()},
         )
 
@@ -137,6 +160,55 @@ class RecurrentStatePool(Resource):
     def block(self, name: str, layer_idx: int) -> torch.Tensor:
         """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
         return self._blocks[name][layer_idx]
+
+    def gather(
+        self, name: str, layer_idx: int = 0, *, label: str = "main", start: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Block ``name`` of this step's rows under ``label``, ``[rows, *shape]``
+        (a copy), in the order the step declared them.
+
+        It addresses rows through the step's plan, so a captured and an eager
+        forward read the same slots. A row with no saved state (a request's
+        first step, or a padding row on the sink) reads ``start``, zeros when
+        none is given. A row must declare span >= 1 to reach its own slot; a
+        zero-span row addresses the sink, so it reads ``start``. A pool without
+        a sink refuses (``_need_sink``)."""
+        if self.config.disable_sink_slot:
+            self._need_sink("gather")
+        rows = self.addressing(label)
+        out = self._blocks[name][layer_idx].index_select(0, rows.slot_indices[: rows.num_rows])
+        fresh = ~rows.has_state[: rows.num_rows].view(-1, *(1,) * (out.dim() - 1))
+        return torch.where(fresh, 0 if start is None else start, out)
+
+    def scatter_(self, name: str, value: torch.Tensor, layer_idx: int = 0, *, label: str = "main") -> None:
+        """Write ``value [rows, *shape]`` into block ``name`` of this step's rows
+        under ``label``, in the order ``gather`` reads them; padding rows write
+        the sink, which a pool without one refuses."""
+        if self.config.disable_sink_slot:
+            self._need_sink("scatter_")
+        rows = self.addressing(label)
+        if value.shape[0] != rows.num_rows:
+            raise ValueError(
+                f"recurrent state pool {self._name!r} label {label!r}: {value.shape[0]} rows "
+                f"for a step that declared {rows.num_rows}"
+            )
+        # index_copy_ needs int64: cast once per step, not per block and layer. A capture
+        # records its own cast, so a replay recomputes it from that replay's plan.
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        index = rows.scatter_index.get(capturing)
+        if index is None:
+            index = rows.scatter_index[capturing] = rows.slot_indices[: rows.num_rows].long()
+        self._blocks[name][layer_idx].index_copy_(0, index, value)
+
+    def _need_sink(self, op: str) -> None:
+        # Without a sink, rows with no slot address NO_SLOT, which index_select
+        # and index_copy_ refuse: an IndexError on the CPU, a device-side
+        # assert that kills the worker on CUDA.
+        raise ValueError(
+            f"recurrent state pool {self._name!r} has no sink slot "
+            f"(disable_sink_slot), so {op} has no slot for a padding row; "
+            "unset RecurrentStateConfig.disable_sink_slot to use gather / scatter_"
+        )
 
     @property
     def num_free_slots(self) -> int:
@@ -160,6 +232,7 @@ class RecurrentStatePool(Resource):
         self.reset_request(rid, free=True)
         with self._lock:
             self._slots.pop(rid, None)
+            self._reserved.discard(rid)
 
     def drop(self, rid: str) -> int:
         # zeroed in place, so recomputing the state never waits for a free slot
@@ -197,13 +270,16 @@ class RecurrentStatePool(Resource):
             slot = labels.get(label)
             if slot is not None:
                 return slot
-            if not self._free:
+            reserved = rid in self._reserved
+            if len(self._free) - len(self._reserved) + reserved <= 0:
+                # every free slot is kept for a request already admitted
                 return None
+            self._reserved.discard(rid)
             # Slot ids must be unique across the batch: kernels assume it rather
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
             slot = labels[label] = SlotState(index=self._free.pop())
-            self._admit_taken[(rid, label)] = slot.index
+            self._admit_taken[(rid, label)] = (slot.index, reserved)
             return slot
 
     def _forget_taken(self, is_mine) -> None:
@@ -212,6 +288,31 @@ class RecurrentStatePool(Resource):
         taken = self._admit_taken
         for key in [k for k in taken if is_mine(k[0])]:
             del taken[key]
+
+    # Admission: one slot for a request that holds none
+
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        if not self._decides:
+            return None
+        with self._lock:
+            if self._slots.get(rid) or rid in self._reserved:
+                return None
+        return ASKS
+
+    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        with self._lock:
+            room = len(self._free) - len(self._reserved)
+            if room <= 0:
+                return room
+            self._reserved.add(rid)
+            return None
+
+    def unreserve(self, rid: str) -> None:
+        with self._lock:
+            self._reserved.discard(rid)
+
+    def grew_since(self, mark: int) -> bool:
+        return len(self._free) - len(self._reserved) > mark
 
     # Step lifecycle
 
@@ -229,7 +330,8 @@ class RecurrentStatePool(Resource):
                 self._forget_taken(ctx.is_real_row)
         for segment in step.segments or ():
             if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
-                # reads its state without extending it, or a padding row
+                # a zero-span row is addressed at the sink, like a padding row:
+                # it neither reads nor writes its own slot
                 continue
             if self._alloc(segment.request_id, segment.label) is None:
                 return self._out_of_slots(segment.request_id, segment.label)
@@ -253,7 +355,7 @@ class RecurrentStatePool(Resource):
         with self._lock:
             taken = self._admit_taken
             for rid, label in [k for k in taken if ctx.is_real_row(k[0])]:
-                index = taken.pop((rid, label))
+                index, reserved = taken.pop((rid, label))
                 labels = self._slots.get(rid)
                 slot = labels.get(label) if labels else None
                 if slot is None or slot.index != index:
@@ -261,6 +363,8 @@ class RecurrentStatePool(Resource):
                 del labels[label]
                 self._zero_slot(index)
                 self._free.append(index)
+                if reserved:
+                    self._reserved.add(rid)
 
     def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
         return AdmitOutcome(
