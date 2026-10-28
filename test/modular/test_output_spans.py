@@ -167,6 +167,7 @@ def _worker(engine: Engine) -> tuple[Worker, dict]:
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     worker._innermost_loop_by_node = {}
     worker.request_state = SimpleNamespace(buffer_publish_info=lambda *args: None)
+    worker.scheduler = SimpleNamespace(failed_rids=set())
     return worker, stored
 
 
