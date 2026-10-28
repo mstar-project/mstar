@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource, RewindKind
 from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
     RecurrentStateSpec,
@@ -69,6 +69,9 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
+    # storage only: what a slot holds is its backend's to settle after a verify step
+    rewind_kind = RewindKind.NONE
+
     @classmethod
     def build(
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,

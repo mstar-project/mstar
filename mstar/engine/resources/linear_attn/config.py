@@ -86,3 +86,7 @@ class LinearAttnStep(ResourceStep):
     pool's own step says what becomes of the slots. The walk is derived from
     the spans.
     """
+    # A draft-verify step (``with_draft_verify`` sets it): every row is a block whose tail
+    # the verdict may reject, so the forward leaves the state as it was and the verdict
+    # settles each row's accepted prefix (``GDNManager.settle_verify``).
+    verify: bool = False

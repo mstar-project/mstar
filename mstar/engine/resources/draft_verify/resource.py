@@ -7,7 +7,8 @@ resource carries it across:
 
 - ``plan`` numbers the step and writes the number into the step's slot (its capture slot, or
   the eager one).
-- ``verify``, in the forward and capturable, runs the sampler's verify and copies each row's
+- ``verify``, in the forward and capturable, runs the sampler's verify, settles the node's
+  in-place state from the verdict on the device (``settle_verify``), and copies each row's
   verdict, then the step's number, to the slot's pinned host mirror. A host that reads the
   number has the verdict.
 - ``commit`` notes which mirror row holds each real request's verdict.
@@ -117,12 +118,14 @@ class DraftVerifyResource(Resource):
         )
         self.sampler_key = sampler
         self._sampler: SamplerResource | None = None
+        # the node's resources that `verify` settles on the device (RewindKind.DEVICE)
+        self._settlers: list[Resource] = []
         # capture slot (None: eager) -> its mirror
         self._mirrors: dict[int | None, _Mirror] = {}
         self._cg_rows = 0
         self._seq = 0
-        # (seq, slot, drafts) of the step planned last, until its commit
-        self._planned: tuple[int, int | None, int] | None = None
+        # (seq, slot, drafts, label) of the step planned last, until its commit
+        self._planned: tuple[int, int | None, int, str] | None = None
         # the step an eager forward last staged; a replay runs no Python
         self._verified = 0
         # The plan thread settles a step ahead while the gpu thread commits and emits, so
@@ -151,6 +154,13 @@ class DraftVerifyResource(Resource):
     def bind_sampler(self, sampler: SamplerResource) -> None:
         """The node's sampler, which `verify` runs; bound by the engine at load."""
         self._sampler = sampler
+
+    def bind_settlers(self, resources: Sequence[Resource]) -> None:
+        """The node's ``RewindKind.DEVICE`` resources, which `verify` settles; bound by the
+        engine at load, once per walk that verifies."""
+        for resource in resources:
+            if not any(resource is bound for bound in self._settlers):
+                self._settlers.append(resource)
 
     # ── request lifecycle ──
 
@@ -192,6 +202,15 @@ class DraftVerifyResource(Resource):
                 f"a verify step's sampler step is under {step.sampler!r}, but the node's "
                 f"DraftVerifySpec names {self.sampler_key!r}; pass it to with_draft_verify"
             )
+        label = "main"
+        if self._settlers:
+            labels = {segment.label for segment in step.segments or ()}
+            if len(labels) > 1:
+                # a settle addresses one label's rows, in the verdict's row order
+                raise ValueError(
+                    f"a verify step settles in-place state under one label; this one has {sorted(labels)}"
+                )
+            label = next(iter(labels), label)
         lease = ctx.slot_lease
         slot = None if lease is None else lease.slot
         # this step's forward writes the slot's mirror: read the rows still pending there first
@@ -200,13 +219,13 @@ class DraftVerifyResource(Resource):
         self._seq += 1
         # a kernel argument, not a host buffer, so no later plan can change it under the step
         mirror.seq_dev.fill_(self._seq)
-        self._planned = (self._seq, slot, step.drafts)
+        self._planned = (self._seq, slot, step.drafts, label)
 
     def commit(self, step: VerifyStep, ctx: StepContext) -> None:
         planned, self._planned = self._planned, None
         if planned is None:
             return
-        seq, slot, drafts = planned
+        seq, slot, drafts, _ = planned
         if ctx.slot_lease is None and self._verified != seq:
             raise RuntimeError("the forward of a verify step did not call DraftVerifyResource.verify")
         if ctx.capture:
@@ -264,15 +283,16 @@ class DraftVerifyResource(Resource):
         draft_probs: torch.Tensor | None = None,
     ) -> VerdictTensors:
         """Verify ``block`` (``block_ids``) against the target's ``logits`` over its rows,
-        ``[n * (k + 1), V]``, and stage the verdict for the host. ``request_ids`` are the rows
-        the forward ran, padding rows included. ``draft_probs`` ``[n, k, V]``: the
-        distributions a sampling drafter drew the drafts from (``draft_sample``); None takes
-        each draft as certain."""
+        ``[n * (k + 1), V]``, settle the node's in-place state by the verdict, and stage the
+        verdict for the host. ``request_ids`` are the rows the forward ran, padding rows
+        included. ``draft_probs`` ``[n, k, V]``: the distributions a sampling drafter drew the
+        drafts from (``draft_sample``); None takes each draft as certain. Call it once the
+        target has run over the whole block: a recurrent layer's settle reads what it ran."""
         if self._planned is None:
             raise RuntimeError("DraftVerifyResource.verify outside a planned verify step")
         if self._sampler is None:
             raise RuntimeError("DraftVerifyResource has no sampler bound; the engine binds it at load")
-        seq, slot, drafts = self._planned
+        seq, slot, drafts, label = self._planned
         if block.shape[1] != drafts + 1:
             raise ValueError(f"a verify block of {block.shape[1]} tokens where the step declared {drafts} drafts")
         tokens, accepted = self._sampler.verify(request_ids, block, logits, draft_probs)
@@ -282,6 +302,8 @@ class DraftVerifyResource(Resource):
         mirror.host[:n].copy_(mirror.dev[:n], non_blocking=True)
         # after the rows, on the same stream: the number lands last
         mirror.seq_host.copy_(mirror.seq_dev, non_blocking=True)
+        for resource in self._settlers:
+            resource.settle_verify(accepted, label)
         self._verified = seq
         return VerdictTensors(tokens, accepted, tokens.gather(1, accepted[:, None]))
 

@@ -52,7 +52,8 @@ def verify_walk(
     if undeclared:
         raise ValueError(
             f"{where}, but {undeclared} declare no rewind_kind, so a verify step's rejected rows "
-            "would stay in them; draft verify rewinds paged KV and sequential positions so far"
+            "would stay in them; draft verify rewinds paged KV and sequential positions, and "
+            "settles GDN state, so far"
         )
     if walk in combined_walks:
         raise ValueError(
@@ -69,4 +70,5 @@ def verify_walk(
         if res.rewind_kind is RewindKind.HOST and hasattr(res, "require_lookahead"):
             res.require_lookahead(policy.loop, policy.lookahead)
     dv.bind_sampler(sampler)
+    dv.bind_settlers([res for res in resources.values() if res.rewind_kind is RewindKind.DEVICE])
     return VerifyWalk(dv, policy, dv.sampler_key)

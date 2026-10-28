@@ -25,8 +25,12 @@ from mstar.engine.resources.draft_verify.resource import DraftVerifyResource
 from mstar.engine.resources.draft_verify.startup import verify_walk
 from mstar.engine.resources.kv import manager as kv_manager
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.linear_attn.config import LinearAttnStep
+from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.linear_attn.mamba2 import Mamba2Manager
 from mstar.engine.resources.position.config import PosScheme
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import BucketKey, SlotLease
@@ -375,6 +379,11 @@ def test_the_resources_declare_what_a_rewind_takes():
     assert kv_manager.KVManager.rewind_kind is RewindKind.HOST
     assert DraftVerifyResource.rewind_kind is RewindKind.NONE
     assert SamplerResource.rewind_kind is RewindKind.NONE
+    # recurrent state: GDN settles its own layers in the forward; the pool is storage only, and
+    # Mamba-2 declares nothing, so a node with it refuses to verify
+    assert GDNManager.rewind_kind is RewindKind.DEVICE
+    assert RecurrentStatePool.rewind_kind is RewindKind.NONE
+    assert Mamba2Manager.rewind_kind is None
 
 
 def test_the_position_rewinds_beside_the_kv_length():
@@ -385,6 +394,57 @@ def test_the_position_rewinds_beside_the_kv_length():
     assert pos.position(1, "main") == 4
     pos.rewind(VerdictBatch([1], ["main"], [10]))
     assert pos.position(1, "main") == 0
+
+
+# ── state the forward updates in place (RewindKind.DEVICE) ──
+
+
+class _Settler:
+    """Records what `verify` hands a resource the forward updates in place."""
+
+    rewind_kind = RewindKind.DEVICE
+
+    def __init__(self):
+        self.calls = []
+
+    def settle_verify(self, accepted, label):
+        self.calls.append((accepted.tolist(), label))
+
+
+def test_verify_settles_each_device_resource_once_by_rank_0s_counts():
+    res, sampler = _resource()
+    settler = _Settler()
+    # bound once per verifying walk: a resource two walks bind settles once a step
+    res.bind_settlers([settler])
+    res.bind_settlers([settler])
+    for rid in (1, 2):
+        res.ingest_request(rid)
+    _verify_step(res, sampler, [1, 2], accepted=[2, 0], padded=[1, 2, -3], slot=0)
+    # every row the forward ran, the padding row included, under the step's label
+    assert settler.calls == [([2, 0, 0], "main")]
+
+
+def test_a_verify_step_over_two_labels_has_nothing_to_settle_by():
+    res, _ = _resource()
+    res.bind_settlers([_Settler()])
+    step = VerifyStep(segments=(Segment(1, "a", K + 1), Segment(2, "b", K + 1)), drafts=K)
+    with pytest.raises(ValueError, match="under one label"):
+        res.plan(step, _ctx([1, 2]))
+
+
+def test_the_verifying_walk_binds_the_nodes_device_resources():
+    class Sub:
+        def get_draft_policy(self, walk):
+            return POLICY
+
+        def device_loopback_signals(self, walk):
+            return frozenset()
+
+    dv = DraftVerifyResource(CPU)
+    sampler = SamplerResource(vocab_size=8, enable_repetion_penalty=False, device=CPU, draft_verify=True)
+    settler = _Settler()
+    verify_walk("llm", Sub(), {"draft_verify": dv, "sampler": sampler, "state": settler}, "decode")
+    assert dv._settlers == [settler]
 
 
 # ── declarations ──
@@ -414,6 +474,9 @@ def test_with_draft_verify_adds_the_verify_step_to_rows_of_one_block():
     own = SubmoduleStep(steps={"kv": KVStep(), "sampler": SamplerStep()}, segments=step.segments)
     with pytest.raises(ValueError, match="declare none"):
         with_draft_verify(own, POLICY, "dv")
+    # a step type with a verify field is told the step verifies
+    linear = SubmoduleStep(steps={"kv": KVStep(), "lin": LinearAttnStep()}, segments=step.segments)
+    assert with_draft_verify(linear, POLICY, "dv").get("lin").verify
 
 
 def test_a_verify_step_names_the_sampler_its_resource_verifies_with():

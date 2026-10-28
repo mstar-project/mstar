@@ -27,14 +27,17 @@ class RewindKind(Enum):
     """What a resource keeps per token, as a draft-verify node's rewind sees it.
 
     A verify step commits its whole block of ``k + 1`` rows, and the verdict
-    takes the rejected ones back (``Resource.rewind``). A resource on a node
-    that verifies drafts has to say which of these it is, or the node refuses
-    to load.
+    takes the rejected ones back (``Resource.rewind``, or ``settle_verify`` on
+    the device). A resource on a node that verifies drafts has to say which of
+    these it is, or the node refuses to load.
     """
     # nothing per token: planned from another resource, or per request only
     NONE = "none"
     # a host length the rewind moves back (paged KV, positions)
     HOST = "host"
+    # state the forward updates in place (recurrent): the verdict settles it inside the
+    # forward, through ``Resource.settle_verify``
+    DEVICE = "device"
 
 
 @dataclass(frozen=True)
@@ -145,6 +148,14 @@ class Resource(ABC):
         discarded pre-plan does not bring the rejected rows back.
         """
         raise NotImplementedError(f"{type(self).__name__} declares no rewind")
+
+    def settle_verify(self, accepted: torch.Tensor, label: str) -> None:
+        """Keep each row's accepted part of the verify step running now: ``accepted [rows]``,
+        the drafts the verdict kept per row of ``label`` (device, rank 0's on a lockstep
+        instance; a replay's padding rows included). Called for a ``DEVICE`` resource by
+        ``DraftVerifyResource.verify``, inside the forward and so inside a captured graph:
+        device ops only, at the step's planned rows."""
+        raise NotImplementedError(f"{type(self).__name__} declares no device settle")
 
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;

@@ -1351,9 +1351,17 @@ out of every resource, the tokens each request emits, and the stop.
 
 Each verify step commits its whole block. Before the request's next step admits, the
 runner takes the rejected rows back from every resource of the node that declares
-``rewind_kind = RewindKind.HOST`` (paged KV and positions so far). A resource that
-declares no ``rewind_kind`` keeps the node from loading, as does a combined walk over the
-verifying walk or a prefix-cache key on its labels.
+``rewind_kind = RewindKind.HOST`` (paged KV and positions so far). State a forward updates
+in place declares ``RewindKind.DEVICE``: ``verify`` hands it each row's accepted count and
+the step's label inside the forward (``Resource.settle_verify``), after the target has run
+over the block, so a captured step records the settle too. ``with_draft_verify`` sets
+``verify=True`` on every step of the submodule's with a ``verify`` field. The GDN resource
+is one: under ``LinearAttnStep(verify=True)`` it runs each block from the slot without
+writing the state, and its settle runs the block again from the slot with every rejected
+token's gates closed, which leaves the state and conv window after the kept prefix. The
+recurrent pool is storage (``NONE``); a backend that can't settle (Mamba-2 so far) declares
+nothing. A resource that declares no ``rewind_kind`` keeps the node from loading, as does a
+combined walk over the verifying walk or a prefix-cache key on its labels.
 
 Verification is greedy unless the sampler declares ``enable_sampled_verify=True``: a
 greedy verify keeps the drafts that equal the target's argmax, and refuses a request with a
