@@ -344,7 +344,8 @@ class Cosmos3Config:
     # context-derived pixels are trimmed. Raise if window boundaries seam.
     # With windowed_decode_warm_cache this re-decode runs only for a warm
     # stream's first window (fresh or resumed); a stream's windows all go to
-    # the decoder copy it was admitted to.
+    # the decoder copy it was admitted to. The DiT decodes a chained window's
+    # re-encoded head behind the same context.
     windowed_decode_context_latents: int = 8
     # Keep each live stream's VAE decoder cache (the last frames every causal
     # conv saw) in its request state, so a window decodes only its new latents.

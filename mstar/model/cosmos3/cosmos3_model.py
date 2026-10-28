@@ -37,8 +37,9 @@ Edge checkpoints add the reasoner (the understanding tower served as a VLM):
 
 Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
     video_gen_ar - the denoise loop run window by window over a long clip.
-                 ``chained`` windows re-pin the previous window's tail as clean
-                 conditioning; ``kv`` windows attend block-causally over the
+                 ``chained`` windows pin the previous window's last frames,
+                 re-encoded as a clip of their own, as clean conditioning;
+                 ``kv`` windows attend block-causally over the
                  committed K/V of earlier windows (one commit iteration per
                  window appends the finished window's clean K/V; the pool's
                  retention policy releases frames past the context horizon at
@@ -1828,6 +1829,10 @@ class Cosmos3Model(Model):
                 transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
                 config=self.config,
                 scheduler=self._build_scheduler(),
+                # Chained windows re-encode the frames they continue from;
+                # the same instance as the whole-clip decoder when both
+                # nodes share a process.
+                head_vae=self._build_vae(device) if self._windowed_serving_enabled() else None,
             )
         if node_name == VAE_ENCODER_NODE:
             return Cosmos3VAEEncoderSubmodule(
