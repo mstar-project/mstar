@@ -132,9 +132,9 @@ def usage_table(r):
 
 def handoff(messages, root, diff_paths, previous=None):
     """What a stopped run leaves for the next one: the inline comments it made (and whether each
-    posted), the files it read, its latest progress note and what it wrote since (the model often
-    keeps no note, but says what it is doing as it goes). Merged onto ``previous``, the handoff
-    the run itself started from, if any."""
+    posted), the files it read, the latest progress note and what was written since (the model
+    often keeps no note, but says what it is doing as it goes). Merged onto ``previous``, the
+    handoff the run itself started from, if any."""
     prev = previous or {}
     results = {}
     for m in messages:
@@ -143,7 +143,8 @@ def handoff(messages, root, diff_paths, previous=None):
                 results[b["tool_use_id"]] = b
     comments = {c.get("id") or f"earlier-{i}": c for i, c in enumerate(prev.get("comments", []))}
     reads = set(prev.get("reads", []))
-    note, since_note, wrote = None, [], False
+    # The earlier runs' text since their note, one line per item, so the newest of it is kept.
+    note, since_note = None, prev["recent_text"].split("\n") if prev.get("recent_text") else []
     prefix = root.rstrip("/") + "/"
     for m in messages:
         main_thread = not m.get("parent_tool_use_id") and not m.get("isSidechain")
@@ -168,7 +169,7 @@ def handoff(messages, root, diff_paths, previous=None):
                 path = str(inp["file_path"])
                 reads.add(path[len(prefix):] if path.startswith(prefix) else path)
             elif kind == "text" and main_thread and str(b.get("text", "")).strip():
-                text, wrote = b["text"].strip(), True
+                text = b["text"].strip()
                 if PROGRESS.match(text):
                     note, since_note = text, []
                 else:
@@ -180,7 +181,7 @@ def handoff(messages, root, diff_paths, previous=None):
         "reads": sorted(reads),
         "not_opened": [p for p in diff_paths if p not in opened],
         "note": shorten(note or prev.get("note") or "", NOTE_CHARS),
-        "recent_text": newest(since_note, RECENT_TEXT_CHARS) if wrote else prev.get("recent_text") or "",
+        "recent_text": newest(since_note, RECENT_TEXT_CHARS),
         "seen_assistant": any(map(from_api, messages)),
     }
 
@@ -198,7 +199,7 @@ def shorten(text, limit):
 def newest(texts, limit):
     """The newest of ``texts`` that fit in ``limit`` characters, oldest first, one per line. Older
     texts are dropped whole, since the newest says where the run stopped."""
-    kept, size = [], 0
+    kept, size = [], -1  # the length of the kept texts joined by newlines
     for text in reversed(texts):
         if kept and size + len(text) + 1 > limit:
             break
@@ -258,7 +259,7 @@ def handoff_md(h, pr, head, mode):
             parts.append(f"## {title}\n\n" + "\n".join(lines))
     if h["note"]:
         parts.append("## Latest progress note\n\n" + quote(h["note"]))
-    # Text written after the note, by its run or by a later one that wrote no note.
+    # Text written after the note, by its run and the later ones.
     if h["recent_text"]:
         parts.append(("## Latest notes, after that progress note" if h["note"] else
                       "## Latest notes (no progress note was written)") + "\n\n" + quote(h["recent_text"]))

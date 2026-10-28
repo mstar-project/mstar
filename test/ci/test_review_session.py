@@ -141,7 +141,8 @@ class TestHandoff(unittest.TestCase):
         self.assertIn("## Inline comments already posted\n\n- `mstar/a.py:10` **[P1]** drops a token", md)
 
     def test_a_continued_run_merges_onto_its_handoff(self):
-        first = json.loads(json.dumps(handoff(self.run_messages(), ROOT, ["mstar/a.py", "mstar/c.py"])))
+        after_note = assistant("m7", text("Candidate P1 `mstar/b.py:40`, verifying.\n\nNext: c.py"))
+        first = json.loads(json.dumps(handoff(self.run_messages() + [after_note], ROOT, ["mstar/a.py", "mstar/c.py"])))
         second = handoff([assistant("n1", text("No note here"),
                                     tool("r3", "Read", file_path=f"{ROOT}/pr-head/mstar/c.py"))],
                          ROOT, ["mstar/a.py", "mstar/c.py"], first)
@@ -149,7 +150,8 @@ class TestHandoff(unittest.TestCase):
         self.assertEqual(len(second["comments"]), 3, "the first run's inline comments would be forgotten")
         self.assertEqual(second["not_opened"], [])
         self.assertTrue(second["note"].startswith("Progress:"), "the last progress note would be lost")
-        self.assertEqual(second["recent_text"], "No note here")
+        self.assertEqual(second["recent_text"], "Candidate P1 `mstar/b.py:40`, verifying.\n\nNext: c.py\nNo note here",
+                         "what the first run wrote after its note would be dropped")
         self.assertIn("No note here", SESSION["handoff_md"](second, "568", "abc", "light"),
                       "the first run's note would hide what the second run said last")
 
