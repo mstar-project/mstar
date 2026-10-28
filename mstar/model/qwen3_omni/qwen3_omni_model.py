@@ -684,7 +684,6 @@ class Qwen3OmniModel(Model):
                     ),
                     "prefill_chunks_processed": 0,
                     "voice": model_kwargs.get("voice", "Ethan"),
-                    "talker_max_tokens": self._get_max_talker_output_tokens(**model_kwargs),
                 },
             )
             return ForwardPassArgs(
@@ -694,7 +693,6 @@ class Qwen3OmniModel(Model):
                 request_done="audio" not in output_modalities,
                 step_metadata={
                     "voice": model_kwargs.get("voice", "Ethan"),
-                    "talker_max_tokens": full_metadata.kwargs.get("talker_max_tokens")
                 }
             )
         elif partition_name == "Code2Wav":
@@ -1005,7 +1003,6 @@ class Qwen3OmniModel(Model):
                     "is_prefill": True,
                     # voice is used for the last prefill
                     "voice": metadata.kwargs.get("voice", "Ethan"),
-                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
                 },
             )
         elif metadata.graph_walk == "talker_last_prefill":
@@ -1027,7 +1024,6 @@ class Qwen3OmniModel(Model):
                 unpersist_tensors=unpersist_tensors,
                 step_metadata={
                     "is_prefill": False,
-                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
                 },
             )
 
@@ -1354,9 +1350,11 @@ class Qwen3OmniModel(Model):
         }
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # each last prefill samples the first token (the Thinker's) or codec
+        # frame (the Talker's), so each decode runs one fewer
         return {
-            "thinker_decode_loop": self.get_max_output_tokens(**model_kwargs),
-            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs)),
+            "thinker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1),
+            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs) - 1),
         }
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:

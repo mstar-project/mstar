@@ -560,7 +560,7 @@ def test_decoder_logit_rules():
     assert torch.isinf(later[0, [1, 2]]).all() and torch.isfinite(later[0, EOT])
 
 
-def test_decoder_check_stop_honors_eos_and_max_tokens():
+def test_decoder_check_stop_honors_eos_and_leaves_the_budget_to_the_cap():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
 
@@ -579,7 +579,8 @@ def test_decoder_check_stop_honors_eos_and_max_tokens():
     assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), eos) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
-    assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == {"decode_loop"}
+    # the last iteration of a 4-token budget: the loop's cap ends it, not the stop check
+    assert sub.check_stop("r", info(DECODE_WALK, 2, max_tokens=4), word) == set()
 
 
 def test_decoder_check_stop_batched_agrees_with_per_request():
@@ -600,7 +601,7 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
         "eos": info(DECODE_WALK, 0, 0),                       # stops
         "word": info(DECODE_WALK, 0, 1),                      # keeps going
         "ignored": info(DECODE_WALK, 0, 2, ignore_eos=True),  # EOS ignored
-        "budget": info(DECODE_WALK, 3, 3, max_tokens=4),      # out of budget
+        "budget": info(DECODE_WALK, 2, 3, max_tokens=4),      # last iteration: the cap ends it
         "prefill": info(PREFILL_WALK, 0, 4),                  # never stops the loop
     }
     check = ["prefill", "budget", "ignored", "word", "eos"]  # not forward order
@@ -610,7 +611,7 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
         if got:
             per_request[rid] = got
-    assert batched == per_request == {"eos": {"decode_loop"}, "budget": {"decode_loop"}}
+    assert batched == per_request == {"eos": {"decode_loop"}}
     # no token buffer: the engine falls back to the per-request path
     assert sub.check_stop_batched(["eos"], infos, HostRows(("eos",), {})) is None
 

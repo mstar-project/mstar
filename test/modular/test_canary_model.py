@@ -120,8 +120,9 @@ def test_graph_and_limits(snapshot):
     assert model.get_max_output_tokens(max_output_tokens=None) == 64 - 9
     # published, so the conductor refuses a larger request instead of cutting it short
     assert model.get_max_output_tokens_limit() == 64 - 9
-    # the request's max_output_tokens caps the loop, not the graph's max_iters
-    assert model.get_loop_caps(max_output_tokens=10) == {"decode_loop": 10}
+    # the request's max_output_tokens caps the loop, not the graph's max_iters; the
+    # prefill samples the first of them
+    assert model.get_loop_caps(max_output_tokens=10) == {"decode_loop": 9}
 
 
 def test_request_cap_must_fit_the_kv_pools(snapshot):
@@ -343,7 +344,8 @@ def test_prefill_reserves_each_clips_context_once():
 
 def test_batched_stop_check_agrees_with_the_per_request_one():
     """Rows come in the order the forward ran the requests, which needn't be
-    the order the worker asks in; EOS, ignore_eos and the token limit."""
+    the order the worker asks in; EOS and ignore_eos. The token limit is the
+    loop's cap, so a word on the limit's last iteration stops nothing here."""
     from types import SimpleNamespace
 
     from mstar.model.canary.config import SAMPLER
@@ -355,7 +357,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
         return SimpleNamespace(resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
                                dynamic_loop_iter_counts={"decode_loop": decoded}, max_tokens=max_tokens)
 
-    infos = {"eos": info(), "ignored": info(ignore_eos=True), "limit": info(decoded=9, max_tokens=10), "go": info()}
+    infos = {"eos": info(), "ignored": info(ignore_eos=True), "limit": info(decoded=8, max_tokens=10), "go": info()}
     rows = ("go", "limit", "eos", "ignored")
     tokens = torch.tensor([[7], [7], [3], [3]])
     asked = ["eos", "ignored", "limit", "go"]
@@ -364,9 +366,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
         asked, infos, HostRows(request_ids=rows, buffers={"new_token": tokens}), step_walk="decode",
     )
     one_by_one = {rid: node.check_stop(rid, infos[rid], {"new_token": [tokens[rows.index(rid)]]}) for rid in asked}
-    assert batched == {rid: stop for rid, stop in one_by_one.items() if stop} == {
-        "eos": {"decode_loop"}, "limit": {"decode_loop"},
-    }
+    assert batched == {rid: stop for rid, stop in one_by_one.items() if stop} == {"eos": {"decode_loop"}}
 
 
 def test_decoder_node_caps_captures_and_names(snapshot):

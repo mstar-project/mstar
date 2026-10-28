@@ -211,15 +211,12 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        # the token budget is the loop's cap (`get_loop_caps`)
         if "new_token" not in outputs:
             return set()
         token = outputs["new_token"][0].item()
-        eos_token_id = self.config.stop_token_id
-        ignore_eos= request_info.resource_configs[SAMPLER].ignore_eos
-        if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
-            return {"decode_loop"}
-        return set()
+        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+        return {"decode_loop"} if not ignore_eos and token == self.config.stop_token_id else set()
 
 
 class SNACDecoderSubmodule(NodeSubmodule):

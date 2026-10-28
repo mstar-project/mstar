@@ -354,10 +354,17 @@ text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label w
    the default ``max_output_tokens`` cut to the context its prompt leaves, and a stop check
    reads that length from ``request_info.max_tokens``, which carries the cut. A model that
    reads a length from another key lists it in ``LENGTH_KWARGS``. Speculation never runs past a
-   cap. A model whose stop
-   check ends a loop at a count returns that count, so the cap and the stop check end the
-   loop on the same iteration; ``test/modular/test_model_kv_layouts.py`` checks this for
-   every model. Growth on an uncapped loop is counted to its graph ``max_iters``.
+   cap. Growth on an uncapped loop is counted to its graph ``max_iters``.
+
+   The cap is the request's token budget: both graph runtimes end the loop there, so a stop
+   check need only look for a stop token. Count what the walks before the loop emit. A
+   prefill that samples the first token leaves the decode loop ``max_output_tokens - 1``
+   iterations, and at least 1, since a loop runs at least once; mark that prefill's emitted
+   edge ``conductor_new_token=True`` so the conductor ends a one-token request after the
+   prefill instead. A loop that its cap ends gets no ``publish_after_stop``, so a model that
+   publishes final-only state (BAGEL's ``final_publish_labels``) also ends the loop in its
+   stop check, on the same iteration. ``test/modular/test_model_kv_layouts.py`` and
+   ``test/modular/test_max_output_tokens.py`` check the count for each model.
 
 Where ``process_prompt`` computes a length that a walk computes another way, such as a
 media item's rows, the walk asserts the two agree: BAGEL's ViT walk against
@@ -927,7 +934,8 @@ Step 3 — Declare the computation graph
   ``EMIT_TO_CLIENT`` and ``EMPTY_DESTINATION`` are defined in
   ``mstar/graph/special_destinations.py``. Note that no edge flag stops a ``decode``
   loop. A loop stops when a submodule's ``check_stop`` registers a stop signal against
-  that ``Loop``, for example on EOS. See Step 4.
+  that ``Loop``, for example on EOS, or when it has run the request's cap from
+  ``get_loop_caps``. See Step 4.
 - ``Sequential([...])`` and ``Parallel([...])`` compose subgraphs in order or
   concurrently.
 - ``Loop(name, section, max_iters, outputs)`` is a subgraph that iterates. Its body feeds
@@ -1039,7 +1047,7 @@ methods are:
 ``check_stop(...) -> set[str]`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
-   terminates.
+   terminates before its cap; the token budget itself is the cap from ``get_loop_caps``.
 
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,

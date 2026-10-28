@@ -377,7 +377,8 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill samples the first token, so decode runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         """The LLM's prompt is its token ids. Its generated audio codes never

@@ -1163,15 +1163,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        # the token budget is the loop's cap (`get_loop_caps`)
         if "new_token" not in outputs or request_info.graph_walk != "thinker_decode":
             return set()
         token = outputs["new_token"][0].item()
-        ignore_eos= request_info.resource_configs[THINKER_SAMPLER].ignore_eos
-        eos_token_id = self.config.im_end_token_id
-        if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 1 >= request_info.max_tokens):
-            return {"thinker_decode_loop"}
-        return set()
+        ignore_eos = request_info.resource_configs[THINKER_SAMPLER].ignore_eos
+        return {"thinker_decode_loop"} if not ignore_eos and token == self.config.im_end_token_id else set()
 
     def filter_batched_output(
         self,
@@ -1683,15 +1680,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        # the frame budget (talker_max_output_tokens) is the loop's cap
         if "layer0_codes" not in outputs:
             return set()
-        token = outputs["layer0_codes"][0].item()
         eos_token_id = self.config.talker.codec_eos_token_id
-        max_tokens = request_info.step_metadata.get(
-            "talker_max_tokens", request_info.max_tokens
-        )
-        if (eos_token_id is not None and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
+        if eos_token_id is not None and outputs["layer0_codes"][0].item() == eos_token_id:
             return {"talker_decode_loop"}
         return set()
 

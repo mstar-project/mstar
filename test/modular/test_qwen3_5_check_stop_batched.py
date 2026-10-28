@@ -35,7 +35,7 @@ def test_batched_agrees_with_per_request(shape):
     row_rids = ("d", "a", "c", "b", "e")
     infos = {
         "d": _info(),                        # EOS: stops
-        "a": _info(done=99, max_tokens=100), # out of budget: stops
+        "a": _info(done=98, max_tokens=100), # last iteration: the loop's cap ends it
         "c": _info(ignore_eos=True),         # EOS ignored: keeps going
         "b": _info(),                        # other stop id: stops
         "e": _info(),                        # stopped a step ago, not checked
@@ -52,7 +52,7 @@ def test_batched_agrees_with_per_request(shape):
         if got:
             per_request[rid] = got
     assert batched == per_request
-    assert batched == {"d": {"decode_loop"}, "a": {"decode_loop"}, "b": {"decode_loop"}}
+    assert batched == {"d": {"decode_loop"}, "b": {"decode_loop"}}
 
 
 def test_only_a_decode_rows_token_can_stop():
@@ -85,7 +85,7 @@ def test_engine_falls_back_and_attributes_failures():
     from mstar.engine.engine import Engine
 
     failures = {}
-    infos = {"a": _info(done=99, max_tokens=100)}  # "x" missing
+    infos = {"a": _info()}  # "x" missing
     batch = SimpleNamespace(
         node_name="LLM",
         request_ids=["a", "x"],
@@ -100,7 +100,7 @@ def test_engine_falls_back_and_attributes_failures():
         check_stop=lambda rid, info, out: LLMSubmodule.check_stop(_sub(), rid, info, out),
     )
     engine = SimpleNamespace(_submodules={"LLM": SimpleNamespace(submodule=sub)})
-    tokens = torch.tensor([3, 3])
+    tokens = torch.tensor([EOS, 3])
     outputs = {"a": {"new_token": [tokens[0:1]]}, "x": {"new_token": [tokens[1:2]]}}
     stops = Engine.check_stop_for_batch(
         engine, batch, outputs, host_rows=HostRows(("a", "x"), {"new_token": tokens}),
@@ -120,7 +120,7 @@ def test_rows_out_of_batch_order_still_map_by_request():
 
     sub = LLMSubmodule.__new__(LLMSubmodule)
     sub.config = SimpleNamespace(stop_token_ids={7})
-    rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 1])})
+    rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 7])})
 
     def info(max_tokens, iters=0):
         return SimpleNamespace(
@@ -129,7 +129,7 @@ def test_rows_out_of_batch_order_still_map_by_request():
             dynamic_loop_iter_counts={"decode_loop": iters}, max_tokens=max_tokens,
         )
 
-    infos = {"a": info(100), "b": info(100), "c": info(5, iters=4), "d": info(100)}
+    infos = {"a": info(100), "b": info(100), "c": info(100), "d": info(100)}
     stops = LLMSubmodule.check_stop_batched(sub, ["c", "d", "b", "a"], infos, rows)
     assert stops == {"c": {"decode_loop"}, "b": {"decode_loop"}}
     # forward order: the same answer without the row map

@@ -172,7 +172,8 @@ class HiggsAudioModel(Model):
         return model_kwargs.get("max_output_tokens", 1024)
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the last prefill samples the first token, so decode runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(
@@ -186,6 +187,9 @@ class HiggsAudioModel(Model):
                 name="new_token",
                 output_modality="text",
                 persist=True,
+                # counted, so a one-token request ends after prefill: a loop
+                # runs at least once
+                conductor_new_token=True,
             ),
         ]
 

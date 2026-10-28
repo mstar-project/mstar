@@ -337,12 +337,9 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        # the token budget is the loop's cap (`get_loop_caps`)
         if "new_token" not in outputs or request_info.graph_walk != "decode":
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        decoded_tokens = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-        if (not ignore_eos and token in self.config.stop_token_ids) or \
-                decoded_tokens >= request_info.max_tokens:
-            return {"decode_loop"}
-        return set()
+        return {"decode_loop"} if not ignore_eos and token in self.config.stop_token_ids else set()

@@ -623,17 +623,13 @@ class LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        # only a decode row's stop can end decode_loop; a prefill is not in it yet
+        # only a decode row's stop can end decode_loop; a prefill is not in it
+        # yet. The token budget is the loop's cap (`get_loop_caps`).
         if request_info.graph_walk != "decode" or "new_token" not in outputs:
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        hit_eos = not ignore_eos and token in self.config.stop_token_ids
-        out_of_budget = (
-            request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-            >= request_info.max_tokens
-        )
-        return {"decode_loop"} if hit_eos or out_of_budget else set()
+        return {"decode_loop"} if not ignore_eos and token in self.config.stop_token_ids else set()
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         # decode rows are one token each, like the template; the prefill walks
@@ -668,13 +664,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 continue
             # the set test first: a stop id is rare, the config read behind it
             # goes through the wrapper
-            if (
-                value in stop_ids
-                and not info.resource_configs[SAMPLER].ignore_eos
-            ) or (
-                info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-                >= info.max_tokens
-            ):
+            if value in stop_ids and not info.resource_configs[SAMPLER].ignore_eos:
                 stops[rid] = {"decode_loop"}
         return stops
 

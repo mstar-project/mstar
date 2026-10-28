@@ -16,7 +16,9 @@ class TokenStepNode:
 
     A subclass binds ``SAMPLER`` to its sampler resource's key and sets
     ``MAX_PREFILL_BATCH_SIZE`` and ``stop_token_ids``; it overrides the walk
-    and loop names if its graph uses others.
+    and loop names if its graph uses others. The stop check looks for a stop
+    token only: the request's token budget is the decode loop's cap, which
+    the model sets in ``get_loop_caps``.
     """
 
     DECODE_WALK = "decode"
@@ -60,9 +62,7 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        ignore_eos = request_info.resource_configs[self.SAMPLER].ignore_eos
-        decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
-        return (not ignore_eos and token in self.stop_token_ids) or decoded >= request_info.max_tokens
+        return token in self.stop_token_ids and not request_info.resource_configs[self.SAMPLER].ignore_eos
 
     def check_stop(
         self,

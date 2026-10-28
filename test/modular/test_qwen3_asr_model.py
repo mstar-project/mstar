@@ -187,11 +187,12 @@ def test_prompt_layout_matches_reference_template():
         model.prompt_ids(2, context="hello <|audio_pad|> world")
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64, 8192])
+@pytest.mark.parametrize("max_tokens", [1, 2, 64, 8192])
 def test_decode_ends_at_the_cap_and_the_loop_holds_any_cap_the_context_does(max_tokens):
-    """The request's cap is the iteration check_stop ends decode on, and the graph's
-    decode loop runs to the context, so a length past the default cap is served
-    rather than refused at intake."""
+    """The cap is the rest of the request's budget after the prefill's token, only
+    a stop token ends decode before it, and the graph's decode loop runs to the
+    context, so a length past the default cap is served rather than refused at
+    intake."""
     from types import SimpleNamespace
 
     from mstar.engine.resources import SamplingReqConfig
@@ -201,16 +202,17 @@ def test_decode_ends_at_the_cap_and_the_loop_holds_any_cap_the_context_does(max_
     cap = model.get_loop_caps(max_output_tokens=max_tokens)[DECODE_LOOP]
     assert cap <= model.get_graph_walk_graphs()[DECODE_WALK].max_iters
 
+    assert 1 + cap == max(max_tokens, 2), "the prefill's token and the cap aren't the request's budget"
+
     llm = Qwen3ASRLLMSubmodule(None, model.config)
     word = {"new_token": [torch.tensor([1234])]}
-    stopped = next(
-        k + 1 for k in range(cap + 1)
-        if llm.check_stop("r", SimpleNamespace(
-            graph_walk=DECODE_WALK, max_tokens=cap, dynamic_loop_iter_counts={DECODE_LOOP: k},
+    assert not any(
+        llm.check_stop("r", SimpleNamespace(
+            graph_walk=DECODE_WALK, max_tokens=max_tokens, dynamic_loop_iter_counts={DECODE_LOOP: k},
             resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
         ), word)
-    )
-    assert stopped == cap, "the cap and the stop check end decode on different iterations"
+        for k in range(cap)
+    ), "the stop check ends decode before its cap on a token that is not a stop token"
 
 def test_process_prompt_builds_features_and_prompt():
     model = _make_model()
@@ -395,7 +397,8 @@ def test_llm_check_stop():
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
-    assert sub.check_stop("r", info(DECODE_WALK, 9, max_tokens=10), word) == {"decode_loop"}
+    # the last iteration of a 10-token budget: the loop's cap ends it, not the stop check
+    assert sub.check_stop("r", info(DECODE_WALK, 8, max_tokens=10), word) == set()
 
 
 def test_llm_check_stop_batched_agrees_with_per_request():
@@ -415,7 +418,7 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         "word": info(DECODE_WALK, 0),
         "eot": info(DECODE_WALK, 0),
         "ignored": info(DECODE_WALK, 0, ignore_eos=True),
-        "budget": info(DECODE_WALK, 9, max_tokens=10),
+        "budget": info(DECODE_WALK, 8, max_tokens=10),  # last iteration: the cap ends it
         "prefill": info(PREFILL_WALK, 0),
     }
     check = list(reversed(row_rids))  # not forward order
@@ -427,9 +430,7 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
         if got:
             per_request[rid] = got
-    assert batched == per_request == {
-        "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "budget": {"decode_loop"},
-    }
+    assert batched == per_request == {"im_end": {"decode_loop"}, "eot": {"decode_loop"}}
     assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 
 

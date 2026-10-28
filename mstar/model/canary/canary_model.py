@@ -172,7 +172,8 @@ class CanaryModel(Model):
         return self.get_max_output_tokens()
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill samples the first token, so decode runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([
@@ -185,7 +186,11 @@ class CanaryModel(Model):
                 name="decoder",
                 input_names=["encoder_states", "text_inputs"],
                 outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text", persist=True),
+                    # counted, so a one-token request ends here: a loop runs at least once
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text", persist=True,
+                        conductor_new_token=True,
+                    ),
                 ],
             ),
         ])

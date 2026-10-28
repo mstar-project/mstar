@@ -839,9 +839,11 @@ class Model(ABC):
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         """The iterations each named loop may run for this request, each at least 1.
 
-        A loop runs the smaller of its graph ``max_iters`` and its cap. A model
-        whose stop check ends a loop at a count sets the cap to that count, so the
-        loop ends on the same iteration and never speculates past it.
+        A loop runs the smaller of its graph ``max_iters`` and its cap, and never
+        speculates past it, so the cap is the request's budget for a decode loop:
+        ``max_output_tokens`` less what the walks before it emit (one token, for a
+        prefill that samples the first). A model whose stop check ends a loop at a
+        count sets the cap to that count, so the loop ends on the same iteration.
         """
         return {}
 

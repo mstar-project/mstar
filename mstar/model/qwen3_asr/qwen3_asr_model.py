@@ -237,6 +237,8 @@ class Qwen3ASRModel(Model):
                         name="new_token",
                         output_modality="text",
                         persist=True,
+                        # counted, so a one-token request ends here: a loop runs at least once
+                        conductor_new_token=True,
                     ),
                 ],
             ),
@@ -428,7 +430,8 @@ class Qwen3ASRModel(Model):
         )
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+        # the prefill samples the first token, so decode runs one fewer
+        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
