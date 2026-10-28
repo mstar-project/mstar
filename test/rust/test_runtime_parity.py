@@ -343,19 +343,7 @@ def test_speculation_agrees(pair):
     assert _ready(rt) == []
 
 
-@pytest.mark.parametrize("make", [_python, _rust])
-def test_a_disabled_node_walk_is_never_a_speculation_target(make):
-    """A chunkable (node, walk) is measured and cut when scheduled, so the
-    runtime never offers it, whether entered or looped back into."""
-    rt, _book, _store = make(disable_spec_node_walks=[("ar_decode", WALK)])
-    rid = _admit(rt)
-    assert _spec_targets(rt, "prefill", WALK, rid) == []
-    assert _spec_targets(rt, "ar_decode", WALK, rid) == []
-    assert _ready(rt) == []
 
-    rt, _book, _store = make(disable_spec_node_walks=[("ar_decode", "another_walk")])
-    rid = _admit(rt)
-    assert [o.node_name for o in _spec_targets(rt, "prefill", WALK, rid)] == ["ar_decode"]
 
 
 def test_loop_iters_agree(pair):

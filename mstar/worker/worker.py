@@ -506,9 +506,6 @@ class Worker:
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
-            disable_spec_node_walks=(
-                loaded.chunkable_node_walks(model) if loaded is not None else ()
-            ),
         )
 
         self.engine_manager = EngineManager.build(
@@ -1753,8 +1750,13 @@ class Worker:
     # Output handling
     # ------------------------------------------------------------------
     def _push_back_batch(self, batch: ScheduledBatch) -> None:
-        """Return a whole batch's nodes to the ready set (admit refusal, OOM)."""
+        """Return a whole batch's nodes to the ready set (admit refusal, OOM).
+
+        The chunks this step was cut for did not run, so its lookahead goes
+        too: the retry is cut from where the last chunk landed.
+        """
         rids = list(batch.request_to_worker_graph)
+        self.scheduler.drop_chunk_lookahead(rids, batch.node_name)
         self._graph_runtime.push_back_node(
             batch.node_name, rids,
             [batch.request_to_worker_graph[rid] for rid in rids],
@@ -2724,6 +2726,7 @@ class Worker:
                 speculating_same_node,
             ),
             mid_prefill=mid_prefill,
+            speculative=True,
         )
 
         if fresh_batch is not None:
@@ -4659,11 +4662,16 @@ class Worker:
                                 speculation.plan_future = None
                             if not speculation.is_yield_away:
                                 # The step will not run at all: un-ingest every
-                                # staged chunk and hand them all back.
+                                # staged chunk and hand them all back. Its
+                                # chunk lookahead goes too, or the next step
+                                # would start past tokens nothing prefilled.
+                                sb = speculation.scheduled_batch
+                                self.scheduler.drop_chunk_lookahead(
+                                    list(sb.request_to_worker_graph), sb.node_name,
+                                )
                                 self._settle_speculation(speculation, success=False)
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.
-                                sb = speculation.scheduled_batch
                                 fresh = [
                                     rid for rid in sb.request_to_worker_graph
                                     if rid not in speculation.continuing_rids

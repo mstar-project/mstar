@@ -41,7 +41,7 @@ from mstar.worker.batch_builder import (
     BatchBuildResult,
     FIFOBatchBuilder,
 )
-from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, MidPrefillRow, ScheduledBatch
+from mstar.worker.micro_scheduler import ChunkCursor, MicroScheduler, MidPrefillRow, ScheduledBatch
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -1843,7 +1843,8 @@ def test_a_chunked_row_starts_past_its_cached_prefix():
     first = _next_batch(sched, manager)
 
     assert first.chunk_ranges == {"p0": (4, 6, 10)}
-    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(4, 10)
+    progress = sched.chunk_progress[("p0", NODE)]
+    assert (progress.done, progress.total) == (4, 10)
     assert not sched.cached_prefix
 
 
@@ -1930,7 +1931,11 @@ def test_a_mixing_merge_runs_the_next_chunk_of_a_row_whose_chunk_is_in_flight():
 
     assert merged.chunk_ranges == {"p0": (4, 8, 10)}
     assert merged.incomplete_node_rids == {"p0"}
-    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(0, 10), "nothing landed yet"
+    progress = sched.chunk_progress[("p0", NODE)]
+    assert (progress.done, progress.total) == (0, 10), "nothing landed yet"
+    # two chunks are now in flight and neither has landed, so the next one is
+    # cut after the second -- reading ``done`` would re-run both
+    assert progress.next_start() == 8
     assert not manager.pops[1:], "nothing popped: the row's node is in flight"
 
 
@@ -1979,3 +1984,60 @@ def test_the_last_chunk_of_a_row_mid_prefill_runs_whole_in_the_merge():
 
     assert merged.chunk_ranges == {"p0": (8, 10, 10)}
     assert not merged.incomplete_node_rids
+
+
+# ── the chunk lookahead ─────────────────────────────────────────────────
+
+
+def test_a_speculative_chunk_is_cut_after_the_one_in_flight():
+    """Speculating the next chunk means cutting it before the current one
+    lands, so it has to read the lookahead; ``done`` would re-run the tokens
+    the step in flight is already running."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 4, 10)}
+
+    manager.queues["wg0"]._ready.update({"p0": {NODE}})
+    spec = _next_batch(sched, manager, speculative=True)
+
+    assert spec.chunk_ranges == {"p0": (4, 8, 10)}
+    progress = sched.chunk_progress[("p0", NODE)]
+    assert progress.done == 0, "nothing landed"
+    assert progress.cursor_spec == ChunkCursor(4, 8)
+    assert progress.cursor == ChunkCursor(0, 4), "the committed one is untouched"
+
+
+def test_a_cleared_speculation_leaves_the_next_chunk_where_it_was():
+    """A speculation that never runs must leave no trace, or the step after it
+    starts past tokens nothing prefilled -- a gap in the KV, not a repeat."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    _next_batch(sched, manager)
+    manager.queues["wg0"]._ready.update({"p0": {NODE}})
+    _next_batch(sched, manager, speculative=True)
+
+    sched.drop_chunk_lookahead(["p0"])
+
+    progress = sched.chunk_progress[("p0", NODE)]
+    assert progress.cursor is progress.cursor_spec is None
+    assert progress.next_start() == 0, "back to what landed"
+
+
+def test_a_landed_chunk_promotes_the_speculative_cursor():
+    """Once the speculated step is the one in flight it is no longer a guess,
+    so it becomes the committed cursor."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    _next_batch(sched, manager)
+    manager.queues["wg0"]._ready.update({"p0": {NODE}})
+    _next_batch(sched, manager, speculative=True)
+
+    sched.advance_chunk("p0", NODE, 4)  # the first chunk landed
+
+    progress = sched.chunk_progress[("p0", NODE)]
+    assert progress.done == 4
+    assert progress.cursor == ChunkCursor(4, 8) and progress.cursor_spec is None
+    assert progress.next_start() == 8

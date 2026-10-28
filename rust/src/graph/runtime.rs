@@ -178,7 +178,6 @@ pub struct GraphRuntime {
     /// (node, walk) pairs never returned as a speculation target: a chunkable
     /// walk's rows are measured and cut when scheduled, and a continuing row's
     /// inputs do not exist yet.
-    no_spec: FxHashSet<(Sym, Sym)>,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -583,12 +582,8 @@ pub struct GraphRuntime {
             return vec![];
         };
         let g = self.graphs[wg as usize].clone();
-        let walk = self.interner.get(graph_walk);
         spec_nodes
             .into_iter()
-            .filter(|sn| {
-                !walk.is_some_and(|w| self.no_spec.contains(&(g.node(sn.node).name, w)))
-            })
             .filter(|sn| {
                 // The destination opts out of async scheduling too.
                 g.node(sn.node).async_enabled
@@ -1452,7 +1447,7 @@ impl GraphRuntime {
     #[new]
     #[pyo3(signature = (
         worker_graphs, remote_worker_graphs, sharding, bookkeeping, me,
-        communicator = None, combined_walks = None, disable_spec_node_walks = None,
+        communicator = None, combined_walks = None,
     ))]
     fn new(
         worker_graphs: Vec<WorkerGraphArg>,
@@ -1467,7 +1462,6 @@ impl GraphRuntime {
         // batched under `combined[i]`
         combined_walks: Option<(Vec<String>, Vec<String>, Vec<String>)>,
         // (node, walk) pairs speculation never targets
-        disable_spec_node_walks: Option<Vec<(String, String)>>,
     ) -> PyResult<Self> {
         let mut it = StrToId::default();
         let (nodes, walks, combined) = combined_walks.unwrap_or_default();
@@ -1481,11 +1475,6 @@ impl GraphRuntime {
             .zip(&walks)
             .zip(&combined)
             .map(|((n, w), c)| ((it.intern(n), it.intern(w)), it.intern(c)))
-            .collect();
-        let no_spec: FxHashSet<(Sym, Sym)> = disable_spec_node_walks
-            .unwrap_or_default()
-            .iter()
-            .map(|(n, w)| (it.intern(n), it.intern(w)))
             .collect();
         let mut graphs = Vec::with_capacity(worker_graphs.len());
         let mut wg_ids = Vec::with_capacity(worker_graphs.len());
@@ -1592,7 +1581,6 @@ impl GraphRuntime {
             staged_specs: FxHashMap::default(),
             spec_counter: 0,
             combined_walk_of,
-            no_spec,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
         })

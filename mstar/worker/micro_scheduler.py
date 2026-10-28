@@ -230,11 +230,35 @@ class PopReadyResult(NamedTuple):
 
 
 
+class ChunkCursor(NamedTuple):
+    """A scheduled chunk: where it starts, and where the one after it does."""
+    start: int
+    next_start: int
+
+
 @dataclass(slots=True)
 class ChunkProgress:
-    """A row mid-prefill: tokens whose chunks have landed, and its total."""
+    """A row mid-prefill: tokens whose chunks have landed, and its total.
+
+    ``done`` is the ground truth, advanced in postprocess when a chunk lands.
+    The cursors are a lookahead, so the next chunk can be cut while the one
+    before it is still running: without them a step scheduled during that
+    window reads ``done`` and re-runs tokens already in flight. They are only
+    ever ahead of ``done``, so discarding them falls back to it -- which is
+    what every failure path does, since a chunk that was scheduled and did not
+    land leaves nothing behind.
+    """
     done: int
     total: int
+    # the last chunk scheduled on the normal path
+    cursor: ChunkCursor | None = None
+    # a chunk scheduled speculatively, dropped if that speculation is
+    cursor_spec: ChunkCursor | None = None
+
+    def next_start(self) -> int:
+        """Where a chunk scheduled now begins."""
+        ahead = self.cursor_spec or self.cursor
+        return ahead.next_start if ahead is not None else self.done
 
 
 def _pre_existing_tokens(seq_lens: Collection[int], n: int) -> int:
@@ -400,6 +424,8 @@ class MicroScheduler:
         deadline = time.monotonic() + self.HOLD_BACKOFF_SECONDS
         for rid in request_ids:
             self.held_until[rid] = deadline
+        # the step they were cut for is not running, so the retry is cut again
+        self.drop_chunk_lookahead(request_ids)
 
     def tp_rids(self, message: ScheduleTPNode) -> list[int]:
         """``ScheduleTPNode`` crosses the wire, so its rids are strings; these
@@ -605,6 +631,7 @@ class MicroScheduler:
         capture_group_of: int | None = None,
         pre_existing_seq_lens: Callable[[], Collection[int]] | None = None,
         mid_prefill: Collection[MidPrefillRow] = (),
+        speculative: bool = False,
     ) -> ScheduledBatch | None:
         """
         One step's worth: a pending TP follow batch if there is one, else
@@ -705,6 +732,7 @@ class MicroScheduler:
                 skip_walk=skip_walk,
                 pre_existing_seq_lens=pre_existing_seq_lens,
                 mid_prefill=mid_prefill if key == target else (),
+                speculative=speculative,
             )
 
         # A backlogged key goes first, oldest first, so a split set drains
@@ -828,6 +856,7 @@ class MicroScheduler:
         skip_walk: str | None = None,
         pre_existing_seq_lens: Callable[[], Collection[int]] | None = None,
         mid_prefill: Collection[MidPrefillRow] = (),
+        speculative: bool = False,
     ) -> ScheduledBatch | None:
         """One step for ``node_walk`` out of the caller's ``mid_prefill`` rows,
         its backlog and its ready ``entries``, composed by the batch builder.
@@ -897,7 +926,7 @@ class MicroScheduler:
             row_tokens=row_tokens,
             chunkable=chunkable,
             min_chunk_tokens=min_chunk,
-        ), starts)
+        ), starts, speculative)
 
     def _mid_prefill_rows(
         self, node_walk: tuple[str, str], rows: Collection[MidPrefillRow],
@@ -1153,6 +1182,7 @@ class MicroScheduler:
     def _build_and_schedule(
         self, request_state: RequestStateManager, request: BatchBuildRequest,
         mid_prefill_starts: dict[int, int] | None = None,
+        speculative: bool = False,
     ) -> ScheduledBatch | None:
         """Have the batch builder compose one step for ``request``'s (node,
         walk), and carry out its verdict.
@@ -1196,7 +1226,7 @@ class MicroScheduler:
             self._mark_scheduled(*node_walk, len(result.scheduled))
             self._assign_chunks(
                 result.scheduled, result.chunk_tokens or {}, request.row_tokens,
-                mid_prefill_starts or {},
+                mid_prefill_starts or {}, speculative,
             )
             result.scheduled.relabel_if_uniform()
         return result.scheduled
@@ -1228,10 +1258,15 @@ class MicroScheduler:
     def _assign_chunks(
         self, batch: ScheduledBatch, chunk_tokens: dict[int, int],
         row_tokens: dict[int, int], mid_prefill_starts: dict[int, int],
+        speculative: bool = False,
     ) -> None:
         """Stamp the [start, end) each chunked row runs this step, with the
         total it was measured at; a row first cut here starts its progress.
-        A row whose chunk is still in flight starts where that chunk ends.
+
+        A row starts where the chunk before it ends, which ``ChunkProgress``
+        tracks ahead of ``done`` so a chunk can be cut while the one before it
+        is still running. ``speculative`` keeps that lookahead apart, since a
+        cleared speculation must leave no trace.
 
         A row whose walk has no token budget is never measured, so it gets no
         range at all. The worker reads an absent range as having run whole,
@@ -1245,21 +1280,49 @@ class MicroScheduler:
                 if rid not in chunk_tokens:
                     continue
                 progress = self.chunk_progress[key] = ChunkProgress(cached, cached + row_tokens[rid])
-            start, total = mid_prefill_starts.get(rid, progress.done), progress.total
+            start = mid_prefill_starts.get(rid, progress.next_start())
+            total = progress.total
             end = start + chunk_tokens.get(rid, total - start)
             batch.chunk_ranges[rid] = (start, end, total)
+            cursor = ChunkCursor(start, end)
+            if speculative:
+                progress.cursor_spec = cursor
+            else:
+                progress.cursor = cursor
             if end < total:
                 batch.incomplete_node_rids.add(rid)
 
     def advance_chunk(self, rid: int, node_name: str, end: int) -> None:
-        """A chunk ending at ``end`` landed; the last one ends the row's progress."""
+        """A chunk ending at ``end`` landed; the last one ends the row's progress.
+
+        A speculative cursor becomes the normal one here: the step it was cut
+        for is the one now in flight, so it is no longer a guess.
+        """
         progress = self.chunk_progress.get((rid, node_name))
         if progress is None:
             return
         if end >= progress.total:
             del self.chunk_progress[(rid, node_name)]
-        else:
-            progress.done = end
+            return
+        progress.done = end
+        if progress.cursor_spec is not None:
+            progress.cursor, progress.cursor_spec = progress.cursor_spec, None
+
+    def drop_chunk_lookahead(
+        self, rids: Collection[int], node_name: str | None = None,
+    ) -> None:
+        """Forget chunks scheduled for ``rids`` that did not land.
+
+        Called wherever a step is abandoned -- admission refused, the rows put
+        on hold, the forward raised, a speculation cleared -- so the next one
+        is cut from ``done`` again. A chunk that never ran wrote no state, so
+        there is nothing else to undo. ``node_name`` None means every node,
+        for a caller holding a request rather than a step.
+        """
+        for rid in rids:
+            for key, progress in self.chunk_progress.items():
+                if key[0] == rid and node_name in (None, key[1]):
+                    progress.cursor = progress.cursor_spec = None
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
         """Park ``batch``, folding it into whatever already waits under this key.

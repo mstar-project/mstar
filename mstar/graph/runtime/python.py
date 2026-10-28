@@ -1,5 +1,4 @@
 import logging
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from mstar.api_server.request_types import APIServerMessage, ResultTensors
@@ -133,15 +132,11 @@ class PythonGraphRuntime(GraphRuntime):
         tensor_manager: TensorCommunicationManager,
         communicator: BaseCommunicator | None = None,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
-        disable_spec_node_walks: Iterable[tuple[str, str]] = (),
     ):
         self._my_worker_id = my_worker_id
         # (node, walk) pairs never a speculation target: a chunkable walk's rows
         # are measured and cut when scheduled, and a continuing row's inputs
         # do not exist yet
-        self._no_spec = frozenset(disable_spec_node_walks)
-        # (node, real walk) -> the combined walk the scheduler batches it under;
-        # a ready-scan target or exclusion may name either
         self._combined_walk_of = dict(combined_walk_of or {})
         self._communicator = communicator
         # Refcount changes go through the manager rather than the bare store,
@@ -704,8 +699,6 @@ class PythonGraphRuntime(GraphRuntime):
 
         out: list[SpeculationOutput] = []
         for info in ready:
-            if (info.node_name, graph_walk) in self._no_spec:
-                continue
             target = wgio.nodes[info.node_name]
             if not target.enable_async_scheduling:
                 # The destination opts out of async scheduling; mirrors the

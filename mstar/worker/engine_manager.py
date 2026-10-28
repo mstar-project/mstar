@@ -241,15 +241,6 @@ class LoadedSubmodules:
     # (`_unchunkable_nodes`): no token budget, and still speculable
     no_chunking: frozenset[str] = frozenset()
 
-    def chunkable_node_walks(self, model: Model) -> list[tuple[str, str]]:
-        """(node, walk) pairs whose prefill may be split, which speculation
-        must never target (``disable_spec_node_walks``)."""
-        return sorted(
-            (node, walk)
-            for (node, walk), policy in model.chunking_policy_of().items()
-            if policy.chunkable and node in self.submodules
-            and node not in self.no_chunking
-        )
 
 
 @dataclass

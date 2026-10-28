@@ -116,7 +116,7 @@ class _FakeWorker:
     def __init__(self):
         self._graph_runtime = _Runtime()
         self.held: list[str] = []
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
+        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, drop_chunk_lookahead=lambda *a: None)
         self.offload_calls: list[str] = []
 
     @property
@@ -201,7 +201,7 @@ class _HoldingWorker:
 
     def __init__(self):
         self._graph_runtime = _Runtime()
-        self.scheduler = SimpleNamespace(hold_requests=lambda rids: None)
+        self.scheduler = SimpleNamespace(hold_requests=lambda rids: None, drop_chunk_lookahead=lambda *a: None)
         self._hold_logged = {}
         # not a sharded node, so this rank runs its own OOM recovery
         self.parallel_nodes = set()
@@ -259,7 +259,7 @@ class _RefusedWorker(_HoldingWorker):
     def __init__(self):
         super().__init__()
         self.held: list[str] = []
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
+        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, drop_chunk_lookahead=lambda *a: None)
 
 
 @pytest.mark.parametrize(
