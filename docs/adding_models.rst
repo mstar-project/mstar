@@ -1036,17 +1036,15 @@ methods are:
    scheduling overlap. Use this method only to rename outputs for routing. Put decisions
    that depend on tensor values in ``check_stop``.
 
-``check_stop(...) -> set[str]`` (optional)
+``check_stop(...) -> set[str] | StopCheck`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
-   terminates.
-
-``withheld_outputs(...) -> Sequence[str]`` (optional)
-   Runs right after ``check_stop`` on the same host copies. Return the names of this
-   step's outputs that are not data for this request and must not be routed, for example
-   a frame streamed alongside the EOS token: its consumer then never receives it, instead
-   of finding and dropping it with a device read. Qwen3-TTS's ``TalkerSubmodule`` keeps
-   its EOS frame out of the codec stream this way.
+   terminates. To also keep some of this step's outputs from being routed, return
+   ``StopCheck(stops, withheld=(names...))``, for example a frame streamed alongside the
+   EOS token: its consumer then never receives it, instead of finding and dropping it with
+   a device read. ``check_stop_batched`` returns a ``BatchedStopCheck`` for the same.
+   The Qwen3-TTS and Qwen3-Omni Talkers and Fish S2 Pro's AR keep their EOS frame out of
+   the codec stream this way.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of

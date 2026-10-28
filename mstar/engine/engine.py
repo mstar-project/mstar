@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -50,12 +50,14 @@ from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
     BatchedModelOutput,
+    BatchedStopCheck,
     HostRows,
     InputMetadata,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopCheck,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -317,8 +319,8 @@ class ExecutingBatch:
     # the rest of it runs.
     failed_requests: dict[int, str] = field(default_factory=dict)
     # rid -> outputs the stop check found are not data this step
-    # (``NodeSubmodule.withheld_outputs``); the worker does not route them
-    withheld_outputs: dict[int, Sequence[str]] = field(default_factory=dict)
+    # (``StopCheck.withheld``); the worker does not route them
+    withheld_outputs: dict[int, tuple[str, ...]] = field(default_factory=dict)
     # A lockstep step whose rows' input reads every rank checks before
     # preparing it: the leader's rows in its order (see
     # ``Worker._drop_rows_whose_read_failed``); None for no check
@@ -1839,19 +1841,10 @@ class Engine:
         if it raises, the per-request path runs so a failure lands on its own
         request.
 
-        Also records each rid's ``submodule.withheld_outputs`` on
-        ``batch.withheld_outputs``, for the caller to leave unrouted.
+        Outputs the check withholds (``StopCheck`` / ``BatchedStopCheck``) go
+        on ``batch.withheld_outputs``, for the caller to leave unrouted.
         """
         submodule = self._submodules[batch.node_name].submodule
-        stops = self._check_stops(submodule, batch, outputs, host_rows)
-        if type(submodule).withheld_outputs is not NodeSubmodule.withheld_outputs:
-            self._collect_withheld_outputs(submodule, batch, outputs)
-        return stops
-
-    def _check_stops(
-        self, submodule: NodeSubmodule, batch: ExecutingBatch,
-        outputs: dict[str, NameToTensorList], host_rows: HostRows | None,
-    ) -> dict[str, set[str]]:
         if host_rows is not None:
             try:
                 ctx = batch.step_context
@@ -1865,9 +1858,14 @@ class Engine:
                     batch.node_name, exc_info=True,
                 )
                 batched = None
+            if isinstance(batched, BatchedStopCheck):
+                if batched.withheld:
+                    batch.withheld_outputs = batched.withheld
+                return batched.stops
             if batched is not None:
                 return batched
         stops: dict[str, set[str]] = {}
+        withheld: dict[str, tuple[str, ...]] = {}
         for rid in batch.request_ids:
             rid_outputs = outputs.get(rid)
             if not rid_outputs:
@@ -1879,31 +1877,15 @@ class Engine:
             except Exception as error:
                 batch.register_failure(rid, error)
                 continue
+            if isinstance(rid_stops, StopCheck):
+                if rid_stops.withheld:
+                    withheld[rid] = rid_stops.withheld
+                rid_stops = rid_stops.stops
             if rid_stops:
                 stops[rid] = rid_stops
+        if withheld:
+            batch.withheld_outputs = withheld
         return stops
-
-    def _collect_withheld_outputs(
-        self, submodule: NodeSubmodule, batch: ExecutingBatch,
-        outputs: dict[str, NameToTensorList],
-    ) -> None:
-        for rid in batch.request_ids:
-            rid_outputs = outputs.get(rid)
-            if not rid_outputs or rid in batch.failed_requests:
-                continue
-            try:
-                names = submodule.withheld_outputs(
-                    rid, batch.per_request_info_wrapped[rid], rid_outputs
-                )
-            except Exception as error:
-                logger.exception(
-                    "withheld_outputs failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
-                )
-                batch.register_failure(rid, error)
-                continue
-            if names:
-                batch.withheld_outputs[rid] = names
 
     def finalize_batch(
         self, batch: ExecutingBatch,

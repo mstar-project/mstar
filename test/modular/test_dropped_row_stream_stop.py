@@ -24,7 +24,7 @@ torch = pytest.importorskip("torch")
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
@@ -38,8 +38,6 @@ class _ReachedRoutingError(Exception):
 class _Sub:
     """A stream consumer; ``bad`` rows raise in the named stage, ``skip`` rows
     are declined by prepare_inputs."""
-
-    withheld_outputs = NodeSubmodule.withheld_outputs
 
     def __init__(self, bad=(), stage="prepare", skip=()):
         self.bad, self.stage, self.skip = set(bad), stage, set(skip)

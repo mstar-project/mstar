@@ -89,6 +89,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopCheck,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 from mstar.utils.h2d import PinnedStager
@@ -788,11 +789,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
+    ) -> set[str] | StopCheck:
         """Stop the graph loop on codec EOS or the request frame limit.
 
         This callback runs off the GPU execution thread, so reading the sampled
         token with ``item`` is allowed here rather than in ``postprocess``.
+        An EOS frame stays out of the codec stream, ``ignore_eos`` or not: EOS
+        is loop control and not a codebook index, and only this host copy
+        tells it from audio.
         """
         if "layer0_codes" not in outputs:
             return set()
@@ -803,27 +807,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         max_tokens = request_info.max_tokens
         sampling_config = request_info.resource_configs.get(TALKER_SAMPLER)
         ignore_eos = bool(getattr(sampling_config, "ignore_eos", False))
-        reached_eos = (
-            not ignore_eos and token == self.talker_config.codec_eos_token_id
-        )
+        is_eos = token == self.talker_config.codec_eos_token_id
+        reached_eos = is_eos and not ignore_eos
+        stops = set()
         if reached_eos or generated >= max_tokens:
             logger.debug("talker %s: stop after %d frames (eos=%s)", request_id, generated, reached_eos)
-            return {"talker_decode_loop"}
-        return set()
-
-    def withheld_outputs(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> tuple[str, ...]:
-        """An EOS frame stays out of the codec stream: EOS is loop control and
-        not a codebook index, and only the host copy here tells it from audio."""
-        del request_id, request_info
-        if "layer0_codes" not in outputs:
-            return ()
-        token = int(outputs["layer0_codes"][0].item())
-        return ("codec_tokens",) if token == self.talker_config.codec_eos_token_id else ()
+            stops = {"talker_decode_loop"}
+        return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Admit compatible prefill/decode requests to continuous batching.
@@ -1078,7 +1068,7 @@ class CodecSubmodule(ARNodeSubmodule):
         ``[quantizers, frames]``; every request is padded to the smallest
         captured window that fits so the ramp's windows and the terminal tail
         all replay CUDA graphs. Every item is a frame: the Talker withholds
-        its EOS frame from the stream (``TalkerSubmodule.withheld_outputs``).
+        its EOS frame from the stream (``TalkerSubmodule.check_stop``).
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)

@@ -3591,8 +3591,9 @@ class Worker:
             )
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
-        # Not stored, so not routed: a streaming edge then carries no item for
-        # the row, and the producer's item count leaves it out as well.
+        # What the stop check withheld (``StopCheck.withheld``) is not stored,
+        # so not routed: a streaming edge then carries no item for the row, and
+        # the producer's item count leaves it out as well.
         for rid, names in batch_N.node_batch.withheld_outputs.items():
             rid_outputs = outputs.get(rid)
             if rid_outputs:

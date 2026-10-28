@@ -49,6 +49,27 @@ class HostRows(NamedTuple):
         )
 
 
+class StopCheck(NamedTuple):
+    """``check_stop``'s answer when the step also has outputs that are not data.
+
+    ``withheld`` names outputs of this step the worker leaves unrouted for the
+    request, e.g. a frame streamed beside a stop token: a streaming edge then
+    gets no item for it, so its consumer needs no device read to find and drop
+    it. A plain ``set`` return is the same as ``StopCheck(stops)``.
+    """
+
+    stops: set[str] | frozenset[str] = frozenset()
+    withheld: tuple[str, ...] = ()
+
+
+class BatchedStopCheck(NamedTuple):
+    """``StopCheck`` for ``check_stop_batched``: rid -> loops to stop and
+    rid -> withheld outputs, rids with none left out of each."""
+
+    stops: dict[str, set[str]]
+    withheld: dict[str, tuple[str, ...]]
+
+
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
@@ -1036,7 +1057,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
+    ) -> set[str] | StopCheck:
         """
         Return the set of dynamic-loop names that should stop after this step.
 
@@ -1051,6 +1072,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         will run for that rid and its output discarded — the standard
         1-wasted-step cost for any stop signal.
 
+        A ``StopCheck`` also names outputs of this step that are not routed
+        (``StopCheck.withheld``), decided off the same read; it may withhold
+        without stopping.
+
         Default: no stops.
         """
         return set()
@@ -1060,32 +1085,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
         step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
+    ) -> dict[str, set[str]] | BatchedStopCheck | None:
         """``check_stop`` for the whole batch at once, off the host rows.
 
-        Optional. Returns rid -> loops to stop (rids with none left out), and
-        must agree with ``check_stop`` for every rid. None, or a raise, falls
-        back to the per-request path. ``step_walk`` is the walk every row ran,
-        or None when the step mixes walks (each row's is on its info).
+        Optional. Returns rid -> loops to stop (rids with none left out), or a
+        ``BatchedStopCheck`` for a submodule whose ``check_stop`` withholds,
+        and must agree with ``check_stop`` for every rid. None, or a raise,
+        falls back to the per-request path. ``step_walk`` is the walk every row
+        ran, or None when the step mixes walks (each row's is on its info).
         """
         return None
-
-    def withheld_outputs(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> Sequence[str]:
-        """Outputs of this step that are not routed for ``request_id``.
-
-        Runs after ``check_stop`` on the same host copies, so it may read
-        values. For an output that a step produces whatever it samples but
-        that is not data for some values, e.g. a frame streamed alongside a
-        stop token: the consumer never receives it, and needs no device read
-        to find and drop it.
-
-        Default: none.
-        """
-        return ()
 
     def on_request_added(self, request_id: int, request_info: CurrentForwardPassInfo) -> None:
         """The request has reached this worker; none of its steps has run yet.
