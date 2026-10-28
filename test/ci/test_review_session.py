@@ -154,6 +154,9 @@ class TestHandoff(unittest.TestCase):
                          "what the first run wrote after its note would be dropped")
         self.assertIn("No note here", SESSION["handoff_md"](second, "568", "abc", "light"),
                       "the first run's note would hide what the second run said last")
+        paragraphs = handoff([assistant("p1", text("A" * 1400 + "\n\n" + "B" * 1400))], ROOT, [])
+        third = handoff([assistant("p2", text("C" * 300))], ROOT, [], paragraphs)["recent_text"]
+        self.assertFalse(third.startswith("\n"), "a kept part of an earlier message would open on a blank line")
 
     def test_an_api_error_is_not_the_reviewer_s_output(self):
         msg = assistant("m1", text("API Error: 529 Overloaded"))

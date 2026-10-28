@@ -146,7 +146,8 @@ def handoff(messages, root, diff_paths, previous=None):
                 results[b["tool_use_id"]] = b
     comments = {c.get("id") or f"earlier-{i}": c for i, c in enumerate(prev.get("comments", []))}
     reads = set(prev.get("reads", []))
-    # The earlier runs' text since their note, one line per item, so the newest of it is kept.
+    # The earlier runs' text since their note, one line per item, so the newest of it is kept
+    # (an earlier message may then be kept only in part).
     note, since_note = None, prev["recent_text"].split("\n") if prev.get("recent_text") else []
     prefix = root.rstrip("/") + "/"
     for m in messages:
@@ -201,14 +202,15 @@ def shorten(text, limit):
 
 def newest(texts, limit):
     """The newest of ``texts`` that fit in ``limit`` characters, oldest first, one per line. Older
-    texts are dropped whole, since the newest says where the run stopped."""
+    texts are dropped whole, since the newest says where the run stopped; blank lines it would
+    open on are dropped too."""
     kept, size = [], -1  # the length of the kept texts joined by newlines
     for text in reversed(texts):
         if kept and size + len(text) + 1 > limit:
             break
         kept.append(text)
         size += len(text) + 1
-    return shorten("\n".join(reversed(kept)), limit)
+    return shorten("\n".join(reversed(kept)), limit).lstrip("\n")
 
 
 def result_text(content):
