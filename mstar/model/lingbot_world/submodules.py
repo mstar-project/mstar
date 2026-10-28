@@ -201,6 +201,8 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         self.encoder_vae = encoder_vae
         self.config = config
         self.schedule = make_fast_schedule(config.sample_shift, config.timesteps_index, config.num_train_timesteps)
+        if encoder_vae is not None and config.vae_encode_channels_last:
+            wan_vae.encoder_to_channels_last(encoder_vae)
         if vae is not None and not config.vae_decode_fp32:
             # the latents are cast to bf16 for the decode
             vae.to(torch.bfloat16)

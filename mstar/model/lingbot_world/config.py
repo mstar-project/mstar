@@ -80,6 +80,12 @@ class LingBotWorldConfig:
     # eager rounding); the attentions and the cache writes stay eager.
     dit_compile: bool = True
 
+    # The condition encode stays fp32, as the reference's; channels-last runs
+    # its convs without layout conversions: 187 -> 140 ms per chunk on a B300
+    # at 464x832 for the first ~8 chunks (after that the black-frame encode is
+    # cached), the latents within 0.0023 of the contiguous encode's.
+    vae_encode_channels_last: bool = True
+
     # The decode's precision, layout and compile; each settable in model_kwargs.
     # The reference decodes fp32, contiguous and eager: 291 ms per 16-frame chunk
     # at 464x832 on a B300. bf16 channels-last compiled (Inductor's deterministic

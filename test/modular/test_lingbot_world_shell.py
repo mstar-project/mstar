@@ -479,7 +479,8 @@ def test_the_dit_declares_one_ragged_cross_attention(model):
     assert LingBotWorldModel(skip_weight_loading=True, reference_attention=True).get_node_resources() == []
 
 
-SWITCHES = ("reference_attention", "dit_compile", "vae_decode_fp32", "vae_decode_channels_last", "vae_decode_compile")
+SWITCHES = ("reference_attention", "dit_compile", "vae_encode_channels_last", "vae_decode_fp32",
+            "vae_decode_channels_last", "vae_decode_compile")
 
 
 @pytest.mark.parametrize("name", SWITCHES)
@@ -492,13 +493,13 @@ def test_a_model_kwargs_switch_must_be_a_bool(name, value):
 
 def test_model_kwargs_switches_set_the_config():
     default = LingBotWorldModel(skip_weight_loading=True).config
-    assert [getattr(default, n) for n in SWITCHES] == [False, True, False, True, True]
+    assert [getattr(default, n) for n in SWITCHES] == [False, True, True, False, True, True]
     for name in SWITCHES:
         flipped = LingBotWorldModel(skip_weight_loading=True, **{name: not getattr(default, name)}).config
         assert getattr(flipped, name) is not getattr(default, name)
         assert all(getattr(flipped, n) is getattr(default, n) for n in SWITCHES if n != name)
     reference = LingBotWorldModel(skip_weight_loading=True, **REFERENCE_MODEL_KWARGS).config
-    assert [getattr(reference, n) for n in SWITCHES] == [True, False, True, False, False]
+    assert [getattr(reference, n) for n in SWITCHES] == [True, False, False, True, False, False]
 
 
 def _bare_dit_submodule(model, resources):
