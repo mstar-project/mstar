@@ -47,11 +47,11 @@ def test_one_copy_padded_and_skipped_when_unchanged(kv):
     kv._stage_static(s4, [5, 6], [1, 2], 2)
     assert _staged(kv, s4) == ([5, 6, SINK_PAGE, SINK_PAGE], [1, 2, 0, 0])
     assert s4.total_tokens == 2
-    ring = kv._plan_stager._next
+    copies = kv._plan_stager.copies
     kv._stage_static(s4, [5, 6], [1, 2], 2)
-    assert kv._plan_stager._next == ring, "the same addressing staged twice copied twice"
+    assert kv._plan_stager.copies == copies, "the same addressing staged twice copied twice"
     kv._stage_static(s4, [5, 7], [1, 2], 2)
-    assert kv._plan_stager._next != ring
+    assert kv._plan_stager.copies == copies + 1
     assert _staged(kv, s4) == ([5, 7, SINK_PAGE, SINK_PAGE], [1, 2, 0, 0])
 
 
@@ -62,9 +62,9 @@ def test_capture_lengths_share_a_slots_buffer(kv):
     kv._stage_static(s2, [5], [1], 1)
     assert _staged(kv, s2) == ([5, SINK_PAGE], [1, 0])
     # s4's values were overwritten by s2's: staging them again must copy
-    ring = kv._plan_stager._next
+    copies = kv._plan_stager.copies
     kv._stage_static(s4, [9, 9, 9, 9], [3, 3, 3, 3], 4)
-    assert kv._plan_stager._next != ring
+    assert kv._plan_stager.copies == copies + 1
     assert _staged(kv, s4) == ([9, 9, 9, 9], [3, 3, 3, 3])
     # another slot or label has its own buffer
     assert kv._static_plan_state(1, "main", 4).staging.data_ptr() != s4.staging.data_ptr()
@@ -83,9 +83,9 @@ def test_an_eager_write_uploads_its_addressing_in_one_copy(kv):
         qo_indptr=i32([0, 3, 5]), paged_kv_indptr=i32([0, 2, 3]), paged_kv_indices=i32([7, 9, 4]),
         paged_kv_last_page_len=i32([4, 2]), kv_lens=None,
     )
-    ring = kv._plan_stager._next
+    copies = kv._plan_stager.copies
     state = kv._host_plan_state(indptrs, 5)
-    assert kv._plan_stager._next == (ring + 1) % kv._plan_stager._depth
+    assert kv._plan_stager.copies == copies + 1
     torch.cuda.synchronize()
     assert state.token_to_page.is_cuda and state.total_tokens == 5
     assert state.token_to_page.tolist() == [9, 9, 9, 4, 4]
