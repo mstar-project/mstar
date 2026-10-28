@@ -306,6 +306,8 @@ class RecurrentStateSpec(NodeResourceSpec):
         if max_slots is not None:
             self.config.max_slots = max_slots
         if prefix_slots is not None:
+            if prefix_slots < 0:
+                raise ValueError(f"prefix_slots={prefix_slots} must be >= 0")
             self.config.prefix_slots = prefix_slots
         if state_dtype is not None:
             try:

@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from mstar.engine.engine import Engine
-from mstar.engine.resources.base import CachedPrefix, Resource
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
@@ -62,12 +62,23 @@ class _StubChains:
         return self.keys.get(rid, [])[:pages]
 
 
-def _pool(prefix_slots: int = 2, world_size: int = 1) -> RecurrentStatePool:
+def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
+    """The pool as the engine builds it, over a KV cache whose `prefix_cache` is ``prefix_cache``."""
+    kv = _specs(0)["kv"]
+    kv.config.prefix_cache = prefix_cache
+    group = type("Group", (), {"world_size": world_size})() if world_size > 1 else None
+    return RecurrentStatePool.build(
+        RecurrentStateSpec(resource_key="state", nodes={NODE}, config=config),
+        EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=group, dependencies={"kv": kv}),
+    )
+
+
+def _pool(prefix_slots: int = 2, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
     config = RecurrentStateConfig(
         num_layers=2, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
         max_slots=4, prefix_slots=prefix_slots, kv_cache="kv",
     )
-    pool = RecurrentStatePool(device=torch.device("cpu"), config=config, world_size=world_size)
+    pool = _build(config, world_size, prefix_cache)
     pool.bind_kv(_StubChains())
     pool.enable_prefix_cache(b"a root")
     return pool
@@ -154,9 +165,11 @@ def test_a_full_set_evicts_the_oldest_snapshot_nothing_holds():
 
 
 
-def test_snapshots_stay_off_above_one_rank_and_without_slots():
-    assert not _pool(world_size=2).enable_prefix_cache(b"a root")
-    assert not _pool(prefix_slots=0).enable_prefix_cache(b"a root")
+@pytest.mark.parametrize("closed", [{"world_size": 2}, {"prefix_cache": False}, {"prefix_slots": 0}])
+def test_snapshots_stay_off_and_unallocated_where_the_cache_cant_open(closed):
+    pool = _pool(**closed)
+    assert not pool.enable_prefix_cache(b"a root")
+    assert pool.block("state", 0).shape[0] == pool.config.max_slots, "allocated snapshot slots nothing can use"
     assert _pool().enable_prefix_cache(b"a root")
 
 
@@ -313,7 +326,7 @@ def _open(monkeypatch, prefix_slots: int = 2, world_size: int = 1) -> Engine:
     engine._resources = {
         "kv": KVManager(cfg=specs["kv"].config, name="kv", joint_comm_group=None,
                         transfer_engine_info=None, device=torch.device("cpu")),
-        "state": RecurrentStatePool(torch.device("cpu"), specs["state"].config, world_size=world_size),
+        "state": _build(specs["state"].config, world_size),
         "gdn": _StubGDN(),
     }
     engine._open_prefix_caches(specs, _Keyed())

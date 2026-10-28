@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.linear_attn import LinearAttnConfig, LinearAttnManager, LinearAttnSpec, LinearAttnStep
 from mstar.engine.resources.linear_attn.config import LinearAttnVariant
 from mstar.engine.resources.recurrent import (
@@ -48,7 +49,10 @@ def _build(device):
     spec = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
         num_layers=1, blocks=GEOMETRY.to_blocks(), max_slots=6, prefix_slots=4, kv_cache="kv",
     ))
-    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=device))
+    kv = KVSpec("kv", {"llm"}, PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4 * PAGE, page_size=PAGE,
+    ))
+    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=device, dependencies={"kv": kv}))
     pool.bind_kv(_StubChains())
     assert pool.enable_prefix_cache(b"a root")
     manager = LinearAttnManager.build(

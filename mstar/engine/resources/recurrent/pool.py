@@ -11,7 +11,7 @@ import logging
 import threading
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -138,15 +138,18 @@ class RecurrentStatePool(Resource):
         if info.joint_comm_group is not None:
             world_size = info.joint_comm_group.world_size
             config.shard(world_size)
+        kv = info.dependencies.get(config.kv_cache)
+        if world_size > 1 or kv is None or not kv.config.prefix_cache:
+            # no snapshot slots where the prefix cache can't open
+            config = replace(config, prefix_slots=0)
         # resolved here, not written back: the config is the model's, shared by its specs
         return cls(
             device=info.device, config=config, name=spec.resource_key, kv_dtype=info.kv_dtype,
-            world_size=world_size,
         )
 
     def __init__(
         self, device: torch.device, config: RecurrentStateConfig, name: str = "recurrent_state",
-        kv_dtype: torch.dtype | None = None, world_size: int = 1,
+        kv_dtype: torch.dtype | None = None,
     ):
         """``kv_dtype`` (the engine's) stands in for a block's ``dtype=None``."""
         if config.prefix_slots and config.disable_sink_slot:
@@ -158,7 +161,6 @@ class RecurrentStatePool(Resource):
         self.config = config
         # the resource key, for errors
         self._name = name
-        self._world_size = world_size
 
         # One [num_layers, max_slots + prefix_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
@@ -617,11 +619,7 @@ class RecurrentStatePool(Resource):
 
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         del root, walks
-        if self._world_size > 1 and self.config.prefix_slots:
-            logger.info(
-                "recurrent state: prefix snapshots off at world size %d", self._world_size,
-            )
-        if self._world_size > 1 or not self.config.prefix_slots:
+        if not self.config.prefix_slots:
             self._kv = None
         return self._kv is not None
 
