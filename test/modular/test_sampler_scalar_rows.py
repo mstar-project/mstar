@@ -56,11 +56,11 @@ def test_a_gather_of_the_bytes_a_slot_holds_issues_no_copy():
     bufs.register_request("c", SamplingConfig(temperature=0.5, top_k=7, top_p=0.9, min_p=0.1))
     stager = bufs._scalar_rows._stager
     bufs.gather_static(["a"], 2, 0)
-    ring = stager._next
+    copies = stager.copies
     # another batch with the same settings: a gather, but no copy
     bufs.gather_static(["c"], 2, 0)
-    assert stager._next == ring
+    assert stager.copies == copies
     bufs.gather_static(["b"], 2, 0)
-    assert stager._next != ring
+    assert stager.copies == copies + 1
     torch.cuda.synchronize()
     assert _rows(bufs, 2, 0)[4] == [True, False]
