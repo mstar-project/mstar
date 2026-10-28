@@ -429,10 +429,10 @@ class Gr00tN17Preprocessor:
     def frame_layout(self, embodiment_tag: str) -> tuple[tuple[str, ...], int]:
         """This embodiment's camera views, in order, and its frames per view.
 
-        The order is the contract a request is sent in: the engine's
-        media path keys loaded files by *modality*, not by name
-        (`data_worker.py:583`), so several cameras arrive as one positional list
-        and only this order says which frame is which camera.
+        The order is the contract a request is sent in: the engine's media path
+        keys loaded files by *modality*, not by name
+        (`PreprocessWorkerThread._load_media`), so several cameras arrive as one
+        positional list and only this order says which frame is which camera.
         """
         tag = self._tag(embodiment_tag)
         return tuple(self.video_keys[tag]), self.video_steps[tag]
@@ -489,9 +489,9 @@ class Gr00tN17Preprocessor:
         tag = self._tag(embodiment_tag)
         # The per-tag view and joint-group names are the checkpoint's, so a client
         # cannot guess them: name the ones this embodiment wants. Without this a
-        # missing view is a bare `KeyError`, which `data_worker.py:929` answers
-        # with a **500** whose body is just the key -- the same trap the top-level
-        # guards in `gr00t_n17_model.py` were added to avoid.
+        # missing view is a bare `KeyError`, which `PreprocessWorkerThread._fail_request`
+        # answers with a **500** whose body is just the key -- the same trap the
+        # top-level guards in `gr00t_n17_model.py` were added to avoid.
         for name, want, got in (("video", self.video_keys[tag], video),
                                 ("state", self.state_keys[tag], state)):
             missing = [k for k in want if k not in got]

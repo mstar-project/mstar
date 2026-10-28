@@ -1291,8 +1291,9 @@ def test_a_span_with_no_attention_of_its_own_is_read_with_sdpa():
 @torch.no_grad()
 def test_the_sdpa_fallback_is_one_object_and_not_one_per_forward(monkeypatch):
     """A compiled region guards on the identity of the callables it is handed, so a fallback
-    built per forward retraces every step (``mstar/engine/resources/convenience.py:147-150``
-    holds the ragged callables per label for this reason). No parity test can see it."""
+    built per forward retraces every step (the bound
+    ``resource.run`` is one object per label for this reason). No parity
+    test can see it."""
     seen: list = []
     forward = BasicTransformerBlock.forward
 

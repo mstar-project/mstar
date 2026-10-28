@@ -1,7 +1,7 @@
 """GR00T N1.7's whole ``action_gen`` loop on the GPU, against NVIDIA's reference recordings.
 
 ``test_dit_gpu.py`` pins one DT forward. This file pins the loop around it: the four iterations of
-``Gr00tN17DenoiseStepSubmodule.denoise`` (``submodules.py:677``) from the seeded noise to the
+``Gr00tN17DenoiseStepSubmodule.denoise`` (``submodules.py``) from the seeded noise to the
 served chunk, then ``Gr00tN17Preprocessor.unapply`` to the joint values a robot is sent. It also
 checks that batching two requests, or two rows at different loop iterations, changes neither row.
 
@@ -14,9 +14,9 @@ request; the bar is mean abs error within **1.2x** of it. Ours is handed the bf1
 ``vl_embeds`` and ``state_features``: the dump's differ by mean abs 8.4e-02 (another stack's
 backbone) and would still pass at 0.98-1.09x, so the ratio would read two backbones, not our loop.
 
-Every span runs on SDPA (no attention resource is bound, so ``_SDPA_ATTEND``,
-``components/dit.py:334``); the ragged kernels are ``test_dit_gpu.py``'s. Needs CUDA, the cached
-checkpoint and the recordings, and skips without any of them.
+Every span runs on SDPA (no attention resource is bound, so ``DiT.forward`` falls back to
+``_SDPA_ATTEND``); the ragged kernels are ``test_dit_gpu.py``'s. Needs CUDA, the cached checkpoint
+and the recordings, and skips without any of them.
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ _BUCKETS = {(13, 448): 8, (21, 448): 12}
 # The denoise step's tensors: action encoder, position table, the DT (456), decoder; the count
 # says the node is the whole step, not the DT alone.
 _STEP_TENSORS = 467
-# GR00T's four steps (`schedule_for`, `submodules.py:510`). Sigma *ascends*: it is GR00T's
+# GR00T's four steps (`Gr00tN17DenoiseStepSubmodule.schedule_for`). Sigma *ascends*: it is GR00T's
 # time, not a noise level, and the recordings were made against it.
 _SIGMAS = (0.0, 0.25, 0.5, 0.75, 1.0)
 _TIMESTEPS = (0.0, 250.0, 500.0, 750.0)
@@ -348,10 +348,10 @@ def test_the_four_step_loop_matches_the_oracle_on_every_recorded_request(
     """Ours in bf16 against the fp32 reference, all 20 requests, each at **its own** floor.
 
     The port's one end-to-end number: action encoder, position table on the 40 action rows only
-    (``submodules.py:699``), the 32 DT blocks, the decoder's horizon slice and four bf16 Euler
-    updates (``submodules.py:719``). The floor ranges 3.1e-03 to 9.0e-03 over the 20, so one
-    pooled bar would let the easy requests pay for a bad one. The reference's rms is asserted
-    too, so the answer off disk is the trained model's.
+    (``Gr00tN17DenoiseStepSubmodule.denoise``), the 32 DT blocks, the decoder's horizon slice and
+    four bf16 Euler updates (``euler_step`` in ``denoise``). The floor ranges 3.1e-03 to 9.0e-03
+    over the 20, so one pooled bar would let the easy requests pay for a bad one. The reference's
+    rms is asserted too, so the answer off disk is the trained model's.
     """
     for request in requests:
         rms = request.want.pow(2).mean().sqrt().item()
@@ -373,10 +373,10 @@ def test_the_decoded_actions_match_the_oracle_in_every_joint_group(
     """Ours and both reference runs through ``unapply``, compared **per joint group**.
 
     The 132-wide chunk is mostly padding, and ``unapply`` cuts it per group from the absolute
-    statistics (``preprocessing.py:196``), un-normalises each by its own bounds and composes the
-    relative groups onto the raw state: a 7-dim group that is 5% of the chunk is 100% of one
-    joint. Both reference runs are decoded here so the decode's own arithmetic sits inside the
-    floor; ``unapply``'s parity is ``test_preprocessing.py``'s.
+    statistics (``Gr00tN17Preprocessor.action_dims``), un-normalises each by its own bounds and
+    composes the relative groups onto the raw state: a 7-dim group that is 5% of the chunk is
+    100% of one joint. Both reference runs are decoded here so the decode's own arithmetic sits
+    inside the floor; ``unapply``'s parity is ``test_preprocessing.py``'s.
 
     The bar is the worst group against the worst group's floor: measured median 1.013, max
     1.066. Each group against its own floor also passes but only just (worst 1.194, on
@@ -439,9 +439,10 @@ def test_the_parity_bar_rejects_our_loop_with_the_image_rows_blanked(
 def test_the_recorded_requests_occupy_two_buckets(requests: list[_Request]):
     """The 20 requests are exactly two (text rows, image rows) buckets, 8 and 12 deep.
 
-    Each bucket key is its own forward and CUDA graph (``bucket_key_for``,
-    ``submodules.py:490``), so the count is what a DROID deployment pays per step. It is also
-    what lets ``pair`` find two different requests the engine would batch together.
+    Each bucket key is its own forward and CUDA graph
+    (``Gr00tN17DenoiseStepSubmodule.bucket_key_for``), so the count is what a DROID deployment
+    pays per step. It is also what lets ``pair`` find two different requests the engine would
+    batch together.
     """
     counts: dict[tuple[int, int], int] = {}
     for request in requests:
@@ -506,7 +507,7 @@ def test_giving_the_text_blocks_the_image_rows_dwarfs_the_batching_gap(
 ):
     """Negative control for the batching bar: the text blocks read the image rows instead.
 
-    ``_span_for`` (``components/dit.py:218``) picks text when ``idx % 4 == 0``; a swap keeps every
+    ``_span_for`` (``components/dit.py``) picks text when ``idx % 4 == 0``; a swap keeps every
     shape, and slicing the image rows to the text count keeps the bucket. Measured: mean
     2.97e-02 against a floor of 1.15e-03, 26x where the bar admits 1.2x.
     """

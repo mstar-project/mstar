@@ -83,7 +83,7 @@ def send(client: MStarClient, obs, seed: int) -> bytes:
 
 def send_streamed(url: str, obs, seed: int) -> bytes:
     """The streamed action off the binary frames. ``MStarClient.stream`` cannot carry it:
-    its event fallback decodes an action's bytes as UTF-8 (``client.py:440-442``)."""
+    its event fallback decodes an action's bytes as UTF-8 (``MStarClient._to_event``)."""
     text, frames, kwargs = obs
     data = {"text": text, "output_modalities": "action", "streaming": "true",
             "model_kwargs": json.dumps({**kwargs, "seed": seed})}
