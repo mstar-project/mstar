@@ -381,6 +381,17 @@ asr = [
     "numba>=0.61",  # Whisper word timestamps' DTW (components/alignment.py)
 ]
 
+# GLM-5.x
+glm = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
+    "safetensors",
+    "transformers",
+    "triton",
+]
+
 all = [
     "ruff",
     "pytest>=9.0.3",
