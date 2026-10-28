@@ -499,7 +499,11 @@ the compiler version pinned in ``rust-toolchain.toml``):
    maturin develop --release -m rust/Cargo.toml
 
 Build with ``--release`` — an unoptimized debug build (maturin's default)
-costs real latency on the hot receive path. Verify with:
+costs real latency on the hot receive path. If ``mstar-ai`` came from a Linux
+wheel that carries the extension, this build (a separate ``mstar-rust``
+distribution) takes precedence over the wheel's copy in the same environment;
+``pip uninstall mstar-rust`` goes back to the wheel's, and neither uninstall
+removes the other's files. Verify with:
 
 .. code-block:: bash
 

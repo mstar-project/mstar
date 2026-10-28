@@ -60,6 +60,15 @@ Python transport and graph runtime.
   on distributing it. Until then the license step fails, so `wheels` fails and
   `pypi-wheels` is skipped; `pypi` still publishes the sdist, the pure wheel
   and the aliases.
+- **Two copies of `mstar_rust`.** `maturin develop` (or `pip install ./rust`)
+  installs `rust/` as a separate `mstar-rust` distribution, a `mstar_rust/`
+  package directory. In an environment that also has a Rust wheel's top-level
+  `mstar_rust.*.so`, the package directory wins (Python's path finder takes a
+  package directory over a same-named module), so the maturin build is what
+  loads; the startup line `control mesh transport: rust <version> from
+  <path>` names it. The two own different files, so uninstalling one never
+  deletes the other's: `pip uninstall mstar-rust` goes back to the wheel's
+  copy.
 - **Checks.** Each wheel is installed without dependencies into a clean venv
   outside the build container and must import `mstar_rust`, run
   `mstar-server --help` and list the license file. A failure there keeps the
