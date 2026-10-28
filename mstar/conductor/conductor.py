@@ -1838,6 +1838,12 @@ class Conductor:
         """
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
+        # A self-triggering partition's next pass can report in the same cycle,
+        # and is queued again before this pass's state is reset. When the
+        # earlier call ended the partition, on the flag the later report
+        # latched, the later call has nothing left to advance.
+        if pstate.is_done:
+            return all(ps.is_done for ps in request_data.partition_states.values())
 
         incoming_connections = request_data.get_incoming_connections(partition_name)
 

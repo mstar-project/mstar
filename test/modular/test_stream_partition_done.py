@@ -119,6 +119,32 @@ def test_the_flag_on_any_report_ends_a_partition_without_a_stream_in(flag_on):
     assert pstate.worker_reported_done is False, "reset for the next pass"
 
 
+def test_two_passes_reported_in_one_cycle_end_the_partition_once():
+    """A self-triggering partition's next pass can report before the conductor
+    advances the last one. Both reports queue the partition (the completed set
+    still covers the pass), and the final one's flag latches before either call
+    runs: the first call ends the partition, the second must not advance it."""
+    c, req, rec = _conductor()
+    c.enable_prof = False
+    pstate = req.partition_states["B"]
+    pstate.current_worker_graph_ids = {0}
+    req.worker_graph_to_workers = {0: ["w"]}
+    queued = [
+        name
+        for done in (False, True)
+        for name in c._process_worker_graphs_done(WorkerGraphsDone(
+            request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
+            partition_done=done,
+        ))
+    ]
+    assert queued == ["B", "B"]
+    for name in queued:
+        c._process_done_forward("r", name)
+    assert pstate.is_done is True
+    assert c.model.calls == [("B", ["tok"])], "the done partition is not advanced again"
+    assert rec.producer_done == [("r", "B", "C")]
+
+
 def test_chain_closes_partition_by_partition():
     c, req, rec = _conductor()
     c.model.get_partition_forward_pass_args = lambda partition_name, partition_metadata, persist_signals, \
