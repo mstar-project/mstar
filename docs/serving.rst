@@ -528,14 +528,18 @@ empty cache at the default ``-O1`` (1,294 s at ``-O2``); a warm start skips the 
 torch's default cache in ``/tmp`` already survives a process restart on the same host; M*'s
 default keeps it across a new container or a reboot that clears ``/tmp``.
 
-To keep it, persist ``~/.cache`` (``$XDG_CACHE_HOME`` if you set it), which
-holds all of it:
+To keep it, persist these (all under ``~/.cache`` by default):
 
-- ``~/.cache/mstar/torchinductor``: Inductor's compiled graphs, autotune picks and Triton
-  kernels (M* sets ``TORCHINDUCTOR_CACHE_DIR`` to it unless you export one)
-- ``~/.cache/flashinfer``: FlashInfer's JIT builds
-- ``~/.triton/cache``: Triton kernels compiled outside Inductor
-- ``~/.cache/huggingface``: the weights
+- ``$XDG_CACHE_HOME/mstar/torchinductor``: Inductor's compiled graphs and autotune picks
+  (``TORCHINDUCTOR_CACHE_DIR``)
+- ``$XDG_CACHE_HOME/mstar/triton``: Triton's compiled kernels, Inductor's and others' alike
+  (``TRITON_CACHE_DIR``)
+- ``~/.cache/flashinfer``: FlashInfer's JIT builds (it follows ``FLASHINFER_WORKSPACE_BASE``,
+  default home, not ``$XDG_CACHE_HOME``)
+- ``$HF_HOME``: the weights (``$XDG_CACHE_HOME/huggingface`` by default)
+
+``$XDG_CACHE_HOME`` defaults to ``~/.cache``, and M* sets the first two variables unless you
+export them.
 
 In a container, mount these from a volume rather than only ``~/.cache/huggingface``.
 Inductor keys its entries on the torch and Triton builds and, on CUDA and ROCm, the GPU
@@ -547,8 +551,8 @@ has no GPU model, so give each GPU model its own cache there.
 The default trades torch's node-local ``/tmp`` for home. Nothing prunes the cache, and every
 upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which costs only the
 next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
-concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
-path and copy a warm cache in at job start.
+concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` and
+``TRITON_CACHE_DIR`` to node-local paths and copy a warm cache in at job start.
 
 .. _tensor-transport:
 

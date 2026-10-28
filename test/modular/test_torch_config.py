@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from mstar.engine import _default_compile_cache, recompile_limit
+from mstar.engine import _default_compile_caches, recompile_limit
 from mstar.worker.worker import Worker
 
 
@@ -39,13 +39,14 @@ def test_recompile_limit_env(monkeypatch, raw, expected):
 def test_compile_cache_defaults_under_the_user_cache(tmp_path, entry):
     """torch writes its /tmp default into the environment when ``torch._dynamo``
     is first imported, so mstar's default has to land before any import does."""
-    env = {k: v for k, v in os.environ.items() if k not in ("TORCHINDUCTOR_CACHE_DIR", "XDG_CACHE_HOME")}
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "XDG_CACHE_HOME")}
     env["XDG_CACHE_HOME"] = str(tmp_path)
-    code = f"import os, {entry}; print(os.environ['TORCHINDUCTOR_CACHE_DIR'])"
+    code = f"import os, {entry}; print(os.environ['TORCHINDUCTOR_CACHE_DIR'], os.environ['TRITON_CACHE_DIR'])"
     out = subprocess.run(
         [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300, check=True,
     ).stdout.strip().splitlines()[-1]
-    assert out == str(tmp_path / "mstar" / "torchinductor")
+    assert out == f"{tmp_path / 'mstar' / 'torchinductor'} {tmp_path / 'mstar' / 'triton'}"
 
 
 def _no_home(cls):
@@ -58,6 +59,7 @@ def test_compile_cache_without_a_usable_cache_home(tmp_path, monkeypatch, xdg, h
     process with no home keeps torch's default rather than failing to import."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
     if xdg is None:
         monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     else:
@@ -66,6 +68,6 @@ def test_compile_cache_without_a_usable_cache_home(tmp_path, monkeypatch, xdg, h
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
     else:
         monkeypatch.setattr(Path, "home", classmethod(_no_home))
-    _default_compile_cache()
+    _default_compile_caches()
     expected = str(tmp_path / "home" / ".cache" / "mstar" / "torchinductor") if has_home else None
     assert os.environ.get("TORCHINDUCTOR_CACHE_DIR") == expected

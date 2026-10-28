@@ -494,7 +494,10 @@ class Conductor:
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
-        logger.info("Inductor compile cache: %s", os.environ.get("TORCHINDUCTOR_CACHE_DIR"))
+        logger.info(
+            "Compile caches: Inductor %s, Triton %s",
+            os.environ.get("TORCHINDUCTOR_CACHE_DIR"), os.environ.get("TRITON_CACHE_DIR"),
+        )
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
