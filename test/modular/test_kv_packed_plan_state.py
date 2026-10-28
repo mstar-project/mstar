@@ -1,6 +1,8 @@
-"""A captured packed step's write addressing, computed on the host
-(`_stage_packed_plan_state`), matches the device unpacking of the same
-indptrs (`_compute_plan_state` into the captured state)."""
+"""A packed step's write addressing, computed on the host from the plan's
+indptrs (`_packed_addressing`), matches unpacking the same indptrs with torch
+ops (the device path it replaced, kept here as the reference): staged into a
+captured state (`_stage_packed_plan_state`) and uploaded for an eager write
+(`_host_plan_state`)."""
 
 from __future__ import annotations
 
@@ -50,14 +52,25 @@ def _state():
     )
 
 
+def _unpacked(indptrs, total):
+    """The reference: each token's page and offset by torch ops on the indptrs."""
+    qo, kvp = indptrs.qo_indptr.long(), indptrs.paged_kv_indptr.long()
+    lens = qo[1:] - qo[:-1]
+    kv_after = (kvp[1:] - kvp[:-1] - 1) * PAGE + indptrs.paged_kv_last_page_len.long()
+    seg = torch.repeat_interleave(torch.arange(len(lens)), lens, output_size=total)
+    g = (kv_after - lens)[seg] + torch.arange(total) - torch.repeat_interleave(qo[:-1], lens, output_size=total)
+    page = torch.div(g, PAGE, rounding_mode="floor")
+    return indptrs.paged_kv_indices.long()[kvp[:-1][seg] + page], g - page * PAGE
+
+
 def _device_unpacked(kv, indptrs) -> KVPlanState:
-    """The reference: the device unpacking, then copied into a captured state
-    with SINK_PAGE / 0 past the real tokens."""
+    """The reference, copied into a captured state with SINK_PAGE / 0 past the
+    real tokens."""
     total = int(indptrs.qo_indptr[-1])
-    plan = kv._compute_plan_state(indptrs, total_tokens=total)
+    pages, offsets = _unpacked(indptrs, total)
     ref = _state()
-    ref.token_to_page[:total].copy_(plan.token_to_page)
-    ref.token_to_cache[:total].copy_(plan.token_to_cache)
+    ref.token_to_page[:total].copy_(pages)
+    ref.token_to_cache[:total].copy_(offsets)
     ref.token_to_page[total:].fill_(SINK_PAGE)
     ref.token_to_cache[total:].fill_(0)
     ref.total_tokens = total
@@ -119,3 +132,19 @@ def test_a_row_past_its_pages_is_refused():
         )
         with pytest.raises(RuntimeError, match="past its own pages"):
             kv._stage_packed_plan_state(indptrs, _state(), CAPTURE)
+
+
+def test_an_eager_writes_host_addressing_matches_the_reference():
+    kv = KVManager.__new__(KVManager)
+    kv.kv_cache = SimpleNamespace(page_size=PAGE)
+    kv._device = torch.device("cpu")
+    kv._plan_stager = PinnedStager(torch.long)
+    rng = np.random.default_rng(1)
+    for _ in range(20):
+        indptrs = _indptrs(rng)
+        total = int(indptrs.qo_indptr[-1])
+        pages, offsets = _unpacked(indptrs, total)
+        got = kv._host_plan_state(indptrs, total)
+        assert got.total_tokens == total
+        assert torch.equal(got.token_to_page, pages)
+        assert torch.equal(got.token_to_cache, offsets)

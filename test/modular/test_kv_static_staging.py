@@ -71,3 +71,22 @@ def test_capture_lengths_share_a_slots_buffer(kv):
     assert kv._static_plan_state(0, "ctx", 4).staging.data_ptr() != s4.staging.data_ptr()
     with pytest.raises(ValueError):
         kv._stage_static(s2, [1, 2, 3], [0, 0, 0], 3)
+
+
+def test_an_eager_write_uploads_its_addressing_in_one_copy(kv):
+    """Two rows appending 3 and 2 tokens after 5 and 0 stored ones (page size
+    4): the addressing lands on the device whole, from one stager copy."""
+    from mstar.engine.resources.kv.plan import PagedIndptrs
+
+    i32 = lambda v: torch.tensor(v, dtype=torch.int32)  # noqa: E731
+    indptrs = PagedIndptrs(
+        qo_indptr=i32([0, 3, 5]), paged_kv_indptr=i32([0, 2, 3]), paged_kv_indices=i32([7, 9, 4]),
+        paged_kv_last_page_len=i32([4, 2]), kv_lens=None,
+    )
+    ring = kv._plan_stager._next
+    state = kv._host_plan_state(indptrs, 5)
+    assert kv._plan_stager._next == (ring + 1) % kv._plan_stager._depth
+    torch.cuda.synchronize()
+    assert state.token_to_page.is_cuda and state.total_tokens == 5
+    assert state.token_to_page.tolist() == [9, 9, 9, 4, 4]
+    assert state.token_to_cache.tolist() == [1, 2, 3, 0, 1]

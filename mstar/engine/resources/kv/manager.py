@@ -2175,55 +2175,6 @@ class KVManager(AttentionResource):
             ))
         return views
 
-    def _compute_plan_state(
-        self, cuda_indptrs: PagedIndptrs,
-        total_tokens: int
-    ) -> KVPlanState:
-        qo_indptr = cuda_indptrs.qo_indptr
-        paged_kv_indptr = cuda_indptrs.paged_kv_indptr
-        paged_kv_last_page_len = cuda_indptrs.paged_kv_last_page_len
-        paged_kv_indices = cuda_indptrs.paged_kv_indices
-
-        # Compute per-token page and offset for vectorized KV writes
-        n_req = qo_indptr.shape[0] - 1
-        starts = qo_indptr[:-1].to(torch.int32)
-        lens = (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32)
-
-        # Pages/lengths AFTER append
-        num_pages_after = (
-            paged_kv_indptr[1:] - paged_kv_indptr[:-1]
-        ).to(torch.int32)
-        kv_len_after = (
-            (num_pages_after - 1) * self.kv_cache.page_size + paged_kv_last_page_len
-        )
-
-        # Flatten to per-token indices
-        # output_size keeps repeat_interleave from syncing to read `lens`
-        seg = torch.repeat_interleave(
-            torch.arange(n_req, dtype=torch.int32, device=self._device), lens,
-            output_size=total_tokens
-        )
-        intra = torch.arange(
-            total_tokens, dtype=torch.int32, device=self._device
-        ) - torch.repeat_interleave(starts, lens, output_size=total_tokens)
-
-        # Absolute KV position per token
-        start_new = kv_len_after[seg] - lens[seg]
-        g = start_new + intra
-
-        # Map to page + offset
-        page_off = torch.div(g, self.kv_cache.page_size, rounding_mode="floor").to(
-            torch.int32
-        )
-        off_in_page = (g - page_off * self.kv_cache.page_size).to(torch.int32)
-        abs_page_ptr = paged_kv_indptr[:-1][seg] + page_off
-
-        return KVPlanState(
-            token_to_page=paged_kv_indices[abs_page_ptr].to(torch.long),
-            token_to_cache=off_in_page.to(torch.long),
-            total_tokens=total_tokens
-        )
-
     def _empty_plan_state(self) -> KVPlanState:
         empty = self._empty_locations
         if empty is None:
@@ -2267,15 +2218,20 @@ class KVManager(AttentionResource):
     def _stage_packed_plan_state(
         self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int,
     ) -> KVPlanState:
-        """``_compute_plan_state`` staged into the captured state, computed on
-        the host from the indptrs the plan built there."""
-        qo = indptrs.qo_indptr.numpy()
-        total = int(qo[-1])
+        """``_packed_addressing`` staged into the captured state."""
+        total = int(indptrs.qo_indptr[-1])
         if total == 0:
             # every row reads without writing (a zero-span context label):
             # the buffer is all SINK_PAGE, which the mirror usually already holds
             return self._stage_static(static_state, (), (), 0)
+        pages, offsets = self._packed_addressing(indptrs, total)
+        return self._stage_static(static_state, pages, offsets, total)
+
+    def _packed_addressing(self, indptrs: PagedIndptrs, total: int) -> tuple[np.ndarray, np.ndarray]:
+        """Each new token's page and offset in it, from the plan's host
+        indptrs: tokens are appended after each row's stored length."""
         page_size = self.kv_cache.page_size
+        qo = indptrs.qo_indptr.numpy()
         kvp = indptrs.paged_kv_indptr.numpy()
         spans = np.diff(qo)
         seg = np.repeat(np.arange(len(spans)), spans)
@@ -2291,9 +2247,20 @@ class KVManager(AttentionResource):
                 f"(spans {spans.tolist()}, kv indptr {kvp.tolist()}, last page lens {last.tolist()})"
             )
         pos = (kv_after - spans - qo[:-1])[seg] + np.arange(total)
-        page, offset = np.divmod(pos, page_size)
-        pages = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
-        return self._stage_static(static_state, pages, offset, total)
+        page, offsets = np.divmod(pos, page_size)
+        return indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page], offsets
+
+    def _host_plan_state(self, indptrs: PagedIndptrs, total: int) -> KVPlanState:
+        """An eager write's addressing: computed on the host and uploaded in
+        one page-locked copy, rather than unpacked on the device from
+        uploaded indptrs (four copies and a dozen small kernels a step)."""
+        pages, offsets = self._packed_addressing(indptrs, total)
+        host = np.empty(2 * total, np.int64)
+        host[:total] = pages
+        host[total:] = offsets
+        both = torch.empty(2 * total, dtype=torch.long, device=self._device)
+        self._plan_stager.copy_(both, host)
+        return KVPlanState(token_to_page=both[:total], token_to_cache=both[total:], total_tokens=total)
 
     def _stage_decode_plan_state(
         self, views: list[SequenceView] | None, static_state: KVPlanState,
@@ -2358,11 +2325,7 @@ class KVManager(AttentionResource):
                 # addressing to upload and unpack
                 plan_state = self._empty_plan_state()
             else:
-                indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
-                plan_state = self._compute_plan_state(
-                    indptrs.cuda_indptrs,
-                    total_tokens=total_tokens,
-                )
+                plan_state = self._host_plan_state(indptrs.cpu_indptrs, total_tokens)
             # (a leased step staged above: these are eager)
             if eager_write and ctx.is_preplan and plan_state.token_to_page.is_cuda:
                 plan_state.ready = torch.cuda.Event()
