@@ -4058,7 +4058,7 @@ class KVManager(AttentionResource):
         moving ``rid`` frees pages. Otherwise return an empty list, and ``rid`` waits until the room grows. It also
         returns an empty list when pages released since the grant ran short cover the shortage. None when the pool
         doesn't decide or ``rid`` has no arrival number. ``droppable`` returns whether a request can be dropped
-        once every step holding it has landed.
+        once the steps it has launched land.
         """
         if not self._decides:
             return None
