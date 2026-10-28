@@ -62,6 +62,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     # ASR: NVIDIA's FastConformer models, batched and captured.
     "canary": "canary.yaml",
     "canary_qwen": "canary_qwen.yaml",
+    "parakeet": "parakeet.yaml",
+    "nemotron_asr": "nemotron_asr.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
     "lingbot_world_1_3b": "lingbot_world_1_3b.yaml",
@@ -71,6 +73,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "ltx2_5": "ltx2_5.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
+    "glm52": "glm52_tp8.yaml",
 }
 
 # qwen 3.5 series (dense)
@@ -192,7 +195,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
     if model in ("whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
-                 "canary", "canary_qwen"):
+                 "canary", "canary_qwen", "parakeet", "nemotron_asr"):
         lines.append("    print(client.transcribe(\"speech.wav\", language=\"en\"))")
     if model.startswith("omnilingual_asr_ctc_"):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
