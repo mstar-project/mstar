@@ -14,6 +14,7 @@ checked out:
         --out DIR --comment partial.md [--previous handoff.json] SOURCE...
 """
 import argparse
+import ast
 import json
 import os
 import re
@@ -203,10 +204,23 @@ def first_line(content):
 
 
 def diff_paths(diff_text):
-    """The files ``pr.diff`` adds or changes, in order (deleted files have nothing to open)."""
+    """The files ``pr.diff`` adds or changes, in order (deleted files, ``+++ /dev/null``, have
+    nothing to open)."""
     lines = diff_text.splitlines()
-    return [line[len("+++ b/"):].rstrip("\t\r") for i, line in enumerate(lines)
-            if i and line.startswith("+++ b/") and lines[i - 1].startswith("--- ")]
+    paths = []
+    for before, line in zip(lines, lines[1:], strict=False):
+        if not (before.startswith("--- ") and line.startswith("+++ ")):
+            continue
+        path = line[len("+++ "):].rstrip("\t\r")
+        if path.startswith('"'):
+            # Git quotes a path with unusual characters, as a C string of its UTF-8 bytes.
+            try:
+                path = ast.literal_eval(path).encode("latin-1").decode("utf-8", "replace")
+            except (ValueError, SyntaxError):
+                continue
+        if path.startswith("b/"):
+            paths.append(path[len("b/"):])
+    return paths
 
 
 def comment_lines(h, status):

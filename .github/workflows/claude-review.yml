@@ -343,12 +343,14 @@ jobs:
           if [ -n "$PREV" ]; then cp "$PREV/handoff.md" handoff.md; fi
           # GitHub refuses `gh pr diff` past 20,000 lines or 300 files. Fall back
           # to the files API (up to 3,000 files; it omits the patch of a file
-          # that is too large on its own).
+          # that is too large on its own). A removed file's new side is /dev/null,
+          # as in git's own diff.
           if ! gh pr diff "$PR" --repo "$REPO" > pr.diff 2> diff.err; then
             echo "::warning::gh pr diff failed ($(head -c 300 diff.err)); building pr.diff from the files API."
             gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] |
               (.previous_filename // .filename) as $old |
-              "diff --git a/\($old) b/\(.filename)\n--- a/\($old)\n+++ b/\(.filename)\n\(.patch // "(no patch from GitHub: binary, or too large to show)")"' > pr.diff
+              (if .status == "removed" then "/dev/null" else "b/\(.filename)" end) as $new |
+              "diff --git a/\($old) b/\(.filename)\n--- a/\($old)\n+++ \($new)\n\(.patch // "(no patch from GitHub: binary, or too large to show)")"' > pr.diff
           fi
           gh pr view "$PR" --repo "$REPO" --json body --jq .body > pr-body.md
 
