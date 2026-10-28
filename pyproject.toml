@@ -313,8 +313,15 @@ pi05 = [
 ]
 
 gr00t_n17 = [
+    # the VL bridge and the DT import diffusers' FeedForward and timestep embeddings
+    "diffusers>=0.39",
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
     # Image eval transform: cv2's INTER_AREA, the reference's filter.
     "opencv-python-headless",
+    "safetensors",
+    "transformers",
 ]
 
 vjepa2 = [
