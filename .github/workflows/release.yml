@@ -36,12 +36,22 @@ on:
       - MANIFEST.in
       - .github/workflows/release.yml
 
+# A newer push supersedes a PR or manual run; a release run is never cancelled.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
 jobs:
   wheels:
     strategy:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
+    env:
+      # Version-specific rather than abi3, matching the extension that
+      # `maturin develop` builds and the tests exercise. PR and manual runs
+      # build one CPython per architecture; the check expects one wheel each.
+      CIBW_BUILD: ${{ github.event_name == 'release' && 'cp312-manylinux_* cp313-manylinux_* cp314-manylinux_*' || 'cp312-manylinux_*' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
@@ -68,9 +78,6 @@ jobs:
             rust/about.hbs -o LICENSES-THIRD-PARTY-mstar-server.txt
       - uses: pypa/cibuildwheel@v4.2.1
         env:
-          # Version-specific rather than abi3, matching the extension that
-          # `maturin develop` builds and the tests exercise.
-          CIBW_BUILD: "cp312-manylinux_* cp313-manylinux_* cp314-manylinux_*"
           CIBW_BEFORE_ALL_LINUX: >-
             curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none &&
             cd {project} && $HOME/.cargo/bin/rustup toolchain install
@@ -92,7 +99,7 @@ jobs:
       - name: Check each wheel in a clean venv
         shell: python
         run: |
-          import glob, re, subprocess, tempfile
+          import glob, os, re, subprocess, tempfile
           expected = re.search(r'^EXPECTED_MSTAR_RUST_VERSION = "(.+)"$',
                                open("mstar/communication/communicator.py").read(), re.M)[1]
           check = """
@@ -108,7 +115,7 @@ jobs:
           subprocess.run([server, '--help'], env=env, check=True)
           """
           wheels = sorted(glob.glob("wheelhouse/*.whl"))
-          assert len(wheels) == 3, wheels
+          assert len(wheels) == len(os.environ["CIBW_BUILD"].split()), wheels
           for whl in wheels:
               py = "python3." + re.search(r"-cp3(\d+)-", whl).group(1)
               venv = tempfile.mkdtemp()

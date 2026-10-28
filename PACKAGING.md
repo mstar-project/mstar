@@ -116,6 +116,7 @@ engine, so they need no separate upload.
 
 `python -m build` makes only the pure-Python wheel. The Linux Rust wheels need
 cibuildwheel (Docker) with the workflow's `CIBW_*` settings. The workflow
-builds and checks them without publishing on any pull request that touches
-`rust/`, the build files or the workflow, and from the Actions tab on any
-branch (`Run workflow`); only a published Release runs the publishing jobs.
+builds and checks them without publishing, for CPython 3.12 only, on any pull
+request that touches `rust/`, the build files or the workflow, and from the
+Actions tab on any branch (`Run workflow`); only a published Release builds
+all three versions and runs the publishing jobs.
