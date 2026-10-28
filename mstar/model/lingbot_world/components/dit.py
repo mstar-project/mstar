@@ -254,17 +254,26 @@ def attended_frames(config: LingBotWorldConfig, chunk: int) -> int:
     return min(frames, config.local_attn_size) if config.local_attn_size > -1 else frames
 
 
-@torch.compiler.disable
-def _window_attention(
-    attend: Attend, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cache: "RollingKVCache",
-    kv: tuple[torch.Tensor, torch.Tensor], plan: "_WritePlan",
-) -> torch.Tensor:
-    """Write the chunk's K/V into the layer's rolling cache ``kv``, then attend
-    over the window. Eager inside a compiled block: the cache offsets change
-    chunk to chunk, so traced they would recompile it every chunk."""
-    cache.write_layer(*kv, k, v, plan)
-    window = cache.window(plan)
-    return attend(q, kv[0][:, window], kv[1][:, window])
+class ChunkWindow:
+    """One chunk's window attention for every block: write the chunk's K/V
+    into a layer's rolling cache, then attend over the window. Eager inside a
+    compiled block, and handed to it as one object rather than as the plan's
+    integers: the cache offsets change chunk to chunk, and Dynamo guards on
+    integer arguments, so traced (or passed as ints) they would recompile
+    every block every chunk."""
+
+    def __init__(self, attend: Attend, cache: "RollingKVCache", plan: "_WritePlan"):
+        self.attend = attend
+        self.cache = cache
+        self.plan = plan
+
+    @torch.compiler.disable
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        self.cache.write_layer(*kv, k, v, self.plan)
+        window = self.cache.window(self.plan)
+        return self.attend(q, kv[0][:, window], kv[1][:, window])
 
 
 class CausalSelfAttention(nn.Module):
@@ -280,8 +289,7 @@ class CausalSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps)
 
     def forward(
-        self, x: torch.Tensor, rope: torch.Tensor, cache: RollingKVCache, kv: tuple[torch.Tensor, torch.Tensor],
-        plan: _WritePlan, attend: Attend,
+        self, x: torch.Tensor, rope: torch.Tensor, kv: tuple[torch.Tensor, torch.Tensor], window: ChunkWindow,
     ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -289,7 +297,7 @@ class CausalSelfAttention(nn.Module):
         v = self.v(x).view(b, s, n, d)
         roped_query = causal_rope_apply(q, rope).type_as(v)
         roped_key = causal_rope_apply(k, rope).type_as(v)
-        x = _window_attention(attend, roped_query, roped_key, v, cache, kv, plan)
+        x = window(roped_query, roped_key, v, kv)
         return self.o(x.flatten(2))
 
 
@@ -341,11 +349,12 @@ class CausalBlock(nn.Module):
 
     def forward(
         self, x: torch.Tensor, e: torch.Tensor, cam: tuple[torch.Tensor, torch.Tensor], cross_k: torch.Tensor,
-        cross_v: torch.Tensor, attn_args: dict, text_attend: Attend,
+        cross_v: torch.Tensor, rope: torch.Tensor, kv: tuple[torch.Tensor, torch.Tensor], window: ChunkWindow,
+        text_attend: Attend,
     ) -> torch.Tensor:
         with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
-        y = self.self_attn(self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2), **attn_args)
+        y = self.self_attn(self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2), rope, kv, window)
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -481,7 +490,8 @@ class LingBotCausalDiT(nn.Module):
 
         x = self.patch_embedding(torch.cat([x, y], dim=0).unsqueeze(0))
         grid = tuple(x.shape[2:])
-        x = x.flatten(2).transpose(1, 2)
+        # contiguous: a compiled block guards on its input's strides
+        x = x.flatten(2).transpose(1, 2).contiguous()
         seq_len = x.size(1)
 
         per_token = t.dim() > 1
@@ -507,11 +517,11 @@ class LingBotCausalDiT(nn.Module):
                 cache.cross_v.append(v)
 
         plan = cache.plan(current_start, seq_len)
+        window = ChunkWindow(attention.window, cache, plan)
         for i, block in enumerate(self.blocks):
             # the layer's buffers, not its index: a compiled block would guard on the int
-            attn_args = dict(rope=chunk.rope, cache=cache, kv=(cache.k[i], cache.v[i]), plan=plan,
-                             attend=attention.window)
-            x = block(x, e0, chunk.cam[i], cache.cross_k[i], cache.cross_v[i], attn_args, attention.text)
+            x = block(x, e0, chunk.cam[i], cache.cross_k[i], cache.cross_v[i], chunk.rope,
+                      (cache.k[i], cache.v[i]), window, attention.text)
         cache.global_end = plan.current_end
         cache.local_end = plan.local_end
 
