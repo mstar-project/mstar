@@ -193,6 +193,24 @@ def test_the_pages_a_request_that_passed_frees_go_to_the_head(leave):
     assert getattr(kv._head_wait, "rid", None) != "head", "the admitted head's wait would decide who passes next"
 
 
+@pytest.mark.parametrize("slots, passes", [(5, True), (4, False)], ids=["a slot left for the head", "none left"])
+def test_a_request_passes_beside_a_recurrent_pool_only_while_a_slot_is_left_for_the_head(slots, passes):
+    """Qwen3.5 runs a KV pool and a recurrent pool on one node, and a request asks both."""
+    kv = _manager(max_num_pages=16)
+    state = RecurrentStatePool.build(
+        RecurrentStateSpec(resource_key="state", nodes={NODE}, config=RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)}, max_slots=slots,
+        )),
+        EngineResourceInfo(device=torch.device("cpu")),
+    )
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "state": state}, node_resources={NODE: ["kv", "state"]}))
+    kv = _passing(free=3, head=5, kv=kv)
+    kv.ingest_request("short", KVReqConfig(prefix_keys={"main": _keys(HELD + [8] * 8)}, loop_caps={"decode_loop": 16},
+        kv_layout={"main": StreamLayout((PrefixSpan(56, 56, WALK),), (("decode_loop", 1),), keyed_spans=1)}))
+
+    assert _ready(kv, "short") is passes, "the head would wait for a slot a request passing it took"
+
+
 class _Slots(Resource):
     """A pool that lets a request pass and has no slot for ``refused``."""
 
