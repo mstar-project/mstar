@@ -671,6 +671,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.generation_kwargs.check_seed"><code class="docutils literal notranslate"><span class="pre">check_seed()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.generation_kwargs.normalize_generation_kwargs"><code class="docutils literal notranslate"><span class="pre">normalize_generation_kwargs()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.generation_kwargs.offset_seed"><code class="docutils literal notranslate"><span class="pre">offset_seed()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -686,10 +687,11 @@
 <span id="mstar-utils-generation-kwargs"></span><h1>mstar.utils.generation_kwargs<a class="headerlink" href="#module-mstar.utils.generation_kwargs" title="Link to this heading">#</a></h1>
 <p>The client-facing generation knobs, checked once where every endpoint submits.</p>
 <p>One meaning per knob on every model: <code class="docutils literal notranslate"><span class="pre">null</span></code> is the
-same as leaving the key out, types are strict (no <code class="docutils literal notranslate"><span class="pre">&quot;0.7&quot;</span></code>), and a value out of
-range is a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> (a 400) before any worker sees the request. A
-multi-stage model’s <code class="docutils literal notranslate"><span class="pre">&lt;stage&gt;_&lt;knob&gt;</span></code> (<code class="docutils literal notranslate"><span class="pre">talker_temperature</span></code>) follows the
-rule for <code class="docutils literal notranslate"><span class="pre">&lt;knob&gt;</span></code>.</p>
+same as leaving the key out, a value is coerced to the knob’s type only when it
+denotes exactly that value (<code class="docutils literal notranslate"><span class="pre">&quot;0.7&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;5&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">5.0</span></code> for an integer; never a
+bool), and a value out of range is a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> (a 400) before any worker
+sees the request. A multi-stage model’s <code class="docutils literal notranslate"><span class="pre">&lt;stage&gt;_&lt;knob&gt;</span></code> (<code class="docutils literal notranslate"><span class="pre">talker_temperature</span></code>)
+follows the rule for <code class="docutils literal notranslate"><span class="pre">&lt;knob&gt;</span></code>.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -697,7 +699,10 @@ rule for <code class="docutils literal notranslate"><span class="pre">&lt;knob&g
 <td><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> unless <code class="docutils literal notranslate"><span class="pre">seed</span></code> is None or an integer that fits in int64.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.generation_kwargs.normalize_generation_kwargs" title="mstar.utils.generation_kwargs.normalize_generation_kwargs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">normalize_generation_kwargs</span></code></a>(model_kwargs)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> with nulls dropped, length aliases folded into <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, and every known knob type- and range-checked.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> with nulls dropped, length aliases folded into <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, and every known knob coerced, then type- and range-checked.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.generation_kwargs.offset_seed" title="mstar.utils.generation_kwargs.offset_seed"><code class="xref py py-obj docutils literal notranslate"><span class="pre">offset_seed</span></code></a>(seed, i)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">seed</span> <span class="pre">+</span> <span class="pre">i</span></code> wrapped to signed int64, as the Rust frontend computes it.</p></td>
 </tr>
 </tbody>
 </table>
@@ -719,7 +724,7 @@ and past it the request cannot even be packed for the conductor.</p>
 <dt class="sig sig-object py" id="mstar.utils.generation_kwargs.normalize_generation_kwargs">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.generation_kwargs.</span></span><span class="sig-name descname"><span class="pre">normalize_generation_kwargs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/generation_kwargs.html#normalize_generation_kwargs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.generation_kwargs.normalize_generation_kwargs" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> with nulls dropped, length aliases folded into
-<code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, and every known knob type- and range-checked.</p>
+<code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, and every known knob coerced, then type- and range-checked.</p>
 <p>Raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> naming the knob and its allowed range.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -727,6 +732,23 @@ and past it the request cannot even be packed for the conductor.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.generation_kwargs.offset_seed">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.generation_kwargs.</span></span><span class="sig-name descname"><span class="pre">offset_seed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">seed</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">i</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/generation_kwargs.html#offset_seed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.generation_kwargs.offset_seed" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">seed</span> <span class="pre">+</span> <span class="pre">i</span></code> wrapped to signed int64, as the Rust frontend computes it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>seed</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>i</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -782,6 +804,7 @@ and past it the request cannot even be packed for the conductor.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.generation_kwargs.check_seed"><code class="docutils literal notranslate"><span class="pre">check_seed()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.generation_kwargs.normalize_generation_kwargs"><code class="docutils literal notranslate"><span class="pre">normalize_generation_kwargs()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.generation_kwargs.offset_seed"><code class="docutils literal notranslate"><span class="pre">offset_seed()</span></code></a></li>
 </ul>
   </nav></div>
 

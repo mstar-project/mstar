@@ -998,6 +998,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">release_unread</span><span class="p">,</span> <span class="n">rid</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.protocol</span><span class="w"> </span><span class="kn">import</span> <span class="n">VoiceCard</span><span class="p">,</span> <span class="n">VoiceList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.speech_chunking</span><span class="w"> </span><span class="kn">import</span> <span class="n">split_sentences</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.generation_kwargs</span><span class="w"> </span><span class="kn">import</span> <span class="n">offset_seed</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_plan_chunks</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
@@ -1026,8 +1027,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"sentence_chunking"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="n">seed</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">)</span>
     <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">seed</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">seed</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">and</span> <span class="n">index</span><span class="p">:</span>
-        <span class="c1"># the conductor's seed is an int64: a seed near the top wraps instead of overflowing</span>
-        <span class="n">kwargs</span><span class="p">[</span><span class="s2">"seed"</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">seed</span> <span class="o">+</span> <span class="n">index</span><span class="p">)</span> <span class="o">%</span> <span class="mi">2</span><span class="o">**</span><span class="mi">63</span>
+        <span class="n">kwargs</span><span class="p">[</span><span class="s2">"seed"</span><span class="p">]</span> <span class="o">=</span> <span class="n">offset_seed</span><span class="p">(</span><span class="n">seed</span><span class="p">,</span> <span class="n">index</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">kwargs</span>
 
 
@@ -1048,7 +1048,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="create_speech">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html#mstar.api_server.openai.serving_speech.create_speech">[docs]</a>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_speech</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">raw_request</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>  <span class="c1"># noqa: ARG001</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_speech</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">raw_request</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
     <span class="n">sample_rate</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">get_output_sample_rate</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">)</span> <span class="k">if</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">24000</span>
     <span class="c1"># before any upload or GPU work: a format we cannot produce is the client's error</span>
     <span class="k">try</span><span class="p">:</span>
@@ -1084,23 +1084,16 @@ window.runMermaid = runMermaid;</script>
         <span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">submit</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">min</span><span class="p">(</span><span class="n">lookahead</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">)))]</span>
         <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">:</span>
             <span class="n">raw_pcm</span> <span class="o">=</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"pcm"</span>
-            <span class="c1"># Look at the first result before committing to a 200: a request the</span>
-            <span class="c1"># engine rejects (bad voice, dead worker, ...) must surface as an HTTP</span>
-            <span class="c1"># error, not as an empty WAV.</span>
-            <span class="n">first_iter</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">pending</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+            <span class="c1"># a request the engine rejects gets its status, not an empty WAV</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="n">first</span> <span class="o">=</span> <span class="k">await</span> <span class="n">anext</span><span class="p">(</span><span class="n">first_iter</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-                <span class="k">if</span> <span class="n">_is_error</span><span class="p">(</span><span class="n">first</span><span class="p">):</span>
-                    <span class="c1"># Read it to the end so the finished request isn't aborted.</span>
-                    <span class="k">await</span> <span class="n">_drain</span><span class="p">(</span><span class="n">first_iter</span><span class="p">)</span>
-                    <span class="k">raise</span> <span class="n">_http_error</span><span class="p">(</span><span class="n">first</span><span class="p">)</span>
+                <span class="n">first_iter</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">open_result_stream</span><span class="p">(</span><span class="n">pending</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">raw_request</span><span class="p">)</span>
             <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
                 <span class="c1"># The first piece released itself; release the ones submitted ahead.</span>
                 <span class="n">release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">pending</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
                 <span class="k">raise</span>
             <span class="n">stream_owns_uploads</span> <span class="o">=</span> <span class="kc">True</span>
             <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span>
-                <span class="n">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">submit</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">),</span> <span class="n">pending</span><span class="p">,</span> <span class="n">first_iter</span><span class="p">,</span> <span class="n">first</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span>
+                <span class="n">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">submit</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">),</span> <span class="n">pending</span><span class="p">,</span> <span class="n">first_iter</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span>
                             <span class="n">with_wav_header</span><span class="o">=</span><span class="ow">not</span> <span class="n">raw_pcm</span><span class="p">,</span> <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">),</span>
                 <span class="n">media_type</span><span class="o">=</span><span class="s2">"audio/pcm"</span> <span class="k">if</span> <span class="n">raw_pcm</span> <span class="k">else</span> <span class="s2">"audio/wav"</span><span class="p">,</span>
                 <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
@@ -1143,13 +1136,8 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
 
 
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_drain</span><span class="p">(</span><span class="n">iterator</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="k">async</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">iterator</span><span class="p">:</span>
-        <span class="k">pass</span>
-
-
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">submit</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">str</span><span class="p">],</span> <span class="n">num_chunks</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">pending</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
-                      <span class="n">first_iter</span><span class="p">,</span> <span class="n">first</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">with_wav_header</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+                      <span class="n">first_iter</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">with_wav_header</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
                       <span class="n">file_paths</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
     <span class="n">read</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># pieces read to the end; the rest are released if the stream stops early</span>
     <span class="k">try</span><span class="p">:</span>
@@ -1159,12 +1147,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">num_chunks</span><span class="p">:</span>
                 <span class="c1"># Keep the next chunk generating while this one plays.</span>
                 <span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">submit</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)))</span>
-            <span class="k">if</span> <span class="n">index</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="n">iterator</span><span class="p">,</span> <span class="n">head</span> <span class="o">=</span> <span class="n">first_iter</span><span class="p">,</span> <span class="n">first</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">iterator</span><span class="p">,</span> <span class="n">head</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">pending</span><span class="p">[</span><span class="n">index</span><span class="p">]),</span> <span class="kc">None</span>
-            <span class="k">if</span> <span class="n">head</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">head</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span> <span class="ow">and</span> <span class="n">head</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
-                <span class="k">yield</span> <span class="n">head</span><span class="o">.</span><span class="n">data</span>
+            <span class="n">iterator</span> <span class="o">=</span> <span class="n">first_iter</span> <span class="k">if</span> <span class="n">index</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">pending</span><span class="p">[</span><span class="n">index</span><span class="p">])</span>
             <span class="n">error</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">async</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">iterator</span><span class="p">:</span>
                 <span class="c1"># Read past an error to the end: leaving early would abort a</span>

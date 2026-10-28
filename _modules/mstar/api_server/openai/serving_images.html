@@ -974,6 +974,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">now</span><span class="p">,</span> <span class="n">release_unread</span><span class="p">,</span> <span class="n">rid</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.generation_kwargs</span><span class="w"> </span><span class="kn">import</span> <span class="n">offset_seed</span>
 
 
 <div class="viewcode-block" id="create_images">
@@ -991,7 +992,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
         <span class="n">model_kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">seed</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">i</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="n">model_kwargs</span><span class="p">[</span><span class="s2">"seed"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span> <span class="o">+</span> <span class="n">i</span>
+            <span class="n">model_kwargs</span><span class="p">[</span><span class="s2">"seed"</span><span class="p">]</span> <span class="o">=</span> <span class="n">offset_seed</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">seed</span><span class="p">),</span> <span class="n">i</span><span class="p">)</span>
         <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"img"</span><span class="p">)</span>
         <span class="c1"># Listed before submitting: submit_request registers the request</span>
         <span class="c1"># before handing it on, so a failed submit still holds an entry.</span>

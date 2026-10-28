@@ -963,13 +963,23 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""The client-facing generation knobs, checked once where every endpoint submits.</span>
 
 <span class="sd">One meaning per knob on every model: ``null`` is the</span>
-<span class="sd">same as leaving the key out, types are strict (no ``"0.7"``), and a value out of</span>
-<span class="sd">range is a ``ValueError`` (a 400) before any worker sees the request. A</span>
-<span class="sd">multi-stage model's ``&lt;stage&gt;_&lt;knob&gt;`` (``talker_temperature``) follows the</span>
-<span class="sd">rule for ``&lt;knob&gt;``.</span>
+<span class="sd">same as leaving the key out, a value is coerced to the knob's type only when it</span>
+<span class="sd">denotes exactly that value (``"0.7"``, ``"5"``, ``5.0`` for an integer; never a</span>
+<span class="sd">bool), and a value out of range is a ``ValueError`` (a 400) before any worker</span>
+<span class="sd">sees the request. A multi-stage model's ``&lt;stage&gt;_&lt;knob&gt;`` (``talker_temperature``)</span>
+<span class="sd">follows the rule for ``&lt;knob&gt;``.</span>
 <span class="sd">"""</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sampler.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">BOOL_KNOBS</span><span class="p">,</span>
+    <span class="n">INT_KNOB_RULES</span><span class="p">,</span>
+    <span class="n">REAL_KNOB_RULES</span><span class="p">,</span>
+    <span class="n">check_bool_knob</span><span class="p">,</span>
+    <span class="n">check_int_knob</span><span class="p">,</span>
+    <span class="n">check_real_knob</span><span class="p">,</span>
+<span class="p">)</span>
 
 
 <div class="viewcode-block" id="check_seed">
@@ -989,21 +999,47 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="c1"># knob -&gt; (rule text, predicate) for real-valued knobs</span>
-<span class="n">_REAL_RULES</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s2">"temperature"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 0 (0 is greedy)"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">),</span>
-    <span class="s2">"top_p"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"in (0, 1] (1 is off; greedy is temperature 0)"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="mi">0</span> <span class="o">&lt;</span> <span class="n">v</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">),</span>
-    <span class="s2">"min_p"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"in [0, 1] (0 is off)"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">v</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">),</span>
-    <span class="s2">"repetition_penalty"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt; 0 (1 is off)"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">),</span>
-<span class="p">}</span>
+<div class="viewcode-block" id="offset_seed">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.generation_kwargs.html#mstar.utils.generation_kwargs.offset_seed">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">offset_seed</span><span class="p">(</span><span class="n">seed</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">i</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``seed + i`` wrapped to signed int64, as the Rust frontend computes it."""</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">seed</span> <span class="o">+</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">2</span><span class="o">**</span><span class="mi">63</span><span class="p">)</span> <span class="o">%</span> <span class="mi">2</span><span class="o">**</span><span class="mi">64</span> <span class="o">-</span> <span class="mi">2</span><span class="o">**</span><span class="mi">63</span></div>
+
+
+
+<span class="c1"># knob -&gt; (rule text, predicate); the sampling ones are the sampler's own</span>
+<span class="n">_REAL_RULES</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="n">REAL_KNOB_RULES</span><span class="p">}</span>
 <span class="n">_INT_RULES</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s2">"top_k"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 0 (0 is off)"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">),</span>
+    <span class="o">**</span><span class="n">INT_KNOB_RULES</span><span class="p">,</span>
     <span class="s2">"max_output_tokens"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 1"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">),</span>
 <span class="p">}</span>
-<span class="n">_BOOL_KNOBS</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"ignore_eos"</span><span class="p">,</span> <span class="s2">"penalize_prompt"</span><span class="p">)</span>
+<span class="n">_BOOL_KNOBS</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">BOOL_KNOBS</span><span class="p">,</span> <span class="s2">"do_sample"</span><span class="p">)</span>
 
 <span class="c1"># other names for max_output_tokens, in precedence order after it</span>
 <span class="n">MAX_OUTPUT_TOKENS_ALIASES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"max_new_tokens"</span><span class="p">,</span> <span class="s2">"max_completion_tokens"</span><span class="p">,</span> <span class="s2">"max_tokens"</span><span class="p">)</span>
+
+
+<span class="c1"># an integer literal, optionally with a zero fraction: "5", "-3", "5.0"; no exponent</span>
+<span class="n">_INTEGRAL</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"[+-]?[0-9]+(?:\.0*)?"</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_coerce_real</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A numeric string as its float; anything else unchanged, for the checks to judge."""</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">value</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span>
+        <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">value</span>
+    <span class="k">return</span> <span class="n">value</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_coerce_int</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""An integer-valued number or string as its int; anything else unchanged."""</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">float</span><span class="p">)</span> <span class="ow">and</span> <span class="n">value</span><span class="o">.</span><span class="n">is_integer</span><span class="p">():</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">and</span> <span class="n">_INTEGRAL</span><span class="o">.</span><span class="n">fullmatch</span><span class="p">(</span><span class="n">text</span> <span class="o">:=</span> <span class="n">value</span><span class="o">.</span><span class="n">strip</span><span class="p">()):</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">text</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">)[</span><span class="mi">0</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">value</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_knob</span><span class="p">(</span><span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">names</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
@@ -1018,7 +1054,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.generation_kwargs.html#mstar.utils.generation_kwargs.normalize_generation_kwargs">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">normalize_generation_kwargs</span><span class="p">(</span><span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``model_kwargs`` with nulls dropped, length aliases folded into</span>
-<span class="sd">    ``max_output_tokens``, and every known knob type- and range-checked.</span>
+<span class="sd">    ``max_output_tokens``, and every known knob coerced, then type- and range-checked.</span>
 
 <span class="sd">    Raises ``ValueError`` naming the knob and its allowed range.</span>
 <span class="sd">    """</span>
@@ -1029,19 +1065,16 @@ window.runMermaid = runMermaid;</script>
             <span class="n">kwargs</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"max_output_tokens"</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
     <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">key</span> <span class="o">==</span> <span class="s2">"seed"</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span> <span class="o">=</span> <span class="n">_coerce_int</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
             <span class="n">check_seed</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
         <span class="k">elif</span> <span class="p">(</span><span class="n">name</span> <span class="o">:=</span> <span class="n">_knob</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">_REAL_RULES</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">rule</span><span class="p">,</span> <span class="n">ok</span> <span class="o">=</span> <span class="n">_REAL_RULES</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
-            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="p">(</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">)):</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> must be a number </span><span class="si">{</span><span class="n">rule</span><span class="si">}</span><span class="s2">; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">value</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> must be a finite number </span><span class="si">{</span><span class="n">rule</span><span class="si">}</span><span class="s2">; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span> <span class="o">=</span> <span class="n">_coerce_real</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+            <span class="n">check_real_knob</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="o">*</span><span class="n">_REAL_RULES</span><span class="p">[</span><span class="n">name</span><span class="p">])</span>
         <span class="k">elif</span> <span class="p">(</span><span class="n">name</span> <span class="o">:=</span> <span class="n">_knob</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">_INT_RULES</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">rule</span><span class="p">,</span> <span class="n">ok</span> <span class="o">=</span> <span class="n">_INT_RULES</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
-            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> must be an integer </span><span class="si">{</span><span class="n">rule</span><span class="si">}</span><span class="s2">; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="k">elif</span> <span class="n">_knob</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">_BOOL_KNOBS</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> must be true or false; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span> <span class="o">=</span> <span class="n">_coerce_int</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+            <span class="n">check_int_knob</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="o">*</span><span class="n">_INT_RULES</span><span class="p">[</span><span class="n">name</span><span class="p">])</span>
+        <span class="k">elif</span> <span class="n">_knob</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">_BOOL_KNOBS</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">check_bool_knob</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">kwargs</span></div>
 
 </pre></div>

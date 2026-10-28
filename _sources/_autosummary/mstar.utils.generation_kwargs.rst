@@ -15,6 +15,7 @@ mstar.utils.generation\_kwargs
    
       check_seed
       normalize_generation_kwargs
+      offset_seed
    
    
 

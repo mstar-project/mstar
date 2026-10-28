@@ -13,6 +13,9 @@ mstar.engine.resources.sampler.config
 
    .. autosummary::
    
+      check_bool_knob
+      check_int_knob
+      check_real_knob
       derive_seed
    
    

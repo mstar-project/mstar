@@ -711,6 +711,9 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.SamplingReqConfig.validate"><code class="docutils literal notranslate"><span class="pre">SamplingReqConfig.validate()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.check_bool_knob"><code class="docutils literal notranslate"><span class="pre">check_bool_knob()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.check_int_knob"><code class="docutils literal notranslate"><span class="pre">check_int_knob()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.check_real_knob"><code class="docutils literal notranslate"><span class="pre">check_real_knob()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.derive_seed"><code class="docutils literal notranslate"><span class="pre">derive_seed()</span></code></a></li>
 </ul>
             </nav>
@@ -732,7 +735,16 @@ step without pulling them in behind it.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.sampler.config.derive_seed" title="mstar.engine.resources.sampler.config.derive_seed"><code class="xref py py-obj docutils literal notranslate"><span class="pre">derive_seed</span></code></a>(seed, stream)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.sampler.config.check_bool_knob" title="mstar.engine.resources.sampler.config.check_bool_knob"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_bool_knob</span></code></a>(key, value)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.sampler.config.check_int_knob" title="mstar.engine.resources.sampler.config.check_int_knob"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_int_knob</span></code></a>(key, value, rule, ok)</p></td>
+<td><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> unless <code class="docutils literal notranslate"><span class="pre">value</span></code> is an integer satisfying <code class="docutils literal notranslate"><span class="pre">ok</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.sampler.config.check_real_knob" title="mstar.engine.resources.sampler.config.check_real_knob"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_real_knob</span></code></a>(key, value, rule, ok)</p></td>
+<td><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> unless <code class="docutils literal notranslate"><span class="pre">value</span></code> is a finite number satisfying <code class="docutils literal notranslate"><span class="pre">ok</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.sampler.config.derive_seed" title="mstar.engine.resources.sampler.config.derive_seed"><code class="xref py py-obj docutils literal notranslate"><span class="pre">derive_seed</span></code></a>(seed, stream)</p></td>
 <td><p>A seed for one named stream of a request, as a non-negative int64.</p></td>
 </tr>
 </tbody>
@@ -1011,6 +1023,53 @@ node cannot honour. None means the sampler’s default.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.sampler.config.check_bool_knob">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.sampler.config.</span></span><span class="sig-name descname"><span class="pre">check_bool_knob</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sampler/config.html#check_bool_knob"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.sampler.config.check_bool_knob" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.sampler.config.check_int_knob">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.sampler.config.</span></span><span class="sig-name descname"><span class="pre">check_int_knob</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rule</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ok</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sampler/config.html#check_int_knob"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.sampler.config.check_int_knob" title="Link to this definition">#</a></dt>
+<dd><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> unless <code class="docutils literal notranslate"><span class="pre">value</span></code> is an integer satisfying <code class="docutils literal notranslate"><span class="pre">ok</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>rule</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.sampler.config.check_real_knob">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.sampler.config.</span></span><span class="sig-name descname"><span class="pre">check_real_knob</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rule</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ok</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sampler/config.html#check_real_knob"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.sampler.config.check_real_knob" title="Link to this definition">#</a></dt>
+<dd><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> unless <code class="docutils literal notranslate"><span class="pre">value</span></code> is a finite number satisfying <code class="docutils literal notranslate"><span class="pre">ok</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>rule</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.sampler.config.derive_seed">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.sampler.config.</span></span><span class="sig-name descname"><span class="pre">derive_seed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">seed</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sampler/config.html#derive_seed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.sampler.config.derive_seed" title="Link to this definition">#</a></dt>
 <dd><p>A seed for one named stream of a request, as a non-negative int64.</p>
@@ -1120,6 +1179,9 @@ request’s samplers do not draw correlated numbers from one seed.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.SamplingReqConfig.validate"><code class="docutils literal notranslate"><span class="pre">SamplingReqConfig.validate()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.check_bool_knob"><code class="docutils literal notranslate"><span class="pre">check_bool_knob()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.check_int_knob"><code class="docutils literal notranslate"><span class="pre">check_int_knob()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.check_real_knob"><code class="docutils literal notranslate"><span class="pre">check_real_knob()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.sampler.config.derive_seed"><code class="docutils literal notranslate"><span class="pre">derive_seed()</span></code></a></li>
 </ul>
   </nav></div>
