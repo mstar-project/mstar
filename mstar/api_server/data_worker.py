@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.model.components.diffusion.image_io import PNG_WORKERS
 
 try:
     import torchaudio  # noqa: F401 — probes availability; real usage in callers
@@ -66,19 +67,30 @@ from mstar.utils.ipc_format import (
 
 logger = logging.getLogger(__name__)
 
-# Outputs whose postprocess encodes a whole artifact (a PNG takes tens of ms) run
-# on the encode pool, so reads, streamed chunks and prompt preprocessing do not
-# wait behind them. Streamed modalities stay inline, in arrival order.
-POOLED_OUTPUT_MODALITIES = frozenset({"image"})
+# Outputs whose postprocess encodes a whole artifact (a PNG takes tens of ms,
+# an mp4 mux hundreds) run on the encode pool, so reads, streamed chunks and
+# prompt preprocessing do not wait behind them.
+ARTIFACT_MODALITIES = frozenset({"image", "video"})
 
 
-def encode_workers(cpus: int | None = None) -> int:
-    """Outputs encoded at once. A PNG deflates on up to 8 threads of its own
-    (``image_io.PNG_WORKERS``), so the pool times that stays within the CPUs
-    the process may use."""
+def pooled_output(modality: str, loop_indices: NestedLoopIndices | None) -> bool:
+    """Whether an output encodes on the pool: an artifact modality that the
+    walk emits outside any loop. An output a loop emits is a stream (V-JEPA2's
+    video, once per iteration) and stays inline, in arrival order, as do text
+    and audio, whose chunks are cheap and carry inline metadata."""
+    streamed = loop_indices is not None and bool(loop_indices.loop_name_order)
+    return modality in ARTIFACT_MODALITIES and not streamed
+
+
+def encode_workers(cpus: int | None = None, png_workers: int | None = None) -> int:
+    """Outputs encoded at once. A PNG deflates on ``png_workers`` threads of
+    its own (``image_io.PNG_WORKERS``), so the pool times that stays within
+    the CPUs the process may use."""
     if cpus is None:
         cpus = usable_cpus()
-    return max(1, min(4, cpus // 8))
+    if png_workers is None:
+        png_workers = PNG_WORKERS
+    return max(1, min(4, cpus // png_workers))
 
 
 def _sha256(path: str) -> bytes:
@@ -1243,7 +1255,7 @@ class PreprocessWorkerThread:
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                         if self.enable_nvtx:
                             profiler.range_pop()
-                        if self._encode_pool is not None and modality in POOLED_OUTPUT_MODALITIES:
+                        if self._encode_pool is not None and pooled_output(modality, loop_indices):
                             self._submit_encode(request_id, sequence, modality, tensor_info.uuid, tensor)
                             pooled = True
                         else:

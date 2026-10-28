@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState, encode_workers
+from mstar.graph.loop_indices import NestedLoopIndices
 
 
 class _Model:
@@ -86,15 +87,17 @@ def worker():
     wt._encode_pool.shutdown(wait=True)
 
 
-def _output(wt, request_id: str, modality: str, values: list[int]):
-    """``values`` arrive as ``request_id``'s next outputs, one tensor each."""
+def _output(wt, request_id: str, modality: str, values: list[int], looped: bool = False):
+    """``values`` arrive as ``request_id``'s next outputs, one tensor each;
+    ``looped`` ones as a loop emits them, one per iteration."""
     state = wt.request_output_state.setdefault(request_id, RequestOutputState())
     infos = []
-    for value in values:
+    for i, value in enumerate(values):
         uuid = f"{request_id}/{state.next_sequence}"
         wt.tensor_manager.tensors[uuid] = torch.tensor([value])
         wt.tensor_uuid_to_metadata_per_request.setdefault(request_id, {})[uuid] = {"v": value}
-        state.order[uuid] = (state.next_sequence, None)
+        indices = NestedLoopIndices(["rollout"], {"rollout": i}, 0) if looped else None
+        state.order[uuid] = (state.next_sequence, indices)
         state.next_sequence += 1
         infos.append(SimpleNamespace(uuid=uuid))
     edge = SimpleNamespace(name=f"{modality}_output", tensor_info=infos)
@@ -125,7 +128,22 @@ def _pass_until(wt, n: int, timeout_s: float = 5.0) -> list:
 
 @pytest.mark.parametrize(("cpus", "workers"), [(1, 1), (8, 1), (16, 2), (40, 4), (256, 4)])
 def test_the_pool_times_a_pngs_own_threads_fits_the_cpus(cpus, workers):
-    assert encode_workers(cpus) == workers
+    assert encode_workers(cpus, png_workers=8) == workers
+    assert workers * 8 <= max(cpus, 8)
+
+
+def test_a_whole_video_is_pooled_and_a_loops_frames_stay_inline(worker):
+    _output(worker, "clip", "video", [1])
+    _output(worker, "rollout", "video", [2, 3], looped=True)
+    worker.model.gate(2).set()
+    worker.model.gate(3).set()
+    worker._process_read_tensors()
+    assert worker.model.threads[2] == threading.current_thread().name
+    assert worker.model.threads[3] == threading.current_thread().name
+    assert [c.data for c in _drain(worker)] == [b"video:2", b"video:3"]
+    worker.model.gate(1).set()
+    (chunk,) = _pass_until(worker, 1)
+    assert chunk.data == b"video:1" and worker.model.threads[1].startswith("mstar-encode")
 
 
 def test_an_image_is_encoded_off_the_thread_and_released_when_done(worker):

@@ -759,6 +759,10 @@ class Model(ABC):
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
 
+        An image or video artifact encodes on the API server's pool, beside the
+        data worker's inline calls for the request's other outputs, so an
+        override must not keep state across calls.
+
         Modality to expected encoding type:
         - text: utf-8
         - image: png
