@@ -653,4 +653,5 @@ Compilation
        ``TORCH_COMPILE_CACHE_KEY_TAG``, since Inductor's graph cache would
        otherwise reuse kernels compiled by the bundled ptxas (decided by
        :func:`mstar.platforms.ptxas.blackwell_ptxas_env`). A value you set
-       is kept.
+       is kept, and the cache tag then names the ptxas you chose, so a cache
+       another ptxas wrote is not reused.

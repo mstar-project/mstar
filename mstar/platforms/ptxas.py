@@ -21,6 +21,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 BLACKWELL_PTXAS_ENV = "TRITON_PTXAS_BLACKWELL_PATH"
+CACHE_TAG_ENV = "TORCH_COMPILE_CACHE_KEY_TAG"
 FIXED_PTXAS = (13, 1, 115)
 
 
@@ -69,11 +70,14 @@ def blackwell_ptxas_env() -> dict[str, str]:
     if not _has_blackwell_gpu():
         return {}
     if path := os.environ.get(BLACKWELL_PTXAS_ENV):
+        version = ptxas_version(path)
         logger.info(
             "Triton runs ptxas %s for Blackwell (%s from %s)",
-            _version_str(ptxas_version(path)), path, BLACKWELL_PTXAS_ENV,
+            _version_str(version), path, BLACKWELL_PTXAS_ENV,
         )
-        return {}
+        # A cache the bundled ptxas wrote would keep serving its kernels, so the
+        # tag names this ptxas too. A tag the user set themselves is kept as is.
+        return _cache_tag(version)
     bundled = _triton_blackwell_ptxas()
     bundled_version = ptxas_version(bundled) if bundled else None
     if bundled_version is None:
@@ -96,10 +100,13 @@ def blackwell_ptxas_env() -> dict[str, str]:
         "which fixes a miscompile of integer floor division",
         _version_str(torch_version), torch_ptxas, _version_str(bundled_version), fixed,
     )
-    return {
-        BLACKWELL_PTXAS_ENV: torch_ptxas,
-        # Inductor's graph cache key ignores the ptxas, so untagged it keeps serving
-        # kernels the bundled one compiled. torch reads this at import, so it takes
-        # effect in the processes spawned after it is set.
-        "TORCH_COMPILE_CACHE_KEY_TAG": f"ptxas-blackwell-{_version_str(torch_version)}",
-    }
+    return {BLACKWELL_PTXAS_ENV: torch_ptxas, **_cache_tag(torch_version)}
+
+
+def _cache_tag(version: tuple[int, int, int] | None) -> dict[str, str]:
+    """Inductor's graph cache key ignores the ptxas, so untagged it keeps serving
+    kernels another ptxas compiled. torch reads the tag at import, so it takes
+    effect in the processes spawned after it is set."""
+    if version is None:
+        return {}
+    return {CACHE_TAG_ENV: f"ptxas-blackwell-{_version_str(version)}"}
