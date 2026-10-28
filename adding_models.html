@@ -1720,6 +1720,11 @@ that depend on tensor values in <code class="docutils literal notranslate"><span
 objects to stop, for example after seeing the EOS token. This is how a decode loop
 terminates.</p>
 </dd>
+<dt><code class="docutils literal notranslate"><span class="pre">on_request_added(self,</span> <span class="pre">request_id,</span> <span class="pre">request_info)</span></code> (optional)</dt><dd><p>Called on the worker’s main thread when the request reaches the worker, before any of
+its steps, with the request’s first <code class="docutils literal notranslate"><span class="pre">CurrentForwardPassInfo</span></code>. For host work worth
+starting early on a thread of the submodule’s own; it must not touch the device. The
+DiT scaffold draws a request’s seeded noise here (<code class="docutils literal notranslate"><span class="pre">PREFETCH_SEEDS</span></code>).</p>
+</dd>
 <dt><code class="docutils literal notranslate"><span class="pre">cleanup_request(self,</span> <span class="pre">request_id)</span></code> (optional)</dt><dd><p>Free per-request state held inside the submodule when a request finishes: buffers,
 per-request caches, counters. See Qwen3-Omni’s <code class="docutils literal notranslate"><span class="pre">Code2WavSubmodule</span></code> for an example.</p>
 </dd>
@@ -2809,6 +2814,11 @@ from <code class="docutils literal notranslate"><span class="pre">denoise</span>
 scalar adds a <code class="docutils literal notranslate"><span class="pre">STEP_SCALARS</span></code> entry naming the attribute of its <code class="docutils literal notranslate"><span class="pre">FlowMatchSchedule</span></code>
 to slice it from — the base stages that tensor on the device and slices it per step, so
 nothing in the batching path has to change.</p>
+<p>A model whose <code class="docutils literal notranslate"><span class="pre">seed_loop_back</span></code> depends on nothing but the bucket key and the request’s
+seed sets <code class="docutils literal notranslate"><span class="pre">PREFETCH_SEEDS</span> <span class="pre">=</span> <span class="pre">True</span></code> (klein and Z-Image do): the base then draws the noise
+when the request reaches the worker, on a thread of its own, and iteration 0 only copies
+it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0, once per
+joining row.</p>
 <p>Every span a layer attends over must be declared with its own label (default: one
 <code class="docutils literal notranslate"><span class="pre">&quot;main&quot;</span></code> segment per request); <code class="docutils literal notranslate"><span class="pre">ragged_for(label)</span></code> hands that span’s kernel to the
 layers, which fall back to SDPA when no ragged resource is bound.</p>

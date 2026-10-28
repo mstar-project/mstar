@@ -705,7 +705,7 @@ values a destination already holds, as in a steady decode batch.</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.h2d.to_device_nonblocking" title="mstar.utils.h2d.to_device_nonblocking"><code class="xref py py-obj docutils literal notranslate"><span class="pre">to_device_nonblocking</span></code></a>(tensor, device)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without the host waiting: a CPU source goes through pinned memory, so the copy queues behind the work already on the stream instead of draining it first (a pageable copy blocks until then).</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without a host stall.</p></td>
 </tr>
 </tbody>
 </table>
@@ -844,9 +844,18 @@ shape) in this stager’s dtype, through <code class="docutils literal notransla
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.h2d.to_device_nonblocking">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.h2d.</span></span><span class="sig-name descname"><span class="pre">to_device_nonblocking</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/h2d.html#to_device_nonblocking"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.h2d.to_device_nonblocking" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without the host waiting: a CPU source goes
-through pinned memory, so the copy queues behind the work already on the
-stream instead of draining it first (a pageable copy blocks until then).</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without a host stall.</p>
+<p>A copy from pageable memory blocks the calling thread until it retires, so on
+the GPU thread it waits out the step still running there. This writes a CPU
+tensor into a pinned buffer with one memcpy on the calling thread (<code class="docutils literal notranslate"><span class="pre">copy_</span></code>
+would split it over the intra-op pool, where a descheduled thread holds up the
+GPU thread) and queues one non-blocking copy from it on the current stream.
+torch’s caching host allocator keeps the pinned buffer until that copy has
+retired, so nothing is written over an in-flight source.</p>
+<p>The result is valid on the stream the copy was issued on; another stream has
+to wait on it, as for any async copy. The host tensor is read as it is, so the
+device tensor is bit-identical to a pageable copy; a model that packs a draw
+does so before this.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">

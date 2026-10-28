@@ -2136,6 +2136,18 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.on_request_added">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.on_request_added">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">on_request_added</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The request has reached this worker; none of its steps has run yet.</span>
+
+<span class="sd">        Runs on the worker's main thread, so host work worth starting early</span>
+<span class="sd">        belongs on a thread of the submodule's own, and nothing here may touch</span>
+<span class="sd">        the device. State goes in :meth:`request_state`, which the removal of</span>
+<span class="sd">        the request frees. Default: nothing.</span>
+<span class="sd">        """</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.cleanup_request">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.cleanup_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">cleanup_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
