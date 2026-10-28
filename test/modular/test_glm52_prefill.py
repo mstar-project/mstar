@@ -321,9 +321,9 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     torch.testing.assert_close(logits[1], logits[0], rtol=1e-5, atol=1e-5)
 
 
-def test_capture_configs_raise_the_recompile_limit_to_fit(monkeypatch):
+def test_capture_configs_raise_the_recompile_limit_to_fit(torch_flag):
     # every captured token count costs a decoder layer's frames up to three entries
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 84)
+    torch_flag(torch._dynamo.config, "recompile_limit", 84)
     buckets = list(range(64, 2049, 64))
     cfg = Glm52ModelConfig(prefill_token_buckets=buckets,
                            prefill_batched_token_buckets=[2304, 2560, 3072, 3584, 4096],
@@ -331,18 +331,18 @@ def test_capture_configs_raise_the_recompile_limit_to_fit(monkeypatch):
     _submodule(cfg).get_accelerator_graph_configs(torch.device("cpu"))
     shapes = len(buckets) + 5 + 7  # + the decode batch sizes
     assert torch._dynamo.config.recompile_limit >= 3 * shapes
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 84)
+    torch_flag(torch._dynamo.config, "recompile_limit", 84)
     _submodule(Glm52ModelConfig()).get_accelerator_graph_configs(torch.device("cpu"))
     assert torch._dynamo.config.recompile_limit == 84  # the default buckets fit
 
 
-def test_recompile_limit_reaches_the_thread_that_runs_steps(monkeypatch):
+def test_recompile_limit_reaches_the_thread_that_runs_steps(torch_flag):
     # dynamo's config is per thread, and the engine runs steps on a thread of its own
     import threading
 
     from mstar.engine import apply_torch_config
 
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 84)
+    torch_flag(torch._dynamo.config, "recompile_limit", 84)
     cfg = Glm52ModelConfig(prefill_token_buckets=list(range(64, 2049, 64)),
                            prefill_capture_batch_sizes=[1, 4, 16])
     sub = _submodule(cfg)
@@ -356,7 +356,7 @@ def test_recompile_limit_reaches_the_thread_that_runs_steps(monkeypatch):
     def _pos(engine_inputs=None):  # preprocess's first resource read, right after the limit
         raise _StopError
 
-    monkeypatch.setattr(sub, "_pos", _pos)
+    sub._pos = _pos
     seen = []
 
     def step():
