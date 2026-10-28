@@ -12,12 +12,12 @@ the implementation:
 """
 
 try:
-    from .tp_async_sim import INSTANCE_SCENARIOS, ONE_POOL, OWN_POOLS, SCENARIOS, explore, explore_instance
+    from .tp_async_sim import INSTANCE_SCENARIOS, SCENARIOS, explore, explore_instance
 except ImportError:  # collected without package context
     import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from tp_async_sim import INSTANCE_SCENARIOS, ONE_POOL, OWN_POOLS, SCENARIOS, explore, explore_instance
+    from tp_async_sim import INSTANCE_SCENARIOS, SCENARIOS, explore, explore_instance
 
 
 def _run(mode, scenario, nranks=2):
@@ -77,9 +77,9 @@ def test_b2_waste_matches_design_prediction():
 # --- two lockstep nodes on one instance ----------------------------------------
 
 
-def _run_instance(scenario, nranks, pools):
+def _run_instance(scenario, nranks):
     need, pages, script = INSTANCE_SCENARIOS[scenario]
-    return explore_instance(nranks, need, pages, pools, script, scenario)
+    return explore_instance(nranks, need, pages, script, scenario)
 
 
 def test_two_lockstep_nodes_with_their_own_pools_stay_in_step():
@@ -88,17 +88,8 @@ def test_two_lockstep_nodes_with_their_own_pools_stay_in_step():
     in every interleaving, each node's moves riding on its own next step."""
     for nranks in (2, 3):
         for name in INSTANCE_SCENARIOS:
-            res = _run_instance(name, nranks, OWN_POOLS)
+            res = _run_instance(name, nranks)
             assert res.ok, (name, nranks, res.violations[:1])
-
-
-def test_two_lockstep_nodes_sharing_an_evictable_pool_desync():
-    """Why validation refuses the layout: an eviction under A frees the pages
-    B's next step takes on rank 0 alone, since A's move waits for A's step."""
-    for name in ("evict-under-a-then-b", "alloc-fail-then-evict"):
-        res = _run_instance(name, 2, ONE_POOL)
-        assert any("I1" in kind for kind, _ in res.violations), name
-    assert _run_instance("abort-between-nodes", 2, ONE_POOL).ok, "a teardown is stamped, not journalled"
 
 
 # --- a follower's input read failing after rank 0 scheduled the row ----------

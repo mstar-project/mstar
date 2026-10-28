@@ -439,41 +439,14 @@ SCENARIOS = {
 MODES = ("SERIAL", "B1", "B2_VOID", "B2_LOCAL", "B2_RETRACT")
 
 
-def run_all(nranks=2):
-    results = []
-    for name, (comp0, script, must) in SCENARIOS.items():
-        for mode in MODES:
-            results.append(explore(mode, nranks, comp0, script, name, must))
-    return results
-
-
-def main():
-    for nranks in (2, 3):
-        print(f"\n=== {nranks} ranks ===")
-        print(f"{'scenario':<18} {'mode':<11} {'states':>7} {'terms':>6} "
-              f"{'waste':>5}  result")
-        for r in run_all(nranks):
-            verdict = "PASS" if r.ok else f"FAIL ({r.violations[0][0]})"
-            print(f"{r.scenario:<18} {r.mode:<11} {r.states:>7} "
-                  f"{r.terminals:>6} {r.max_waste:>5}  {verdict}")
-            if r.violations:
-                kind, trace = r.violations[0]
-                print(f"{'':<18} shortest-found trace: "
-                      f"{' '.join('/'.join(map(str, a)) for a in trace)}")
-
-
-if __name__ == "__main__":
-    main()
-
-
 # ---------------------------------------------------------------------------
 # Two lockstep nodes on one instance: the resident journal
 # ---------------------------------------------------------------------------
 # Rank 0 interleaves steps of nodes A and B with the moves only it decides (an
 # eviction, a reload) and teardowns. Each step goes out with the moves rank 0
 # made since that node's last step (the journal is per node), and a follower
-# replays them before admitting the step. Each node has a page pool; ``pools``
-# maps nodes to pools, so A and B may have their own or share one.
+# replays them before admitting the step. Each node has a page pool of its own:
+# validation refuses a KV pool shared by two lockstep nodes of a worker.
 #
 # Rank 0 moves pages only once its last broadcast step has admitted (the admit
 # fence), and a teardown carries the seq of the last step it followed, which a
@@ -510,7 +483,7 @@ def _move(rank, pool, kind, rid):
         rank["host"] = frozenset(k for k in host if k[1] != rid)
 
 
-def _admit(rank, pool, node, rids):
+def _admit(rank, pool, rids):
     """One step's admit: a row not yet holding pages in the node's pool takes
     its own. All or nothing, as the KV resource's admit is."""
     if any((pool, r) in rank["host"] for r in rids):
@@ -524,16 +497,18 @@ def _admit(rank, pool, node, rids):
             got[(pool, r)] = taken
     rank["free"][pool] = free
     rank["held"].update(got)
-    return ("ran", node, tuple(sorted(got.items())))
+    return ("ran", pool, tuple(sorted(got.items())))
 
 
-def _instance_world(nranks, need, pages, pools, script):
+def _instance_world(nranks, need, pages, script):
+    # one pool per node, named after it
+    pools = {op[1] for op in script if op[0] != "remove"}
     ranks = [{
-        "free": {pool: tuple(range(pages)) for pool in set(pools.values())},
+        "free": {pool: tuple(range(pages)) for pool in pools},
         "held": {}, "host": frozenset(), "need": dict(need),
         "fifo": (), "steps": (), "owed": (), "admitted": (),
     } for _ in range(nranks)]
-    return {"pools": dict(pools), "script": tuple(script), "pc": 0, "seq": 0,
+    return {"script": tuple(script), "pc": 0, "seq": 0,
             "pending": (), "ranks": ranks}
 
 
@@ -560,7 +535,6 @@ def _instance_actions(w):
 
 def _instance_apply(w, act):
     w = copy.deepcopy(w)
-    pools = w["pools"]
     if act[0] == "lead":
         op = w["script"][w["pc"]]
         w["pc"] += 1
@@ -581,7 +555,7 @@ def _instance_apply(w, act):
                 r["fifo"] = r["fifo"] + (("REMOVE", w["seq"] - 1, op[1]),)
         else:  # an eviction or reload, under ``op[1]``'s node
             kind, node, rid = op
-            _move(lead, pools[node], kind, rid)
+            _move(lead, node, kind, rid)
             w["pending"] = w["pending"] + ((node, kind, rid),)
     elif act[0] == "proc":
         r = w["ranks"][act[1]]
@@ -602,15 +576,15 @@ def _instance_apply(w, act):
                     _move(r, None, "remove", rid)
             r["owed"] = tuple(m for m in r["owed"] if m[0] >= seq)
             for moved_node, kind, rid in sent:
-                _move(r, pools[moved_node], kind, rid)
-        r["admitted"] = r["admitted"] + ((seq,) + _admit(r, pools[node], node, rids),)
+                _move(r, moved_node, kind, rid)
+        r["admitted"] = r["admitted"] + ((seq,) + _admit(r, node, rids),)
     return w
 
 
-def explore_instance(nranks, need, pages, pools, script, name=""):
+def explore_instance(nranks, need, pages, script, name=""):
     """Every interleaving of ``script`` (rank 0's ops) on ``nranks`` ranks."""
     res = Result(name, "PER_NODE_JOURNAL")
-    stack = [(_instance_world(nranks, need, pages, pools, script), ())]
+    stack = [(_instance_world(nranks, need, pages, script), ())]
     seen = set()
     while stack:
         w, trace = stack.pop()
@@ -668,5 +642,30 @@ INSTANCE_SCENARIOS = {
          ("step", "B", ("r2",)), ("evict", "B", "r1"), ("step", "A", ("r2",))),
     ),
 }
-OWN_POOLS = {"A": "a", "B": "b"}
-ONE_POOL = {"A": "kv", "B": "kv"}
+
+
+def run_all(nranks=2):
+    results = []
+    for name, (comp0, script, must) in SCENARIOS.items():
+        for mode in MODES:
+            results.append(explore(mode, nranks, comp0, script, name, must))
+    return results
+
+
+def main():
+    for nranks in (2, 3):
+        print(f"\n=== {nranks} ranks ===")
+        print(f"{'scenario':<18} {'mode':<11} {'states':>7} {'terms':>6} "
+              f"{'waste':>5}  result")
+        for r in run_all(nranks):
+            verdict = "PASS" if r.ok else f"FAIL ({r.violations[0][0]})"
+            print(f"{r.scenario:<18} {r.mode:<11} {r.states:>7} "
+                  f"{r.terminals:>6} {r.max_waste:>5}  {verdict}")
+            if r.violations:
+                kind, trace = r.violations[0]
+                print(f"{'':<18} shortest-found trace: "
+                      f"{' '.join('/'.join(map(str, a)) for a in trace)}")
+
+
+if __name__ == "__main__":
+    main()
