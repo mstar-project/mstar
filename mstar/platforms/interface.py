@@ -80,6 +80,10 @@ class CudaPlatform(Platform):
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
 
+    def process_env_defaults(self) -> dict[str, str]:
+        # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
+        return {"NCCL_GRAPH_REGISTER": "0"}
+
 
 class RocmPlatform(Platform):
     name = "rocm"

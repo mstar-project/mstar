@@ -83,6 +83,14 @@ class PinnedStager:
         ]
         self._views = [b.numpy() for b in self._bufs]
 
+    def to_device(self, values: Sequence | np.ndarray | torch.Tensor, device: torch.device) -> torch.Tensor:
+        """A new ``device`` tensor holding ``values`` (a sequence, an array or a CPU tensor, any
+        shape) in this stager's dtype, through ``copy_``: one non-blocking H2D, no stream drain."""
+        host = np.asarray(values, dtype=self._np_dtype)
+        out = torch.empty(host.shape, dtype=self.dtype, device=device)
+        self.copy_(out, host.reshape(-1))
+        return out
+
     def copy_(
         self,
         dst: torch.Tensor,
@@ -136,3 +144,13 @@ class PinnedStager:
             ev.record(torch.accelerator.current_stream(dst.device))
             if mirror is not None:
                 mirror.record(key, values)
+
+
+def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """``tensor`` on ``device`` without the host waiting: a CPU source goes
+    through pinned memory, so the copy queues behind the work already on the
+    stream instead of draining it first (a pageable copy blocks until then)."""
+    device = torch.device(device)
+    if device.type != "cuda" or tensor.device.type != "cpu":
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
