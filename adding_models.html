@@ -1736,6 +1736,18 @@ boundaries depend on the real sequence lengths and therefore cannot be computed 
 the captured region. Both methods are defined on <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code>, so any node can use
 them.</p>
 </dd>
+<dt><code class="docutils literal notranslate"><span class="pre">spanned_outputs(graph_walk)</span> <span class="pre">-&gt;</span> <span class="pre">frozenset[str]</span></code> (optional)</dt><dd><p>Outputs whose valid length per row is known only on the device, such as audio with
+silence to trim. <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns a <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> whose
+<code class="docutils literal notranslate"><span class="pre">output_spans</span></code> maps the output’s name to a <code class="docutils literal notranslate"><span class="pre">[bs,</span> <span class="pre">2]</span></code> int64 tensor on the device:
+row <code class="docutils literal notranslate"><span class="pre">i</span></code> holds the first and one-past-last index of row <code class="docutils literal notranslate"><span class="pre">i</span></code>’s valid samples along
+the output’s last dimension. A step that returns spans returns one for every output
+declared here, since per-request forwards are merged by name. The forward keeps a
+fixed width and does no host read.
+The worker cuts each row to its span after the step’s completion event, before the stop
+check, transport or a streaming edge reads it. The cut is a view, not a copy. Engine-side
+<code class="docutils literal notranslate"><span class="pre">postprocess</span></code> still sees the uncut output. A spanned output must not feed a node that
+the same worker speculates into.</p>
+</dd>
 </dl>
 <p>Two more methods control batching and CUDA graphs: <code class="docutils literal notranslate"><span class="pre">can_batch</span></code> with
 <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>, and <code class="docutils literal notranslate"><span class="pre">get_cuda_graph_configs</span></code>. They are described in Step 5.</p>

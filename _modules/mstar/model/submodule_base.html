@@ -1090,6 +1090,17 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># A mixed step's rows whose own walk keeps every output signal on the</span>
     <span class="c1"># device (see ``ExecutingBatch.loopback_rids``)</span>
     <span class="n">loopback_rids</span><span class="p">:</span> <span class="nb">frozenset</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+    <span class="c1"># output name -&gt; [bs, 2] int64 on the forward's device: row i holds the</span>
+    <span class="c1"># first and one-past-last index of the valid part of request i's output</span>
+    <span class="c1"># along its last dim. The worker cuts the rows to it once the step has</span>
+    <span class="c1"># run (see ``NodeSubmodule.spanned_outputs``).</span>
+    <span class="n">output_spans</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The request each row of ``output_spans`` belongs to, stamped by the</span>
+    <span class="c1"># engine like ``row_request_ids``.</span>
+    <span class="n">span_request_ids</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># ``output_spans`` on the host, staged by the gpu thread behind the step</span>
+    <span class="c1"># like ``host_rows``.</span>
+    <span class="n">host_spans</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="BatchedModelOutput.coerce">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.coerce">[docs]</a>
@@ -1214,7 +1225,27 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">other</span><span class="o">.</span><span class="n">row_outputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">row_outputs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">row_outputs</span> <span class="o">=</span> <span class="p">{}</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">row_outputs</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">row_outputs</span><span class="p">)</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">row_outputs</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">row_outputs</span><span class="p">)</span>
+        <span class="c1"># Unlike the stop buffers, spans cannot be dropped on a merge: a row</span>
+        <span class="c1"># left without its span would leave the step uncut. Both sides span</span>
+        <span class="c1"># the same names (the engine checks a step against its declaration),</span>
+        <span class="c1"># so the rows concatenate name by name.</span>
+        <span class="k">if</span> <span class="n">other</span><span class="o">.</span><span class="n">output_spans</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">output_spans</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">output_spans</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">output_spans</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">span_request_ids</span> <span class="o">=</span> <span class="n">other</span><span class="o">.</span><span class="n">span_request_ids</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">other</span><span class="o">.</span><span class="n">output_spans</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output_spans</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"cannot merge spans for </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">output_spans</span><span class="p">)</span><span class="si">}</span><span class="s2"> with spans "</span>
+                        <span class="sa">f</span><span class="s2">"for </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">output_spans</span><span class="p">)</span><span class="si">}</span><span class="s2">: every forward of a step spans "</span>
+                        <span class="sa">f</span><span class="s2">"the same outputs"</span>
+                    <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">output_spans</span> <span class="o">=</span> <span class="p">{</span>
+                    <span class="n">name</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">span</span><span class="p">,</span> <span class="n">other</span><span class="o">.</span><span class="n">output_spans</span><span class="p">[</span><span class="n">name</span><span class="p">]])</span>
+                    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">output_spans</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+                <span class="p">}</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">span_request_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">span_request_ids</span> <span class="o">+</span> <span class="n">other</span><span class="o">.</span><span class="n">span_request_ids</span></div>
 </div>
 
 
@@ -1784,10 +1815,11 @@ window.runMermaid = runMermaid;</script>
         <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">engine_inputs</span><span class="p">:</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span>
         <span class="o">**</span><span class="n">kwargs</span> <span class="c1"># coming from preprocess output</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NameToTensorList</span><span class="p">:</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NameToTensorList</span> <span class="o">|</span> <span class="n">BatchedModelOutput</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""</span>
 <span class="sd">        Pure tensor → NameToTensorList computation.</span>
-<span class="sd">        Compilable + CUDA-graphable.</span>
+<span class="sd">        Compilable + CUDA-graphable. A ``BatchedModelOutput`` keyed by the</span>
+<span class="sd">        request id, as ``forward_batched`` returns, can carry ``output_spans``.</span>
 <span class="sd">        """</span>
         <span class="k">pass</span></div>
 
@@ -1875,6 +1907,28 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        ``postprocess``: the stop check, the inline emit and the next step's</span>
 <span class="sd">        speculation read the step's rows instead. Empty by default;</span>
 <span class="sd">        ``MSTAR_DEVICE_LOOPBACK=0`` keeps every node on the tensor path."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.spanned_outputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.spanned_outputs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">spanned_outputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Outputs of this walk that may come with a valid span per row, in</span>
+<span class="sd">        ``BatchedModelOutput.output_spans`` under the output's name. The worker</span>
+<span class="sd">        cuts each row to its span along the last dim once the step's completion</span>
+<span class="sd">        event has fired, before the stop check, transport or a streaming edge</span>
+<span class="sd">        reads it, so a forward (and its captured graphs) can keep a fixed width</span>
+<span class="sd">        and still emit a length known only on the device, without a host read.</span>
+<span class="sd">        The cut is a view, and a row whose span covers its whole output is left</span>
+<span class="sd">        as it is.</span>
+
+<span class="sd">        The engine-side ``postprocess`` and ``batch_postprocess`` see the</span>
+<span class="sd">        uncut output. A spanned output must not feed a node this worker</span>
+<span class="sd">        speculates into, which would read it before the cut; startup refuses</span>
+<span class="sd">        that unless one of the two nodes sets ``enable_async_scheduling=False``.</span>
+<span class="sd">        Not for a signal kept on the device or sent inline, which have no</span>
+<span class="sd">        per-request tensor to cut. Empty by default."""</span>
         <span class="k">del</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="nb">frozenset</span><span class="p">()</span></div>
 

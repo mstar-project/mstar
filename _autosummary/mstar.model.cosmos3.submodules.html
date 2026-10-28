@@ -871,7 +871,8 @@ stateless and placeable on any rank.</p>
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sound_latents</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">target_samples</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3AudioDecoderSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>engine_inputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p>
@@ -1028,7 +1029,8 @@ gather is shaped by the step and cannot be captured.</p>
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3DiTSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>engine_inputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p>
@@ -1346,7 +1348,8 @@ prompt tokens at prefill for the repetition penalty.</p>
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_lens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vision_embeds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3ReasonerSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>engine_inputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p>
@@ -1466,7 +1469,8 @@ done, so it is not vetoed.</p>
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latents</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderARSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>engine_inputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p>
@@ -1502,7 +1506,8 @@ latents) before decoding, matching the fused t2i pipeline’s decode.</p>
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latents</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>engine_inputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p>
@@ -1554,7 +1559,8 @@ frames of a full-latent-shape tensor (zeros elsewhere).</p></li>
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VAEEncoderSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vision</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">condition_indexes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latent_shape</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEEncoderSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEEncoderSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>engine_inputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p>
@@ -1597,7 +1603,8 @@ prompt is rendered), so this node only runs the encoder.</p>
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VisionEncoderSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pixel_values</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vision_grid_thw</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VisionEncoderSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VisionEncoderSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>engine_inputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p>

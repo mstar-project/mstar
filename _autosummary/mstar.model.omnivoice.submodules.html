@@ -816,7 +816,8 @@ firing if async scheduling has already advanced the deferred count.</p>
 <dt class="sig sig-object py" id="mstar.model.omnivoice.submodules.OmniVoiceBackboneSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/submodules.html#OmniVoiceBackboneSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.submodules.OmniVoiceBackboneSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -962,7 +963,8 @@ raises rather than emitting.</p>
 <dt class="sig sig-object py" id="mstar.model.omnivoice.submodules.OmniVoiceCode2WavSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">audio_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ref_rms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/submodules.html#OmniVoiceCode2WavSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.submodules.OmniVoiceCode2WavSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1031,7 +1033,8 @@ the engine does not have today.</p>
 <dt class="sig sig-object py" id="mstar.model.omnivoice.submodules.OmniVoiceRefEncoderSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">waveform</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/submodules.html#OmniVoiceRefEncoderSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.submodules.OmniVoiceRefEncoderSubmodule.forward" title="Link to this definition">#</a></dt>
 <dd><p>Pure tensor → NameToTensorList computation.
-Compilable + CUDA-graphable.</p>
+Compilable + CUDA-graphable. A <code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code> keyed by the
+request id, as <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> returns, can carry <code class="docutils literal notranslate"><span class="pre">output_spans</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
