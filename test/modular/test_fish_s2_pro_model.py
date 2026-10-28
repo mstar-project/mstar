@@ -502,6 +502,17 @@ def test_eos_is_not_sampled_on_the_prefill_frame_or_with_ignore_eos():
         engine_inputs, torch.zeros(3, dim, dtype=torch.float64), packed["last_token_indices"], packed["suppress_eos"]
     )
     assert out["new_token"].tolist() == [7, ar.eos_code, 7]
+    # the <|im_end|> frame's span is empty, so the codec stream never carries it
+    books = ar.config.num_codebooks
+    assert out["codec_spans"].tolist() == [[0, books], [0, 0], [0, books]]
+    batched = ar.forward_batched("ar_decode", engine_inputs, torch.zeros(3, dim, dtype=torch.float64), **{
+        name: packed[name] for name in ("last_token_indices", "suppress_eos")
+    })
+    assert list(batched.per_rid_outputs) == ["p", "d", "i"]
+    assert batched.output_spans["codec_tokens"].tolist() == [[0, books], [0, 0], [0, books]]
+    assert [batched.per_rid_outputs[rid]["codec_tokens"][0][0].item() for rid in "pdi"] == [7, ar.eos_code, 7]
+    for walk in ("ar_prefill", "ar_prefill_clone", "ar_decode"):
+        assert ar.spanned_outputs(walk) == {"codec_tokens"}
 
 
 def assert_same_tensor(new: torch.Tensor, old: torch.Tensor) -> None:

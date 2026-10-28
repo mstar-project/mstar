@@ -53,6 +53,7 @@ from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -96,6 +97,7 @@ class ARSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    _SPANNED = frozenset({"codec_tokens"})
 
     def __init__(self, slow_ar: FishSlowAR, fast_ar: FishFastAR, config: FishS2ProConfig) -> None:
         super().__init__()
@@ -257,11 +259,17 @@ class ARSubmodule(ARNodeSubmodule):
         semantic = torch.where(is_eos, torch.zeros_like(head_index), head_index)
         codes = self.fast_ar(last_hidden, semantic, self._get_fast_kv(semantic.shape[0]))
         next_embeds = self.next_input_embeds(head_index, codes)
-        # The codec stream carries the head index in codebook 0, so the frame
-        # that ends the stream (<|im_end|>) is recognizable and dropped.
+        # Codebook 0 carries the head index, which ``postprocess`` falls back
+        # to; the <|im_end|> frame's span is empty, so it never reaches the codec.
         stream = codes.clone()
         stream[:, 0] = head_index
-        return {"ar_input_embeds": next_embeds, "codec_tokens": stream, "new_token": head_index}
+        end = torch.where(is_eos, 0, stream.shape[-1])
+        return {
+            "ar_input_embeds": next_embeds,
+            "codec_tokens": stream,
+            "new_token": head_index,
+            "codec_spans": torch.stack([torch.zeros_like(end), end], dim=1),
+        }
 
     def forward(
         self,
@@ -271,14 +279,17 @@ class ARSubmodule(ARNodeSubmodule):
         last_token_indices: torch.Tensor,
         suppress_eos: torch.Tensor,
         **kwargs: Any,
-    ) -> NameToTensorList:
+    ) -> BatchedModelOutput:
         del graph_walk, kwargs
         output = self._run_frame(engine_inputs, input_embeds, last_token_indices, suppress_eos)
-        return {
-            "ar_input_embeds": [output["ar_input_embeds"]],
-            "codec_tokens": [output["codec_tokens"][0]],
-            "new_token": [output["new_token"]],
-        }
+        return BatchedModelOutput(
+            per_rid_outputs={engine_inputs.request_ids[0]: {
+                "ar_input_embeds": [output["ar_input_embeds"]],
+                "codec_tokens": [output["codec_tokens"][0]],
+                "new_token": [output["new_token"]],
+            }},
+            output_spans={"codec_tokens": output["codec_spans"]},
+        )
 
     def forward_batched(
         self,
@@ -288,17 +299,26 @@ class ARSubmodule(ARNodeSubmodule):
         last_token_indices: torch.Tensor,
         suppress_eos: torch.Tensor,
         **kwargs: Any,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         del graph_walk, kwargs
         output = self._run_frame(engine_inputs, input_embeds, last_token_indices, suppress_eos)
-        return {
-            request_id: {
-                "ar_input_embeds": [output["ar_input_embeds"][i : i + 1]],
-                "codec_tokens": [output["codec_tokens"][i]],
-                "new_token": [output["new_token"][i]],
-            }
-            for i, request_id in enumerate(engine_inputs.request_ids)
-        }
+        return BatchedModelOutput(
+            per_rid_outputs={
+                request_id: {
+                    "ar_input_embeds": [output["ar_input_embeds"][i : i + 1]],
+                    "codec_tokens": [output["codec_tokens"][i]],
+                    "new_token": [output["new_token"][i]],
+                }
+                for i, request_id in enumerate(engine_inputs.request_ids)
+            },
+            output_spans={"codec_tokens": output["codec_spans"]},
+        )
+
+    def spanned_outputs(self, graph_walk: str) -> frozenset[str]:
+        """Every walk streams ``codec_tokens``; an <|im_end|> frame's span is
+        empty (the prefill walks never sample it, so theirs are whole)."""
+        del graph_walk
+        return self._SPANNED
 
     def postprocess(
         self,
@@ -437,15 +457,19 @@ class CodecSubmodule(ARNodeSubmodule):
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        """Drop the end-of-stream frame and lay the window out as ``[10, frames]``."""
+        """Lay the window out as ``[10, frames]``. Every item is a frame: the
+        AR's <|im_end|> frame has an empty span and never reaches the stream."""
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
-        codes = inputs["codec_tokens"][0].to(device=self.get_device(), dtype=torch.long)
+        received = inputs.get("codec_tokens")
+        if received:
+            codes = received[0].to(device=self.get_device(), dtype=torch.long)
+        else:
+            # an empty terminal flush reaches the node with no tensor
+            codes = torch.zeros(0, self.config.num_codebooks, dtype=torch.long, device=self.get_device())
         codes = codes.view(-1, self.config.num_codebooks)
-        # A sync: which window holds the end-of-stream frame is not known on the host.
-        codes = codes[codes[:, 0] < self.config.eos_code]
         frames = codes.shape[0]
-        context = min(chunk.context_items if chunk is not None else 0, frames)
+        context = chunk.context_items if chunk is not None else 0
         start_offset = chunk.start_offset if chunk is not None else 0
         conv_start = context - min(context, self.conv_context)
         logger.debug(
