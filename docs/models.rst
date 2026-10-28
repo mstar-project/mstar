@@ -78,10 +78,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Qwen/Qwen3-Coder-30B-A3B-Instruct``
      - Qwen3-Coder (30B/3B active): Qwen3-MoE causal LM (GQA, 128 experts, top-8),
        bf16 on one 80 GB GPU. Served by the generic text LM (``mstar/model/text_lm``),
-       which takes any ``qwen3`` / ``qwen3_moe`` checkpoint. Tool calls are refused for now.
+       which takes any ``qwen3`` / ``qwen3_moe`` checkpoint. Tool calls in Qwen's XML markup,
+       and ``/v1/messages`` and ``/v1/responses`` on the chat (see Qwen3.5 below).
    * - ``qwen3_{0.6,1.7,4,8}b``
      - ``Qwen/Qwen3-8B``
-     - Qwen3 dense causal LM, text chat, on the same generic text LM.
+     - Qwen3 dense causal LM, text chat, on the same generic text LM. Its template writes
+       tool calls as JSON (hermes), which is not parsed yet, so tools are refused.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -319,6 +321,16 @@ videos may be interleaved with text anywhere in the prompt, and prefill follows
 the order they were written::
 
     mstar serve qwen3_5_4b --gpus 0
+
+Tool calls (``tools``, ``tool_choice`` ``auto``, ``none``, ``required`` or a
+named function, ``parallel_tool_calls``, ``tool`` turns) go through the
+checkpoint's chat template, and a reply's calls in Qwen's markup
+(``<tool_call><function=...><parameter=...>``, the format of Qwen3-Coder and
+of every Qwen3.5 to Qwen3.8 checkpoint) come back as ``tool_calls``, with the
+reasoning as ``reasoning_content``. Anthropic's ``/v1/messages`` and
+OpenAI's ``/v1/responses`` are translated onto the chat, text only. A forced
+call has no grammar behind it: the prompt opens the call, and the model writes
+its arguments. The Rust frontend still refuses tools.
 
 Video follows transformers' ``Qwen3VLProcessor`` exactly: frames are decoded
 with torchcodec on the host (FFmpeg's shared libraries must be installed;

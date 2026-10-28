@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.api_server.openai import glm_chat
-from mstar.api_server.openai.tool_calls import GLM47, ChatTools
+from mstar.api_server.openai.tool_calls import GLM47, QWEN3_CODER, ChatTools
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
@@ -466,23 +466,38 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 class Qwen3_5Adapter(OpenAIAdapter):
     """Qwen3.5: text, image and video chat (``image_url`` / ``video_url`` parts), text out.
 
-    Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
-    ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
-    non-OpenAI fields via ``extra_body``:
+    Chat only, with tool calls in Qwen's markup (``qwen3_coder``, see
+    ``TextChatAdapter``), and Anthropic's ``/v1/messages`` and
+    ``/v1/responses`` on it (text only there); the other ``/v1/*`` surfaces
+    stay 404. Sampling keys: ``temperature``, ``top_p``, ``max_output_tokens``
+    and ``seed``, plus two non-OpenAI fields via ``extra_body``:
 
     * ``repetition_penalty`` — the sampler applies it over the prompt's tokens
       as well as the generated ones.
     * ``enable_thinking`` (default true) — the chat template opens a
-      ``<think>`` block. Set it false for short answers.
+      ``<think>`` block, which comes back as ``reasoning_content``. Set it
+      false for short answers.
+
+    ``efforts`` are the template's ``reasoning_effort`` levels (Qwen3.8's).
     """
 
     supports_chat = True
+    supports_messages = True
+    supports_responses = True
+
+    def __init__(self, efforts: tuple[str, ...] = ()):
+        self.tools = _qwen_tools("optional", efforts)
+
+    @property
+    def reasoning_efforts(self) -> tuple[str, ...]:
+        return self.tools.efforts
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        text, file_paths, in_mods, parts = flatten_messages(_tool_turns_as_user(req).messages, upload_dir)
+        _stop_strings(req)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
+        self.tools.apply(req, mk)
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,
@@ -491,6 +506,12 @@ class Qwen3_5Adapter(OpenAIAdapter):
             model_kwargs=mk,
             prompt_parts=parts,
         )
+
+    def make_output_parser(self, req: ChatCompletionRequest):
+        return self.tools.parser(_passthrough(req))
+
+    def stop_strings(self, req: ChatCompletionRequest) -> list[str]:
+        return _stop_strings(req)
 
 
 class OrpheusAdapter(OpenAIAdapter):
@@ -1376,6 +1397,15 @@ def _stop_strings(req: ChatCompletionRequest) -> list[str]:
     return stops
 
 
+def _qwen_tools(thinking: str, efforts: tuple[str, ...] = ()) -> ChatTools:
+    """Qwen's templates (Qwen3-Coder, Qwen3.5 and later): the ``qwen3_coder``
+    markup, and the switches they read (Qwen3.6's ``preserve_thinking``,
+    Qwen3.8's ``reasoning_effort``). They concatenate ``content``, so it goes
+    as text, with Qwen3.5's attachment placeholders."""
+    return ChatTools(QWEN3_CODER, thinking=thinking, efforts=efforts, flatten_content=True,
+                     template_kwargs=("enable_thinking", "preserve_thinking", "reasoning_effort"))
+
+
 class TextChatAdapter(OpenAIAdapter):
     """Text-only LLMs: chat messages in, text out. The model's ``process_prompt``
     applies its own chat template; sampling fields reach it as model_kwargs.
@@ -1560,16 +1590,18 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "z_image_turbo": DiffusionImageAdapter(),
     "glm52": GlmChatAdapter(always_thinks=False, reasoning_efforts=("high", "max")),
     "glm5_next": GlmChatAdapter(always_thinks=True, reasoning_efforts=("low", "high", "max")),
-    "qwen3_coder_30b_a3b": TextChatAdapter(),
+    "qwen3_coder_30b_a3b": TextChatAdapter(_qwen_tools("never")),
 }
 
 # One key per size; every size takes the same adapter.
 ADAPTER_REGISTRY.update({
     f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
 })
-# Qwen3.8-27B is the Qwen3.5 architecture and chat template family.
-ADAPTER_REGISTRY["qwen3_8_27b"] = Qwen3_5Adapter()
-# Qwen3 dense, on the generic text LM like Qwen3-Coder
+# Qwen3.8-27B is the Qwen3.5 architecture and chat template family; its template adds
+# reasoning_effort levels.
+ADAPTER_REGISTRY["qwen3_8_27b"] = Qwen3_5Adapter(efforts=("low", "medium", "xhigh"))
+# Qwen3 dense, on the generic text LM like Qwen3-Coder; its template writes calls as
+# hermes JSON, which no parser here reads yet, so tools are refused
 ADAPTER_REGISTRY.update({f"qwen3_{size}b": TextChatAdapter() for size in ("0.6", "1.7", "4", "8")})
 
 

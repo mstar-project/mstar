@@ -98,6 +98,15 @@ the decoder, and how checkpoint keys map to its parameters. Qwen3 dense and MoE
 decoder component plus an ``LM_FAMILIES`` entry. Anything the shared walks cannot
 express (media inputs, extra nodes, drafter heads) still wants its own package.
 
+Tool calls belong to the chat template's family, not to the model: the adapter names the
+family's markup in a ``ChatTools`` (``mstar/api_server/openai/tool_calls.py``:
+``qwen3_coder`` for Qwen3-Coder and Qwen3.5 onward, ``glm47`` for GLM), which sends the
+request's ``messages``, ``tools`` and template switches to ``process_prompt`` and parses the
+reply's calls, streamed or whole. The model renders those through its chat template, appends
+a forced call's ``reply_prefix``, and lists the four in ``PREPROCESS_ONLY_KWARGS``. A family
+whose calls are another shape of tagged XML is a new ``CallFormat``; one that writes JSON
+or its own grammar needs a parser of its own beside ``ReplyParser``.
+
 Step 1 — Register the model
 ---------------------------
 

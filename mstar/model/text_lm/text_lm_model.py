@@ -68,6 +68,12 @@ class TextLMModel(Model):
     # packed prefill captures, in prompt tokens per step; a deployment overrides them in
     # model_kwargs (an empty list leaves prefill eager)
     PREFILL_TOKEN_BUCKETS = (512, 1024, 2048, 4096, 8192)
+    # the chat API's messages and tools (``tool_calls.ChatTools``), read only by the chat
+    # template here, and kept off the conductor's wire, which cannot carry every number a
+    # tool schema may hold (2**64)
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs", "reply_prefix")
+    # the template switches a request may set; apply_chat_template's own arguments are not
+    TEMPLATE_SWITCHES = ("enable_thinking", "preserve_thinking", "reasoning_effort")
 
     def __init__(
         self,
@@ -276,7 +282,7 @@ class TextLMModel(Model):
             raise ValueError("this model takes text and produces text")
         if tensors and "text_inputs" in tensors:
             (ids,) = tensors["text_inputs"]
-        elif prompt is None and not prompt_parts:
+        elif prompt is None and not prompt_parts and not kwargs.get("messages"):
             raise ValueError("the request carries no prompt")
         else:
             ids = self._render_chat(prompt, prompt_parts, kwargs)
@@ -295,22 +301,37 @@ class TextLMModel(Model):
         return ProcessPromptOutput({"text_inputs": [ids]}, {"kv_layout": {KV_CACHE: {"main": layout}}})
 
     def _render_chat(self, prompt: str | None, prompt_parts: list[PromptPart] | None, kwargs: dict) -> torch.Tensor:
-        """The chat's turns through the checkpoint's template, the assistant turn opened. A
-        bare prompt is one user turn. ``enable_thinking`` reaches templates that switch on it."""
-        parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
-        messages = [
-            {"role": turn.role, "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
-            for turn in chat_turns(parts)
-        ]
-        template_kwargs = {}
+        """The chat through the checkpoint's template, the assistant turn opened: the chat
+        API's ``messages``, ``tools`` and template switches when its adapter serves tool
+        calls, else the prompt's turns (a bare prompt is one user turn). ``enable_thinking``
+        reaches templates that switch on it, as a bool: the reply's parser reads it so. A
+        ``reply_prefix`` (a forced tool call's opening) follows the generation prompt."""
+        messages = kwargs.get("messages")
+        if messages is not None and not isinstance(messages, list):
+            raise ValueError("messages must be a list of chat messages")
+        if not messages:
+            parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
+            messages = [
+                {"role": turn.role, "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
+                for turn in chat_turns(parts)
+            ]
+        switches = kwargs.get("chat_template_kwargs") or {}
+        if not isinstance(switches, dict):
+            raise ValueError("chat_template_kwargs must be an object")
+        switches = {k: v for k, v in switches.items() if k in self.TEMPLATE_SWITCHES}
         if kwargs.get("enable_thinking") is not None:
-            template_kwargs["enable_thinking"] = bool(kwargs["enable_thinking"])
+            switches.setdefault("enable_thinking", kwargs["enable_thinking"])
+        if "enable_thinking" in switches:
+            switches["enable_thinking"] = bool(switches["enable_thinking"])
         try:
             ids = self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True, return_dict=False, **template_kwargs,
+                messages, tools=kwargs.get("tools"), add_generation_prompt=True, tokenize=True, return_dict=False,
+                **switches,
             )
         except TemplateError as exc:
             raise ValueError(f"the chat template refused the chat: {exc}") from exc
+        if prefix := kwargs.get("reply_prefix"):
+            ids = [*ids, *self.tokenizer.encode(prefix, add_special_tokens=False)]
         return torch.tensor(ids, dtype=torch.long)
 
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:

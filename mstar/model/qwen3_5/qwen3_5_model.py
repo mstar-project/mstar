@@ -164,6 +164,13 @@ class Qwen3_5DenseModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
+    # the chat API's messages and tools (`tool_calls.ChatTools`), read only by
+    # the chat template here, and kept off the conductor's wire, which cannot
+    # carry every number a tool schema may hold (2**64)
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs", "reply_prefix")
+    # the template switches a request may set (Qwen3.6 reads preserve_thinking,
+    # Qwen3.8 reasoning_effort too); apply_chat_template's own arguments are not
+    TEMPLATE_SWITCHES = ("enable_thinking", "preserve_thinking", "reasoning_effort")
 
     _text_detokenizer: TextChunkDetokenizer | None = None
 
@@ -190,6 +197,8 @@ class Qwen3_5DenseModel(Model):
         # which only the tokenizer knows. See `Qwen3_5Config.stop_token_ids`.
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
+        # read on every text chunk (the data worker's usage), so built once
+        self._stop_token_ids = self.config.stop_token_ids
 
         # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -514,19 +523,34 @@ class Qwen3_5DenseModel(Model):
         timestamps = [self._video_timestamps(metadata) for metadata in video_metadata]
 
         # The released checkpoints are chat models (base ones say `-Base`), so
-        # always use the chat template. `enable_thinking=False` emits an empty,
-        # pre-closed `<think>` block, which is how Qwen turns reasoning off.
+        # always use the chat template: over the chat API's messages and tools
+        # when its adapter sends them (tool calls, `tool_calls.ChatTools`; their
+        # attachments are placeholders in the order `parts` has them), else over
+        # `parts`. `enable_thinking=False` emits an empty, pre-closed `<think>`
+        # block, which is how Qwen turns reasoning off; it goes as a bool, as the
+        # reply's parser reads it.
+        messages = kwargs.get("messages")
+        if messages is not None and not isinstance(messages, list):
+            raise ValueError("messages must be a list of chat messages")
+        switches = kwargs.get("chat_template_kwargs") or {}
+        if not isinstance(switches, dict):
+            raise ValueError("chat_template_kwargs must be an object")
+        switches = {k: v for k, v in switches.items() if k in self.TEMPLATE_SWITCHES}
+        switches["enable_thinking"] = bool(switches.get("enable_thinking", kwargs.get("enable_thinking", True)))
         try:
             text = self.tokenizer.apply_chat_template(
-                messages_from_parts(parts),
+                messages or messages_from_parts(parts),
+                tools=kwargs.get("tools"),
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=kwargs.get("enable_thinking", True),
+                **switches,
             )
         except TemplateError as exc:
             # a chat the template refuses (a system message after the first turn,
             # no user turn) is the client's to fix: a 400, not a 500
             raise ValueError(f"Qwen3.5's chat template refused the chat: {exc}") from exc
+        # what the reply opens with, after the generation prompt (a forced tool call)
+        text += kwargs.get("reply_prefix") or ""
         if timestamps:
             start, pad, end = self._PLACEHOLDER_TOKENS[VIDEO]
             text = expand_video_pads(text, pad, start, end, timestamps)
@@ -579,6 +603,9 @@ class Qwen3_5DenseModel(Model):
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+
+    def stop_token_ids(self) -> frozenset[int]:
+        return self._stop_token_ids
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(

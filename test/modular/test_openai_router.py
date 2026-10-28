@@ -1006,6 +1006,44 @@ def test_a_whitespace_stop_is_seen_when_text_follows_it(client_and_stub):
     assert body["choices"][0]["finish_reason"] == "stop" and body["usage"]["completion_tokens"] == 7
 
 
+
+_QWEN_TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}}]
+_QWEN_REPLY = [b"Two cities.\n\n<tool_call>\n<function=get_we", b"ather>\n<parameter=city>\nPa",
+               b"ris\n</parameter>\n<parameter=days>\nTrue", b"\n</parameter>\n</function>\n</tool_call>\n<tool_call>",
+               b"\n<function=get_weather>\n<parameter=city>\n<b>Rome</b>\n</parameter>\n</function>\n</tool_call>"]
+
+
+@pytest.mark.parametrize("model", ["qwen3_coder_30b_a3b", "qwen3_5_0.8b"])
+def test_qwen_chat_tool_calls_stream_as_they_come_whole(client_and_stub, model):
+    """The same reply, whole and streamed: content, two calls in Qwen's markup, typed by the schema
+    (an integer the model wrote as Python's True stays what it wrote: off the schema)."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    stub.next_chunks = [_Chunk("text", b) for b in _QWEN_REPLY]
+    body = {"model": model, "messages": [{"role": "user", "content": "weather?"}], "tools": _QWEN_TOOLS,
+            "enable_thinking": False}
+    whole = client.post("/v1/chat/completions", json=body).json()["choices"][0]
+    events = _glm_events(client.post("/v1/chat/completions", json={**body, "stream": True}).text)
+    deltas = [e["choices"][0]["delta"] for e in events]
+    calls = {}
+    for c in (c for d in deltas for c in d.get("tool_calls", [])):
+        if "id" in c:
+            calls[c["index"]] = {"id": c["id"], "type": "function", "function": dict(c["function"])}
+        else:
+            calls[c["index"]]["function"]["arguments"] += c["function"]["arguments"]
+    streamed = {"content": "".join(d.get("content") or "" for d in deltas), "calls": list(calls.values()),
+                "finish": events[-1]["choices"][0]["finish_reason"]}
+    assert whole["message"]["content"] == streamed["content"] == "Two cities."
+    strip = [{**c, "id": None} for c in whole["message"]["tool_calls"]]
+    assert strip == [{**c, "id": None} for c in streamed["calls"]]
+    assert [c["function"]["arguments"] for c in strip] == [
+        '{"city": "Paris", "days": "True"}', '{"city": "<b>Rome</b>"}']
+    assert whole["finish_reason"] == streamed["finish"] == "tool_calls"
+    mk = stub.last_submit["model_kwargs"]
+    assert mk["tools"] == _QWEN_TOOLS and mk["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 _PNG_URL = "data:image/png;base64," + base64.b64encode(
     base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
 ).decode()

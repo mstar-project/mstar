@@ -199,11 +199,13 @@ _CHAT_ADAPTERS = [
     adapters.BagelAdapter, adapters.Qwen3OmniAdapter, adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter,
     adapters.TextChatAdapter,
 ]
+# the ones that parse no tool call out of a reply (Qwen3.5's does: test_qwen_tool_calls)
+_REFUSING_CHAT_ADAPTERS = [a for a in _CHAT_ADAPTERS if a is not adapters.Qwen3_5Adapter]
 _FUNCTION = {"name": "get_weather"}
 _NAMED = {"type": "function", "function": _FUNCTION}
 
 
-@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize("adapter", _REFUSING_CHAT_ADAPTERS, ids=lambda a: a.__name__)
 @pytest.mark.parametrize("fields", [
     {"tools": [_NAMED]}, {"tool_choice": "required"}, {"tool_choice": _NAMED},
     {"functions": [_FUNCTION]}, {"function_call": _FUNCTION},

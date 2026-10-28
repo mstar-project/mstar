@@ -293,3 +293,37 @@ def test_count_tokens_renders_the_prompt_the_model_would_get(client_and_stub):
     r = client.post("/v1/messages/count_tokens", json={"messages": [{"role": "user", "content": "hi"}],
                                                         "max_tokens": 5})
     assert r.status_code == 400 and "max_tokens" in r.json()["error"]["message"]
+
+
+QWEN_CALL = (b"<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+             b"<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_qwen3_coder_tool_use_comes_back_alike_streamed_or_whole(client_and_stub, stream):
+    """Claude Code on Qwen3-Coder: the tool result goes back as the template's tool turn, and
+    the call in Qwen's markup comes back as a tool_use block."""
+    client, stub = client_and_stub
+    stub.model_name = "qwen3_coder_30b_a3b"
+    stub.next_chunks = _usage_chunks((b"Checking.\n\n", 3), (QWEN_CALL[:50], 9), (QWEN_CALL[50:], 9), stop=True)
+    r = client.post("/v1/messages", json=_body(tools=[WEATHER], stream=stream, messages=[
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                                           "input": {"city": "Rome"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"},
+                                     {"type": "text", "text": "and Paris?"}]}]))
+    mk = stub.last_submit["model_kwargs"]
+    assert [m["role"] for m in mk["messages"]] == ["user", "assistant", "tool", "user"]
+    assert mk["messages"][1]["tool_calls"][0]["function"]["arguments"] == {"city": "Rome"}
+    if stream:
+        events = _events(r.text)
+        blocks = [e["content_block"] for e in events if e["type"] == "content_block_start"]
+        deltas = [e["delta"] for e in events if e["type"] == "content_block_delta"]
+        text = "".join(d.get("text", "") for d in deltas)
+        use = {**blocks[1], "input": json.loads("".join(d.get("partial_json", "") for d in deltas))}
+        reason = events[-2]["delta"]["stop_reason"]
+    else:
+        msg = r.json()
+        text, use, reason = msg["content"][0]["text"], msg["content"][1], msg["stop_reason"]
+    assert text == "Checking." and reason == "tool_use"
+    assert (use["type"], use["name"], use["input"]) == ("tool_use", "get_weather", {"city": "Paris", "days": 3})
