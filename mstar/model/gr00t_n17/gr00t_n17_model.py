@@ -577,6 +577,20 @@ class Gr00tN17Model(Model):
                 "gr00t_n17 needs `state`: an observation is a language instruction "
                 "plus the camera views and the robot's proprioceptive state"
             )
+        # The reference asserts the history length (`gr00t_n1d7.py`, `prepare_input`);
+        # here it is the client's input, so a 400. Past this point a wrong `T` fails in the
+        # state encoder's forward, which fails every request in that worker step, and a
+        # bare `(D,)` fails the decode's `[:, -1]` after the whole forward has run.
+        history = self.config.state_history_length
+        wrong = {
+            k: np.shape(v) for k, v in kwargs["state"].items()
+            if np.ndim(v) != 3 or np.shape(v)[:2] != (1, history)
+        }
+        if wrong:
+            raise ValueError(
+                f"gr00t_n17 takes each state group as `(1, {history}, D)`, one request and "
+                f"{history} timestep(s); got {wrong}"
+            )
         out = self.processor(
             embodiment_tag=tag,
             video=self._views_from_frames(tag, (tensors or {}).get("image_inputs")),
@@ -587,14 +601,6 @@ class Gr00tN17Model(Model):
             language=[prompt or ""],
             state=kwargs["state"],
         )
-        # The reference asserts this; here it is the client's input, so a 400. Past this
-        # point a wrong history only fails in a batched forward, taking its batch with it.
-        rows = out["state"].reshape(-1, self.config.max_state_dim).shape[0]
-        if rows != self.config.state_history_length:
-            raise ValueError(
-                f"gr00t_n17 takes {self.config.state_history_length} state row(s) per joint "
-                f"group, `(1, {self.config.state_history_length}, D)`; got {rows}"
-            )
         return {name: [tensor] for name, tensor in out.items()}
 
     def request_kwargs(self) -> frozenset[str]:

@@ -6,6 +6,7 @@ synthetic checkpoint; the real widths on ``meta``.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import re
@@ -1304,17 +1305,36 @@ def test_no_instruction_is_served_as_the_empty_instruction():
     assert not same_as_empty("Pick up the cup")
 
 
-@pytest.mark.parametrize("rows", [2, 0], ids=["a history of 2", "no state row"])
-def test_a_state_that_is_not_the_configured_history_is_refused_at_the_request(rows):
-    """The reference asserts ``T == state_history_length``; past ``process_prompt`` a wrong
-    ``T`` fails in a batched forward and takes the batch with it."""
-    model = _model()
+_STATE_LEADS = {
+    "one timestep": (1, 1),
+    "a history of 2": (1, 2),
+    "no timestep": (1, 0),
+    "a batch of 2": (2, 1),
+    "a bare vector": (),
+    "an extra axis": (1, 1, 2),
+}
+
+
+@pytest.mark.parametrize("history", [1, 2])
+@pytest.mark.parametrize("lead", list(_STATE_LEADS.values()), ids=list(_STATE_LEADS))
+def test_only_a_state_of_one_request_and_the_configured_history_is_served(lead, history):
+    """The reference asserts ``T == state_history_length``. Past ``process_prompt`` a wrong
+    ``T`` fails the state encoder's forward and every request in that step with it, and a
+    bare vector fails the decode once the whole forward has run."""
+    model = _model(dataclasses.replace(_config(), state_history_length=history))
     model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
     frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
-    state = {"arm": np.zeros((1, rows, 2), np.float32), "grip": np.zeros((1, rows, 1), np.float32)}
-    with pytest.raises(ValueError, match=rf"1 state row\(s\).*got {rows}"):
-        model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": frames},
-                             embodiment_tag="bot", state=state)
+    state = {"arm": np.zeros((*lead, 2), np.float32), "grip": np.zeros((*lead, 1), np.float32)}
+
+    def serve():
+        return model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": frames},
+                                    embodiment_tag="bot", state=state)
+
+    if lead == (1, history):
+        assert serve()["state"][0].shape == (1, history, 8)
+    else:
+        with pytest.raises(ValueError, match=rf"`\(1, {history}, D\)`.*'arm'"):
+            serve()
 
 
 def test_postprocess_names_every_joint_group_the_way_the_reference_does():
