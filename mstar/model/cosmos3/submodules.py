@@ -300,13 +300,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
-    def __init__(self, transformer, config, scheduler=None, head_vae=None):
+    def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
         super().__init__()
         self.transformer = transformer
         self.config = config
         # Re-encodes the frames a chained window (or a resumed session)
         # continues from; built only for deployments serving windowed video.
-        self._window_head = ChainedWindowHead(head_vae, config) if head_vae is not None else None
+        self._window_head = (
+            ChainedWindowHead(head_decode_vae, head_encode_vae, config) if head_decode_vae is not None else None
+        )
         # Template scheduler; a fresh instance (with its own multistep state) is
         # built per request from this one's config.
         self._scheduler_template = scheduler
@@ -783,11 +785,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         )
         return node_inputs
 
-    def _head_latents(self, window_latents: torch.Tensor, units: int) -> torch.Tensor:
-        if self._window_head is None:
-            raise RuntimeError("Cosmos3 windowed generation needs the DiT node's VAE (enable_windowed_video).")
-        return self._window_head(window_latents, units)
-
     def _session_tail(self, session_id: str, units: int, height: int, width: int) -> torch.Tensor:
         """The head a resumed request pins: ``units`` latent frames re-encoded
         from the stored last window's final frames (``ChainedWindowHead``), at
@@ -805,7 +802,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 f"Cosmos3 resume_session: session {session_id!r} holds latents of shape "
                 f"{tuple(tail.shape)}, which cannot seed a {height}x{width} window."
             )
-        return self._head_latents(tail, units)
+        return self._window_head(tail, units)
 
     def _store_session_tail(self, st, window_latents: torch.Tensor) -> None:
         """The rollout's final window, kept for a ``resume_session`` follow-up
@@ -991,7 +988,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             shape, generator=st["ar_generator"], device=device, dtype=dtype
         )
         if plan.cond_units > 0:
-            tail = self._head_latents(window_latents, plan.cond_units).to(dtype)
+            tail = self._window_head(window_latents, plan.cond_units).to(dtype)
             vmask = torch.zeros((1, 1, plan.units, 1, 1), device=device, dtype=dtype)
             vmask[:, :, :plan.cond_units] = 1.0
             cond_video = torch.zeros(shape, device=device, dtype=dtype)
@@ -2612,10 +2609,7 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         if next(vae.parameters()).dtype != torch.float32:
             vae.float()
         device = vision.device
-        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
-            1, -1, 1, 1, 1
-        )
+        mean, inv_std = _latent_affine(vae, torch.float32, device)
         # fp32 outside autocast; pipeline-side latent normalization; the DiT
         # consumes the latents in its bf16 checkpoint dtype.
         with torch.autocast(device_type=device.type, enabled=False):
@@ -2684,6 +2678,15 @@ def _wan_vae():
     return wan_vae
 
 
+def _latent_affine(vae, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pipeline-side latent normalization of ``vae`` as ``[1, C, 1, 1, 1]``
+    tensors: raw latents ``z = latents / inv_std + mean``, DiT latents
+    ``(z - mean) * inv_std``."""
+    mean = torch.tensor(vae.config.latents_mean, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+    inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=dtype, device=device)).view(1, -1, 1, 1, 1)
+    return mean, inv_std
+
+
 def _vae_decode_dtype() -> torch.dtype:
     # cuDNN ships fast Hopper bf16 conv3d for the Wan-VAE decode only from
     # 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
@@ -2706,32 +2709,33 @@ class ChainedWindowHead:
     window's first positions expect; pinned there, the rollout washes out
     within a few windows. Like the reference's video-to-video conditioning,
     the head is the last ``1 + (units - 1) * tf`` frames, decoded to 8 bits
-    and encoded again as a clip of their own. The tail is decoded behind
-    ``windowed_decode_context_latents`` latents of the same window.
-
-    Holds the VAE outside the module tree, so the engine's casts of the DiT
-    never reach it; it runs in the decode dtype, like the decoder nodes.
+    and encoded again as a clip of their own. The decode is the whole-clip
+    decode the ``vae_decoder`` node runs (compiled, channels-last, the
+    cuDNN-gated dtype, the frames quantized as served), behind
+    ``chained_head_context_latents`` latents of the same window so the causal
+    decoder is warm at the kept frames; the encode runs fp32 like the encoder
+    node's. Both VAEs are the model's shared copies when the nodes share a
+    process. Held outside the module tree, so the engine's casts of the DiT
+    never reach them.
     """
 
-    def __init__(self, vae, config):
-        self.vae = vae
+    def __init__(self, decode_vae, encode_vae, config):
+        self.decoder = Cosmos3VAEDecoderSubmodule(decode_vae, config, channels_last=config.vae_decode_channels_last)
+        self.encode_vae = encode_vae
         self.config = config
 
     def __call__(self, window_latents: torch.Tensor, units: int) -> torch.Tensor:
-        vae = self.vae
-        dtype = _vae_decode_dtype()
-        if next(vae.parameters()).dtype != dtype:
-            vae.to(dtype)
-        device = window_latents.device
-        mean = torch.tensor(vae.config.latents_mean, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=dtype, device=device)).view(1, -1, 1, 1, 1)
-        ctx = max(0, int(self.config.windowed_decode_context_latents))
-        z = window_latents[:, :, -min(window_latents.shape[2], units + ctx):].to(dtype)
+        # at least one: a clip's latent 0 is a clip start, a mid-stream latent is not
+        ctx = max(1, int(self.config.chained_head_context_latents))
+        z = window_latents[:, :, -min(window_latents.shape[2], units + ctx):]
         frames = 1 + (units - 1) * self.config.vae.scale_factor_temporal
-        with torch.autocast(device_type=device.type, enabled=False):
-            pixels = vae.decode((z / inv_std + mean).to(dtype)).sample[:, :, -frames:]
-            pixels = ((pixels / 2 + 0.5).clamp(0, 1) * 255).round() / 127.5 - 1
-            raw_mu = vae.encode(pixels.to(dtype)).latent_dist.mode()
+        pixels = self.decoder._decode_pixels(z)[:, :, -frames:]
+        vae = self.encode_vae
+        if next(vae.parameters()).dtype != torch.float32:
+            vae.float()
+        mean, inv_std = _latent_affine(vae, torch.float32, z.device)
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            raw_mu = vae.encode(pixels.to(torch.float32) / 127.5 - 1).latent_dist.mode()
         return ((raw_mu - mean) * inv_std).to(window_latents.dtype)
 
 
@@ -2746,12 +2750,17 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     # speedup path.
     disable_torch_compile = True
 
-    def __init__(self, vae, config):
+    def __init__(self, vae, config, channels_last: bool = False):
         super().__init__()
         self.vae = vae
         self.config = config
         self._decode_dtype_cached = None
-        self._channels_last = False
+        # Channels-last weights and activations (cuDNN's native conv3d layout),
+        # converted in place before any compile traces the decode; only the
+        # instance given here is converted (see Cosmos3Model).
+        self._channels_last = vae is not None and channels_last
+        if self._channels_last:
+            _wan_vae().to_channels_last(vae)
         # The decode is 3D-conv bound, one-shot per request at request-specific
         # shapes, and not graph-captured; torch.compile fuses its pointwise
         # epilogues (~20-30% off the 189-frame video decode, neutral for
@@ -2788,10 +2797,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         vae_dtype = self._decode_dtype()
         if next(vae.parameters()).dtype != vae_dtype:
             vae = vae.to(vae_dtype)
-        mean = torch.tensor(vae.config.latents_mean, dtype=vae_dtype, device=latents.device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae_dtype, device=latents.device)).view(
-            1, -1, 1, 1, 1
-        )
+        mean, inv_std = _latent_affine(vae, vae_dtype, latents.device)
         # Force z to the VAE dtype: the engine's outer autocast promotes the
         # `1.0 / std` division to fp32, and a fp32 z into the autocast-off bf16
         # conv3d fails ("Input type (float) and bias type (BFloat16)"). No-op
@@ -2874,18 +2880,13 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     """
 
     def __init__(self, vae, config):
-        super().__init__(vae, config)
+        super().__init__(vae, config, channels_last=config.vae_decode_channels_last)
         # Per-session decode context (the latents behind a session's last
         # frames), so a resumed rollout's first window decodes seamlessly.
         # Same store as the DiT's, so the two age their sessions alike.
         self._sessions = SessionStore(
             config.session_store_size, config.session_timeout_s, config.session_timeout_max_s,
         )
-        # Before any compile traces the decode; only this node's VAE instance
-        # is converted (see Cosmos3Model).
-        if vae is not None and config.vae_decode_channels_last:
-            _wan_vae().to_channels_last(vae)
-            self._channels_last = True
         self._warm_enabled = vae is not None and bool(config.windowed_decode_warm_cache)
         self._step = _wan_vae().DecoderStep(vae, compile=self._decode_compiled) if self._warm_enabled else None
 

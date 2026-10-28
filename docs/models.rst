@@ -1031,8 +1031,9 @@ own ``window_decoder`` partition; a request opts in per call:
      - Pixel frames per window (quantized to latent frames).
    * - ``overlap_frames``
      - 32 on Edge, 8 elsewhere
-     - ``chained`` only: frames re-pinned from the previous window (at least two
-       latent frames).
+     - ``chained`` only: frames re-pinned from the previous window, as k = 1 +
+       (overlap_frames - 1) // 4 latent frames (at least two), which pin
+       1 + 4(k - 1) frames: 5 and 29 at the defaults.
    * - ``context_frames``
      - 61
      - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.

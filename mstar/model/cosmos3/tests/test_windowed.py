@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
 from types import SimpleNamespace
 
 import pytest
@@ -258,27 +257,29 @@ class _CausalVAE(torch.nn.Module):
 def test_chained_window_head_layout(ctx, monkeypatch) -> None:
     """A chained window's head is the finished window's last 1 + 4(u-1)
     frames encoded as a clip of their own, not its tail latents: the decode
-    sees the tail behind ``windowed_decode_context_latents`` latents, the
-    encode sees exactly those frames at 8 bits, and the head's first latent
-    is the encoder's clip-start latent."""
-    from mstar.model.cosmos3.submodules import ChainedWindowHead
+    sees the tail behind ``chained_head_context_latents`` latents, the encode
+    sees those frames quantized as served (``_to_uint8``), and the head's
+    first latent is the encoder's clip-start latent."""
+    from mstar.model.cosmos3.submodules import ChainedWindowHead, Cosmos3VAEDecoderSubmodule
 
     monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
-    cfg.windowed_decode_context_latents = ctx
+    cfg.chained_head_context_latents = ctx
     vae = _CausalVAE(cfg.latent_channel)
-    # Latent l holds (100 + 10 l) / 127.5 - 1: exact at 8 bits, inside [-1, 1].
+    # Latent l holds (100 + 10 l) / 127.5 - 1, inside [-1, 1].
     values = (100 + 10 * torch.arange(8, dtype=torch.float32)) / 127.5 - 1
     window = values.view(1, 1, 8, 1, 1).expand(1, cfg.latent_channel, 8, 4, 4).contiguous()
-    head = ChainedWindowHead(vae, cfg)(window, 2)
+    head = ChainedWindowHead(vae, vae, cfg)(window, 2)
 
     assert torch.equal(vae.decoded[0], window[:, :, -min(8, 2 + ctx):])
     frames = vae.encoded[0]
     assert frames.shape[2] == 5
-    # The last frame of latent 6, then latent 7's four frames.
-    assert torch.allclose(frames[0, 0, :, 0, 0], torch.stack([values[6]] + [values[7]] * 4), atol=1e-6)
+    # The last frame of latent 6, then latent 7's four frames, at 8 bits.
+    served = Cosmos3VAEDecoderSubmodule._to_uint8(values).float() / 127.5 - 1
+    assert torch.allclose(frames[0, 0, :, 0, 0], torch.stack([served[6]] + [served[7]] * 4), atol=1e-6)
     assert head.shape == (1, cfg.latent_channel, 2, 4, 4)
-    assert torch.allclose(head[:, :, 0], values[6] + 100) and torch.allclose(head[:, :, 1], values[7])
+    assert torch.allclose(head[:, :, 0], served[6] + 100) and torch.allclose(head[:, :, 1], served[7])
     # The raw tail is what the window would have pinned before.
     assert not torch.allclose(head, window[:, :, -2:])
 
@@ -726,17 +727,6 @@ def test_session_gen_params() -> None:
         model._resolve_gen_params(
             {"window_mode": "kv", "num_frames": 189, "session_id": "s", "session_timeout_s": 0}, [], ["video"],
         )
-
-
-def test_overlap_rounding_to_zero_warns(caplog) -> None:
-    """An overlap below half a latent frame rounds to none; say so."""
-    model = _windowed_model()
-    with caplog.at_level(logging.WARNING, logger="mstar.model.cosmos3.cosmos3_model"):
-        p = model._resolve_gen_params(
-            {"window_mode": "chained", "num_frames": 61, "overlap_frames": 1}, [], ["video"],
-        )
-    assert p["overlap_latent_units"] == 0
-    assert "rounds to no latent frames" in caplog.text
 
 
 def test_session_tail_store_and_resume(monkeypatch) -> None:
