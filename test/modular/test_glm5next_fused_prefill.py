@@ -9,11 +9,13 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.kda import KDAPlan
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
-from mstar.model.glm5_next.kda import Glm5NextKdaConfig, TorchKDAKernels
+from mstar.model.glm5_next.kda import Glm5NextKdaConfig
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and fused_decode._HAS_TRITON),
@@ -52,6 +54,8 @@ class _Pool:
 
 class _Kda:
     """The KDA resource's ``run`` on a hand-built plan."""
+
+    speculative_tokens = 0
 
     def __init__(self, plan, kernels):
         self.plan, self.kernels = plan, kernels
@@ -129,7 +133,7 @@ def _reference(kda, x, spans, rec, conv, autocast=False):
 
 def _paged(kda, x, spans, rec, conv, kernels=None):
     """``x`` through the layer's paged path, the pool's blocks being ``rec`` and ``conv``."""
-    kda.pool, kda.kda = _Pool(rec, conv), _Kda(_plan(spans), kernels or kda_triton.TritonKDAKernels())
+    kda.mix = KDACallable(_Pool(rec, conv), _Kda(_plan(spans), kernels or kda_triton.TritonKDAKernels()))
     with torch.no_grad():
         return kda.forward_paged(x, 0)
 
@@ -223,8 +227,8 @@ def test_kda_prefill_continue_then_decode(fp32_matmul):
     out = torch.cat([_fused(kda, x[:100], first, rec, conv),
                      _fused(kda, x[100:300], second, rec, conv)])
     slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
-    kda.kda.plan = KDAPlan(slot_ids=slots, has_state=torch.ones_like(slots, dtype=torch.bool),
-                           spans=(1,), num_tokens=1, is_decode=True)
+    kda.mix.attn.plan = KDAPlan(slot_ids=slots, has_state=torch.ones_like(slots, dtype=torch.bool),
+                                spans=(1,), num_tokens=1, is_decode=True)
     with torch.no_grad():
         step = kda.forward_paged(x[300:], 0)
 

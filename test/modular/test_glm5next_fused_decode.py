@@ -3,7 +3,9 @@ reference — parity on CUDA."""
 import pytest
 import torch
 
+from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn.kda import KDAPlan
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
 from mstar.model.components.norm import RMSNorm
 from mstar.model.glm5_next import fused_decode
@@ -11,7 +13,7 @@ from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
 from mstar.model.glm5_next.components.decoder_layer import Glm5NextDecoderLayer
 from mstar.model.glm5_next.components.moe import Glm5NextMoEGate
 from mstar.model.glm5_next.config import Glm5NextModelConfig
-from mstar.model.glm5_next.kda import Glm5NextKdaConfig, TorchKDAKernels
+from mstar.model.glm5_next.kda import Glm5NextKdaConfig
 from mstar.model.glm5_next.mhc import Glm5NextHyperConnection, update_streams
 
 pytestmark = pytest.mark.skipif(
@@ -67,6 +69,8 @@ class _Pool:
 class _Kda:
     """The KDA resource's ``run`` on a hand-built plan."""
 
+    speculative_tokens = 0
+
     def __init__(self, plan, kernels):
         self.plan, self.kernels = plan, kernels
 
@@ -85,7 +89,7 @@ def _decode_plan(slots):
 
 
 def _bind(kda, rec, conv, plan, kernels):
-    kda.pool, kda.kda = _Pool(rec, conv), _Kda(plan, kernels)
+    kda.mix = KDACallable(_Pool(rec, conv), _Kda(plan, kernels))
 
 
 @pytest.mark.parametrize("batch", [1, 5, 32])
@@ -248,7 +252,7 @@ def test_kda_layer_fused_matches_reference(batch, monkeypatch):
         fused_pools = {k: v.clone() for k, v in pools.items()}
         for k, v in saved.items():
             pools[k].copy_(v)
-        layer.self_attn.kda.kernels = TorchKDAKernels()
+        layer.self_attn.mix.attn.kernels = TorchKDAKernels()
         monkeypatch.setattr(fused_decode, "_ENABLED", False)
         ref = layer(streams)
     torch.testing.assert_close(out, ref, rtol=3e-2, atol=3e-2)
