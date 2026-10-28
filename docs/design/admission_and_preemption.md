@@ -142,7 +142,7 @@ Then:
 2. Otherwise, if R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
 3. Otherwise, R waits until the pool's room grows past what its failed grant saw.
 
-The choice is one `KVManager.preempt` call under the pool's lock.
+The runner makes the choice in `StepRunner.preempt`, in its arrival order, under the pool's lock. The pool reports what each request holds and would free and whether the host can take it, and makes the earmark.
 
 Why this shape:
 
