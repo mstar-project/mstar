@@ -2269,11 +2269,15 @@ class KVManager(AttentionResource):
     ) -> KVPlanState:
         """``_compute_plan_state`` staged into the captured state, computed on
         the host from the indptrs the plan built there."""
-        page_size = self.kv_cache.page_size
         qo = indptrs.qo_indptr.numpy()
+        total = int(qo[-1])
+        if total == 0:
+            # every row reads without writing (a zero-span context label):
+            # the buffer is all SINK_PAGE, which the mirror usually already holds
+            return self._stage_static(static_state, (), (), 0)
+        page_size = self.kv_cache.page_size
         kvp = indptrs.paged_kv_indptr.numpy()
         spans = np.diff(qo)
-        total = int(qo[-1])
         seg = np.repeat(np.arange(len(spans)), spans)
         # each token's position in its stream, after the append
         last = indptrs.paged_kv_last_page_len.numpy()
@@ -2454,6 +2458,7 @@ class KVManager(AttentionResource):
             decode=decode,
             rows=segments,
             view_builder=build_views,
+            columns=cols,
         )
 
     @staticmethod
@@ -2812,7 +2817,7 @@ class KVManager(AttentionResource):
             "KV preplan is already pending; clear_preplan before planning a "
             "different step ahead"
         )
-        laps = PhaseLaps(f"{ctx.plan_phase}.kv_cache.")
+        laps = PhaseLaps(f"{ctx.plan_phase}.{self.name}.")
         self.reset_default_cursors()
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):

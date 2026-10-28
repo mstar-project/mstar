@@ -79,6 +79,25 @@ def test_host_addressing_matches_device_unpacking():
         assert torch.equal(got.token_to_cache[:CAPTURE], ref.token_to_cache[:CAPTURE])
 
 
+def test_a_step_that_only_reads_stages_the_sink():
+    """Every row zero-span (a decoder reading the encoder context it wrote
+    earlier): nothing is written, and every slot the graph scatters goes to
+    SINK_PAGE, overwriting what the buffer held."""
+    kv = KVManager.__new__(KVManager)
+    kv.kv_cache = SimpleNamespace(page_size=PAGE)
+    kv._device = torch.device("cpu")
+    kv._plan_stager = PinnedStager(torch.long)
+    i32 = lambda v: torch.tensor(v, dtype=torch.int32)  # noqa: E731
+    indptrs = PagedIndptrs(
+        qo_indptr=i32([0, 0, 0, 0]), paged_kv_indptr=i32([0, 2, 3, 3]), paged_kv_indices=i32([5, 6, 9]),
+        paged_kv_last_page_len=i32([4, PAGE, PAGE]), kv_lens=None,
+    )
+    got = kv._stage_packed_plan_state(indptrs, _state(), CAPTURE)
+    assert got.total_tokens == 0
+    assert got.token_to_page.tolist() == [SINK_PAGE] * CAPTURE
+    assert got.token_to_cache.tolist() == [0] * CAPTURE
+
+
 def test_a_row_past_its_pages_is_refused():
     """A writing row with no page, or a last page longer than a page, would
     give a page index outside the row; numpy would wrap a negative one onto
@@ -87,6 +106,7 @@ def test_a_row_past_its_pages_is_refused():
 
     kv = KVManager.__new__(KVManager)
     kv.kv_cache = SimpleNamespace(page_size=PAGE)
+    kv._device = torch.device("cpu")
     kv._plan_stager = PinnedStager(torch.long)
     i32 = lambda v: torch.tensor(v, dtype=torch.int32)  # noqa: E731
     for kvp, idx, last in (

@@ -111,7 +111,7 @@ def _ctx(rids, padded_bs, slot):
     return SimpleNamespace(
         request_ids=list(rids), padded_request_ids=list(rids) + ["pad"] * (padded_bs - len(rids)),
         slot_lease=SlotLease(slot=slot, bucket=BucketKey(graph_walk="decode", bs=padded_bs, num_tokens=padded_bs)),
-        is_preplan=False, slot=slot, is_padding_row=lambda rid: rid == "pad",
+        is_preplan=False, plan_phase="res.plan", slot=slot, is_padding_row=lambda rid: rid == "pad",
     )
 
 
