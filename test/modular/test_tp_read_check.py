@@ -625,16 +625,16 @@ def test_a_colocated_encoders_output_is_a_followers_read(tmp_path):
 
 
 def test_one_lockstep_node_taking_an_input_leaves_another_nodes_copy_checked(tmp_path):
-    """One producer beside rank 0 feeds the same signal to two lockstep nodes
-    (BAGEL's ``combine_cfg`` and its LLMs): the first node's step spends only its
-    own read, so the second's goes out checked too."""
-    other = "LLM_cfg"
+    """One producer beside rank 0 feeds the same signal to two lockstep nodes:
+    the first node's step spends only its own read, so the second's goes out
+    checked too."""
+    other = "LLM_2"
     w = _leader(tmp_path, nodes=(NODE, other), consumed={
-        ("combine_cfg", NODE): {"latents"}, ("combine_cfg", other): {"latents"},
+        ("producer", NODE): {"latents"}, ("producer", other): {"latents"},
     })
     w._note_local_lockstep_inputs(
         StoredOutputs(flat_uuids=[22], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
-        ["latents"], "combine_cfg", lambda rid: WALK,
+        ["latents"], "producer", lambda rid: WALK,
     )
     ran = _step({"r1": ["latents"]})
     assert _broadcast(w, ran) == (True, ("r1",))
