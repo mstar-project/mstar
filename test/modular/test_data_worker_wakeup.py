@@ -8,6 +8,7 @@ import select
 import threading
 import time
 from concurrent.futures import Future
+from types import SimpleNamespace
 
 from mstar.api_server.data_worker import InlineToken, PreprocessWorkerThread
 from mstar.communication.event import EventWakeup
@@ -15,6 +16,10 @@ from mstar.graph.loop_indices import NestedLoopIndices
 
 
 class _Model:
+    def get_partition_topology(self):
+        from mstar.streaming.topology import PartitionTopology
+        return PartitionTopology(partitions=["default"])
+
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 
@@ -41,6 +46,13 @@ class _PollingComm:
     def send(self, entity, msg):
         pass
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
 
 class _BareComm:
     def get_all_new_messages(self):
@@ -49,6 +61,13 @@ class _BareComm:
     def send(self, entity, msg):
         pass
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
 
 class _TM:
     def __init__(self):
@@ -56,6 +75,11 @@ class _TM:
 
     def start_read_tensors(self, request_id, graph_edges, graph_walk=None):
         return list(self.futures)
+
+    def take_failed_reads(self):
+
+        return []
+
 
     def get_ready_tensors(self):
         return {}

@@ -95,6 +95,7 @@ impl NodeState {
 
 #[derive(Clone, Default)]
 struct LoopState {
+    max_iters: u32,          // Loop.max_iters, this request's copy
     curr_iter: u32,          // Loop.curr_iter
     finish_signal: bool,     // Loop._finish_signal
     done: bool,              // Loop.is_done
@@ -161,6 +162,8 @@ pub struct Completed {
     /// takes a reference on each. Apply before `freed`, which can name the
     /// same tensor.
     pub taken: Vec<u64>,
+    /// Finished-loop cache holds to exchange for routed readers AFTER fanout.
+    pub transferred: Vec<u64>,
 }
 
 /// Python's `SpeculativeNodeInfo`.
@@ -188,18 +191,23 @@ pub struct RequestState {
     /// `Loop._uncache_outputs`, `Loop._uncache_accumulated_outputs`).
     refs_taken: Vec<u64>,
     refs_released: Vec<u64>,
+    refs_transferred: Vec<u64>,
 }
 
 impl RequestState {
     pub fn new(graph: GraphRef) -> Self {
         let nodes = graph.nodes.iter().map(|n| NodeState::new(n.inputs.len())).collect();
-        let loops = vec![LoopState::default(); graph.loops.len()];
+        let loops = graph
+            .loops
+            .iter()
+            .map(|l| LoopState { max_iters: l.max_iters, ..LoopState::default() })
+            .collect();
         let w = graph.n_ready_words();
         let mut s = Self {
             nodes, loops, ready: vec![0; w], ready_streaming: vec![0; w],
             root_completed: 0, is_done: false, num_times_run: 0,
             spec_dirty: Vec::new(), refs_taken: Vec::new(),
-            refs_released: Vec::new(), graph,
+            refs_released: Vec::new(), refs_transferred: Vec::new(), graph,
         };
         s.seed_streaming_ready();
         s
@@ -532,6 +540,7 @@ impl RequestState {
             filtered,
             freed,
             taken: std::mem::take(&mut self.refs_taken),
+            transferred: std::mem::take(&mut self.refs_transferred),
         }
     }
 
@@ -563,7 +572,7 @@ impl RequestState {
 
         let finishing = {
             let st = &self.loops[lid as usize];
-            st.finish_signal || lspec.max_iters == st.curr_iter + 1
+            st.finish_signal || st.max_iters == st.curr_iter + 1
         };
         if finishing {
             self.finish_loop(g, lid, out, filtered);
@@ -627,6 +636,11 @@ impl RequestState {
             let st = &mut self.loops[lid as usize];
             (std::mem::take(&mut st.cached), std::mem::take(&mut st.accum))
         };
+        // Keep the holds alive through fanout/persist marking. Nested loops
+        // can transfer the same UUID more than once; preserve multiplicity.
+        for (_, tensors) in cached.iter().chain(accum.iter()) {
+            self.refs_transferred.extend(tensors.iter().map(|t| t.uuid));
+        }
         let own_edges_from = out.len();
         for o in &lspec.outputs {
             let t = cached.iter().find(|(n, _)| *n == o.name)
@@ -764,6 +778,15 @@ impl RequestState {
         st.done || st.finish_signal
     }
 
+    pub fn loop_max_iters(&self, lid: LoopId) -> u32 {
+        self.loops[lid as usize].max_iters
+    }
+
+    pub fn cap_loop(&mut self, lid: LoopId, cap: u32) {
+        let st = &mut self.loops[lid as usize];
+        st.max_iters = st.max_iters.min(cap);
+    }
+
     pub fn loop_indices(&self) -> Vec<u32> {
         self.loops.iter().map(|l| l.curr_iter).collect()
     }
@@ -840,7 +863,7 @@ impl RequestState {
             n.clear();
         }
         for l in self.loops.iter_mut() {
-            *l = LoopState::default();
+            *l = LoopState { max_iters: l.max_iters, ..LoopState::default() };
         }
         for w in self.ready.iter_mut() { *w = 0 }
         for w in self.ready_streaming.iter_mut() { *w = 0 }
@@ -944,6 +967,7 @@ mod tests {
                 // Advancing un-caches the regular output only; the
                 // accumulated one is held across iterations.
                 assert_eq!(done.freed, vec![new_tok], "iteration {i}");
+                assert!(done.transferred.is_empty());
                 assert_eq!(st.loop_iter(0), i as u32 + 1);
                 let names: Vec<Sym> = done.edges.iter().map(|e| e.name).collect();
                 assert_eq!(names, vec![tok, it.get("frame").unwrap(), h]);
@@ -958,6 +982,7 @@ mod tests {
                 // Finishing hands the caches to the loop's output edges: no
                 // release, and the loop-back edge is dropped.
                 assert!(done.freed.is_empty());
+                assert_eq!(done.transferred, vec![30, 11, 21, 31]);
                 assert_eq!(done.filtered, vec![(tok, dec)]);
                 assert!(done.edges.iter().all(|e| !matches!(e.dest, Dest::Local(_))));
                 let out: Vec<(Dest, Vec<u64>)> = done.edges.iter()

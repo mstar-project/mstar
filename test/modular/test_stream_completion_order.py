@@ -141,6 +141,7 @@ class _Producer:
             request_id=RID, partition="LLM", graph_walk="decode",
             partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0, 1], [[PRODUCER], [CONSUMER]]),
+            loop_caps={},
         )
 
     def step(self, uuid):

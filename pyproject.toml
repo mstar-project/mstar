@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=78.1.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -25,15 +25,19 @@ classifiers = [
 ]
 dependencies = [
     "fastapi",
+    # floors for the HTTP stack: the first releases with the published
+    # parser and form-limit fixes
+    "starlette>=1.3.1",
+    "h11>=0.16.0",
     "numpy",
     "PyYAML",
     "pyzmq",
     "msgpack",
-    "python-multipart",
+    "python-multipart>=0.0.31",
     "requests",
-    "torch>=2.9.1,<2.13.0",
-    "torchvision>=0.24.1",
-    "torchaudio>=2.9.1",
+    "torch>=2.10.0,<2.13.0",
+    "torchvision>=0.25.0",
+    "torchaudio>=2.10.0",
     "uvicorn",
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
     "websockets",
@@ -65,10 +69,18 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 # PyPI reject the mstar upload, so it is an install step instead — see
 # docs/installation.rst, same as flash-attn.
 omnivoice = []
+command_a_plus = [
+    "flashinfer-python>=0.6.18",
+    "huggingface-hub>=1.5",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "ninja",
+    "safetensors",
+    "transformers>=5.17",
+]
 
 dev = [
     "ruff<=0.16",
-    "pytest>=8.2",
+    "pytest>=9.0.3",
 ]
 
 # Optional: non-WAV audio containers (mp3/flac/...) for the OpenAI audio API
@@ -94,7 +106,7 @@ eval = [
     "datasets",
     "huggingface-hub",
     "matplotlib",
-    "Pillow",
+    "Pillow>=12.3.0",
     "soundfile",
     "transformers",
 ]
@@ -108,9 +120,12 @@ audioseal = [
 
 # Optional: server_vad turn detection on /v1/realtime. Silero VAD (MIT) ships
 # its 2 MB ONNX weights in the wheel; onnxruntime (MIT) runs them on one thread.
+# semantic_vad also runs Pipecat's Smart Turn v3 (BSD-2 weights, fetched
+# separately) with onnxruntime on Whisper features from transformers (Apache-2.0).
 vad = [
     "silero-vad>=5.1",
     "onnxruntime>=1.17",
+    "transformers",
 ]
 
 # Optional: serve a deployment as a NVIDIA Dynamo backend
@@ -126,7 +141,7 @@ bagel = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
-    "Pillow",
+    "Pillow>=12.3.0",
     "regex",
     "safetensors",
     "torchvision",
@@ -139,7 +154,7 @@ bagel_xpu = [
     "einops",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
-    "Pillow",
+    "Pillow>=12.3.0",
     "regex",
     "safetensors",
     "torchvision",
@@ -163,7 +178,7 @@ cosmos3 = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
-    "Pillow",
+    "Pillow>=12.3.0",
     "safetensors",
     "torchvision",
     "torchcodec",
@@ -178,7 +193,7 @@ qwen3_omni = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
-    "Pillow",
+    "Pillow>=12.3.0",
     "regex",
     "qwen-omni-utils",
     # qwen-omni-utils imports audioread for a video's audio track but does not
@@ -188,7 +203,8 @@ qwen3_omni = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "transformers",
+    # the vision encoder builds its grid inputs with transformers.vision_utils
+    "transformers>=5.18",
     "datasets",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
 ]
@@ -330,7 +346,7 @@ flux2_klein = [
     "diffusers>=0.39",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
-    "Pillow",
+    "Pillow>=12.3.0",
     "safetensors",
     "torchvision",
     "transformers",
@@ -351,15 +367,21 @@ asr = [
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
-    "torchcodec==0.8.*",
+    # decodes WAV / FLAC / OGG / MP3 uploads without FFmpeg (torchcodec takes the rest)
+    "soundfile",
+    # torchcodec doesn't declare its torch requirement and loads only next to the torch
+    # it was built for, so the extra pins the pair the Dockerfiles ship (torch 2.10 with 0.10)
+    "torch>=2.10.0,<2.11",
+    "torchcodec==0.10.*",
     "transformers",
     "datasets",
     "jiwer",  # WER computation for asr_eval.py
+    "numba>=0.61",  # Whisper word timestamps' DTW (components/alignment.py)
 ]
 
 all = [
     "ruff",
-    "pytest>=8.2",
+    "pytest>=9.0.3",
     "soundfile",
     "silero-vad>=5.1",
     "onnxruntime>=1.17",
@@ -370,14 +392,15 @@ all = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
-    "Pillow",
+    "Pillow>=12.3.0",
     "regex",
     "safetensors",
     "torchvision",
     "torchaudio",
     "torchcodec",
-    # Qwen3-TTS's speech tokenizer (qwen-tts, installed --no-deps) needs check_model_inputs
-    "transformers>=4.57.3",
+    # Qwen3-TTS's speech tokenizer (qwen-tts, installed --no-deps) needs check_model_inputs,
+    # and Qwen3-Omni's vision encoder needs transformers.vision_utils
+    "transformers>=5.18",
     "safetensors",
     "triton",
     "qwen-omni-utils",
@@ -419,7 +442,7 @@ exclude = ["tests*", "benchmark*", "examples*"]
 # mstar/default_configs/ at build time; see setup.py) so `mstar serve <model>`
 # works from a pip install.
 [tool.setuptools.package-data]
-"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp", "configs/*.json"]
 "mstar.default_configs" = ["*.yaml"]
 
 [tool.ruff]

@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
@@ -87,7 +87,7 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
     ]
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": chain(pages)}, prefix_tail={"main": []},
-        prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
     ))
 
 
@@ -184,7 +184,7 @@ def test_a_pool_of_live_leaves_gives_up_after_one_look_at_each():
         return entry
 
     index._pop_leaf = _counting_pop
-    freed = index.evict(kv.config.max_num_pages)
+    freed = len(index.evict(kv.config.max_num_pages))
 
     assert freed == 0, "a page a running request holds was counted as freed"
     assert len(popped) == len(set(popped)), (
@@ -204,12 +204,12 @@ def test_a_leaf_that_was_passed_over_is_still_there_for_the_next_shortfall():
     assert _admit(kv, "a", TOKENS).ok, "the request under test never ran"
     indexed = sorted(kv._index.pages())
 
-    assert kv._index.evict(PAGES_PER_REQUEST) == 0, (
+    assert len(kv._index.evict(PAGES_PER_REQUEST)) == 0, (
         "a pool whose every leaf is live gave something back"
     )
     kv.remove_request("a")
 
-    assert kv._index.evict(PAGES_PER_REQUEST) == PAGES_PER_REQUEST, (
+    assert len(kv._index.evict(PAGES_PER_REQUEST)) == PAGES_PER_REQUEST, (
         "the leaves the first pass put back could not be found by the second"
     )
     assert sorted(kv._index.pages()) == [] and indexed, "nothing was indexed"
