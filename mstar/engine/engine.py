@@ -2067,6 +2067,11 @@ class Engine:
         request_ids: list[int],
     ) -> None:
         """Publish state that must include the last iteration of a stopped loop."""
+        # A row that ran nothing this step -- one the prefix cache served whole
+        # -- has no iteration here to publish, though its loop still stops.
+        request_ids = [rid for rid in request_ids if rid in batch.per_request_info]
+        if not request_ids:
+            return
         published = self._runner.publish_after_stop(
             request_ids,
             node_name=batch.node_name,

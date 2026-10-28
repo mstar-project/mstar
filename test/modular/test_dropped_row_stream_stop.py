@@ -135,7 +135,7 @@ def _worker(eng, runtime):
     return w
 
 
-def _postprocess(sub, rids=(1, 2), pending_stops=()):
+def _postprocess(sub, rids=(1, 2), pending_stops=(), cached=(), chunk_loop=False):
     """What ``Worker.run`` does with a finished step: drop and report the rows
     a per-rid stage failed, then postprocess the rest. ``pending_stops`` makes
     the step a speculative new loop iteration whose rows in it already
@@ -143,10 +143,14 @@ def _postprocess(sub, rids=(1, 2), pending_stops=()):
     eng, runtime = _engine(sub), _Runtime(pending_stops)
     batch = _batch(rids)
     eng.prepare_inputs(batch)
+    # rows the prefix cache served whole: declined by prepare, kept by postprocess
+    batch.cached_rids = set(cached)
     outputs = BatchedModelOutput(per_rid_outputs={
         r: {"audio": [torch.zeros(1)]} for r in batch.request_ids
     })
     w = _worker(eng, runtime)
+    if chunk_loop:
+        w._chunk_loop_walks = frozenset({(NODE, WALK)})
     pending = PendingBatch(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK,
@@ -199,3 +203,14 @@ def test_a_row_that_overstayed_its_loop_stop_is_not_stopped_again():
     assert not w.reported
     assert batch.final_stream_rids == {1}
     assert batch.stream_partition_done_rids == {1}
+
+
+def test_a_cache_served_row_ends_its_chunk_loop_without_publishing():
+    """A chunkable walk the prefix cache served whole never runs, but its chunk
+    Loop is still stopped. Finalizing that stop read the row's forward-pass
+    info, which a row that did not run no longer has: ``KeyError``, and every
+    request in the step failed with it."""
+    batch, runtime, w = _postprocess(_Sub(skip={2}), cached={2}, chunk_loop=True)
+    assert sorted(runtime.stopped) == [1, 2], "the served row's loop still ends"
+    assert not w.reported
+    assert 2 not in batch.resource_publish_info
