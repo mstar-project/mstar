@@ -44,6 +44,7 @@ from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import ARNodeInputs, InputMetadata, ModelInputsFromEngine
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
+from mstar.worker.engine_manager import _refuse_speculated_spans
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "qwen3tts.yaml"
 
@@ -174,6 +175,14 @@ def test_qwen3_tts_declares_talker_and_codec_graphs():
     assert topology.partitions == ["Talker", "Codec"]
     assert len(topology.connections) == 1
     assert topology.connections[0].edge_name == "codec_tokens"
+    # The Talker spans the stream it feeds the Codec, which startup allows:
+    # the Codec reads it from its stream buffer, after the cut.
+    submodules = {
+        "Talker": TalkerSubmodule.__new__(TalkerSubmodule),
+        "Codec": CodecSubmodule.__new__(CodecSubmodule),
+    }
+    for graph in (model, _variant_model("base")):
+        _refuse_speculated_spans(submodules, graph)
 
 
 def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
@@ -1021,6 +1030,52 @@ def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
     assert submodule.check_stop("request", request_info, outputs) == set()
 
 
+def test_qwen3_tts_talker_spans_eos_frames_out_of_the_codec_stream(monkeypatch):
+    """EOS is loop control, not a codebook index: a row that samples it gets
+    an empty span on ``codec_tokens``, so the worker never streams its frame,
+    also under ``ignore_eos`` (the span reads the token alone)."""
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    eos, groups = config.talker.codec_eos_token_id, config.talker.num_code_groups
+    # The backbone and the depth loop need the engine's attention resources;
+    # every code of a frame here is its sampled group-0 token.
+    monkeypatch.setattr(submodule.model, "forward", lambda input_embeds, *, label: input_embeds)
+    monkeypatch.setattr(
+        submodule, "_depth_loop",
+        lambda last_hidden, layer0_codes, sample_codes: (layer0_codes[:, None].repeat(1, groups), last_hidden),
+    )
+    sampled = []
+    sampler = SimpleNamespace(sample=lambda request_ids, logits: torch.tensor(sampled[:len(request_ids)]))
+
+    def run(method, graph_walk, request_ids, tokens):
+        sampled[:] = tokens
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=request_ids, per_request_info={},
+            resources={TALKER_SAMPLER: sampler, CODE_PRED_SAMPLER: sampler},
+        )
+        rows = len(request_ids)
+        return getattr(submodule, method)(
+            graph_walk, engine_inputs, input_embeds=torch.zeros(rows, config.talker.hidden_size),
+            last_token_indices=torch.arange(rows), suppress_eos=torch.zeros(rows, dtype=torch.bool),
+        )
+
+    for walk in ("talker_prefill", "talker_prefill_clone", "talker_decode"):
+        assert submodule.spanned_outputs(walk) == {"codec_tokens"}
+    out = run("forward_batched", "talker_decode", ["a", "b", "c"], [5, eos, 7])
+    assert out.output_spans["codec_tokens"].tolist() == [[0, groups], [0, 0], [0, groups]]
+    assert [out.per_rid_outputs[rid]["codec_tokens"][0][0].item() for rid in "abc"] == [5, eos, 7]
+    # the unbatched forward keys its one request by id
+    out = run("forward", "talker_decode", ["b"], [eos])
+    assert list(out.per_rid_outputs) == ["b"] and out.output_spans["codec_tokens"].tolist() == [[0, 0]]
+    # A clone prefill streams the reference tail ahead of its first frame: one
+    # span covers the row's whole list, so an EOS first frame takes the tail with it.
+    submodule.request_state("clone").add("reference_frames", torch.arange(12).view(3, groups))
+    for token, span in ((5, [[0, groups]]), (eos, [[0, 0]])):
+        out = run("forward_batched", "talker_prefill_clone", ["clone"], [token])
+        assert len(out.per_rid_outputs["clone"]["codec_tokens"]) == 3
+        assert out.output_spans["codec_tokens"].tolist() == span
+
+
 def test_qwen3_tts_suppresses_eos_for_official_minimum_frames():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
@@ -1832,14 +1887,13 @@ def test_qwen3_tts_fused_snake_matches_the_reference_activation():
     torch.testing.assert_close(fused(x), expected, rtol=1e-5, atol=1e-6)
 
 
-def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
+def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape():
     config = _tiny_model_config()
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
-    eos = config.talker.codec_eos_token_id
     codes = torch.tensor([
         [1, 2, 3, 4],
-        [eos, 0, 0, 0],
         [5, 6, 7, 8],
+        [9, 10, 11, 12],
     ])
 
     prepared = submodule.prepare_inputs(
@@ -1847,17 +1901,32 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
         SimpleNamespace(request_id="request", rid_handle="request"),
         {"codec_tokens": [codes]},
         input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
-            start_offset=1, context_items=1, num_items=3, is_final=False,
+            start_offset=1, context_items=1, num_items=3, is_final=True,
         )}),
     )
 
-    # Three items (one of them EOS) pad up to the smallest captured window (4).
+    # Three frames pad up to the smallest captured window (4), the one
+    # `cg_key_info` picks from the chunk info alone.
     packed = prepared.tensor_inputs["codec_tokens"]
     assert packed.shape == (4, 4)
-    assert packed[:, :2].t().tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
-    assert packed[:, 2:].count_nonzero().item() == 0
-    assert prepared.kwargs == {"frames": 2, "context": 1, "conv_start": 0, "is_final": False}
+    assert packed[:, :3].t().tolist() == codes.tolist()
+    assert packed[:, 3:].count_nonzero().item() == 0
+    assert prepared.kwargs == {"frames": 3, "context": 1, "conv_start": 0, "is_final": True}
     assert submodule.request_state("request")["codec_bucket"] == 4
+    assert submodule.cg_key_info("codec_chunk", {"request": None}, {
+        "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True)}),
+    }) == 4
+
+    # A stream whose only frame was EOS (an empty span) ends with an empty chunk: no audio.
+    empty = submodule.prepare_inputs(
+        "codec_chunk", SimpleNamespace(request_id="empty", rid_handle="empty"), {},
+        input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(0, 0, 0, True)}),
+    )
+    assert empty.tensor_inputs["codec_tokens"].shape == (4, 1)
+    assert empty.kwargs["frames"] == empty.kwargs["context"] == 0
+    outputs = {"audio_chunk": [torch.arange(4)]}
+    submodule.postprocess("empty", None, outputs, inputs=empty)
+    assert outputs["audio_chunk"][0].numel() == 0
 
     # A single frame lands in the first ramp bucket; too many frames is an error.
     one = submodule.prepare_inputs(

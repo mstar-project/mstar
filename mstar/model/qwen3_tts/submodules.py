@@ -137,6 +137,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    _SPANNED = frozenset({"codec_tokens"})
     # Prefill prompts are short (a sentence plus the ChatML frame, an optional
     # instruction and speaker slot): a few token buckets cover them, and the
     # eager alternative costs ~20 ms of launch overhead per request.
@@ -602,11 +603,16 @@ class TalkerSubmodule(ARNodeSubmodule):
                 last_hidden, layer0_codes,
                 lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
             )
+        # EOS is loop control, not a codebook index: its frame's span is
+        # empty, so the codec stream never carries it (``spanned_outputs``).
+        eos = layer0_codes == self.talker_config.codec_eos_token_id
+        end = torch.where(eos, 0, all_codes.shape[-1])
 
         return {
             "talker_input_embeds": codec_embed_sum,
             "codec_tokens": all_codes,
             "new_token": layer0_codes,
+            "codec_spans": torch.stack([torch.zeros_like(end), end], dim=1),
         }
 
     def _depth_loop(
@@ -723,17 +729,20 @@ class TalkerSubmodule(ARNodeSubmodule):
         last_token_indices: torch.Tensor,
         suppress_eos: torch.Tensor,
         **kwargs: Any,
-    ) -> NameToTensorList:
+    ) -> BatchedModelOutput:
         del kwargs
         output = self._run_frame(
             engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         request_id = engine_inputs.request_ids[0]
-        return {
-            "talker_input_embeds": [output["talker_input_embeds"]],
-            "codec_tokens": self._codec_stream_items(graph_walk, request_id, output["codec_tokens"][0]),
-            "new_token": [output["new_token"]],
-        }
+        return BatchedModelOutput(
+            per_rid_outputs={request_id: {
+                "talker_input_embeds": [output["talker_input_embeds"]],
+                "codec_tokens": self._codec_stream_items(graph_walk, request_id, output["codec_tokens"][0]),
+                "new_token": [output["new_token"]],
+            }},
+            output_spans={"codec_tokens": output["codec_spans"]},
+        )
 
     def forward_batched(
         self,
@@ -743,19 +752,28 @@ class TalkerSubmodule(ARNodeSubmodule):
         last_token_indices: torch.Tensor,
         suppress_eos: torch.Tensor,
         **kwargs: Any,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         del kwargs
         output = self._run_frame(
             engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
-        return {
-            request_id: {
-                "talker_input_embeds": [output["talker_input_embeds"][i:i + 1]],
-                "codec_tokens": self._codec_stream_items(graph_walk, request_id, output["codec_tokens"][i]),
-                "new_token": [output["new_token"][i]],
-            }
-            for i, request_id in enumerate(engine_inputs.request_ids)
-        }
+        return BatchedModelOutput(
+            per_rid_outputs={
+                request_id: {
+                    "talker_input_embeds": [output["talker_input_embeds"][i:i + 1]],
+                    "codec_tokens": self._codec_stream_items(graph_walk, request_id, output["codec_tokens"][i]),
+                    "new_token": [output["new_token"][i]],
+                }
+                for i, request_id in enumerate(engine_inputs.request_ids)
+            },
+            output_spans={"codec_tokens": output["codec_spans"]},
+        )
+
+    def spanned_outputs(self, graph_walk: str) -> frozenset[str]:
+        """Every walk streams ``codec_tokens``; an EOS frame's span is empty,
+        and a clone prefill's reference tail goes with it (no audio either way)."""
+        del graph_walk
+        return self._SPANNED
 
     def postprocess(
         self,
@@ -1058,46 +1076,41 @@ class CodecSubmodule(ARNodeSubmodule):
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        """Remove EOS frames and pad one stream window to its capture bucket.
+        """Pad one stream window to its capture bucket.
 
         Input arrives as ``[frames, code_groups]``. The official decoder wants
         ``[quantizers, frames]``; every request is padded to the smallest
         captured window that fits so the ramp's windows and the terminal tail
-        all replay CUDA graphs.
+        all replay CUDA graphs. Every item is a frame: the Talker's EOS frame
+        has an empty span and never reaches the stream.
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
         state = self.request_state(fwd_info.rid_handle)
-        codes = inputs["codec_tokens"][0].to(
-            device=self.get_device(), dtype=torch.long
-        )
+        received = inputs.get("codec_tokens")
+        if received:
+            codes = received[0].to(device=self.get_device(), dtype=torch.long)
+        else:
+            # a stream that never got a frame (its first was EOS) ends with an empty chunk
+            codes = torch.zeros(0, self.config.num_code_groups, dtype=torch.long, device=self.get_device())
         if codes.ndim == 1:
             codes = codes.view(-1, self.config.num_code_groups)
         if codes.ndim != 2:
             raise ValueError(
                 f"Expected codec tokens with shape (frames, groups), got {codes.shape}"
             )
-        num_items = codes.shape[0]
-        # EOS belongs to Talker loop control and is not a valid codec codebook
-        # index for waveform reconstruction. It is only ever the last frame of
-        # a stream, so the leading context count is unaffected. A sync: which
-        # window holds that frame is not known on the host.
-        codes = codes[
-            codes[:, 0] != self.config.talker.codec_eos_token_id,
-            :self.config.codec.num_quantizers,
-        ]
+        codes = codes[:, :self.config.codec.num_quantizers]
         frames = codes.shape[0]
-        context = min(chunk.context_items if chunk is not None else 0, frames)
+        context = chunk.context_items if chunk is not None else 0
         # First window frame the conv stack decodes: the new frames' conv context.
         conv_start = context - min(context, self.conv_context) if self.split_decode else 0
-        # The bucket is chosen from the window's item count (EOS included) so
-        # that ``cg_key_info``, which only sees the stream chunk info, agrees.
-        bucket = self._bucket(max(chunk.num_items if chunk is not None else num_items, 1))
+        # the window's item count, which is all ``cg_key_info`` sees
+        bucket = self._bucket(max(frames, 1))
         if frames < bucket:
             codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
         logger.debug(
-            "codec %s: window items=%d context=%d frames=%d bucket=%d final=%s",
-            fwd_info.request_id, num_items, context, frames, bucket, chunk is not None and chunk.is_final,
+            "codec %s: window context=%d frames=%d bucket=%d final=%s",
+            fwd_info.request_id, context, frames, bucket, chunk is not None and chunk.is_final,
         )
         state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream chunk info
         # The window's geometry rides with this pass: under speculative

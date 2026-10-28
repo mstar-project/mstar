@@ -325,7 +325,7 @@ def mstar_greedy(driver: MStarTalkerDriver, tensors: dict, prompt: dict, frames:
     codes = []
 
     def forward(engine_inputs, **kw):
-        return talker.forward(fwd.graph_walk, engine_inputs, **kw)
+        return talker.forward(fwd.graph_walk, engine_inputs, **kw).per_rid_outputs[rid]
 
     out = driver.step("talker_prefill", fwd, tensors, forward)
     # ``codec_tokens`` is the list of stream items (one ``[groups]`` frame each;
