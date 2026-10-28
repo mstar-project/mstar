@@ -30,7 +30,7 @@ model_kwargs:
   # Graph mode holds one FlashInfer workspace per attention label per slot (the
   # denoise step alone: 3 labels x 2 slots), at MSTAR_WORKSPACE_BUFFER_MB each,
   # 512 by default. On a 12-16 GB card set it to 128, or the card fills before
-  # the first request (an RTX 5070 Ti with 512: 1.6 s a request; with 128: 0.12 s).
+  # the first request.
   accelerator_graph: true
   capture_shapes: [[13, 448], [21, 448], [25, 448]]
   capture_batch_sizes: [1, 2, 4, 8]

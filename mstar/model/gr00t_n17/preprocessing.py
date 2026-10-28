@@ -440,9 +440,9 @@ class Gr00tN17Preprocessor:
     def warmup_chat_template(self) -> None:
         """Compile the backbone processor's jinja chat template once, up front.
 
-        `apply_chat_template` costs 15.7 ms on its first call and 0.04 ms after:
-        the template is compiled lazily and cached on the processor. A server that
-        does not do this charges its first robot observation for the compile.
+        `apply_chat_template` compiles the template on its first call and caches it
+        on the processor, so a server that does not do this charges its first robot
+        observation for the compile.
         Without a backbone processor there is no template, so there is nothing to
         warm.
         """

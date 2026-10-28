@@ -556,7 +556,7 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
         """A batch mixing prompt lengths matches no capture and runs eager one request at a
-        time, so batch each length apart (on a GH200 the mix capped serving at ~8 req/s)."""
+        time, so batch each length apart."""
         del graph_walk
         return True
 

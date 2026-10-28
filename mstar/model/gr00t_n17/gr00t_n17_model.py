@@ -507,8 +507,7 @@ class Gr00tN17Model(Model):
         is the expensive part (a tokenizer and an image processor).
         """
         self.processor.image(np.zeros((180, 320, 3), dtype=np.uint8))
-        # The bigger half of the first request's cost is the backbone processor's
-        # jinja template: measured 15.7 ms on first use against 0.04 ms after, and
+        # The backbone processor's jinja template compiles on first use, and
         # `Model.warmup_preprocess` names a tokenizer as exactly what this hook is for.
         self.processor.warmup_chat_template()
 
