@@ -12,7 +12,7 @@
 #
 # Optional:
 #   --model  <name>         Run only this model (whisper_large|higgs_audio|canary|
-#                           canary_qwen)
+#                           canary_qwen|parakeet|nemotron_asr)
 #   --num-requests  <n>     Total requests per model (default: 100)
 #   --batch-size  <b>       Batch size for offline profiling (default: 4)
 #   --max-concurrency <c>   Concurrency cap for closed-loop profiling (default: 4)
@@ -53,7 +53,7 @@ if [[ -z "$URL" ]]; then
   exit 1
 fi
 
-ASR_MODELS=(whisper_large higgs_audio canary canary_qwen)
+ASR_MODELS=(whisper_large higgs_audio canary canary_qwen parakeet nemotron_asr)
 
 if [[ -n "$MODEL" ]]; then
   ASR_MODELS=("$MODEL")
@@ -109,7 +109,7 @@ if [[ -z "$MODEL" ]] && command -v python &>/dev/null; then
 import json, os, sys
 
 output_dir = os.environ.get("_ASR_OUTPUT_DIR", "./asr_benchmark_results")
-models = ["whisper_large", "higgs_audio", "canary", "canary_qwen"]
+models = ["whisper_large", "higgs_audio", "canary", "canary_qwen", "parakeet", "nemotron_asr"]
 
 rows = []
 for m in models:
