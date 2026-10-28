@@ -441,9 +441,10 @@ class Model(ABC):
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
 
     # Intra-op threads for the API server's preprocessing of this model's
-    # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
-    # default of one per core; ``preprocess_torch_threads`` in the model's
-    # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
+    # inputs (``load_image``, ``process_prompt``, ...). None takes a default
+    # sized from the CPUs the process may use; ``preprocess_torch_threads`` in
+    # the model's config.yaml overrides either. See
+    # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
 
     def _get_worker_graphs_for_graph_walk(
@@ -791,6 +792,10 @@ class Model(ABC):
         ``request_kwargs`` is the request's model_kwargs, so encoders can honor
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
+
+        An image or video artifact encodes on the API server's pool, beside the
+        data worker's inline calls for the request's other outputs, so an
+        override must not keep state across calls.
 
         Modality to expected encoding type:
         - text: utf-8
