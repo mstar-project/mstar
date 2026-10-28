@@ -991,6 +991,12 @@ so an image or clip produced alongside other requests differs from its solo
 result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
 request at a time when outputs must be bitwise repeatable.
 
+The denoise step is compiled (``compile_denoise``) in Inductor's deterministic
+mode by default (``denoise_compile_mode: deterministic``): kernel configs are
+picked by rule, so a seed gives the same video from every server process.
+``default`` is torch.compile's own defaults, and ``level`` takes the ``mstar
+serve -O`` level's options (``-O2``: max-autotune).
+
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``

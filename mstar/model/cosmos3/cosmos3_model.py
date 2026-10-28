@@ -264,6 +264,7 @@ class Cosmos3Model(Model):
                         "field; ignored.", k,
                     )
         cfg.check_streaming_decode()
+        cfg.check_compile()
         return cfg
 
     def _load_tokenizer(self):

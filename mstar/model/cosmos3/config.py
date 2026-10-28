@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+DENOISE_COMPILE_MODES = ("deterministic", "default", "level")
+
 
 def _filtered(cls: type, d: dict[str, Any]) -> dict[str, Any]:
     """Keep only the dict entries that name a field on the dataclass ``cls``."""
@@ -484,6 +486,12 @@ class Cosmos3Config:
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
     compile_denoise: bool = True
+    # How the denoise step compiles: "deterministic" is Inductor's defaults in
+    # its deterministic mode (kernel configs picked by rule, so every server
+    # process runs the same kernels and one seed gives one video); "default" is
+    # torch.compile's defaults, which time some kernel configs on first use;
+    # "level" takes the ``mstar serve -O`` level's options (-O2: max-autotune).
+    denoise_compile_mode: str = "deterministic"
     # torch.compile the reasoner's captured decode step before the CUDA-graph
     # capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the
     # norms', rotary's and residuals' pointwise pieces; fused, the step runs
@@ -547,6 +555,17 @@ class Cosmos3Config:
                 f"Cosmos3 windowed_decode_latents_per_call={self.windowed_decode_latents_per_call} is more "
                 f"than the {window} latent frames of the smaller default window ({default_frames} frames); "
                 "0 decodes each window's new latents in one call."
+            )
+
+    def check_compile(self) -> None:
+        """Reject compile settings that would be read as something else: a
+        non-boolean switch (a yaml ``"false"`` is truthy) or an unknown mode."""
+        if not isinstance(self.compile_denoise, bool):
+            raise ValueError(f"Cosmos3 compile_denoise must be true or false, got {self.compile_denoise!r}.")
+        if self.denoise_compile_mode not in DENOISE_COMPILE_MODES:
+            raise ValueError(
+                f"Cosmos3 denoise_compile_mode must be one of {DENOISE_COMPILE_MODES}, "
+                f"got {self.denoise_compile_mode!r}."
             )
 
     @property

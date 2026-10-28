@@ -160,6 +160,23 @@ REASONER_DECODE_LOOP = "reasoner_decode_loop"
 REASONER_LABEL = "main"
 
 
+def denoise_compile_kwargs(mode: str) -> dict:
+    """``torch.compile`` arguments for the denoise step; see
+    ``Cosmos3Config.denoise_compile_mode``."""
+    kwargs: dict = {"fullgraph": False, "dynamic": False}
+    if mode == "level":
+        from mstar.engine.accelerator_graph_runner import compile_kwargs
+
+        return compile_kwargs(None)
+    if mode == "deterministic":
+        import torch._inductor.config as inductor_config
+
+        # torch builds without the mode compile with the defaults
+        if hasattr(inductor_config, "deterministic"):
+            kwargs["options"] = {"deterministic": True}
+    return kwargs
+
+
 def latent_frames(num_frames: int, config) -> int:
     return 1 if num_frames == 1 else 1 + (num_frames - 1) // config.vae.scale_factor_temporal
 
@@ -321,13 +338,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # attention; ``config.compile_denoise=False`` keeps the eager step for
         # the bit-exact parity tests.
         if config.compile_denoise and transformer is not None:
-            self.transformer.denoise_step = torch.compile(
-                self.transformer.denoise_step, fullgraph=False, dynamic=False,
-            )
+            kwargs = denoise_compile_kwargs(config.denoise_compile_mode)
+            self.transformer.denoise_step = torch.compile(self.transformer.denoise_step, **kwargs)
             self.transformer.denoise_step_batched_cfg = torch.compile(
-                self.transformer.denoise_step_batched_cfg, fullgraph=False, dynamic=False,
+                self.transformer.denoise_step_batched_cfg, **kwargs,
             )
-            logger.info("Cosmos3 denoise compute torch.compile enabled")
+            logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
 
     def to(self, *args, **kwargs):
         # The engine casts this submodule to bf16; the timestep embedder must stay
