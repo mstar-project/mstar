@@ -104,7 +104,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - V-JEPA 2 video encoder + masked predictor.
    * - ``vjepa2_ac``
      - ``vjepa2-ac-vitg``
-     - V-JEPA 2-AC encoder + action-conditioned predictor.
+     - V-JEPA 2-AC encoder + action-conditioned predictor. Video frames take the official
+       repo's central square crop, not the HF processor's resize and crop.
    * - ``whisper_large_v3_turbo``
      - ``openai/whisper-large-v3-turbo``
      - Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
