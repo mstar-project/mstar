@@ -34,12 +34,14 @@ class SegmentAttention:
         out, start = [], 0
         for span in (q.shape[0],) if self.seq_lengths is None else self.seq_lengths:
             rows = slice(start, start + span)
-            # the kernel's layout is [tokens, heads, dim]; SDPA wants heads first
+            # the kernel's layout is [tokens, heads, dim]; SDPA wants [batch, heads, tokens, dim],
+            # and without the batch axis every fused kernel refuses and it falls back to math,
+            # which rounds unlike the reference's call (1.21x on GH200's vision bar)
             out.append(
                 F.scaled_dot_product_attention(
-                    q[rows].transpose(0, 1), k[rows].transpose(0, 1), v[rows].transpose(0, 1),
+                    q[rows].transpose(0, 1)[None], k[rows].transpose(0, 1)[None], v[rows].transpose(0, 1)[None],
                     is_causal=self.causal, enable_gqa=self.gqa,
-                ).transpose(0, 1)
+                )[0].transpose(0, 1)
             )
             start += span
         return torch.cat(out)
