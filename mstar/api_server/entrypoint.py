@@ -2388,7 +2388,8 @@ def default_preprocess_threads(cpus: int | None = None) -> int:
     Torch's default is one per host core, which inside a container can be several
     times the CPUs the cgroup quota lets run; a fork-join op then waits for its
     parked threads. A quarter of the usable CPUs, at most 4: the process shares
-    them with the engine workers, and its per-request ops are a few MB.
+    them with the engine workers. A long video input still loads faster on more,
+    so a deployment that serves those can raise ``preprocess_torch_threads``.
     """
     if cpus is None:
         from mstar.utils.cpus import usable_cpus

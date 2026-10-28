@@ -168,7 +168,9 @@ You must implement these abstract methods:
 
 ``postprocess(self, output, modality) -> bytes``
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
-   images, raw PCM for audio, and so on.
+   images, raw PCM for audio, and so on. An image or video the walk emits outside a loop
+   encodes on a small thread pool in the API server, beside the inline calls for the
+   request's other outputs, so it must not keep state across calls.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
@@ -1758,10 +1760,10 @@ The API server runs ``load_image`` / ``process_prompt`` and output encoding with
 intra-op pool. Torch sizes it at one thread per host core, which in a container can be
 several times the CPUs the cgroup quota lets run, and an op waits on any of its threads
 the scheduler has parked. The API server therefore defaults to a quarter of the CPUs it
-may use (its affinity, capped by the cgroup ``cpu.max`` quota), at most 4. A model sets
-its own size with ``PREPROCESS_TORCH_THREADS`` on the class (Qwen3.5 uses 4). A
-deployment overrides either at the top level of its config; ``null`` keeps torch's
-default:
+may use (its affinity, capped by the cgroup ``cpu.max`` quota), at most 4. Long video
+inputs still load faster on more threads. A model sets its own size with
+``PREPROCESS_TORCH_THREADS`` on the class (Qwen3.5 uses 4). A deployment overrides either
+at the top level of its config; ``null`` keeps torch's default:
 
 .. code-block:: yaml
 
