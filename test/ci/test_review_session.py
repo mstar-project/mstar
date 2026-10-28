@@ -183,6 +183,16 @@ class TestCli(unittest.TestCase):
         self.assertIn("**Progress:** P1 `b.py:7` unverified", md)
         self.assertNotIn("unverified", comment, "the public comment would list unverified leads")
 
+    def test_a_continued_run_that_said_nothing_keeps_its_handoff(self):
+        with tempfile.TemporaryDirectory() as d:
+            prev, out = Path(d, "prev.json"), Path(d, "out")
+            prev.write_text(json.dumps({"runs": 1, "comments": [], "reads": [], "note": "Progress: a.py done",
+                                        "last_text": ""}))
+            code = run_main("handoff", "--pr", "7", "--head", "abc", "--mode", "light", "--out", str(out),
+                            "--previous", str(prev), str(Path(d, "missing.json")))
+            self.assertEqual(code, 0, "the earlier handoff would no longer be offered to /review continue")
+            self.assertEqual(json.loads(Path(out, "handoff.json").read_text())["note"], "Progress: a.py done")
+
     def test_a_corrupt_previous_handoff_starts_afresh(self):
         with tempfile.TemporaryDirectory() as d:
             ex, prev, out = Path(d, "exec.json"), Path(d, "prev.json"), Path(d, "out")

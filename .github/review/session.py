@@ -244,7 +244,9 @@ def main():
     diff = Path(a.diff).read_text(errors="replace") if a.diff and Path(a.diff).is_file() else ""
     # Tool paths are absolute, under the workspace the workflow runs this from.
     h = handoff(load(a.sources), os.getcwd(), diff_paths(diff), previous)
-    if not h.pop("seen_assistant"):
+    # A continued run that stopped before Claude said anything still passes on the handoff it
+    # started from, which is still valid for this head.
+    if not h.pop("seen_assistant") and previous is None:
         print("No Claude Code messages to hand off.", file=sys.stderr)
         return 1
     out = Path(a.out)
