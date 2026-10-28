@@ -733,8 +733,9 @@ or ``increase()``.
 - ``mstar_prefix_cache_query_tokens_total{model_name, component}``,
   ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
   tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
-  tokens found there. Only models that key their prompts for prefix reuse (BAGEL and
-  Orpheus) count, and above one rank only with ``prefix_cache_tp`` set.
+  tokens found there. Only models that key their prompts for prefix reuse (BAGEL,
+  Orpheus and Qwen3-Omni's Thinker) count, and above one rank only with
+  ``prefix_cache_tp`` set.
 - ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
   step on the node is ready (its inputs arrived) and not running: waiting for room in a
   step or for the worker to pick the node.
