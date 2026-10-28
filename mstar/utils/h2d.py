@@ -136,3 +136,29 @@ class PinnedStager:
             ev.record(torch.accelerator.current_stream(dst.device))
             if mirror is not None:
                 mirror.record(key, values)
+
+
+def to_device_queued(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """``tensor`` on ``device`` without a host stall.
+
+    A copy from pageable memory blocks the calling thread until it retires, so on
+    the GPU thread it waits out the step still running there. This writes the
+    tensor into a pinned buffer with one memcpy on the calling thread (``copy_``
+    would split it over the intra-op pool, where a descheduled thread holds up the
+    GPU thread) and queues one non-blocking copy from it on the current stream.
+    torch's caching host allocator keeps the pinned buffer until that copy has
+    retired, so nothing is written over an in-flight source.
+
+    The result is valid on the stream the copy was issued on; another stream has
+    to wait on it, as for any async copy. The host tensor is read as it is, so the
+    device tensor is bit-identical to a pageable copy; a model that packs a draw
+    does so before this.
+    """
+    device = torch.device(device)
+    if tensor.device == device or not DeviceCapability.of(device).is_accelerator:
+        return tensor.to(device)
+    source = tensor if tensor.is_contiguous() else tensor.contiguous()
+    pinned = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
+    if source.numel():
+        pinned.view(-1).view(torch.uint8).numpy()[:] = source.view(-1).view(torch.uint8).numpy()
+    return pinned.to(device, non_blocking=True)

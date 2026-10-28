@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+import threading
 
 import pytest
 import torch
@@ -566,6 +567,43 @@ def test_removing_the_request_drops_its_draw():
     _added(sub, "p5").result()
     sub.cleanup_request(_handle("p5"))
     assert _handle("p5") not in sub.request_states
+
+
+class GatedToy(PrefetchingToy):
+    """Draws on the pool block until the test opens the gate, so a third request's
+    draw stays queued behind the pool's two threads; an inline draw is not gated."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gate = threading.Event()
+
+    def seed_latents(self, fwd_info, bucket_key, generator):
+        if threading.current_thread().name.startswith("mstar-seed"):
+            self.gate.wait(timeout=10)
+        return super().seed_latents(fwd_info, bucket_key, generator)
+
+
+def test_removing_a_request_cancels_its_queued_draw():
+    sub = GatedToy()
+    running = [_added(sub, "q0"), _added(sub, "q1")]
+    queued = _added(sub, "q2")
+    sub.cleanup_request(_handle("q2"))
+    assert queued.cancelled(), "a queued draw would delay a live request's"
+    sub.gate.set()
+    for future in running:
+        future.result()
+
+
+def test_a_queued_draw_for_another_bucket_key_is_cancelled():
+    sub = GatedToy()
+    running = [_added(sub, "q3"), _added(sub, "q4")]
+    queued = _added(sub, "q5", tokens=8, seed=3)
+    got = sub.prepare_inputs(WALK, _info("q5", 0, tokens=16, seed=3), _inputs())
+    assert got.tensor_inputs[LATENTS].shape == (16, 4)
+    assert queued.cancelled()
+    sub.gate.set()
+    for future in running:
+        future.result()
 
 
 def test_an_initial_loop_back_of_its_own_is_not_handed_the_draw():

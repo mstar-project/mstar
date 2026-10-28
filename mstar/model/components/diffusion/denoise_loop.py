@@ -59,20 +59,10 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
-from mstar.model.components.diffusion.noise import NoiseStager
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.utils.device import DeviceCapability
+from mstar.utils.h2d import to_device_queued
 
 logger = logging.getLogger(__name__)
-
-
-def _queue_to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """``tensor`` on ``device`` without a host sync. A blocking copy synchronizes the
-    stream, so on the GPU thread it waits out the step still running there; one
-    from pinned memory is only queued behind it."""
-    if tensor.device == device or not DeviceCapability.of(device).is_accelerator:
-        return tensor.to(device)
-    return tensor.pin_memory().to(device, non_blocking=True)
 
 
 class StepScalar(NamedTuple):
@@ -156,9 +146,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self._layouts: dict[Hashable, Any] = {}
         self._uncaptured_layouts: OrderedDict[Hashable, Any] = OrderedDict()
         self.max_uncaptured_layouts = int(max_uncaptured_layouts)
-        # Pinned staging rings for the seeded noise, one per dtype, built on first
-        # use (a stager allocates nothing until it stages something).
-        self._noise_stagers: dict[torch.dtype, NoiseStager] = {}
         # Draws seeds ahead under PREFETCH_SEEDS; built on first use.
         self._seed_pool: ThreadPoolExecutor | None = None
         # One callable per attention label for the life of a binding; see
@@ -184,28 +171,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """Initial noise for one request, ``[L, C]`` on the CPU generator's device."""
         raise NotImplementedError
 
-    def noise_stager(self, dtype: torch.dtype) -> NoiseStager:
-        """This node's pinned staging ring for ``dtype``, built on first use.
-
-        A benign race between the plan and GPU threads can build two and keep one;
-        a stager holds no buffers until it stages something, so that costs nothing.
-        """
-        stager = self._noise_stagers.get(dtype)
-        if stager is None:
-            stager = self._noise_stagers[dtype] = NoiseStager(dtype)
-        return stager
-
     def stage_seed(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """Seed tensor on ``device``, copied from pinned memory without stalling.
-
-        ``tensor.to(device)`` would copy from pageable host memory, which blocks the
-        calling thread until it retires -- and this runs on the GPU thread, where
-        that stalls the pre-plan and the overlap with the previous step's
-        postprocess. See :mod:`mstar.model.components.diffusion.noise`.
-        """
-        if tensor.device == device:
-            return tensor
-        return self.noise_stager(tensor.dtype).to_device(tensor, device)
+        """Seed tensor on ``device`` without stalling the GPU thread, where this
+        runs: a pageable copy would hold up the pre-plan and the overlap with the
+        previous step's postprocess (:func:`mstar.utils.h2d.to_device_queued`)."""
+        return to_device_queued(tensor, device)
 
     def seed_loop_back(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, generator: torch.Generator,
@@ -262,8 +232,21 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             return None
         state.remove("seed_draw")
         drawn_key, future = entry
+        if drawn_key != bucket_key:
+            # a later stage's geometry draws inline; a draw still queued on the
+            # pool would only delay a live request's
+            future.cancel()
+            return None
         # usually done long before; waiting releases the GIL and syncs no device
-        return future.result() if drawn_key == bucket_key else None
+        return future.result()
+
+    def cleanup_request(self, request_id: str):
+        state = self.request_states.get(request_id)
+        entry = state.get("seed_draw") if state is not None else None
+        if entry is not None:
+            # a request removed before iteration 0 leaves its draw queued otherwise
+            entry[1].cancel()
+        super().cleanup_request(request_id)
 
     def request_inputs(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, bucket_key: Hashable,
@@ -418,7 +401,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     f"entries for {schedule.num_steps} steps, but "
                     f"{scalar.source} has {tensor.shape[0]}."
                 )
-            staged.setdefault(scalar.source, _queue_to_device(tensor, device))
+            staged.setdefault(scalar.source, to_device_queued(tensor, device))
         return staged
 
     def _carried_inputs(
