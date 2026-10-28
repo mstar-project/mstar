@@ -1026,7 +1026,10 @@ own ``window_decoder`` partition; a request opts in per call:
    * - ``window_mode``
      - — (``chained`` with ``stream_video``)
      - ``chained``: every window is a full bidirectional denoise conditioned on
-       the previous window's tail (``overlap_frames`` pinned clean). ``kv``
+       the previous window's tail (``overlap_frames`` pinned clean: the last
+       frames are decoded and encoded again as a clip of their own, the
+       video-to-video conditioning layout, so the window's first latent frame
+       is a single-frame one as in training). ``kv``
        (experimental, see below): the finished window's clean K/V is committed
        to the cache and later windows attend to it block-causally; no overlap,
        and frames older than ``context_frames`` behind the frontier are
@@ -1037,8 +1040,9 @@ own ``window_decoder`` partition; a request opts in per call:
      - Pixel frames per window (quantized to latent frames).
    * - ``overlap_frames``
      - 32 on Edge, 8 elsewhere
-     - ``chained`` only: frames re-pinned from the previous window (at least two
-       latent frames).
+     - ``chained`` only: frames re-pinned from the previous window, as k = 1 +
+       (overlap_frames - 1) // 4 latent frames (at least two), which pin
+       1 + 4(k - 1) frames: 5 and 29 at the defaults.
    * - ``context_frames``
      - 61
      - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.

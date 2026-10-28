@@ -669,6 +669,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.ChainedWindowHead"><code class="docutils literal notranslate"><span class="pre">ChainedWindowHead</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule"><code class="docutils literal notranslate"><span class="pre">Cosmos3AudioDecoderSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">Cosmos3AudioDecoderSubmodule.disable_torch_compile</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">Cosmos3AudioDecoderSubmodule.forward()</span></code></a></li>
@@ -825,33 +826,58 @@ matches running the whole transformer each step.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3AudioDecoderSubmodule</span></code></a>(...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.ChainedWindowHead" title="mstar.model.cosmos3.submodules.ChainedWindowHead"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ChainedWindowHead</span></code></a>(decode_vae, encode_vae, config)</p></td>
+<td><p>The clean head of a window that continues earlier frames: a chained window's overlap, or a resumed session's first window.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3AudioDecoderSubmodule</span></code></a>(...)</p></td>
 <td><p>AVAE sound decode node (STATELESS): final denoised sound latents <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">C,</span> <span class="pre">T]</span></code> -&gt; stereo waveform <code class="docutils literal notranslate"><span class="pre">[channels,</span> <span class="pre">samples]</span></code> in [-1, 1], trimmed to the request's target sample count.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule</span></code></a>(transformer, config[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule</span></code></a>(transformer, config[, ...])</p></td>
 <td><p>Dual-pathway DiT node (understanding tower + generation denoiser).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3ReasonerSubmodule</span></code></a>(transformer, config)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3ReasonerSubmodule</span></code></a>(transformer, config)</p></td>
 <td><p>The understanding tower served as a causal VLM.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule</span></code></a>(vae, config)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule</span></code></a>(vae, config)</p></td>
 <td><p>Streaming Wan VAE decode for windowed AR video (ported from #198).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderSubmodule</span></code></a>(vae, config)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderSubmodule</span></code></a>(vae, config[, ...])</p></td>
 <td><p>Wan VAE decode node: final denoised latents -&gt; pixel frames.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VAEEncoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VAEEncoderSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3VAEEncoderSubmodule</span></code></a>(vae, config)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VAEEncoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VAEEncoderSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3VAEEncoderSubmodule</span></code></a>(vae, config)</p></td>
 <td><p>Wan VAE conditioning-encode node (STATELESS): the request's conditioning image or video -&gt; clean anchor latents for the denoise loop.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VisionEncoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VisionEncoderSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3VisionEncoderSubmodule</span></code></a>(vision_model, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VisionEncoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VisionEncoderSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3VisionEncoderSubmodule</span></code></a>(vision_model, ...)</p></td>
 <td><p>The Edge reasoner's vision tower + projector (STATELESS): the request's packed image/video patches -&gt; one text-space token per merged 2x2 block, in prompt order, for the reasoner prefill to scatter over its <code class="docutils literal notranslate"><span class="pre">&lt;|image_pad|&gt;</span></code> / <code class="docutils literal notranslate"><span class="pre">&lt;|video_pad|&gt;</span></code> tokens.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.GenStepInfo" title="mstar.model.cosmos3.submodules.GenStepInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">GenStepInfo</span></code></a>(cfg, cfg_active, capture_key[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.GenStepInfo" title="mstar.model.cosmos3.submodules.GenStepInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">GenStepInfo</span></code></a>(cfg, cfg_active, capture_key[, ...])</p></td>
 <td><p>What a denoise step's declaration needs and cannot read off the batch.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.ChainedWindowHead">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">ChainedWindowHead</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">decode_vae</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encode_vae</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#ChainedWindowHead"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.ChainedWindowHead" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>The clean head of a window that continues earlier frames: a chained
+window’s overlap, or a resumed session’s first window.</p>
+<p>The checkpoint was trained on clips whose first latent frame encodes one
+pixel frame alone and every later one the four frames after it, so a
+finished window’s tail latents (mid-stream latents) are not what a
+window’s first positions expect; pinned there, the rollout washes out
+within a few windows. Like the reference’s video-to-video conditioning,
+the head is the last <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">+</span> <span class="pre">(units</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">*</span> <span class="pre">tf</span></code> frames, decoded to 8 bits
+and encoded again as a clip of their own. The decode is the whole-clip
+decode the <code class="docutils literal notranslate"><span class="pre">vae_decoder</span></code> node runs (compiled, channels-last, the
+cuDNN-gated dtype, the frames quantized as served), behind
+<code class="docutils literal notranslate"><span class="pre">chained_head_context_latents</span></code> latents of the same window so the causal
+decoder is warm at the kept frames; the encode runs fp32 like the encoder
+node’s. Both VAEs are the model’s shared copies when the nodes share a
+process. Held outside the module tree, so the engine’s casts of the DiT
+never reach them.</p>
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">Cosmos3AudioDecoderSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sound_tokenizer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3AudioDecoderSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule" title="Link to this definition">#</a></dt>
@@ -894,7 +920,7 @@ request id, as <code class="docutils literal notranslate"><span class="pre">forw
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">Cosmos3DiTSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transformer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3DiTSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">Cosmos3DiTSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transformer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_decode_vae</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_encode_vae</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3DiTSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule" title="mstar.model.submodule_base.ARNodeSubmodule"><code class="xref py py-class docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a></p>
 <p>Dual-pathway DiT node (understanding tower + generation denoiser).</p>
 <dl class="py attribute">
@@ -1492,11 +1518,16 @@ request id, as <code class="docutils literal notranslate"><span class="pre">forw
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">Cosmos3VAEDecoderSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vae</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">Cosmos3VAEDecoderSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vae</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">channels_last</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule" title="mstar.model.submodule_base.NodeSubmodule"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a></p>
 <p>Wan VAE decode node: final denoised latents -&gt; pixel frames.</p>
 <p>Applies the pipeline-side latent normalization (the VAE itself returns raw
 latents) before decoding, matching the fused t2i pipeline’s decode.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>channels_last</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
+</dd>
+</dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule.disable_torch_compile">
 <span class="sig-name descname"><span class="pre">disable_torch_compile</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule.disable_torch_compile" title="Link to this definition">#</a></dt>
@@ -1797,6 +1828,7 @@ trimmed by the audio decode node).</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.ChainedWindowHead"><code class="docutils literal notranslate"><span class="pre">ChainedWindowHead</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule"><code class="docutils literal notranslate"><span class="pre">Cosmos3AudioDecoderSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">Cosmos3AudioDecoderSubmodule.disable_torch_compile</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3AudioDecoderSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">Cosmos3AudioDecoderSubmodule.forward()</span></code></a></li>

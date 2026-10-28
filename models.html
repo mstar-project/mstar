@@ -1782,7 +1782,10 @@ own <code class="docutils literal notranslate"><span class="pre">window_decoder<
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">window_mode</span></code></p></td>
 <td><p>— (<code class="docutils literal notranslate"><span class="pre">chained</span></code> with <code class="docutils literal notranslate"><span class="pre">stream_video</span></code>)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">chained</span></code>: every window is a full bidirectional denoise conditioned on
-the previous window’s tail (<code class="docutils literal notranslate"><span class="pre">overlap_frames</span></code> pinned clean). <code class="docutils literal notranslate"><span class="pre">kv</span></code>
+the previous window’s tail (<code class="docutils literal notranslate"><span class="pre">overlap_frames</span></code> pinned clean: the last
+frames are decoded and encoded again as a clip of their own, the
+video-to-video conditioning layout, so the window’s first latent frame
+is a single-frame one as in training). <code class="docutils literal notranslate"><span class="pre">kv</span></code>
 (experimental, see below): the finished window’s clean K/V is committed
 to the cache and later windows attend to it block-causally; no overlap,
 and frames older than <code class="docutils literal notranslate"><span class="pre">context_frames</span></code> behind the frontier are
@@ -1795,8 +1798,9 @@ stays bounded).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">overlap_frames</span></code></p></td>
 <td><p>32 on Edge, 8 elsewhere</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">chained</span></code> only: frames re-pinned from the previous window (at least two
-latent frames).</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">chained</span></code> only: frames re-pinned from the previous window, as k = 1 +
+(overlap_frames - 1) // 4 latent frames (at least two), which pin
+1 + 4(k - 1) frames: 5 and 29 at the defaults.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">context_frames</span></code></p></td>
 <td><p>61</p></td>

@@ -26,6 +26,7 @@ mstar.model.cosmos3.submodules
 
    .. autosummary::
    
+      ChainedWindowHead
       Cosmos3AudioDecoderSubmodule
       Cosmos3DiTSubmodule
       Cosmos3ReasonerSubmodule
