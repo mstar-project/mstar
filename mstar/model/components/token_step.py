@@ -60,9 +60,14 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
+        """A stop id, or on a decode row the token budget. A prompt walk
+        does not check the budget, so max_output_tokens=1 still runs one
+        decode step, as on main."""
         ignore_eos = request_info.resource_configs[self.SAMPLER].ignore_eos
+        if not ignore_eos and token in self.stop_token_ids:
+            return True
         decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
-        return (not ignore_eos and token in self.stop_token_ids) or decoded >= request_info.max_tokens
+        return request_info.graph_walk == self.DECODE_WALK and decoded >= request_info.max_tokens
 
     def _stop_names(self, token: int, request_info: CurrentForwardPassInfo) -> set[str]:
         """``check_stop``'s answer for one row: a decode row stops the loop,
