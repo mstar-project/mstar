@@ -256,7 +256,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -335,7 +334,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1497,8 +1495,9 @@ forward ran.</p></li>
 <code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_hit_tokens_total{model_name,</span> <span class="pre">component}</span></code>: counters, prompt
 tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
 tokens found there. Only models that key their prompts for prefix reuse (BAGEL,
-Orpheus and Qwen3-Omni’s Thinker) count, and above one rank only with
-<code class="docutils literal notranslate"><span class="pre">prefix_cache_tp</span></code> set.</p></li>
+Orpheus, Qwen3.5 and Qwen3-Omni’s Thinker) count, and above one rank only with
+<code class="docutils literal notranslate"><span class="pre">prefix_cache_tp</span></code> set. Qwen3.5’s hit counts the KV cache’s tokens before its
+recurrent pool cuts the hit to a snapshot.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_component_pending_steps{model_name,</span> <span class="pre">component}</span></code>: gauge, requests whose next
 step on the node is ready (its inputs arrived) and not running: waiting for room in a
 step or for the worker to pick the node.</p></li>

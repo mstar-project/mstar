@@ -255,7 +255,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -334,7 +333,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1123,6 +1121,28 @@ checkpoint therefore needs <code class="docutils literal notranslate"><span clas
 one, the engine keeps the cache shut and logs why.</p>
 </dd>
 </dl>
+<p>A recurrent layer can’t skip tokens: its state after a token is all it keeps of the tokens
+before it. On a node with a recurrent state pool, a hit is cut to the longest snapshot of
+that state the pool holds under it. Name the KV cache in the pool’s config
+(<code class="docutils literal notranslate"><span class="pre">RecurrentStateConfig(kv_cache=...)</span></code>), and give the deployment <code class="docutils literal notranslate"><span class="pre">prefix_slots</span></code> under
+the pool’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code> key. Each snapshot slot costs as much as a request slot.</p>
+<ul class="simple">
+<li><p>A prefill keeps the state at its last page boundary before its end, since a resend’s KV
+hit always leaves the last page to recompute, and at its KV hit’s last page
+boundary when that is past what it restored. A shared prefix is then served from the third request
+that shares it. A step longer than the largest captured bucket checkpoints less often, so that
+its checkpoints fit the captured steps’ buffer, and keeps its boundaries on that interval.</p></li>
+<li><p>A decode step that ends a page keeps the state there, so a later turn that re-sends the
+reply restores it. It replaces the request’s previous decode snapshot once the KV chain
+keys its page; a step whose token never reaches the chain, such as the one speculated
+past the reply’s end, leaves the previous one in place.</p></li>
+<li><p>A snapshot is keyed by the KV chain’s key at its page. A full set of slots evicts the
+least recently used snapshot that no request holds.</p></li>
+</ul>
+<p>Snapshots stay off without <code class="docutils literal notranslate"><span class="pre">prefix_slots</span></code>, and also above one rank, without a named KV
+cache, or when that cache’s <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> is off; in those three cases the pool allocates
+no snapshot slots. Every cache on the node then stays shut, and the engine logs which
+resource kept it shut.</p>
 <p>A model with a keyed label is checked at load time. Loading fails in two more cases:</p>
 <ul class="simple">
 <li><p>A position resource over a keyed cache uses a scheme other than sequential. A page is
@@ -1130,9 +1150,10 @@ reusable only where its tokens land at the positions they were written at. The m
 is <code class="docutils literal notranslate"><span class="pre">resource</span> <span class="pre">'&lt;key&gt;'</span> <span class="pre">places</span> <span class="pre">positions</span> <span class="pre">by</span> <span class="pre">&lt;scheme&gt;,</span> <span class="pre">but</span> <span class="pre">it</span> <span class="pre">sits</span> <span class="pre">over</span> <span class="pre">['&lt;kv</span> <span class="pre">key&gt;'],</span>
 <span class="pre">which</span> <span class="pre">the</span> <span class="pre">model</span> <span class="pre">keyed</span> <span class="pre">for</span> <span class="pre">prefix</span> <span class="pre">reuse;</span> <span class="pre">either</span> <span class="pre">drop</span> <span class="pre">the</span> <span class="pre">stream</span> <span class="pre">or</span> <span class="pre">give</span> <span class="pre">the</span> <span class="pre">resource</span> <span class="pre">a</span>
 <span class="pre">sequential</span> <span class="pre">scheme</span></code>.</p></li>
-<li><p>A resource on a keyed node does not set <code class="docutils literal notranslate"><span class="pre">prefix_skip_safe</span></code>. A hit takes the front of
-the request away from every resource on the node, including resources that never saw
-those tokens. The message is <code class="docutils literal notranslate"><span class="pre">resource</span> <span class="pre">'&lt;key&gt;'</span> <span class="pre">cannot</span> <span class="pre">serve</span> <span class="pre">a</span> <span class="pre">request</span> <span class="pre">whose</span> <span class="pre">prefix</span>
+<li><p>A resource on a keyed node does not set <code class="docutils literal notranslate"><span class="pre">prefix_skip_safe</span></code>, and is neither a
+recurrent state pool nor a resource over pools alone. A hit takes the front of the
+request away from every resource on the node, including resources that never saw those
+tokens. The message is <code class="docutils literal notranslate"><span class="pre">resource</span> <span class="pre">'&lt;key&gt;'</span> <span class="pre">cannot</span> <span class="pre">serve</span> <span class="pre">a</span> <span class="pre">request</span> <span class="pre">whose</span> <span class="pre">prefix</span>
 <span class="pre">came</span> <span class="pre">from</span> <span class="pre">the</span> <span class="pre">cache,</span> <span class="pre">but</span> <span class="pre">it</span> <span class="pre">sits</span> <span class="pre">on</span> <span class="pre">['&lt;node&gt;'],</span> <span class="pre">which</span> <span class="pre">the</span> <span class="pre">model</span> <span class="pre">keyed</span> <span class="pre">for</span> <span class="pre">prefix</span>
 <span class="pre">reuse;</span> <span class="pre">either</span> <span class="pre">drop</span> <span class="pre">the</span> <span class="pre">stream</span> <span class="pre">or</span> <span class="pre">give</span> <span class="pre">the</span> <span class="pre">resource</span> <span class="pre">the</span> <span class="pre">prefix</span> <span class="pre">hooks</span></code>.</p></li>
 </ul>
@@ -2383,16 +2404,19 @@ that a misspelled setting is never silently ignored:</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">max_slots</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">max_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">state_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">prefix_slots</span></code> (see <strong>Cross-request prefix reuse</strong>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code> / <code class="docutils literal notranslate"><span class="pre">flex</span></code> / <code class="docutils literal notranslate"><span class="pre">xpu_paged</span></code>),
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code>
 (<code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> (<code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>,
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. The two ceilings size CUDA-graph buckets, which is a

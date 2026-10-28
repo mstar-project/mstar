@@ -430,6 +430,29 @@ overrides** in :doc:`serving`.
    checkpoint therefore needs ``prefix_cache_salt`` set to use the cache at all. Without
    one, the engine keeps the cache shut and logs why.
 
+A recurrent layer can't skip tokens: its state after a token is all it keeps of the tokens
+before it. On a node with a recurrent state pool, a hit is cut to the longest snapshot of
+that state the pool holds under it. Name the KV cache in the pool's config
+(``RecurrentStateConfig(kv_cache=...)``), and give the deployment ``prefix_slots`` under
+the pool's ``resources:`` key. Each snapshot slot costs as much as a request slot.
+
+- A prefill keeps the state at its last page boundary before its end, since a resend's KV
+  hit always leaves the last page to recompute, and at its KV hit's last page
+  boundary when that is past what it restored. A shared prefix is then served from the third request
+  that shares it. A step longer than the largest captured bucket checkpoints less often, so that
+  its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
+- A decode step that ends a page keeps the state there, so a later turn that re-sends the
+  reply restores it. It replaces the request's previous decode snapshot once the KV chain
+  keys its page; a step whose token never reaches the chain, such as the one speculated
+  past the reply's end, leaves the previous one in place.
+- A snapshot is keyed by the KV chain's key at its page. A full set of slots evicts the
+  least recently used snapshot that no request holds.
+
+Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
+cache, or when that cache's ``prefix_cache`` is off; in those three cases the pool allocates
+no snapshot slots. Every cache on the node then stays shut, and the engine logs which
+resource kept it shut.
+
 A model with a keyed label is checked at load time. Loading fails in two more cases:
 
 - A position resource over a keyed cache uses a scheme other than sequential. A page is
@@ -437,9 +460,10 @@ A model with a keyed label is checked at load time. Loading fails in two more ca
   is ``resource '<key>' places positions by <scheme>, but it sits over ['<kv key>'],
   which the model keyed for prefix reuse; either drop the stream or give the resource a
   sequential scheme``.
-- A resource on a keyed node does not set ``prefix_skip_safe``. A hit takes the front of
-  the request away from every resource on the node, including resources that never saw
-  those tokens. The message is ``resource '<key>' cannot serve a request whose prefix
+- A resource on a keyed node does not set ``prefix_skip_safe``, and is neither a
+  recurrent state pool nor a resource over pools alone. A hit takes the front of the
+  request away from every resource on the node, including resources that never saw those
+  tokens. The message is ``resource '<key>' cannot serve a request whose prefix
   came from the cache, but it sits on ['<node>'], which the model keyed for prefix
   reuse; either drop the stream or give the resource the prefix hooks``.
 
@@ -1746,6 +1770,8 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``RecurrentStateSpec``
+     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**)
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``

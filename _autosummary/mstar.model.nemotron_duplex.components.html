@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.nemotron_duplex.components.audio_codec" href="mstar.model.nemotron_duplex.components.audio_codec.html" />
+    <link rel="next" title="mstar.model.nemotron_duplex.components.conformer" href="mstar.model.nemotron_duplex.components.conformer.html" />
     <link rel="prev" title="mstar.model.nemotron_duplex" href="mstar.model.nemotron_duplex.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -252,7 +252,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -331,7 +330,6 @@
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -674,16 +672,13 @@ STT perception + RNN-T head, the EarTTS talker and the RVQ audio codec.</p>
 <p class="rubric">Modules</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.nemotron_duplex.components.audio_codec.html#module-mstar.model.nemotron_duplex.components.audio_codec" title="mstar.model.nemotron_duplex.components.audio_codec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">audio_codec</span></code></a></p></td>
-<td><p>EarTTS RVQ audio codec (<code class="docutils literal notranslate"><span class="pre">tts_model.audio_codec.*</span></code>).</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.nemotron_duplex.components.conformer.html#module-mstar.model.nemotron_duplex.components.conformer" title="mstar.model.nemotron_duplex.components.conformer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">conformer</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.nemotron_duplex.components.conformer.html#module-mstar.model.nemotron_duplex.components.conformer" title="mstar.model.nemotron_duplex.components.conformer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">conformer</span></code></a></p></td>
 <td><p>Fast-Conformer STT perception stack (<code class="docutils literal notranslate"><span class="pre">stt_model.perception.*</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.nemotron_duplex.components.dft.html#module-mstar.model.nemotron_duplex.components.dft" title="mstar.model.nemotron_duplex.components.dft"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dft</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.nemotron_duplex.components.dft.html#module-mstar.model.nemotron_duplex.components.dft" title="mstar.model.nemotron_duplex.components.dft"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dft</span></code></a></p></td>
 <td><p>Fixed-size real DFTs as matmuls, for the transforms inside captured CUDA graphs.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.nemotron_duplex.components.rnnt.html#module-mstar.model.nemotron_duplex.components.rnnt" title="mstar.model.nemotron_duplex.components.rnnt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rnnt</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.nemotron_duplex.components.rnnt.html#module-mstar.model.nemotron_duplex.components.rnnt" title="mstar.model.nemotron_duplex.components.rnnt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rnnt</span></code></a></p></td>
 <td><p>RNN-T transcription head (<code class="docutils literal notranslate"><span class="pre">stt_model.rnnt_decoder.*</span></code> / <code class="docutils literal notranslate"><span class="pre">rnnt_joint.*</span></code>).</p></td>
 </tr>
 </tbody>
@@ -712,11 +707,11 @@ STT perception + RNN-T head, the EarTTS talker and the RVQ audio codec.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.nemotron_duplex.components.audio_codec.html"
+       href="mstar.model.nemotron_duplex.components.conformer.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.nemotron_duplex.components.audio_codec</p>
+        <p class="prev-next-title">mstar.model.nemotron_duplex.components.conformer</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

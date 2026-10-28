@@ -609,7 +609,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -688,7 +687,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1071,6 +1069,11 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_trail_order</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">page_trail</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_cap_order</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span>
+            <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">])</span><span class="o">.</span><span class="n">cap_cached_prefix</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">Resource</span><span class="o">.</span><span class="n">cap_cached_prefix</span>
+        <span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_node_cap_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cap_order</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_trail_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_trail_order</span><span class="p">)</span>
         <span class="c1"># capture-time buffer allocation, likewise scoped: a node's runner has</span>
         <span class="c1"># no business sizing a resource it never plans against</span>
@@ -1090,7 +1093,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        The smallest answer wins, because a step is one span: a resource that</span>
 <span class="sd">        holds less than another has to be caught up by the tokens that run.</span>
-<span class="sd">        A resource with no opinion is not an answer of zero.</span>
+<span class="sd">        A resource with no opinion is not an answer of zero. A resource that</span>
+<span class="sd">        holds only some lengths then caps the agreed prefix.</span>
 <span class="sd">        """</span>
         <span class="n">agreed</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">):</span>
@@ -1099,6 +1103,9 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
             <span class="k">if</span> <span class="n">answer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="n">agreed</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">answer</span><span class="o">.</span><span class="n">tokens</span> <span class="o">&lt;</span> <span class="n">agreed</span><span class="o">.</span><span class="n">tokens</span><span class="p">):</span>
                 <span class="n">agreed</span> <span class="o">=</span> <span class="n">answer</span>
+        <span class="k">if</span> <span class="n">agreed</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_cap_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cap_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">):</span>
+                <span class="n">agreed</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">cap_cached_prefix</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">agreed</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">agreed</span></div>
 
 

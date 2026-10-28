@@ -609,7 +609,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -688,7 +687,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -973,8 +971,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">to whichever request gets that handle next. Known handle-keyed state:</span>
 <span class="sd">MicroScheduler.{failed_rids, admit_errors, held_until, backlog} (purged by</span>
 <span class="sd">clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,</span>
-<span class="sd">streaming_buffers}, the engine's and tensor manager's per-request state, and</span>
-<span class="sd">WorkerProfileInfo.</span>
+<span class="sd">streaming_buffers}, the engine's and tensor manager's per-request state,</span>
+<span class="sd">RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,</span>
+<span class="sd">_unkeyed, _admit_restores, _admit_snaps} (purged by</span>
+<span class="sd">remove_request), and WorkerProfileInfo.</span>
 
 <span class="sd">MicroScheduler.pending_tp_follow_count is the one deliberate exception: a</span>
 <span class="sd">ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it</span>

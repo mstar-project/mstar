@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.model.nemotron_duplex.components.dft" href="mstar.model.nemotron_duplex.components.dft.html" />
-    <link rel="prev" title="mstar.model.nemotron_duplex.components.audio_codec" href="mstar.model.nemotron_duplex.components.audio_codec.html" />
+    <link rel="prev" title="mstar.model.nemotron_duplex.components" href="mstar.model.nemotron_duplex.components.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -256,7 +256,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -335,7 +334,6 @@
 <li class="toctree-l4 current active"><a class="reference internal" href="mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -926,7 +924,7 @@ A call with no chunk and not at its end is left as it is.</p>
 <li><p><strong>chunks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>torch.Tensor</em></a><em> | </em><em>None</em><em>]</em>)</p></li>
 <li><p><strong>final</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>]</em>)</p></li>
 <li><p><strong>n</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>front</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool" title="mstar.engine.resources.recurrent.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+<li><p><strong>front</strong> (<em>RecurrentStatePool</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -967,7 +965,7 @@ tails as they were).</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>torch.Tensor</em></a>)</p></li>
 <li><p><strong>kv</strong> (<a class="reference internal" href="mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager" title="mstar.engine.resources.kv.bounded.manager.BoundedKVManager"><em>BoundedKVManager</em></a>)</p></li>
-<li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool" title="mstar.engine.resources.recurrent.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+<li><p><strong>pool</strong> (<em>RecurrentStatePool</em>)</p></li>
 <li><p><strong>n</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>torch.Tensor</em></a>)</p></li>
 </ul>
 </dd>
@@ -1013,9 +1011,9 @@ window is the 15 mel frames before them plus them (the third output).</p>
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>chunk</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>torch.Tensor</em></a>)</p></li>
-<li><p><strong>front</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool" title="mstar.engine.resources.recurrent.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+<li><p><strong>front</strong> (<em>RecurrentStatePool</em>)</p></li>
 <li><p><strong>kv</strong> (<a class="reference internal" href="mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager" title="mstar.engine.resources.kv.bounded.manager.BoundedKVManager"><em>BoundedKVManager</em></a>)</p></li>
-<li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool" title="mstar.engine.resources.recurrent.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+<li><p><strong>pool</strong> (<em>RecurrentStatePool</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1253,7 +1251,7 @@ stored in another, a call’s frames drift from the offline ones.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentBlockConfig" title="mstar.engine.resources.recurrent.config.RecurrentBlockConfig"><em>RecurrentBlockConfig</em></a>]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <em>RecurrentBlockConfig</em>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1313,7 +1311,7 @@ the preemphasis. Right-aligned: the newest sample / frame is last.</p>
 <dd class="field-odd"><p><strong>config</strong> (<a class="reference internal" href="mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.ConformerSTTConfig" title="mstar.model.nemotron_duplex.config.ConformerSTTConfig"><em>ConformerSTTConfig</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentBlockConfig" title="mstar.engine.resources.recurrent.config.RecurrentBlockConfig"><em>RecurrentBlockConfig</em></a>]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <em>RecurrentBlockConfig</em>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1332,12 +1330,12 @@ the preemphasis. Right-aligned: the newest sample / frame is last.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.model.nemotron_duplex.components.audio_codec.html"
+       href="mstar.model.nemotron_duplex.components.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.model.nemotron_duplex.components.audio_codec</p>
+        <p class="prev-next-title">mstar.model.nemotron_duplex.components</p>
       </div>
     </a>
     <a class="right-next"

@@ -256,7 +256,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -335,7 +334,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -942,12 +940,14 @@ time the worker had a step running. Buckets: <a class="reference internal" href=
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_batch_size{model_name,</span> <span class="pre">component,</span> <span class="pre">graph_walk}</span></code></dt><dd><p>Histogram, rows the step’s forward ran. Buckets: <a class="reference internal" href="#metrics-buckets"><span class="std std-ref">batch</span></a>.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_query_tokens_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Prompt tokens looked up in the prefix cache, once per request (its whole
-keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL and
-Orpheus). Under tensor parallelism only rank 0 counts a lookup.</p>
+keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL,
+Orpheus and Qwen3.5). Under tensor parallelism only rank 0 counts a lookup.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_prefix_cache_hit_tokens_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Tokens the prefix cache already held at that lookup. The hit rate is
 <code class="docutils literal notranslate"><span class="pre">rate(mstar_prefix_cache_hit_tokens_total[5m])</span></code> divided by
-<code class="docutils literal notranslate"><span class="pre">rate(mstar_prefix_cache_query_tokens_total[5m])</span></code>.</p>
+<code class="docutils literal notranslate"><span class="pre">rate(mstar_prefix_cache_query_tokens_total[5m])</span></code>. For Qwen3.5 these are the KV
+cache’s tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool
+cuts to 0 still counts.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_component_pending_steps{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
 running: waiting for room in a step, or for the worker to pick the node.</p>

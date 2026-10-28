@@ -256,7 +256,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -335,7 +334,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -681,6 +679,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.nodes"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.nodes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -845,6 +844,12 @@ resource stays free of the manager and its kernels.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.resource_key">
 <span class="sig-name descname"><span class="pre">resource_key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_key" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.writes_prefix_snapshots">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">writes_prefix_snapshots</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.writes_prefix_snapshots" title="Link to this definition">#</a></dt>
+<dd><p>Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them.</p>
+</dd></dl>
 
 </dd></dl>
 
@@ -1020,6 +1025,7 @@ would otherwise be a silently ineffective setting.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.nodes"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.nodes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

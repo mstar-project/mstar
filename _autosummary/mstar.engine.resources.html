@@ -256,7 +256,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -335,7 +334,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.submodules.html">mstar.model.nemotron_duplex.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -840,6 +838,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.nodes"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.nodes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -948,12 +947,15 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">Resource.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.adopt_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.apply_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.bind_dependencies"><code class="docutils literal notranslate"><span class="pre">Resource.bind_dependencies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.build"><code class="docutils literal notranslate"><span class="pre">Resource.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.build_accelerator_graph_buffers"><code class="docutils literal notranslate"><span class="pre">Resource.build_accelerator_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.can_capture"><code class="docutils literal notranslate"><span class="pre">Resource.can_capture()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.can_reload"><code class="docutils literal notranslate"><span class="pre">Resource.can_reload()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.cap_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.cap_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.cleanup"><code class="docutils literal notranslate"><span class="pre">Resource.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.clear_preplan"><code class="docutils literal notranslate"><span class="pre">Resource.clear_preplan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.close_prefix_cache"><code class="docutils literal notranslate"><span class="pre">Resource.close_prefix_cache()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.commit"><code class="docutils literal notranslate"><span class="pre">Resource.commit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.complete_cached_walk"><code class="docutils literal notranslate"><span class="pre">Resource.complete_cached_walk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.depends_on"><code class="docutils literal notranslate"><span class="pre">Resource.depends_on()</span></code></a></li>
@@ -2223,6 +2225,12 @@ resource stays free of the manager and its kernels.</p>
 <span class="sig-name descname"><span class="pre">resource_key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.resource_key" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.writes_prefix_snapshots">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">writes_prefix_snapshots</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.writes_prefix_snapshots" title="Link to this definition">#</a></dt>
+<dd><p>Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them.</p>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -2917,6 +2925,20 @@ skipped can still read them.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.Resource.bind_dependencies">
+<span class="sig-name descname"><span class="pre">bind_dependencies</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resources</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.bind_dependencies"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.bind_dependencies" title="Link to this definition">#</a></dt>
+<dd><p>The live resources this one’s spec names in <cite>depends_on</cite>, once all are built.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>resources</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.Resource" title="mstar.engine.resources.base.Resource"><em>Resource</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.Resource.build">
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">build</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.build"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.build" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -2981,6 +3003,26 @@ check that the reload was successful.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.Resource.cap_cached_prefix">
+<span class="sig-name descname"><span class="pre">cap_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.cap_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.cap_cached_prefix" title="Link to this definition">#</a></dt>
+<dd><p>The longest prefix up to <code class="docutils literal notranslate"><span class="pre">prefix</span></code> this resource can serve, for a
+resource that holds only some lengths.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>prefix</strong> (<a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.CachedPrefix" title="mstar.engine.resources.base.CachedPrefix"><em>CachedPrefix</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.CachedPrefix" title="mstar.engine.resources.base.CachedPrefix"><em>CachedPrefix</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.Resource.cleanup">
 <span class="sig-name descname"><span class="pre">cleanup</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.cleanup"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.cleanup" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -2989,6 +3031,17 @@ check that the reload was successful.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.Resource.clear_preplan">
 <span class="sig-name descname"><span class="pre">clear_preplan</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.clear_preplan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.clear_preplan" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.Resource.close_prefix_cache">
+<span class="sig-name descname"><span class="pre">close_prefix_cache</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.close_prefix_cache"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.close_prefix_cache" title="Link to this definition">#</a></dt>
+<dd><p>Undo <cite>enable_prefix_cache</cite>. Called before any request.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.Resource.commit">
@@ -4540,7 +4593,8 @@ does: a publisher may key what it publishes on the walk.</p>
 <dd><p>The longest prefix of this walk every resource on <code class="docutils literal notranslate"><span class="pre">node_name</span></code> can serve.</p>
 <p>The smallest answer wins, because a step is one span: a resource that
 holds less than another has to be caught up by the tokens that run.
-A resource with no opinion is not an answer of zero.</p>
+A resource with no opinion is not an answer of zero. A resource that
+holds only some lengths then caps the agreed prefix.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -4734,22 +4788,19 @@ conductor validates a deployment.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.position.html#module-mstar.engine.resources.position" title="mstar.engine.resources.position"><code class="xref py py-obj docutils literal notranslate"><span class="pre">position</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.recurrent.html#module-mstar.engine.resources.recurrent" title="mstar.engine.resources.recurrent"><code class="xref py py-obj docutils literal notranslate"><span class="pre">recurrent</span></code></a></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.rms_norm.html#module-mstar.engine.resources.rms_norm" title="mstar.engine.resources.rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.rms_norm.html#module-mstar.engine.resources.rms_norm" title="mstar.engine.resources.rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm</span></code></a></p></td>
 <td><p>Backend-neutral RMSNorm operator.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.runner.html#module-mstar.engine.resources.runner" title="mstar.engine.resources.runner"><code class="xref py py-obj docutils literal notranslate"><span class="pre">runner</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.runner.html#module-mstar.engine.resources.runner" title="mstar.engine.resources.runner"><code class="xref py py-obj docutils literal notranslate"><span class="pre">runner</span></code></a></p></td>
 <td><p>sequencing for resource call cycle</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.sampler.html#module-mstar.engine.resources.sampler" title="mstar.engine.resources.sampler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.sampler.html#module-mstar.engine.resources.sampler" title="mstar.engine.resources.sampler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.spec.html#module-mstar.engine.resources.spec" title="mstar.engine.resources.spec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.spec.html#module-mstar.engine.resources.spec" title="mstar.engine.resources.spec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec</span></code></a></p></td>
 <td><p>Resource declarations models hand to the engine.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.step.html#module-mstar.engine.resources.step" title="mstar.engine.resources.step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.step.html#module-mstar.engine.resources.step" title="mstar.engine.resources.step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step</span></code></a></p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -4975,6 +5026,7 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.nodes"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.nodes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -5083,12 +5135,15 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">Resource.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.adopt_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.apply_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.bind_dependencies"><code class="docutils literal notranslate"><span class="pre">Resource.bind_dependencies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.build"><code class="docutils literal notranslate"><span class="pre">Resource.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.build_accelerator_graph_buffers"><code class="docutils literal notranslate"><span class="pre">Resource.build_accelerator_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.can_capture"><code class="docutils literal notranslate"><span class="pre">Resource.can_capture()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.can_reload"><code class="docutils literal notranslate"><span class="pre">Resource.can_reload()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.cap_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.cap_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.cleanup"><code class="docutils literal notranslate"><span class="pre">Resource.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.clear_preplan"><code class="docutils literal notranslate"><span class="pre">Resource.clear_preplan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.close_prefix_cache"><code class="docutils literal notranslate"><span class="pre">Resource.close_prefix_cache()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.commit"><code class="docutils literal notranslate"><span class="pre">Resource.commit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.complete_cached_walk"><code class="docutils literal notranslate"><span class="pre">Resource.complete_cached_walk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.depends_on"><code class="docutils literal notranslate"><span class="pre">Resource.depends_on()</span></code></a></li>
