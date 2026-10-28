@@ -122,7 +122,8 @@ class MultimodalDecoderModel(Model):
     # in errors and logs
     NAME: str
     # what the API and conductor processes download: enough to build the
-    # config and tokenize; workers fetch the full snapshot (`_resolve_weights`)
+    # config and tokenize (generation_config.json, which `__init__` reads,
+    # comes too); workers fetch the full snapshot (`_resolve_weights`)
     METADATA_FILES: tuple[str, ...]
 
     # one per attachment modality the model takes, set by its `__init__`
@@ -150,7 +151,7 @@ class MultimodalDecoderModel(Model):
 
         return snapshot_download(
             repo_id=self.model_path_hf, cache_dir=self.cache_dir,
-            allow_patterns=list(self.METADATA_FILES),
+            allow_patterns=[*self.METADATA_FILES, "generation_config.json"],
         )
 
     def _resolve_weights(self) -> str:

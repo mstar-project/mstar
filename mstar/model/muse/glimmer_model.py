@@ -63,7 +63,7 @@ _IMAGE_PROCESSOR = {
 class MuseGlimmerModel(MultimodalDecoderModel):
     NAME = "Muse Glimmer"
     METADATA_FILES = (
-        "config.json", "generation_config.json", "processor_config.json",
+        "config.json", "processor_config.json",
         "tokenizer_config.json", "tokenizer.json", "chat_template.jinja",
     )
 

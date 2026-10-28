@@ -2362,7 +2362,7 @@ from the checkpoint's ``generation_config.json``), the LLM's ``SamplerSpec``
 (``_sampler_spec``, whose min-p filter is on only where the checkpoint defaults
 ``min_p``, so a request's ``min_p > 0`` is otherwise refused at admission), sharding, the
 submodule cache and where the files come from. A model sets ``NAME`` and
-``METADATA_FILES`` (with ``generation_config.json``) and writes ``__init__`` (setting
+``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention
 resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``. ``media`` holds a ``MediaIntake`` per attachment modality: its

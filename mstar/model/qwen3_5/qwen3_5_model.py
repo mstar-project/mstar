@@ -68,7 +68,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         "vocab.json",
         "tokenizer.json",
         "merges.txt",
-        "generation_config.json",
     )
 
     def __init__(
