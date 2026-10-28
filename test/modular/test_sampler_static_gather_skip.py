@@ -9,14 +9,14 @@ from mstar.engine.resources.sampler.utils import SamplerBuffers, SamplingConfig
 def _buffers(monkeypatch) -> tuple[SamplerBuffers, list]:
     buffers = SamplerBuffers.allocate(8, torch.device("cpu"), cg_slots=2)
     gathers: list = []
-    for buf in buffers._scalar_buffers():
-        real = buf.gather
+    rows = buffers._scalar_rows
+    real = rows.gather
 
-        def counting(rows, padded_bs, cg_slot, _real=real):
-            gathers.append(cg_slot)
-            return _real(rows, padded_bs, cg_slot)
+    def counting(slot_idx, padded_bs, cg_slot):
+        gathers.append(cg_slot)
+        return real(slot_idx, padded_bs, cg_slot)
 
-        monkeypatch.setattr(buf, "gather", counting)
+    monkeypatch.setattr(rows, "gather", counting)
     return buffers, gathers
 
 
