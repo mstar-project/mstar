@@ -322,6 +322,15 @@ class Qwen3_5_Dense(Model):
         return {"temperature": 0.0, "enable_thinking": True, "chat_template_kwargs": {"enable_thinking": True}}
 
 
+class Qwen3_Dense(Qwen3_5_Dense):
+    """Qwen3 dense, text in and out."""
+
+    DEFAULT_MODEL_ID = "Qwen/Qwen3-8B"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T}
+
+
 class Qwen3_8_Dense(Qwen3_5_Dense):
     """Qwen3.8 dense: the Qwen3.5 architecture, defaulting to the 27B."""
 
@@ -493,6 +502,7 @@ class ModelType(Enum):
     CANARY_QWEN = "canary_qwen"
     PARAKEET = "parakeet"
     NEMOTRON_ASR = "nemotron_asr"
+    QWEN3 = "qwen3"
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
 
@@ -535,6 +545,8 @@ class ModelType(Enum):
             return Parakeet(**kwargs)
         if self == ModelType.NEMOTRON_ASR:
             return NemotronAsr(**kwargs)
+        if self == ModelType.QWEN3:
+            return Qwen3_Dense(**kwargs)
         if self == ModelType.QWEN3_5:
             return Qwen3_5_Dense(**kwargs)
         if self == ModelType.QWEN3_8:

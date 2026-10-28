@@ -1,4 +1,4 @@
-"""Dense Qwen3 causal language model from the shared components.
+"""Qwen3 causal language models, dense and MoE, from the shared components.
 
 Qwen3 = Llama-style pre-norm decoder with GQA, per-head QK RMSNorm, SwiGLU
 MLP and plain RoPE (``rope_theta`` 1e6, no Llama-3 scaling). Several
@@ -6,14 +6,18 @@ audio-LLM checkpoints ship one as their text decoder (Qwen3-ASR, Higgs-Audio,
 Qwen3-Omni's dense layers); this is the one place to build it from
 ``ParallelAttention`` / ``ParallelGatedMLP`` / ``RMSNorm``, bound to the
 KV, attention and position resources of the node that owns it.
+``Qwen3MoeLM`` is the same decoder with routed experts in place of the MLP
+(HF's ``qwen3_moe``: Qwen3-30B-A3B, Qwen3-Coder).
 
-Parameter paths mirror HF's ``Qwen3ForCausalLM`` with the ``model.`` prefix
-dropped (``embed_tokens.*``, ``layers.N.*``, ``norm.*``, ``lm_head.*``); a
-checkpoint that ties ``lm_head`` to the embedding loads without the head key.
+Parameter paths mirror HF's ``Qwen3ForCausalLM`` / ``Qwen3MoeForCausalLM`` with
+the ``model.`` prefix dropped (``embed_tokens.*``, ``layers.N.*``, ``norm.*``,
+``lm_head.*``); a checkpoint that ties ``lm_head`` to the embedding loads
+without the head key.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -27,6 +31,9 @@ from mstar.model.components.distributed import (
     VocabParallelEmbedding,
 )
 from mstar.model.components.norm import RMSNorm
+
+if TYPE_CHECKING:
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 
 class Qwen3Attention(ParallelAttention):
@@ -90,6 +97,20 @@ class Qwen3LMConfig:
     rope_theta: float = 1_000_000.0
     max_position_embeddings: int = 32768
     tie_word_embeddings: bool = False
+    # qwen3_moe: routed experts replace the MLP on the layers ``is_moe_layer`` names
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    norm_topk_prob: bool = True
+    decoder_sparse_step: int = 1
+    mlp_only_layers: list[int] = field(default_factory=list)
+
+    def is_moe_layer(self, layer_idx: int) -> bool:
+        return (
+            self.num_experts > 0
+            and layer_idx not in self.mlp_only_layers
+            and (layer_idx + 1) % self.decoder_sparse_step == 0
+        )
 
     @classmethod
     def from_hf(cls, hf: dict) -> "Qwen3LMConfig":
@@ -110,6 +131,8 @@ class Qwen3DenseLM(nn.Module):
         comm_group: CommGroup | None = None,
     ):
         super().__init__()
+        if config.num_experts and type(self) is Qwen3DenseLM:
+            raise ValueError("a qwen3_moe config builds Qwen3MoeLM, not the dense Qwen3 LM")
         self.config = config
         comm_group = comm_group or CommGroup.trivial()
         self.embed_tokens = VocabParallelEmbedding(
@@ -133,16 +156,11 @@ class Qwen3DenseLM(nn.Module):
                     kv_key=kv_key,
                     pos_key=pos_key,
                 ),
-                mlp=ParallelGatedMLP(
-                    comm_group=comm_group,
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.intermediate_size,
-                    activation="silu",
-                ),
+                mlp=self._make_mlp(layer_idx, comm_group),
                 input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                 post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
             )
-            for _ in range(config.num_hidden_layers)
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(
@@ -153,13 +171,26 @@ class Qwen3DenseLM(nn.Module):
             gather_output=True,
         )
 
+    def _make_mlp(self, layer_idx: int, comm_group: CommGroup) -> nn.Module:
+        return ParallelGatedMLP(
+            comm_group=comm_group,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            activation="silu",
+        )
+
+    def _stacked_params(self) -> list:
+        from mstar.model.loader import LLAMA_STACKED_PARAMS
+
+        return LLAMA_STACKED_PARAMS
+
     def load_weights(self, weights) -> set[str]:
         """Stream HF ``(name, tensor)`` pairs (``model.`` prefix already
         dropped); tie the head to the embedding when the checkpoint does;
         raise on anything left unloaded."""
-        from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
+        from mstar.model.loader import load_hf_weights
 
-        loaded = load_hf_weights(self, weights, stacked_params=LLAMA_STACKED_PARAMS)
+        loaded = load_hf_weights(self, weights, stacked_params=self._stacked_params())
         if "lm_head.weight" not in loaded:
             if not self.config.tie_word_embeddings:
                 raise RuntimeError("Qwen3 checkpoint has no lm_head.weight and does not tie embeddings")
@@ -205,3 +236,71 @@ class Qwen3DenseLM(nn.Module):
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+
+class Qwen3MoeLM(Qwen3DenseLM):
+    """HF's ``Qwen3MoeForCausalLM``: the dense decoder with a softmax top-k routed-expert block
+    (no shared expert) in place of the MLP on every layer ``is_moe_layer`` names. The experts
+    split by ``moe_parallel`` (TP by default, or EP)."""
+
+    def __init__(
+        self,
+        config: Qwen3LMConfig,
+        *,
+        attn_key: str,
+        kv_key: str,
+        pos_key: str,
+        comm_group: CommGroup | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
+    ):
+        from mstar.model.components.moe_parallel import MoeParallelConfig
+
+        if not config.num_experts:
+            raise ValueError("Qwen3MoeLM needs num_experts > 0")
+        moe_parallel = moe_parallel or MoeParallelConfig()
+        if moe_parallel.mask_padding or moe_parallel.log_expert_load_every:
+            raise ValueError("Qwen3MoeLM does not mask padding rows or log expert load")
+        # a plain attribute, set first: the base __init__ builds the layers through _make_mlp
+        self.moe_parallel = moe_parallel
+        super().__init__(config, attn_key=attn_key, kv_key=kv_key, pos_key=pos_key, comm_group=comm_group)
+
+    def _make_mlp(self, layer_idx: int, comm_group: CommGroup) -> nn.Module:
+        from mstar.model.components.moe_parallel import instantiate_moe_block
+
+        if not self.config.is_moe_layer(layer_idx):
+            return super()._make_mlp(layer_idx, comm_group)
+        return instantiate_moe_block(
+            hidden_size=self.config.hidden_size,
+            num_experts=self.config.num_experts,
+            num_experts_per_tok=self.config.num_experts_per_tok,
+            moe_intermediate_size=self.config.moe_intermediate_size,
+            norm_topk_prob=self.config.norm_topk_prob,
+            comm_group=comm_group,
+            moe_parallel=self.moe_parallel,
+        )
+
+    def _stacked_params(self) -> list:
+        from mstar.model.loader import LLAMA_STACKED_PARAMS, hf_expert_stacked_params
+
+        return hf_expert_stacked_params(self.config.num_experts) + LLAMA_STACKED_PARAMS
+
+    def load_weights(self, weights) -> set[str]:
+        """As the dense LM's, and every expert's three projections must arrive: one of them
+        fills a slice of a stacked parameter, which counts as loaded after its first."""
+        import re
+
+        expert_key = re.compile(r"^layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
+        seen: set[str] = set()
+
+        def tally(pairs):
+            for name, tensor in pairs:
+                if expert_key.match(name):
+                    seen.add(name)
+                yield name, tensor
+
+        loaded = super().load_weights(tally(weights))
+        moe_layers = sum(self.config.is_moe_layer(i) for i in range(self.config.num_hidden_layers))
+        missing = 3 * self.config.num_experts * moe_layers - len(seen)
+        if missing:
+            raise RuntimeError(f"Qwen3-MoE checkpoint left {missing} expert weight(s) unloaded")
+        return loaded

@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.resources.draft_verify.config import DraftPolicy
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -117,6 +118,17 @@ class BatchedModelOutput:
     # A mixed step's rows whose own walk keeps every output signal on the
     # device (see ``ExecutingBatch.loopback_rids``)
     loopback_rids: frozenset = frozenset()
+    # output name -> [bs, 2] int64 on the forward's device: row i holds the
+    # first and one-past-last index of the valid part of request i's output
+    # along its last dim. The worker cuts the rows to it once the step has
+    # run (see ``NodeSubmodule.spanned_outputs``).
+    output_spans: dict[str, torch.Tensor] | None = None
+    # The request each row of ``output_spans`` belongs to, stamped by the
+    # engine like ``row_request_ids``.
+    span_request_ids: tuple | None = None
+    # ``output_spans`` on the host, staged by the gpu thread behind the step
+    # like ``host_rows``.
+    host_spans: dict[str, torch.Tensor] | None = None
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -222,6 +234,26 @@ class BatchedModelOutput:
             if self.row_outputs is None:
                 self.row_outputs = {}
             self.row_outputs.update(other.row_outputs)
+        # Unlike the stop buffers, spans cannot be dropped on a merge: a row
+        # left without its span would leave the step uncut. Both sides span
+        # the same names (the engine checks a step against its declaration),
+        # so the rows concatenate name by name.
+        if other.output_spans:
+            if not self.output_spans:
+                self.output_spans = dict(other.output_spans)
+                self.span_request_ids = other.span_request_ids
+            else:
+                if other.output_spans.keys() != self.output_spans.keys():
+                    raise ValueError(
+                        f"cannot merge spans for {sorted(self.output_spans)} with spans "
+                        f"for {sorted(other.output_spans)}: every forward of a step spans "
+                        f"the same outputs"
+                    )
+                self.output_spans = {
+                    name: torch.cat([span, other.output_spans[name]])
+                    for name, span in self.output_spans.items()
+                }
+                self.span_request_ids = self.span_request_ids + other.span_request_ids
 
 
 @dataclass
@@ -722,10 +754,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         **kwargs # coming from preprocess output
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | BatchedModelOutput:
         """
         Pure tensor → NameToTensorList computation.
-        Compilable + CUDA-graphable.
+        Compilable + CUDA-graphable. A ``BatchedModelOutput`` keyed by the
+        request id, as ``forward_batched`` returns, can carry ``output_spans``.
         """
         pass
 
@@ -773,6 +806,19 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, has_loopback
         return None
 
+    def get_draft_policy(self, graph_walk: str) -> DraftPolicy | None:
+        """How this walk drafts and verifies (speculative decoding); None, the default, is
+        plain decoding. Asked once per walk, when the engine loads the node.
+
+        A walk with a policy runs ``policy.block`` tokens per row (``prepare_inputs``), wraps
+        its step in ``with_draft_verify`` (``declare_step``), and in its forward drafts, has
+        the node's ``DraftVerifyResource`` agree on them (``agree``), runs the target over
+        ``block_ids`` and hands the logits to ``verify``, whose ``next_inputs`` are the
+        loop-back. The engine rewinds the rejected rows and emits each row's tokens under
+        ``policy.emit``, and the walk's stop is the engine's, not ``check_stop``'s."""
+        del graph_walk
+        return None
+
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
         but their spans, and every real row has the span of the template row.
@@ -795,6 +841,25 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``postprocess``: the stop check, the inline emit and the next step's
         speculation read the step's rows instead. Empty by default;
         ``MSTAR_DEVICE_LOOPBACK=0`` keeps every node on the tensor path."""
+        del graph_walk
+        return frozenset()
+
+    def spanned_outputs(self, graph_walk: str) -> frozenset[str]:
+        """Outputs of this walk that may come with a valid span per row, in
+        ``BatchedModelOutput.output_spans`` under the output's name. The worker
+        cuts each row to its span along the last dim once the step's completion
+        event has fired, before the stop check, transport or a streaming edge
+        reads it, so a forward (and its captured graphs) can keep a fixed width
+        and still emit a length known only on the device, without a host read.
+        The cut is a view, and a row whose span covers its whole output is left
+        as it is.
+
+        The engine-side ``postprocess`` and ``batch_postprocess`` see the
+        uncut output. A spanned output must not feed a node this worker
+        speculates into, which would read it before the cut; startup refuses
+        that unless one of the two nodes sets ``enable_async_scheduling=False``.
+        Not for a signal kept on the device or sent inline, which have no
+        per-request tensor to cut. Empty by default."""
         del graph_walk
         return frozenset()
 
@@ -1018,6 +1083,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         or None when the step mixes walks (each row's is on its info).
         """
         return None
+
+    def on_request_added(self, request_id: int, request_info: CurrentForwardPassInfo) -> None:
+        """The request has reached this worker; none of its steps has run yet.
+
+        Runs on the worker's main thread, so host work worth starting early
+        belongs on a thread of the submodule's own, and nothing here may touch
+        the device. State goes in :meth:`request_state`, which the removal of
+        the request frees. Default: nothing.
+        """
 
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes. The engines call

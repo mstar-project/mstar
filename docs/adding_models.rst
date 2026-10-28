@@ -82,6 +82,22 @@ Plus a handful of things outside that package:
 
 Step 1 covers all of them.
 
+A text-only LLM may need no package of its own
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``mstar/model/text_lm/`` serves any Hugging Face causal-LM checkpoint whose decoder is
+already in ``mstar/model/components/``: one ``LLM`` node, a prefill and a decode loop,
+paged KV with attention, RoPE positions and the sampler declared from the checkpoint's
+``config.json``, its chat template, stop ids from the tokenizer and
+``generation_config.json``, prefix-cache keys over the prompt and the reply, and
+captured decode and packed prefill. The checkpoint's ``model_type`` picks an entry in
+``LM_FAMILIES`` (``mstar/model/text_lm/config.py``): how to read the config, how to build
+the decoder, and how checkpoint keys map to its parameters. Qwen3 dense and MoE
+(``qwen3``, ``qwen3_moe``) are there. A new model of a known family is a registry line
+(``TextLMModel``), a config YAML and a ``TextChatAdapter`` entry; a new family is a
+decoder component plus an ``LM_FAMILIES`` entry. Anything the shared walks cannot
+express (media inputs, extra nodes, drafter heads) still wants its own package.
+
 Step 1 — Register the model
 ---------------------------
 
@@ -316,7 +332,7 @@ returns each request's layout from ``process_prompt``.
 ``KVReqConfig`` can name on any node and walk, ``main`` when it names none. A layout may be
 empty where an opened label is never written. It may also name labels the request opens
 only on another deployment, as an unguided BAGEL generation does for a CFG-parallel one.
-A layout has five fields:
+A layout has six fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A
   :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
@@ -330,11 +346,18 @@ A layout has five fields:
 - ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
 - ``keyed_spans``: how many leading spans the label's keys cover, by default every span
   before the first ``rows`` span.
+- ``lookahead``: the most slots a committing step writes past the tokens the request keeps,
+  before a trim takes them back. A draft-verify step commits its whole block and its
+  rejected drafts are trimmed, so ``growth`` counts one slot per kept token and the
+  lookahead the rows written ahead of them. A layout can't have both a lookahead and a
+  ``retention``: retention releases at commit, before the trim.
 
-The footprint adds the spans, the growth at each loop's iterations and the scratch, and
-rounds up to whole pages per label. A span's own scratch counts only with the spans before
-it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
-takes the window's peak instead.
+The footprint adds the spans, the growth at each loop's iterations, the lookahead and the
+scratch, and rounds up to whole pages per label. A span's own scratch counts only with the
+spans before it, so a window's denoise steps and its commit count once. Under a
+``RetentionPolicy`` it takes the window's peak instead. The lookahead's rows have positions
+too, so the conductor holds the positions at the caps plus the lookahead to the pool's
+``max_seq_len``.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
@@ -602,7 +625,17 @@ The spec types are:
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SamplingReqConfig`` above. ``loopback_state`` declares per-request state a
        decode loop keeps on the device beside its last sampled token. See
-       `Device loop-back`_.
+       `Device loop-back`_. ``draft_verify`` marks the sampler of a node that verifies
+       drafts, and ``enable_sampled_verify`` is the capability to verify at temperature > 0.
+       See `Draft-verify decoding`_.
+   * - ``DraftVerifySpec(sampler=...)``
+     - Carries a verify step's verdict from the forward to the host, for a node whose
+       decode walk verifies drafts (speculative decoding). ``sampler`` names the node's
+       sampler, which verifies. See `Draft-verify decoding`_.
+   * - ``NgramSpec(max_drafts=..., min_ngram=..., max_ngram=...)``
+     - Drafts a verify step's tokens by prompt lookup, from each request's prompt and
+       reply: no drafter weights. Named by ``DraftPolicy.proposer``. See
+       `Draft-verify decoding`_.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
@@ -1046,6 +1079,12 @@ methods are:
    objects to stop, for example after seeing the EOS token. This is how a decode loop
    terminates.
 
+``on_request_added(self, request_id, request_info)`` (optional)
+   Called on the worker's main thread when the request reaches the worker, before any of
+   its steps, with the request's first ``CurrentForwardPassInfo``. For host work worth
+   starting early on a thread of the submodule's own; it must not touch the device. The
+   DiT scaffold draws a request's seeded noise here (``PREFETCH_SEEDS``).
+
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
    per-request caches, counters. See Qwen3-Omni's ``Code2WavSubmodule`` for an example.
@@ -1058,6 +1097,19 @@ methods are:
    boundaries depend on the real sequence lengths and therefore cannot be computed inside
    the captured region. Both methods are defined on ``NodeSubmodule``, so any node can use
    them.
+
+``spanned_outputs(graph_walk) -> frozenset[str]`` (optional)
+   Outputs whose valid length per row is known only on the device, such as audio with
+   silence to trim. ``forward_batched`` returns a ``BatchedModelOutput`` whose
+   ``output_spans`` maps the output's name to a ``[bs, 2]`` int64 tensor on the device:
+   row ``i`` holds the first and one-past-last index of row ``i``'s valid samples along
+   the output's last dimension. A step that returns spans returns one for every output
+   declared here, since per-request forwards are merged by name. The forward keeps a
+   fixed width and does no host read.
+   The worker cuts each row to its span after the step's completion event, before the stop
+   check, transport or a streaming edge reads it. The cut is a view, not a copy. Engine-side
+   ``postprocess`` still sees the uncut output. A spanned output must not feed a node that
+   the same worker speculates into.
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
@@ -1291,6 +1343,113 @@ address rows the same way, and the model never sees a slot index.
    that frame once per layer and exceeds the recompile limit. The shared ``Attention``
    layer creates one callable per layer. That is safe only because the callable is never
    passed into a traced function.
+
+Draft-verify decoding
+~~~~~~~~~~~~~~~~~~~~~
+
+A decode walk can draft ``k`` tokens per step and verify them in the same forward
+(speculative decoding: MTP heads, a DSpark or EAGLE drafter). The model keeps its
+drafter's forward. The engine owns the rest: the verdict, taking the rejected rows back
+out of every resource, the tokens each request emits, and the stop.
+
+- ``get_draft_policy(graph_walk)`` returns a ``DraftPolicy`` for the walk, or None (the
+  default) for plain decoding: ``max_drafts`` (``k``), the ``stop_ids`` that end a reply,
+  the ``loop`` the stop ends and the ``emit`` signal the tokens go out on. It is asked
+  once per walk, when the engine loads the node.
+- ``prepare_inputs`` gives a decode row ``input_seq_len = policy.block`` (``k + 1``) and
+  one input id, the last emitted token. The capture config does the same, so a decode
+  bucket holds ``block`` tokens per row.
+- ``declare_step`` wraps the decode step in ``with_draft_verify(step, policy)``, which adds
+  the ``VerifyStep`` and the sampler's step (``sampler=`` names the sampler, ``"sampler"``
+  by default). The model declares no ``SamplerStep`` on a verify step.
+- The forward drafts ``[n, k]`` tokens and hands them to the node's
+  ``DraftVerifyResource``: ``agree`` (rank 0's drafts on a lockstep instance), then
+  ``block_ids`` (``[n, k + 1]``), the target over those rows, and ``verify(request_ids,
+  block, logits)``. Its ``next_inputs`` are the loop-back edge, produced for every row.
+  A drafter that samples draws each draft with ``draft_sample(request_ids, logits)``, which
+  returns the token and the distribution it came from, and passes the distributions
+  stacked as ``verify(..., draft_probs=...)``. Drafts given without them are taken as
+  certain (a point mass), which is exact for any drafter.
+- The model's ``get_node_resources`` declares a ``DraftVerifySpec`` on the node and
+  ``SamplerSpec(draft_verify=True)``. Its layout for the label the walk grows declares
+  ``lookahead=policy.lookahead`` (``2k + 1``, see `Paged KV layouts`_).
+
+Each verify step commits its whole block. Before the request's next step admits, the
+runner takes the rejected rows back from every resource of the node that declares
+``rewind_kind = RewindKind.HOST`` (paged KV and positions so far). State a forward updates
+in place declares ``RewindKind.DEVICE``: ``verify`` hands it each row's accepted count and
+the step's label inside the forward (``Resource.settle_verify``), after the target has run
+over the block, so a captured step records the settle too. ``with_draft_verify`` sets
+``verify=True`` on every step of the submodule's with a ``verify`` field. The GDN resource
+is one: under ``LinearAttnStep(verify=True)`` it runs each block from the slot without
+writing the state, and its settle runs the block again from the slot with every rejected
+token's gates closed, which leaves the state and conv window after the kept prefix. The
+recurrent pool is storage (``NONE``); a backend that can't settle (Mamba-2 so far) declares
+nothing. A resource that declares no ``rewind_kind`` keeps the node from loading, as does a
+combined walk over the verifying walk or a prefix-cache key on its labels.
+
+Under the async worker, the next step is pre-planned while the current one runs, before its
+verdict is known: from the lengths the current step committed, as if it kept its whole block.
+Once the verdict lands, the runner rewinds and each pre-planned resource corrects its staged
+plan (``Resource.correct_preplan``; paged KV, positions, FlashInfer attention and the sampler
+do). A node pre-plans this way only when every pre-planning resource of its verify step sets
+``corrects_preplan``; otherwise its pre-plan waits for the verdict first. A resource that adds
+state to a verifying node and pre-plans should implement it: what the pre-plan read of a
+length the rewind moved has to be put right there, in place.
+Two kinds of drafter need no drafting code of the model's own, and a verify step's forward
+runs either through one helper, ``draft_verify_step(dv, request_ids, inputs, target,
+drafter=None)``: the drafts, ``agree``, ``target`` (the block's ids, flat, to the target's
+logits) and ``verify``; it returns the next step's inputs.
+
+- An engine-side proposer: ``DraftPolicy(proposer=NGRAM)`` names the node's ``NgramSpec``
+  (prompt lookup: the tokens that followed the last earlier occurrence of the request's
+  suffix), and ``draft_verify_step`` with no drafter takes the block from
+  ``DraftVerifyResource.propose``. The proposer learns the prompt from the prefill steps,
+  which declare ``ProposeStep(history={rid: prompt_ids})`` under its key, and every emitted
+  token from the verdicts. A proposer is a ``DraftProposer`` resource: ``observe`` takes each
+  verdict once, ``plan`` stages a verify step's drafts and ``propose`` hands them to the
+  forward. It fits drafters whose state is per-request host data.
+- A drafter with weights runs in the forward as a ``Drafter`` (``propose(inputs, dv,
+  request_ids) -> Drafts``, ``next_inputs(block, verdict)``), passed to
+  ``draft_verify_step``. A separate draft model (a small LLM with the target's tokenizer) is
+  one, in ``mstar/model/components/draft_model.py``: ``DraftModel`` is the declaration
+  (``max_drafts``, the drafter's ``PagedKVConfig``, the resource keys under ``DraftKeys``,
+  ``sample`` to draw drafts as the request samples) and ``DraftLLMProposer`` wraps the
+  drafter's LM (``embed`` / call / ``logits``) bound to those keys. The target adds
+  ``draft.node_resources(nodes)`` to its resources (the drafter's own KV, attention and
+  positions, which the runner rewinds by the same verdict as the target's);
+  ``draft.kv_layout(prompt_len, prefill_walk, loop, policy.lookahead)`` beside its own layout
+  in ``process_prompt``, and ``draft.check_prompt(len)``; ``draft.prefill_steps(request_ids,
+  spans)`` to its prefill step and ``draft.verify_steps()`` to its verify step; and
+  ``proposer.prefill`` over each prompt but its last token in the prefill forward. The
+  drafter's KV runs one token behind the target's: a verify row's input is the request's last
+  two kept tokens ``[prev, bonus]`` (a two-token loop-back, and a prefill that hands the
+  decode loop ``[last prompt token, sampled token]``), and its block ``[prev, bonus, d1 ..
+  d(k-1)]`` sits one position before the target's ``[bonus, d1 .. dk]``. Both span ``k + 1``
+  rows, so the verdict takes back the same rows from both. Each of the ``k`` draft passes
+  runs the whole block under the step's one causal attention plan and reads its own row.
+
+``DraftConfig.from_kwargs(model_kwargs["draft"])`` reads a deployment's ``draft:`` settings
+for either (``method: ngram``, or ``method: draft_model`` with the drafter's ``model``), and
+its ``policy`` and ``resources`` give the walk's policy and the specs to declare; read the
+layouts' lookahead off ``policy().lookahead`` rather than repeating its formula. The toys in
+``test/modular/draft_verify_toy.py`` (both kinds) and ``draft_model_toy.py`` are the CPU
+consumers.
+
+Verification is greedy unless the sampler declares ``enable_sampled_verify=True``: a
+greedy verify keeps the drafts that equal the target's argmax, and refuses a request with a
+``temperature``. A sampled verify runs rejection sampling against the target filtered as the
+request samples (temperature, ``min_p``, ``top_k`` and ``top_p``): draft ``i`` stays with
+probability ``min(1, p_i(d_i) / q_i(d_i))``, the first one refused is replaced by a draw
+from ``max(0, p_i - q_i)``, and a row that keeps every draft draws one more token from the
+target. The tokens it emits are distributed as sampling the target one token at a time;
+greedy requests come out as under the greedy verify. It filters every row of a verify block
+each step, which a node serving greedy requests only doesn't need. It runs FlashInfer's
+chain kernel and reads each request's seed and RNG offset as the sampler does, so a seed
+reproduces a request's stream in the same batch layout. Either way ``repetition_penalty``
+and ``min_tokens`` are refused: they depend on the tokens before each draft, which the
+verify doesn't track. The tiny model in ``test/modular/draft_verify_toy.py`` is the
+reference consumer.
 
 Loading weights
 ~~~~~~~~~~~~~~~
@@ -1759,11 +1918,13 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~
 
-The API server runs ``load_image`` / ``process_prompt`` with torch's intra-op pool, which
-defaults to one thread per core. For a few small ops per request a small pool is faster,
-especially on a shared node, where an op waits on any of its threads another process has
-descheduled. A model sets its size with ``PREPROCESS_TORCH_THREADS`` on the class (Qwen3.5
-uses 4). A deployment overrides it at the top level of its config; ``null`` keeps torch's
+The API server runs ``load_image`` / ``process_prompt`` and output encoding with torch's
+intra-op pool. Torch sizes it at one thread per host core, which in a container can be
+several times the CPUs the cgroup quota lets run, and an op waits on any of its threads
+the scheduler has parked. The API server therefore defaults to a quarter of the CPUs it
+may use (its affinity, capped by the cgroup ``cpu.max`` quota), at most 4. A model sets
+its own size with ``PREPROCESS_TORCH_THREADS`` on the class (Qwen3.5 uses 4). A
+deployment overrides either at the top level of its config; ``null`` keeps torch's
 default:
 
 .. code-block:: yaml
@@ -2207,6 +2368,12 @@ from ``denoise`` as a ``{name: tensor}`` mapping. A scheduler needing another pe
 scalar adds a ``STEP_SCALARS`` entry naming the attribute of its ``FlowMatchSchedule``
 to slice it from — the base stages that tensor on the device and slices it per step, so
 nothing in the batching path has to change.
+
+A model whose ``seed_loop_back`` depends on nothing but the bucket key and the request's
+seed sets ``PREFETCH_SEEDS = True`` (klein and Z-Image do): the base then draws the noise
+when the request reaches the worker, on a thread of its own, and iteration 0 only copies
+it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0, once per
+joining row.
 
 Every span a layer attends over must be declared with its own label (default: one
 ``"main"`` segment per request); ``ragged_for(label)`` hands that span's kernel to the

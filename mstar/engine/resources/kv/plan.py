@@ -237,12 +237,15 @@ class KVPlanOutput:
     Output of KVManager.plan for a single label
     """
 
-    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+    __slots__ = (
+        "cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows",
+        "token_pages", "token_offsets",
+    )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
         cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
-        rows=None, view_builder=None,
+        rows=None, view_builder=None, token_pages=None, token_offsets=None,
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
@@ -257,6 +260,10 @@ class KVPlanOutput:
         # each row's write page and offset in it, so staging need not walk the views
         self.decode_pages = decode_pages
         self.decode_offsets = decode_offsets
+        # the same for a step of several tokens a row (a verify block) planned off the cache:
+        # each real row's tokens' write pages and offsets, padding rows left out
+        self.token_pages = token_pages
+        self.token_offsets = token_offsets
         # (request_id, label, to_compute) per view, for consumers that need no
         # pages or lengths (the position resource); None means read the views
         self.rows = rows
@@ -278,6 +285,8 @@ class KVPlanOutput:
     def is_decode(self) -> bool:
         if self.decode_pages is not None:
             return True
+        if self.token_pages is not None:
+            return False
         return all(view.to_compute == 1 for view in self.views)
 
 

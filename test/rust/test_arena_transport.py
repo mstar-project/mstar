@@ -899,6 +899,30 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
 
 
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.bool])
+def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, dtype):
+    """A CPU consumer's tensor is a copy: the producer reclaiming the slot and
+    staging another tensor into it must not change what was read."""
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path)
+    original = (torch.arange(3 * 16 * 24) % 7 == 3) if dtype == torch.bool else (
+        torch.arange(3 * 16 * 24) % 251).to(dtype)
+    original = original.reshape(1, 3, 16, 24)
+    infos = prod.store_and_return_tensor_info("r1", {"img": [original]})
+    prod.register_for_send("r1", infos["img"])
+    (info,) = infos["img"]
+    cons.start_read_tensors("r1", [GraphEdge(next_node="B", name="img", tensor_info=infos["img"])])
+    got = cons.tensor_store.get_tensor(info.uuid)
+    assert got.dtype == dtype and got.shape == original.shape and torch.equal(got, original)
+
+    location = prod._arena_locs[info.uuid]
+    prod._cleanup_by_uuid(info.uuid)
+    again = prod.store_and_return_tensor_info("r2", {"img": [torch.zeros_like(original)]})
+    prod.register_for_send("r2", again["img"])
+    assert prod._arena_locs[again["img"][0].uuid] == location, "the test needs the slot reused"
+    assert torch.equal(got, original), "the read aliased the producer's slot"
+
+
 def _is_mapped(ptr: int) -> bool:
     with open("/proc/self/maps") as f:
         for line in f:
