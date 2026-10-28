@@ -48,7 +48,7 @@ if os.environ.get("CIBUILDWHEEL") == "1":
     from setuptools_rust import Binding, RustBin, RustExtension, Strip
 
     # --locked: the checked-in Cargo.lock versions, not whatever resolves on
-    # the day (the license notices are collected from rust/server/Cargo.lock).
+    # the day; the license notices are collected from the same lockfiles.
     # Stripped: the symbols are unused at runtime and only bloat six wheels.
     wheel_build = {"cargo_manifest_args": ["--locked"], "strip": Strip.All}
     rust_extensions += [

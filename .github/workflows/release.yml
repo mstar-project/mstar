@@ -56,9 +56,11 @@ jobs:
       # wheels (without the file) while libzmq's license awaits sign-off.
       - name: Collect third-party licenses
         continue-on-error: ${{ github.event_name != 'release' }}
-        run: >-
-          cargo about generate --locked -c rust/about.toml
-          -m rust/server/Cargo.toml rust/about.hbs -o LICENSES-THIRD-PARTY.txt
+        run: |
+          cargo about generate --locked -c rust/about.toml -m rust/Cargo.toml \
+            rust/about.hbs -o LICENSES-THIRD-PARTY-mstar_rust.txt
+          cargo about generate --locked -c rust/about.toml -m rust/server/Cargo.toml \
+            rust/about.hbs -o LICENSES-THIRD-PARTY-mstar-server.txt
       - uses: pypa/cibuildwheel@v4.2.1
         env:
           # Version-specific rather than abi3, matching the extension that
@@ -91,8 +93,9 @@ jobs:
           check = """
           import importlib.metadata as md, mstar_rust, os, pathlib, subprocess, sys, sysconfig
           assert mstar_rust.__version__ == sys.argv[1], mstar_rust.__version__
-          licenses = 'LICENSES-THIRD-PARTY.txt'
-          assert not os.path.exists(licenses) or licenses in {f.name for f in md.files('mstar-ai')}
+          shipped = {f.name for f in md.files('mstar-ai')}
+          for licenses in ('LICENSES-THIRD-PARTY-mstar_rust.txt', 'LICENSES-THIRD-PARTY-mstar-server.txt'):
+              assert not os.path.exists(licenses) or licenses in shipped, licenses
           server = pathlib.Path(sysconfig.get_path('scripts')) / 'mstar-server'
           needed = subprocess.run(['readelf', '-d', server], capture_output=True, text=True, check=True).stdout
           assert 'libpython' not in needed, needed

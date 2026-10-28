@@ -48,9 +48,10 @@ Python transport and graph runtime.
   for CI, the release wheels and local builds. Bump it there.
 - **Third-party licenses.** Before building, the workflow runs
   [cargo-about](https://github.com/EmbarkStudios/cargo-about) with
-  `rust/about.toml` over `rust/server` (whose dependency tree contains
-  `rust/`'s) and writes `LICENSES-THIRD-PARTY.txt`, which ships in each Rust
-  wheel's `dist-info/licenses/`. A crate under a license not in `accepted`
+  `rust/about.toml` over `rust/` and over `rust/server` and writes
+  `LICENSES-THIRD-PARTY-mstar_rust.txt` and
+  `LICENSES-THIRD-PARTY-mstar-server.txt`, which ship in each Rust wheel's
+  `dist-info/licenses/`. A crate under a license not in `accepted`
   fails the `wheels` job. The C/C++ that crates vendor is declared there by
   hand (libzmq via zeromq-src, Oniguruma via onig_sys, esaxx via esaxx-rs);
   check those entries when bumping those crates.

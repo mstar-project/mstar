@@ -1,6 +1,7 @@
-# cargo-about config for LICENSES-THIRD-PARTY.txt, the notices for the Rust
+# cargo-about config for the LICENSES-THIRD-PARTY-*.txt notices of the Rust
 # crates (and the C/C++ they vendor) compiled into the Linux wheels. The release
-# workflow runs it on rust/server, whose dependency tree contains rust/'s.
+# workflow runs it once per binary: on rust/ for the mstar_rust extension and on
+# rust/server for mstar-server, which share most crates but not pyo3's.
 # A crate under any license not listed here fails the wheel build.
 accepted = [
     "Apache-2.0",
@@ -24,7 +25,8 @@ private = { ignore = true }
 workarounds = ["ring"]
 
 # The crate fields below cover only the Rust wrappers; these add the vendored
-# C/C++ sources that are compiled into the binaries.
+# C/C++ sources that are compiled into the binaries. onig_sys and esaxx-rs are
+# only in rust/server's tree, so the rust/ run warns that they are absent.
 
 # libzmq 4.3.4: LGPL-3.0 plus a static-linking exception appended to
 # COPYING.LESSER, and the BSD-3-Clause SHA-1 it compiles. The exception is
