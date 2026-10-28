@@ -29,10 +29,13 @@ class LoadedAdapter:
     """One adapter, ready to copy into a slot.
 
     ``a[target]`` is ``[target layers, slices * max_rank, in]`` and ``b[target]`` is
-    ``[target layers, out, max_rank]``, both already this rank's shard. A target the adapter
-    does not touch is absent. ``digest`` is ``adapter_digest`` of the unsharded weights, so
-    every rank agrees on it, computed as the API server computes the one it roots the
-    adapter's prefix-cache keys in.
+    ``[target layers, out, max_rank]``, both already this rank's shard; an experts target's
+    hold a pair per expert, ``[target layers, experts, ...]``. A target the adapter does not
+    touch is absent. ``layer_ranks[target]`` (int32 ``[target layers]``) is the slot's rank
+    at each layer: ``rank``, or 0 where this rank's shard of the layer's A or B is all
+    zero (it adds nothing), as the kernels read it. ``digest`` is ``adapter_digest`` of
+    the unsharded weights, so every rank agrees on it, computed as the API server computes
+    the one it roots the adapter's prefix-cache keys in.
     """
 
     name: str
@@ -41,6 +44,7 @@ class LoadedAdapter:
     scaling: float
     a: dict[str, torch.Tensor]
     b: dict[str, torch.Tensor]
+    layer_ranks: dict[str, torch.Tensor]
 
 
 def _maps(spec: LoraSpec, module: str) -> bool:
@@ -52,6 +56,7 @@ def _maps(spec: LoraSpec, module: str) -> bool:
         return False
     try:
         target.module_slices(ref.shard_id)
+        target.expert_of(ref.shard_id)
     except KeyError:
         return False
     return True
@@ -92,24 +97,6 @@ def misfit(spec: LoraSpec, module: str, a_shape, b_shape) -> str | None:
     )
 
 
-def inspect_adapter(spec: LoraSpec, path: str) -> AdapterInfo:
-    """Rank, unmapped and misfitting modules of the checkpoint at ``path``.
-
-    Reads only the safetensors header unless the model converts a native layout, which
-    needs the tensors.
-    """
-    if spec.convert_keys is None:
-        from safetensors import safe_open
-
-        with safe_open(path, "pt") as f:
-            return inspect_keys(spec, ((key, f.get_slice(key).get_shape()) for key in f.keys()))
-    adapter = read_lora_file(path, convert_keys=spec.convert_keys)
-    return _classify(spec, {
-        module: {"A": tuple(layer.a.shape), "B": tuple(layer.b.shape)}
-        for module, layer in adapter.layers.items()
-    })
-
-
 def adapter_targets(spec: LoraSpec, path: str) -> set[str]:
     """The targets of ``spec`` the checkpoint at ``path`` holds LoRA weights for."""
     if spec.convert_keys is None:
@@ -128,41 +115,37 @@ def adapter_targets(spec: LoraSpec, path: str) -> set[str]:
     }
 
 
-def inspect_keys(spec: LoraSpec, items) -> AdapterInfo:
-    """``inspect_adapter`` over ``(checkpoint key, shape)`` pairs, as a header lists them."""
-    shapes: dict[str, dict[str, tuple[int, ...]]] = {}
-    for key, shape in items:
-        # a key no plain LoRA has (DoRA, modules_to_save, ...) raises a refusal, named
-        module, kind = parse_lora_key(normalize_lora_key(key))
-        if kind != "alpha":
-            shapes.setdefault(module, {})[kind] = tuple(shape)
-    return _classify(spec, shapes)
-
-
-def _classify(spec: LoraSpec, shapes: dict[str, dict[str, tuple[int, ...]]]) -> AdapterInfo:
+def classify_adapter(spec: LoraSpec, shapes: dict[str, dict[str, tuple[int, ...]]]) -> AdapterInfo:
+    """Rank, unmapped and misfitting modules of an adapter, from each module's A and B
+    shapes (both present, as ``read_lora_file`` requires)."""
     unmapped, misfits = [], []
     for module, ab in shapes.items():
+        if ab["A"][0] == 0:
+            # its alpha / r has no value to fold into the slot's one scaling
+            raise ValueError(f"LoRA module {module} has rank 0")
         if _ignored(spec, module):
             continue
         if not _maps(spec, module):
             unmapped.append(module)
-        elif "A" in ab and "B" in ab:
-            error = misfit(spec, module, ab["A"], ab["B"])
-            if error is not None:
-                misfits.append(error)
+        elif (error := misfit(spec, module, ab["A"], ab["B"])) is not None:
+            misfits.append(error)
     return AdapterInfo(
-        rank=max((ab["A"][0] for ab in shapes.values() if "A" in ab), default=0),
+        rank=max((ab["A"][0] for ab in shapes.values()), default=0),
         unmapped=tuple(sorted(unmapped)),
         misfits=tuple(sorted(misfits)),
     )
 
 
 def check_adapter_file(spec: LoraSpec, name: str, path: str) -> bytes:
-    """The adapter at ``path`` checked against ``spec`` and read as a worker reads it
-    (shapes against the targets included); returns its digest. Raises ``ValueError``
-    for an adapter the deployment cannot serve."""
-    spec.check_adapter(name, inspect_adapter(spec, path))
-    return LoraAdapterStore(spec, pin=False, dtype=torch.float32).read(name, path).digest
+    """The adapter at ``path`` checked against ``spec`` and its digest, which a worker's
+    read holds the file to; the digest is of the read that was checked. Raises
+    ``ValueError`` for an adapter the deployment cannot serve."""
+    raw = read_lora_file(path, convert_keys=spec.convert_keys)
+    spec.check_adapter(name, classify_adapter(spec, {
+        module: {"A": tuple(layer.a.shape), "B": tuple(layer.b.shape)}
+        for module, layer in raw.layers.items()
+    }))
+    return adapter_digest(raw)
 
 
 def check_adapters(spec: LoraSpec) -> dict[str, bytes]:
@@ -219,59 +202,32 @@ class LoraAdapterStore:
             self._adapters.move_to_end(name)
         return adapter
 
-    def load(self, name: str, path: str, digest: bytes | None = None) -> LoadedAdapter:
+    def load(self, name: str, path: str, digest: bytes) -> LoadedAdapter:
         """The adapter under ``name``, read from ``path`` unless it is already held."""
         adapter = self.get(name)
         if adapter is not None:
             return adapter
         return self.put(self.read(name, path, digest))
 
-    def read(self, name: str, path: str, digest: bytes | None = None) -> LoadedAdapter:
-        """``path`` read, checked against the spec and sharded for this rank, without
-        holding it: a caller can read outside whatever lock guards ``put``. With
-        ``digest``, weights that digest otherwise are refused: the file changed since the
-        adapter was checked and keyed, and serving it would put other weights under the
-        same prefix-cache root, or different weights on different ranks."""
-        adapter = self._read(name, path)
-        if digest is not None and adapter.digest != digest:
-            raise ValueError(
-                f"LoRA adapter {name!r} changed on disk since it was loaded (digest "
-                f"{adapter.digest.hex()[:16]}, expected {digest.hex()[:16]}); load it again"
-            )
-        return adapter
-
-    def put(self, adapter: LoadedAdapter, keep: Collection[str] = ()) -> LoadedAdapter:
-        """Hold ``adapter``, dropping the least recently used past ``capacity``, but none
-        named in ``keep`` (which may hold the tier past capacity for a while)."""
-        self._adapters[adapter.name] = adapter
-        self._adapters.move_to_end(adapter.name)
-        excess = len(self._adapters) - self._spec.cpu_capacity
-        if excess > 0:
-            for dropped in [n for n in self._adapters if n not in keep and n != adapter.name][:excess]:
-                del self._adapters[dropped]
-                logger.info("LoRA store: dropped %s from the host tier", dropped)
-        return adapter
-
-    def drop(self, name: str) -> None:
-        self._adapters.pop(name, None)
-
-    def _read(self, name: str, path: str) -> LoadedAdapter:
+    def read(self, name: str, path: str, digest: bytes) -> LoadedAdapter:
+        """``path`` read and sharded for this rank, without holding it: a caller can read
+        outside whatever lock guards ``put``. ``digest`` is of the weights
+        ``check_adapter_file`` checked against the spec, so a read that digests the same
+        holds checked weights; one that digests otherwise is refused before anything is
+        staged: the file changed since the adapter was checked and keyed, and serving it
+        would put other weights under the same prefix-cache root, or different weights
+        on different ranks."""
         spec = self._spec
         raw = read_lora_file(path, convert_keys=spec.convert_keys)
-        if not raw.layers:
-            raise ValueError(f"LoRA adapter {name!r} holds no LoRA layers")
+        read_digest = adapter_digest(raw)
+        if read_digest != digest:
+            raise ValueError(
+                f"LoRA adapter {name!r} changed on disk since it was loaded (digest "
+                f"{read_digest.hex()[:16]}, expected {digest.hex()[:16]}); load it again"
+            )
         # modules another node's pool loads (or the deployment never runs) are not this one's
         modules = sorted(m for m in raw.layers if not _ignored(spec, m))
-        unmapped = [m for m in modules if not _maps(spec, m)]
-        if unmapped:
-            raise ValueError(
-                f"LoRA adapter {name!r} touches modules with no declared target: {unmapped[:5]}"
-            )
         rank = max((raw.layers[m].a.shape[0] for m in modules), default=0)
-        if rank > spec.max_rank:
-            raise ValueError(
-                f"LoRA adapter {name!r} has rank {rank}, above max_rank {spec.max_rank}"
-            )
         # One scaling per slot; a module whose alpha / r differs has the ratio folded
         # into its B (PEFT's rank_pattern / alpha_pattern, Kohya's per-module alphas).
         # The slot's is the first nonzero one, so the fold never divides by zero (an
@@ -283,23 +239,32 @@ class LoraAdapterStore:
         R = spec.max_rank
         a_host: dict[str, torch.Tensor] = {}
         b_host: dict[str, torch.Tensor] = {}
+        # [target layers] bool: whether this rank's shard of the layer's A / B is nonzero
+        a_live: dict[str, torch.Tensor] = {}
+        b_live: dict[str, torch.Tensor] = {}
         for module in modules:
             layer = raw.layers[module]
             ref = spec.module_map(module)
             target = spec.targets[ref.target]
             sharded = self._sharded[ref.target]
             if ref.target not in a_host:
-                rows = len(self._layer_rows[ref.target])
+                # in the slots' dtype and pinned from the start: an experts target's
+                # tensors are GBs, which a staged copy would hold twice
+                lead = (len(self._layer_rows[ref.target]),)
+                if target.experts > 1:
+                    lead += (target.experts,)
                 a_host[ref.target] = torch.zeros(
-                    rows, sharded.num_slices * R, sharded.in_features, dtype=torch.float32,
+                    *lead, sharded.num_slices * R, sharded.in_features, dtype=self._dtype, pin_memory=self._pin,
                 )
                 b_host[ref.target] = torch.zeros(
-                    rows, sharded.out_features, R, dtype=torch.float32,
+                    *lead, sharded.out_features, R, dtype=self._dtype, pin_memory=self._pin,
                 )
-            row = self._layer_rows[ref.target][ref.layer]
-            error = misfit(spec, module, layer.a.shape, layer.b.shape)
-            if error is not None:
-                raise ValueError(f"LoRA adapter {name!r} does not fit this model: {error}")
+                a_live[ref.target] = torch.zeros(lead[0], dtype=torch.bool)
+                b_live[ref.target] = torch.zeros(lead[0], dtype=torch.bool)
+            # the layer's row of the target's storage, and the expert's in it
+            at = (self._layer_rows[ref.target][ref.layer],)
+            if target.experts > 1:
+                at += (target.expert_of(ref.shard_id),)
             a = layer.a.float().reshape(as_linear(layer.a.shape))
             b = layer.b.float().reshape(as_linear(layer.b.shape))
             r = a.shape[0]
@@ -316,21 +281,39 @@ class LoraAdapterStore:
                 a_r, b_r = target.shard_pair(i, a, b_i, self._rank, self._world_size)
                 # past b_r's rows, a slice's alignment padding (if any) stays zero
                 offset = sum(sharded.out_slices[:i])
-                a_host[ref.target][row, i * R:i * R + r] = a_r
-                b_host[ref.target][row, offset:offset + b_r.shape[0], :r] = b_r
-
-        def host(t: torch.Tensor) -> torch.Tensor:
-            t = t.to(self._dtype)
-            return t.pin_memory() if self._pin else t
+                a_host[ref.target][(*at, slice(i * R, i * R + r))] = a_r
+                b_host[ref.target][(*at, slice(offset, offset + b_r.shape[0]), slice(0, r))] = b_r
+                a_live[ref.target][at[0]] |= bool(a_r.any())
+                b_live[ref.target][at[0]] |= bool(b_r.any())
 
         logger.info(
             "LoRA store: read %s (rank %d, %d modules, scaling %.4g)", name, rank, len(modules), scaling,
         )
         return LoadedAdapter(
             name=name,
-            digest=adapter_digest(raw),
+            digest=read_digest,
             rank=rank,
             scaling=scaling,
-            a={t: host(v) for t, v in a_host.items()},
-            b={t: host(v) for t, v in b_host.items()},
+            a=a_host,
+            b=b_host,
+            layer_ranks={t: _pinned((a_live[t] & b_live[t]).to(torch.int32) * rank, self._pin) for t in a_host},
         )
+
+    def put(self, adapter: LoadedAdapter, keep: Collection[str] = ()) -> LoadedAdapter:
+        """Hold ``adapter``, dropping the least recently used past ``capacity``, but none
+        named in ``keep`` (which may hold the tier past capacity for a while)."""
+        self._adapters[adapter.name] = adapter
+        self._adapters.move_to_end(adapter.name)
+        excess = len(self._adapters) - self._spec.cpu_capacity
+        if excess > 0:
+            for dropped in [n for n in self._adapters if n not in keep and n != adapter.name][:excess]:
+                del self._adapters[dropped]
+                logger.info("LoRA store: dropped %s from the host tier", dropped)
+        return adapter
+
+    def drop(self, name: str) -> None:
+        self._adapters.pop(name, None)
+
+
+def _pinned(t: torch.Tensor, pin: bool) -> torch.Tensor:
+    return t.pin_memory() if pin else t

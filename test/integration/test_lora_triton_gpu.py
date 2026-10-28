@@ -354,6 +354,7 @@ def test_kernels_match_the_reference(op, max_rank, in_features, slices, tokens):
     scalings = torch.rand(slots, generator=g, device="cuda") + 0.5
     token_slots = torch.randint(0, slots, (tokens,), generator=g, device="cuda")
     order, indptr = slot_layout(token_slots, slots)
+    addressing = (order, indptr, token_slots.to(torch.int32))
     y0 = torch.randn(tokens, out_features, generator=g, device="cuda")
     want, got = y0.clone(), y0.to(torch.bfloat16)
     untouched = (token_slots == 0) | (token_slots == 3)  # the zero adapter and the rank-0 slot
@@ -361,15 +362,15 @@ def test_kernels_match_the_reference(op, max_rank, in_features, slices, tokens):
         ids = torch.randint(0, in_features, (tokens,), generator=g, device="cuda")
         ids[::5], ids[3::7] = -1, in_features + 11
         untouched |= (ids < 0) | (ids >= in_features)
-        h_ref = ref_ops.gather_shrink_reference(ids, a, order, indptr, ranks)
-        h = ops.lora_gather_shrink(ids, a.to(torch.bfloat16), order, indptr, ranks)
-        ops.lora_expand_(got, h, b.to(torch.bfloat16), order, indptr, ranks, scalings, list(slices))
+        h_ref = ref_ops.gather_shrink_reference(ids, a, addressing[2], ranks)
+        h = ops.lora_gather_shrink(ids, a.to(torch.bfloat16), addressing[2], ranks)
+        ops.lora_expand_(got, h, b.to(torch.bfloat16), *addressing, ranks, scalings, list(slices))
     else:
         x = torch.randn(tokens, in_features, generator=g, device="cuda")
-        h_ref = ref_ops.shrink_reference(x, a, order, indptr, ranks, len(slices))
-        ops.lora_apply_(got, x.to(torch.bfloat16), a.to(torch.bfloat16), b.to(torch.bfloat16), order, indptr,
+        h_ref = ref_ops.shrink_reference(x, a, addressing[2], ranks, len(slices))
+        ops.lora_apply_(got, x.to(torch.bfloat16), a.to(torch.bfloat16), b.to(torch.bfloat16), *addressing,
                         ranks, scalings, list(slices))
-    ref_ops.expand_reference_(want, h_ref, b, order, indptr, ranks, scalings, list(slices))
+    ref_ops.expand_reference_(want, h_ref, b, addressing[2], ranks, scalings, list(slices))
     check(got.float() - y0.to(torch.bfloat16).float(), want - y0, op)
     assert torch.equal(got[untouched], y0.to(torch.bfloat16)[untouched])
 
@@ -384,11 +385,12 @@ def test_a_tiled_rank_inside_a_captured_graph():
     scalings = torch.rand(slots, generator=g, device="cuda") + 0.5
     ranks = torch.zeros(slots, dtype=torch.int32, device="cuda")
     order, indptr = slot_layout(torch.zeros(tokens, dtype=torch.long, device="cuda"), slots)
+    token_slot = torch.zeros(tokens, dtype=torch.int32, device="cuda")  # the Triton kernels read order / indptr
     x, y = torch.zeros(tokens, in_features, **BF16), torch.zeros(tokens, sum(slices), **BF16)
 
     def run():
         out = y.clone()
-        ops.lora_apply_(out, x, a, b, order, indptr, ranks, scalings, slices)
+        ops.lora_apply_(out, x, a, b, order, indptr, token_slot, ranks, scalings, slices)
         return out
 
     graph, out = capture(run)
@@ -404,3 +406,175 @@ def test_a_tiled_rank_inside_a_captured_graph():
         assert torch.equal(out, eager), f"replay differs from eager for ranks {mix_ranks}"
         if not any(mix_ranks):
             assert torch.equal(out, y)
+
+
+@pytest.mark.parametrize("tokens,top_k,stage", [(1, 8, "gate_up"), (37, 8, "gate_up"), (300, 8, "gate_up"),
+                                                 (5, 8, "down"), (300, 8, "down")])
+def test_experts_kernels_match_the_reference(tokens, top_k, stage):
+    """``apply_experts_`` on the fused-MoE grouped GEMM (one align over combined ids, a shrink, an
+    accumulating expand per slice) at the Qwen3-Omni Thinker's TP1 shapes against the fp32 reference,
+    over 7 slots of 128 experts with rows on no id (the zero adapter, a skipped expert)."""
+    g = torch.Generator(device="cuda").manual_seed(tokens + top_k)
+    hidden, inter, rank, num_ids = 2048, 768, 16, 7 * 128
+    gate_up = stage == "gate_up"
+    in_features, slices = (hidden, (inter, inter)) if gate_up else (inter, (hidden,))
+    a = torch.randn(num_ids, len(slices) * rank, in_features, generator=g, device="cuda") / in_features ** 0.5
+    b = torch.randn(num_ids, sum(slices), rank, generator=g, device="cuda") / rank ** 0.5
+    ids = torch.randint(0, num_ids + 1, (tokens, top_k), generator=g, device="cuda", dtype=torch.int32)
+    ids[::3, 0] = num_ids  # rows that get nothing
+    weight = torch.rand(tokens, top_k, generator=g, device="cuda") + 0.5
+    x = torch.randn(tokens if gate_up else tokens * top_k, in_features, generator=g, device="cuda")
+    x_top_k = top_k if gate_up else 1
+    y0 = torch.randn(tokens * top_k, sum(slices), generator=g, device="cuda")
+    want = y0.clone()
+    ref_ops.TorchLoraBackend().apply_experts_(x, want, a, b, ids, weight, x_top_k, slices)
+    backend = TritonLoraBackend()
+    got = y0.to(torch.bfloat16)
+    alignment = backend.align_experts(ids, num_ids)
+    backend.apply_experts_(x.to(torch.bfloat16), got, a.to(torch.bfloat16), b.to(torch.bfloat16), ids, weight,
+                           x_top_k, slices, alignment)
+    check(got.float() - y0.to(torch.bfloat16).float(), want - y0, f"experts {stage}")
+    untouched = (ids.reshape(-1) == num_ids)
+    assert torch.equal(got[untouched], y0.to(torch.bfloat16)[untouched])
+
+
+# a small MoE layer: experts, hidden, intermediate, top-k, adapter rank
+MOE_E, MOE_HIDDEN, MOE_INTER, MOE_TOP_K, MOE_RANK = 8, 256, 128, 2, 8
+
+
+def write_experts_adapter(path, seed):
+    """Per-expert PEFT factors on every expert's gate / up / down (alpha = rank, so scaling 1);
+    returns each ``(expert, proj)``'s ``B @ A``."""
+    g = torch.Generator().manual_seed(seed)
+    sd, ref = {}, {}
+    for e in range(MOE_E):
+        for proj, (out, inp) in (("gate", (MOE_INTER, MOE_HIDDEN)), ("up", (MOE_INTER, MOE_HIDDEN)),
+                                 ("down", (MOE_HIDDEN, MOE_INTER))):
+            a, b = torch.randn(MOE_RANK, inp, generator=g) / inp ** 0.5, torch.randn(out, MOE_RANK, generator=g)
+            module = f"base_model.model.layers.0.mlp.experts.{e}.{proj}_proj"
+            sd[f"{module}.lora_A.weight"], sd[f"{module}.lora_B.weight"] = a, b
+            sd[f"{module}.alpha"] = torch.tensor(float(MOE_RANK))
+            ref[(e, proj)] = b @ a
+    save_file(sd, str(path))
+    return ref
+
+
+def experts_layers(paths):
+    """A bound ``FusedExperts`` on a two-slot Triton pool, and the same experts unbound."""
+    import re
+
+    from mstar.engine.resources.lora.config import LoraModuleRef, LoraSpec
+    from mstar.model.components.lora.capable import make_lora_capable
+    from mstar.model.components.moe import FusedExperts
+
+    plain = FusedExperts(num_experts=MOE_E, hidden_size=MOE_HIDDEN, intermediate_size=MOE_INTER).to(**BF16)
+    g = torch.Generator(device="cuda").manual_seed(5)
+    for p in plain.parameters():
+        p.data.copy_(torch.randn(p.shape, generator=g, device="cuda") / p.shape[-1] ** 0.5)
+
+    def place(module):
+        m = re.fullmatch(r"layers\.0\.mlp\.experts\.(\d+)\.(gate|up|down)_proj", module)
+        if m is None:
+            return None
+        param = "down_proj" if m[2] == "down" else "gate_up_proj"
+        return LoraModuleRef(f"experts_{param}", 0, f"{m[2]}:{m[1]}", param)
+
+    spec = LoraSpec(
+        resource_key="lora", nodes={"N"}, num_layers=1, module_map=place, max_slots=2, max_rank=MOE_RANK,
+        targets={f"experts_{p}": t for p, t in plain.lora_targets().items()}, adapters=dict(paths), backend="triton",
+    )
+    spec.adapter_digests = {name: adapter_digest(read_lora_file(path)) for name, path in paths.items()}
+    pool = LoraAdapterPool(spec, "cuda", dtype=torch.bfloat16)
+    bound = FusedExperts(num_experts=MOE_E, hidden_size=MOE_HIDDEN, intermediate_size=MOE_INTER).to(**BF16)
+    bound.load_state_dict(plain.state_dict())
+    make_lora_capable(bound).lora_params = {
+        p: pool.layer_delta(f"experts_{p}", 0) for p in ("gate_up_proj", "down_proj")
+    }
+    return pool, bound, plain
+
+
+def merged_delta(plain, ref, x, weights, ids):
+    """fp32: the experts' output with each expert's adapter merged into it, less the base's."""
+    from mstar.model.components.moe import dispatch_experts_fused
+
+    gate_up, down = plain.gate_up_proj.float(), plain.down_proj.float()
+    merged_gate_up, merged_down = gate_up.clone(), down.clone()
+    for e in range(MOE_E):
+        merged_gate_up[e, :MOE_INTER] += ref[(e, "gate")].cuda()
+        merged_gate_up[e, MOE_INTER:] += ref[(e, "up")].cuda()
+        merged_down[e] += ref[(e, "down")].cuda()
+
+    def run(w1, w2):
+        return dispatch_experts_fused(x.float(), w1, w2, MOE_E, ids, weights.float())
+
+    return run(merged_gate_up, merged_down) - run(gate_up, down)
+
+
+def routed(tokens, g):
+    x = torch.randn(tokens, MOE_HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    probs = torch.softmax(torch.randn(tokens, MOE_E, generator=g, device="cuda"), dim=-1)
+    weights, ids = torch.topk(probs, MOE_TOP_K, dim=-1)
+    return x, weights, ids
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_bound_experts_match_each_rows_merged_adapter(tmp_path, captured):
+    """A bound ``FusedExperts`` through ``fused_experts(lora=)`` (gate/up delta before the SwiGLU,
+    routing-weighted down delta before the top-k sum), two adapters and base rows in one batch,
+    against each row's adapter merged into its experts in fp32: eagerly, and inside one captured
+    graph replayed for other adapter mixes. Base rows (and bucket padding) are bitwise the unbound
+    layer's."""
+    paths, refs = {}, {}
+    for name, seed in (("e1", 1), ("e2", 2)):
+        paths[name] = str(tmp_path / f"{name}.safetensors")
+        refs[name] = write_experts_adapter(paths[name], seed)
+    pool, bound, plain = experts_layers(paths)
+    g = torch.Generator(device="cuda").manual_seed(17)
+
+    def compare(mix, out, base, x, weights, ids):
+        at = 0
+        for _, name, n in mix:
+            rows = slice(at, at + n)
+            if name is None:
+                assert torch.equal(out[rows], base[rows]), "base rows changed"
+            else:
+                want = merged_delta(plain, refs[name], x[rows], weights[rows], ids[rows])
+                check(out[rows].float() - base[rows].float(), want, f"experts {name}")
+            at += n
+
+    mixes = [[("m0", "e1", 9), ("m1", None, 1), ("m2", "e2", 20)], [("m3", "e2", 5), ("m4", None, 30)]]
+    if not captured:
+        for mix in mixes:
+            step, ctx = eager_step(pool, mix)
+            x, weights, ids = routed(sum(n for *_, n in mix), g)
+            with torch.no_grad():
+                out, base = bound(x, weights, ids), plain(x, weights, ids)
+            pool.commit(step, ctx)
+            compare(mix, out, base, x, weights, ids)
+            for rid, *_ in mix:
+                pool.remove_request(rid)
+        return
+    lease = SlotLease(slot=0, bucket=BucketKey("prefill_text", BUCKET_BS, BUCKET_TOKENS))
+    for i in range(BUCKET_BS):
+        pool.ingest_capture_row(-(i + 1))
+    bucket_step(pool, [(-(i + 1), BUCKET_TOKENS // BUCKET_BS) for i in range(BUCKET_BS)], lease, capturing=True)
+    x, weights, ids = routed(BUCKET_TOKENS, g)
+
+    def forward():
+        with torch.no_grad():
+            return bound(x, weights, ids), plain(x, weights, ids)
+
+    graph, (out, base) = capture(forward)
+    for mix in mixes:
+        for rid, name, _ in mix:
+            pool.ingest_request(rid, None if name is None else LoraReqConfig(adapter=name))
+        bucket_step(pool, [(rid, n) for rid, _, n in mix], lease)
+        for static, fresh in zip((x, weights, ids), routed(BUCKET_TOKENS, g), strict=True):
+            static.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        real = sum(n for *_, n in mix)
+        compare(mix, out, base, x, weights, ids)
+        assert torch.equal(out[real:], base[real:]), "bucket padding took a delta"
+        for rid, *_ in mix:
+            pool.remove_request(rid)

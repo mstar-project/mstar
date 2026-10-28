@@ -51,6 +51,7 @@ flag on the block.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -58,6 +59,11 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.engine.resources.lora.config import LoraTarget
+from mstar.model.components.lora.capable import LoraBound, LoraCapable
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.lora.pool import ExpertRows, LoraLayerDelta
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +148,7 @@ def dispatch_experts_fused(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
     skip_invalid: bool = False,
+    lora: ExpertsLora | None = None,
 ) -> torch.Tensor:
     """Naive per-expert dispatch using the fused HF checkpoint layout.
 
@@ -158,6 +165,8 @@ def dispatch_experts_fused(
         skip_invalid: set when ``selected_experts`` may hold the sentinel
             ``num_experts`` (a padding row's, or another EP rank's expert);
             those slots contribute nothing.
+        lora: per-request LoRA deltas on the experts, as ``fused_experts``
+            adds them.
     """
     final_hidden_states = torch.zeros_like(hidden_states)
 
@@ -169,14 +178,22 @@ def dispatch_experts_fused(
         expert_mask = expert_mask[..., :num_experts].permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
+    top_k = selected_experts.shape[-1]
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t[0]
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states[token_idx]
+        # the (token, top-k) rows of fused_experts' caches these are
+        gathered = token_idx * top_k + top_k_pos
 
         gate_up = torch.mm(current_state, gate_up_proj[expert_idx].T)
+        if lora is not None:
+            lora.gate_up_(current_state, gate_up, gathered=gathered)
         gate, up = gate_up.chunk(2, dim=-1)
-        current_hidden_states = torch.mm(F.silu(gate) * up, down_proj[expert_idx].T)
+        act = F.silu(gate) * up
+        current_hidden_states = torch.mm(act, down_proj[expert_idx].T)
+        if lora is not None:
+            lora.down_(act, current_hidden_states, gathered=gathered)
         current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
         final_hidden_states.index_add_(
             0, token_idx, current_hidden_states.to(final_hidden_states.dtype),
@@ -207,7 +224,62 @@ def _sync_routing(
     return packed[:, top_k:].to(routing_weights.dtype), packed[:, :top_k].long()
 
 
-class FusedExperts(nn.Module):
+class ExpertsLora:
+    """One MoE layer's per-request expert deltas over this step, as ``fused_experts`` and
+    ``dispatch_experts_fused`` add them: ``gate_up_`` onto the gate+up GEMM's output
+    before the activation, ``down_`` onto the down GEMM's before the top-k sum, scaled by
+    the routing weight as the base output is. Each row's factors are those ``rows``
+    (``LoraLayerDelta.expert_rows``) address."""
+
+    __slots__ = ("gate_up", "down", "rows")
+
+    def __init__(self, gate_up: LoraLayerDelta | None, down: LoraLayerDelta | None, rows: ExpertRows):
+        self.gate_up, self.down, self.rows = gate_up, down, rows
+
+    def gate_up_(self, x: torch.Tensor, y: torch.Tensor, gathered: torch.Tensor | None = None) -> None:
+        """``y [tokens * top_k, 2 * inter]`` += each row's gate and up deltas of ``x
+        [tokens, hidden]``; with ``gathered``, ``x`` and ``y`` hold only those (token,
+        top-k) rows, in that order (the naive dispatch's per-expert gather)."""
+        if self.gate_up is not None:
+            self._add(self.gate_up, x, y, self.rows.scale[:, None], gathered, top_k=self.rows.ids.shape[1])
+
+    def down_(
+        self, x: torch.Tensor, y: torch.Tensor, routing_weights: torch.Tensor | None = None,
+        gathered: torch.Tensor | None = None,
+    ) -> None:
+        """``y [tokens * top_k, hidden]`` += each row's down delta of ``x [tokens * top_k,
+        inter]``, times its routing weight when ``y`` already carries it (the fused
+        kernel's); with ``gathered``, as in ``gate_up_``."""
+        if self.down is None:
+            return
+        weight = self.rows.scale[:, None]
+        if routing_weights is not None:
+            weight = routing_weights.float() * weight
+        self._add(self.down, x, y, weight, gathered, top_k=1)
+
+    def _add(self, delta: LoraLayerDelta, x, y, weight, gathered, top_k: int) -> None:
+        ids = self.rows.ids
+        weight = weight.expand(ids.shape)
+        if gathered is None:
+            delta.grouped_(x, y, ids, weight.contiguous(), top_k, self.rows.alignment)
+        else:
+            delta.grouped_(x, y, ids.reshape(-1)[gathered], weight.reshape(-1)[gathered], 1)
+
+
+class _LoraExperts(LoraBound):
+    """Bound experts: the deltas on ``gate_up_proj`` and / or ``down_proj``
+    (``lora_params``) join the dispatch, which adds them after each grouped GEMM: before
+    the activation, and (routing-weighted) before the top-k sum and the all-reduce."""
+
+    def _dispatch(self, hidden_states, routing_weights, selected_experts, skip_invalid):
+        gate_up, down = self.lora_params.get("gate_up_proj"), self.lora_params.get("down_proj")
+        bound = [d for d in (gate_up, down) if d is not None]
+        rows = bound[0].expert_rows(selected_experts, bound[1:]) if bound else None
+        lora = None if rows is None else ExpertsLora(gate_up, down, rows)
+        return super()._dispatch(hidden_states, routing_weights, selected_experts, skip_invalid, lora=lora)
+
+
+class FusedExperts(nn.Module, LoraCapable):
     """The routed experts of one MoE layer and their dispatch: ``E`` SwiGLU MLPs stacked
     in the fused checkpoint layout, ``gate_up_proj (E_local, 2 * inter_local, hidden)``
     (gate rows, then up) and ``down_proj (E_local, hidden, inter_local)``.
@@ -219,7 +291,12 @@ class FusedExperts(nn.Module):
 
     :meth:`_dispatch` runs the kernel on these parameters. A fused layer that calls the
     kernel on them directly (Command-A+'s ``fused_branches``) does not go through it.
+
+    Each parameter is a LoRA target of its own (``lora_targets``), placed per expert by
+    the stacked-shard ids its loaders take (``"gate:N"`` / ``"up:N"`` / ``"down:N"``).
     """
+
+    lora_twin = _LoraExperts
 
     def __init__(
         self,
@@ -297,6 +374,25 @@ class FusedExperts(nn.Module):
         inter = param.shape[2]
         param.data[local] = loaded_weight[:, self.inter_start:self.inter_start + inter]
 
+    def lora_targets(self) -> dict[str | None, LoraTarget]:
+        """``gate_up_proj`` column-parallel over its gate and up slices, ``down_proj``
+        row-parallel, both per expert; ``expert_split`` says which experts this rank holds
+        when expert parallelism splits them."""
+        split = None
+        if self.num_local_experts != self.num_experts:
+            split = (self.expert_start, self.num_local_experts)
+        inter, experts = self.intermediate_size, self.num_experts
+        return {
+            "gate_up_proj": LoraTarget(
+                in_features=self.hidden_size, out_slices=(inter, inter), parallel="column",
+                slice_names=("gate", "up"), experts=experts, expert_split=split,
+            ),
+            "down_proj": LoraTarget(
+                in_features=inter, out_slices=(self.hidden_size,), parallel="row",
+                slice_names=("down",), experts=experts, expert_split=split,
+            ),
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -328,16 +424,18 @@ class FusedExperts(nn.Module):
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
         skip_invalid: bool,
+        lora: ExpertsLora | None = None,
     ) -> torch.Tensor:
-        """The fused Triton kernel on a GPU, else the naive loop, over local ids."""
+        """The fused Triton kernel on a GPU, else the naive loop, over local ids, adding
+        ``lora``'s deltas (the bound twin's) after each GEMM."""
         if _HAS_FUSED and hidden_states.is_cuda:
             return _fused_experts(
                 hidden_states, self.gate_up_proj, self.down_proj,
-                routing_weights, selected_experts, skip_invalid=skip_invalid,
+                routing_weights, selected_experts, skip_invalid=skip_invalid, lora=lora,
             )
         return dispatch_experts_fused(
             hidden_states, self.gate_up_proj, self.down_proj, self.num_local_experts,
-            selected_experts, routing_weights, skip_invalid=skip_invalid,
+            selected_experts, routing_weights, skip_invalid=skip_invalid, lora=lora,
         )
 
 

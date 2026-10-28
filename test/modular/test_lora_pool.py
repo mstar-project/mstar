@@ -16,6 +16,8 @@ from safetensors.torch import save_file  # noqa: E402
 
 from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
 from mstar.engine.resources.lora import LoraModuleRef, LoraReqConfig, LoraSpec, LoraTarget  # noqa: E402
+from mstar.engine.resources.lora.checkpoint import read_lora_file  # noqa: E402
+from mstar.engine.resources.lora.identity import adapter_digest  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
@@ -223,7 +225,7 @@ def test_a_request_selected_on_other_weights_than_the_pool_serves_is_refused(ada
     first's pages."""
     _, paths = adapters
     pool = make_pool({"a1": paths["a1"]})
-    digest = LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest
+    digest = adapter_digest(read_lora_file(paths["a1"]))
     pool.ingest_request("same", LoraReqConfig("a1", digest))
     with pytest.raises(ValueError, match="other weights"):
         pool.ingest_request("stale", LoraReqConfig("a1", b"\x00" * 32))
@@ -312,9 +314,10 @@ def test_capture_and_padding_rows_take_nothing_and_buffers_are_per_slot_key(adap
 def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
     _, paths = adapters
     spec = make_spec(paths)
-    whole = LoraAdapterStore(spec).load("a1", paths["a1"])
+    digests = spec.adapter_digests
+    whole = LoraAdapterStore(spec).load("a1", paths["a1"], digests["a1"])
     for rank in range(2):
-        part = LoraAdapterStore(spec, rank=rank, world_size=2).load("a1", paths["a1"])
+        part = LoraAdapterStore(spec, rank=rank, world_size=2).load("a1", paths["a1"], digests["a1"])
         # qkv: B rows split per slice, A whole; o: A columns split, B whole
         torch.testing.assert_close(part.b["qkv"][:, :8], whole.b["qkv"][:, rank * 8:(rank + 1) * 8])
         torch.testing.assert_close(part.b["qkv"][:, 8:12], whole.b["qkv"][:, 16 + rank * 4:16 + (rank + 1) * 4])
@@ -324,9 +327,9 @@ def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
         assert part.digest == whole.digest
     store = LoraAdapterStore(make_spec(paths, cpu_capacity=2))
     for name in ("a1", "a2"):
-        store.load(name, paths[name])
+        store.load(name, paths[name], digests[name])
     store.get("a1")  # a1 now most recent
-    store.load("a3", paths["a3"])
+    store.load("a3", paths["a3"], digests["a3"])
     assert "a1" in store and "a3" in store and "a2" not in store
     assert store.get("a3").digest != whole.digest == store.get("a1").digest
 

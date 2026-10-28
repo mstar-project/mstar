@@ -211,12 +211,13 @@ class Qwen3OmniModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
     def _lora_spec(self) -> LoraSpec:
-        """Per-request adapters on the Thinker: its attention, any dense MLP layers and
-        the LM head (one row per request: the last token's). The routed experts and the
-        router take none (packed expert tensors, run by the fused-MoE kernel), so an
-        adapter touching them is refused with that reason; so is one touching the
-        Talker or the encoders, which are other nodes. Modules are named as the full
-        model's checkpoint names them (``thinker.*``) or as the Thinker alone does."""
+        """Per-request adapters on the Thinker: its attention, any dense MLP layers, the
+        LM head (one row per request: the last token's), and the routed experts when the
+        YAML's ``targets:`` names them (``experts_gate_up_proj`` / ``experts_down_proj``,
+        opt-in). The router takes none, so an adapter touching it is refused with that
+        reason; so is one touching the Talker or the encoders, which are other nodes.
+        Modules are named as the full model's checkpoint names them (``thinker.*``) or as
+        the Thinker alone does."""
         from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
         return module_lora_spec(

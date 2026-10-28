@@ -3,7 +3,9 @@
 A LoRA-capable module (``LoraCapable``) describes its own target (``lora_target``),
 with the checkpoint's (unsharded) shapes and how the base splits them across
 tensor-parallel ranks, and its rank-local shape (``lora_local_shape``), which binding
-checks against the pool's shard of that target. Its forward knows nothing of LoRA.
+checks against the pool's shard of that target; a module with a target per stacked
+parameter (MoE experts) describes them in ``lora_targets``. Its forward knows nothing of
+LoRA.
 
 Binding a delta swaps the instance to its family's twin class (``lora_capability``), a
 ``LoraBound`` mixin over the same forward that adds the delta in place before anything
@@ -19,6 +21,8 @@ take the same swap, to ``LoraLinear`` / ``LoraPatchConvNd`` or a twin made for t
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import torch
@@ -53,6 +57,12 @@ class LoraCapable:
         ``token_fold``) and ``layers`` belong to the model's declaration, not here."""
         raise NotImplementedError
 
+    def lora_targets(self) -> dict[str | None, LoraTarget]:
+        """The module's targets by the parameter each adapts: one, under None, for a
+        module that is one target; one per stacked parameter for MoE experts, whose
+        rank-local shapes are the parameters' own (``[experts, out, in]``)."""
+        return {None: self.lora_target()}
+
     def lora_local_shape(self) -> tuple[int, int]:
         """``(in, out)`` of the delta on this rank: the input columns the module reads
         and the output columns it writes before any collective."""
@@ -68,6 +78,8 @@ class LoraBound:
     # module's own forward never adds it, since the node also calls the module outside
     # its planned step (e.g. embedding a prompt in ``prepare_inputs``)
     lora_deferred: "LoraLayerDelta | None" = None
+    # parameter -> its delta, for a module with a target per parameter (``lora_targets``)
+    lora_params: "Mapping[str, LoraLayerDelta]" = MappingProxyType({})
 
 
 class LoraOutputAdd(LoraBound):
@@ -145,6 +157,15 @@ def _twin(kind: type, mixin: type) -> type:
     return found
 
 
+def _twin_methods(twin: type) -> list[str]:
+    """The methods a family's twin defines over the module's own (``forward`` for a
+    linear's, ``_dispatch`` for MoE experts')."""
+    return sorted({
+        name for c in twin.__mro__ if c not in LoraBound.__mro__
+        for name, value in vars(c).items() if callable(value) and not name.startswith("__")
+    })
+
+
 class LoraCapability(NamedTuple):
     """How a module takes a LoRA delta: ``capable`` is the capable class it is, or is
     swapped to at bind; else ``reason`` says why it cannot."""
@@ -179,8 +200,14 @@ def lora_capability(module: nn.Module) -> LoraCapability | None:
         return LoraCapability(kind)
     if isinstance(module, LoraCapable):
         family = next(c for c in kind.__mro__ if "lora_twin" in c.__dict__)
-        if kind.forward is not family.forward:
-            return LoraCapability(None, f"{kind.__name__} subclasses {family.__name__} with a forward of its own")
+        # the twin overrides these (replacing them, or wrapping them through super()), so
+        # a subclass's own would be skipped or run outside the twin's contract
+        own = [
+            name for name in _twin_methods(family.lora_twin)
+            if getattr(kind, name, None) is not getattr(family, name, None)
+        ]
+        if own:
+            return LoraCapability(None, f"{kind.__name__} subclasses {family.__name__} with a {own[0]} of its own")
         return LoraCapability(_twin(kind, family.lora_twin))
     if isinstance(module, nn.Linear):
         if kind.forward is not nn.Linear.forward:

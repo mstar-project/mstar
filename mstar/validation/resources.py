@@ -5,6 +5,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.engine.resources.runner import topo_sort
 from mstar.engine.resources.spec import (
@@ -14,7 +15,7 @@ from mstar.engine.resources.spec import (
     unknown_overrides_message,
 )
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
-from mstar.model.base import Model, keyed_labels
+from mstar.model.base import Model, keyed_labels, node_moe_parallel_configs
 
 
 def check_resources(
@@ -33,6 +34,7 @@ def check_resources(
         except ValueError as e:
             problems.append(str(e))
     problems += _apply_overrides(specs, config)
+    problems += _expert_lora_split_by_ep(specs, config)
     problems += _uncacheable_positions(specs, model)
     problems += _unskippable_resources(specs, model)
     problems += _unknown_prefix_walks(model)
@@ -71,6 +73,30 @@ def _apply_overrides(
             by_key[key].apply_yaml_overrides(**kwargs)
         except (TypeError, ValueError) as e:
             yield f"resources.{key}: {e}"
+
+
+def _expert_lora_split_by_ep(specs: Sequence[NodeResourceSpec], config: Mapping[str, Any]) -> Iterator[str]:
+    """LoRA on MoE experts a node splits over its ranks by expert parallelism, which
+    binding refuses (it is served under TP only)."""
+    groups = config.get("node_groups") or []
+    try:
+        ep = {node for node, c in node_moe_parallel_configs(groups).items() if c.parallel == "ep"}
+        split = {node for ng in groups if ng.get("tp_size", 1) > 1 for node in ng["node_names"] if node in ep}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return  # a malformed node group is reported with the placement
+    for spec in specs:
+        if not isinstance(spec, LoraSpec):
+            continue
+        split_targets = sorted(
+            name for name, t in spec.targets.items()
+            if t.experts > 1 and split & ({t.node} if t.node else spec.nodes)
+        )
+        if split_targets:
+            yield (
+                f"resources.{spec.resource_key}: targets {split_targets} are LoRA on MoE experts, which "
+                f"{sorted(split & spec.nodes)} split by expert parallelism (`ep_config: parallel: ep`); serve them "
+                "with `parallel: tp`, or leave the experts targets out of `targets:`"
+            )
 
 
 def _uncacheable_positions(

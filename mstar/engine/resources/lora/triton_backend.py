@@ -33,6 +33,10 @@ import triton
 import triton.language as tl
 
 from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink
+from mstar.utils.fused_moe import MoeAlignment
+from mstar.utils.fused_moe.align import moe_align_block_size
+from mstar.utils.fused_moe.kernels import get_default_config, invoke_fused_moe_kernel
+from mstar.utils.fused_moe.runner import tl_compute_type
 
 # fused slices the expand kernel takes in one launch (q/k/v, gate/up, a delta-net's
 # q / k / v / z / a / b)
@@ -264,7 +268,7 @@ def _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices)
     )
 
 
-def _shrink_cuda(x, a, token_order, slot_indptr, ranks, num_slices):
+def _shrink_cuda(x, a, token_order, slot_indptr, token_slot, ranks, num_slices):
     tokens, in_features = x.shape
     h = x.new_empty(tokens, a.shape[1])
     if tokens == 0:
@@ -273,13 +277,13 @@ def _shrink_cuda(x, a, token_order, slot_indptr, ranks, num_slices):
     return h
 
 
-def _expand_cuda(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices):
+def _expand_cuda(y, h, b, token_order, slot_indptr, token_slot, ranks, scalings, out_slices):
     if y.shape[0] == 0:
         return
     _expand_from(y, h.unsqueeze(0), b, token_order, slot_indptr, ranks, scalings, out_slices)
 
 
-def _apply_cuda(y, x, a, b, token_order, slot_indptr, ranks, scalings, out_slices):
+def _apply_cuda(y, x, a, b, token_order, slot_indptr, token_slot, ranks, scalings, out_slices):
     tokens, in_features = x.shape
     if tokens == 0:
         return
@@ -302,4 +306,45 @@ lora_apply_.register_kernel("cuda")(_apply_cuda)
 
 
 class TritonLoraBackend(LoraOpsBackend):
-    """The custom ops with the kernels above registered for CUDA."""
+    """The custom ops with the kernels above registered for CUDA, and experts targets on
+    the fused-MoE grouped GEMM (``invoke_fused_moe_kernel``) over combined ids: one align
+    per MoE layer groups its rows by (slot, expert), a shrink writes ``h``, and an expand
+    per slice adds into the layer's cache (``accumulate``) scaled per row."""
+
+    def align_experts(self, ids, num_ids):
+        if not ids.is_cuda:
+            return None
+        block_m = _experts_config(ids, num_ids)["BLOCK_SIZE_M"]
+        return MoeAlignment(*moe_align_block_size(ids, block_m, num_ids), block_m)
+
+    def apply_experts_(self, x, y, a, b, ids, row_weight, top_k, out_slices, alignment=None):
+        if alignment is None:
+            super().apply_experts_(x, y, a, b, ids, row_weight, top_k, out_slices)
+            return
+        if y.shape[0] == 0:
+            return
+        config = _experts_config(ids, a.shape[0])
+        assert config["BLOCK_SIZE_M"] == alignment.block_m
+        sorted_ids, expert_ids, num_post_padded, _ = alignment
+        compute_type = tl_compute_type(x.dtype)
+        launch = dict(
+            topk_ids=ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
+            num_tokens_post_padded=num_post_padded, config=config, compute_type=compute_type,
+        )
+        max_rank = b.shape[-1]
+        h = x.new_empty(y.shape[0], a.shape[1])
+        invoke_fused_moe_kernel(x, a, h, row_weight, mul_routed_weight=False, top_k=top_k, **launch)
+        offset = 0
+        for i, width in enumerate(out_slices):
+            invoke_fused_moe_kernel(
+                h[:, i * max_rank:(i + 1) * max_rank], b[:, offset:offset + width], y[:, offset:offset + width],
+                row_weight, mul_routed_weight=True, top_k=1, accumulate=True, **launch,
+            )
+            offset += width
+
+
+def _experts_config(ids: torch.Tensor, num_ids: int) -> dict:
+    """The tiles of every LoRA GEMM over one layer's combined ids, which share one
+    alignment and so one ``BLOCK_SIZE_M``: the base kernel's defaults, which pick by token
+    and id counts alone."""
+    return get_default_config(M=ids.shape[0], E=num_ids, N=0, K=0, top_k=ids.shape[1])

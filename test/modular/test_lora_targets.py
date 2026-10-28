@@ -21,7 +21,17 @@ import torch.nn.functional as F
 from torch import nn
 
 pytest.importorskip("safetensors")
-from lora_module_helpers import DTYPE, compute, plan, pool, rand, run_ranks, serve, write_peft  # noqa: E402
+from lora_module_helpers import (  # noqa: E402
+    DTYPE,
+    compute,
+    header_info,
+    plan,
+    pool,
+    rand,
+    run_ranks,
+    serve,
+    write_peft,
+)
 from safetensors.torch import save_file  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
@@ -29,7 +39,7 @@ from mstar.distributed.utils import split_tensor_along_last_dim  # noqa: E402
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file  # noqa: E402
 from mstar.engine.resources.lora.config import describe_load_error  # noqa: E402
 from mstar.engine.resources.lora.ops import lora_gather_shrink  # noqa: E402
-from mstar.engine.resources.lora.store import inspect_adapter, inspect_keys  # noqa: E402
+from mstar.engine.resources.lora.store import check_adapter_file  # noqa: E402
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding  # noqa: E402
 from mstar.model.components.distributed.linear import (  # noqa: E402
     ColumnParallelLinear,
@@ -47,6 +57,7 @@ from mstar.model.components.lora.modules import (  # noqa: E402
     bind_module_lora,
     module_lora_spec,
 )
+from mstar.model.components.moe import FusedExperts  # noqa: E402
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
 from mstar.model.submodule_base import NodeSubmodule  # noqa: E402
 
@@ -469,6 +480,13 @@ class _OwnForward(nn.Linear):
         return super().forward(x) * 2
 
 
+class _OwnDispatch(FusedExperts):
+    """Keeps the forward but runs the kernel its own way, which the bound twin's would skip."""
+
+    def _dispatch(self, *args):
+        return super()._dispatch(*args) * 2
+
+
 def _with(module: nn.Module, change: Callable[[nn.Module], object]) -> nn.Module:
     change(module)
     return module
@@ -480,6 +498,8 @@ REFUSED = {
     "nn_embedding": (lambda: nn.Embedding(32, HIDDEN), "nn.Embedding"),
     "token_embedding_not_served": (lambda: VocabParallelEmbedding(32, HIDDEN), "a token embedding"),
     "subclass_forward": (lambda: _OwnForward(HIDDEN, HIDDEN), "a forward of its own"),
+    "subclass_dispatch": (lambda: _OwnDispatch(num_experts=4, hidden_size=HIDDEN, intermediate_size=4),
+                          "a _dispatch of its own"),
     "instance_forward": (lambda: _with(nn.Linear(HIDDEN, HIDDEN), lambda m: setattr(m, "forward", lambda x: x)),
                          "replaced on the instance"),
     "forward_hooks": (lambda: _with(nn.Linear(HIDDEN, HIDDEN), lambda m: m.register_forward_hook(lambda *a: None)),
@@ -503,10 +523,21 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
         "layers.0.bad": (rand(2, HIDDEN, seed=3), rand(HIDDEN, 2, seed=4)),
     })
     serve(spec, {"a": path})
-    info = inspect_adapter(spec, path)
-    assert info.unmapped == ("layers.0.bad",)
-    with pytest.raises(ValueError, match=re.escape(reason)):
-        spec.check_adapter("a", info)
+    with pytest.raises(ValueError, match=re.escape(reason)) as err:
+        check_adapter_file(spec, "a", path)
+    assert "layers.0.bad" in str(err.value)
+
+
+def test_a_deferred_pattern_over_moe_experts_is_refused():
+    """The experts' deltas join their dispatch, which a node adding them itself would skip."""
+    with torch.device("meta"):
+        root = nn.Module()
+        root.layers = nn.ModuleList([nn.Module()])
+        root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
+        root.layers[0].experts = FusedExperts(num_experts=4, hidden_size=HIDDEN, intermediate_size=4)
+    spec = module_lora_spec(lambda _: root, nodes={"N"}, root_path="", deferred=["layers.0.experts"])
+    with pytest.raises(ValueError, match=r"`deferred` matches .*layers\.0\.experts\.down_proj"):
+        spec.targets  # noqa: B018 - the walk runs on first read
 
 
 def test_a_deployment_without_a_lora_block_never_builds_the_root():
@@ -531,7 +562,7 @@ def test_a_deployment_without_a_lora_block_never_builds_the_root():
     assert set(spec.targets) == {"fc"} and len(built) == 1
 
 
-# --- the checkpoint: keys, scaling, header refusals ----------------------------------------
+# --- the checkpoint: keys, scaling, load refusals ------------------------------------------
 
 @pytest.mark.parametrize("key,want", [
     ("base_model.model.model.embed_tokens.lora_embedding_A", ("model.embed_tokens", "A")),
@@ -589,20 +620,28 @@ def test_alpha_and_rank_patterns_scale_each_module_as_peft_does(config, want, tm
     assert alphas == pytest.approx(want)
 
 
-def test_header_refusals_reach_the_client_as_themselves():
-    """A misfit and a non-LoRA key are refusals a runtime load answers with as written."""
+def test_load_refusals_reach_the_client_as_themselves():
+    """A misfit, a rank-0 module and a non-LoRA key are refusals a runtime load answers
+    with as written."""
     with torch.device("meta"):
         root = nn.Module()
-        root.layers = nn.ModuleList([nn.Module()])
-        root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
+        root.layers = nn.ModuleList([nn.Module(), nn.Module()])
+        for layer in root.layers:
+            layer.fc = nn.Linear(HIDDEN, HIDDEN)
     spec = serve(module_lora_spec(lambda _: root, nodes={"N"}, root_path=""), {})
-    key = "base_model.model.layers.0.fc.lora_{}.weight"
-    bad = inspect_keys(spec, [(key.format("A"), (4, 2 * HIDDEN)), (key.format("B"), (HIDDEN, 4))])
+    key = "base_model.model.layers.{}.fc.lora_{}.weight"
+    bad = header_info(spec, [(key.format(0, "A"), (4, 2 * HIDDEN)), (key.format(0, "B"), (HIDDEN, 4))])
     with pytest.raises(ValueError, match="does not fit") as misfit:
         spec.check_adapter("x", bad)
+    # beside a rank-4 module, which a whole-adapter rank of 0 would not catch
+    with pytest.raises(ValueError, match=r"layers\.0\.fc has rank 0") as rank0:
+        header_info(spec, [
+            (key.format(0, "A"), (0, HIDDEN)), (key.format(0, "B"), (HIDDEN, 0)),
+            (key.format(1, "A"), (4, HIDDEN)), (key.format(1, "B"), (HIDDEN, 4)),
+        ])
     with pytest.raises(ValueError, match="DoRA") as dora:
-        inspect_keys(spec, [("base_model.model.layers.0.fc.lora_magnitude_vector", (HIDDEN,))])
-    for exc in (misfit.value, dora.value):
+        header_info(spec, [("base_model.model.layers.0.fc.lora_magnitude_vector", (HIDDEN,))])
+    for exc in (misfit.value, rank0.value, dora.value):
         assert describe_load_error(exc) == str(exc)
     assert "/srv" not in describe_load_error(OSError("/srv/adapters/x: permission denied"))
 
@@ -610,7 +649,7 @@ def test_header_refusals_reach_the_client_as_themselves():
 def test_gather_shrink_op_matches_its_fake():
     torch.library.opcheck(
         lora_gather_shrink,
-        # tokens on slots [1, 2, 0, 1], grouped by slot
-        (torch.tensor([0, 5, -1, 31]), rand(3, 4, 32, seed=1), torch.tensor([2, 0, 3, 1], dtype=torch.int32),
-         torch.tensor([0, 1, 3, 4], dtype=torch.int32), torch.tensor([0, 4, 2], dtype=torch.int32)),
+        # tokens on slots [1, 2, 0, 1]
+        (torch.tensor([0, 5, -1, 31]), rand(3, 4, 32, seed=1), torch.tensor([1, 2, 0, 1], dtype=torch.int32),
+         torch.tensor([0, 4, 2], dtype=torch.int32)),
     )

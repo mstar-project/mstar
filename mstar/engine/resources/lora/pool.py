@@ -50,10 +50,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -63,6 +63,7 @@ from mstar.engine.resources.lora.backend import LoraBackend, make_backend
 from mstar.engine.resources.lora.config import (
     LoraReqConfig,
     LoraSpec,
+    check_expert_ids,
     describe_load_error,
 )
 from mstar.engine.resources.lora.store import LoadedAdapter, LoraAdapterStore
@@ -129,6 +130,16 @@ class LoraAddressing:
 
     token_order: torch.Tensor   # [tokens] int32, token indices grouped by slot (stable)
     slot_indptr: torch.Tensor   # [num_slots + 1] int32, each slot's range of token_order
+    token_slot: torch.Tensor    # [tokens] int32, each token's slot (0 past every range)
+
+
+class ExpertRows(NamedTuple):
+    """How one MoE layer's (token, top-k) rows address its experts targets this step
+    (``LoraLayerDelta.expert_rows``)."""
+
+    ids: torch.Tensor     # [tokens, top_k] int32 combined ids; past every factor for none
+    scale: torch.Tensor   # [tokens], each token's slot's scaling
+    alignment: Any        # LoraBackend.align_experts of ids, shared by every GEMM over them
 
 
 class LoraLayerDelta:
@@ -151,8 +162,14 @@ class LoraLayerDelta:
         self._grouping = declared.row_grouping
         # an embedding's input is token ids, and its shrink a gather
         self._embedding = declared.kind == "embedding"
+        # an experts target's factors, one per (slot, expert) past the zero adapter, as
+        # the combined ids of `expert_rows` address them
+        self.experts = declared.experts
+        if self.experts > 1:
+            self.a, self.b = self.a.flatten(0, 1), self.b.flatten(0, 1)
 
-    def __call__(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def _live(self) -> bool:
+        """Whether this step adds deltas; raises outside a planned step's compute."""
         if self._pool.outside_compute() and not torch.compiler.is_compiling():
             raise RuntimeError(
                 "a LoRA delta was called outside its node's planned step (e.g. from "
@@ -160,7 +177,12 @@ class LoraLayerDelta:
                 "address another step's rows. Call the module's base computation there "
                 "and add the delta in preprocess or the forward"
             )
-        if not self._pool.active:
+        return self._pool.active
+
+    def __call__(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if self.experts > 1:
+            raise ValueError("an experts target's delta is per (token, top-k) row: add it with `grouped_`")
+        if not self._live():
             # an idle step: no row names an adapter, so nothing is launched
             return y
         if self._embedding:
@@ -176,6 +198,47 @@ class LoraLayerDelta:
         )
         return y
 
+    def grouped_(
+        self, x: torch.Tensor, y: torch.Tensor, ids: torch.Tensor, row_weight: torch.Tensor,
+        top_k: int, alignment=None,
+    ) -> None:
+        """An experts target's delta, ``LoraBackend.apply_experts_`` over this layer's
+        factors: ``y [rows, out]`` += ``row_weight`` times each row's delta of ``x [rows
+        // top_k, in]``, for the combined ids ``ids`` of ``expert_rows`` (``alignment``
+        theirs, or None)."""
+        if self.experts == 1:
+            raise ValueError("`grouped_` adds an experts target's delta; call a linear's delta directly")
+        self._backend.apply_experts_(
+            x.to(self.a.dtype), y, self.a, self.b, ids, row_weight, top_k, self.out_slices, alignment,
+        )
+
+    def expert_rows(self, topk_ids: torch.Tensor, others: Sequence[LoraLayerDelta] = ()) -> ExpertRows | None:
+        """The rows of ``topk_ids`` (``[tokens, top_k]``, this rank's expert ids) for this
+        experts delta and ``others``, the same MoE layer's other experts deltas; None on
+        an idle step.
+
+        Each row addresses its token's slot's A and B for its expert through one combined
+        id ``(slot - 1) * experts + expert``. A row on the zero adapter, on a slot whose
+        adapter adapts none of these at this layer, or on a skipped (sentinel) expert gets
+        the id past every factor, which no GEMM reads.
+        """
+        if not self._live():
+            return None
+        token_slot = self._pool.addressing(1).token_slot
+        if token_slot.shape[0] != topk_ids.shape[0]:
+            raise ValueError(
+                f"LoRA experts see {topk_ids.shape[0]} tokens but the step declared "
+                f"{token_slot.shape[0]}; the segments' spans must add up to the tokens routed"
+            )
+        slot = token_slot.long()
+        adapted = self.ranks[slot] > 0
+        for other in others:
+            adapted = adapted | (other.ranks[slot] > 0)
+        own = adapted[:, None] & (topk_ids >= 0) & (topk_ids < self.experts)
+        none = self.a.shape[0]
+        ids = torch.where(own, (slot - 1)[:, None] * self.experts + topk_ids, none).to(torch.int32)
+        return ExpertRows(ids, self.scalings[slot], self._backend.align_experts(ids, none))
+
 
 # int32 entries per alignment unit: each array starts on a 16-byte boundary, which
 # compiled kernels reading them as inputs expect
@@ -188,11 +251,13 @@ def _aligned(n: int) -> int:
 
 class _Section(NamedTuple):
     """Offsets of one row grouping's arrays: ``count`` rows, their order grouped by slot
-    (``token_order``), and each slot's range of it (``slot_indptr``)."""
+    (``token_order``), each slot's range of it (``slot_indptr``), and each row's slot
+    (``token_slot``)."""
 
     count: int
     order: int
     slot: int
+    token_slot: int
 
 
 class _Layout(NamedTuple):
@@ -212,8 +277,9 @@ class _Layout(NamedTuple):
             count = rows if grouping == 0 else tokens // grouping
             order = at
             slot = order + _aligned(count)
-            at = slot + _aligned(num_slots + 1)
-            sections.append(_Section(count, order, slot))
+            token_slot = slot + _aligned(num_slots + 1)
+            at = token_slot + _aligned(count)
+            sections.append(_Section(count, order, slot, token_slot))
         return cls(rows, tokens, tuple(sections), at)
 
 
@@ -305,6 +371,7 @@ class LoraAdapterPool(Resource):
         # the row groupings the targets read; per token always, first
         self._groupings = (1, *sorted({t.row_grouping for t in self.targets.values()} - {1}))
 
+        check_expert_ids(spec.resource_key, spec.max_slots, self.targets)  # as the spec checked it
         self._layer_rows: dict[str, dict[int, int]] = {}
         self._a: dict[str, torch.Tensor] = {}
         self._b: dict[str, torch.Tensor] = {}
@@ -315,12 +382,14 @@ class LoraAdapterPool(Resource):
             layers = target.layers if target.layers is not None else range(spec.num_layers)
             self._layer_rows[name] = {layer: row for row, layer in enumerate(layers)}
             rows = len(self._layer_rows[name])
+            # an experts target holds no zero adapter (its ids skip it) and a pair per expert
+            lead = (rows, num_slots) if target.experts == 1 else (rows, spec.max_slots, target.experts)
             self._a[name] = torch.zeros(
-                rows, num_slots, target.num_slices * max_rank, target.in_features,
+                *lead, target.num_slices * max_rank, target.in_features,
                 dtype=self.dtype, device=self._device,
             )
             self._b[name] = torch.zeros(
-                rows, num_slots, target.out_features, max_rank,
+                *lead, target.out_features, max_rank,
                 dtype=self.dtype, device=self._device,
             )
             self._ranks[name] = torch.zeros(rows, num_slots, dtype=torch.int32, device=self._device)
@@ -400,16 +469,23 @@ class LoraAdapterPool(Resource):
             served = self._serving[name]
             self._store.load(name, served.path, served.digest)
 
+        device_bytes = sum(t.numel() * t.element_size() for t in (*self._a.values(), *self._b.values()))
+        # a host copy is one slot's worth, pinned, for each of up to cpu_capacity adapters
+        slot_bytes = sum(
+            t[:, 0].numel() * t.element_size() for t in (*self._a.values(), *self._b.values())
+        )
         logger.info(
-            "LoRA pool: %d slots (+ zero adapter), max rank %d, targets %s, %.2f MiB",
-            spec.max_slots, max_rank, sorted(self.targets),
-            sum(t.numel() * t.element_size() for t in (*self._a.values(), *self._b.values())) / 2**20,
+            "LoRA pool: %d slots (+ zero adapter), max rank %d, targets %s, %.2f MiB; "
+            "host tier up to %d x %.2f MiB pinned",
+            spec.max_slots, max_rank, sorted(self.targets), device_bytes / 2**20,
+            spec.cpu_capacity, slot_bytes / 2**20,
         )
 
     # Storage access
 
     def weights(self, target: str, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(a [slots, slices * R, in], b [slots, out, R])`` of one target at one stack layer."""
+        """``(a [slots, slices * R, in], b [slots, out, R])`` of one target at one stack
+        layer; an experts target's are ``[max_slots, experts, ...]``, no zero adapter's."""
         row = self._layer_rows[target][layer_idx]
         return self._a[target][row], self._b[target][row]
 
@@ -520,8 +596,8 @@ class LoraAdapterPool(Resource):
         self.load_adapter_async(name, path, digest).result()
 
     def load_adapter_async(self, name: str, path: str, digest: bytes) -> Future:
-        """Serve ``name`` from ``path``: read it on the reader thread, check it against the
-        spec (and against ``digest``, the weights the API server checked), shard it for
+        """Serve ``name`` from ``path``: read it on the reader thread, hold it to ``digest``
+        (of the weights the API server checked against the spec), shard it for
         this rank into the host tier, and only then make it servable. The future fails if
         it is served already, is still retiring from an unload, or cannot be read; a
         refusal visible now raises here. A request that names it takes a slot on its
@@ -956,18 +1032,25 @@ class LoraAdapterPool(Resource):
                 self._prefetch(evicted)
         for name in self._a:
             a, b = adapter.a.get(name), adapter.b.get(name)
+            # an experts target stores no zero adapter
+            index = slot if self.targets[name].experts == 1 else slot - 1
+            slot_a, slot_b = self._a[name][:, index], self._b[name][:, index]
             if a is None:
-                self._a[name][:, slot].zero_()
-                self._b[name][:, slot].zero_()
+                slot_a.zero_()
+                slot_b.zero_()
                 self._ranks[name][:, slot] = 0
+            elif self.targets[name].experts > 1:
+                # layer by layer: the slot's view is strided across layers, and copying it
+                # whole would stage a contiguous temporary the size of the slot (GBs)
+                for row in range(slot_a.shape[0]):
+                    slot_a[row].copy_(a[row], non_blocking=True)
+                    slot_b[row].copy_(b[row], non_blocking=True)
             else:
-                self._a[name][:, slot].copy_(a, non_blocking=True)
-                self._b[name][:, slot].copy_(b, non_blocking=True)
-                # a layer whose A or B is all zero adds nothing; computed on the device,
-                # in stream order after the copies, so nothing waits on the host
-                live = (self._a[name][:, slot].flatten(1).ne(0).any(1)
-                        & self._b[name][:, slot].flatten(1).ne(0).any(1))
-                self._ranks[name][:, slot] = live.to(torch.int32) * adapter.rank
+                slot_a.copy_(a, non_blocking=True)
+                slot_b.copy_(b, non_blocking=True)
+            if a is not None:
+                # 0 at a layer whose A or B is all zero, which adds nothing (the store's read)
+                self._ranks[name][:, slot].copy_(adapter.layer_ranks[name], non_blocking=True)
         self.scalings[slot] = adapter.scaling
         state.adapter = adapter.name
         self._resident[adapter.name] = slot
@@ -1024,6 +1107,7 @@ class LoraAdapterPool(Resource):
             counts = self._grouped_spans(spans, grouping)
             count = int(counts.sum())
             token_slots = np.repeat(slots, counts)
+            host[sec.token_slot:sec.token_slot + count] = token_slots
             host[sec.order:sec.order + count] = np.argsort(token_slots, kind="stable")
             np.cumsum(
                 np.bincount(token_slots, minlength=num_slots),
@@ -1032,6 +1116,7 @@ class LoraAdapterPool(Resource):
             current[grouping] = LoraAddressing(
                 token_order=data[sec.order:sec.order + count],
                 slot_indptr=data[sec.slot:sec.slot + num_slots + 1],
+                token_slot=data[sec.token_slot:sec.token_slot + count],
             )
         self._stager.copy_(data, host, mirror=buf.mirror)
         buf.planned = (planned, current)

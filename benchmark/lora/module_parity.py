@@ -42,7 +42,9 @@ Adapters: Orpheus has a PEFT ecosystem on the Hub (``DEFAULT_ADAPTERS``: rank 64
 and a rank-16 one on the pretrained base). The others have none known, so ``--synthetic
 N`` (the default for them) writes N random PEFT adapters of the real shapes over every
 target but the vocabulary-sized ones, each with an ``adapter_config.json`` (rank 16,
-alpha 32), which every phase reads alike.
+alpha 32), which every phase reads alike. Every target the model declares is served,
+the opt-in experts targets included (the Qwen3-Omni Thinker's routed experts: a synthetic
+adapter there holds an A and B for every expert, about 3.3 GB in fp32 at rank 16).
 """
 
 from __future__ import annotations
@@ -463,7 +465,7 @@ def _synthetic(spec, directory: Path, count: int, rank: int = 16, alpha: float =
         g = torch.Generator().manual_seed(1000 + n)
         tensors, modules = {}, set()
         for path, ref in module_map.bindings.items():
-            target = spec.targets[ref.target]
+            target = _declared(spec)[ref.target]
             if target.kind == "embedding" or target.per_segment:
                 continue
             for name, rows in _checkpoint_names(module_map, path, target):
@@ -483,12 +485,21 @@ def _synthetic(spec, directory: Path, count: int, rank: int = 16, alpha: float =
 
 def _checkpoint_names(module_map, path: str, target) -> list[tuple[str, int]]:
     """The checkpoint modules that load ``path``'s slices: each loader rule turned back
-    (and the checkpoint prefix restored), kept when the map places it on this path."""
+    (and the checkpoint prefix restored), kept when the map places it on this path. An
+    experts target's are the per-expert ``experts.<N>.<slice>_proj`` modules (the HF MoE
+    layout), each slice of each expert."""
     prefix = module_map.rules.prefix
-    stems = [(path, None)] if target.num_slices == 1 else [
-        (path.replace(rule.target_suffix, rule.source_suffix), rule.shard_id)
-        for rule in module_map.rules.stacked_params if path.endswith(rule.target_suffix)
-    ]
+    if target.experts > 1:
+        stem = path.rsplit(".", 1)[0]
+        stems = [(f"{stem}.{e}.{name}_proj", f"{name}:{e}")
+                 for e in range(target.experts) for name in target.slice_names]
+    elif target.num_slices == 1:
+        stems = [(path, None)]
+    else:
+        stems = [
+            (path.replace(rule.target_suffix, rule.source_suffix), rule.shard_id)
+            for rule in module_map.rules.stacked_params if path.endswith(rule.target_suffix)
+        ]
     names = []
     for stem, shard in stems:
         for candidate in (prefix + stem, stem):
@@ -499,6 +510,20 @@ def _checkpoint_names(module_map, path: str, target) -> list[tuple[str, int]]:
     if not names:
         raise SystemExit(f"no checkpoint name places {path}; pass real adapters for this model")
     return names
+
+
+def _declared(spec) -> dict:
+    """Every target the model declares, the opt-in experts targets (``dropped_targets``)
+    included."""
+    return {**spec.targets, **spec.dropped_targets}
+
+
+def _experts_opt_in(spec) -> dict:
+    """The ``lora:`` block's ``targets``, naming every target when the model declares opt-in
+    experts targets; else nothing, so the API server narrows to what the adapters touch."""
+    if spec.dropped_targets:
+        return {"targets": sorted(_declared(spec))}
+    return {}
 
 
 def _max_rank(adapters: dict[str, str]) -> int:
@@ -534,7 +559,9 @@ def _lora_logits(spec_: ModelSpec, model, adapters: dict[str, str], prompts, rop
     from mstar.engine.resources.step import StepContext
 
     spec = _lora_spec(model)
-    spec.apply_yaml_overrides(max_slots=len(adapters), max_rank=_max_rank(adapters), adapters=adapters)
+    # every target the model declares, the opt-in experts targets included
+    spec.apply_yaml_overrides(max_slots=len(adapters), max_rank=_max_rank(adapters), adapters=adapters,
+                              targets=sorted(_declared(spec)))
     spec.adapter_digests = check_adapters(spec)  # as the API server pins them
     spec.dtype = torch.bfloat16
     pool = LoraAdapterPool(spec, "cuda")
@@ -575,8 +602,13 @@ def _merge_into(sub, spec, path: str) -> None:
         if spec.ignored_modules is not None and spec.ignored_modules(name):
             continue
         ref = module_map(name)
-        target = spec.targets[ref.target]
-        weight = modules[prefix + by_ref[(ref.target, ref.layer)]].weight
+        target = _declared(spec)[ref.target]
+        bound = by_ref[(ref.target, ref.layer)]
+        if ref.param is None:
+            weight = modules[prefix + bound].weight
+        else:  # one expert's matrix of a stacked parameter
+            stacked = getattr(modules[prefix + bound.removesuffix(f".{ref.param}")], ref.param)
+            weight = stacked[target.expert_of(ref.shard_id)]
         a, b = layer.a.float().reshape(layer.a.shape[0], -1), layer.b.float().reshape(layer.b.shape[0], -1)
         delta = (layer.alpha / a.shape[0]) * (b.cuda() @ a.cuda())
         with torch.no_grad():
@@ -713,7 +745,7 @@ def serve(args, spec_: ModelSpec) -> int:
         lora_config = {**base_config, "resources": {
             **(base_config.get("resources") or {}),
             "lora": {"max_slots": max(1, len(args.adapters) - 1), "max_rank": _max_rank(args.adapters),
-                     "adapters": dict(args.adapters)},
+                     "adapters": dict(args.adapters), **_experts_opt_in(_lora_spec(_model(args.model)))},
         }}
         path = Path(tmp) / "lora.yaml"
         path.write_text(yaml.safe_dump(lora_config))
