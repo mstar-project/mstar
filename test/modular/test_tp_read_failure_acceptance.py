@@ -13,17 +13,19 @@ run as rank 0 runs it. Whatever the fix, these must hold:
       leasable, so a later request with the same prefix doesn't reuse them
   A4  a request running beside the failed one gives bit-identical outputs
       to the same run with no failure
-  A5  the same for a text-only row, which has no image grid
+  A5  the same for a text-only row, which has no media
 
 Each run is two real ranks of one TP=2 instance, each in its own process
 with a gloo process group, running the real ``Worker.run`` loop, the real
 ``MicroScheduler``, the real shared-memory tensor manager, the real
 ``Engine`` (prepare, admit, forward, commit through the real ``StepRunner``
-and ``KVManager``) and Qwen3.5's real ``prepare_inputs``, which reads
-``image_grid_thw`` on the host to size the image span. The LLM forward is a
-stand-in that all-reduces each rank's partial over the TP group, as a
-row-parallel layer does, so a rank that never joins a step, or joins it with
-another token count, shows up as a collective timeout or a gloo abort.
+and ``KVManager``) and Qwen3.5's real ``prepare_inputs``, which checks a
+media row's ``vision_embeds`` against the walk's ``MEDIA_LAYOUT`` and places
+its MRoPE positions from it. The LLM forward is a stand-in that splices the
+media rows in at their pads and all-reduces each rank's partial over the TP
+group, as a row-parallel layer does, so a rank that never joins a step, or
+joins it with another token count, shows up as a collective timeout or a gloo
+abort.
 
 Fakes: the graph runtime and request state (inputs land through
 ``ingest_inputs_batch``; what a rank routes and sends is recorded off
@@ -65,11 +67,13 @@ HERE = Path(__file__).resolve().parent
 
 WORKERS = ("worker_0", "worker_1")
 NODE = "LLM"
-VISION_WALK, TEXT_WALK = "prefill_vision", "prefill"
+VISION_WALK, TEXT_WALK = "prefill_vision", "prefill_text"
 KV = "kv"
 HIDDEN = 16
 VOCAB = 512
 MERGE = 2
+# the image pad and its sentinels, all below the ids `_ids` draws
+PAD, VISION_START, VISION_END = 0, 1, 2
 PAGE_SIZE = 16
 ROOT = b"tp read failure"
 SIGNALS = ("new_token", "hidden")
@@ -82,8 +86,9 @@ DEADLINE_S = 30.0
 # Per-rank setup a fix adds to Worker.__init__ (see the module docstring).
 _DESIGN_SETUP = ("_setup_read_gate", "_setup_tp_read_check")
 
-# What each request reads. A grid prompt is Qwen3.5's prefill_vision layout:
-# text, image, text; an image of grid (t, h, w) takes t*(h/2)*(w/2) tokens.
+# What each request reads. A grid prompt is Qwen3.5's prefill_vision row: the
+# whole prompt, text, image and text, its image of grid (t, h, w) expanded to
+# t*(h/2)*(w/2) pads between its sentinels.
 _PROMPTS = {
     "grid": {
         "r0": dict(texts=(5, 7), grid=(1, 16, 24)),
@@ -95,7 +100,7 @@ _PROMPTS = {
     },
 }
 # the input of r1 whose follower read fails
-_FAILING = {"grid": "image_grid_thw", "text": "text_inputs"}
+_FAILING = {"grid": "vision_embeds", "text": "text_inputs"}
 
 
 def _ids(n: int, seed: int) -> list[int]:
@@ -106,17 +111,35 @@ def _inputs(kind: str, rid: str) -> dict[str, list[torch.Tensor]]:
     """The tensors each rank reads for ``rid``, by signal."""
     spec = _PROMPTS[kind][rid]
     seed = int(rid[1:]) + 1
-    texts = [torch.tensor(_ids(n, seed * 10 + i)) for i, n in enumerate(spec["texts"])]
+    texts = [_ids(n, seed * 10 + i) for i, n in enumerate(spec["texts"])]
     if kind == "text":
-        return {"text_inputs": texts}
-    t, h, w = spec["grid"]
-    span = t * (h // MERGE) * (w // MERGE)
+        return {"text_inputs": [torch.tensor(texts[0])]}
+    span = _span(kind, rid)
     gen = torch.Generator().manual_seed(seed)
+    ids = texts[0] + [VISION_START] + [PAD] * span + [VISION_END] + texts[1]
     return {
-        "text_inputs": texts,
-        "image_grid_thw": [torch.tensor([[t, h, w]], dtype=torch.int64)],
+        "text_inputs": [torch.tensor(ids)],
         "vision_embeds": [torch.randn(span, HIDDEN, generator=gen)],
     }
+
+
+def _span(kind: str, rid: str) -> int:
+    t, h, w = _PROMPTS[kind][rid]["grid"]
+    return t * (h // MERGE) * (w // MERGE)
+
+
+def _step_metadata(kind: str, rid: str) -> dict:
+    """The walk's step metadata: a grid prompt's ``MEDIA_LAYOUT``, as intake
+    lays it out."""
+    from mstar.model.multimodal import MEDIA_LAYOUT
+
+    if kind == "text":
+        return {}
+    spec = _PROMPTS[kind][rid]
+    return {MEDIA_LAYOUT: {
+        "offset": [spec["texts"][0] + 1], "tokens": [_span(kind, rid)],
+        "output": ["vision_embeds"], "grid": [list(spec["grid"])],
+    }}
 
 
 def _walk(kind: str) -> str:
@@ -207,17 +230,20 @@ class _Rope:
 def _submodule_class():
     from mstar.engine.resources.kv.config import KVStep
     from mstar.engine.resources.step import Segment, SubmoduleStep
+    from mstar.model.components.sampled_token_decoder import splice_media
+    from mstar.model.multimodal import vision_encoder
     from mstar.model.qwen3_5.config import ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     class _LLM(LLMSubmodule):
         """Qwen3.5's LLM node: everything but the model is the real submodule
-        (``prepare_inputs``, which reads the image grid on the host, and the
-        capture configs' dummy rows), so a fix that builds a row the way the
-        submodule does gets the real code. The forward is a stand-in: each
-        rank's partial of every token's embedding is summed over the TP group,
-        and a row's output is its mean, which every rank then holds whole. A
-        row's output depends on nothing but its own tokens."""
+        (``prepare_inputs``, which checks a media row against its layout and
+        places its positions, and the capture configs' dummy rows), so a fix
+        that builds a row the way the submodule does gets the real code. The
+        forward is a stand-in: each rank's partial of every token's embedding,
+        media rows spliced in at their pads, is summed over the TP group, and a
+        row's output is its mean, which every rank then holds whole. A row's
+        output depends on nothing but its own tokens and media."""
 
         def __init__(self, group, rank):
             torch.manual_seed(1234)
@@ -227,10 +253,11 @@ def _submodule_class():
             super().__init__(
                 model=model,
                 config=SimpleNamespace(
-                    vision_start_token_id=1, vision_end_token_id=2, hidden_size=HIDDEN,
-                    stop_token_ids=(),
+                    vision_start_token_id=VISION_START, vision_end_token_id=VISION_END,
+                    hidden_size=HIDDEN, stop_token_ids=(),
                 ),
                 vision_config=SimpleNamespace(spatial_merge_size=MERGE),
+                encoders=(vision_encoder((PAD,)),),
             )
             self.head = torch.randn(HIDDEN, VOCAB)
             self.requires_grad_(False)
@@ -282,11 +309,12 @@ def _submodule_class():
             )
 
         def preprocess(self, graph_walk, engine_inputs, inputs):
-            return {"embeds": [
-                inp.input_embeds if inp.input_embeds is not None
-                else self.model.model.embed_tokens(inp.input_ids)
-                for inp in inputs
-            ]}
+            embeds = []
+            for inp in inputs:
+                rows = self.model.model.embed_tokens(inp.input_ids)
+                media = inp.tensor_inputs.get("vision_embeds")
+                embeds.append(rows if media is None else splice_media(rows, inp.input_ids, media, (PAD,)))
+            return {"embeds": embeds}
 
         def forward(self, graph_walk, engine_inputs, **kwargs):
             raise AssertionError("every step here runs batched")
@@ -729,7 +757,6 @@ def _rank_main(rank, scenario, inbox, outbox):
         import mstar.communication.wire_types  # noqa: F401  (registers the tags)
         from mstar.communication.tensors import SharedMemoryCommunicationManager
         from mstar.conductor.request_info import CurrentForwardPassInfo
-        from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
 
         dist.init_process_group(
             "gloo", init_method=f"file://{scenario.store}", rank=rank, world_size=2,
@@ -745,11 +772,10 @@ def _rank_main(rank, scenario, inbox, outbox):
             WORKERS[rank], "localhost", "cpu", None, shm_dir=os.path.join(scenario.shm_root, str(rank)),
         )
         graph.tensor_manager = tm
-        order = [TEXT_PART, IMAGE_PART, TEXT_PART] if kind == "grid" else [TEXT_PART]
         for rid in ("r0", "r1"):
             graph.admit(rid, CurrentForwardPassInfo(
                 request_id=rid, graph_walk=_walk(kind), fwd_index=0, random_seed=0, max_tokens=1,
-                step_metadata={"prefill_order": order},
+                step_metadata=_step_metadata(kind, rid),
             ))
             tokens = _prompt_tokens(kind, rid)
             engine.add_request(rid, {KV: _kv_config(tokens)} if scenario.prefix_cache else None)
@@ -929,7 +955,7 @@ def _run(tmp_path, scenario: Scenario) -> Run:
 
 KINDS = [
     pytest.param("grid", id="grid"),
-    # A5: a text-only row has no grid, so its step has rank 0's shape anyway
+    # A5: a text-only row has no media, so its step has rank 0's shape anyway
     pytest.param("text", id="text_only"),
 ]
 
@@ -942,7 +968,7 @@ def _healthy_ok(run: Run):
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_followers_failed_read_fails_only_its_request_and_nothing_hangs(tmp_path, kind):
-    """A1 (and A5 for text_only). The follower's read of r1's image grid (or
+    """A1 (and A5 for text_only). The follower's read of r1's vision rows (or
     text) fails after rank 0 read its own copy: the run settles before the
     deadline, r1 fails and is torn down on both ranks, and r0 completes."""
     run = _run(tmp_path, Scenario(kind=kind))

@@ -336,8 +336,9 @@ rounds up to whole pages per label. A span's own scratch counts only with the sp
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead.
 
-``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
-text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
+``prompt_spans(plan, texts, text_walk, item_spans)`` builds the spans of a prompt whose
+text and attachments, in ``prefill_plan`` order, are each written by their own walk, as
+BAGEL lays out its prompt:
 
 .. code-block:: python
 
@@ -2325,6 +2326,84 @@ On the API side ``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py
 ``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes
 ``width``/``height``, ``seed`` and other knobs pass through); register it under the
 model's registry key. The SDK exposes ``generate_image`` and ``edit_image``.
+
+Worked example: a vision-language model on the VLM scaffold
+-----------------------------------------------------------
+
+A decoder LLM with a ViT in front of it (Qwen3.5, Muse Glimmer) shares one graph and
+two node shapes, so M* ships them as a scaffold; a model adds its components, its
+resource declarations and a few overrides. The older span-split path, a walk per text
+span and attachment (``prefill_plan``, ``find_media_spans``, ``split_around_spans``,
+``prompt_spans``; BAGEL and Qwen3-Omni), is legacy: a new model builds on this scaffold.
+BAGEL stays on it because a whole-prompt row would lose what its spans carry: an image to
+generate from is written twice, as VAE latents and as ViT patches, by walks of their own,
+its classifier-free-guidance branches open KV labels over different subsets of the
+prompt's spans, and its leading text span is keyed for prefix reuse. Moving Qwen3-Omni
+and BAGEL onto the scaffold is tracked as a follow-up.
+
+Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder`` list::
+
+    prefill_text   : LLM(text_inputs)                        a text-only prompt
+    prefill_vision : vision_encoder(pixel_values, image_grid_thw)
+                     -> LLM(text_inputs, vision_embeds)      the whole prompt, one row
+    prefill_<a>_<b>: Parallel(encoder a, encoder b) -> LLM   one walk per subset of encoders
+    decode         : Loop("decode_loop", LLM)
+    mixed          : prefill_text and decode rows in one step (a combined walk)
+
+The ``Model`` methods are one line each: ``get_graph_walk_graphs`` returns
+``media_walks(max_iters, encoders)``, ``get_combined_graph_walks`` returns
+``text_combined_walks()``, and ``get_initial_forward_pass_args`` /
+``get_partition_forward_pass_args`` call ``initial_prefill_args`` / ``next_prefill_args``
+on the schedule from ``media_prefill_schedule``. ``process_prompt`` tokenizes the whole
+prompt once with one placeholder per attachment, expands each to one pad per token
+with ``expand_media_pads`` (adding the sentinels a template leaves to its processor),
+and returns the pads' layout (``media_layout``) as ``MEDIA_LAYOUT`` metadata. The
+encoders' inputs are lists in prompt order, as their outputs fill the pads.
+
+The ``LLM`` node subclasses ``SampledTokenDecoder``
+(``mstar/model/components/sampled_token_decoder.py``), which owns the capture configs
+(decode, packed text prefill, mixed, and one packed capture every media walk replays,
+which also caps their batches), device loop-back of the sampled token, the splice of
+the encoders' outputs into the prompt's embeddings inside the forward
+(``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
+sampler and the position resource, the forward through the sampler and both stop
+checks, ``TokenStepNode``'s (EOS, or the request's token count, where the loop's cap
+also ends it) on decode rows only. A media row's tensor holds exactly the pads in its
+ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
+sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
+writes:
+
+.. code-block:: python
+
+    class LLMSubmodule(SampledTokenDecoder):
+        ATTN_KEY = ATTN_FULL  # the attention resource that picks each prefill row's last token
+
+        def __init__(self, model, config, encoders):
+            super().__init__(model, config, encoders)
+
+        def layer_steps(self):  # this step's work on the layers' resources
+            return {KV_CACHE: KVStep(), ATTN_FULL: AttentionStep(causal=True)}
+
+        def max_rows_in_combined(self, graph_walk): ...  # a mixed step's prompt-row cap
+        # optional, for positions the resource cannot place (MRoPE):
+        def prompt_positions(self, fwd_info, layout, num_tokens): ...  # -> (custom_pos_ids, advance)
+        def decoder_kwargs(self, graph_walk, engine_inputs, num_tokens, **tensors): ...
+
+Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
+(the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
+``Qwen3_5ForCausalLM`` does (``Qwen3DenseLM`` has the first three). The sampler and
+position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``.
+``MSTAR_DECODE_BUCKETS`` sets the default decode ladder.
+
+The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
+(``mstar/model/components/block_loop_encoder.py``): one prompt per step, every image
+packed into one call, and the tower's block loop replayed as a piecewise region per
+patch bucket (``BLOCK_LOOP_PATCH_BUCKETS``). Its ``prepare_inputs`` returns the
+tower's tensors in ``tensor_inputs`` and, in ``resource_step_info``, each of
+``SEGMENT_LABELS``' attending spans (frames, windows) over the same patches. The tower
+provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`` and
+``project(encoded, **tensors)``. A prompt whose spans under some label exceed the
+ragged resource's ``max_segments_per_request`` takes no lease and runs eagerly.
 
 Advanced: async partitions and streaming
 ----------------------------------------
