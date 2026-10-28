@@ -33,6 +33,10 @@ and writes the winners there, so a kernel gets faster on a GPU without a change 
 
 `--list` prints every op and the shapes each table file covers.
 
+`moe_gemm` takes `--dtype float8_e4m3fn` for fp8 block-scale experts (`fused_experts_fp8`, W8A8
+with 128 x 128 weight scale blocks): its rows keep `BLOCK_SIZE_K` at the block's 128, which the
+kernel's per-tile rescale needs, and the server logs that command for an fp8 shape it runs untuned.
+
 ## How a config is chosen
 
 - A table file is named for one GPU model (its `torch.cuda.get_device_name()`, non-alphanumerics

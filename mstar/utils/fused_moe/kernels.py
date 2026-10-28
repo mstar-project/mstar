@@ -616,29 +616,41 @@ def moe_sum_reduce_triton(
 
 
 # ---------------------------------------------------------------------------
-# Block-size / warp-count configuration (shape-only; the fp8 runner overrides
-# BLOCK_SIZE_K and the decode tiles on top of it)
+# Block-size / warp-count configuration (shape-only; a moe_gemm table row for the
+# shape replaces it)
 # ---------------------------------------------------------------------------
+
+# The weight scale block fused_experts_fp8's tables are swept for. Its kernel rescales once per K
+# tile, so a config's BLOCK_SIZE_K is always the block's K, tuned or default.
+FP8_BLOCK = (128, 128)
 
 
 def _triton_unavailable(device: torch.device, dtype: torch.dtype, shape: Mapping[str, int]) -> str | None:
     if device.type != "cuda":
         return f"needs a CUDA or ROCm device, not {device.type}"
+    if dtype == FP8_DTYPE:
+        # both contraction dims (hidden, and the intermediate size N / 2) take whole K blocks
+        block_k = FP8_BLOCK[1]
+        if shape["K"] % block_k or (shape["N"] // 2) % block_k:
+            return (f"e4m3 experts need K and N / 2 in whole {block_k}-wide scale blocks, "
+                    f"not K={shape['K']}, N={shape['N']}")
+        return None
     if dtype not in (torch.bfloat16, torch.float16):
-        return f"runs bf16 and fp16 activations, not {dtype}"
+        return f"runs bf16 and fp16 activations, or e4m3 block-scale experts, not {dtype}"
     return None
 
 
 # fused_experts' two grouped GEMMs: gate/up (N = 2 * the per-rank expert intermediate size,
 # K = hidden) and down. Rows are keyed by the token count M. A row holds the gate/up tiles,
 # and its "down" holds the down GEMM's differences, except BLOCK_SIZE_M, which the two GEMMs
-# share because they share one alignment.
+# share because they share one alignment. An entry's dtype is the weights': bf16 / fp16 for
+# fused_experts, float8_e4m3fn for fused_experts_fp8 (W8A8 with 128 x 128 weight scale blocks).
 MOE_GEMM = register(KernelOp(
     name="moe_gemm",
     shape=("E", "N", "K", "top_k"),
     bucket="M",
     backends=(Backend("triton", _triton_unavailable),),
-    doc="fused_experts' bf16/fp16 grouped expert GEMMs (gate/up, then down)",
+    doc="fused_experts' grouped expert GEMMs (gate/up, then down): bf16/fp16, or e4m3 block-scale W8A8",
 ))
 
 _TILE_ROWS: dict[tuple, tuple | None] = {}
@@ -694,6 +706,46 @@ def get_config(
         if abs(row[0] - M) < abs(best[0] - M):
             best = row
     return dict(best[1]), dict(best[2])
+
+
+def get_config_fp8(
+    M: int, E: int, N: int, K: int, top_k: int, block_k: int = FP8_BLOCK[1],
+    device: torch.device | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """:func:`get_config` for ``fused_experts_fp8`` with ``block_k``-wide scale blocks: the
+    ``moe_gemm`` table's ``float8_e4m3fn`` row for this shape (tables hold 128 x 128 blocks'),
+    else :func:`get_default_config_fp8`. Called eagerly, inside its custom op."""
+    rows = _tile_rows(E, N, K, top_k, FP8_DTYPE, device) if block_k == FP8_BLOCK[1] else None
+    if rows is None:
+        return get_default_config_fp8(M, E, N, K, top_k, block_k)
+    best = rows[0]
+    for row in rows[1:]:  # nearest M, the smaller on a tie
+        if abs(row[0] - M) < abs(best[0] - M):
+            best = row
+    up, down = dict(best[1]), dict(best[2])
+    # a row can't change what the kernel's per-K-tile rescale needs
+    up["BLOCK_SIZE_K"] = down["BLOCK_SIZE_K"] = block_k
+    return up, down
+
+
+def get_default_config_fp8(
+    M: int, E: int, N: int, K: int, top_k: int, block_k: int = FP8_BLOCK[1],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """``fused_experts_fp8``'s tiles where no table has the shape: :func:`get_default_config`'s
+    ``BLOCK_SIZE_M``, ``block_k``, and up to 16 tokens GLM-5.2's TP8 decode sweep
+    (``benchmark/glm52/bench_fused_moe_config.py``)."""
+    config = get_default_config(M, E, N, K, top_k)
+    config["BLOCK_SIZE_K"] = block_k
+    # get_default_config ignores N, so the down GEMM (N=hidden) would inherit the gate/up tiles;
+    # at decode shapes each launch gets its own instead
+    if M <= 16:
+        down = dict(config, BLOCK_SIZE_N=128, GROUP_SIZE_M=1, num_warps=4, num_stages=2)
+        config.update(BLOCK_SIZE_N=64, GROUP_SIZE_M=8, num_warps=4, num_stages=5)
+        return config, down
+    # the usual block-fp8 tiles; BLOCK_SIZE_M stays shape-picked: both launches read the same
+    # alignment, so it must match across them
+    config.update(BLOCK_SIZE_N=128, GROUP_SIZE_M=32, num_warps=4, num_stages=3)
+    return config, dict(config)
 
 
 def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, int]:

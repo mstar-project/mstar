@@ -30,10 +30,10 @@ def tuned_table(tmp_path, monkeypatch):
     kernels._TILE_ROWS.clear()
 
 
-def _write(path, rows, top_k=2, shape=None):
+def _write(path, rows, top_k=2, shape=None, dtype="bfloat16"):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"format": 1, "op": "moe_gemm", "entries": [{
-        "dtype": "bfloat16", "shape": shape or {"E": 8, "N": 64, "K": 32, "top_k": top_k}, "backend": "triton",
+        "dtype": dtype, "shape": shape or {"E": 8, "N": 64, "K": 32, "top_k": top_k}, "backend": "triton",
         "provenance": {"device": "Test GPU", "date": "2026-10-28", "harness": "test"}, "rows": rows}]}))
 
 
@@ -58,6 +58,56 @@ def test_get_config_uses_nearest_batch_and_down_overrides(tuned_table):
     # fp16 activations have no entry here
     assert kernels.get_config(M=2, E=8, N=64, K=32, top_k=2, dtype=torch.float16)[0] == \
         kernels.get_default_config(2, 8, 64, 32, 2)
+
+
+FP8_SHAPE = {"E": 8, "N": 256, "K": 256, "top_k": 2}
+
+
+def test_fp8_tiles_without_a_table_are_the_previous_defaults(tuned_table):
+    """No float8_e4m3fn entry: fused_experts_fp8 launches what it always did (GLM-5.2's decode
+    tiles up to 16 tokens, the block-fp8 defaults above), BLOCK_SIZE_K the scale block's."""
+    _write(tuned_table, {"1": {"BLOCK_SIZE_M": 64}}, shape=FP8_SHAPE)  # bf16's entry, not fp8's
+    up, down = kernels.get_config_fp8(M=4, **FP8_SHAPE)
+    assert up == {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 8,
+                  "num_warps": 4, "num_stages": 5}
+    assert down == {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1,
+                    "num_warps": 4, "num_stages": 2}
+    up, down = kernels.get_config_fp8(M=300, **FP8_SHAPE)
+    assert up == down == {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32,
+                          "num_warps": 4, "num_stages": 3}
+    assert kernels.get_config_fp8(M=4, **FP8_SHAPE, block_k=64)[0]["BLOCK_SIZE_K"] == 64
+
+
+def test_fp8_tiles_come_from_the_tables_fp8_entry(tuned_table):
+    tile = {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1,
+            "num_warps": 4, "num_stages": 4}
+    _write(tuned_table, shape=FP8_SHAPE, dtype="float8_e4m3fn", rows={
+        "1": {**tile, "down": {"BLOCK_SIZE_N": 64, "num_stages": 3}},
+        # a row can't move BLOCK_SIZE_K off the scale block: the kernel rescales per K tile
+        "256": {**tile, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 64},
+    })
+    up, down = kernels.get_config_fp8(M=2, **FP8_SHAPE)
+    assert up == tile and down == {**tile, "BLOCK_SIZE_N": 64, "num_stages": 3}
+    up, down = kernels.get_config_fp8(M=200, **FP8_SHAPE)
+    assert up["BLOCK_SIZE_M"] == down["BLOCK_SIZE_M"] == 64
+    assert up["BLOCK_SIZE_K"] == down["BLOCK_SIZE_K"] == 128
+    # the fp8 entry serves neither the bf16 kernel nor another scale block
+    assert kernels.get_config(M=2, **FP8_SHAPE)[0] == kernels.get_default_config(2, *FP8_SHAPE.values())
+    assert kernels.get_config_fp8(M=2, **FP8_SHAPE, block_k=64)[0]["BLOCK_SIZE_N"] == 64
+
+
+def test_the_triton_backend_takes_fp8_experts_in_whole_scale_blocks():
+    from mstar.utils.quant_fp8 import FP8_DTYPE
+
+    triton = kernels.MOE_GEMM.backend("triton")
+    cuda = torch.device("cuda")
+    # Qwen3-Coder-30B-A3B's experts at TP1 and TP2
+    assert triton.unavailable(cuda, FP8_DTYPE, {"E": 128, "N": 1536, "K": 2048, "top_k": 8}) is None
+    assert triton.unavailable(cuda, FP8_DTYPE, {"E": 128, "N": 768, "K": 2048, "top_k": 8}) is None
+    # TP4 cuts a 128-wide scale block
+    assert "scale blocks" in triton.unavailable(cuda, FP8_DTYPE, {"E": 128, "N": 384, "K": 2048, "top_k": 8})
+    assert triton.unavailable(cuda, torch.float32, FP8_SHAPE) is not None
+    assert triton.unavailable(torch.device("cpu"), FP8_DTYPE, FP8_SHAPE) is not None
 
 
 def test_command_a_plus_keeps_its_gb200_tiles():

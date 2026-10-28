@@ -2087,7 +2087,9 @@ command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048
 ``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
 each against the default config's output, and writes the winners with where they were measured.
 ``--out DIR`` with ``MSTAR_KERNEL_TABLES=DIR`` serves a sweep before it is committed;
-``benchmark/kernels/README.md`` has the workflow and how to add an op.
+``benchmark/kernels/README.md`` has the workflow and how to add an op. ``moe_gemm``'s entries are
+keyed by the experts' weight dtype: ``bfloat16`` for ``fused_experts``, ``float8_e4m3fn`` for the
+block-scale W8A8 ``fused_experts_fp8`` (128 x 128 scale blocks, ``BLOCK_SIZE_K`` 128).
 
 Worked example: Orpheus
 -----------------------

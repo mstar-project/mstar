@@ -19,7 +19,7 @@ from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
     act_and_mul_triton,
     get_config,
-    get_default_config,
+    get_config_fp8,
     invoke_fused_moe_kernel,
     invoke_fused_moe_kernel_fp8_w8a8,
     moe_sum_reduce_triton,
@@ -333,22 +333,10 @@ def _fused_experts_fp8_impl(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
-    config = get_default_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
-    # The per-K-tile rescale in the kernel is exact only when each K tile is
-    # exactly one quant group, so the shape-picked BLOCK_SIZE_K is overridden.
-    config["BLOCK_SIZE_K"] = block_k
-    # get_default_config ignores N, so the down GEMM (N=hidden) would inherit
-    # the gate/up tiles; at decode shapes each launch gets its own
-    # sweep-picked tiles instead (benchmark/glm52/bench_fused_moe_config.py).
-    config_down = dict(config)
-    if num_tokens <= 16:
-        config.update(BLOCK_SIZE_N=64, GROUP_SIZE_M=8, num_warps=4, num_stages=5)
-        config_down.update(BLOCK_SIZE_N=128, GROUP_SIZE_M=1, num_warps=4, num_stages=2)
-    else:
-        # The usual block-fp8 tile defaults. BLOCK_SIZE_M stays shape-picked: both
-        # launches read the same alignment, so it must match across them.
-        config.update(BLOCK_SIZE_N=128, GROUP_SIZE_M=32, num_warps=4, num_stages=3)
-        config_down = dict(config)
+    # the moe_gemm table's float8_e4m3fn row for this shape, or the defaults; BLOCK_SIZE_K is
+    # block_k either way
+    config, config_down = get_config_fp8(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k,
+                                         block_k=block_k, device=hidden_states.device)
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
