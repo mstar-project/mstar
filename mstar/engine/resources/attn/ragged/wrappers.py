@@ -301,3 +301,14 @@ class FlashInferRaggedPrefillWrapper(_FlashInferRaggedPrefillBase, RaggedPrefill
 
 class FlashInferRaggedCrossPrefillWrapper(_FlashInferRaggedPrefillBase, RaggedCrossPrefillWrapper):
     """Ragged cross-attention through FlashInfer."""
+
+
+class FlashInferPrefixedPrefillWrapper(_FlashInferRaggedPrefillBase):
+    """Query segment ``i`` attends key segment ``i``, which holds a frozen
+    prefix followed by the query's own tokens (the dense attention backend's
+    layout). Causal aligns each query block to the end of its keys."""
+
+    @torch.compiler.disable
+    def plan(self, q_cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool = False) -> None:
+        """Each ``[num_segments + 1]`` with [0] == 0; CPU tensors preferred."""
+        self._plan(q_cu_seqlens, kv_cu_seqlens, causal)

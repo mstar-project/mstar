@@ -29,9 +29,11 @@ from mstar.engine.resources import (
     SlotLease,
     StepContext,
 )
+from mstar.engine.resources.attn import dense as dense_module
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.dense import (
     DenseAttentionManager,
+    FlashInferDenseAttentionManager,
     _fa3_unavailable_reason,
 )
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
@@ -117,7 +119,7 @@ class TestDensePlan:
         assert segment.q_len == 5
         # only the pages the prefix actually covers, not the ones reserved for
         # the fresh span
-        assert segment.pages.tolist() == [1, 2]
+        assert list(segment.pages) == [1, 2]
 
     def test_cumulative_lengths_pack_in_kv_plan_order(self):
         manager = _manager()
@@ -128,8 +130,8 @@ class TestDensePlan:
         manager.plan(AttentionStep(causal=False), _ctx(views))
         plan = manager._current_plans["main"]
 
-        assert plan.cu_q.tolist() == [0, 2, 6]
-        assert plan.cu_k.tolist() == [0, 5, 18]
+        assert list(plan.cu_q) == [0, 2, 6]
+        assert list(plan.cu_k) == [0, 5, 18]
         assert plan.max_q == 4
         assert plan.max_k == 13
         assert [s.request_id for s in plan.segments] == ["r0", "r1"]
@@ -262,6 +264,63 @@ class TestBackendSelection:
         assert isinstance(manager, expected)
         assert manager.depends_on() == {"kv"}
 
+    def _build_on_cuda(self, monkeypatch, fa3_reason, flashinfer_reason, flashinfer_backend="auto"):
+        """Build a dense spec for a CUDA device with FA3's and FlashInfer's
+        availability forced; nothing is allocated, so this runs on CPU."""
+        monkeypatch.setattr(dense_module, "_fa3_unavailable_reason", lambda device=None: fa3_reason)
+        monkeypatch.setattr(
+            dense_module, "_flashinfer_ragged_unavailable_reason", lambda device=None: flashinfer_reason,
+        )
+        spec = AttentionSpec(
+            resource_key="attn_gen",
+            nodes={"dit"},
+            config=AttentionConfig(
+                kv_cache="kv", backend=AttnBackend.DENSE, flashinfer_backend=flashinfer_backend,
+            ),
+        )
+        return AttentionManager.build(
+            spec,
+            EngineResourceInfo(
+                device=torch.device("cuda", 0),
+                dependencies={"kv": KVSpec(resource_key="kv", nodes={"dit"}, config=PagedKVConfig(
+                    num_layers=1, num_kv_heads=2, head_dim=128, max_seq_len=64, max_num_pages=MAX_PAGES,
+                    page_size=PAGE_SIZE,
+                ))},
+            ),
+        )
+
+    def test_dense_without_fa3_runs_on_flashinfer_ragged(self, monkeypatch):
+        """Where FA3 has no kernel (Blackwell), the dense pass keeps its
+        semantics on FlashInfer's ragged prefill rather than going paged."""
+        manager = self._build_on_cuda(
+            monkeypatch, "fa3-fwd has no kernel for compute capability 10.3", None, "cudnn",
+        )
+        assert type(manager) is FlashInferDenseAttentionManager
+        assert manager._backend == "cudnn"
+        assert manager.requires_kv_write is False
+        assert manager.force_double_buffer is True
+
+    def test_dense_without_fa3_or_flashinfer_goes_paged(self, monkeypatch, caplog):
+        import logging
+
+        dense_module._warn_dense_fallback.cache_clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=dense_module.logger.name):
+                manager = self._build_on_cuda(monkeypatch, "no fa3", "ImportError: no flashinfer")
+        finally:
+            dense_module._warn_dense_fallback.cache_clear()
+        assert type(manager) is FlashInferManager
+        assert "no fa3; ImportError: no flashinfer" in caplog.text
+
+    def test_dense_kernels_do_not_share_a_fingerprint(self):
+        """They differ in the last bits, so a cached artifact keyed on the
+        resource must not carry over from one to the other."""
+        fa3 = _manager()
+        fi = FlashInferDenseAttentionManager(
+            kv_cache="kv", device=torch.device("cpu"), dtype=torch.float32, kv_config=_kv_config(),
+        )
+        assert fa3.fingerprint() != fi.fingerprint()
+
     def test_only_the_dense_backend_skips_the_kv_write(self):
         assert _manager().requires_kv_write is False
         assert FlashInferManager(
@@ -270,6 +329,59 @@ class TestBackendSelection:
             dtype=torch.float32,
             kv_config=_kv_config(),
         ).requires_kv_write is True
+
+
+def _gpu_flashinfer():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import flashinfer  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _gpu_flashinfer(), reason="needs a CUDA GPU and flashinfer")
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_flashinfer_dense_matches_sdpa_over_prefix_and_fresh(causal):
+    """Two segments with different frozen prefixes and GQA: each query block
+    attends its own [prefix | fresh] keys, and a causal plan aligns the block
+    to the end of them, as FA3 does."""
+    dev = torch.device("cuda")
+    page, hq, hkv, d = 16, 4, 2, 128
+    cfg = PagedKVConfig(
+        num_layers=1, num_kv_heads=hkv, head_dim=d, max_seq_len=256, max_num_pages=16,
+        page_size=page, num_qo_heads=hq,
+    )
+    manager = FlashInferDenseAttentionManager(
+        kv_cache="kv", device=dev, dtype=torch.bfloat16, kv_config=cfg,
+    )
+    torch.manual_seed(0)
+    layer = torch.randn(16, 2, page, hkv, d, device=dev, dtype=torch.bfloat16)
+    segs = [("r0", [3, 4], 20, 37), ("r1", [7], 9, 50)]  # rid, prefix pages, prefix, fresh
+    views = [_view(rid, pages + [15], prefix=pre, fresh=fr) for rid, pages, pre, fr in segs]
+    manager.plan(AttentionStep(causal=causal), _ctx(views))
+    total = sum(fr for *_, fr in segs)
+    q = torch.randn(total, hq, d, device=dev, dtype=torch.bfloat16)
+    k = torch.randn(total, hkv, d, device=dev, dtype=torch.bfloat16)
+    v = torch.randn(total, hkv, d, device=dev, dtype=torch.bfloat16)
+    out = manager.run(q, "main", layer, k=k, v=v, layer_idx=0)
+
+    off = 0
+    for _, pages, pre, fr in segs:
+        rows = layer[pages]
+        kk = torch.cat([rows[:, 0].reshape(-1, hkv, d)[:pre], k[off:off + fr]])
+        vv = torch.cat([rows[:, 1].reshape(-1, hkv, d)[:pre], v[off:off + fr]])
+        mask = None
+        if causal:
+            # query i sees the prefix and fresh tokens 0..i
+            mask = torch.ones(fr, pre + fr, dtype=torch.bool, device=dev).tril(diagonal=pre)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q[off:off + fr].transpose(0, 1).float(), kk.transpose(0, 1).float(), vv.transpose(0, 1).float(),
+            attn_mask=mask, enable_gqa=True,
+        ).transpose(0, 1)
+        torch.testing.assert_close(out[off:off + fr].float(), ref, atol=2e-2, rtol=2e-2)
+        off += fr
 
 
 @pytest.fixture

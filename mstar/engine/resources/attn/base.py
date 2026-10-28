@@ -51,8 +51,8 @@ class AttentionManager(AttentionResource):
     # Label / layer cursors come from `AttentionResource`; `run` resolves them.
 
     def fingerprint(self) -> bytes:
-        # the class, not the declared backend: `build` degrades dense to paged
-        # where the FA3 kernel is unusable, and the two do not agree bit for bit
+        # the class, not the declared backend: `build` moves dense to another
+        # kernel where the FA3 one is unusable, and they do not agree bit for bit
         return fingerprint(type(self).__name__)
 
     @classmethod
@@ -86,16 +86,20 @@ class AttentionManager(AttentionResource):
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
         if backend == AttnBackend.DENSE:
-            # A dense backend needs the FlashAttention-3 kernel; where the
-            # wheel does not match the installed torch/CUDA build or has no
-            # kernel for the GPU, degrade to the paged backend AUTO picks
-            # rather than failing to serve.
-            # The two are drop-in for each other: the step declaration is
+            # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
+            # that has no kernel for the GPU or does not import, the same pass
+            # runs on FlashInfer's ragged prefill, and where FlashInfer cannot
+            # run either it degrades to the paged backend AUTO picks rather
+            # than failing to serve.
+            # All three are drop-in for each other: the step declaration is
             # identical (see DenseAttentionManager) and `requires_kv_write`
             # tells the layer which one it is talking to.
             from mstar.engine.resources.attn.dense import (
                 DenseAttentionManager,
+                FlashInferDenseAttentionManager,
                 _fa3_unavailable_reason,
+                _flashinfer_ragged_unavailable_reason,
+                _log_dense_on_flashinfer,
                 _warn_dense_fallback,
             )
 
@@ -107,8 +111,18 @@ class AttentionManager(AttentionResource):
                     dtype=info.kv_dtype,
                     kv_config=kv_config,
                 )
+            fi_reason = _flashinfer_ragged_unavailable_reason(info.device)
+            if fi_reason is None:
+                _log_dense_on_flashinfer(reason, spec.config.flashinfer_backend)
+                return FlashInferDenseAttentionManager(
+                    kv_cache=spec.config.kv_cache,
+                    device=info.device,
+                    dtype=info.kv_dtype,
+                    kv_config=kv_config,
+                    backend=spec.config.flashinfer_backend,
+                )
             backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
-            _warn_dense_fallback(reason, backend)
+            _warn_dense_fallback(f"{reason}; {fi_reason}", backend)
 
         if backend == AttnBackend.FLASHINFER_MLA:
             from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager

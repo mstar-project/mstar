@@ -920,11 +920,15 @@ Cosmos3 environment requirements
   (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
-  one matching your environment. When it is not importable, the engine logs a
-  warning at startup and automatically falls back to the paged ``flashinfer``
-  backend — serving still works, only the bs=1 dense fast path is lost.
-  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects
-  the paged backend explicitly.
+  one matching your environment. It ships kernels for sm_80 and sm_90a only.
+  Where it is not importable or has no kernel for the GPU (Blackwell), the
+  same dense pass runs on FlashInfer's ragged prefill, whose ``auto`` kernel on
+  a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
+  against 6.3 ms for the paged prefill. ``resources: attn_gen:
+  flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``).
+  Without FlashInfer either, the engine logs a warning and falls back to the
+  paged backend. ``model_kwargs.attention_backend: flashinfer`` in the config
+  YAML selects the paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).

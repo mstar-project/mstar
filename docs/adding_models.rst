@@ -521,7 +521,10 @@ The spec types are:
        ``AttnBackend.DENSE``, ``AttnBackend.FLEX`` or ``AttnBackend.FLASHINFER_MLA``.
        Leave it at ``AUTO`` unless the model needs a specific kernel. FlashInfer, dense
        and MLA attention require a ``PagedKVConfig``; FlexAttention requires a
-       ``RingKVConfig``.
+       ``RingKVConfig``. ``DENSE`` runs one varlen pass over each stream's frozen
+       prefix (gathered from the pages once) and the step's fresh K/V, eager only:
+       FA3 (AITER on ROCm), or FlashInfer's ragged prefill where FA3 has no kernel for
+       the GPU, with ``flashinfer_backend`` picking its kernel.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
        ``"fa3"`` when the FlashInfer backend is selected. ``decode_tensor_cores``
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
