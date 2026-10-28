@@ -4,6 +4,7 @@ import copy
 import multiprocessing
 import os
 import pickle
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -21,11 +22,10 @@ def resolve(monkeypatch):
         monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
         monkeypatch.setattr(torch.version, "hip", hip)
         monkeypatch.setattr(torch, "xpu", SimpleNamespace(is_available=lambda: xpu))
-        platforms.resolve_platform.cache_clear()
+        monkeypatch.setattr(platforms, "_platform", None)
         return platforms.resolve_platform()
 
-    yield run
-    platforms.resolve_platform.cache_clear()
+    return run
 
 
 def test_a_rocm_build_is_rocm_though_torch_calls_it_cuda(resolve):
@@ -50,13 +50,30 @@ def test_current_platform_follows_resolution(resolve):
 
 
 def test_resolving_caches_the_platform():
-    platforms.resolve_platform()
-    assert platforms.resolve_platform.cache_info().currsize == 1
+    assert platforms.resolve_platform() is platforms.resolve_platform()
+    assert platforms._platform is not None
 
 
 def test_the_next_test_starts_with_no_platform_cached():
     # test/modular/conftest.py clears the cache around every test
-    assert platforms.resolve_platform.cache_info().currsize == 0
+    assert platforms._platform is None
+
+
+def test_compiled_code_asks_the_platform_without_a_dynamo_warning(monkeypatch):
+    """Dynamo warns on every compile that calls an lru_cache-wrapped function,
+    which ``resolve_platform`` was."""
+    pytest.importorskip("triton.compiler")  # torch.compile rejects conftest's triton stub
+    monkeypatch.setattr(platforms, "_platform", RocmPlatform())
+
+    def step(x):
+        return x * 3 if current_platform.is_rocm() else x
+
+    torch.compiler.reset()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = torch.compile(step, fullgraph=True, backend="eager")(torch.ones(2))
+    assert out.tolist() == [3.0, 3.0]
+    assert not [w for w in caught if "lru_cache" in str(w.message)]
 
 
 def test_current_platform_pickles_and_copies_as_itself(resolve):

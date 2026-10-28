@@ -19,7 +19,7 @@ import types
 import pytest
 import torch
 
-from mstar.platforms import resolve_platform
+from mstar import platforms
 
 # --- torch._dynamo.config stub --------------------------------------------
 
@@ -78,6 +78,6 @@ def torch_flag():
 def _fresh_platform():
     """Clear the cached platform, so a test that stubs ``torch.cuda`` can't
     leak its platform into later tests."""
-    resolve_platform.cache_clear()
+    platforms._platform = None
     yield
-    resolve_platform.cache_clear()
+    platforms._platform = None

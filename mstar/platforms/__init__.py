@@ -10,7 +10,6 @@ hardware is.
 
 from __future__ import annotations
 
-import functools
 import os
 from typing import cast
 
@@ -36,9 +35,20 @@ __all__ = [
 ]
 
 
-@functools.cache
+# A module global, not functools.cache: dynamo warns on every compile of code
+# that calls an lru_cache-wrapped function, and traces a global read cleanly.
+_platform: Platform | None = None
+
+
 def resolve_platform() -> Platform:
     """The stack whose devices this process can see, decided on first use."""
+    global _platform
+    if _platform is None:
+        _platform = _detect_platform()
+    return _platform
+
+
+def _detect_platform() -> Platform:
     if torch.cuda.is_available():
         return RocmPlatform() if torch.version.hip is not None else CudaPlatform()
     xpu = getattr(torch, "xpu", None)
