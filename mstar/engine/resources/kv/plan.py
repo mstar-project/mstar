@@ -79,15 +79,6 @@ class PagedIndptrs(NamedTuple):
     # rebuild it with torch ops.
     kv_lens: torch.Tensor | None = None
 
-    def to_device(self, device: torch.device):
-        return PagedIndptrs(
-            qo_indptr=self.qo_indptr.to(device, non_blocking=True),
-            paged_kv_indptr=self.paged_kv_indptr.to(device, non_blocking=True),
-            paged_kv_indices=self.paged_kv_indices.to(device, non_blocking=True),
-            paged_kv_last_page_len=self.paged_kv_last_page_len.to(device, non_blocking=True),
-            kv_lens=self.kv_lens,
-        )
-
     def to_kwargs_dict(self):
         return dict(
             qo_indptr=self.qo_indptr,
@@ -241,13 +232,13 @@ class KVPlanOutput:
     """
 
     __slots__ = (
-        "cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets",
+        "cpu_indptrs", "_views", "_view_builder", "decode_pages", "decode_offsets",
         "rows", "_decode", "columns",
     )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
-        cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
+        decode_pages=None, decode_offsets=None,
         rows=None, view_builder=None, decode: bool | None = None, columns=None,
     ):
         self.cpu_indptrs = cpu_indptrs
@@ -256,9 +247,6 @@ class KVPlanOutput:
         # made on first use (the FlashInfer path never asks for them)
         self._views = views
         self._view_builder = view_builder
-        # only the packed write addressing needs these on device, and only the
-        # resource that builds them reads them; see KVManager._setup_plan_states
-        self.cuda_indptrs = cuda_indptrs
         # a decode step planned off the previous one (KVManager's plan cache):
         # each row's write page and offset in it, so staging need not walk the views
         self.decode_pages = decode_pages
