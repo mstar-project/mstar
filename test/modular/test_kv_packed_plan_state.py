@@ -2,21 +2,32 @@
 indptrs (`_packed_addressing`), matches unpacking the same indptrs with torch
 ops (the device path it replaced, kept here as the reference): staged into a
 captured state (`_stage_packed_plan_state`) and uploaded for an eager write
-(`_host_plan_state`). A step that writes nothing leaves a slot's buffer zero
-and then issues no copy."""
+(`_host_plan_state`), from the Rust addressing and from its numpy fallback. A
+step that writes nothing leaves a slot's buffer zero and then issues no copy."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
+from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.manager import KVManager, KVPlanState, _SlotBuffer
 from mstar.engine.resources.kv.plan import SINK_PAGE, PagedIndptrs
 from mstar.utils.h2d import PinnedStager
 
 PAGE, CAPTURE = 16, 96
+
+
+@pytest.fixture(params=["rust", "numpy"])
+def addressing(request, monkeypatch):
+    if request.param == "rust" and manager_mod._rust_packed_addressing is None:
+        pytest.skip("the mstar_rust extension is not built with kv_packed_addressing")
+    if request.param == "numpy":
+        monkeypatch.setattr(manager_mod, "_rust_packed_addressing", None)
+    return request.param
 
 
 def _kv():
@@ -90,7 +101,7 @@ def _device_unpacked(kv, indptrs) -> KVPlanState:
     return ref
 
 
-def test_host_addressing_matches_device_unpacking():
+def test_host_addressing_matches_device_unpacking(addressing):
     kv = _kv()
     rng = np.random.default_rng(0)
     for _ in range(20):
@@ -118,16 +129,11 @@ def test_a_step_that_only_reads_stages_the_sink():
     assert got.token_to_cache.tolist() == [0] * CAPTURE
 
 
-def test_a_row_past_its_pages_is_refused():
+def test_a_row_past_its_pages_is_refused(addressing):
     """A writing row with no page, or a last page longer than a page, would
     give a page index outside the row; numpy would wrap a negative one onto
     another row's page."""
-    import pytest
-
-    kv = KVManager.__new__(KVManager)
-    kv.kv_cache = SimpleNamespace(page_size=PAGE)
-    kv._device = torch.device("cpu")
-    kv._plan_stager = PinnedStager(torch.long)
+    kv = _kv()
     i32 = lambda v: torch.tensor(v, dtype=torch.int32)  # noqa: E731
     for kvp, idx, last in (
         ([0, 1, 1], [5], [3, 1]),  # second row writes a token with no page
@@ -137,11 +143,11 @@ def test_a_row_past_its_pages_is_refused():
             qo_indptr=i32([0, 2, 3]), paged_kv_indptr=i32(kvp), paged_kv_indices=i32(idx),
             paged_kv_last_page_len=i32(last), kv_lens=None,
         )
-        with pytest.raises(RuntimeError, match="past its own pages"):
+        with pytest.raises((RuntimeError, ValueError), match="past its own pages"):
             kv._stage_packed_plan_state(indptrs, _state(), CAPTURE)
 
 
-def test_an_eager_writes_host_addressing_matches_the_reference():
+def test_an_eager_writes_host_addressing_matches_the_reference(addressing):
     kv = _kv()
     rng = np.random.default_rng(1)
     for _ in range(20):

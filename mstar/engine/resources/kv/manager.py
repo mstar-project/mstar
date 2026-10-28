@@ -60,6 +60,11 @@ from mstar.engine.resources.step import (
 )
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
+
+try:  # rust/src/kv_plan.rs; an older build has none
+    from mstar_rust import kv_packed_addressing as _rust_packed_addressing
+except ImportError:
+    _rust_packed_addressing = None
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 from mstar.utils.profiler import PhaseLaps
 
@@ -2243,14 +2248,22 @@ class KVManager(AttentionResource):
         if total == 0:
             # every row reads without writing (a zero-span context label)
             return self._stage_static(static_state, (), (), 0)
-        pages, offsets = self._packed_addressing(indptrs, total)
-        return self._stage_static(static_state, pages, offsets, total)
+        both = self._packed_addressing(indptrs, total)
+        return self._stage_static(static_state, both[:total], both[total:], total)
 
-    def _packed_addressing(self, indptrs: PagedIndptrs, total: int) -> tuple[np.ndarray, np.ndarray]:
-        """Each new token's page and offset in it, from the plan's host
-        indptrs: tokens are appended after each row's stored length."""
+    def _packed_addressing(self, indptrs: PagedIndptrs, total: int) -> np.ndarray:
+        """Each new token's page, then each one's offset in it (``2 * total``
+        int64), from the plan's host indptrs: tokens are appended after each
+        row's stored length. One Rust call when the extension has it."""
         page_size = self.kv_cache.page_size
         qo = indptrs.qo_indptr.numpy()
+        if _rust_packed_addressing is not None:
+            both = np.empty(2 * total, np.int64)
+            _rust_packed_addressing(
+                qo, indptrs.paged_kv_indptr.numpy(), indptrs.paged_kv_indices.numpy(),
+                indptrs.paged_kv_last_page_len.numpy(), page_size, both,
+            )
+            return both
         kvp = indptrs.paged_kv_indptr.numpy()
         spans = np.diff(qo)
         seg = np.repeat(np.arange(len(spans)), spans)
@@ -2266,17 +2279,16 @@ class KVManager(AttentionResource):
                 f"(spans {spans.tolist()}, kv indptr {kvp.tolist()}, last page lens {last.tolist()})"
             )
         pos = (kv_after - spans - qo[:-1])[seg] + np.arange(total)
-        page, offsets = np.divmod(pos, page_size)
-        return indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page], offsets
+        both = np.empty(2 * total, np.int64)
+        page, both[total:] = np.divmod(pos, page_size)
+        both[:total] = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
+        return both
 
     def _host_plan_state(self, indptrs: PagedIndptrs, total: int) -> KVPlanState:
         """An eager write's addressing: computed on the host and uploaded in
         one page-locked copy, rather than unpacked on the device from
         uploaded indptrs (four copies and a dozen small kernels a step)."""
-        pages, offsets = self._packed_addressing(indptrs, total)
-        host = np.empty(2 * total, np.int64)
-        host[:total] = pages
-        host[total:] = offsets
+        host = self._packed_addressing(indptrs, total)
         both = torch.empty(2 * total, dtype=torch.long, device=self._device)
         self._plan_stager.copy_(both, host)
         return KVPlanState(token_to_page=both[:total], token_to_cache=both[total:], total_tokens=total)

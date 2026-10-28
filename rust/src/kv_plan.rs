@@ -8,6 +8,9 @@
 //! fallback in `page_table.py` is the same arithmetic, op for op; a step of a
 //! few dozen rows is where the ~30 numpy calls it takes cost more than the
 //! per-row Python they replace, and one call here costs less than either.
+//!
+//! `packed_addressing` is a packed step's write locations, one page and offset
+//! per new token, for an eager write too large for per-token numpy to be cheap.
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
@@ -113,6 +116,94 @@ pub fn kv_plan_columns<'py>(
     Ok((PyByteArray::new(py, bytes), cols.total, cols.all_have_pages))
 }
 
+/// Each new token's page and offset, for a packed step that appends `span`
+/// tokens to each row after what it stores: `out[..total]` the pages,
+/// `out[total..]` the offsets in them. The arrays are a plan label's
+/// FlashInfer arrays (`qo_indptr`, `paged_kv_indptr`, `paged_kv_indices`,
+/// `paged_kv_last_page_len`); `KVManager._packed_addressing` is the numpy
+/// version.
+pub fn packed_addressing(
+    qo: &[i32],
+    kv_indptr: &[i32],
+    indices: &[i32],
+    last_page_len: &[i32],
+    page_size: i64,
+    out: &mut [i64],
+) -> Result<(), String> {
+    let n = last_page_len.len();
+    if qo.len() != n + 1 || kv_indptr.len() != n + 1 {
+        return Err("indptrs and rows of different lengths".into());
+    }
+    if page_size <= 0 {
+        return Err("page_size must be positive".into());
+    }
+    let total = qo[n] as usize;
+    if out.len() != 2 * total {
+        return Err(format!("{} output slots for {} tokens", out.len(), total));
+    }
+    let (pages, offsets) = out.split_at_mut(total);
+    for r in 0..n {
+        let (q0, q1) = (qo[r] as usize, qo[r + 1] as usize);
+        if q1 < q0 || q1 > total {
+            return Err(format!("row {r}: qo_indptr is not ascending"));
+        }
+        let span = (q1 - q0) as i64;
+        if span == 0 {
+            continue; // reads only
+        }
+        let k0 = kv_indptr[r] as i64;
+        let held = kv_indptr[r + 1] as i64 - k0;
+        let last = last_page_len[r] as i64;
+        // the row's length after the append, so its first new token's position;
+        // a row's tokens must land in its own pages, not the next row's
+        let start = (held - 1) * page_size + last - span;
+        if start < 0 || last > page_size {
+            return Err(format!(
+                "KV packed plan: row {r} writes past its own pages \
+                 ({span} new tokens, {held} pages, last page length {last})"
+            ));
+        }
+        for j in 0..span {
+            let pos = start + j;
+            let page = (k0 + pos / page_size) as usize;
+            if page >= indices.len() {
+                return Err(format!("row {r}: page {page} is past the plan's indices"));
+            }
+            pages[q0 + j as usize] = indices[page] as i64;
+            offsets[q0 + j as usize] = pos % page_size;
+        }
+    }
+    Ok(())
+}
+
+/// ``packed_addressing`` for Python, into ``out`` (C-contiguous int64 of
+/// ``2 * total``).
+#[pyfunction]
+pub fn kv_packed_addressing(
+    qo: PyBuffer<i32>,
+    kv_indptr: PyBuffer<i32>,
+    indices: PyBuffer<i32>,
+    last_page_len: PyBuffer<i32>,
+    page_size: i64,
+    out: PyBuffer<i64>,
+) -> PyResult<()> {
+    for buf in [&qo, &kv_indptr, &indices, &last_page_len] {
+        if !buf.is_c_contiguous() {
+            return Err(PyValueError::new_err("the plan arrays must be C-contiguous"));
+        }
+    }
+    if !out.is_c_contiguous() || out.readonly() {
+        return Err(PyValueError::new_err("out must be a writable C-contiguous int64 buffer"));
+    }
+    // SAFETY: C-contiguous buffers of the declared item type, held by the
+    // caller for this call under the GIL; `out` is writable and is not one
+    // of the inputs (the caller allocates it)
+    let view = |b: &PyBuffer<i32>| unsafe { std::slice::from_raw_parts(b.buf_ptr() as *const i32, b.item_count()) };
+    let out = unsafe { std::slice::from_raw_parts_mut(out.buf_ptr() as *mut i64, out.item_count()) };
+    packed_addressing(view(&qo), view(&kv_indptr), view(&indices), view(&last_page_len), page_size, out)
+        .map_err(PyValueError::new_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +251,35 @@ mod tests {
     #[test]
     fn an_extent_past_the_pool_is_refused() {
         assert!(plan_columns(&[1, 2], &[1], &[2], &[8], &[1], 4).is_err());
+    }
+
+    #[test]
+    fn packed_tokens_land_after_each_rows_stored_length() {
+        // page size 4: row 0 appends 3 after 5 stored (8 -> pages 7, 9),
+        // row 1 appends 2 to an empty stream (page 4)
+        let mut out = vec![0i64; 10];
+        packed_addressing(&[0, 3, 5], &[0, 2, 3], &[7, 9, 4], &[4, 2], 4, &mut out).unwrap();
+        assert_eq!(&out[..5], &[9, 9, 9, 4, 4]);
+        assert_eq!(&out[5..], &[1, 2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn packed_addressing_refuses_more_tokens_than_pages() {
+        let mut out = vec![0i64; 10];
+        assert!(packed_addressing(&[0, 5], &[0, 1], &[7], &[2], 4, &mut out).is_err());
+    }
+
+    #[test]
+    fn packed_addressing_refuses_a_last_page_longer_than_a_page() {
+        // row 0's token would land in page 9, which is row 1's
+        let mut out = vec![0i64; 4];
+        assert!(packed_addressing(&[0, 1, 2], &[0, 1, 2], &[7, 9], &[5, 1], 4, &mut out).is_err());
+    }
+
+    #[test]
+    fn a_row_that_only_reads_needs_no_pages() {
+        let mut out = vec![0i64; 2];
+        packed_addressing(&[0, 0, 1], &[0, 0, 1], &[7], &[0, 1], 4, &mut out).unwrap();
+        assert_eq!(out, vec![7, 0]);
     }
 }
