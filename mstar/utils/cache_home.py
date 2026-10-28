@@ -1,5 +1,5 @@
 """The user's cache root, which M*'s on-disk caches (compiled kernels,
-downloaded checkpoints, eval work dirs) live under.
+downloaded checkpoints) live under.
 
 Standard library only: :mod:`mstar.engine` calls it before importing torch.
 """
