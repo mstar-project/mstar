@@ -65,7 +65,7 @@ VISION_ENCODER, LLM, STATE_ENCODER, VL_BRIDGE, DENOISE_STEP = (
 )
 
 # The Loop's name, which is **not** the walk's. `Loop.name` defaults to a fresh
-# uuid4 (`graph/base.py:487`) and `graph/base.py:485` says it must be set by
+# uuid4 and the comment on that field (`graph/base.py`) says it must be set by
 # hand, because the engine keys a loop's iteration counter and its stop signals
 # on it: `get_loop_indices()` builds `{loop.name: curr_iter}`, and the scaffold
 # reads `dynamic_loop_iter_counts.get(self.loop_name, 0)`. Give the submodule
@@ -85,11 +85,12 @@ class Gr00tN17Model(Model):
     """`nvidia/GR00T-N1.7-3B` on M\\*."""
 
     # `process_prompt` turns these three into tensor edges, so the conductor has
-    # no use for the originals and `wire.py:507-511` refuses a tensor in control
-    # metadata outright. The data worker keeps its own copy either way
-    # (`data_worker.py:586`), which is where `postprocess` reads the tag back to
-    # unnormalise the actions. `walk` is deliberately **not** here: the schedule
-    # is chosen on the conductor side (`conductor.py:1018-1023`), after the strip.
+    # no use for the originals and `_dynamic` (`wire.py`) refuses a tensor in
+    # control metadata outright. The data worker keeps its own copy either way
+    # (`PreprocessWorkerThread._process_input`), which is where `postprocess`
+    # reads the tag back to unnormalise the actions. `walk` is deliberately
+    # **not** here: the schedule is chosen on the conductor side
+    # (`Conductor._do_ingest_request`), after the strip.
     PREPROCESS_ONLY_KWARGS = ("state", "embodiment_tag")
 
     PREFILL_WALK = "prefill"
@@ -155,11 +156,11 @@ class Gr00tN17Model(Model):
 
         Registration passes a hub id (`nvidia/GR00T-N1.7-3B`); a vendored
         checkout and the tests pass a path. Everything downstream needs a
-        directory: `config.py:40-44` reads `config.json` from it, the processor
-        reads three more json files out of it, and the weight loader opens its
-        safetensors shards (`weight_loader.py:84-92`). One snapshot serves all
-        three, which is why this fetches the whole repo rather than the config
-        alone -- pi05 resolves the same way (`pi05_model.py:282-290`).
+        directory: `Gr00tN17Config.from_hf` reads `config.json` from it, the
+        processor reads three more json files out of it, and the weight loader
+        opens its safetensors shards (`load_gr00t_n17_weights`). One snapshot
+        serves all three, which is why this fetches the whole repo rather than
+        the config alone -- pi05 resolves the same way (`Pi05Model._ensure_repo`).
         """
         if self._repo_dir is None:
             if Path(self.model_path_hf).is_dir():
@@ -203,8 +204,8 @@ class Gr00tN17Model(Model):
 
         Each therefore declares its own `dtype`: with none, a cacheless resource
         falls back to "the engine's KV dtype (which is actually a misnamed
-        autocast dtype)" (`ragged/config.py:68-73`), so the dtype the parity bar is
-        measured in would track an unrelated default. z_image, flux2_klein and
+        autocast dtype)" (`RaggedAttentionConfig.dtype`), so the dtype the parity
+        bar is measured in would track an unrelated default. z_image, flux2_klein and
         ltx2_5 pin theirs for the same reason.
 
         The DT needs **two**: a resource is one *kind* of attention, so the
@@ -220,15 +221,16 @@ class Gr00tN17Model(Model):
                     num_qo_heads=vision.num_heads, num_kv_heads=vision.num_heads,
                     head_dim=vision.hidden_size // vision.num_heads,
                     # `vision_encoder` declares one segment per *frame* -- a frame
-                    # attends to itself alone (`submodules.py:112`) -- so the bound is
+                    # attends to itself alone
+                    # (`Gr00tN17VisionEncoderSubmodule.declare_step`) -- so the bound is
                     # the most camera views any embodiment has, which the processor
-                    # reads off the checkpoint (`preprocessing.py:50`).
+                    # reads off the checkpoint (`Gr00tN17Preprocessor.video_keys`).
                     max_segments_per_request=self.max_views,
                     dtype=torch.bfloat16,
                 ),
             ),
             # Causality is a property of the *step*, not the resource: the LLM
-            # node declares `AttentionStep(causal=True)` (`submodules.py:227`).
+            # node declares `AttentionStep(causal=True)` (`Gr00tN17LLMSubmodule.declare_step`).
             # GR00T is the first model on `main` to ask for that on a ragged
             # resource — every other user is non-causal.
             RaggedAttentionSpec(
@@ -267,7 +269,7 @@ class Gr00tN17Model(Model):
                     dtype=torch.bfloat16,
                     # `max_segments_per_request` stays at its default 1: the
                     # cross resource plans one wrapper **per pair**, keyed
-                    # `cross_label(q_label, kv_label)` (`flashinfer.py:254-257`),
+                    # `cross_label(q_label, kv_label)` (`_RaggedCrossManagerBase._plan_layouts`),
                     # and each pair sees one `sa` segment and one key segment per
                     # request. The bound is per label, not per step.
                 ),
@@ -283,7 +285,7 @@ class Gr00tN17Model(Model):
 
         `action_gen`'s terminal output **must** be named for the section's
         loop-back edge, and both for the scaffold's own `LATENTS`.
-        `Loop.__post_init__` (`graph/base.py:636-640`) keeps only the outputs the
+        `Loop.__post_init__` (`graph/base.py`) keeps only the outputs the
         section actually produces, so a mismatched name is **dropped** and the
         walk emits nothing at all -- not a wrong iteration, no output. (pi05's
         comment cites a `_replace_outputs_for_final_iter` that no longer exists
@@ -437,8 +439,9 @@ class Gr00tN17Model(Model):
         """One frame per camera view per timestep, and no more.
 
         The widest embodiment in this checkpoint has 3 views and every one has 2
-        frames per view, so 6. The data worker refuses a request over this before
-        decoding any file (`data_worker.py:580`).
+        frames per view, so 6. The data worker refuses a request over this
+        before decoding any file (`check_file_counts` in
+        `PreprocessWorkerThread._load_media`).
         """
         views = max(len(v) for v in self.processor.video_keys.values())
         steps = max(self.processor.video_steps.values())
@@ -479,12 +482,13 @@ class Gr00tN17Model(Model):
     def warmup_preprocess(self) -> None:
         """Pay the lazy `cv2` import before the first robot observation does.
 
-        The image transform imports cv2 inside the call (`preprocessing.py:471`)
-        because OpenCV is a `gr00t_n17` extra and not a core dependency,
-        so without this the first request of a server's life pays for it. Running
-        the real resize rather than importing the module warms whatever else that
-        path touches; the frame is camera-shaped so the work is the real work, and
-        it is microseconds.
+        The image transform imports cv2 inside the call
+        (`Gr00tN17Preprocessor._shortest_edge_to`) because OpenCV is a
+        `gr00t_n17` extra and not a core dependency, so without this the first
+        request of a server's life pays for it. Running the real resize rather
+        than importing the module warms whatever else that path touches; the
+        frame is camera-shaped so the work is the real work, and it is
+        microseconds.
 
         Nothing else here is lazy: `__init__` already builds the processor, which
         is the expensive part (a tokenizer and an image processor).
@@ -492,7 +496,7 @@ class Gr00tN17Model(Model):
         self.processor.image(np.zeros((180, 320, 3), dtype=np.uint8))
         # The bigger half of the first request's cost is the backbone processor's
         # jinja template: measured 15.7 ms on first use against 0.04 ms after, and
-        # `base.py:889-895` names a tokenizer as exactly what this hook is for.
+        # `Model.warmup_preprocess` names a tokenizer as exactly what this hook is for.
         self.processor.warmup_chat_template()
 
     def _views_from_frames(self, tag: str, frames: list | None) -> dict[str, np.ndarray]:
@@ -501,8 +505,8 @@ class Gr00tN17Model(Model):
         Camera frames travel the **media path**, because they are bulk
         media -- one recorded DROID observation is 3.36 MiB against the 1 MiB cap
         on a `model_kwargs` form field. That path keys loaded files by *modality*
-        (`data_worker.py:583`), so every frame arrives in one list and the order
-        is the only thing that says which camera it came from.
+        (`PreprocessWorkerThread._load_media`), so every frame arrives in one list
+        and the order is the only thing that says which camera it came from.
 
         The order is the reference's own: **time-major, views in the embodiment's
         `modality_keys` order**, which is how `preprocessing.__call__` and
@@ -552,9 +556,9 @@ class Gr00tN17Model(Model):
                 "gr00t_n17 needs an `embodiment_tag`: it selects the joint "
                 "groups, the normalisation stats and the per-robot weights"
             )
-        # `data_worker.py:929` is `400 if isinstance(exc, (ValueError, TypeError))
-        # else 500`, so a bare KeyError here would answer a malformed request with
-        # a 500 whose body is just the missing key's name.
+        # `PreprocessWorkerThread._fail_request` answers `400 if isinstance(exc,
+        # (ValueError, TypeError)) else 500`, so a bare KeyError here would answer a
+        # malformed request with a 500 whose body is just the missing key's name.
         if "state" not in kwargs:
             raise ValueError(
                 "gr00t_n17 needs `state`: an observation is a language instruction "
@@ -585,10 +589,10 @@ class Gr00tN17Model(Model):
     def _walk_schedule(self, model_kwargs: dict | None) -> list[str]:
         """The walks this request runs, in order.
 
-        flux2_klein's idiom (`flux2_klein_model.py:358-361`): the sequence is
-        decided once, carried in `metadata.kwargs`, and advanced by the
-        transition hook. Without it a model has no way to express "this request
-        runs walk B after walk A", and no way to say it is finished.
+        flux2_klein's idiom (`Flux2KleinModel.get_initial_forward_pass_args`):
+        the sequence is decided once, carried in `metadata.kwargs`, and advanced
+        by the transition hook. Without it a model has no way to express "this
+        request runs walk B after walk A", and no way to say it is finished.
         """
         walk = (model_kwargs or {}).get("walk")
         if walk in (self.BACKBONE_WALK, self.STATE_WALK):
@@ -627,11 +631,12 @@ class Gr00tN17Model(Model):
         `np.frombuffer(g["data"], g["dtype"]).reshape(g["shape"])`.
         `mstar.communication.wire` is deliberately not reused -- that is the
         control plane's serializer, and it refuses array payloads outright
-        (`wire.py:507-511`).
+        (`_dynamic` in `wire.py`).
 
         The two kwargs this reads are why they are in `PREPROCESS_ONLY_KWARGS`:
         stripping them from the conductor's copy leaves the data worker's
-        (`data_worker.py:586`), which is the one handed back here.
+        (`PreprocessWorkerThread._process_input`), which is the one handed back
+        here.
         """
         if modality != "action":
             raise ValueError(f"gr00t_n17 emits actions, not {modality!r}")
@@ -691,7 +696,7 @@ class Gr00tN17Model(Model):
             # A reuse walk holds a subset of `prefill`'s nodes, but the request
             # that drives it carries the whole observation either way:
             # `process_prompt` returns everything the processor produces and
-            # `preprocessing.py:201-203` adds `state` and `embodiment_id`
+            # `Gr00tN17Preprocessor.__call__` adds `state` and `embodiment_id`
             # unconditionally, so a `state` request still arrives with
             # `pixel_values`. Skip what this walk cannot reach, exactly as the
             # line above skips what the request did not send -- routing it would
@@ -715,12 +720,12 @@ class Gr00tN17Model(Model):
             inputs=inputs,
             # Everything the request arrived with that this walk does not park.
             # The routed inputs are the obvious half; the rest matter just as
-            # much, because `data_worker.py:583` persists *every* initial signal
-            # and only the model can say it is done with one. Two kinds never
-            # reach a node: `action_mask`, which the processor always produces
-            # (`preprocessing.py:203`) and no node reads, and -- on a reuse walk
-            # -- whatever that walk's nodes cannot consume. Releasing by uuid
-            # rather than by edge covers both without naming either.
+            # much, because `PreprocessWorkerThread._store_persisted` persists
+            # *every* initial signal and only the model can say it is done with one.
+            # Two kinds never reach a node: `action_mask`, which the processor
+            # always produces (`Gr00tN17Preprocessor.__call__`) and no node reads,
+            # and -- on a reuse walk -- whatever that walk's nodes cannot consume.
+            # Releasing by uuid rather than by edge covers both without naming either.
             unpersist_tensors=[
                 info for infos in input_signals.values() for info in infos
                 if info.uuid not in parked
@@ -753,8 +758,8 @@ class Gr00tN17Model(Model):
         # Past the end means finished. A reuse walk is a schedule of one, so it
         # lands here on its first transition rather than re-emitting itself with
         # no inputs -- which the conductor reads as "self-triggers via
-        # StreamBuffer" (`conductor.py:1528`) and GR00T has no stream, so the
-        # partition would idle forever.
+        # StreamBuffer" (`Conductor._process_done_forward`) and GR00T has no
+        # stream, so the partition would idle forever.
         request_done = step >= len(schedule)
         if request_done:
             return ForwardPassArgs(

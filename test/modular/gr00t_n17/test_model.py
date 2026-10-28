@@ -85,22 +85,23 @@ _CARRIED = "latents"
 # Each node's contract, spelled out from `submodules.py` (the cite is the
 # `prepare_inputs` that reads the name, or the `forward` that returns it).
 _NODE_INPUTS = {
-    # `submodules.py:86,96`
+    # `Gr00tN17VisionEncoderSubmodule.prepare_inputs`
     VISION_ENCODER: {"pixel_values", "image_grid_thw"},
-    # `submodules.py:180-183,207`. NOT `position_ids` or `image_rows`: it derives
-    # both (`submodules.py:196-209`) and emits `image_rows`.
+    # `Gr00tN17LLMSubmodule.prepare_inputs`. NOT `position_ids` or `image_rows`: it
+    # derives both there and emits `image_rows`.
     LLM: {"vision_embeds", "deepstack_embeds", "input_ids", "image_grid_thw"},
-    VL_BRIDGE: {"backbone_features", "image_rows"},  # `submodules.py:372-373`
-    STATE_ENCODER: {"state", "embodiment_id"},  # `submodules.py:290-291`
-    # the carried sample (`denoise_loop.py:399`), the conditioning (`submodules.py:550,564,577`)
+    VL_BRIDGE: {"backbone_features", "image_rows"},  # `Gr00tN17VLBridgeSubmodule.prepare_inputs`
+    STATE_ENCODER: {"state", "embodiment_id"},  # `Gr00tN17StateEncoderSubmodule.prepare_inputs`
+    # the carried sample (`DenoiseLoopSubmodule._carried_inputs`), the conditioning
+    # (`Gr00tN17DenoiseStepSubmodule.request_inputs`)
     DENOISE_STEP: {_CARRIED, "vl_text", "vl_image", "state_features", "embodiment_id"},
 }
 _NODE_OUTPUTS = {
-    VISION_ENCODER: {"vision_embeds", "deepstack_embeds"},  # `submodules.py:154`
-    LLM: {"backbone_features", "image_rows"},  # `submodules.py:266`
-    VL_BRIDGE: {"vl_text", "vl_image"},  # `submodules.py:430-431`
-    STATE_ENCODER: {"state_features"},  # `submodules.py:331`
-    DENOISE_STEP: {_CARRIED},  # `denoise_loop.py:426`
+    VISION_ENCODER: {"vision_embeds", "deepstack_embeds"},  # `Gr00tN17VisionEncoderSubmodule.forward`
+    LLM: {"backbone_features", "image_rows"},  # `Gr00tN17LLMSubmodule.forward`
+    VL_BRIDGE: {"vl_text", "vl_image"},  # `Gr00tN17VLBridgeSubmodule.forward`
+    STATE_ENCODER: {"state_features"},  # `Gr00tN17StateEncoderSubmodule.forward`
+    DENOISE_STEP: {_CARRIED},  # `DenoiseLoopSubmodule._run`
 }
 # What a request carries into `prefill`, and where each one goes; `image_grid_thw`
 # goes to two nodes.
@@ -277,10 +278,10 @@ def test_prefill_is_a_parallel_whose_two_branches_never_wait_on_each_other():
 
 def test_prefills_persist_edges_park_rather_than_point_at_a_node():
     """Regression: a persist edge once pointed at ``denoise_step``, which is not in
-    ``prefill``, and nothing raised: the tensor is parked either way and the
-    destination is read only when routed. ``persist`` and a real destination
-    are compatible in general (``graph/runtime/python.py:1057-1060``);
-    ``EMPTY_DESTINATION`` is the idiom flux2_klein uses (``flux2_klein_model.py:193``)."""
+    ``prefill``, and nothing raised: the tensor is parked either way and the destination is
+    read only when routed. ``persist`` and a real destination are compatible in general
+    (``PythonGraphRuntime._process_node_outputs``); ``EMPTY_DESTINATION`` is the idiom
+    flux2_klein uses (``Flux2KleinModel.get_graph_walk_graphs``)."""
     prefill = _model().get_graph_walk_graphs()[_PREFILL]
     persisted = [edge for edge in _edges(prefill) if edge.persist]
 
@@ -297,13 +298,14 @@ def test_a_persisted_request_input_keeps_its_destination():
     """``embodiment_id`` must reach ``state_encoder`` and survive ``prefill``, because
     the denoise step reads it every iteration, so its edge has both a destination and
     ``persist``. The flag is the model's own marker: the conductor parks every initial
-    signal (``conductor.py:1000``) and the runtime reads ``persist`` only on outputs
-    (``graph/runtime/python.py:997``).
+    signal (``Conductor._do_ingest_request``) and the runtime reads ``persist`` only on
+    outputs (``PythonGraphRuntime._process_node_outputs``).
 
     The release list is per signal, not per edge. Per edge, ``image_grid_thw`` (routed
     twice) would be released twice and ``action_mask`` (routed nowhere,
-    ``preprocessing.py:203``) never, held for the request's life since
-    ``data_worker.py:583`` persists every initial signal. Regression for that leak."""
+    ``Gr00tN17Preprocessor.__call__``) never, held for the request's life since
+    ``PreprocessWorkerThread._store_persisted`` persists every initial signal. Regression
+    for that leak."""
     model = _model()
     # `action_mask` rides along unrouted: it is the one input the full path
     # receives and no node reads.
@@ -328,8 +330,8 @@ def test_a_persisted_request_input_keeps_its_destination():
 
 def test_the_loops_terminal_output_is_named_for_the_sections_loop_back_edge():
     """``Loop.__post_init__`` keeps only terminal outputs the section produces, matched
-    by name (``base.py:641``), so a renamed terminal output is silently deleted and
-    ``action_gen`` emits nothing (pi05 warns of the same, ``pi05_model.py:447-455``)."""
+    by name (``graph/base.py``), so a renamed terminal output is silently deleted and
+    ``action_gen`` emits nothing (pi05 warns of the same, ``Pi05Model.get_graph_walk_graphs``)."""
     loop = _model().get_graph_walk_graphs()[_ACTION_GEN]
 
     assert isinstance(loop, Loop)
@@ -357,12 +359,12 @@ def test_the_loops_terminal_output_is_named_for_the_sections_loop_back_edge():
 def test_each_node_declares_the_contract_its_submodule_reads():
     """Each node's declared inputs and outputs against what ``submodules.py`` reads and
     returns; nothing else checks the two, and an output key matching no edge is dropped
-    silently (``graph/runtime/python.py:401-405``). Inputs are ``==``; outputs are
+    silently (``PythonGraphRuntime.get_output_signals``). Inputs are ``==``; outputs are
     ``<=`` per walk (reuse walks emit less) and ``==`` over the union.
 
     No walk may gain a loop-back by accident: declaring ``image_rows`` (an LLM output)
     as an LLM input turns the walk's own edge into a loop-back on a node that already
-    ran (``graph/base.py:420-422``)."""
+    ran (``Sequential.get_inputs_outputs``, ``graph/base.py``)."""
     walks = _model().get_graph_walk_graphs()
     emitted: dict[str, set[str]] = {name: set() for name in _NODE_OUTPUTS}
 
@@ -433,12 +435,12 @@ def test_action_gens_conditioning_inputs_are_exactly_what_prefill_persists():
 
 
 def test_the_loops_carried_edge_is_the_scaffolds_own_latents_name():
-    """The carried sample is the scaffold's: ``_carried_inputs`` reads
-    ``loop_back_names`` (``denoise_loop.py:399``) and ``_run`` returns ``LATENTS``
-    (``denoise_loop.py:426``), while the worker routes by the graph's edge names.
+    """The carried sample is the scaffold's: ``DenoiseLoopSubmodule._carried_inputs``
+    reads ``loop_back_names`` and ``DenoiseLoopSubmodule._run`` returns ``LATENTS``,
+    while the worker routes by the graph's edge names.
     Regression: with the walk naming it ``actions``, iteration 1 raised "loop-back
     edge(s) ['latents'] missing". ``denoise``'s parameter must match too, since the
-    scaffold passes it by keyword (``denoise_loop.py:88-92``)."""
+    scaffold passes it by keyword (``DenoiseLoopSubmodule.LATENTS``)."""
     loop = _model().get_graph_walk_graphs()[_ACTION_GEN]
     carried = {name for name, _ in loop._loop_back_inputs}
 
@@ -455,9 +457,10 @@ def test_the_loops_carried_edge_is_the_scaffolds_own_latents_name():
 
 def test_every_input_the_loop_needs_is_delivered_to_it():
     """The conductor parks tensors but does not route them into the next walk; this hook
-    must build an edge for every ``denoise_step`` input (``conductor.py:1487``,
-    flux2_klein's shape, ``flux2_klein_model.py:406-412``). Regression: it once emitted
-    only the carried edge, and the loop never became ready."""
+    must build an edge for every ``denoise_step`` input
+    (``Conductor._process_done_forward``, flux2_klein's shape,
+    ``Flux2KleinModel.get_partition_forward_pass_args``). Regression: it once emitted only
+    the carried edge, and the loop never became ready."""
     model = _model()
     walks = model.get_graph_walk_graphs()
     metadata = _metadata(model)
@@ -491,7 +494,7 @@ def test_the_reuse_walks_expose_the_nodes_prefill_already_contains():
     """Each reuse walk is ``prefill``'s own nodes stopping early (same names, inputs and
     internal edge), not a second description that can drift. ``vl_bridge`` stays out of
     ``backbone``: its weights are GR00T's ``action_head.*``. The emitted modality is
-    ``tensor`` because "embedding" is not in ``entrypoint.py:43``
+    ``tensor`` because "embedding" is not in ``entrypoint.py``'s
     ``SUPPORTED_MODALITIES``, and the server would reject the response after the work."""
     walks = _model().get_graph_walk_graphs()
     prefill = _nodes(walks[_PREFILL])
@@ -527,11 +530,11 @@ _REUSE_WALKS = {"the backbone walk": _BACKBONE_WALK, "the state walk": _STATE}
 @pytest.mark.parametrize("walk", list(_REUSE_WALKS.values()), ids=list(_REUSE_WALKS))
 def test_a_reuse_walk_is_selected_by_name_and_schedules_only_itself(walk):
     """The schedule is decided once and parked in ``metadata.kwargs`` (flux2_klein's
-    idiom, ``flux2_klein_model.py:358-361``). Its first entry picks the worker graphs
-    (``conductor.py:1030``), so a schedule starting at ``prefill`` serves an action;
-    a second entry sends the request to ``action_gen``, whose inputs never complete.
-    ``walk`` must be in ``request_kwargs`` (``model/base.py:757-762``) or the client is
-    told it was ignored."""
+    idiom, ``Flux2KleinModel.get_initial_forward_pass_args``). Its first entry picks the
+    worker graphs (``Conductor._do_ingest_request``), so a schedule starting at ``prefill``
+    serves an action; a second entry sends the request to ``action_gen``, whose inputs
+    never complete. ``walk`` must be in ``request_kwargs`` (``Model.request_kwargs``) or
+    the client is told it was ignored."""
     model = _model()
     metadata = _metadata(model, walk=walk)
 
@@ -547,7 +550,7 @@ def test_a_reuse_walk_is_selected_by_name_and_schedules_only_itself(walk):
 @pytest.mark.parametrize("walk", list(_REUSE_WALKS.values()), ids=list(_REUSE_WALKS))
 def test_a_reuse_walk_is_done_at_its_first_transition(walk):
     """A hang, not an error: re-emitting the current walk with no inputs reads to the
-    conductor as "partition self-triggers via StreamBuffer" (``conductor.py:1528-1531``)
+    conductor as "partition self-triggers via StreamBuffer" (``Conductor._process_done_forward``)
     and it sends nothing, so the request holds its worker graphs until killed. A reuse
     walk parks nothing, so ``persist_signals`` is empty."""
     model = _model()
@@ -592,12 +595,13 @@ _UNREACHABLE = {
 
 @pytest.mark.parametrize("walk, name, node", list(_UNREACHABLE.values()), ids=list(_UNREACHABLE))
 def test_a_reuse_walk_drops_an_input_it_has_no_node_for(walk, name, node):
-    """A reuse request always carries the whole observation (``preprocessing.py:201-203``,
-    ``data_worker.py:554``, ``conductor.py:1018-1023``), so refusing would refuse every
-    real reuse request; regression for that. The input must not be routed (an edge to a
-    node outside the walk is shipped and never consumed) and must still be released
-    (``data_worker.py:583``), with no later hop to release it on. The full path routing
-    the same input is the positive control."""
+    """A reuse request always carries the whole observation
+    (``Gr00tN17Preprocessor.__call__``, ``PreprocessWorkerThread._process_input``,
+    ``Conductor._do_ingest_request``), so refusing would refuse every real reuse request;
+    regression for that. The input must not be routed (an edge to a node outside the walk is
+    shipped and never consumed) and must still be released
+    (``PreprocessWorkerThread._store_persisted``), with no later hop to release it on. The
+    full path routing the same input is the positive control."""
     model = _model()
     signals = {signal: [_info([1], uuid=i)] for i, signal in enumerate(_ROUTED)}
     args = model.get_initial_forward_pass_args(
@@ -625,8 +629,8 @@ def test_a_reuse_walk_drops_an_input_it_has_no_node_for(walk, name, node):
 def test_the_embodiment_id_is_parked_only_where_a_loop_reads_it_back():
     """Parked only on the full path, where the denoise step reads it every iteration;
     on a reuse walk nothing ever unpersists it, so a parked copy leaks for the request's
-    life. Both directions, since the flag (``gr00t_n17_model.py:706``) can be wrong
-    either way, and the leak is asserted on the release list itself."""
+    life. Both directions, since the flag (``Gr00tN17Model.get_initial_forward_pass_args``)
+    can be wrong either way, and the leak is asserted on the release list itself."""
     model = _model()
     signals = {"state": [_info([1, 8], uuid=1)], "embodiment_id": [_info([1], uuid=2)]}
 
@@ -650,11 +654,11 @@ def test_the_embodiment_id_is_parked_only_where_a_loop_reads_it_back():
 
 
 def test_the_reuse_walk_node_sets_match_the_graphs():
-    """``REUSE_WALK_NODES`` is a hand copy of graph structure (``gr00t_n17_model.py:100-107``)
-    and drifts both ways: a stale node lets an input through to nothing, a missing one
-    refuses a valid request. A selectable walk missing from it gets ``reachable=None``
-    (``gr00t_n17_model.py:684``), "route everything", so selectable and listed must be
-    the same walks."""
+    """``Gr00tN17Model.REUSE_WALK_NODES`` is a hand copy of graph structure and drifts
+    both ways: a stale node lets an input through to nothing, a missing one refuses a valid
+    request. A selectable walk missing from it gets ``reachable=None``
+    (``Gr00tN17Model.get_initial_forward_pass_args``), "route everything", so selectable
+    and listed must be the same walks."""
     model = _model()
     walks = model.get_graph_walk_graphs()
 
@@ -748,10 +752,11 @@ def test_every_head_geometry_is_read_off_the_config(scale):
 
 
 def test_the_vision_bound_is_the_only_one_that_is_not_one_per_request():
-    """``max_segments_per_request`` is per span label (``flashinfer.py:81-100``), and the
-    cross resource plans one wrapper per pair (``flashinfer.py:254-257``). Only the ViT,
-    one segment per frame, exceeds 1. The DT's cross bound looks like it should be
-    ``len(DT_XATTN_PAIRS)``, but each pair sees one segment per request per label."""
+    """``max_segments_per_request`` is per span label (``_RaggedManagerBase._cg_wrapper``),
+    and the cross resource plans one wrapper per pair
+    (``_RaggedCrossManagerBase._plan_layouts``). Only the ViT, one segment per frame,
+    exceeds 1. The DT's cross bound looks like it should be ``len(DT_XATTN_PAIRS)``, but
+    each pair sees one segment per request per label."""
     specs = _specs(_model())
 
     assert {key: spec.config.max_segments_per_request for key, spec in specs.items()} == {
@@ -765,8 +770,8 @@ def test_the_vision_bound_is_the_only_one_that_is_not_one_per_request():
 
 def test_every_spec_pins_its_activation_dtype():
     """A cacheless ragged resource with ``dtype=None`` takes the engine's KV dtype
-    (``ragged/config.py:68-73``), so the parity bar's bf16 would track something
-    unrelated to this model (z_image pins too, ``z_image_model.py:128-129``)."""
+    (``RaggedAttentionConfig.dtype``), so the parity bar's bf16 would track something
+    unrelated to this model (z_image pins too, ``ZImageModel.get_node_resources``)."""
     specs = _specs(_model())
 
     assert {spec.config.dtype for spec in specs.values()} == {torch.bfloat16}
@@ -800,7 +805,7 @@ _VIEW_CASES = {
 def test_max_views_is_the_widest_embodiments_video_keys(video_keys, expected):
     """Sizes the ViT's segment bound; an under-count plans fewer spans than the forward
     attends, and a ragged kernel reading the declared length gives a wrong answer, not a
-    crash. Read off the processor's per-tag video keys (``preprocessing.py:50``)."""
+    crash. Read off the processor's per-tag video keys (``Gr00tN17Preprocessor.video_keys``)."""
     model = _model(video_keys=video_keys)
 
     assert model.max_views == expected
@@ -859,9 +864,10 @@ _SPANS = {
 @pytest.mark.parametrize("text_rows, image_rows", list(_SPANS.values()), ids=list(_SPANS))
 def test_the_bucket_keys_span_counts_come_off_the_persisted_tensors_own_dims(text_rows, image_rows):
     """``denoise_step`` needs the span lengths before their tensors arrive, so they ride on
-    ``step_metadata`` under the names the node reads (``submodules.py:493-502``).
-    Derived from the persisted tensors' own ``dims``, because the node's check
-    (``submodules.py:557``) only catches a disagreement inside a batch."""
+    ``step_metadata`` under the names the node reads
+    (``Gr00tN17DenoiseStepSubmodule.bucket_key_for``). Derived from the persisted tensors'
+    own ``dims``, because the node's check (``Gr00tN17DenoiseStepSubmodule.request_inputs``)
+    only catches a disagreement inside a batch."""
     model = _model()
     metadata = _metadata(model)
     persist = {
@@ -1059,7 +1065,7 @@ def test_the_served_vision_node_holds_the_vision_config_and_prepares_a_grid(tmp_
 
 
 def test_only_the_bridge_opts_out_of_autocast_and_it_is_built_in_the_engines_dtype(tmp_path):
-    """The engine keeps an opted-out node in its built dtype (``engine_manager.py:245-252``),
+    """The engine keeps an opted-out node in its built dtype (``EngineManager.build``),
     so the bridge must be built in bf16 here; in fp32 it runs fp32 with autocast off,
     not NVIDIA's bf16 bridge. The other four keep the engine's autocast."""
     model, _ = _served(tmp_path)
@@ -1306,8 +1312,8 @@ def test_postprocess_adds_the_batch_axis_the_engine_hands_back_without():
 def test_postprocess_finds_the_tag_and_the_state_in_the_kwargs_the_data_worker_kept():
     """The decode needs the tag and the raw state at the end of the request; the conductor's
     kwargs are stripped of ``PREPROCESS_ONLY_KWARGS`` but the data worker's are not
-    (``data_worker.py:586``). Moving the state shifts the relative group, so a dropped
-    state cannot pass as an absolute chunk."""
+    (``PreprocessWorkerThread._process_input``). Moving the state shifts the relative group,
+    so a dropped state cannot pass as an absolute chunk."""
     assert {"embodiment_tag", "state"} <= set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS)
     moved = {"arm": _RAW_STATE["arm"] + 100.0}
     raw = _decoding_model().postprocess(_CHUNK, "action", {"embodiment_tag": "bot", "state": moved})
@@ -1440,7 +1446,7 @@ def test_the_model_constructs_from_its_two_checkpoints():
     """``__init__`` is otherwise routed around, and its processor call was once wrong.
     Two repos: the action head is ``nvidia/GR00T-N1.7-3B``, the Qwen3-VL dims are
     ``nvidia/Cosmos-Reason2-2B``. ``max_action_horizon`` must be the config's: the
-    processor refuses a too-long embodiment against it (``preprocessing.py:69-71``)."""
+    processor refuses a too-long embodiment against it (``Gr00tN17Preprocessor.__init__``)."""
     model = Gr00tN17Model(model_path_hf=str(GR00T), backbone_path_hf=BACKBONE)
 
     assert model.config == Gr00tN17Config.from_hf(GR00T, BACKBONE)
@@ -1450,7 +1456,7 @@ def test_the_model_constructs_from_its_two_checkpoints():
     # 3: the widest embodiment in this checkpoint, off the processor's video keys
     assert model.max_views == 3
     assert _specs(model)[VISION_ATTN].config.max_segments_per_request == 3
-    # a frozenset, as `base.py:756` declares; no `video`: frames travel the media path
+    # a frozenset, as `Model.request_kwargs` declares; no `video`: frames travel the media path
     assert model.request_kwargs() == frozenset({"embodiment_tag", "state", "walk"})
     # `walk` stays on the control wire: the conductor chooses the schedule with it
     assert set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS) < model.request_kwargs()
