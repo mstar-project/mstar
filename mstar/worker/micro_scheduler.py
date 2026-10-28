@@ -1428,10 +1428,12 @@ class MicroScheduler:
         # head TP follow batch: get_next_batch *will* schedule that one (rank 0
         # is waiting on it), so it counts as real ready work.
         tp_pend_rids: set[int] = set()
+        head_node = None
         if self.tp_batches_pending_schedule:
             pend: ScheduleTPNode = self.tp_batches_pending_schedule[0]
             if self._key(pend.node_name, pend.graph_walk) != exclude_target:
                 tp_pend_rids = set(self.tp_rids(pend))
+                head_node = pend.node_name
         # Don't bother expiring held_until here — we only read it; the next
         # get_next_batch call will refresh.
         now = time.monotonic()
@@ -1445,11 +1447,19 @@ class MicroScheduler:
         # final and skips the engine pass.
         if not self.runtime.has_ready_excluding(exclude, scan_exclude):
             return False
+        leads = self.parallel_leader_nodes
         for spec in self._ready_specs(exclude, None, scan_exclude):
+            # A node rank 0 leads runs here only as rank 0's head says, so of
+            # its graph-ready rows only the head's are work this rank can take.
+            followed = leads is not None and spec.node_name not in leads
+            if followed and spec.node_name != head_node:
+                continue
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
             for rid in spec.rids:
+                if followed and rid not in tp_pend_rids:
+                    continue
                 fwd_info = request_state.get_fwd_info(
                     rid, node_partition
                 )

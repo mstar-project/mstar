@@ -464,3 +464,209 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Two lockstep nodes on one instance: the resident journal
+# ---------------------------------------------------------------------------
+# Rank 0 interleaves steps of nodes A and B with the moves only it decides (an
+# eviction, a reload) and teardowns. Each step goes out with the moves rank 0
+# made since that node's last step (the journal is per node), and a follower
+# replays them before admitting the step. Each node has a page pool; ``pools``
+# maps nodes to pools, so A and B may have their own or share one.
+#
+# Rank 0 moves pages only once its last broadcast step has admitted (the admit
+# fence), and a teardown carries the seq of the last step it followed, which a
+# follower admits before it frees the pages. Admission is deterministic
+# (lowest free pages first), so the ranks hold the same pages iff they
+# replayed the same moves in the same order. Explored over every order of
+# follower message processing and each rank's admits.
+
+def _alloc(free, need):
+    if len(free) < need:
+        return None, free
+    taken = tuple(sorted(free)[:need])
+    return taken, tuple(p for p in free if p not in taken)
+
+
+def _move(rank, pool, kind, rid):
+    """Apply one page move on ``pool`` to ``rank`` (a dict) in place."""
+    free, held, host = rank["free"], rank["held"], rank["host"]
+    key = (pool, rid)
+    if kind == "evict":
+        if held.get(key):
+            free[pool] = tuple(sorted(free[pool] + held[key]))
+            held[key] = ()
+            rank["host"] = host | {key}
+    elif kind == "reload":
+        if key in host:
+            taken, free[pool] = _alloc(free[pool], rank["need"][rid])
+            assert taken is not None, f"reload of {rid} does not fit"
+            held[key] = taken
+            rank["host"] = host - {key}
+    else:  # a teardown, from every pool
+        for k in [k for k in held if k[1] == rid]:
+            free[k[0]] = tuple(sorted(free[k[0]] + held.pop(k)))
+        rank["host"] = frozenset(k for k in host if k[1] != rid)
+
+
+def _admit(rank, pool, node, rids):
+    """One step's admit: a row not yet holding pages in the node's pool takes
+    its own. All or nothing, as the KV resource's admit is."""
+    if any((pool, r) in rank["host"] for r in rids):
+        return ("refused",)
+    free, got = rank["free"][pool], {}
+    for r in rids:
+        if (pool, r) not in rank["held"]:
+            taken, free = _alloc(free, rank["need"][r])
+            if taken is None:
+                return ("refused",)
+            got[(pool, r)] = taken
+    rank["free"][pool] = free
+    rank["held"].update(got)
+    return ("ran", node, tuple(sorted(got.items())))
+
+
+def _instance_world(nranks, need, pages, pools, script):
+    ranks = [{
+        "free": {pool: tuple(range(pages)) for pool in set(pools.values())},
+        "held": {}, "host": frozenset(), "need": dict(need),
+        "fifo": (), "steps": (), "owed": (), "admitted": (),
+    } for _ in range(nranks)]
+    return {"pools": dict(pools), "script": tuple(script), "pc": 0, "seq": 0,
+            "pending": (), "ranks": ranks}
+
+
+def _instance_key(w):
+    return (w["pc"], w["seq"], w["pending"], tuple(
+        (tuple(sorted(r["free"].items())), tuple(sorted(r["held"].items())), r["host"],
+         r["fifo"], r["steps"], r["owed"], r["admitted"])
+        for r in w["ranks"]
+    ))
+
+
+def _instance_actions(w):
+    acts = []
+    # the admit fence: rank 0 acts only once its last broadcast step admitted
+    if w["pc"] < len(w["script"]) and not w["ranks"][0]["steps"]:
+        acts.append(("lead",))
+    for i, r in enumerate(w["ranks"]):
+        if i and r["fifo"]:
+            acts.append(("proc", i))
+        if r["steps"]:
+            acts.append(("admit", i))
+    return acts
+
+
+def _instance_apply(w, act):
+    w = copy.deepcopy(w)
+    pools = w["pools"]
+    if act[0] == "lead":
+        op = w["script"][w["pc"]]
+        w["pc"] += 1
+        lead = w["ranks"][0]
+        if op[0] == "step":
+            _, node, rids = op
+            seq, w["seq"] = w["seq"], w["seq"] + 1
+            # the node's own moves since its last step (``take_resident_delta``)
+            sent = tuple(m for m in w["pending"] if m[0] == node)
+            w["pending"] = tuple(m for m in w["pending"] if m[0] != node)
+            lead["steps"] = lead["steps"] + ((seq, node, rids, ()),)
+            for r in w["ranks"][1:]:
+                r["fifo"] = r["fifo"] + (("STEP", seq, node, rids, sent),)
+        elif op[0] == "remove":
+            _move(lead, None, "remove", op[1])
+            # stamped with the last step this rank broadcast and admitted
+            for r in w["ranks"][1:]:
+                r["fifo"] = r["fifo"] + (("REMOVE", w["seq"] - 1, op[1]),)
+        else:  # an eviction or reload, under ``op[1]``'s node
+            kind, node, rid = op
+            _move(lead, pools[node], kind, rid)
+            w["pending"] = w["pending"] + ((node, kind, rid),)
+    elif act[0] == "proc":
+        r = w["ranks"][act[1]]
+        msg, r["fifo"] = r["fifo"][0], r["fifo"][1:]
+        if msg[0] == "STEP":
+            r["steps"] = r["steps"] + (msg[1:],)
+        else:
+            r["owed"] = r["owed"] + (msg[1:],)
+    else:
+        i = act[1]
+        r = w["ranks"][i]
+        (seq, node, rids, sent), r["steps"] = r["steps"][0], r["steps"][1:]
+        if i:
+            # what rank 0 did before this step: the teardowns of the steps
+            # before it, then the moves sent with it
+            for after, rid in r["owed"]:
+                if after < seq:
+                    _move(r, None, "remove", rid)
+            r["owed"] = tuple(m for m in r["owed"] if m[0] >= seq)
+            for moved_node, kind, rid in sent:
+                _move(r, pools[moved_node], kind, rid)
+        r["admitted"] = r["admitted"] + ((seq,) + _admit(r, pools[node], node, rids),)
+    return w
+
+
+def explore_instance(nranks, need, pages, pools, script, name=""):
+    """Every interleaving of ``script`` (rank 0's ops) on ``nranks`` ranks."""
+    res = Result(name, "PER_NODE_JOURNAL")
+    stack = [(_instance_world(nranks, need, pages, pools, script), ())]
+    seen = set()
+    while stack:
+        w, trace = stack.pop()
+        k = _instance_key(w)
+        if k in seen:
+            continue
+        seen.add(k)
+        res.states += 1
+        if res.states > STATE_CAP:
+            raise RuntimeError(f"state cap hit: {name}")
+        acts = _instance_actions(w)
+        if not acts:
+            res.terminals += 1
+            lead = w["ranks"][0]["admitted"]
+            if w["pc"] < len(w["script"]) or any(r["fifo"] or r["steps"] for r in w["ranks"]):
+                err = "I4 deadlock"
+            else:
+                err = next((
+                    f"I1 divergence: rank 0 {lead} | rank {i} {r['admitted']}"
+                    for i, r in enumerate(w["ranks"][1:], start=1) if r["admitted"] != lead
+                ), None)
+            if err and len(res.violations) < 3:
+                res.violations.append((err, trace))
+            continue
+        for a in acts:
+            try:
+                stack.append((_instance_apply(w, a), trace + (a,)))
+            except AssertionError as e:
+                if len(res.violations) < 3:
+                    res.violations.append((f"assert: {e}", trace + (a,)))
+    return res
+
+
+# name: (per-request pages, pages per pool, rank 0's ops in order)
+INSTANCE_SCENARIOS = {
+    # an eviction under A, then steps of B, then A's reload and step
+    "evict-under-a-then-b": (
+        {"r0": 2, "r1": 2, "r2": 2}, 4,
+        (("step", "A", ("r0",)), ("step", "B", ("r1",)),
+         ("evict", "A", "r0"), ("step", "B", ("r2",)), ("remove", "r2"),
+         ("reload", "A", "r0"), ("step", "A", ("r0",))),
+    ),
+    # a step refused for want of pages on every rank, then the eviction that
+    # makes room and its retry
+    "alloc-fail-then-evict": (
+        {"r0": 2, "r1": 2, "r2": 2}, 4,
+        (("step", "A", ("r0",)), ("step", "B", ("r1",)), ("step", "A", ("r1", "r2")),
+         ("evict", "A", "r0"), ("step", "B", ("r2",)), ("step", "A", ("r1",))),
+    ),
+    # a request aborted between an A step and a B step: its pages free in the
+    # same gap on every rank
+    "abort-between-nodes": (
+        {"r0": 2, "r1": 2, "r2": 2}, 4,
+        (("step", "A", ("r0",)), ("step", "B", ("r1",)), ("remove", "r0"),
+         ("step", "B", ("r2",)), ("evict", "B", "r1"), ("step", "A", ("r2",))),
+    ),
+}
+OWN_POOLS = {"A": "a", "B": "b"}
+ONE_POOL = {"A": "kv", "B": "kv"}

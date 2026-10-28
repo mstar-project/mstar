@@ -347,15 +347,60 @@ def test_worker_graph_and_sharding_group_tp_mismatch_is_refused():
     ]
 
 
-def test_two_lockstep_nodes_on_one_worker_are_refused(tmp_path):
-    """Worker.__init__ raised this on every rank, after the engine was built."""
-    cfg = _cfg(tmp_path, [
-        {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
-        {"node_names": ["b"], "ranks": [0, 1], "tp_size": 2},
-    ])
+_TP2 = {"ranks": [0, 1], "tp_size": 2}
+
+
+@pytest.mark.parametrize("groups", [
+    [{"node_names": ["a", "b"], **_TP2}],
+    [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **_TP2}],
+    # two replicas each: every worker is in the same block for both nodes
+    [{"node_names": ["a"], "ranks": [0, 1, 2, 3], "tp_size": 2},
+     {"node_names": ["b"], "ranks": [0, 1, 2, 3], "tp_size": 2}],
+], ids=["one_group", "two_groups", "replicas"])
+def test_lockstep_nodes_sharing_one_instance_are_accepted(groups, tmp_path, monkeypatch):
+    """One leader and one step stream, so the nodes may share a resource too."""
+    model = _Model(_a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a", "b"])
+    _start_conductor(model, _cfg(tmp_path, groups), tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("offload", [0, 4])
+def test_lockstep_nodes_sharing_an_evictable_kv_are_refused(offload, tmp_path, monkeypatch):
+    """Rank 0's evictions reach the followers with the next step of the node
+    that made them, so two lockstep nodes over one evictable pool could admit
+    out of step. Without host offload nothing is evicted."""
+    from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+
+    model = _Model(
+        _a_then_b, specs=[KVSpec("kv", {"a", "b"}, PagedKVConfig(max_seq_len=64))],
+        tp_enabled_nodes=["a", "b"],
+    )
+    cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources={"kv": {"cpu_offload_pages": offload}})
+    if not offload:
+        _start_conductor(model, cfg, tmp_path, monkeypatch)
+        return
+    assert [p for p in _problems(model, cfg) if "offloads to the host" in p] == [
+        f"Resource spec kv offloads to the host (cpu_offload_pages 4) and is shared by "
+        f"lockstep-parallel nodes ['a', 'b'] on worker_{rank}. Rank 0 replicates an eviction "
+        "with the next step of the node that made it, so another node's step could admit on "
+        "a follower before the eviction lands there. Give each node its own KV spec, or set "
+        "cpu_offload_pages to 0 (the instance-wide journal is #873's)."
+        for rank in (0, 1)
+    ]
+
+
+@pytest.mark.parametrize("b", [
+    {"ranks": [1, 0], "tp_size": 2},  # the same ranks, led by the other one
+    {"ranks": [0, 1, 2, 3], "tp_size": 4},
+], ids=["other_leader", "other_size"])
+def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, tmp_path):
+    """Two instances on a worker are two leaders' step streams with no order
+    between them."""
+    cfg = _cfg(tmp_path, [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **b}])
     assert _problems(_Model(_a_then_b, tp_enabled_nodes=["a", "b"]), cfg) == [
-        f"Multiple parallel nodes ['a', 'b'] found in worker worker_{rank}; current "
-        "implementation requires at most one lockstep-parallel node per worker."
+        f"Lockstep-parallel nodes on worker_{rank} are in different lockstep instances: "
+        f"a on TP ranks [0, 1], SP ranks None; b on TP ranks {b['ranks']}, SP ranks None. "
+        "A worker's lockstep nodes must share one instance: the same ranks, in the "
+        "same order, with the same tp_size and sp_size."
         for rank in (0, 1)
     ]
 

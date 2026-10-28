@@ -83,6 +83,7 @@ class CommGroup:
         # see ``init_allreduce_fusion``
         self._ar_fusion_ws: int | None = None
         self._ar_fusion_max_tokens = 0
+        self._ar_fusion_hidden = 0
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce(self.device_group)
 
@@ -161,16 +162,19 @@ class CommGroup:
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
         """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs; larger inputs keep the NCCL path. Collective: every
-        member calls it at the same point. Returns whether it is available."""
+        hidden]`` inputs; other inputs keep the NCCL path. Collective: every
+        member calls it at the same point. Returns whether it is available
+        for ``hidden``, which is only the first width set up: every lockstep
+        node of an instance shares its group."""
         if self.world_size == 1 or self._ar_fusion_ws is not None:
-            return self._ar_fusion_ws is not None
+            return self._ar_fusion_ws is not None and self._ar_fusion_hidden == hidden
         from mstar.distributed.ar_fusion import create_workspace
 
         self._ar_fusion_ws = create_workspace(
             self, max_tokens, hidden, dtype,
         )
         self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
+        self._ar_fusion_hidden = hidden
         return self._ar_fusion_ws is not None
 
     def allreduce_add_rmsnorm(
@@ -182,6 +186,7 @@ class CommGroup:
         projection's partial sum (its linear skipped ``reduce_results``)."""
         if (self._ar_fusion_ws is not None
                 and x.shape[0] <= self._ar_fusion_max_tokens
+                and x.shape[-1] == self._ar_fusion_hidden
                 and x.is_contiguous() and residual.is_contiguous()):
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 

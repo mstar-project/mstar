@@ -12,12 +12,12 @@ the implementation:
 """
 
 try:
-    from .tp_async_sim import SCENARIOS, explore
+    from .tp_async_sim import INSTANCE_SCENARIOS, ONE_POOL, OWN_POOLS, SCENARIOS, explore, explore_instance
 except ImportError:  # collected without package context
     import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from tp_async_sim import SCENARIOS, explore
+    from tp_async_sim import INSTANCE_SCENARIOS, ONE_POOL, OWN_POOLS, SCENARIOS, explore, explore_instance
 
 
 def _run(mode, scenario, nranks=2):
@@ -72,6 +72,33 @@ def test_b2_retract_is_refuted_on_structural_cancel():
 def test_b2_waste_matches_design_prediction():
     # expected run-ahead cost: one wasted forward per request end at B=1
     assert _run("B2_VOID", "clean-3step").max_waste == 1
+
+
+# --- two lockstep nodes on one instance ----------------------------------------
+
+
+def _run_instance(scenario, nranks, pools):
+    need, pages, script = INSTANCE_SCENARIOS[scenario]
+    return explore_instance(nranks, need, pages, pools, script, scenario)
+
+
+def test_two_lockstep_nodes_with_their_own_pools_stay_in_step():
+    """Rank 0 interleaves steps of two nodes with evictions, reloads, a refused
+    admit and an abort: every rank admits the same steps with the same pages
+    in every interleaving, each node's moves riding on its own next step."""
+    for nranks in (2, 3):
+        for name in INSTANCE_SCENARIOS:
+            res = _run_instance(name, nranks, OWN_POOLS)
+            assert res.ok, (name, nranks, res.violations[:1])
+
+
+def test_two_lockstep_nodes_sharing_an_evictable_pool_desync():
+    """Why validation refuses the layout: an eviction under A frees the pages
+    B's next step takes on rank 0 alone, since A's move waits for A's step."""
+    for name in ("evict-under-a-then-b", "alloc-fail-then-evict"):
+        res = _run_instance(name, 2, ONE_POOL)
+        assert any("I1" in kind for kind, _ in res.violations), name
+    assert _run_instance("abort-between-nodes", 2, ONE_POOL).ok, "a teardown is stamped, not journalled"
 
 
 # --- a follower's input read failing after rank 0 scheduled the row ----------

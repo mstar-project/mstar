@@ -505,11 +505,11 @@ def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_hea
 FOLLOWERS = ["w0", "w1"]
 
 
-def _leader(tmp_path, streamed=()):
+def _leader(tmp_path, streamed=(), nodes=(NODE,)):
     tm, _ = _shm_manager(tmp_path)
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
-    w.parallel_nodes, w.parallel_leader_nodes = {NODE}, {NODE}
+    w.parallel_nodes, w.parallel_leader_nodes = set(nodes), set(nodes)
     w.is_tp_follower, w.enable_nvtx = False, False
     w._tp_broadcast_seq = 0
     w.sent = []
@@ -556,11 +556,11 @@ def _land(w, rid, edge):
     w._check_ready_tensors()
 
 
-def _step(rows):
-    """A step whose rows take ``rows[rid]``'s input names."""
+def _step(rows, node=NODE):
+    """A step of ``node`` whose rows take ``rows[rid]``'s input names."""
     rids = list(rows)
     return ExecutingBatch(
-        node_name=NODE, per_request_info=dict.fromkeys(rids, SimpleNamespace()),
+        node_name=node, per_request_info=dict.fromkeys(rids, SimpleNamespace()),
         step_context=StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False),
         per_request_input_tensors={
             rid: {name: [torch.zeros(1)] for name in names} for rid, names in rows.items()
@@ -614,6 +614,24 @@ def test_a_colocated_encoders_output_is_a_followers_read(tmp_path):
     )
 
     assert _broadcast(w, _step({"r0": [], "r1": ["vision_embeds"]})) == (True, ("r0", "r1"))
+
+
+def test_one_lockstep_node_taking_an_input_leaves_another_nodes_copy_checked(tmp_path):
+    """One producer beside rank 0 feeds the same signal to two lockstep nodes
+    (BAGEL's ``combine_cfg`` and its LLMs): the first node's step spends only its
+    own read, so the second's goes out checked too."""
+    other = "LLM_cfg"
+    w = _leader(tmp_path, nodes=(NODE, other))
+    w._note_local_lockstep_inputs(
+        StoredOutputs(flat_uuids=[22], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
+        ["latents"],
+    )
+    ran = _step({"r1": ["latents"]})
+    assert _broadcast(w, ran) == (True, ("r1",))
+    w._consume_lockstep_reads(ran)
+
+    assert _broadcast(w, _step({"r1": ["latents"]}, node=other)) == (True, ("r1",))
+    assert _broadcast(w, _step({"r1": ["latents"]})) == (False, None)
 
 
 def test_a_streamed_input_is_checked_on_every_step(tmp_path):

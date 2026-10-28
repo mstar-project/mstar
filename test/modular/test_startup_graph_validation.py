@@ -42,7 +42,7 @@ from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwa
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mstar.utils.containers import ParallelList
-from mstar.validation import DeploymentError, validate_deployment
+from mstar.validation import validate_deployment
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -370,9 +370,12 @@ _TP2 = {"ranks": [1, 2], "tp_size": 2}
     # on one worker the flag is shared, but self-triggered passes still overlap
     (_vocoder_then_post, _ONE, _ONE, False),
     (_gated_vocoder_then_post, _ONE, _ONE, True),
+    # one TP instance on the same ranks shares the flag too
+    (_gated_vocoder_then_post, _TP2, _TP2, True),
     # each node_group picks its own replica, so a request can split across them
     (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, False),
-], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_dp_replicas"])
+], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_colocated_tp",
+     "gated_dp_replicas"])
 def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted, tmp_path, monkeypatch):
     cfg = _config(tmp_path, [
         {"node_names": ["producer"], "ranks": [0]},
@@ -389,24 +392,6 @@ def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted,
         r"2 worker graphs \[\['vocoder'\], \['post'\]\] on ranks"
     )):
         _start_conductor(model, cfg, tmp_path, monkeypatch)
-
-
-def test_colocated_tp_consumer_walk_passes_the_stream_check_but_not_one_lockstep_node(tmp_path):
-    """One TP instance on the same ranks shares the final-stream flag, but two
-    TP node_groups on one worker are two lockstep nodes there, which every
-    worker refused at startup and the conductor now refuses first."""
-    cfg = _config(tmp_path, [
-        {"node_names": ["producer"], "ranks": [0]},
-        {"node_names": ["vocoder"], **_TP2},
-        {"node_names": ["post"], **_TP2},
-    ])
-    with pytest.raises(DeploymentError) as refusal:
-        _validate(_stream_model(_gated_vocoder_then_post, tp_enabled_nodes=["vocoder", "post"]), cfg)
-    assert refusal.value.problems == [
-        f"Multiple parallel nodes ['post', 'vocoder'] found in worker worker_{rank}; current "
-        "implementation requires at most one lockstep-parallel node per worker."
-        for rank in (1, 2)
-    ]
 
 
 def test_consumer_loop_spanning_worker_graphs_is_rejected(tmp_path):

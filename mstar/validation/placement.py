@@ -6,6 +6,7 @@ from typing import Any
 
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -319,15 +320,19 @@ def _sharding_groups(
                     )
 
 
+def _members(group) -> list[int] | None:
+    return group.group_members if group.world_size > 1 else None
+
+
 def _worker_parallelism(
     worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
 ) -> Iterator[str]:
     """What each worker would check of its own ``WorkerParallelGroups``, on the
-    same groups the conductor hands it: at most one lockstep-parallel node per
-    worker, and every resource spec's nodes on one TP x SP shape and, on each
-    worker, in one parallel group. Over every node placed on the worker; the
-    engine checked only nodes it built a submodule for, so a dummy run (no
-    weights) skipped the resource checks."""
+    same groups the conductor hands it: every lockstep-parallel node on a
+    worker in the same TP and SP groups (one lockstep instance), and every resource spec's nodes on one
+    TP x SP shape and, on each worker, in one parallel group. Over every node
+    placed on the worker; the engine checked only nodes it built a submodule
+    for, so a dummy run (no weights) skipped the resource checks."""
     ranks = sorted({rank for wg in worker_graphs for rank in wg.ranks})
     if not ranks:
         return
@@ -358,15 +363,22 @@ def _worker_parallelism(
         for rank, wid in zip(ranks, worker_ids, strict=True)
     }
     for wid, nodes in deployed.items():
+        groups = per_worker[wid]
         parallel_nodes = sorted(
-            node for node in nodes
-            if per_worker[wid].get_instance_world_size_for_node(node) > 1
+            node for node in nodes if groups.get_instance_world_size_for_node(node) > 1
         )
-        if len(parallel_nodes) > 1:
+        # A worker leads or follows one instance, whose steps go out as one
+        # ordered stream from its rank 0, so its lockstep nodes share it.
+        if not groups.all_in_same_group(parallel_nodes):
+            placed = "; ".join(
+                f"{node} on TP ranks {_members(groups.get_tp_config_for_node(node))}, "
+                f"SP ranks {_members(groups.get_sp_config_for_node(node))}"
+                for node in parallel_nodes
+            )
             yield (
-                f"Multiple parallel nodes {parallel_nodes} found in worker {wid}; "
-                "current implementation requires at most one lockstep-parallel node "
-                "per worker."
+                f"Lockstep-parallel nodes on {wid} are in different lockstep instances: "
+                f"{placed}. A worker's lockstep nodes must share one instance: the same "
+                "ranks, in the same order, with the same tp_size and sp_size."
             )
 
     all_nodes = set().union(*deployed.values())
@@ -379,10 +391,27 @@ def _worker_parallelism(
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same TP x SP shape across replicas"
             )
+        evictable = isinstance(spec, KVSpec) and getattr(spec.config, "cpu_offload_pages", 0) > 0
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes
             if local and not per_worker[wid].all_in_same_group(sorted(local)):
                 yield (
                     f"Resource spec {spec.resource_key} local nodes {sorted(local)} "
                     f"on {wid} must all be in the same parallel (tp x sp) group"
+                )
+            # Rank 0 journals an eviction with the next step of the node that
+            # made it (#873 reworks the journal), so a follower can admit
+            # another node's step on the same pool before the move lands.
+            lockstep = sorted(
+                node for node in local
+                if per_worker[wid].get_instance_world_size_for_node(node) > 1
+            )
+            if evictable and len(lockstep) > 1:
+                yield (
+                    f"Resource spec {spec.resource_key} offloads to the host (cpu_offload_pages "
+                    f"{spec.config.cpu_offload_pages}) and is shared by lockstep-parallel nodes "
+                    f"{lockstep} on {wid}. Rank 0 replicates an eviction with the next step of "
+                    "the node that made it, so another node's step could admit on a follower "
+                    "before the eviction lands there. Give each node its own KV spec, or set "
+                    "cpu_offload_pages to 0 (the instance-wide journal is #873's)."
                 )
