@@ -370,10 +370,12 @@ def _kept(pool: RecurrentStatePool) -> dict[int, int]:
     return {key[2]: write.offset for key, write in pool._snap_writes.items()}
 
 
-def test_a_prefill_from_token_0_keeps_its_last_boundary():
+@pytest.mark.parametrize("length, kept", [(19, {16: 16}), (16, {12: 12}), (8, {4: 4}), (4, {})])
+def test_a_prefill_from_token_0_keeps_its_last_boundary(length, kept):
+    """A page-aligned prompt keeps the page before its end: a resend's KV hit stops there."""
     pool = _pool()
-    _prefill(pool, "a", A[:19], hit=None)
-    assert _kept(pool) == {16: 16}
+    _prefill(pool, "a", A[:length], hit=None)
+    assert _kept(pool) == kept
 
 
 def test_a_prefill_from_a_restored_boundary_keeps_its_last():

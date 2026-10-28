@@ -728,7 +728,7 @@ class RecurrentStatePool(Resource):
                 return
             if span < page or (rid, label) not in self._keyed:
                 return
-            for boundary in sorted({start + span // every * every, start + (hit - start) // every * every}):
+            for boundary in sorted({start + (span - 1) // every * every, start + (hit - start) // every * every}):
                 if start < boundary <= start + span:
                     self._reserve_write(rid, label, boundary, boundary - start)
 
