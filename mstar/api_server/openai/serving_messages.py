@@ -37,6 +37,7 @@ import json
 from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import rid, sse
 from mstar.api_server.openai.protocol import ChatCompletionRequest
+from mstar.model.base import ProcessPromptOutput
 
 _FIELDS = {"model", "messages", "system", "max_tokens", "stop_sequences", "stream", "temperature", "top_p",
            "top_k", "tools", "tool_choice", "thinking", "metadata"}
@@ -259,8 +260,10 @@ async def count_tokens(api, adapter, body) -> dict:
     model's own prompt processing (chat template and tokenizer)."""
     req, _ = to_chat_request(body, counting=True)
     args = adapter.chat_to_request(req, api.upload_dir)
-    tensors = await asyncio.to_thread(
-        api.model.process_prompt, args.text, args.input_modalities, args.output_modalities, **args.model_kwargs)
+    out = await asyncio.to_thread(
+        api.model.process_prompt, args.text, args.input_modalities, args.output_modalities,
+        prompt_parts=args.prompt_parts, **args.model_kwargs)
+    tensors = out.new_input_tensors if isinstance(out, ProcessPromptOutput) else out
     return {"input_tokens": sum(t.numel() for t in tensors.get("text_inputs", []))}
 
 

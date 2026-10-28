@@ -283,6 +283,13 @@ def test_count_tokens_renders_the_prompt_the_model_would_get(client_and_stub):
         "model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "system": "Be brief.", "tools": [WEATHER]})
     assert r.json() == {"input_tokens": 37} and stub.last_submit is None
     assert [m["role"] for m in seen["messages"]] == ["system", "user"] and seen["tools"][0]["function"]["name"]
+    # what a model's process_prompt returns, with the metadata beside the tensors
+    from mstar.model.base import ProcessPromptOutput
+
+    stub.model.process_prompt = lambda *a, **kw: ProcessPromptOutput(
+        {"text_inputs": [torch.zeros(5, dtype=torch.long), torch.zeros(4, dtype=torch.long)]}, {"kv_layout": {}})
+    r = client.post("/v1/messages/count_tokens", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert r.json() == {"input_tokens": 9}
     r = client.post("/v1/messages/count_tokens", json={"messages": [{"role": "user", "content": "hi"}],
                                                         "max_tokens": 5})
     assert r.status_code == 400 and "max_tokens" in r.json()["error"]["message"]

@@ -287,3 +287,21 @@ def test_llm_node_caps_captures_and_names():
     ]
     walks = object.__new__(CanaryQwenModel).get_graph_walk_graphs()
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER
+
+
+def test_the_data_worker_reads_its_stop_ids_from_the_hook():
+    """The data worker asks ``Model.stop_token_ids()`` on every text chunk (why the reply
+    ended); an attribute of that name, set in ``__init__``, failed every transcript there."""
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download("nvidia/canary-qwen-2.5b", allow_patterns=["*.json"], local_files_only=True)
+        snapshot_download("Qwen/Qwen3-1.7B", allow_patterns=["*.json", "*.txt"], local_files_only=True)
+    except Exception:  # noqa: BLE001 — not cached: skip
+        pytest.skip("Canary-Qwen's configs and Qwen3-1.7B's tokenizer are not cached")
+    from mstar.api_server.data_worker import _text_usage
+
+    model = CanaryQwenModel("nvidia/canary-qwen-2.5b")
+    stops = model.stop_token_ids()
+    assert stops == frozenset(model.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>"))
+    assert _text_usage(torch.tensor([5, min(stops)]), stops, 9)["stop_token"] is True

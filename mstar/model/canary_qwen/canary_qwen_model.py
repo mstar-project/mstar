@@ -118,12 +118,15 @@ class CanaryQwenModel(Model):
         # NeMo registers the placeholder as a special token at load, as here
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.config.audio_locator_tag]})
         self.audio_token_id = self.tokenizer.convert_tokens_to_ids(self.config.audio_locator_tag)
-        self.stop_token_ids = {self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")}
+        self._stop_ids = frozenset(self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>"))
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     def checkpoint_path(self) -> str | None:
         return str(self.local_dir)
+
+    def stop_token_ids(self) -> frozenset[int]:
+        return self._stop_ids
 
     # -------------------------------------------------------------------
     # resources
@@ -385,5 +388,5 @@ class CanaryQwenModel(Model):
                 llm = llm.to(autocast_dtype)
             llm = llm.to_empty(device=device)
             llm.load_weights(self._llm_weights(device))
-            return CanaryQwenLLMSubmodule(llm.eval(), self.audio_token_id, self.stop_token_ids)
+            return CanaryQwenLLMSubmodule(llm.eval(), self.audio_token_id, self._stop_ids)
         return None
