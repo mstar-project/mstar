@@ -22,10 +22,12 @@ Choices where the APIs differ:
   400. ``include: ["reasoning.encrypted_content"]`` is taken, and served by
   that content: ``encrypted_content`` stays unset, as the reasoning is no
   secret. An input reasoning item is read for its content, or its summary.
-* ``reasoning.effort`` maps onto the template's levels, least to most: GLM's
-  lowest takes ``minimal`` and ``low``, its middle ``medium``, its highest
-  ``high`` and ``xhigh`` (GLM-5.2 has no low: its levels are high and max).
-  ``none`` turns thinking off where the model can.
+* ``reasoning.effort`` maps onto the template's levels, least to most: the
+  lowest takes ``minimal`` and ``low``, the middle one ``medium`` (of two, the
+  lower), the highest ``high`` and ``xhigh`` (GLM-5.2's levels are high and
+  max, GLM-5.3's low, high and max, Qwen3.8's low, medium and xhigh). A
+  template with no levels takes the effort as a hint and drops it. ``none``
+  turns thinking off where the model can.
 * ``output_tokens_details.reasoning_tokens`` counts the tokens of the chunks
   that began inside the reasoning; ``input_tokens_details`` is left out.
 * A reply cut off by ``max_output_tokens`` is ``incomplete``, and a call it
@@ -209,9 +211,10 @@ def _reasoning(reasoning, efforts: tuple[str, ...]) -> dict:
         return {"enable_thinking": False}
     if effort not in _EFFORT_RANK:
         raise ValueError(f"reasoning.effort takes none, minimal, low, medium, high or xhigh; got {effort!r}")
-    # the levels above the template's lowest, ranked from its top
-    wanted = {0: "low", 1: "high", 2: "max"}[_EFFORT_RANK[effort]]
-    return {"reasoning_effort": wanted if wanted in efforts else efforts[0]}
+    if not efforts:
+        return {}
+    n = len(efforts)
+    return {"reasoning_effort": efforts[{0: 0, 1: (n - 1) // 2, 2: n - 1}[_EFFORT_RANK[effort]]]}
 
 
 async def create_response(api, model_name, adapter, body, raw_request=None):

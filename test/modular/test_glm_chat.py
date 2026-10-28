@@ -295,8 +295,11 @@ def test_an_agent_turn_with_a_tool_result_reaches_the_template(model, tmp_path):
 @pytest.mark.parametrize("value", [None, 0, ""])
 def test_a_falsy_enable_thinking_turns_thinking_off(value, tmp_path):
     # the GLM-5.2 template reads truthiness: its prompt ends in <think></think>
-    p = adapters.get_adapter("glm52").make_output_parser(_chat(chat_template_kwargs={"enable_thinking": value}))
+    adapter = adapters.get_adapter("glm52")
+    p = adapter.make_output_parser(_chat(tools=[WEATHER], chat_template_kwargs={"enable_thinking": value}))
     assert p.message("Hello there!") == {"role": "assistant", "content": "Hello there!"}
+    # with no tools either, nothing is split out of the reply: no parser, the text is the answer
+    assert adapter.make_output_parser(_chat(chat_template_kwargs={"enable_thinking": value})) is None
 
 
 def test_template_keys_it_does_not_read_are_dropped(tmp_path):
