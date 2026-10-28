@@ -120,10 +120,11 @@ class DensePlan:
 class _GatheredPrefix:
     """One stream's gathered prefix, per layer, tagged with what it was read
     from so a stale gather cannot be served."""
-    """gathered prefix of one stream per-layer. tagged with what read from so stale cannot serve"""
     generation: int
     length: int
     layers: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    # the prefix's page index on the device: one H2D per gather, not per layer
+    pages: torch.Tensor | None = None
 
 
 class DenseAttentionManager(AttentionManager):
@@ -304,10 +305,10 @@ class DenseAttentionManager(AttentionManager):
             return cached
 
         cfg = self._kv_config
+        if entry.pages is None:
+            entry.pages = torch.tensor(segment.pages, dtype=torch.long, device=kv_cache_layer.device)
         # [n_pages, 2, page_size, num_kv_heads, head_dim] -> the prefix's rows
-        pages = kv_cache_layer[
-            torch.tensor(segment.pages, dtype=torch.long, device=kv_cache_layer.device)
-        ]
+        pages = kv_cache_layer[entry.pages]
         k_pref = pages[:, 0].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
         v_pref = pages[:, 1].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
         # the gather already copied; the slice keeps the trailing slots of the

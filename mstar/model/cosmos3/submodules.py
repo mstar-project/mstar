@@ -2732,9 +2732,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
             "0", "false", "no", "off",
         ):
             self._decode_compiled = True
-            # the fast path compiles its own DecoderStep and never calls vae.decode
-            if not fast:
-                self._decode = _wan_vae().compile_decode(vae.decode)
+            # images (one latent) decode through this; the fast path's DecoderStep takes the clips
+            self._decode = _wan_vae().compile_decode(vae.decode)
             logger.info("Cosmos3 VAE decode torch.compile enabled")
         # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the
         # choice is fixed at startup, not on the first request.
@@ -2746,7 +2745,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
             _wan_vae().to_channels_last(vae)
             self._channels_last = True
             self._fast_step = _wan_vae().DecoderStep(vae, compile=self._decode_compiled, deterministic=True)
-            logger.info("Cosmos3 VAE decode: whole clips on the shared Wan VAE decoder (channels-last)")
+            logger.info("Cosmos3 VAE decode: video clips on the shared Wan VAE decoder (channels-last), "
+                        "images through the stock decode")
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
@@ -2801,7 +2801,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""
         vae_dtype = self._decode_dtype()
         z = self._vae_input(latents)
-        if self._fast_step is not None:
+        # one latent (an image) is faster through the stock decode (24 vs 36 ms on an H200)
+        if self._fast_step is not None and z.shape[2] > 1:
             wan_vae = _wan_vae()
             with torch.autocast(device_type="cuda", enabled=False):
                 decoded = wan_vae.decode_causal(

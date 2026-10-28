@@ -1000,16 +1000,19 @@ picked by rule, so a seed gives the same video from every server process.
 ``default`` is torch.compile's own defaults, and ``level`` takes the ``mstar
 serve -O`` level's options (``-O2``: max-autotune).
 
-Whole clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
+Video clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
 one decoder call per latent, channels-last, in the decode dtype (bf16 with
 cuDNN >= 9.16, otherwise fp32; see above), on the node's own decoder-only copy
 of the VAE. The first two calls (the clip-start latent and the one after it)
-run eager; every later call is compiled in Inductor's deterministic mode.
-False decodes with the compiled stock ``vae.decode`` on the shared instance.
+run eager; every later call is compiled in Inductor's deterministic mode. An
+image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
+is faster for a single frame. False decodes everything with the compiled stock
+``vae.decode`` on the shared instance.
 
 Two or more requests at the same denoise step run one cross-request forward
 (``max_gen_batch_size``, default 8), compiled with the same mode
-(``compile_denoise_batched``). At 832x480x121 one request's guidance pair is
+(``compile_denoise_batched``) for video, image and sound; the action step runs
+eager. At 832x480x121 one request's guidance pair is
 24k tokens, which already fills the GPU's GEMM and attention throughput, so a
 batch of N costs N single steps: batching keeps requests in step rather than
 adding throughput. The first batch of each size compiles on arrival.

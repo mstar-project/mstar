@@ -384,13 +384,14 @@ class Cosmos3Config:
     # whole-clip decoder under ``vae_decode_fast``. A node with its switch off
     # shares one default-layout instance instead.
     vae_decode_channels_last: bool = True
-    # Decode a whole clip (the non-windowed video and image walks) with the
-    # shared Wan VAE decoder: the same per-latent decoder calls as
-    # ``vae.decode`` from an empty cache, channels-last, in the decode dtype
-    # (fp32 below cuDNN 9.16), on a decoder-only copy of the VAE (~1 GiB in
-    # bf16). The first two calls run eager, every later one compiled in
-    # Inductor's deterministic mode. False decodes with the compiled stock
-    # ``vae.decode``.
+    # Decode a video clip (the non-windowed video walks) with the shared Wan
+    # VAE decoder: the same per-latent decoder calls as ``vae.decode`` from an
+    # empty cache, channels-last, in the decode dtype (fp32 below cuDNN 9.16),
+    # on a decoder-only copy of the VAE (~1 GiB in bf16). The first two calls
+    # run eager, every later one compiled in Inductor's deterministic mode. An
+    # image (one latent) keeps the compiled stock ``vae.decode`` on the same
+    # copy, faster for a single frame. False decodes everything with the
+    # compiled stock ``vae.decode``.
     vae_decode_fast: bool = True
     # Let cuDNN time its conv algorithms for each new streaming-decode shape
     # (once, then cached) instead of its heuristic pick. Same math, but the
@@ -502,8 +503,10 @@ class Cosmos3Config:
     # "level" takes the ``mstar serve -O`` level's options (-O2: max-autotune).
     denoise_compile_mode: str = "deterministic"
     # Compile the cross-request denoise step (two or more requests in one
-    # forward) too, with the same mode. Eager, its norms, rotary and residuals
-    # cost about 80 ms of GPU per extra row at 832x480x121 on a B300.
+    # forward) too, with the same mode: the video, image and sound steps; the
+    # action step (``denoise_step_action_batched``) runs eager. Eager, the
+    # norms, rotary and residuals cost about 80 ms of GPU per extra row at
+    # 832x480x121 on a B300.
     compile_denoise_batched: bool = True
     # torch.compile the reasoner's captured decode step before the CUDA-graph
     # capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the
