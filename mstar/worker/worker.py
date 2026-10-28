@@ -4150,7 +4150,9 @@ class Worker:
         The cut is a view, and it replaces the tensor in its list in place, so
         a second name that ``postprocess`` or ``unpack_packed_outputs`` gave
         the same list is cut with it. Two names the forward returned on its own
-        get their own lists from the engine and keep their own widths.
+        get their own lists from the engine and keep their own widths. A row
+        whose span is empty has no output under the name: it leaves the row's
+        dict, so nothing is stored, routed or streamed for it.
         """
         spans = outputs.host_spans or outputs.output_spans
         per_rid = outputs.per_rid_outputs
@@ -4162,6 +4164,10 @@ class Worker:
                 row = per_rid.get(rid)
                 tensors = row.get(name) if row is not None else None
                 if not tensors:
+                    continue
+                if end <= max(start, 0):
+                    del row[name]
+                    cut = True
                     continue
                 for i, tensor in enumerate(tensors):
                     if start > 0 or end < tensor.shape[-1]:

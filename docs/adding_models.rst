@@ -1063,9 +1063,12 @@ methods are:
    declared here, since per-request forwards are merged by name. The forward keeps a
    fixed width and does no host read.
    The worker cuts each row to its span after the step's completion event, before the stop
-   check, transport or a streaming edge reads it. The cut is a view, not a copy. Engine-side
-   ``postprocess`` still sees the uncut output. A spanned output must not feed a node that
-   the same worker speculates into.
+   check, transport or a streaming edge reads it. The cut is a view, not a copy. A row whose
+   span is empty (``end <= start``) has no output under that name: it is not stored or
+   routed, and a streaming edge gets no item for it, so a frame that is not data (one
+   sampled with a stop token, say) never reaches the consumer. Engine-side ``postprocess``
+   still sees the uncut output. A spanned output must not feed a node that the same worker
+   speculates into.
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.

@@ -1537,6 +1537,39 @@ def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
     assert book.can_gc(1), "still held after its only reader released"
 
 
+def test_a_row_with_no_tensor_on_a_stream_sends_it_no_item(streams_to_sibling):
+    """A row may route zero tensors on a streaming signal (an empty span left
+    that step's item out): it gets no chunk, the rest of the batch streams as
+    usual."""
+    rt, book, store = streams_to_sibling
+    rids = [
+        rt.add_request(
+            request_id=f"r{i}", partition="default", graph_walk=WALK,
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
+        )
+        for i in (1, 2)
+    ]
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM")] * 2))
+    rt.pop_rids("LLM", WALK, rids)
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="LLM",
+            output_signals=["new_token"],
+            wg_ids=ParallelList(rids, [0, 0]),
+            tensors=[1], num_tensors=[1, 0],
+        ),
+    )
+    assert out.local_streaming_by_signal.keys() == {"new_token"}
+    assert out.local_streaming_by_signal["new_token"].keys == [rids[0]]
+    assert out.local_streaming_by_signal["new_token"].values == [1]
+    assert out.register_uuids == []
+
+
 def test_the_speculation_target_reports_its_output_signals(pair):
     """A speculated batch never goes through pop_rids, so the target carries
     the names instead -- left empty, completion routes none of the node's
