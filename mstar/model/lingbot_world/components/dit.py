@@ -423,7 +423,7 @@ class LingBotCausalDiT(nn.Module):
         defaults in its deterministic mode, so every process compiles the same
         kernels; with ``autotune`` the -O level's options, whose kernel picks
         are per process. The cache write and both attentions stay eager
-        (``_window_attention``, the ragged callables), so a block traces once
+        (``ChunkWindow``, the ragged callables), so a block traces once
         for every chunk."""
         from mstar.model.components.diffusion.compile_utils import with_inductor_rounding
 
