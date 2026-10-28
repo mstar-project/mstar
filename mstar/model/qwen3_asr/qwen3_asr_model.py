@@ -168,9 +168,10 @@ class Qwen3ASRModel(Model):
                 ),
             ),
             KVSpec(resource_key=KV_CACHE, nodes={LLM_NODE}, config=kv_config),
+            # two query heads per KV head: the CUDA-core decode kernel wins
             AttentionSpec(
                 resource_key=ATTN, nodes={LLM_NODE},
-                config=AttentionConfig(kv_cache=KV_CACHE),
+                config=AttentionConfig(kv_cache=KV_CACHE, decode_tensor_cores=False),
             ),
             PositionSpec(
                 resource_key=ROPE, nodes={LLM_NODE},

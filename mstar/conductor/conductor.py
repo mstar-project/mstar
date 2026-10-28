@@ -23,6 +23,7 @@ from mstar.api_server.request_types import (
     RequestFailed,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -40,7 +41,7 @@ from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
-from mstar.platforms import apply_process_env_defaults
+from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.streaming.topology import CLIENT
@@ -68,6 +69,7 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 from mstar.validation import validate_deployment
+from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
 
@@ -253,11 +255,14 @@ def _worker_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    env: dict[str, str] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
     picklability. ``status_interval_s`` turns on the worker's metrics."""
-    # before anything in this process touches the device runtime
+    # before anything in this process touches the device runtime; the MPS pipe
+    # directory in ``env`` decides whether this process becomes an MPS client
     apply_process_env_defaults()
+    os.environ.update(env or {})
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
     # segments were never unlinked and leaked into /dev/shm for the life of
@@ -489,6 +494,10 @@ class Conductor:
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
+        logger.info(
+            "Compile caches: Inductor %s, Triton %s",
+            os.environ.get("TORCHINDUCTOR_CACHE_DIR"), os.environ.get("TRITON_CACHE_DIR"),
+        )
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
@@ -500,6 +509,12 @@ class Conductor:
             int(rank): int(index)
             for rank, index in (self.model_config.get("rank_devices") or {}).items()
         }
+        # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
+        # conductor owns, so workers sharing a GPU overlap their kernels instead
+        # of time-slicing. validate_deployment checked the value.
+        self._mps_requested = self.model_config.get("mps", False)
+        self._mps: MpsDaemon | None = None
+
         self.default_sharding_config = deployment.sharding_config
         # The conductor is the only process that sees every worker graph, so it
         # owns the numbering. Workers receive their graphs (and these ids) at
@@ -640,6 +655,13 @@ class Conductor:
             self._resource_specs_cache = specs
         return specs
 
+    def _streamed_partitions(self) -> frozenset[str]:
+        streamed = getattr(self, "_streamed_partitions_cache", None)
+        if streamed is None:
+            streamed = streamed_partitions(list(self._resource_specs().values()), self.model)
+            self._streamed_partitions_cache = streamed
+        return streamed
+
     def _fit_loop_caps(self, model_kwargs: dict, configs: dict, cap: int) -> tuple[int, dict[str, int]]:
         """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
         within what the request's resources hold. A loop that ``max_output_tokens`` doesn't drive is
@@ -759,6 +781,13 @@ class Conductor:
 
             _cuda_op_available()
         ctx = mp.get_context("spawn")
+        atexit.register(self.shutdown)
+        if self._mps_requested:
+            # a host check, not a config one: shipped configs validate on any machine
+            if not current_platform.is_cuda():
+                raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
+            self._mps = MpsDaemon()
+            self._mps.start()
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
@@ -783,16 +812,22 @@ class Conductor:
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
                     "status_interval_s": self._status_interval_s,
+                    "env": self._mps.client_env if self._mps is not None else None,
                 },
                 daemon=False,
             )
             p.start()
             self._worker_processes.append(p)
 
-        atexit.register(self.shutdown)
-
     def shutdown(self):
-        """Terminate and join all worker processes."""
+        """Terminate and join all worker processes, then stop the MPS daemon if any."""
+        try:
+            self._stop_workers()
+        finally:
+            if self._mps is not None:
+                self._mps.stop()
+
+    def _stop_workers(self):
         if not self._worker_processes:
             return  # already done (run()'s caller and the atexit hook both call this)
         logger.info("Shutting down conductor...")
@@ -1316,6 +1351,8 @@ class Conductor:
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        if not all(partition_states[name].is_done for name in self._streamed_partitions()):
+            prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
         refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():

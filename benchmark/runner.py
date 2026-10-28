@@ -294,6 +294,11 @@ class Benchmark:
             "aggregate": {
                 "max_concurrency": agg.max_concurrency,
                 "ttft_s": {modality: _stats(stats) for modality, stats in agg.ttft.items()},
+                "itl_s": {modality: _stats(stats) for modality, stats in agg.itl.items()},
+                "text_token_throughput": agg.text_token_throughput,
+                "total_text_tokens": agg.total_text_tokens,
+                "mean_text_tokens": agg.mean_text_tokens,
+                "total_input_tokens": agg.total_input_tokens,
                 "e2e_latency_s": _stats(agg.e2e_latency),
                 "rtf": _stats(agg.rtf),
                 "audio_seconds_throughput": agg.audio_seconds_throughput,

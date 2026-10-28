@@ -19,12 +19,15 @@ predicted. The recipe, reproduced here on M*'s own components:
    characters in a language written without spaces); a word starts with its first token and ends where the next word
    starts, the last one where end-of-text is predicted.
 
-The functions here are pure tensor/numpy code with no engine dependencies,
-so the same math is unit-tested on the CPU and run by the decoder
-submodule's ``align`` walk on the GPU.
+Steps 1 and 2 are GPU work: the decoder submodule's ``align`` walk emits the
+matrix (``alignment_output``). Steps 3 and 4 run on the host in the API
+server, when ``WhisperModel.postprocess`` renders that output
+(``word_timings``). The functions here are pure tensor/numpy code with no
+engine dependencies, so the same math is unit-tested on the CPU.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import string
 
@@ -37,6 +40,9 @@ logger = logging.getLogger(__name__)
 # encoder positions per second: a 30 s window is 1500 positions
 FRAMES_PER_SECOND = 50
 MEDIAN_FILTER_WIDTH = 7
+# Rows of the teacher-forced sequence before the first that predicts a text
+# token: <|sot|><|lang|><|task|> (the <|notimestamps|> row predicts it)
+PROMPT_ROWS = 3
 PREPENDED_PUNCTUATION = "\"'“¿([{-"
 APPENDED_PUNCTUATION = "\"'.。,，!！?？:：”)]}、"
 # Written without spaces between words: without morpheme analysis, each run of
@@ -79,31 +85,33 @@ def _dtw_trace(cost: np.ndarray) -> np.ndarray:
     return trace
 
 
-# The double loop is ~60k cells for a full window: ~1 ms compiled by numba
-# (the asr extra), far longer as plain Python on the GPU thread.
-try:
-    from numba import njit
-
-    _dtw_trace_fast = njit(cache=True, nogil=True)(_dtw_trace)
-except ImportError:
-    logger.warning(
-        "numba is not installed: word timestamps run the DTW in plain Python on the "
-        "GPU thread, far slower. Install mstar[asr]."
-    )
-    _dtw_trace_fast = _dtw_trace
+@functools.cache
+def _compiled_dtw_trace():
+    """``_dtw_trace`` compiled by numba (the asr extra), once, on first use: the
+    double loop is up to ~670k cells (444 rows by 1500 frames), milliseconds
+    compiled and far longer as plain Python. Imported here, not at module
+    load, so only the process that runs the DTW loads numba. Without numba, or
+    if it cannot compile, the DTW stays plain Python, loudly."""
+    try:
+        from numba import njit
+    except ImportError:
+        logger.warning("numba is not installed: word timestamps run the DTW in plain Python, far slower. "
+                       "Install mstar[asr].")
+        return _dtw_trace
+    try:
+        fast = njit(cache=True, nogil=True)(_dtw_trace)
+        fast(np.zeros((2, 2), dtype=np.float64))
+    except Exception as exc:  # noqa: BLE001 — any compile failure: keep serving
+        logger.warning("numba could not compile the DTW (%s): word timestamps fall back to plain Python", exc)
+        return _dtw_trace
+    return fast
 
 
 def warm_up() -> None:
-    """Compile the DTW now, at load, rather than inside the first word-timestamp
-    request; fall back to plain Python, loudly, if numba cannot compile it."""
-    global _dtw_trace_fast
-    if _dtw_trace_fast is _dtw_trace:
-        return
-    try:
-        _dtw_trace_fast(np.zeros((2, 2), dtype=np.float64))
-    except Exception as exc:  # noqa: BLE001 — any compile failure: keep serving
-        logger.warning("numba could not compile the DTW (%s): word timestamps fall back to plain Python", exc)
-        _dtw_trace_fast = _dtw_trace
+    """Compile the DTW now, in the process that runs it (the API server's data
+    worker, at model load), rather than inside the first word-timestamp
+    request."""
+    _compiled_dtw_trace()
 
 
 def dtw(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -111,7 +119,7 @@ def dtw(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     ``cost`` (rows x frames), moving right, down or diagonally. Returns the
     path's row and frame indices, each of length ``len(path)``."""
     cost = np.ascontiguousarray(cost, dtype=np.float64)
-    trace = _dtw_trace_fast(cost)
+    trace = _compiled_dtw_trace()(cost)
     trace[0, :] = 2
     trace[:, 0] = 1
     i, j = cost.shape
@@ -145,6 +153,32 @@ def alignment_matrix(weights: torch.Tensor, num_frames: int, medfilt_width: int 
     w = median_filter(w, medfilt_width)
     # a head that never varies (or a broken pass) must not derail the DTW
     return torch.nan_to_num(w.mean(dim=0), nan=0.0)
+
+
+def alignment_output(weights: torch.Tensor, tokens: torch.Tensor, num_frames: int) -> torch.Tensor:
+    """The align walk's one output tensor, from the alignment heads'
+    ``weights`` over the whole teacher-forced ``tokens``
+    (``<|sot|><|lang|><|task|><|notimestamps|> text <|eot|>``).
+
+    Layout, float32 ``[n_text + 1, frames + 1]``: ``alignment_matrix`` of the
+    rows that predict each text token and end-of-text, then one column of
+    token ids (exact in float32): row ``i``'s text token, and on the last row
+    the language token, which word splitting needs. Device ops only, so the
+    walk never waits on the host.
+    """
+    matrix = alignment_matrix(weights[:, PROMPT_ROWS:-1], num_frames)
+    ids = torch.cat([tokens[PROMPT_ROWS + 1:-1], tokens[1:2]]).to(matrix.dtype)
+    return torch.cat([matrix, ids[:, None]], dim=1)
+
+
+def unpack_output(output: torch.Tensor) -> tuple[torch.Tensor, list[int], int]:
+    """``alignment_output``'s tensor -> (matrix, text token ids, language token id)."""
+    if output.dim() != 2 or output.shape[1] < 2:
+        raise ValueError(
+            f"an alignment output is [tokens, frames + 1] with at least one frame; got {tuple(output.shape)}"
+        )
+    ids = output[:, -1].long().tolist()
+    return output[:, :-1], ids[:-1], ids[-1]
 
 
 def token_start_frames(matrix: torch.Tensor) -> np.ndarray:
@@ -221,19 +255,17 @@ def merge_punctuation(words: list[dict]) -> list[dict]:
 
 
 def word_timings(
-    weights: torch.Tensor, text_tokens: list[int], decode, num_frames: int,
-    language: str | None = None,
+    matrix: torch.Tensor, text_tokens: list[int], decode, language: str | None = None,
 ) -> list[dict]:
     """Words with ``start`` / ``end`` seconds for one window.
 
-    ``weights`` holds the alignment heads' attention for the rows that
-    predict ``text_tokens`` plus the final row that predicts end-of-text
-    (``len(text_tokens) + 1`` rows); ``num_frames`` is how many mel frames
-    of the window carry audio; ``language`` is the transcript's language code.
+    ``matrix`` is ``alignment_matrix`` over the rows that predict
+    ``text_tokens`` plus the final row that predicts end-of-text
+    (``len(text_tokens) + 1`` rows); ``language`` is the transcript's
+    language code.
     """
     if not text_tokens:
         return []
-    matrix = alignment_matrix(weights, num_frames)
     starts = token_start_frames(matrix) / FRAMES_PER_SECOND  # one per row
     words = split_words(decode, text_tokens, language)
     bounds = np.concatenate([[0], np.cumsum([len(toks) for _, toks in words])])

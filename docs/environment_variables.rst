@@ -165,6 +165,12 @@ Communication
        the conductor sets ``lo`` for its workers and NCCL's bootstrap
        sockets listen on loopback only. A value you set, or a set
        ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``NCCL_GRAPH_REGISTER``
+     - ``0``
+     - NCCL's own variable. On, NCCL registers the buffers a CUDA graph
+       captures, which succeeds on ``expandable_segments`` memory, and
+       Cosmos3 SP4 with batched captures then gave wrong images (#897).
+       Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
      - PyTorch's variable for the Gloo groups next to each TP/SP group.
@@ -326,8 +332,9 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_SERVER_BIN``
      - unset
      - Path to the ``mstar-server`` binary. Fallback order:
-       ``--rust-frontend-bin``, this variable, ``$PATH``, then the in-repo
-       ``rust/server/target/release`` build.
+       ``--rust-frontend-bin``, this variable, the running environment's
+       scripts directory (where the Linux wheels install it), ``$PATH``, then
+       the in-repo ``rust/server/target/release`` build.
    * - ``MSTAR_API_KEY``
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
@@ -571,12 +578,12 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``reads_device_loopback``: Qwen3.5 decode) and only when the sampler
-       has graph buffers; the sampler keeps the masters for those nodes
-       alone, so a node that takes its tokens on the host (Whisper's
-       decoder) no longer pays the eager-step master write, a small
-       synchronous host-to-device copy per step. ``0`` keeps every node on
-       the per-request tensor path.
+       (``reads_device_loopback``: the decode walks of Qwen3.5, Qwen3-ASR and
+       Whisper, which also keeps its timestamp rule state in the sampler's
+       declared loop-back state) and only when the sampler has graph
+       buffers; the sampler keeps the masters for those nodes alone, so a
+       node that takes its tokens on the host does not pay the eager-step
+       master write. ``0`` keeps every node on the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
      - A captured decode step builds its rotary tables inside the graph from
@@ -635,3 +642,20 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``TORCHINDUCTOR_CACHE_DIR``
+     - ``$XDG_CACHE_HOME/mstar/torchinductor`` (``~/.cache/mstar/torchinductor`` when unset)
+     - torch's own variable; M* sets this default when importing
+       :mod:`mstar.engine` (``_default_compile_caches``), so compiled graphs and
+       autotune picks survive a restart that keeps the cache directory. An exported
+       value wins, and a home that can't be written keeps torch's
+       ``/tmp/torchinductor_<user>``. Point it at an empty directory to measure a cold
+       start (Triton's kernels follow it unless ``TRITON_CACHE_DIR`` is exported;
+       FlashInfer's JIT cache stays warm). See
+       :ref:`serving:Restarts and the compile cache`.
+   * - ``TRITON_CACHE_DIR``
+     - ``$TORCHINDUCTOR_CACHE_DIR/triton``
+     - Triton's own variable, defaulted by the same function once
+       ``TORCHINDUCTOR_CACHE_DIR`` is resolved (exported or M*'s default; left unset
+       when that falls back to torch's). An exported value wins. Holds Triton's compiled
+       kernels, Inductor's and those compiled outside it; without it, where a kernel
+       lands depends on whether Inductor compiled first.

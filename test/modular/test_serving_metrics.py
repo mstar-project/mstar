@@ -1304,6 +1304,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     cfg.write_text(text)
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
+    # sizing torch's pool would outlive the test in this process
+    monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
     return str(cfg)
 
 

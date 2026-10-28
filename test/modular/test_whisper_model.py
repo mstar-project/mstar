@@ -25,7 +25,7 @@ from mstar.model.components.audio_features import (  # noqa: E402
     sinusoid_positions,
 )
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs  # noqa: E402
+from mstar.model.submodule_base import ARNodeInputs, HostRows, ModelInputsFromEngine, NodeInputs  # noqa: E402
 from mstar.model.whisper.components.decoder import WhisperDecoderModel  # noqa: E402
 from mstar.model.whisper.components.encoder import WhisperEncoderModel  # noqa: E402
 from mstar.model.whisper.config import (  # noqa: E402
@@ -50,7 +50,6 @@ REPO = Path(__file__).resolve().parents[2]
 
 # large-v3 token ids, as in the checkpoints' generation_config.json
 SOT, EOT, EN, DE, TRANSCRIBE, TRANSLATE, PREV, NOTS = 50258, 50257, 50259, 50261, 50360, 50359, 50362, 50364
-STARTOFLM = 50361  # opens the align walk's word timings
 
 
 def _tiny_config(**overrides) -> WhisperModelConfig:
@@ -70,11 +69,11 @@ class _FakeTokenizer:
     """Just enough of the Whisper tokenizer for prompt and detokenizer tests."""
 
     def __init__(self, config: WhisperModelConfig):
-        specials = {SOT, EOT, EN, DE, TRANSCRIBE, TRANSLATE, PREV, NOTS, STARTOFLM}
+        specials = {SOT, EOT, EN, DE, TRANSCRIBE, TRANSLATE, PREV, NOTS}
         self.all_special_ids = sorted(specials)
         self._names = {SOT: "<|startoftranscript|>", EOT: "<|endoftext|>", EN: "<|en|>", DE: "<|de|>",
                        TRANSCRIBE: "<|transcribe|>", TRANSLATE: "<|translate|>",
-                       PREV: "<|startofprev|>", NOTS: "<|notimestamps|>", STARTOFLM: "<|startoflm|>"}
+                       PREV: "<|startofprev|>", NOTS: "<|notimestamps|>"}
         self.config = config
 
     def convert_tokens_to_ids(self, token):
@@ -361,6 +360,9 @@ def test_decoder_declares_context_span_only_on_encoder_walks():
         ("p", CONTEXT_LABEL, cfg.max_source_positions), ("d", CONTEXT_LABEL, 0),
     ]
     assert step.steps[CROSS_ATTN].causal is False and step.steps[KV_CACHE] is not None
+    # an encoder walk writes the context in preprocess, outside the prefill graph
+    assert step.steps[CROSS_KV_CACHE].eager_write is True
+    assert sub.declare_step(DECODE_WALK, ["d"], [decode_row]).steps[CROSS_KV_CACHE].eager_write is False
 
 
 def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
@@ -374,17 +376,21 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     ctx = {"encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]}
     # a prompt without <|notimestamps|> turns the rules on, so the first token must be a timestamp
     row = sub.prepare_inputs(PREFILL_WALK, fwd, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE])], **ctx})
-    assert sub.request_state(1)["language"] == EN
-    assert sub.request_state(1)["task"] == TRANSCRIBE
     assert row.tensor_inputs["ts_rules"].tolist() == [1, FIRST_TOKEN, cfg.timestamp_begin - 1, cfg.timestamp_begin + 51]
     # a plain prompt: inactive row
     plain = _fwd(2, "plain", language=EN, task=TRANSCRIBE, timestamps=False)
     row2 = sub.prepare_inputs(PREFILL_WALK, plain, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE, NOTS])], **ctx})
     assert row2.tensor_inputs["ts_rules"].tolist() == inactive_state()
+    written = []
+    sub._write_context = written.append
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs(["ts", "plain"]), [row, row2])
     # staged from the host rows in one copy each
     assert batch["ts_rules"].tolist() == [row.tensor_inputs["ts_rules"].tolist(), inactive_state()]
     assert batch["row_lens"].tolist() == [3, 4]
+    # the context is written eagerly, both requests in segment order, and stays
+    # out of the forward's inputs (the prefill graph is sized by the prompt)
+    assert [t.shape for t in written] == [(2 * cfg.max_source_positions, cfg.d_model)]
+    assert "encoder_states" not in batch
 
     # a decode step takes the state routed with its token, never a host history
     routed = torch.tensor([1, 2, cfg.timestamp_begin + 2, cfg.vocab_size])
@@ -398,9 +404,18 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     outputs = {"new_token": [torch.tensor([5])], "ts_rules": [routed]}
     sub.postprocess("ts", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"] and outputs["ts_rules"] == [routed]
-    # the capture template carries the same row so the graph's input set is fixed
-    (decode_cfg,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    # the capture templates carry the same row so the graphs' input sets are fixed
+    decode_cfg, prefill_cfg = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
+    (template,) = prefill_cfg.get_node_inputs(1, 4)
+    assert template.tensor_inputs["ts_rules"].tolist() == inactive_state()
+    assert template.tensor_inputs["encoder_states"].shape[0] == cfg.max_source_positions
+    # a replay's padding rows are stacked with real prefill rows, whose rule state is on the host
+    _, meta_prefill = sub.get_accelerator_graph_configs(torch.device("meta"))
+    assert meta_prefill.get_node_inputs(1, 4)[0].tensor_inputs["ts_rules"].device.type == "cpu"
+    # prompt buckets give every row 3 to 8 tokens
+    assert all(3 * bs <= n <= 8 * bs for bs in (1, 2, 32) for n in prefill_cfg.get_total_tokens(bs))
+    assert prefill_cfg.get_total_tokens(32) == [128]
     # language detection never applies the rules
     # timestamps=True on purpose: the detection walk must still decode with
     # the rules off, which is the guard rather than the metadata
@@ -412,38 +427,96 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     assert detect.tensor_inputs["ts_rules"].tolist() == inactive_state()
 
 
+def _align_meta(language=EN, **overrides):
+    """The align walk's step metadata, as the route builds it."""
+    return {"language": language, "task": TRANSCRIBE, "audio_frames": 100, **overrides}
+
+
+def _stop_info(walk, handle, word_timestamps=True, decoded=0, max_tokens=444):
+    """Stand-in for a step's ``CurrentForwardPassInfo`` in the stop check."""
+    return type("I", (), {
+        "graph_walk": walk, "max_tokens": max_tokens, "rid_handle": handle,
+        "step_metadata": {"word_timestamps": word_timestamps},
+        "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},
+        "dynamic_loop_iter_counts": {"decode_loop": decoded},
+    })()
+
+
+def _align_inputs(cfg):
+    return {"encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]}
+
+
 def test_decoder_align_walk_uses_the_detected_language():
+    """The detected language and the first token come off the prompt walks'
+    host tokens in the stop check; the align walk reads no device value."""
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
-    # after detection the route leaves the language unset on the prompt walk
-    fwd = _fwd(7, "r", language=None, task=TRANSCRIBE, timestamps=False)
-    detected = torch.tensor([DE])
-    sub.prepare_inputs(
-        PREFILL_PROMPT_WALK, fwd,
-        {"text_inputs": [detected], "prompt_tail": [torch.tensor([TRANSCRIBE, NOTS])]},
+    for walk, token in ((DETECT_LANGUAGE_WALK, DE), (PREFILL_PROMPT_WALK, 7)):
+        stops = sub.check_stop_batched(
+            ["r"], {"r": _stop_info(walk, 7)}, HostRows(("r",), {"new_token": torch.tensor([token])}), step_walk=walk,
+        )
+        assert stops == {}
+    sub.check_stop_batched(
+        ["r"], {"r": _stop_info(DECODE_WALK, 7)}, HostRows(("r",), {"new_token": torch.tensor([EOT])}),
     )
-    detected.fill_(EN)  # the input's memory is reused once the walk is done
-    row = sub.prepare_inputs(ALIGN_WALK, fwd, {
-        "transcript": [torch.tensor([7]), torch.tensor([EOT])],
-        "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
-        "audio_frames": [torch.tensor([cfg.num_frames])],
-    })
+    # after detection the route leaves the language unset on the align walk
+    row = sub.prepare_inputs(ALIGN_WALK, _fwd(7, "r", **_align_meta(language=None)), _align_inputs(cfg))
     assert row.input_ids.tolist() == [SOT, DE, TRANSCRIBE, NOTS, 7, EOT]
+    assert row.input_ids.device.type == "cpu" and row.kwargs == {"audio_frames": 100}
 
 
 def test_decoder_align_walk_fits_the_position_table():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
-    sub.request_state(8).add("language", EN)
     # more text than fits after the forced prompt
-    row = sub.prepare_inputs(ALIGN_WALK, _fwd(8), {
-        "transcript": [torch.tensor([7])] * cfg.max_target_positions + [torch.tensor([EOT])],
-        "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
-        "audio_frames": [torch.tensor([cfg.num_frames])],
-    })
+    sub.request_state(8).add("decoded", [7] * cfg.max_target_positions + [EOT])
+    row = sub.prepare_inputs(ALIGN_WALK, _fwd(8, **_align_meta()), _align_inputs(cfg))
     assert row.input_seq_len == cfg.max_target_positions and row.input_ids.tolist()[-1] == EOT
+
+
+@pytest.mark.parametrize("recorded,language,match", [
+    ({}, EN, "no transcript recorded; the 'prefill' or 'prefill_prompt' walk"),
+    ({"decoded": [7]}, None, "no language; the 'detect_language' walk"),
+])
+def test_align_without_the_prompt_walks_state_is_an_error(recorded, language, match):
+    """The prompt walks record the transcript's first token and a detected
+    language on the worker that ran them; the error names the walk whose
+    record is missing."""
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    sub.request_state(3).add_all(**recorded)
+    with pytest.raises(RuntimeError, match=match):
+        sub.prepare_inputs(ALIGN_WALK, _fwd(3, **_align_meta(language=language)), _align_inputs(cfg))
+
+
+@pytest.mark.parametrize("groups,ok", [
+    # one group serving every walk
+    ([{"node_names": ["audio_encoder", "decoder"], "ranks": [0]}], True),
+    # decode and align together, but the prompt walks that record the first
+    # token and the language elsewhere
+    ([{"node_names": ["audio_encoder"], "ranks": [0]},
+      {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill"]},
+      {"node_names": ["decoder"], "ranks": [1], "graph_walks": ["decode", "align"]}], False),
+    # align on another rank than decode
+    ([{"node_names": ["audio_encoder"], "ranks": [0]},
+      {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill", "decode"]},
+      {"node_names": ["decoder"], "ranks": [1], "graph_walks": ["align"]}], False),
+    # align on no group at all
+    ([{"node_names": ["audio_encoder"], "ranks": [0]},
+      {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill", "decode"]}], False),
+])
+def test_decoder_walks_must_share_ranks(groups, ok):
+    assert DECODE_WALK == "decode" and ALIGN_WALK == "align"
+    config = {"max_concurrent_requests": 64, "node_groups": groups}
+    model = _make_model()
+    if ok:
+        model.validate_config_yaml(config, "x.yaml")
+    else:
+        with pytest.raises(ValueError, match="must run on the same ranks"):
+            model.validate_config_yaml(config, "x.yaml")
 
 
 def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
@@ -496,7 +569,7 @@ def test_decoder_check_stop_honors_eos_and_max_tokens():
 
     def info(walk, decoded, max_tokens=444):
         return type("I", (), {
-            "graph_walk": walk, "max_tokens": max_tokens, "rid_handle": 9,
+            "graph_walk": walk, "max_tokens": max_tokens, "rid_handle": 9, "step_metadata": {},
             "resource_configs": {"sampler": _Cfg()},
             "dynamic_loop_iter_counts": {"decode_loop": decoded},
         })()
@@ -509,6 +582,115 @@ def test_decoder_check_stop_honors_eos_and_max_tokens():
     assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == {"decode_loop"}
 
 
+def test_decoder_check_stop_batched_agrees_with_per_request():
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+
+    def info(walk, decoded, handle, max_tokens=444, ignore_eos=False):
+        return type("I", (), {
+            "graph_walk": walk, "max_tokens": max_tokens, "rid_handle": handle, "step_metadata": {},
+            "resource_configs": {"sampler": type("C", (), {"ignore_eos": ignore_eos})()},
+            "dynamic_loop_iter_counts": {"decode_loop": decoded},
+        })()
+
+    # rows in forward order, plus two padding rows a replay leaves at the end
+    tokens = torch.tensor([EOT, 1234, EOT, 1234, EOT, 0, 0])
+    row_rids = ("eos", "word", "ignored", "budget", "prefill")
+    infos = {
+        "eos": info(DECODE_WALK, 0, 0),                       # stops
+        "word": info(DECODE_WALK, 0, 1),                      # keeps going
+        "ignored": info(DECODE_WALK, 0, 2, ignore_eos=True),  # EOS ignored
+        "budget": info(DECODE_WALK, 3, 3, max_tokens=4),      # out of budget
+        "prefill": info(PREFILL_WALK, 0, 4),                  # never stops the loop
+    }
+    check = ["prefill", "budget", "ignored", "word", "eos"]  # not forward order
+    batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
+    per_request = {}
+    for i, rid in enumerate(row_rids):
+        got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
+        if got:
+            per_request[rid] = got
+    assert batched == per_request == {"eos": {"decode_loop"}, "budget": {"decode_loop"}}
+    # no token buffer: the engine falls back to the per-request path
+    assert sub.check_stop_batched(["eos"], infos, HostRows(("eos",), {})) is None
+
+
+@pytest.mark.parametrize("request_walks", [None, {"eos": DECODE_WALK, "word": DECODE_WALK}])
+def test_engine_stop_check_takes_the_batched_path(request_walks):
+    """The engine passes ``step_walk``; a signature without it raised, and the
+    engine silently fell back to one ``check_stop`` per row."""
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import Engine
+
+    sub = _decoder_submodule(_tiny_config())
+
+    def per_request(*args):
+        raise AssertionError("fell back to the per-request stop check")
+
+    sub.check_stop = per_request
+    sub.request_state(1).add("decoded", [7])  # a word-timestamp request's transcript, from its prompt walk
+    infos = {}
+    for handle, rid in enumerate(("eos", "word")):
+        infos[rid] = type("I", (), {
+            "graph_walk": DECODE_WALK, "max_tokens": 444, "rid_handle": handle,
+            "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},
+            "dynamic_loop_iter_counts": {"decode_loop": 0},
+        })()
+    failures = {}
+    batch = SimpleNamespace(
+        node_name="decoder", request_ids=["eos", "word"], per_request_info_wrapped=infos,
+        register_failure=failures.setdefault,
+        step_context=SimpleNamespace(graph_walk=DECODE_WALK, request_walks=request_walks),
+    )
+    engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
+    tokens = torch.tensor([EOT, 1234, 0])  # a padding row past the real ones
+    stops = Engine.check_stop_for_batch(
+        engine, batch, {}, host_rows=HostRows(("eos", "word"), {"new_token": tokens}),
+    )
+    assert stops == {"eos": {"decode_loop"}} and not failures
+    assert sub.request_state(1).get("decoded") == [7, 1234]
+
+
+def test_a_batched_stop_check_that_raises_partway_records_each_token_once():
+    """When the batched stop check raises, the engine re-runs it per request;
+    a row the batched pass already recorded keeps its token once."""
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import Engine
+
+    sub = _decoder_submodule(_tiny_config())
+    infos = {}
+    for handle, (rid, first) in enumerate((("a", 7), ("b", 8))):
+        sub.request_state(handle).add("decoded", [first])
+        infos[rid] = _stop_info(DECODE_WALK, handle)
+
+    class _RaisesOnce(dict):
+        raised = False
+
+        def __getitem__(self, rid):
+            if rid == "b" and not self.raised:
+                self.raised = True
+                raise RuntimeError("lookup failed")
+            return super().__getitem__(rid)
+
+    failures = {}
+    batch = SimpleNamespace(
+        node_name="decoder", request_ids=["a", "b"], per_request_info_wrapped=_RaisesOnce(infos),
+        register_failure=failures.setdefault,
+        step_context=SimpleNamespace(graph_walk=DECODE_WALK, request_walks=None),
+    )
+    engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
+    tokens = torch.tensor([1234, 99])
+    outputs = {"a": {"new_token": [tokens[:1]]}, "b": {"new_token": [tokens[1:]]}}
+    stops = Engine.check_stop_for_batch(
+        engine, batch, outputs, host_rows=HostRows(("a", "b"), {"new_token": tokens}),
+    )
+    assert batch.per_request_info_wrapped.raised and stops == {} and not failures
+    assert sub.request_state(0).get("decoded") == [7, 1234]
+    assert sub.request_state(1).get("decoded") == [8, 99]
+
+
 # --------------------------------------------------------------------------
 # model: graph, state machine, prompt processing, output rendering
 # --------------------------------------------------------------------------
@@ -519,21 +701,19 @@ def test_graph_walks_and_resources():
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {PREFILL_WALK, DETECT_LANGUAGE_WALK, PREFILL_PROMPT_WALK, DECODE_WALK, ALIGN_WALK}
     align = walks[ALIGN_WALK]
-    assert align.name == DECODER_NODE and set(align.input_names) == {"encoder_states", "transcript", "audio_frames"}
-    assert [(e.name, e.next_node) for e in align.outputs] == [("word_tokens", EMIT_TO_CLIENT)]
+    assert align.name == DECODER_NODE and list(align.input_names) == ["encoder_states"]
+    assert [(e.name, e.next_node) for e in align.outputs] == [("alignment", EMIT_TO_CLIENT)]
     loop = walks[DECODE_WALK]
     loop_node = loop.section
     assert set(loop_node.input_names) == {"text_inputs", "ts_rules"}
-    # the token loops back (persisted for the align walk) and reaches the
-    # client once, through the loop's accumulated output
-    assert {e.name for e in loop_node.outputs if e.next_node == DECODER_NODE} == {
-        "new_token", "text_inputs", "ts_rules"
-    }
-    assert not any(e.next_node == EMIT_TO_CLIENT for e in loop_node.outputs)
-    assert [(e.name, e.next_node, e.output_modality, e.persist) for e in loop.accumulated_outputs] == [
-        ("new_token", EMIT_TO_CLIENT, "text", True),
+    # the token and its rule state loop back (kept on the device by slot) and
+    # the token goes to the client inline each step; nothing accumulates (the
+    # align walk reads the tokens the decoder recorded)
+    assert {e.name for e in loop_node.outputs if e.next_node == DECODER_NODE} == {"text_inputs", "ts_rules"}
+    assert [(e.name, e.output_modality, e.persist) for e in loop_node.outputs if e.next_node == EMIT_TO_CLIENT] == [
+        ("text_inputs", "text", False),
     ]
-    assert [e.persist for e in loop_node.outputs if e.name == "new_token"] == [False]
+    assert not loop.accumulated_outputs
     assert model.nodes == [ENCODER_NODE, DECODER_NODE]
     specs = model.get_node_resources()
     kv = {s.resource_key: s for s in specs if isinstance(s, KVSpec)}
@@ -544,6 +724,9 @@ def test_graph_walks_and_resources():
     assert kv[CROSS_KV_CACHE].config.max_num_pages == per_req_ctx * model.MAX_CONCURRENT_REQUESTS + 1
     cap = model.MAX_CONCURRENT_REQUESTS
     assert kv[KV_CACHE].config.max_num_pages == 1 + 4 * cap  # padding rows of a capture hold no pages
+    # MHA: both attentions run the CUDA-core decode kernel
+    attn = [s for s in specs if hasattr(getattr(s, "config", None), "decode_tensor_cores")]
+    assert len(attn) == 2 and not any(s.config.decode_tensor_cores for s in attn)
     assert model.get_max_output_tokens() == 444
     assert model.get_max_output_tokens(max_output_tokens=32) == 32
 
@@ -576,29 +759,27 @@ def test_state_machine_forced_language():
 
 def test_state_machine_aligns_words_after_decoding():
     model = _make_model()
-    frames = object()
     args = model.get_initial_forward_pass_args(
         "default", ["audio", "text"], ["text"],
-        {**_signals(["audio", "text_inputs"]), "audio_frames": [frames]}, model_kwargs={"timestamps": "word"},
+        _signals(["audio", "text_inputs"]), model_kwargs={"timestamps": "word", "language": "en", "audio_frames": 77},
     )
-    assert args.full_metadata.kwargs["word_timestamps"] and args.full_metadata.kwargs["audio_frames"] == [frames]
+    assert args.step_metadata["word_timestamps"]
     first, rules = object(), object()
     nxt = model.get_partition_forward_pass_args(
         "default", args.full_metadata, {"new_token": [first], "ts_rules": [rules]},
     )
     assert nxt.full_metadata.graph_walk == DECODE_WALK
-    # the first transcript token is not released: the align walk needs every token
-    assert nxt.unpersist_tensors == [rules]
-    enc, tokens = object(), [first, object(), object()]
+    # the stop check kept the first token on the decoder: the tensor is released
+    assert nxt.unpersist_tensors == [first, rules]
+    enc = object()
     align = model.get_partition_forward_pass_args(
-        "default", nxt.full_metadata, {"new_token": tokens, "ts_rules": [rules], "encoder_states": [enc]},
+        "default", nxt.full_metadata, {"ts_rules": [rules], "encoder_states": [enc]},
     )
     assert align.full_metadata.graph_walk == ALIGN_WALK and not align.request_done
-    assert [(e.next_node, e.name, e.tensor_info) for e in align.inputs] == [
-        (DECODER_NODE, "encoder_states", [enc]), (DECODER_NODE, "transcript", tokens),
-        (DECODER_NODE, "audio_frames", [frames]),
-    ]
-    assert set(map(id, align.unpersist_tensors)) == set(map(id, [enc, *tokens, frames, rules]))
+    assert [(e.next_node, e.name, e.tensor_info) for e in align.inputs] == [(DECODER_NODE, "encoder_states", [enc])]
+    assert set(map(id, align.unpersist_tensors)) == set(map(id, [enc, rules]))
+    # the forced prompt and the audio length travel on the host
+    assert align.step_metadata == {"is_prefill": False, **_align_meta(audio_frames=77)}
     assert model.get_partition_forward_pass_args("default", align.full_metadata, {}).request_done
 
 
@@ -647,10 +828,7 @@ def test_state_machine_language_detection():
     # the detection step's (inactive) rule state is dropped, not routed
     assert set(map(id, second.unpersist_tensors)) == {id(lang), id(tail), id(stale_rules)}
     # the second prefill restates the settings; the language is still unknown
-    assert second.step_metadata == {
-        "is_prefill": True, "language": None,
-        "task": model.config.task_token("transcribe"), "timestamps": False,
-    }
+    assert second.step_metadata == {"is_prefill": True, "timestamps": False, "word_timestamps": False}
 
     third = model.get_partition_forward_pass_args("default", second.full_metadata, {"new_token": [object()]})
     assert third.full_metadata.graph_walk == DECODE_WALK and not third.full_metadata.is_prefill
@@ -668,27 +846,34 @@ def test_state_machine_language_detection():
 ])
 def test_route_metadata_agrees_with_the_prompt_it_was_built_beside(kwargs):
     """The decoder reads the prompt settings off ``step_metadata`` rather than
-    scanning the prompt tensor, which was a D2H sync. The two are now derived
-    independently from the same request kwargs, so what used to be true by
-    construction needs holding here: the metadata must say exactly what the
-    prompt says.
+    scanning the prompt tensor, which was a D2H sync: the timestamp rules at
+    prefill, and the forced prompt the align walk rebuilds. The two are
+    derived independently from the same request kwargs, so what used to be
+    true by construction needs holding here: the metadata must say exactly
+    what the prompt says.
     """
     model = _make_model()
     wave = torch.randn(8_000)
-    out = model.process_prompt(
-        None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, **kwargs,
-    ).new_input_tensors
+    processed = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, **kwargs)
+    out = processed.new_input_tensors
     args = model.get_initial_forward_pass_args(
         "default", ["audio", "text"], ["text"],
-        {k: list(v) for k, v in out.items()}, model_kwargs=kwargs,
+        {k: list(v) for k, v in out.items()}, model_kwargs={**kwargs, **processed.metadata},
     )
-    meta = args.step_metadata
     prompt = out["text_inputs"][0].tolist()
     prompt += out["prompt_tail"][0].tolist() if "prompt_tail" in out else []
 
     # timestamps on <=> the prompt omits <|notimestamps|>, which is what the
     # submodule used to test the prompt for
-    assert meta["timestamps"] is (model.config.no_timestamps_token_id not in prompt)
+    assert args.step_metadata["timestamps"] is (model.config.no_timestamps_token_id not in prompt)
+    # walk on to the align walk, which rebuilds the forced prompt from its metadata
+    metadata = args.full_metadata
+    metadata.kwargs["word_timestamps"] = True
+    while metadata.graph_walk != ALIGN_WALK:
+        step = model.get_partition_forward_pass_args("default", metadata, {})
+        metadata = step.full_metadata
+    meta = step.step_metadata
+    assert meta["audio_frames"] == wave.numel() // model.config.hop_length
     # the language token, or None exactly when it is being detected
     assert meta["language"] == (
         None if kwargs.get("language") is None
@@ -704,11 +889,11 @@ def test_route_metadata_agrees_with_the_prompt_it_was_built_beside(kwargs):
 def test_process_prompt_builds_window_and_prompts():
     model = _make_model()
     wave = torch.randn(8_000)  # half the tiny config's 1 s window
-    out = model.process_prompt(
-        None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en",
-    ).new_input_tensors
+    processed = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
+    out = processed.new_input_tensors
     assert torch.equal(out["audio"][0], wave)  # samples as they are; the encoder pads and makes the mel
-    assert out["audio_frames"][0].tolist() == [wave.numel() // model.config.hop_length]
+    # on the host for the align walk
+    assert processed.metadata["audio_frames"] == wave.numel() // model.config.hop_length
     assert out["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert "prompt_tail" not in out
 
@@ -792,35 +977,52 @@ def test_node_inputs_clone_keeps_encoder_template_shape():
     assert clone.tensor_inputs["audio_features"] is not template.tensor_inputs["audio_features"]
 
 
-def test_decoder_align_walk_emits_word_timings_in_the_timestamp_vocabulary():
+def test_decoder_align_walk_emits_the_alignment_and_postprocess_times_the_words():
     cfg = _tiny_config(alignment_heads=[[0, 1], [1, 2]])
     model = _make_model(cfg)
     torch.manual_seed(0)
     decoder = WhisperDecoderModel(cfg)
     for param in decoder.parameters():  # fused projections start from torch.empty
         torch.nn.init.normal_(param, std=0.05)
-    sub = WhisperDecoderSubmodule(decoder, cfg, tokenizer=model.tokenizer).eval()
-    fwd = type("F", (), {"request_id": "r", "rid_handle": 5})()
+    sub = WhisperDecoderSubmodule(decoder, cfg).eval()
     enc = torch.randn(cfg.max_source_positions, cfg.d_model)
-    # forced English prompt recorded at prefill, then two text tokens and end-of-text generated
-    sub.request_state(5).add("language", EN)
-    sub.request_state(5).add("task", TRANSCRIBE)
-    row = sub.prepare_inputs(ALIGN_WALK, fwd, {
-        "transcript": [torch.tensor([7]), torch.tensor([33]), torch.tensor([EOT])],
-        "encoder_states": [enc], "audio_frames": [torch.tensor([cfg.num_frames])],
+    # two text tokens and end-of-text, recorded by the stop check
+    sub.request_state(5).add("decoded", [7, 33, EOT])
+    row = sub.prepare_inputs(ALIGN_WALK, _fwd(5, "r", **_align_meta(audio_frames=cfg.num_frames)), {
+        "encoder_states": [enc],
     })
     assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 7, 33, EOT]
     assert sub.declare_step(ALIGN_WALK, ["r"], [row]) is None and sub.max_batch_size(ALIGN_WALK) == 1
     batch = sub.preprocess(ALIGN_WALK, _engine_inputs(["r"]), [row])
     with torch.no_grad():
         out = sub.forward_batched(ALIGN_WALK, _engine_inputs(["r"]), **batch)
-    ids = out["r"]["word_tokens"][0].tolist()
-    assert ids[0] == STARTOFLM
-    stamps = [i for i in ids[1:] if cfg.is_timestamp(i)]
-    assert len(stamps) % 2 == 0 and stamps == sorted(stamps)  # <start> word <end> per word, monotonic
-    assert all(cfg.timestamp_seconds(t) <= cfg.chunk_length for t in stamps)
-    rendered = model._detokenizer.to_bytes(ids).decode()
-    assert rendered.startswith("<|startoflm|><|") and rendered.count("<|") == 1 + len(stamps)
+    (output,) = out.per_rid_outputs["r"]["alignment"]
+    # the matrix over the encoder positions that hold audio, rows for the 2
+    # text tokens and end-of-text, then the ids column (the language last)
+    assert output.dtype == torch.float32 and output.shape == (3, cfg.num_frames // 2 + 1)
+    assert output[:, -1].tolist() == [7, 33, EN]
+    rendered = model.postprocess(output, "text").decode()
+    stamps = rendered.split("<|")[2:]
+    assert rendered.startswith("<|startoflm|><|") and len(stamps) % 2 == 0  # <start> word <end> per word
+    seconds = [float(s.split("|>")[0]) for s in stamps]
+    assert seconds == sorted(seconds) and seconds[-1] <= cfg.chunk_length
+
+
+def test_postprocess_renders_an_alignment_as_the_route_parses_it():
+    """A float tensor on the text edge is the align walk's alignment: DTW,
+    word grouping and punctuation in the API server, rendered in the
+    timestamp vocabulary after ``<|startoflm|>`` as before."""
+    model = _make_model()
+    rows, frames = 4, 100  # tokens 0, 1, 2 (" a", " b", " c") + end-of-text
+    output = torch.zeros(rows, frames + 1)
+    for i in range(rows):
+        output[i, 25 * i: 25 * i + 25] = 1.0
+    output[:, -1] = torch.tensor([0, 1, 2, EN])
+    assert model.postprocess(output, "text") == (
+        b"<|startoflm|><|0.00|>a<|0.50|><|0.50|>b<|1.00|><|1.00|>c<|1.50|>"
+    )
+    # token ids on the same edge are still detokenized
+    assert model.postprocess(torch.tensor([EN]), "text") == b"<|en|>"
 
 
 def test_decoder_prefill_selects_each_request_last_row_itself():
@@ -834,8 +1036,11 @@ def test_decoder_prefill_selects_each_request_last_row_itself():
     detect = sub.prepare_inputs(DETECT_LANGUAGE_WALK, fwd, {
         "text_inputs": [torch.tensor([SOT])], "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
     })
+    written = []
+    sub._write_context = written.append
     batch = sub.preprocess(DETECT_LANGUAGE_WALK, _engine_inputs(["a"]), [detect])
     assert batch["row_lens"].tolist() == [1] and batch["input_ids"].tolist() == [SOT]
+    assert [t.shape[0] for t in written] == [cfg.max_source_positions]
 
 
 
@@ -857,3 +1062,43 @@ def test_only_turbo_turns_pre_plan_off():
             f"{name} should stay on the pre_plan default"
         )
 
+
+def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():
+    """The decode loop no longer persists its tokens: the stop check records
+    them per request, and nothing past the step that stopped the loop (a
+    speculative step) joins the transcript the align walk teacher-forces."""
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    infos = {"r": _stop_info(PREFILL_WALK, 9), "plain": _stop_info(PREFILL_WALK, 10, word_timestamps=False)}
+    # the prefill's token starts the transcript, only for a word-timestamp request
+    sub.check_stop_batched(
+        ["r", "plain"], infos, HostRows(("r", "plain"), {"new_token": torch.tensor([10, 10])}), step_walk=PREFILL_WALK,
+    )
+    for info in infos.values():
+        info.graph_walk = DECODE_WALK
+    for token in (11, 12, EOT, 13):
+        rows = HostRows(("r", "plain"), {"new_token": torch.tensor([token] * 2)})
+        sub.check_stop_batched(["r", "plain"], infos, rows)
+        for info in infos.values():
+            info.dynamic_loop_iter_counts["decode_loop"] += 1
+    assert sub.request_state(9).get("decoded") == [10, 11, 12, EOT]
+    assert sub.request_state(10).get("decoded", None) is None
+    row = sub.prepare_inputs(ALIGN_WALK, _fwd(9, **_align_meta()), _align_inputs(cfg))
+    assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 10, 11, 12, EOT]
+
+
+def test_decode_loopback_contract(monkeypatch):
+    from mstar.model.whisper.config import SAMPLER
+
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
+    assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs", "ts_rules"})
+    assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
+    assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
+    row = sub.prepare_inputs(DECODE_WALK, _fwd(1), {}, has_loopback=True)
+    assert row.input_ids is None and row.input_seq_len == 1
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
+    assert sub.device_loopback_signals(DECODE_WALK) == frozenset()

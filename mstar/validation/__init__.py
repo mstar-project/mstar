@@ -69,6 +69,8 @@ def validate_deployment(
     problems = list(check_knobs())
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
+    if not isinstance(mps := config.get("mps", False), bool):
+        problems.append(f"mps must be true or false, got {mps!r}")
     # model hooks read `resources:` as a mapping; check_resources reports a bad one
     if resources_shape_problem(config) is None:
         try:

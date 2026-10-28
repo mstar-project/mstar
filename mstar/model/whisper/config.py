@@ -18,6 +18,8 @@ from pathlib import Path
 KV_CACHE = "kv_cache"
 ATTN = "attn"
 SAMPLER = "sampler"
+# The sampler's loop-back state holding each request's timestamp rule state
+TS_RULES = "ts_rules"
 # Positions: Whisper has no RoPE. The resource is declared for its
 # per-(request, label) position counter, which drives the learned absolute
 # ``embed_positions`` lookup; the attention layers never call it.
@@ -47,6 +49,10 @@ DECODE_LOOP = "decode_loop"
 # one teacher-forced pass over the transcript whose cross-attention gives
 # every word its start and end (see ``components/alignment.py``).
 ALIGN_WALK = "align"
+# The align walk's word timings follow the transcript after this marker, one
+# ``<|start|> word <|end|>`` per word in the timestamp vocabulary. Here so the
+# API server's adapter reads it without loading the model's modules.
+WORDS_MARKER = "<|startoflm|>"
 
 
 @dataclass

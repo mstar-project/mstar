@@ -86,14 +86,7 @@ class TokenStepNode:
         """``check_stop`` for every request off one ``tolist``. The base default
         ignores ``step_walk``, so prefill's token can end the decode loop too;
         subclasses may narrow that."""
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+        pairs = host_rows.first_values("new_token", request_ids)
+        if pairs is None:
             return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is not None and i < len(values) and self._stops(values[i], request_infos[rid]):
-                stops[rid] = {self.DECODE_LOOP}
-        return stops
+        return {rid: {self.DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}

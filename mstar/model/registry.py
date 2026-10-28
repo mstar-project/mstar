@@ -20,6 +20,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
+    "glm52": ("mstar.model.glm52.glm52_model", "Glm52Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnilingual_asr_ctc_300m": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
@@ -30,7 +31,9 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
+    "nemotron_asr": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
+    "parakeet": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "personaplex": ("mstar.model.personaplex.personaplex_model", "PersonaPlexModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
@@ -103,6 +106,9 @@ HF_MODELS: dict[str, dict] = {
     # 10 codebooks) with a 44.1 kHz causal DAC codec and reference-audio voice
     # cloning. Weights under the Fish Audio Research License (non-commercial).
     "fish_s2_pro": {"model_path_hf": "fishaudio/s2-pro"},
+    # GLM-5.2: 753B/40B MoE causal LM (MLA + DSA). The official release ships
+    # FP8 e4m3 block-scale under the -FP8 repo id; real serving is TP8.
+    "glm52": {"model_path_hf": "zai-org/GLM-5.2-FP8"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
@@ -125,7 +131,13 @@ HF_MODELS: dict[str, dict] = {
     "omnivoice": {"model_path_hf": "k2-fsa/OmniVoice"},
     # Kokoro-82M TTS: misaki G2P + PL-BERT prosody + iSTFTNet decoder, 54 bundled voices.
     "kokoro": {"model_path_hf": "hexgrad/Kokoro-82M"},
+    # NVIDIA Nemotron-3.5-ASR: cache-aware streaming FastConformer + RNN-T with
+    # a language prompt, 40 language-locales; served here over whole clips.
+    "nemotron_asr": {"model_path_hf": "nvidia/nemotron-3.5-asr-streaming-0.6b"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
+    # NVIDIA Parakeet-TDT-0.6B-v3: FastConformer + token-and-duration
+    # transducer, 25 European languages, language detected from the speech.
+    "parakeet": {"model_path_hf": "nvidia/parakeet-tdt-0.6b-v3"},
     # Gated: accept NVIDIA's license on the model page and use a token with
     # access. Voice presets come from the same repo's voices.tgz, fetched and
     # extracted on first use unless model_kwargs.voice_dir points elsewhere.

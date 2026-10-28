@@ -338,6 +338,13 @@ class Qwen3_5_Dense(Model):
     def get_supported_modalities(self):
         return {RequestType.T2T, RequestType.I2T, RequestType.V2T}
 
+    def get_model_kwargs(self, request_type: RequestType):
+        # Greedy everywhere (mstar's sampler defaults to 0.6), and the same prompt
+        # render: mstar opens a <think> block by default, while the 0.8B/2B templates
+        # only do when asked. mstar reads the flat enable_thinking and vLLM/SGLang
+        # read chat_template_kwargs.
+        return {"temperature": 0.0, "enable_thinking": True, "chat_template_kwargs": {"enable_thinking": True}}
+
 
 class Qwen3_8_Dense(Qwen3_5_Dense):
     """Qwen3.8 dense: the Qwen3.5 architecture, defaulting to the 27B."""
@@ -480,6 +487,16 @@ class CanaryQwen(_FastConformerAsr):
         return "nvidia/canary-qwen-2.5b"
 
 
+class Parakeet(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/parakeet-tdt-0.6b-v3"
+
+
+class NemotronAsr(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/nemotron-3.5-asr-streaming-0.6b"
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -498,6 +515,8 @@ class ModelType(Enum):
     HIGGS_AUDIO = "higgs_audio"
     CANARY = "canary"
     CANARY_QWEN = "canary_qwen"
+    PARAKEET = "parakeet"
+    NEMOTRON_ASR = "nemotron_asr"
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
     PERSONAPLEX = "personaplex"
@@ -537,6 +556,10 @@ class ModelType(Enum):
             return Canary(**kwargs)
         if self == ModelType.CANARY_QWEN:
             return CanaryQwen(**kwargs)
+        if self == ModelType.PARAKEET:
+            return Parakeet(**kwargs)
+        if self == ModelType.NEMOTRON_ASR:
+            return NemotronAsr(**kwargs)
         if self == ModelType.QWEN3_5:
             return Qwen3_5_Dense(**kwargs)
         if self == ModelType.QWEN3_8:

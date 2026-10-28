@@ -306,6 +306,40 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
 
 
+def test_encoder_replays_exactly_when_leased():
+    """A leased step declares nothing of its own, so the forward replays
+    then and runs eagerly otherwise, whatever the runner's buckets allow."""
+    from types import SimpleNamespace
+
+    from mstar.model.qwen3_asr.submodules import AUT_ENCODE
+
+    class Runner:
+        has_bucket = True
+
+        def can_run(self, batch_size, total_tokens):
+            return self.has_bucket
+
+        def run(self, **kwargs):
+            self.ran = kwargs
+            return {"embeds": "replayed"}
+
+    sub, runner = object.__new__(Qwen3ASREncoderSubmodule), Runner()
+
+    def replay(step):
+        engine_inputs = SimpleNamespace(piecewise_runners={AUT_ENCODE: runner}, request_ids=["a", "b"], step=step)
+        return sub._replay_encode(engine_inputs, torch.zeros(12, 8), [4, 8])
+
+    assert replay(step=object()) is None
+    assert not hasattr(runner, "ran")
+    # no declaration but no bucket either (a forward driven outside the engine)
+    runner.has_bucket = False
+    assert replay(step=None) is None
+    assert not hasattr(runner, "ran")
+    runner.has_bucket = True
+    assert replay(step=None) == "replayed"
+    assert runner.ran["seq_lens"] == [4, 8] and runner.ran["real_bs"] == 2
+
+
 def _llm_submodule(cfg):
     sub = object.__new__(Qwen3ASRLLMSubmodule)
     torch.nn.Module.__init__(sub)
@@ -399,6 +433,45 @@ def test_llm_check_stop_batched_agrees_with_per_request():
     assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 
 
+@pytest.mark.parametrize("step_walk", [DECODE_WALK, None])
+def test_engine_stop_check_takes_the_batched_path(step_walk):
+    """The engine passes ``step_walk``; a signature without it raised, and the
+    engine silently fell back to one ``check_stop`` per row."""
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import Engine
+
+    sub = _llm_submodule(_tiny_config())
+
+    def per_request(*args):
+        raise AssertionError("fell back to the per-request stop check")
+
+    sub.check_stop = per_request
+    infos = {
+        rid: type("I", (), {
+            "graph_walk": DECODE_WALK, "max_tokens": 4096,
+            "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},
+            "dynamic_loop_iter_counts": {"decode_loop": 0},
+        })()
+        for rid in ("end", "word")
+    }
+    failures = {}
+    batch = SimpleNamespace(
+        node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
+        register_failure=failures.setdefault,
+        step_context=SimpleNamespace(
+            graph_walk=DECODE_WALK,
+            request_walks=None if step_walk else {"end": DECODE_WALK, "word": DECODE_WALK},
+        ),
+    )
+    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=sub)})
+    tokens = torch.tensor([[IM_END], [1234]])
+    stops = Engine.check_stop_for_batch(
+        engine, batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
+    )
+    assert stops == {"end": {"decode_loop"}} and not failures
+
+
 # --------------------------------------------------------------------------
 # model: graph, resources, state machine
 # --------------------------------------------------------------------------
@@ -417,6 +490,8 @@ def test_graph_resources_and_state_machine():
     assert ragged.config.max_segments_per_request == model.max_windows_per_request == expected
     kv = next(s for s in specs if isinstance(s, KVSpec))
     assert kv.nodes == {LLM_NODE} and kv.config.num_kv_heads == 2 and kv.config.max_num_pages == model.KV_PAGES
+    (attn,) = [s for s in specs if hasattr(getattr(s, "config", None), "decode_tensor_cores")]
+    assert attn.config.decode_tensor_cores is False  # narrow GQA: the CUDA-core decode kernel
     assert model.get_max_output_tokens() == 4096 and model.get_max_output_tokens(max_output_tokens=8) == 8
 
     args = model.get_initial_forward_pass_args(
@@ -561,7 +636,12 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     assert row.input_ids is None and row.input_seq_len == 1
     assert sub.uniform_row_inputs(DECODE_WALK, has_loopback=True).input_seq_len == 1
     routed = sub.prepare_inputs(DECODE_WALK, None, {"text_inputs": [torch.tensor([7])]})
-    sampler = type("S", (), {"loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13]))})()
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    sampler = type("S", (), {
+        "loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13])),
+        "overwrite_rows": SamplerResource.overwrite_rows, "_row_stager": None,
+    })()
     ids = sub.preprocess(DECODE_WALK, ModelInputsFromEngine(
         request_ids=["a", "b", "c"], per_request_info={}, resources={SAMPLER: sampler},
     ), [row, routed, row])["input_ids"]

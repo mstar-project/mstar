@@ -1,4 +1,4 @@
-"""Whisper's decoder node on the shared encoder-decoder base: HF generate's
+"""Whisper's decoder node on the shared TokenStepNode: HF generate's
 token suppression, applied to the logits the sampler gets; the batched stop
 check, which only a decode step's token answers; and the walk and loop names
 of Whisper's graph."""
@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from mstar.model.submodule_base import HostRows
-from mstar.model.whisper.config import WhisperModelConfig
+from mstar.model.whisper.config import PREFILL_WALK, WhisperModelConfig
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 
 
@@ -18,14 +18,7 @@ def _node():
 
 
 class _Decoder(nn.Module):
-    """Zero logits over 8 tokens, whatever the input; notes the context write."""
-
-    def __init__(self):
-        super().__init__()
-        self.wrote_context = False
-
-    def write_cross_kv(self, encoder_states):
-        self.wrote_context = True
+    """Zero logits over 8 tokens, whatever the input."""
 
     def embed(self, input_ids, position_ids):
         return torch.zeros(input_ids.shape[0], 4)
@@ -47,21 +40,18 @@ class _Sampler:
 
 
 def test_forward_suppresses_before_sampling():
-    """A prefill and a decode step through ``forward``: the context written
-    once, and the sampler sees the begin-suppressed tokens masked only for the
-    first token."""
+    """A prefill and a decode step through ``forward``: the sampler sees the
+    begin-suppressed tokens masked only for the first token. (The context is
+    written in ``preprocess``, outside the captured prefill.)"""
     node, sampler = _node(), _Sampler()
     node.decoder = _Decoder()
     engine_inputs = SimpleNamespace(request_ids=["a"], resources={
+        "attn": SimpleNamespace(select_last_hidden=lambda hidden: hidden[-1:]),
         "positions": SimpleNamespace(pos_ids=lambda label: None),
         "sampler": sampler,
     })
-    node.forward("prefill", engine_inputs, input_ids=torch.tensor([9, 9, 9, 9]), encoder_states=torch.zeros(5, 4),
-                 row_lens=torch.tensor([4]))
-    assert node.decoder.wrote_context
-    node.decoder.wrote_context = False
+    node.forward("prefill", engine_inputs, input_ids=torch.tensor([9, 9, 9, 9]))
     node.forward("decode", engine_inputs, input_ids=torch.tensor([9]))
-    assert not node.decoder.wrote_context
     first, later = sampler.logits
     assert first.shape == later.shape == (1, 8)
     assert torch.isinf(first[0, [1, 2, 3, 5]]).all() and not torch.isinf(first[0, [0, 4, 6, 7]]).any()
@@ -75,7 +65,7 @@ def test_names_match_whispers_graph():
     model.config = WhisperModelConfig()
     walks = model.get_graph_walk_graphs()
     node = _node()
-    assert {node.PREFILL_WALK, node.DECODE_WALK} <= set(walks)
+    assert {PREFILL_WALK, node.DECODE_WALK} <= set(walks)
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP
 
 
@@ -85,9 +75,10 @@ def test_batched_stop_check_answers_decode_steps_only():
     node = _node()
     infos = {
         rid: SimpleNamespace(graph_walk=walk, resource_configs={"sampler": SimpleNamespace(ignore_eos=False)},
-                             dynamic_loop_iter_counts={"decode_loop": n}, max_tokens=10)
-        for rid, walk, n in (("eos", "decode", 0), ("limit", "decode", 9), ("go", "decode", 0),
-                             ("prefill_eos", "prefill", 0))
+                             dynamic_loop_iter_counts={"decode_loop": n}, max_tokens=10,
+                             step_metadata={}, rid_handle=i)
+        for i, (rid, walk, n) in enumerate((("eos", "decode", 0), ("limit", "decode", 9), ("go", "decode", 0),
+                                            ("prefill_eos", "prefill", 0)))
     }
     rows = HostRows(request_ids=("go", "limit", "eos", "prefill_eos"),
                     buffers={"new_token": torch.tensor([[7], [7], [3], [3]])})

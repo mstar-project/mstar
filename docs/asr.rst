@@ -47,11 +47,14 @@ requests batch together and are captured per batch size (1 to 64).
 ``align``
     only when word timestamps were asked for: one teacher-forced pass over
     ``<|startoftranscript|><|lang|><|task|><|notimestamps|> transcript
-    <|endoftext|>`` on the served decoder weights, outside the caches. The
-    alignment heads' cross-attention becomes word start/end times (per-head
-    standardization, median filter, dynamic time warping), emitted in
-    Whisper's own timestamp vocabulary after ``<|startoflm|>`` so the same
-    detokenizer renders it and the serving layer lifts it into ``words``.
+    <|endoftext|>`` on the served decoder weights, outside the caches. On the
+    GPU, the alignment heads' cross-attention is standardized per head,
+    median-filtered and averaged, and the walk emits that matrix with the
+    token ids as one float32 tensor. The API server's ``postprocess`` runs the
+    dynamic time warping (compiled by numba, part of the ``asr`` extra, when
+    the API server loads the model) and groups tokens into words, rendered in
+    Whisper's own timestamp vocabulary after ``<|startoflm|>``, which the
+    serving layer lifts into ``words``.
 
 **Request options** (``model_kwargs`` / the OpenAI fields): ``language``
 (ISO code; omit to detect), ``task`` (``transcribe`` or ``translate``),
@@ -128,8 +131,8 @@ the pool holds offload to the host pool and, once that is full too, wait on
 each other until they time out: 16 concurrent single-window 20 minute files
 stalled on 2048 pages, and peaked at 2352 pages with 4096 in the pool.
 
-``qwen3_asr.yaml`` therefore caps Qwen3-ASR at 12 concurrent requests, which
-any mix of files up to 20 minutes fits. The cap costs short-utterance
+``qwen3_asr.yaml`` and ``qwen3_asr_split.yaml`` therefore cap Qwen3-ASR at 12
+concurrent requests, which any mix of files up to 20 minutes fits. The cap costs short-utterance
 throughput: on LibriSpeech test-clean (one H200, Qwen3-ASR 1.7B) RTFx was
 about 420 at 8 concurrent requests, 900 at 32 and 1280 at 64. A deployment
 that only serves short audio can raise ``max_concurrent_requests`` (64 fits
@@ -137,16 +140,25 @@ the default pool); one that serves many long files at once can raise
 ``kv_cache.max_num_pages`` with the cap. Admission that sizes the cap by each
 request's pages instead is planned.
 
-Whisper's decode loop hands a window's tokens to the client in one message
-when the loop ends (``Loop.accumulated_outputs``), so a streaming request
-receives one delta per window. Qwen3-ASR's decode loop keeps its token on the
-device (``device_loopback_signals``) and the worker sends the batch's tokens
-inline, one frame per step (``inline_client_signals``), so they reach the API
-server while the window decodes: a 20 minute window is about 3,450 tokens,
-which, sent as one tensor apiece when the loop ended, could miss the API
-server's 15 s delivery deadline under load. Each chunk is one byte-level BPE
-token, which can end inside a UTF-8 character; the transcription route
+Both decode loops stream their transcript token by token. A decode step
+keeps its rows' tokens on the device for the next step (the sampler's device
+loop-back, ``device_loopback_signals``), and the worker sends the batch's
+tokens to the client in one frame per step from the stop check's host copy
+(``inline_client_signals``), rather than one tensor message per request. A
+streaming request therefore receives one delta per token, and tokens reach
+the API server while the window decodes: a 20 minute Qwen3-ASR window is
+about 3,450 tokens, which, sent as one tensor apiece when the loop ended,
+could miss the API server's 15 s delivery deadline under load. Each chunk is
+one byte-level BPE token, which can end inside a UTF-8 character; the server
 decodes the joined bytes.
+
+The ``*_split`` configs (``whisper_large_split.yaml``,
+``whisper_large_v3_turbo_split.yaml``, ``qwen3_asr_split.yaml``,
+``qwen3_asr_realtime_split.yaml``) put the encoder and the decoder in two
+worker processes on one GPU (``rank_devices``), so a decode step never queues
+behind an encoder batch on the same stream. They set ``mps: true``, so both
+workers run as clients of one CUDA MPS daemon and their kernels overlap rather
+than time-slice (see :doc:`serving`).
 
 Benchmarks and parity
 ---------------------

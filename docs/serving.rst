@@ -252,6 +252,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
        whatever is free.
+   * - ``mps``
+     - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
+       conductor starts in a private directory, so workers that share a GPU overlap their
+       kernels instead of time-slicing (the ASR ``*_split`` configs). NVIDIA only, and it
+       needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
+       shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
+       ``false``.
    * - ``max_call_input_mb``
      - *(optional, default 512)* For a model that takes live client input: how many MiB
        of files (and append text) one call may send over its whole life, its opening
@@ -354,7 +361,7 @@ them by that name:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
                                 # prefix_cache, prefix_cache_salt, prefix_cache_tp
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense)
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
 
@@ -412,6 +419,13 @@ still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU se
 other's memory only as used, so the first to capture can take the other's room. Set
 ``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
 counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
+
+Workers that share a GPU time-slice it by default: one process's kernels wait for the
+other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of its own
+before it spawns the workers, run every worker as its client so their kernels overlap,
+and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
+processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
+driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
@@ -503,6 +517,43 @@ Pi0.5 DROID variant fixes the action horizon:
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`.
+
+Restarts and the compile cache
+------------------------------
+
+On a first start Inductor compiles every capture bucket (tuning it at ``-O1`` and
+``-O2``), and FlashInfer JIT-builds its kernels. Both cache the results, and a
+start that finds them skips that work. Qwen3.5-0.8B on an H200 took 320 s to start with an
+empty cache at the default ``-O1`` (1,294 s at ``-O2``); a warm start skips Inductor's
+compile and tuning. torch's default cache in ``/tmp`` already survives a process restart on
+the same host; M*'s default keeps it across a new container or a reboot that clears ``/tmp``.
+
+To keep it, persist these (all under ``~/.cache`` by default):
+
+- ``$XDG_CACHE_HOME/mstar/torchinductor``: Inductor's compiled graphs and autotune picks
+  (``TORCHINDUCTOR_CACHE_DIR``), and in its ``triton`` subdirectory Triton's compiled kernels,
+  Inductor's and others' alike (``TRITON_CACHE_DIR``)
+- ``~/.cache/flashinfer``: FlashInfer's JIT builds (it follows ``FLASHINFER_WORKSPACE_BASE``,
+  default home, not ``$XDG_CACHE_HOME``)
+- ``$HF_HOME``: the weights (``$XDG_CACHE_HOME/huggingface`` by default)
+
+``$XDG_CACHE_HOME`` defaults to ``~/.cache``. M* sets both variables unless you export them,
+and ``TRITON_CACHE_DIR`` follows an exported ``TORCHINDUCTOR_CACHE_DIR``.
+
+In a container, mount these from a volume rather than only ``~/.cache/huggingface``.
+Inductor keys compiled graphs and ``-O1``'s picks on the torch build. On CUDA and ROCm,
+compiled graphs (and ``-O2``'s GEMM timings) also key on the Triton build, the device (its
+name on CUDA, its gfx arch on ROCm) and the CUDA or HIP version; on XPU, on none of those.
+``-O1``'s picks key on the kernel source, which names the compute capability and SM count but
+not the GPU model, so give each GPU model (or each ROCm card sharing an arch) its own cache
+if one home serves several. Neither key covers the ``ptxas`` that built a kernel or the driver: after changing
+either, delete the cache or set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value.
+
+The default trades torch's node-local ``/tmp`` for home. Nothing prunes the cache, and every
+upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which costs only the
+next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
+concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
+path and copy a warm cache in at job start.
 
 .. _tensor-transport:
 
@@ -719,8 +770,9 @@ or ``increase()``.
 - ``mstar_prefix_cache_query_tokens_total{model_name, component}``,
   ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
   tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
-  tokens found there. Only models that key their prompts for prefix reuse (BAGEL and
-  Orpheus) count, and above one rank only with ``prefix_cache_tp`` set.
+  tokens found there. Only models that key their prompts for prefix reuse (BAGEL,
+  Orpheus and Qwen3-Omni's Thinker) count, and above one rank only with
+  ``prefix_cache_tp`` set.
 - ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
   step on the node is ready (its inputs arrived) and not running: waiting for room in a
   step or for the worker to pick the node.
