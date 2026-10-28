@@ -12,19 +12,155 @@ name: Publish to PyPI
 # one release run at a time: publish with the engine's pending publisher,
 # add the next alias's pending publisher, re-run the failed job, repeat.
 # Uploads skip files that already exist, so re-runs are safe.
+#
+# mstar-ai ships an sdist, a pure-Python wheel, and Linux wheels per CPython
+# version and architecture that also carry the mstar_rust extension (setup.py
+# compiles rust/ only under cibuildwheel). pip prefers the Linux wheel where
+# one matches and falls back to the pure one elsewhere, which then runs on the
+# Python transport and graph runtime. The Linux wheels publish in their own
+# job, so a failure in `wheels` holds back only them.
 
 on:
   release:
     types: [published]
+  # Build and check the Linux wheels without publishing: by hand, or on a PR
+  # that touches what goes into them. Only a release runs the pypi jobs.
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "rust/**"
+      - rust-toolchain.toml
+      - .cargo/config.toml
+      - setup.py
+      - pyproject.toml
+      - MANIFEST.in
+      - .github/workflows/release.yml
+
+# Read-only by default: PR runs build PR code. The publish jobs add id-token.
+permissions:
+  contents: read
+
+# A newer PR or manual run on the same ref cancels one in progress. Release
+# runs have their own group, so neither of those can cancel one; a release run
+# is never cancelled in progress, though a newer one still replaces a pending one.
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
+  wheels:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Version-specific rather than abi3, matching the extension that
+      # `maturin develop` builds and the tests exercise. PR and manual runs
+      # build one CPython per architecture; the check expects one wheel each.
+      CIBW_BUILD: ${{ github.event_name == 'release' && 'cp312-manylinux_* cp313-manylinux_* cp314-manylinux_*' || 'cp312-manylinux_*' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      # The licenses of the crates and vendored C/C++ compiled into the wheel,
+      # shipped in its dist-info/licenses (setuptools' default LICEN[CS]E*
+      # glob). Fails on any license rust/about.toml does not accept.
+      - name: Collect third-party licenses
+        run: |
+          cargo about generate --locked -c rust/about.toml -m rust/Cargo.toml \
+            rust/about.hbs -o LICENSES-THIRD-PARTY-mstar_rust.txt
+          cargo about generate --locked -c rust/about.toml -m rust/server/Cargo.toml \
+            rust/about.hbs -o LICENSES-THIRD-PARTY-mstar-server.txt
+      - uses: pypa/cibuildwheel@v4.2.1
+        env:
+          CIBW_BEFORE_ALL_LINUX: >-
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none &&
+            cd {project} && $HOME/.cargo/bin/rustup toolchain install
+          CIBW_ENVIRONMENT_LINUX: PATH="$HOME/.cargo/bin:$PATH"
+        with:
+          output-dir: wheelhouse
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.13
+            3.14
+      # Outside the build container, with no dependencies installed: the
+      # extension imports at the version mstar expects, the frontend binary
+      # runs from the scripts directory find_server_binary looks in without
+      # any libpython (setup-python puts its libdir on LD_LIBRARY_PATH, which
+      # would hide a link to one), and both license notices are in the
+      # metadata.
+      - name: Check each wheel in a clean venv
+        shell: python
+        run: |
+          import glob, os, re, subprocess, tempfile
+          expected = re.search(r'^EXPECTED_MSTAR_RUST_VERSION = "(.+)"$',
+                               open("mstar/communication/communicator.py").read(), re.M)[1]
+          check = """
+          import importlib.metadata as md, mstar_rust, os, pathlib, subprocess, sys, sysconfig
+          assert mstar_rust.__version__ == sys.argv[1], mstar_rust.__version__
+          shipped = {f.name for f in md.files('mstar-ai')}
+          for licenses in ('LICENSES-THIRD-PARTY-mstar_rust.txt', 'LICENSES-THIRD-PARTY-mstar-server.txt'):
+              assert licenses in shipped, licenses
+          server = pathlib.Path(sysconfig.get_path('scripts')) / 'mstar-server'
+          needed = subprocess.run(['readelf', '-d', server], capture_output=True, text=True, check=True).stdout
+          assert 'libpython' not in needed, needed
+          env = {k: v for k, v in os.environ.items() if k != 'LD_LIBRARY_PATH'}
+          subprocess.run([server, '--help'], env=env, check=True)
+          """
+          wheels = sorted(glob.glob("wheelhouse/*.whl"))
+          assert len(wheels) == len(os.environ["CIBW_BUILD"].split()), wheels
+          for whl in wheels:
+              py = "python3." + re.search(r"-cp3(\d+)-", whl).group(1)
+              venv = tempfile.mkdtemp()
+              subprocess.run([py, "-m", "venv", venv], check=True)
+              subprocess.run([f"{venv}/bin/pip", "install", "-q", "--no-deps", whl], check=True)
+              subprocess.run([f"{venv}/bin/python", "-c", check, expected], check=True)
+              print("ok", whl)
+      # These wheels turn the Rust transport and graph runtime on by default
+      # (MSTAR_RUST_ZMQ / MSTAR_RUST_GRAPH AUTO) on Python versions and an
+      # architecture rust-transport never runs, so each one also runs test/rust
+      # with its dependencies installed (CPU torch). From a copy of test/, so
+      # `mstar` imports from the wheel rather than the checkout.
+      - name: Run test/rust against each wheel
+        shell: python
+        run: |
+          import glob, re, shutil, subprocess, tempfile
+          for whl in sorted(glob.glob("wheelhouse/*.whl")):
+              py = "python3." + re.search(r"-cp3(\d+)-", whl).group(1)
+              venv, tests = tempfile.mkdtemp(), tempfile.mkdtemp()
+              subprocess.run([py, "-m", "venv", venv], check=True)
+              # triton: the arena tests reach mstar.utils.sampling; the rest
+              # are what ci.yml's rust-transport job adds for test/rust.
+              subprocess.run([f"{venv}/bin/pip", "install", "-q",
+                              "--extra-index-url", "https://download.pytorch.org/whl/cpu",
+                              whl, "pytest==9.2.0", "prometheus-client", "httpx", "triton"],
+                             check=True)
+              for d in ("rust", "modular"):  # test/rust imports helpers from test/modular
+                  shutil.copytree(f"test/{d}", f"{tests}/test/{d}")
+              subprocess.run([f"{venv}/bin/pytest", "-q", "-ra", "test/rust"], cwd=tests, check=True)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
   pypi:
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -57,4 +193,24 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-mstar-serve
+          skip-existing: true
+
+  # After pypi, which checked the tag, so these upload only for a release whose
+  # sdist and pure wheel went up.
+  pypi-wheels:
+    needs: [wheels, pypi]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Publish the mstar-ai Linux wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
           skip-existing: true

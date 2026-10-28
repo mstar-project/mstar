@@ -518,6 +518,43 @@ Pi0.5 DROID variant fixes the action horizon:
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`.
 
+Restarts and the compile cache
+------------------------------
+
+On a first start Inductor compiles every capture bucket (tuning it at ``-O1`` and
+``-O2``), and FlashInfer JIT-builds its kernels. Both cache the results, and a
+start that finds them skips that work. Qwen3.5-0.8B on an H200 took 320 s to start with an
+empty cache at the default ``-O1`` (1,294 s at ``-O2``); a warm start skips Inductor's
+compile and tuning. torch's default cache in ``/tmp`` already survives a process restart on
+the same host; M*'s default keeps it across a new container or a reboot that clears ``/tmp``.
+
+To keep it, persist these (all under ``~/.cache`` by default):
+
+- ``$XDG_CACHE_HOME/mstar/torchinductor``: Inductor's compiled graphs and autotune picks
+  (``TORCHINDUCTOR_CACHE_DIR``), and in its ``triton`` subdirectory Triton's compiled kernels,
+  Inductor's and others' alike (``TRITON_CACHE_DIR``)
+- ``~/.cache/flashinfer``: FlashInfer's JIT builds (it follows ``FLASHINFER_WORKSPACE_BASE``,
+  default home, not ``$XDG_CACHE_HOME``)
+- ``$HF_HOME``: the weights (``$XDG_CACHE_HOME/huggingface`` by default)
+
+``$XDG_CACHE_HOME`` defaults to ``~/.cache``. M* sets both variables unless you export them,
+and ``TRITON_CACHE_DIR`` follows an exported ``TORCHINDUCTOR_CACHE_DIR``.
+
+In a container, mount these from a volume rather than only ``~/.cache/huggingface``.
+Inductor keys compiled graphs and ``-O1``'s picks on the torch build. On CUDA and ROCm,
+compiled graphs (and ``-O2``'s GEMM timings) also key on the Triton build, the device (its
+name on CUDA, its gfx arch on ROCm) and the CUDA or HIP version; on XPU, on none of those.
+``-O1``'s picks key on the kernel source, which names the compute capability and SM count but
+not the GPU model, so give each GPU model (or each ROCm card sharing an arch) its own cache
+if one home serves several. Neither key covers the ``ptxas`` that built a kernel or the driver: after changing
+either, delete the cache or set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value.
+
+The default trades torch's node-local ``/tmp`` for home. Nothing prunes the cache, and every
+upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which costs only the
+next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
+concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
+path and copy a warm cache in at job start.
+
 .. _tensor-transport:
 
 Tensor transport
