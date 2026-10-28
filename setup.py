@@ -36,14 +36,13 @@ class build_py_with_configs(build_py):
             shutil.copy2(y, dst / y.name)
 
 
-# Only the release workflow's cibuildwheel builds (on releases, PRs and manual
-# runs alike) compile rust/: the mstar_rust extension and the mstar-server
-# binary (--rust-frontend), which installs into the environment's scripts
-# directory. Every other build is the pure-Python package, and a checkout
-# builds both with cargo/maturin
-# (docs/installation.rst). setuptools' editable finder cannot import a
-# top-level extension built in place, and compiling it would slow every
-# `pip install -e .`.
+# Only a CIBUILDWHEEL=1 build compiles rust/ (the release workflow's
+# cibuildwheel builds, or a build from the sdist): the mstar_rust extension and
+# the mstar-server binary (--rust-frontend), which installs into the
+# environment's scripts directory. Every other build is the pure-Python
+# package, and a checkout builds both with cargo/maturin (docs/installation.rst).
+# setuptools' editable finder cannot import a top-level extension built in
+# place, and compiling it would slow every `pip install -e .`.
 rust_extensions = []
 if os.environ.get("CIBUILDWHEEL") == "1":
     from setuptools_rust import Binding, RustBin, RustExtension, Strip

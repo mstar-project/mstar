@@ -2,7 +2,9 @@
 # can copy them into mstar/default_configs/ (see setup.py).
 graft configs
 # rust/ and the pinned toolchain, so the Rust wheels can be built from the
-# sdist too (setup.py compiles them under CIBUILDWHEEL=1).
+# sdist too (setup.py compiles them under CIBUILDWHEEL=1). Such a build must
+# first run release.yml's two `cargo about generate` commands, or its wheels
+# carry no third-party notices.
 graft rust
 prune rust/target
 prune rust/server/target
