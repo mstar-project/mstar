@@ -37,6 +37,7 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
+from mstar.streaming.topology import PartitionTopology  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -334,7 +335,9 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
     w.wakeup_event = SimpleNamespace(register_future=stub)
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
-    w.scheduler = SimpleNamespace(take_admit_errors=dict, get_next_batch=next_batch)
+    w.scheduler = SimpleNamespace(
+        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub,
+    )
     for name in ("_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
                  "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
@@ -533,6 +536,9 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
         def process_prompt(self, *args, **kwargs):
             return None
 
+        def get_partition_topology(self):
+            return PartitionTopology(partitions=["default"])
+
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.worker_metrics_requested = threading.Event()
@@ -543,8 +549,10 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
         profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
+        # codec / try_send_bytes: the thread's outbox sends through them
         communicator=SimpleNamespace(get_all_new_messages=lambda: [],
-                                     send=lambda entity, msg: sent.append((entity, msg))),
+                                     codec=SimpleNamespace(encode=lambda msg: msg),
+                                     try_send_bytes=lambda entity, msg: sent.append((entity, msg)) or True),
         tensor_manager=_StubTensorManager(), model=_Model(),
         worker_metrics_requested=facade.worker_metrics_requested,
     )

@@ -123,6 +123,7 @@ def _worker(eng, runtime):
     w._copied_inputs = {}
     w._kv_caches = {}
     w._graph_runtime = runtime
+    w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(
         cleanup_collectable=lambda *a: None,
         store_and_return_tensor_info_batch=_store,

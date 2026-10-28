@@ -85,6 +85,7 @@ def _worker(tmp_path):
     w._copied_inputs = {}
     w._innermost_loop_by_node = {}
     w._graph_runtime = _AccumulatingRuntime()
+    w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = _manager(tmp_path, "worker_0")
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},

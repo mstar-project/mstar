@@ -25,7 +25,7 @@ Batching rarely buys throughput for a large video DiT: one 544×960×121 row is 
 
 - `schedule_for` returns a `FlowMatchSchedule`; the base stages its tensors on the device once per request, and `STEP_SCALARS` slices `sigma`, `sigma_next` and `timestep` out per step as `[1]` device tensors. Rows at different steps therefore share one forward, and a captured graph reads them from staged buffers. A scheduler that needs another per-step value (a guidance scale) adds a `StepScalar` entry instead of overriding `prepare_inputs`.
 - **Match the reference's RNG exactly.** `seed_latents` draws from a CPU generator the base seeds per request; draw the same shapes in the same order and dtype as the reference pipeline, or the comparison against the oracle is meaningless from step 0. A recipe that draws more than once (a second stage's noise) has to continue the same generator, not reseed.
-- Seeded noise is staged through a pinned ring (`stage_seed`, `NoiseStager`); `tensor.to(device)` from pageable memory blocks the GPU thread and stalls the pre-plan.
+- Seeded noise and the schedule reach the device through `to_device_nonblocking` (`mstar/utils/h2d.py`: one memcpy into pinned memory, one non-blocking copy); `tensor.to(device)` from pageable memory blocks the GPU thread and stalls the pre-plan.
 - `SOLVER_STATE` names extra loop-back edges for a multi-step scheduler (wan22's UniPC); `seed_loop_back` supplies iteration 0's values and `denoise` returns them alongside the sample.
 
 ## Multi-stage recipes

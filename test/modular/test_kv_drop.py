@@ -132,8 +132,10 @@ def test_a_drop_keeps_the_sampler_and_starts_positions_and_recurrent_state_over(
     )), EngineResourceInfo(device=CPU))
     sampler = SamplerResource(vocab_size=64, enable_repetion_penalty=True, device=CPU)
     engine = _engine({"kv": kv, "rope": rope, "gdn_state": pool, "sampler": sampler})
-    engine._runner.ingest_request("r", {"sampler": SamplingReqConfig(temperature=1.0, repetition_penalty=1.3)})
-    _prefill(kv, "r", PAGE_SIZE)
+    engine._runner.ingest_request("r", {
+        "sampler": SamplingReqConfig(temperature=1.0, repetition_penalty=1.3), "kv": _config(list(range(PAGE_SIZE))),
+    })
+    _write(kv, "r", PAGE_SIZE)
     rope._counters["r"]["main"] = PAGE_SIZE
     slot = pool._alloc("r", "main")
     pool._blocks["state"][:, slot.index] = 1.0

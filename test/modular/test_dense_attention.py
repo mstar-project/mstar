@@ -243,10 +243,11 @@ class TestBackendSelection:
             config=AttentionConfig(kv_cache="kv", backend=AttnBackend.DENSE),
         )
         assert spec.depends_on() == {"kv"}
+        device = torch.device("cpu")
         manager = AttentionManager.build(
             spec,
             EngineResourceInfo(
-                device=torch.device("cpu"),
+                device=device,
                 dependencies={
                     "kv": KVSpec(
                         resource_key="kv", nodes={"llm"}, config=_kv_config(),
@@ -255,7 +256,7 @@ class TestBackendSelection:
             ),
         )
         expected = (
-            DenseAttentionManager if _fa3_unavailable_reason() is None
+            DenseAttentionManager if _fa3_unavailable_reason(device) is None
             else FlashInferManager
         )
         assert isinstance(manager, expected)
