@@ -258,7 +258,8 @@ def handoff_md(h, pr, head, mode):
 
 def partial_md(h):
     """The part of the handoff the "didn't complete" comment shows: the inline comments that
-    posted. The notes stay in the handoff, since they list unverified leads."""
+    posted. The notes list unverified leads, so they stay out of the PR conversation (the
+    handoff artifact can be downloaded, though)."""
     made = [c for c in h["comments"] if c["status"] == "posted"]
     if not made:
         return ""
