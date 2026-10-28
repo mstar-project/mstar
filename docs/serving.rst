@@ -542,9 +542,13 @@ Inductor keys its entries on the torch and Triton builds and, on CUDA and ROCm, 
 model and CUDA or HIP version, so changing any of those recompiles. It doesn't key on the
 ``ptxas`` that built a kernel or on the driver: after changing either, delete the cache or
 set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value. On other backends (XPU) the key
-has no GPU model, so give each GPU model its own cache there. If home is on a network filesystem shared by
-concurrent jobs, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local path and copy a warm
-cache in at job start.
+has no GPU model, so give each GPU model its own cache there.
+
+The default trades torch's node-local ``/tmp`` for home. Nothing prunes the cache, and every
+upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which costs only the
+next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
+concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
+path and copy a warm cache in at job start.
 
 .. _tensor-transport:
 
