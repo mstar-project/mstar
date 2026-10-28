@@ -1,24 +1,25 @@
 import logging
 import os
-from pathlib import Path
+
+from mstar.utils.cache_home import user_cache_dir
 
 
 def _default_compile_cache() -> None:
     """Keep Inductor's cache (compiled graphs, autotune picks, Triton kernels)
     under ``~/.cache`` beside the weights and FlashInfer's JIT cache, rather
     than torch's ``/tmp/torchinductor_<user>``, so a restart that keeps
-    ``~/.cache`` starts warm.
+    ``~/.cache`` starts warm. Importing this package creates the directory.
 
     Must run before anything imports ``torch._dynamo``, which writes torch's
-    own default into the environment. An exported value wins, and a home that
-    can't be written keeps torch's default.
+    own default into the environment. An exported value wins, and without a
+    writable home torch's default stays.
     """
     if os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
         return
-    path = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "mstar" / "torchinductor"
     try:
+        path = user_cache_dir() / "mstar" / "torchinductor"
         path.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    except (OSError, RuntimeError):
         return
     if os.access(path, os.W_OK):
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(path)
