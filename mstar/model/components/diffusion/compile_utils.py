@@ -9,7 +9,7 @@ model never imports a sibling model.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import torch
 from torch import nn
@@ -98,3 +98,24 @@ def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: boo
             return compiled(*args, **kwargs)
 
     return forward
+
+
+def compile_blocks(blocks: Iterable[nn.Module], *, autotune: bool = False, **compile_kwargs) -> None:
+    """Compile each block's forward in place, rounding every intermediate where
+    eager does (``emulate_precision_casts``): by default under Inductor's
+    defaults in its deterministic mode, so every process compiles the same
+    kernels; with ``autotune`` under the -O level's options, whose kernel picks
+    are per process. ``compile_kwargs`` go to ``torch.compile`` (static shapes
+    and no full graph unless overridden). For a transformer whose blocks keep
+    an eager call in the middle (a cache write, a ragged attention), so each
+    block traces into graphs around it once.
+    """
+    if autotune:
+        from mstar.engine.accelerator_graph_runner import compile_kwargs as level_kwargs
+
+        compile_kwargs = {**level_kwargs(None), **compile_kwargs}
+    compile_kwargs = {"fullgraph": False, "dynamic": False, **compile_kwargs}
+    for block in blocks:
+        block.forward = with_inductor_rounding(
+            torch.compile(block.forward, **compile_kwargs), eager_rounding=True, deterministic=not autotune,
+        )

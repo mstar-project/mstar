@@ -121,7 +121,7 @@ def main():
     report["no_window_vs_oracle"] = [stats(x, ref_latents[:, k * cs:(k + 1) * cs]) for k, x in enumerate(lat_full)]
 
     def decode_all(vae_dtype_fp32: bool, channels_last: bool):
-        cfg.vae_decode_fp32 = vae_dtype_fp32
+        sub._decode_dtype = torch.float32 if vae_dtype_fp32 else torch.bfloat16
         vae = model._load_vae().to(DEVICE)
         if not vae_dtype_fp32:
             vae = vae.to(torch.bfloat16)
@@ -146,7 +146,7 @@ def main():
     report["decode_fp32_contiguous"] = decode_all(True, False)
     report["decode_fp32_channels_last"] = decode_all(True, True)
     report["decode_bf16_channels_last"] = decode_all(False, True)
-    cfg.vae_decode_fp32 = True
+    sub._decode_dtype = torch.float32
 
     (out / "controls.json").write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report, indent=2, default=str))

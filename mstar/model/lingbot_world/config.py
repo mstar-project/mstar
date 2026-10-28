@@ -71,35 +71,28 @@ class LingBotWorldConfig:
     video_fps: int = 16
     max_chunks: int = 255  # rollout ceiling, inside rope_max_frames
 
-    # True: both DiT attentions run the reference's FlashAttention-2 varlen
-    # (needs flash-attn), bit-identical to the reference. False: the engine's
-    # ragged attention resource, whose backend the deployment picks (AUTO is
-    # FlashInfer's prefill, the cutlass FMHA on Blackwell).
-    reference_attention: bool = False
-    # Compile each DiT block (Inductor's defaults in its deterministic mode,
-    # eager rounding); the attentions and the cache writes stay eager.
-    dit_compile: bool = True
-    # Compile the blocks at the -O level's options instead: 35.4 -> 37.1 fps
-    # served at 464x832 on a B300 (-O2), but each server process picks its own
-    # kernels, so one seed gives a different rollout per process.
+    # True: the reference's numerics, with which a rollout is bit-identical to
+    # the reference's: both DiT attentions on FlashAttention-2 varlen (needs
+    # flash-attn), an eager DiT, and the fp32 contiguous eager VAE encode and
+    # decode. False: the engine's ragged attention resource (its backend is the
+    # deployment's; AUTO is FlashInfer's prefill, the cutlass FMHA on
+    # Blackwell), each DiT block compiled (Inductor's deterministic mode, eager
+    # rounding; the attentions and the cache writes stay eager), the fp32
+    # encode channels-last (187 -> 140 ms per chunk on a B300 at 464x832 for
+    # the first ~8 chunks, after which the black-frame encode is cached; the
+    # latents within 0.0023 of the contiguous encode's), and the decode
+    # channels-last, compiled and bf16 where cuDNN >= 9.16 has fast bf16
+    # conv3d (291 -> 77 ms per 16-frame chunk, frames 51 dB from the fp32
+    # decode of the same latents; fp32 channels-last compiled, the pick under
+    # an older cuDNN, 135 ms at 71 dB). Nothing in the rollout reads the
+    # decoded frames, so the decode's error stays per frame. The compiles are
+    # per output size; the default size is compiled at load.
+    reference_numerics: bool = False
+    # Compile the blocks at the -O level's options instead of Inductor's
+    # deterministic defaults: 35.4 -> 37.1 fps served at 464x832 on a B300
+    # (-O2), but each server process picks its own kernels, so one seed gives
+    # a different rollout per process. No effect under reference_numerics.
     dit_compile_autotune: bool = False
-
-    # The condition encode stays fp32, as the reference's; channels-last runs
-    # its convs without layout conversions: 187 -> 140 ms per chunk on a B300
-    # at 464x832 for the first ~8 chunks (after that the black-frame encode is
-    # cached), the latents within 0.0023 of the contiguous encode's.
-    vae_encode_channels_last: bool = True
-
-    # The decode's precision, layout and compile; each settable in model_kwargs.
-    # The reference decodes fp32, contiguous and eager: 291 ms per 16-frame chunk
-    # at 464x832 on a B300. bf16 channels-last compiled (Inductor's deterministic
-    # mode) takes 77 ms, frames 51 dB from the reference decode of the same
-    # latents; fp32 channels-last compiled 135 ms at 71 dB. Nothing in the
-    # rollout reads the decoded frames, so this error stays per frame. The
-    # compile is per output size; the default size is compiled at load.
-    vae_decode_fp32: bool = False
-    vae_decode_channels_last: bool = True
-    vae_decode_compile: bool = True
 
     @property
     def head_dim(self) -> int:

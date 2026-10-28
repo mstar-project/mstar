@@ -24,7 +24,8 @@ whose step pairs the chunk's queries with its K/V window and with the text.
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
-encode runs fp32 as the reference does; the decode runs bf16 unless ``vae_decode_fp32``.
+encode runs fp32 as the reference does; the decode runs bf16 (cuDNN >= 9.16)
+unless ``reference_numerics``.
 """
 
 import functools
@@ -202,21 +203,30 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         self.encoder_vae = encoder_vae
         self.config = config
         self.schedule = make_fast_schedule(config.sample_shift, config.timesteps_index, config.num_train_timesteps)
-        if encoder_vae is not None and config.vae_encode_channels_last:
+        fast = not config.reference_numerics
+        self._decode_dtype = torch.float32
+        if encoder_vae is not None and fast:
             wan_vae.encoder_to_channels_last(encoder_vae)
-        if vae is not None and not config.vae_decode_fp32:
-            # the latents are cast to bf16 for the decode
-            vae.to(torch.bfloat16)
-        if vae is not None and config.vae_decode_channels_last:
+        if vae is not None and fast:
+            # cuDNN has fast bf16 conv3d from 9.16; before that bf16 is slower than fp32
+            cudnn = torch.backends.cudnn.version() or 0
+            if cudnn >= 91600:
+                self._decode_dtype = torch.bfloat16
+                vae.to(torch.bfloat16)
+            else:
+                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)", cudnn)
             wan_vae.to_channels_last(vae)
-        self._decode_step = (
-            wan_vae.DecoderStep(vae, compile=config.vae_decode_compile, deterministic=True)
-            if vae is not None else None
-        )
-        if vae is not None and config.vae_decode_compile:
-            for lat_hw in warmup_latent_sizes:
-                self.warmup_decode(lat_hw)
-        if dit is not None and config.dit_compile:
+        self._decode_step = wan_vae.DecoderStep(vae, compile=fast, deterministic=True) if vae is not None else None
+        if vae is not None:
+            # the de-normalize's constants, fp32 on the decoder's device
+            device = next(vae.parameters()).device
+            shape = (1, config.vae_z_dim, 1, 1, 1)
+            self._latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(shape)
+            self._latents_inv_std = 1.0 / torch.tensor(vae.config.latents_std, device=device).view(shape)
+            if fast:
+                for lat_hw in warmup_latent_sizes:
+                    self.warmup_decode(lat_hw)
+        if dit is not None and fast:
             dit.compile_blocks(autotune=config.dit_compile_autotune)
             for lat_hw in warmup_latent_sizes:
                 self.warmup_dit(lat_hw)
@@ -230,11 +240,15 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         self._attention = None
 
     def attention(self) -> DitAttention:
-        """The DiT's attentions through ``DIT_ATTN`` when the engine bound it,
-        else the reference's FA2 (``reference_attention``, the parity harness)."""
+        """The DiT's attentions through ``DIT_ATTN``, or the reference's FA2
+        under ``reference_numerics`` (the parity harness binds no resource)."""
         if self._attention is None:
             resource = self.node_resources.get(DIT_ATTN)
             if resource is None:
+                if not self.config.reference_numerics:
+                    raise RuntimeError(
+                        f"LingBot dit: no {DIT_ATTN} resource is bound; only reference_numerics attends without one"
+                    )
                 self._attention = REFERENCE_ATTENTION
             else:
                 def on(kv_label):
@@ -356,7 +370,8 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         state.add("chunk", chunk + 1)
         if self.keep_chunk_outputs:
             state.add_all(chunk_latents=x0.clone(), chunk_pixels=pixels.clone(), chunk_condition=y.clone())
-        frames_u8 = (pixels[0] / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).permute(1, 2, 3, 0).contiguous()
+        # quantize from fp32; a bf16 decode's frames round once, here
+        frames_u8 = (pixels[0].float() / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).permute(1, 2, 3, 0).contiguous()
         return {
             "clock": [torch.full((1,), chunk + 1, dtype=torch.int64, device=device)],
             "video_output": [frames_u8],
@@ -380,7 +395,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             latents = zeros(cfg.out_dim, cfg.chunk_size, lat_h, lat_w)
             text = zeros(cfg.text_len, cfg.text_dim, dtype=torch.bfloat16)
             condition = zeros(cfg.in_dim - cfg.out_dim, cfg.chunk_size, lat_h, lat_w)
-            if cfg.reference_attention:
+            if cfg.reference_numerics:
                 attention = REFERENCE_ATTENTION
             else:
                 attend = functools.partial(joint_attention, ragged=_warmup_ragged)
@@ -401,12 +416,8 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     def _decode(self, latents: torch.Tensor, state, clip_start: bool) -> torch.Tensor:
         """``[1, 3, frames, H, W]`` in [-1, 1]: the chunk decoded as the
         continuation of the request's stream."""
-        cfg = self.config
-        dtype = torch.float32 if cfg.vae_decode_fp32 else torch.bfloat16
-        z = latents[None].to(dtype)
-        mean = torch.tensor(self.vae.config.latents_mean).view(1, cfg.vae_z_dim, 1, 1, 1).to(z)
-        inv_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, cfg.vae_z_dim, 1, 1, 1).to(z)
-        z = z / inv_std + mean
+        # the de-normalize in fp32 whatever the decode's dtype
+        z = (latents[None].float() / self._latents_inv_std + self._latents_mean).to(self._decode_dtype)
         with torch.amp.autocast("cuda", enabled=False):
             return wan_vae.decode_causal(
                 self.vae, z, state["feat_cache"], self._decode_step, clip_start=clip_start, latents_per_call=1,

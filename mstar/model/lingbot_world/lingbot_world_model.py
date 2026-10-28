@@ -50,18 +50,11 @@ from mstar.model.submodule_base import NodeSubmodule
 logger = logging.getLogger(__name__)
 
 # LingBotWorldConfig switches a deployment sets in model_kwargs
-_CONFIG_KWARGS = (
-    "reference_attention", "dit_compile", "dit_compile_autotune", "vae_encode_channels_last", "vae_decode_fp32",
-    "vae_decode_channels_last", "vae_decode_compile",
-)
+_CONFIG_KWARGS = ("reference_numerics", "dit_compile_autotune")
 
-# The switches set to the reference's numerics: FA2 attention, an eager DiT, the contiguous encode and the
-# fp32, contiguous, eager decode, with which the rollout is bit-identical to the reference's
-# (test/lingbot_world/run_parity.py).
-REFERENCE_MODEL_KWARGS = {
-    "reference_attention": True, "dit_compile": False, "vae_encode_channels_last": False, "vae_decode_fp32": True,
-    "vae_decode_channels_last": False, "vae_decode_compile": False,
-}
+# The reference's numerics: FA2 attention, an eager DiT, the fp32 contiguous eager encode and decode, with which
+# the rollout is bit-identical to the reference's (test/lingbot_world/run_parity.py).
+REFERENCE_MODEL_KWARGS = {"reference_numerics": True}
 
 ENCODE_TEXT_WALK = "encode_text"
 _SCHEDULE = (ENCODE_TEXT_WALK, ROLLOUT_WALK)
@@ -87,6 +80,10 @@ class LingBotWorldModel(Model):
                 if not isinstance(value, bool):
                     raise ValueError(f"LingBot-World {name} must be true or false, got {value!r}.")
                 setattr(self.config, name, value)
+        if kwargs:
+            raise ValueError(
+                f"LingBot-World takes no model_kwargs {sorted(kwargs)}; its switches are {', '.join(_CONFIG_KWARGS)}."
+            )
         self.model_path_hf = model_path_hf or LINGBOT_HF_REPOS[variant]
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
@@ -98,7 +95,7 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        if self.config.reference_attention:
+        if self.config.reference_numerics:
             return []
         cfg = self.config
         return [RaggedCrossAttentionSpec(
@@ -407,7 +404,7 @@ class LingBotWorldModel(Model):
             from mstar.model.lingbot_world.components.dit import require_flash_attn
             from mstar.model.lingbot_world.weight_loader import build_lingbot_dit
 
-            if self.config.reference_attention:
+            if self.config.reference_numerics:
                 require_flash_attn()
             dit = build_lingbot_dit(self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir)
             cfg = self.config
@@ -420,8 +417,8 @@ class LingBotWorldModel(Model):
         return None
 
     def _load_vae(self) -> torch.nn.Module:
-        """A fresh fp32 Wan2.1 VAE per use: the decoder casts its copy to bf16
-        unless ``vae_decode_fp32``, which the encoder must not see."""
+        """A fresh fp32 Wan2.1 VAE per use: the decoder makes its copy bf16 and
+        channels-last unless ``reference_numerics``, which the encoder must not see."""
         from diffusers import AutoencoderKLWan
 
         return AutoencoderKLWan.from_pretrained(

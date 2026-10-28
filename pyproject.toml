@@ -327,11 +327,13 @@ lingbot_world = [
     # UMT5 and the Wan2.1 VAE load through transformers / diffusers (see [wan22]);
     # scipy resamples the camera trajectory (Slerp) as the reference does;
     # ftfy and regex clean the prompt as the reference's T5 tokenizer does.
-    # flash-attn (FA2 varlen, what the reference attends with) is installed
+    # The engine's ragged attention runs on FlashInfer; flash-attn (FA2 varlen,
+    # what the reference attends with under reference_numerics) is installed
     # separately, see docs/installation.rst.
     "accelerate",
     "diffusers>=0.39",
     "einops",
+    "flashinfer-python>=0.6.14",
     "ftfy",
     "huggingface-hub",
     "regex",

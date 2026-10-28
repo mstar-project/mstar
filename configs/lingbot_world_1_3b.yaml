@@ -5,18 +5,16 @@ model: "lingbot_world_1_3b"
 # the UMT5 text length.
 max_seq_len: 512
 
-# Numerics switches (model_kwargs), shown at their defaults. The reference's are
-# reference_attention: true (FA2, needs flash-attn), an eager DiT, the contiguous
-# encode and the fp32, contiguous, eager decode; with all of them the rollout is
-# bit-identical to the reference's. The compiled DiT and decode are compiled at
-# load for 464x832, the output size of a 480x832 image (LingBotWorldModel.geometry).
+# Numerics (model_kwargs), shown at their defaults. reference_numerics: true runs
+# the reference's: FA2 attention (needs flash-attn), an eager DiT, the fp32
+# contiguous encode and decode, with which the rollout is bit-identical to the
+# reference's. The default runs the engine's ragged attention, compiled DiT
+# blocks, a channels-last encode and a bf16 (cuDNN >= 9.16), channels-last,
+# compiled decode; the compiles happen at load for 464x832, the output size of
+# a 480x832 image (LingBotWorldModel.geometry).
 # model_kwargs:
-#   reference_attention: false
-#   dit_compile: true
-#   vae_encode_channels_last: true
-#   vae_decode_fp32: false
-#   vae_decode_channels_last: true
-#   vae_decode_compile: true
+#   reference_numerics: false
+#   dit_compile_autotune: false
 
 # One rollout per GPU: the dense K/V and the VAE caches are per request, so the
 # model refuses any other value (LingBotWorldModel.validate_config_yaml).

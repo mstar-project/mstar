@@ -441,7 +441,7 @@ def test_the_text_encoder_runs_eager_attention_as_the_reference_t5(monkeypatch):
     assert seen["attn_implementation"] == "eager"
 
 
-def test_the_reference_attention_dit_fails_to_build_without_flash_attn(monkeypatch):
+def test_the_reference_numerics_dit_fails_to_build_without_flash_attn(monkeypatch):
     """Not the first request: with flash-attn missing the server must not
     come up healthy and then fail every request."""
     from mstar.model.lingbot_world import weight_loader
@@ -452,7 +452,7 @@ def test_the_reference_attention_dit_fails_to_build_without_flash_attn(monkeypat
     monkeypatch.setitem(sys.modules, "flash_attn", None)
     monkeypatch.setattr(weight_loader, "build_lingbot_dit", no_weights)
     with pytest.raises(ImportError, match="install flash-attn"):
-        LingBotWorldModel(reference_attention=True).get_submodule("dit")
+        LingBotWorldModel(reference_numerics=True).get_submodule("dit")
 
 
 def test_the_engine_attention_dit_builds_without_flash_attn(monkeypatch):
@@ -476,11 +476,10 @@ def test_the_dit_declares_one_ragged_cross_attention(model):
     assert spec.resource_key == DIT_ATTN and spec.nodes == {"dit"}
     assert (spec.config.num_qo_heads, spec.config.num_kv_heads, spec.config.head_dim) == (12, 12, 128)
     assert spec.config.dtype == torch.bfloat16
-    assert LingBotWorldModel(skip_weight_loading=True, reference_attention=True).get_node_resources() == []
+    assert LingBotWorldModel(skip_weight_loading=True, reference_numerics=True).get_node_resources() == []
 
 
-SWITCHES = ("reference_attention", "dit_compile", "dit_compile_autotune", "vae_encode_channels_last",
-            "vae_decode_fp32", "vae_decode_channels_last", "vae_decode_compile")
+SWITCHES = ("reference_numerics", "dit_compile_autotune")
 
 
 @pytest.mark.parametrize("name", SWITCHES)
@@ -493,13 +492,19 @@ def test_a_model_kwargs_switch_must_be_a_bool(name, value):
 
 def test_model_kwargs_switches_set_the_config():
     default = LingBotWorldModel(skip_weight_loading=True).config
-    assert [getattr(default, n) for n in SWITCHES] == [False, True, False, True, False, True, True]
+    assert [getattr(default, n) for n in SWITCHES] == [False, False]
     for name in SWITCHES:
         flipped = LingBotWorldModel(skip_weight_loading=True, **{name: not getattr(default, name)}).config
         assert getattr(flipped, name) is not getattr(default, name)
         assert all(getattr(flipped, n) is getattr(default, n) for n in SWITCHES if n != name)
     reference = LingBotWorldModel(skip_weight_loading=True, **REFERENCE_MODEL_KWARGS).config
-    assert [getattr(reference, n) for n in SWITCHES] == [True, False, False, False, True, False, False]
+    assert [getattr(reference, n) for n in SWITCHES] == [True, False]
+
+
+def test_an_unknown_model_kwarg_is_refused():
+    """A switch this one replaced, or a typo, fails at load instead of serving the default."""
+    with pytest.raises(ValueError, match="vae_decode_fp32"):
+        LingBotWorldModel(skip_weight_loading=True, vae_decode_fp32=True)
 
 
 def _bare_dit_submodule(model, resources):
@@ -524,10 +529,13 @@ def test_a_chunks_step_pairs_its_queries_with_its_window_and_the_text(model):
     assert step.pairs == (("chunk", "window"), ("chunk", "text"))
 
 
-def test_without_the_resource_the_dit_runs_the_reference_attention(model):
+def test_without_the_resource_only_the_reference_numerics_attend(model):
     sub = _bare_dit_submodule(model, {})
-    assert sub.attention() is REFERENCE_ATTENTION
+    with pytest.raises(RuntimeError, match=DIT_ATTN):
+        sub.attention()  # a silent FA2 fallback would hide a deployment without the resource
     assert sub.declare_step(ROLLOUT_WALK, ["r"], [NodeInputs(resource_step_info=ChunkSpans(1, 1, 1))]) is None
+    reference = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True, reference_numerics=True), {})
+    assert reference.attention() is REFERENCE_ATTENTION
 
 
 def test_the_engine_attention_binds_both_pairs(model):

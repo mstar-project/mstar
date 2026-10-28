@@ -61,7 +61,7 @@ def require_flash_attn() -> None:
         raise ImportError(
             "LingBot-World's reference attention is FlashAttention-2 (flash_attn_varlen_func), as the "
             "reference runs; install flash-attn (docs/installation.rst, 'flash-attn (Qwen3-Omni, "
-            "LingBot-World)') or serve without reference_attention."
+            "LingBot-World)') or serve without reference_numerics."
         ) from e
 
 
@@ -418,25 +418,14 @@ class LingBotCausalDiT(nn.Module):
         self._freqs: dict[torch.device, torch.Tensor] = {}
 
     def compile_blocks(self, autotune: bool = False, **compile_kwargs) -> None:
-        """Compile each block's forward in place, rounding every intermediate
-        where eager does (``emulate_precision_casts``): by default Inductor's
-        defaults in its deterministic mode, so every process compiles the same
-        kernels; with ``autotune`` the -O level's options, whose kernel picks
-        are per process. The cache write and window attention (``ChunkWindow``)
-        and a ragged text attention stay eager, so a block traces once for
-        every chunk; the reference's text attention (``REFERENCE_ATTENTION``)
-        is not disabled and compiles with the block."""
-        from mstar.model.components.diffusion.compile_utils import with_inductor_rounding
+        """Compile each block's forward in place (``compile_utils.compile_blocks``:
+        deterministic unless ``autotune``). The cache write and window attention
+        (``ChunkWindow``) and a ragged text attention stay eager, so a block
+        traces once for every chunk; the reference's text attention
+        (``REFERENCE_ATTENTION``) is not disabled and compiles with the block."""
+        from mstar.model.components.diffusion.compile_utils import compile_blocks
 
-        if autotune:
-            from mstar.engine.accelerator_graph_runner import compile_kwargs as level_kwargs
-
-            compile_kwargs = {**level_kwargs(None), **compile_kwargs}
-        compile_kwargs = {"fullgraph": False, "dynamic": False, **compile_kwargs}
-        for block in self.blocks:
-            block.forward = with_inductor_rounding(
-                torch.compile(block.forward, **compile_kwargs), eager_rounding=True, deterministic=not autotune,
-            )
+        compile_blocks(self.blocks, autotune=autotune, **compile_kwargs)
 
     def freqs(self, device: torch.device) -> torch.Tensor:
         if device not in self._freqs:
