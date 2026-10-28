@@ -60,8 +60,8 @@ from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.streaming.topology import ClientStreamLimits, client_stream_limits
 from mstar.utils import profiler
-from mstar.utils.cpus import usable_cpus
 from mstar.utils.client_errors import client_error_text
+from mstar.utils.cpus import usable_cpus
 from mstar.utils.ipc_format import (
     AbortRequest,
     ClientStreamInput,
