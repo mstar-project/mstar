@@ -9,7 +9,6 @@ FlashInfer's one-kernel all-reduce. ``AllReduce.new`` picks one.
 import logging
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -33,26 +32,6 @@ SYMM_DTYPES = (torch.bfloat16, torch.float32)
 # rank then reads the whole message through the switch, so larger ones take
 # the split kernel and a copy out.
 MULTIMEM_ONESHOT_MAX_BYTES = 32 * 1024
-
-
-def _all_ranks_agree(flag: bool, cpu_group) -> bool:
-    """AND ``flag`` across the ranks of ``cpu_group``."""
-    t = torch.tensor([int(flag)])
-    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=cpu_group)
-    return bool(t.item())
-
-
-def flagged_on_any_rank(flags: Sequence[bool], groups: Iterable["CommGroup"]) -> list[bool]:
-    """Per entry, OR ``flags`` across the ranks of each group in ``groups`` in
-    turn: one gloo all-reduce (MAX) each, skipping a group of one rank. Over a
-    TP group and then an SP group, an entry ends up set on every rank of the
-    grid if any rank set it. Every rank passes the same number of entries, in
-    the same order. CPU tensors: it waits on the other ranks, never on a device."""
-    t = torch.tensor(list(flags), dtype=torch.int32)
-    for group in groups:
-        if group.world_size > 1:
-            dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group.cpu_group)
-    return [bool(f) for f in t.tolist()]
 
 
 class AllReduce:
@@ -98,7 +77,7 @@ class AllReduce:
             )
         # every rank or none: one rank on NCCL while its peers wait in the symmetric
         # kernel for its signal deadlocks the first all-reduce
-        if not _all_ranks_agree(backend is not None, group.cpu_group):
+        if not group.agree([int(backend is not None)])[0]:
             if backend is not None:
                 logger.warning("all-reduce %s: another rank could not set it up; using NCCL", mode)
             return AllReduce(group.device_group)
@@ -247,7 +226,7 @@ class FlashInferAllReduce(AllReduce):
         super().__init__(group.device_group)
         self.world_size = group.world_size
         self.ws_id = create_workspace(
-            group.rank, group.world_size, group.cpu_group, 1, max_bytes // 2, torch.bfloat16,
+            group, 1, max_bytes // 2, torch.bfloat16,
         )
         if self.ws_id is None:
             raise RuntimeError("no FlashInfer all-reduce workspace")

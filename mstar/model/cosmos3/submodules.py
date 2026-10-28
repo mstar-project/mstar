@@ -300,10 +300,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
-    def __init__(self, transformer, config, scheduler=None):
+    def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
         super().__init__()
         self.transformer = transformer
         self.config = config
+        # Re-encodes the frames a chained window (or a resumed session)
+        # continues from; built only for deployments serving windowed video.
+        self._window_head = (
+            ChainedWindowHead(head_decode_vae, head_encode_vae, config) if head_decode_vae is not None else None
+        )
         # Template scheduler; a fresh instance (with its own multistep state) is
         # built per request from this one's config.
         self._scheduler_template = scheduler
@@ -781,11 +786,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return node_inputs
 
     def _session_tail(self, session_id: str, units: int, height: int, width: int) -> torch.Tensor:
-        """The stored last-window latents a resumed request pins its head
-        with: the newest ``units`` latent frames, at the request's latent
-        size. Unknown (or evicted) sessions and size mismatches are request
-        errors — silently starting from scratch would break the client's
-        frame accounting."""
+        """The head a resumed request pins: ``units`` latent frames re-encoded
+        from the stored last window's final frames (``ChainedWindowHead``), at
+        the request's latent size. Unknown (or evicted) sessions and size
+        mismatches are request errors — silently starting from scratch would
+        break the client's frame accounting."""
         tail = self._sessions.get(session_id)  # promotes the session
         if tail is None:
             raise ValueError(
@@ -797,7 +802,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 f"Cosmos3 resume_session: session {session_id!r} holds latents of shape "
                 f"{tuple(tail.shape)}, which cannot seed a {height}x{width} window."
             )
-        return tail[:, :, -units:]
+        return self._window_head(tail, units)
 
     def _store_session_tail(self, st, window_latents: torch.Tensor) -> None:
         """The rollout's final window, kept for a ``resume_session`` follow-up
@@ -954,8 +959,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _finish_window(self, st, window_latents, time_index, window_index) -> dict:
         """End of a window: emit the window's clean latents on the streaming
         edge and stage the next window — fresh scheduler, fresh noise, and
-        (chained mode) the finished tail re-pinned as clean overlap
-        conditioning through the same vmask machinery video-to-video uses."""
+        (chained mode) the window's last frames, re-encoded as their own clip
+        (``ChainedWindowHead``), pinned as clean overlap conditioning through
+        the same vmask machinery video-to-video uses."""
         schedule = st["ar_schedule"]
         outputs = {
             "latents": [window_latents],
@@ -982,7 +988,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             shape, generator=st["ar_generator"], device=device, dtype=dtype
         )
         if plan.cond_units > 0:
-            tail = window_latents[:, :, -plan.cond_units:].to(dtype)
+            tail = self._window_head(window_latents, plan.cond_units).to(dtype)
             vmask = torch.zeros((1, 1, plan.units, 1, 1), device=device, dtype=dtype)
             vmask[:, :, :plan.cond_units] = 1.0
             cond_video = torch.zeros(shape, device=device, dtype=dtype)
@@ -1758,7 +1764,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         if not cfg_active:
             velocity, sound_v = self.transformer.denoise_step(
-                latents, vts, st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
+                latents, vts, st["cond"]["gen_position_ids"],
                 st["cond"]["vision_token_shapes"], st["cond"]["vision_noisy_frame_indexes"],
                 st["cond"]["mse_gen_indexes"], COND_LABEL, attn,
                 **self._sound_kwargs(st["cond"], sound_latents, sts),
@@ -1766,8 +1772,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         elif self.batched_cfg:
             (cond_v, s_c), (uncond_v, s_u) = self.transformer.denoise_step_batched_cfg(
                 latents, vts,
-                st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
-                st["uncond"]["position_ids"][:, st["uncond"]["und_len"]:],
+                st["cond"]["gen_position_ids"],
+                st["uncond"]["gen_position_ids"],
                 st["cond"]["vision_token_shapes"],
                 st["cond"]["vision_noisy_frame_indexes"],
                 st["cond"]["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
@@ -1777,13 +1783,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             sound_v = s_u + st["gs"] * (s_c - s_u)
         else:
             cond_v, s_c = self.transformer.denoise_step(
-                latents, vts, st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
+                latents, vts, st["cond"]["gen_position_ids"],
                 st["cond"]["vision_token_shapes"], st["cond"]["vision_noisy_frame_indexes"],
                 st["cond"]["mse_gen_indexes"], COND_LABEL, attn,
                 **self._sound_kwargs(st["cond"], sound_latents, sts),
             )
             uncond_v, s_u = self.transformer.denoise_step(
-                latents, vts, st["uncond"]["position_ids"][:, st["uncond"]["und_len"]:],
+                latents, vts, st["uncond"]["gen_position_ids"],
                 st["uncond"]["vision_token_shapes"], st["uncond"]["vision_noisy_frame_indexes"],
                 st["uncond"]["mse_gen_indexes"], UNCOND_LABEL, attn,
                 **self._sound_kwargs(st["uncond"], sound_latents, sts),
@@ -1806,11 +1812,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         }
 
     def _denoise_action(self, attn, static, latents, action_latents, vts, ats, domain, label):
-        und_len = static["und_len"]
         return self.transformer.denoise_step(
             latents,
             vts,
-            static["position_ids"][:, und_len:],
+            static["gen_position_ids"],
             static["vision_token_shapes"],
             static["vision_noisy_frame_indexes"],
             static["mse_gen_indexes"],
@@ -1873,8 +1878,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             (video_v, action_v), (v_u, a_u) = self.transformer.denoise_step_batched_cfg(
                 latents,
                 vts,
-                st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
-                st["uncond"]["position_ids"][:, st["uncond"]["und_len"]:],
+                st["cond"]["gen_position_ids"],
+                st["uncond"]["gen_position_ids"],
                 st["cond"]["vision_token_shapes"],
                 st["cond"]["vision_noisy_frame_indexes"],
                 st["cond"]["mse_gen_indexes"],
@@ -2055,8 +2060,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             reqs.append({
                 "latents": lat,
                 "vision_timesteps": torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=lat.device),
-                "position_ids_cond": cond["position_ids"][:, cond["und_len"]:],
-                "position_ids_uncond": unc["position_ids"][:, unc["und_len"]:],
+                "position_ids_cond": cond["gen_position_ids"],
+                "position_ids_uncond": unc["gen_position_ids"],
                 "vision_token_shapes": cond["vision_token_shapes"],
                 "vision_noisy_frame_indexes": cond["vision_noisy_frame_indexes"],
                 "vision_mse_loss_indexes": cond["mse_gen_indexes"],
@@ -2108,13 +2113,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # step below.
             t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
             cond = st["cond"]
-            und = cond["und_len"]
             req = {
                 "latents": lat,
                 "action_latents": act,
                 "vision_timesteps": torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=lat.device),
                 "action_timesteps": torch.full((st["cond"]["num_noisy_action_tokens"],), t.item(), device=lat.device),
-                "position_ids_cond": cond["position_ids"][:, und:],
+                "position_ids_cond": cond["gen_position_ids"],
                 "vision_token_shapes": cond["vision_token_shapes"],
                 "vision_noisy_frame_indexes": cond["vision_noisy_frame_indexes"],
                 "vision_mse_loss_indexes": cond["mse_gen_indexes"],
@@ -2125,7 +2129,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             }
             if with_cfg:
                 unc = st["uncond"]
-                req["position_ids_uncond"] = unc["position_ids"][:, unc["und_len"]:]
+                req["position_ids_uncond"] = unc["gen_position_ids"]
             reqs.append(req)
             meta.append((rid, st, lat, act, ti, t))
 
@@ -2187,11 +2191,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             capture_batch_sizes = list(self.gen_capture_batch_sizes)
         dtype = self.transformer.proj_in.weight.dtype
-        # The 2D (TP x SP) captured denoise graph hits a CUDA illegal access at
-        # 480p+ in the combined Ulysses all-gather + TP all-reduce path (pure-TP and
-        # pure-SP capture cleanly; only the combination at this scale). For 2D,
-        # capture only the smallest tier; 480p+ runs eager (correct, just no graph).
-        two_d = self.transformer.sp_group.world_size > 1 and self.transformer.comm_group.world_size > 1
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
         # The capture is bit-faithful at every resolution (the rotary uses a
@@ -2201,8 +2200,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # Capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W).
         max_area = int(os.environ.get(
             "COSMOS3_GRAPH_MAX_LATENT_AREA", self.config.graph_max_latent_area))
-        if two_d:
-            max_area = min(max_area, 1000)  # 256p latent 240 captures; 480p 1560 does not
         # Video tiers (height, width, frames): a plain clip length and/or the
         # windowed rollout's window; one graph per latent shape serves t2v,
         # i2v and chained windows (see ``_capture_key``).
@@ -2389,15 +2386,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         layout = self._capture_layout[tuple(latents.shape[1:])]
         rids = engine_inputs.request_ids
         if latents.shape[0] == 1:
-            # Captured into the denoise CUDA graph. Under SP the Ulysses
-            # exchange must be all-gather (all-to-all is grouped p2p send/recv —
-            # not graph-replayable); the flag holds across warmup/capture/replay
-            # so those kernels compile during eager warmup. No-op without SP.
+            # Captured into the denoise CUDA graph.
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
                 layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
                 layout["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
-                prefer_all_gather=True, noisy_token_mask=noisy_token_mask[0],
+                noisy_token_mask=noisy_token_mask[0],
             )
             return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
         reqs = [
@@ -2615,10 +2609,7 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         if next(vae.parameters()).dtype != torch.float32:
             vae.float()
         device = vision.device
-        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
-            1, -1, 1, 1, 1
-        )
+        mean, inv_std = _latent_affine(vae, torch.float32, device)
         # fp32 outside autocast; pipeline-side latent normalization; the DiT
         # consumes the latents in its bf16 checkpoint dtype.
         with torch.autocast(device_type=device.type, enabled=False):
@@ -2687,6 +2678,67 @@ def _wan_vae():
     return wan_vae
 
 
+def _latent_affine(vae, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pipeline-side latent normalization of ``vae`` as ``[1, C, 1, 1, 1]``
+    tensors: raw latents ``z = latents / inv_std + mean``, DiT latents
+    ``(z - mean) * inv_std``."""
+    mean = torch.tensor(vae.config.latents_mean, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+    inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=dtype, device=device)).view(1, -1, 1, 1, 1)
+    return mean, inv_std
+
+
+def _vae_decode_dtype() -> torch.dtype:
+    # cuDNN ships fast Hopper bf16 conv3d for the Wan-VAE decode only from
+    # 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
+    # single-variable cuDNN swap), so gate on the live version — an upgrade
+    # flips it automatically. COSMOS3_VAE_DECODE_FP32 overrides.
+    override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
+    if override is not None:
+        return torch.float32 if override.lower() not in ("0", "false", "no", "off") else torch.bfloat16
+    ver = torch.backends.cudnn.version() or 0
+    return torch.bfloat16 if ver >= 91600 else torch.float32
+
+
+class ChainedWindowHead:
+    """The clean head of a window that continues earlier frames: a chained
+    window's overlap, or a resumed session's first window.
+
+    The checkpoint was trained on clips whose first latent frame encodes one
+    pixel frame alone and every later one the four frames after it, so a
+    finished window's tail latents (mid-stream latents) are not what a
+    window's first positions expect; pinned there, the rollout washes out
+    within a few windows. Like the reference's video-to-video conditioning,
+    the head is the last ``1 + (units - 1) * tf`` frames, decoded to 8 bits
+    and encoded again as a clip of their own. The decode is the whole-clip
+    decode the ``vae_decoder`` node runs (compiled, channels-last, the
+    cuDNN-gated dtype, the frames quantized as served), behind
+    ``chained_head_context_latents`` latents of the same window so the causal
+    decoder is warm at the kept frames; the encode runs fp32 like the encoder
+    node's. Both VAEs are the model's shared copies when the nodes share a
+    process. Held outside the module tree, so the engine's casts of the DiT
+    never reach them.
+    """
+
+    def __init__(self, decode_vae, encode_vae, config):
+        self.decoder = Cosmos3VAEDecoderSubmodule(decode_vae, config, channels_last=config.vae_decode_channels_last)
+        self.encode_vae = encode_vae
+        self.config = config
+
+    def __call__(self, window_latents: torch.Tensor, units: int) -> torch.Tensor:
+        # at least one: a clip's latent 0 is a clip start, a mid-stream latent is not
+        ctx = max(1, int(self.config.chained_head_context_latents))
+        z = window_latents[:, :, -min(window_latents.shape[2], units + ctx):]
+        frames = 1 + (units - 1) * self.config.vae.scale_factor_temporal
+        pixels = self.decoder._decode_pixels(z)[:, :, -frames:]
+        vae = self.encode_vae
+        if next(vae.parameters()).dtype != torch.float32:
+            vae.float()
+        mean, inv_std = _latent_affine(vae, torch.float32, z.device)
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            raw_mu = vae.encode(pixels.to(torch.float32) / 127.5 - 1).latent_dist.mode()
+        return ((raw_mu - mean) * inv_std).to(window_latents.dtype)
+
+
 class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     """Wan VAE decode node: final denoised latents -> pixel frames.
 
@@ -2698,12 +2750,17 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     # speedup path.
     disable_torch_compile = True
 
-    def __init__(self, vae, config):
+    def __init__(self, vae, config, channels_last: bool = False):
         super().__init__()
         self.vae = vae
         self.config = config
         self._decode_dtype_cached = None
-        self._channels_last = False
+        # Channels-last weights and activations (cuDNN's native conv3d layout),
+        # converted in place before any compile traces the decode; only the
+        # instance given here is converted (see Cosmos3Model).
+        self._channels_last = vae is not None and channels_last
+        if self._channels_last:
+            _wan_vae().to_channels_last(vae)
         # The decode is 3D-conv bound, one-shot per request at request-specific
         # shapes, and not graph-captured; torch.compile fuses its pointwise
         # epilogues (~20-30% off the 189-frame video decode, neutral for
@@ -2727,19 +2784,9 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
 
     def _decode_dtype(self):
-        # cuDNN ships fast Hopper bf16 conv3d for the Wan-VAE decode only from
-        # 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
-        # single-variable cuDNN swap), so gate on the live version — an upgrade
-        # flips it automatically. COSMOS3_VAE_DECODE_FP32 overrides.
         if self._decode_dtype_cached is not None:
             return self._decode_dtype_cached
-        override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
-        if override is not None:
-            on = override.lower() not in ("0", "false", "no", "off")
-            self._decode_dtype_cached = torch.float32 if on else torch.bfloat16
-        else:
-            ver = torch.backends.cudnn.version() or 0
-            self._decode_dtype_cached = torch.bfloat16 if ver >= 91600 else torch.float32
+        self._decode_dtype_cached = _vae_decode_dtype()
         logger.info("Cosmos3 VAE decode dtype = %s (cuDNN %s)",
                     self._decode_dtype_cached, torch.backends.cudnn.version())
         return self._decode_dtype_cached
@@ -2750,10 +2797,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         vae_dtype = self._decode_dtype()
         if next(vae.parameters()).dtype != vae_dtype:
             vae = vae.to(vae_dtype)
-        mean = torch.tensor(vae.config.latents_mean, dtype=vae_dtype, device=latents.device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae_dtype, device=latents.device)).view(
-            1, -1, 1, 1, 1
-        )
+        mean, inv_std = _latent_affine(vae, vae_dtype, latents.device)
         # Force z to the VAE dtype: the engine's outer autocast promotes the
         # `1.0 / std` division to fp32, and a fp32 z into the autocast-off bf16
         # conv3d fails ("Input type (float) and bias type (BFloat16)"). No-op
@@ -2836,18 +2880,13 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     """
 
     def __init__(self, vae, config):
-        super().__init__(vae, config)
+        super().__init__(vae, config, channels_last=config.vae_decode_channels_last)
         # Per-session decode context (the latents behind a session's last
         # frames), so a resumed rollout's first window decodes seamlessly.
         # Same store as the DiT's, so the two age their sessions alike.
         self._sessions = SessionStore(
             config.session_store_size, config.session_timeout_s, config.session_timeout_max_s,
         )
-        # Before any compile traces the decode; only this node's VAE instance
-        # is converted (see Cosmos3Model).
-        if vae is not None and config.vae_decode_channels_last:
-            _wan_vae().to_channels_last(vae)
-            self._channels_last = True
         self._warm_enabled = vae is not None and bool(config.windowed_decode_warm_cache)
         self._step = _wan_vae().DecoderStep(vae, compile=self._decode_compiled) if self._warm_enabled else None
 

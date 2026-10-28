@@ -492,6 +492,17 @@ def load_generation_defaults(
     return out
 
 
+def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -> None:
+    """Finalize kernel layouts across a freshly loaded module tree: any submodule exposing
+    ``process_weights_after_loading(device)`` gets it called (the attention layers build
+    their absorbed w_kc/w_vc here).
+    """
+    for module in root.modules():
+        hook = getattr(module, "process_weights_after_loading", None)
+        if callable(hook):
+            hook(device)
+
+
 # The 25 European languages of NVIDIA's Granary-trained speech checkpoints
 # (canary-1b-v2, parakeet-tdt-0.6b-v3).
 GRANARY_LANGUAGES = (

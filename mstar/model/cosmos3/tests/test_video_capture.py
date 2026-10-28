@@ -114,6 +114,8 @@ def test_postprocess_captured_video_step(monkeypatch) -> None:
     sub = Cosmos3DiTSubmodule(
         transformer=_fake_transformer(), config=Cosmos3Config(compile_denoise=False), scheduler=None,
     )
+    # No VAE here: the next window's head is the raw tail (test_windowed pins the real head).
+    sub._window_head = lambda w, units: w[:, :, -units:]
     ch = sub.config.latent_channel
     sched = SimpleNamespace(timesteps=torch.tensor([900.0, 500.0]),
                             step=lambda v, t, lat, return_dict=False: (lat - v,))
