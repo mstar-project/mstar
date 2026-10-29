@@ -60,6 +60,7 @@ from mstar.communication.tensors import (
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.utils.containers import ParallelList
+from mstar.utils.host_copy import copy_into
 
 logger = logging.getLogger(__name__)
 
@@ -973,10 +974,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         view = self._peer_view(info.shm_segment)
         start = info.shm_offset + info.offset  # offset = TP-shard read offset
         if self.device == "cpu":
-            # A CPU consumer owns a copy past reclaim. numpy copies with one
-            # memcpy; clone() would split it over torch's intra-op pool.
-            flat = torch.from_numpy(np.frombuffer(
-                view, dtype=np.uint8, count=info.nbytes, offset=start).copy())
+            # A CPU consumer owns a copy past reclaim. clone() would split it
+            # over torch's intra-op pool, sized for small ops; copy_into is one
+            # memcpy for those and a few threads of its own for a video.
+            src = np.frombuffer(view, dtype=np.uint8, count=info.nbytes, offset=start)
+            flat = torch.from_numpy(copy_into(np.empty_like(src), src))
             return flat.view(info.dtype).reshape(info.dims)
         flat = torch.frombuffer(
             view[start:start + info.nbytes], dtype=torch.uint8)

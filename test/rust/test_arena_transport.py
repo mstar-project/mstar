@@ -899,10 +899,16 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
 
 
+@pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.bool])
-def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, dtype):
+def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, parallel):
     """A CPU consumer's tensor is a copy: the producer reclaiming the slot and
-    staging another tensor into it must not change what was read."""
+    staging another tensor into it must not change what was read. ``parallel``
+    takes copy_into's sliced path, which a video read uses."""
+    if parallel:
+        from mstar.utils import host_copy
+
+        monkeypatch.setattr(host_copy, "PARALLEL_COPY_BYTES", 0)
     prod = _manager("w0", tmp_path)
     cons = _manager("w1", tmp_path)
     original = (torch.arange(3 * 16 * 24) % 7 == 3) if dtype == torch.bool else (
