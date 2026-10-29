@@ -9,17 +9,20 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 from __future__ import annotations
 
 import base64
+from time import perf_counter
 
 from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.utils.profiler import PHASE_PERIOD, hop_stamp
 from mstar.utils.utf8_stream import Utf8Stream
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
+    t_in = perf_counter()
     args = adapter.chat_to_request(req, api.upload_dir)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
@@ -35,11 +38,14 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             streaming=bool(req.stream),
             request_id=request_id,
         )
+        key = api.submission_key(request_id) if PHASE_PERIOD else None
+        if key is not None:
+            hop_stamp(key, "api.http_in", t_in)
         if req.stream:
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)
             return ReleasingStreamingResponse(
-                _stream_events(batches, model_name, request_id, sample_rate),
+                _stream_events(batches, model_name, request_id, sample_rate, key),
                 release=lambda: api.release_request(request_id),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
             )
@@ -91,7 +97,9 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
     }
 
 
-async def _stream_events(batches, model_name, request_id, sample_rate):
+async def _stream_events(batches, model_name, request_id, sample_rate, key=None):
+    """``key`` (the submission's, while MSTAR_PHASE_TIMING is on) stamps the
+    first text delta's hand-off to the HTTP layer."""
     created = now()
 
     def chunk(delta, finish=None) -> str:
@@ -149,6 +157,9 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
                     failed = True
                     yield error(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500)))
             if text_events:
+                if key is not None:
+                    hop_stamp(key, "api.first_out")
+                    key = None
                 yield "".join(text_events)
     except HTTPException as exc:
         # The delivery timeout raises out of the iterator (which aborts the
