@@ -127,8 +127,10 @@ def test_joint_attention_matches_sdpa(name, heads, rows, peak):
     qb, kb, vb = (torch.cat([t, torch.randn(pad, heads, HEAD_DIM, device=DEV).bfloat16()]) for t in (q, k, v))
     leased = m.run(qb, kb, vb, "main")
     _check_segments(leased, qb, kb, vb, spans, spans)
+    # the bucket's token ceiling sizes the kernel's grid, which may change its split and so the
+    # reduction order, but not the real rows' result beyond rounding
     n = rows * FLUX_TOKENS
-    assert torch.equal(leased[:n], eager), "the bucket's token ceiling does not change the real rows"
+    assert _rel(leased[:n], eager.double()) <= 4e-3
 
 
 def test_each_layers_output_survives_the_next_layer():
