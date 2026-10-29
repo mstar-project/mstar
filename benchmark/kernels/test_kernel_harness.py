@@ -380,5 +380,10 @@ def test_best_promotion_picks_an_implementation_per_shape(tmp_path):
     config = json.loads(path.read_text())
     assert config["classes"] == {"small": {"impl": "vendor"}, "large": {"impl": "vendor"}}
     assert set(config["shapes"]) == {"k32-n64-rows1", "k32-n64-rows2"}
+    # aiter is 10% faster than the default at rows 1 but only 5% at rows 2: rows 2 keeps the default
+    path = store.promote_best(MI300X, "gemv", {"vendor": ("vendor", {}), "aiter": ("aiter", {})}.get,
+                              lambda s: "all", class_default=lambda klass: {"impl": "vendor"}, margin=0.08,
+                              root=tmp_path / "configs")
+    assert json.loads(path.read_text())["shapes"] == {"k32-n64-rows1": {"impl": "aiter"}}
     with pytest.raises(ValueError, match="no passing results"):
         store.promote_best(MI300X, "gemv", lambda family: None, lambda s: None, root=tmp_path / "configs")
