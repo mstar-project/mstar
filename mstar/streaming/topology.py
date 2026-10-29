@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Callable, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import ChunkPolicy, FixedChunkPolicy
+
+if TYPE_CHECKING:
+    from mstar.model.base import Model
 
 
 @dataclass
@@ -24,8 +29,8 @@ class StreamingGraphEdge(GraphEdge):
 
 # The producer of a stream the client feeds into a running request:
 # ``Connection(from_partition=CLIENT, ...)``. It names no partition, so it has
-# no walks, worker or partition state; the API server appends its chunks and
-# ends it when the client's input ends.
+# no walks, worker or partition state; the API server's data worker sends its
+# items to the consumer's ranks and ends it when the client's input ends.
 CLIENT = "client"
 
 
@@ -160,3 +165,35 @@ def client_stream_limits(
         conn.edge_name: (conn.limits or ClientStreamLimits())._replace(**(overrides.get(conn.edge_name) or {}))
         for conn in topology.client_connections()
     }
+
+
+@dataclass(frozen=True, slots=True)
+class ClientStream:
+    """Where a client stream's items go: the node that consumes the edge, a
+    walk it runs in (for routing to its workers) and its partition. A
+    dataclass, which the wire codec carries in the conductor's route and a
+    NamedTuple it would refuse."""
+    node: str
+    graph_walk: str
+    partition: str
+
+
+def find_client_streams(model: Model) -> dict[str, ClientStream]:
+    """Each client stream's consumer, in the partition it flows into, as
+    validate_deployment checked. The conductor derives it, after the worker
+    graphs are built, and sends it to the data worker with each call's route."""
+    connections = model.get_partition_topology().client_connections()
+    if not connections:
+        return {}
+    walks = model.get_graph_walk_graphs()
+    partitions = {p.name: p for p in model.get_partitions()}
+    streams: dict[str, ClientStream] = {}
+    for conn in connections:
+        name, partition = conn.edge_name, partitions[conn.to_partition]
+        (consumer,) = {
+            node.name for walk in walks.values() for node in walk.get_nodes().values()
+            if name in node.input_names
+        }
+        walk = max(walk for walk in partition.graph_walks if consumer in walks[walk].get_nodes())
+        streams[name] = ClientStream(consumer, walk, partition.name)
+    return streams

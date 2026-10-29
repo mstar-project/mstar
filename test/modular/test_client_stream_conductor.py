@@ -1,11 +1,10 @@
 """Client streams: a ``Connection`` from ``CLIENT`` feeds a running request.
 
-The conductor forwards each ``CLIENT_STREAM_INPUT`` chunk to the consuming node's
-workers as a streaming ``INPUT_SIGNALS`` edge and releases its persist hold
-with the reader count, drops them for a request that has ended, and closes
-the stream with ``producer_done`` from ``CLIENT`` when the client's input
-ends. At ``max_concurrent_requests`` a call with open input is refused rather
-than queued.
+The API server's data worker sends a call's items and their end straight to
+the consuming node's ranks. The conductor tells it those ranks once, at
+dispatch (``CLIENT_STREAM_ROUTE``), and again with none once the consuming
+partition ends. At ``max_concurrent_requests`` a call with open input is
+refused rather than queued.
 
 Drives the real ``Conductor.__init__`` and ``Conductor.run`` with worker
 launch and ZMQ stubbed, as ``test_ingest_unpersist.py`` does. The worker test
@@ -37,14 +36,15 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
     CLIENT,
+    ClientStream,
     ClientStreamLimits,
     Connection,
     PartitionTopology,
     client_stream_limits,
+    find_client_streams,
 )
 from mstar.utils.ipc_format import (  # noqa: E402
-    AbortRequest,
-    ClientStreamInput,
+    ClientStreamRoute,
     ConductorMessage,
     ConductorMessageType,
     InputSignals,
@@ -52,6 +52,8 @@ from mstar.utils.ipc_format import (  # noqa: E402
     ReadsDone,
     SetupDone,
     WorkerGraphsDone,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.validation.client_streams import check_client_streams  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
@@ -158,12 +160,12 @@ def _msg(kind, body):
     return ConductorMessage(message_type=kind, body=body)
 
 
-def _new_request(rid, client_input=None):
-    """An opening; without ``client_input`` its client streams stay open (a live call)."""
+def _new_request(rid, input_open=True):
+    """An opening; a live call's leaves input open."""
     return _msg(ConductorMessageType.NEW_REQUEST, NewRequestConductor(
         request_id=rid, initial_signals={}, initial_input_modalities=["audio"],
         initial_output_modalities=["text"], input_metadata={}, model_kwargs={},
-        client_input=client_input,
+        input_open=input_open,
     ))
 
 
@@ -172,14 +174,6 @@ def _info(uuid):
         dims=[1280], dtype=torch.float32, nbytes=5120, address=0, stride=[1], uuid=uuid,
         source_session_id="s", source_entity=PREPROCESS,
     )
-
-
-def _chunk(rid, *uuids, done=False, edge="audio_in", ended=None):
-    """``uuids`` as items of ``edge``; ``done`` ends that stream, ``ended`` the ones it names."""
-    signals = {edge: [_info(u) for u in uuids]} if uuids else {}
-    ended = [edge] if done else list(ended or [])
-    return _msg(ConductorMessageType.CLIENT_STREAM_INPUT,
-                ClientStreamInput(request_id=rid, signals=signals, ended=ended))
 
 
 def _sends(c, *kinds):
@@ -191,14 +185,12 @@ def _sends(c, *kinds):
     return out
 
 
-def _stream_signals(c, rid):
-    """(uuids, producer_done) of each INPUT_SIGNALS for ``rid``, in send order."""
-    out = []
-    for _kind, _entity, body in _sends(c, "INPUT_SIGNALS"):
-        if body.request_id == rid:
-            uuids = [info.uuid for edge in body.inputs for info in edge.tensor_info]
-            out.append((uuids, set(body.producer_done)))
-    return out
+def _routes(c, rid):
+    """The ``workers`` of each CLIENT_STREAM_ROUTE for ``rid``, in send order;
+    every one goes to the data worker."""
+    sends = [(entity, body) for _k, entity, body in _sends(c, "CLIENT_STREAM_ROUTE") if body.request_id == rid]
+    assert {entity for entity, _body in sends} <= {PREPROCESS}
+    return [dict(body.workers) for _entity, body in sends]
 
 
 def _partition_done(c, rid):
@@ -214,89 +206,49 @@ def _reads_done(rid, *entities):
             for e in entities]
 
 
-def test_a_chunk_reaches_the_consumer_as_a_streaming_edge_then_is_released(tmp_path, monkeypatch):
+def test_dispatch_tells_the_data_worker_the_consumers_ranks_once(tmp_path, monkeypatch):
+    """After the workers' NEW_REQUESTs, which the items must not overtake on a
+    rank; the conductor forwards none itself."""
     c = _conductor(tmp_path, monkeypatch)
-    _run(c, [[_new_request("r")], [_chunk("r", 11, 12)]])
+    _run(c, [[_new_request("r")]])
 
-    sends = _sends(c, "INPUT_SIGNALS", "UNPERSIST_TENSORS")
-    (kind, entity, body), (release_kind, release_entity, release) = sends
-    assert (kind, entity, body.partition_name) == ("INPUT_SIGNALS", "worker_0", "Ear")
-    (edge,) = body.inputs
-    assert (edge.name, edge.next_node, edge.is_streaming) == ("audio_in", "ear", True)
-    assert [info.uuid for info in edge.tensor_info] == [11, 12]
-    # released after the send, with one reader each
-    assert (release_kind, release_entity) == ("UNPERSIST_TENSORS", PREPROCESS)
-    assert dict(release.uuid_to_ref_count) == {11: 1, 12: 1}
-    assert c.requests["r"].persist_signal_ref_cnt == {}
+    assert _routes(c, "r") == [{"audio_in": ["worker_0"]}]
+    kinds = [kind for kind, _e, body in _sends(c, "NEW_REQUEST", "CLIENT_STREAM_ROUTE", "INPUT_SIGNALS")]
+    assert kinds == ["NEW_REQUEST", "CLIENT_STREAM_ROUTE"]
 
 
-def test_end_of_input_sends_producer_done_once_and_later_chunks_are_dropped(tmp_path, monkeypatch):
+def test_the_consuming_partitions_end_sends_the_route_again_empty(tmp_path, monkeypatch):
+    """The data worker then answers the stream's later items as late."""
     c = _conductor(tmp_path, monkeypatch)
-    _run(c, [[_new_request("r")], [_chunk("r", 1)], [_chunk("r", done=True)],
-             [_chunk("r", done=True)], [_chunk("r", 2)]])
+    _run(c, [[_new_request("r")], [_partition_done(c, "r")]])
 
-    assert _stream_signals(c, "r") == [([1], set()), ([], {CLIENT})]
-
-
-def test_end_of_input_reports_how_many_items_the_worker_was_sent(tmp_path, monkeypatch):
-    # The consumer's stream buffer closes only once it has registered this
-    # many items, so a done signal that overtook a chunk can't end it early.
-    c = _conductor(tmp_path, monkeypatch)
-    _run(c, [[_new_request("r")], [_chunk("r", 1, 2)], [_chunk("r", 3, done=True)]])
-
-    done = [body for _k, _e, body in _sends(c, "INPUT_SIGNALS")
-            if body.request_id == "r" and body.producer_done]
-    assert [dict(body.producer_done_items) for body in done] == [{"audio_in": 3}]
+    assert _routes(c, "r") == [{"audio_in": ["worker_0"]}, {"audio_in": []}]
 
 
-def test_a_chunk_and_the_end_in_one_message_arrive_in_that_order(tmp_path, monkeypatch):
-    # The worker applies producer_done before a message's inputs, so the end
-    # must travel in a message of its own, after the chunk.
-    c = _conductor(tmp_path, monkeypatch)
-    _run(c, [[_new_request("r")], [_chunk("r", 5, done=True)]])
-
-    assert _stream_signals(c, "r") == [([5], set()), ([], {CLIENT})]
-
-
-def test_a_one_shot_waits_for_a_slot_and_its_opening_input_follows_admission(tmp_path, monkeypatch):
+def test_a_one_shot_waits_for_a_slot_and_is_routed_at_admission(tmp_path, monkeypatch):
     c = _conductor(tmp_path, monkeypatch, max_concurrent_requests=1)
-    one_shot = ClientStreamInput(request_id="b", signals={"audio_in": [_info(1)]}, ended=["audio_in"])
     _run(c, [
-        [_new_request("a"), _new_request("b", one_shot)],
+        [_new_request("a"), _new_request("b", input_open=False)],
         [_partition_done(c, "a")],
         _reads_done("a", PREPROCESS, "worker_0"),
     ])
 
     assert "b" in c.requests
-    assert _stream_signals(c, "b") == [([1], set()), ([], {CLIENT})]
-    # forwarded after b's own NEW_REQUEST
-    kinds = [(k, body.request_id) for k, _e, body in _sends(c, "NEW_REQUEST", "INPUT_SIGNALS")]
-    assert kinds.index(("NEW_REQUEST", "b")) < kinds.index(("INPUT_SIGNALS", "b"))
+    assert _routes(c, "b") == [{"audio_in": ["worker_0"]}]
+    kinds = [(k, body.request_id) for k, _e, body in _sends(c, "NEW_REQUEST", "CLIENT_STREAM_ROUTE")]
+    assert kinds.index(("NEW_REQUEST", "b")) < kinds.index(("CLIENT_STREAM_ROUTE", "b"))
 
 
-@pytest.mark.parametrize("ended", [[], ["audio_in"]])
-def test_a_call_with_open_input_is_refused_at_the_cap(tmp_path, monkeypatch, ended):
+def test_a_call_with_open_input_is_refused_at_the_cap(tmp_path, monkeypatch):
     """A live call that waited for a slot would start, and stay, that far
-    behind its client; one stream left open is enough."""
-    c = _conductor(tmp_path, monkeypatch, model=_AudioAndVideo(), max_concurrent_requests=1)
-    _run(c, [[_new_request("a"), _new_request("b", ClientStreamInput(request_id="b", ended=ended))]])
+    behind its client."""
+    c = _conductor(tmp_path, monkeypatch, max_concurrent_requests=1)
+    _run(c, [[_new_request("a"), _new_request("b")]])
 
     assert "b" not in c.requests and c.waiting_queue == []
     failed = [m.body for e, m in c.comm.sent if getattr(m, "message_type", None) == "request_failed"]
     assert [(f.request_id, f.status) for f in failed] == [("b", 503)]
     assert any(b.request_id == "b" for _k, _e, b in _sends(c, "REMOVE_REQUEST"))
-
-
-def test_chunks_for_a_draining_or_unknown_request_are_dropped(tmp_path, monkeypatch):
-    c = _conductor(tmp_path, monkeypatch)
-    _run(c, [
-        [_new_request("r")],
-        [_msg(ConductorMessageType.ABORT_REQUEST, AbortRequest("r"))],
-        [_chunk("r", 1), _chunk("never-seen", 2)],
-    ])
-
-    assert _stream_signals(c, "r") == []
-    assert _stream_signals(c, "never-seen") == []
 
 
 def test_completion_drains_the_workers_too(tmp_path, monkeypatch):
@@ -325,26 +277,33 @@ def test_client_is_not_a_partition_name():
         )])
 
 
-def test_stream_input_encodes_without_pickle():
-    body = ClientStreamInput(request_id="r", signals={"audio_in": [_info(3)]}, ended=["audio_in"])
-    msg = ConductorMessage(message_type=ConductorMessageType.CLIENT_STREAM_INPUT, body=body)
+def test_a_client_stream_with_a_shard_dim_is_refused(tmp_path, monkeypatch):
+    """The data worker sends every rank the whole item; nothing slices it."""
+    with pytest.raises(ValueError, match="audio_in.*shard_dim"):
+        _conductor(tmp_path, monkeypatch, sharding_config={"shard_dim": {"audio_in": 0}})
+
+
+def test_the_route_encodes_without_pickle():
+    consumers = find_client_streams(_DuplexToy())
+    body = ClientStreamRoute(request_id="r", workers={"audio_in": ["worker_0", "worker_1"]}, consumers=consumers)
+    msg = WorkerMessage(message_type=WorkerMessageType.CLIENT_STREAM_ROUTE, body=body)
     # typed fields, not the pickle fallback; the envelope finds it by its tag
-    assert wire._encoder(ClientStreamInput).__name__ == "_encode_dataclass"
+    assert wire._encoder(ClientStreamRoute).__name__ == "_encode_dataclass"
     decoded = wire.decode(wire.encode(msg))
-    assert decoded.body.request_id == "r" and decoded.body.ended == ["audio_in"]
-    assert decoded.body.signals["audio_in"][0].uuid == 3
+    assert decoded.body.request_id == "r" and decoded.body.workers == {"audio_in": ["worker_0", "worker_1"]}
+    assert decoded.body.consumers == consumers == {"audio_in": ClientStream("ear", "listen", "Ear")}
 
 
 def _stub_worker(sbuf):
     """What ``Worker._process_new_inputs`` touches for a streaming-only signal."""
     reads = []
     req_info = SimpleNamespace(stream_buffers={"audio_in": sbuf})
-    stub = SimpleNamespace(
-        _draining_rids=set(), worker_id="worker_0", enable_nvtx=False, _walk_driven_edges={},
+    stub = Worker.__new__(Worker)
+    vars(stub).update(
+        _reads_done_sent=set(), worker_id="worker_0", enable_nvtx=False, _walk_driven_edges={},
         _rid=lambda rid: 7 if rid == "r" else None,
         request_state=SimpleNamespace(per_request_info={7: req_info}),
         tensor_manager=SimpleNamespace(
-            # the worker also calls it, empty, for the non-streaming inputs
             start_read_tensors=lambda rid, edges, graph_walk=None: edges and reads.append(
                 [info.uuid for edge in edges for info in edge.tensor_info]
             ) or [],
@@ -358,42 +317,22 @@ def test_the_worker_buffers_client_chunks_and_closes_on_producer_done():
     sbuf = StreamBuffer(request_id=7, edge_name="audio_in", from_partition=CLIENT,
                         policy=FixedChunkPolicy(chunk_size=1))
     stub, reads = _stub_worker(sbuf)
-    info = CurrentForwardPassInfo(
-        request_id="r", graph_walk="listen", fwd_index=0, random_seed=0, max_tokens=8,
-        partition_name="Ear",
-    )
     chunk = GraphEdge(next_node="ear", name="audio_in", tensor_info=[_info(1), _info(2)],
                       is_streaming=True)
 
+    # as the data worker sends them: no forward-pass info, which only a
+    # non-streaming input carries
     Worker._process_new_inputs(stub, InputSignals(
-        request_id="r", inputs=[chunk], request_info=info, partition_name="Ear",
+        request_id="r", inputs=[chunk], request_info=None, partition_name="Ear",
     ))
     assert reads == [[1, 2]] and [tid for tid, _walk in sbuf._tensor_ids_in_order] == [1, 2]
     assert not sbuf.producer_done
 
     Worker._process_new_inputs(stub, InputSignals(
-        request_id="r", inputs=[], request_info=info, partition_name="Ear",
+        request_id="r", inputs=[], request_info=None, partition_name="Ear",
         producer_done={CLIENT}, producer_done_items={"audio_in": 2},
     ))
     assert sbuf.producer_done and sbuf._num_items_expected == 2
-
-
-def test_a_chunk_that_fails_fails_only_its_request(tmp_path, monkeypatch):
-    c = _conductor(tmp_path, monkeypatch)
-    real = c._send_inputs
-
-    def flaky(request_id, *a, **k):
-        if request_id == "bad":
-            raise IndexError("/srv/weights/secret no dims")
-        return real(request_id, *a, **k)
-
-    c._send_inputs = flaky
-    _run(c, [[_new_request("bad"), _new_request("good")], [_chunk("bad", 1), _chunk("good", 2)]])
-
-    assert _stream_signals(c, "good") == [([2], set())]
-    error = c.draining["bad"].failure_error
-    assert error.startswith("client input failed: internal error") and "secret" not in error
-    assert c.requests["good"].streaming_connections[CLIENT, "Ear", "audio_in"].token_count == 1
 
 
 def test_a_client_stream_has_one_consumer(tmp_path, monkeypatch):
@@ -454,33 +393,11 @@ class _AudioAndVideo(_DuplexToy):
         ])
 
 
-def test_two_client_streams_into_one_partition_route_and_end_independently(tmp_path, monkeypatch):
-    """Connection state is per (from, to, edge): each stream keeps its own
-    items and its own end, and ending one leaves the other open."""
+def test_every_client_stream_is_routed(tmp_path, monkeypatch):
     c = _conductor(tmp_path, monkeypatch, model=_AudioAndVideo())
-    assert {name: s.partition for name, s in c._client_streams.items()} == {"audio_in": "Ear", "video_in": "Ear"}
-    _run(c, [
-        [_new_request("r")],
-        [_chunk("r", 1, 2), _chunk("r", 3, edge="video_in")],
-        [_chunk("r", ended=["video_in"])],
-        [_chunk("r", 4), _chunk("r", 5, edge="video_in")],      # video's is late: dropped
-        [_chunk("r", ended=["audio_in", "video_in"])],
-    ])
+    _run(c, [[_new_request("r")]])
 
-    signals = [(body.inputs[0].name if body.inputs else None,
-                [info.uuid for edge in body.inputs for info in edge.tensor_info],
-                set(body.producer_done), dict(body.producer_done_items))
-               for _k, _e, body in _sends(c, "INPUT_SIGNALS") if body.request_id == "r"]
-    assert signals == [
-        ("audio_in", [1, 2], set(), {}),
-        ("video_in", [3], set(), {}),
-        (None, [], {CLIENT}, {"video_in": 1}),              # ends video only
-        ("audio_in", [4], set(), {}),
-        (None, [], {CLIENT}, {"audio_in": 3}),              # then audio, once
-    ]
-    conns = c.requests["r"].streaming_connections
-    assert conns[CLIENT, "Ear", "audio_in"].token_count == 3 and conns[CLIENT, "Ear", "video_in"].token_count == 1
-    assert conns[CLIENT, "Ear", "audio_in"].producer_done and conns[CLIENT, "Ear", "video_in"].producer_done
+    assert _routes(c, "r") == [{"audio_in": ["worker_0"], "video_in": ["worker_0"]}]
 
 
 def test_a_client_streams_consumer_must_be_its_partitions_and_the_only_one():
@@ -509,7 +426,7 @@ def test_a_model_without_client_streams_is_not_inspected():
         def get_graph_walk_graphs(self):
             raise AssertionError("walked the graphs of a model with no client stream")
 
-    assert Conductor._find_client_streams(_Plain()) == {} and check_client_streams(_Plain(), {}) == []
+    assert find_client_streams(_Plain()) == {} and check_client_streams(_Plain(), {}) == []
 
 
 @pytest.mark.parametrize("failed_here", [True, False])
