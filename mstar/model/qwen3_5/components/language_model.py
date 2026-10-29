@@ -290,13 +290,69 @@ class Qwen3_5LanguageModel(nn.Module):
         return normed
 
 
+class Qwen3_5MTPHead(nn.Module):
+    """The checkpoints' one-layer multi-token-prediction head (``mtp.*``).
+
+    Position ``p`` takes the hidden state the lm_head reads at ``p`` (after the
+    final norm) and the embedding of the token at ``p + 1``, and predicts the
+    token at ``p + 2``: ``fc([norm_e(embed) | norm_h(hidden)])``, one
+    full-attention layer with its own KV (the cache's last layer), and a final
+    norm whose output feeds the shared lm_head and, chained, the next position.
+    """
+
+    def __init__(self, config: Qwen3_5Config, kv_layer_idx: int, comm_group: CommGroup):
+        super().__init__()
+        self.config = config
+        self.kv_layer_idx = kv_layer_idx
+        self.comm_group = comm_group
+        hidden = config.hidden_size
+        # replicated: its input is the replicated hidden state
+        self.fc = nn.Linear(2 * hidden, hidden, bias=False)
+        self.pre_fc_norm_embedding = _norm(config)
+        self.pre_fc_norm_hidden = _norm(config)
+        self.rope_cache = RopeCache()
+        self.layers = nn.ModuleList([_build_full_attn_layer(config, self.rope_cache, comm_group)])
+        self.norm = _norm(config)
+        layer = self.layers[0]
+        layer.self_attn.o_proj.reduce_results = False
+        layer.mlp.down_proj.reduce_results = False
+
+    def forward(
+        self, hidden: torch.Tensor, next_embeds: torch.Tensor, *, label: str,
+        cos_sin: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        cg = self.comm_group if self.comm_group.world_size > 1 else None
+        x = self.fc(torch.cat(
+            (self.pre_fc_norm_embedding(next_embeds), self.pre_fc_norm_hidden(hidden)), dim=-1,
+        ))
+        self.rope_cache.set(*cos_sin)
+        layer = self.layers[0]
+        attend = layer.self_attn.attend
+        attend.bind_step(label)
+        attend.set_layer_idx(self.kv_layer_idx)
+        h = layer.self_attn(layer.input_layernorm(x))
+        h, residual = layer.post_attention_layernorm.forward_residual(h, x, cg)
+        h = layer.mlp(h)
+        normed, _ = self.norm.forward_residual(h, residual, cg)
+        return normed
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     def __init__(
         self, config: Qwen3_5Config, comm_group: CommGroup | None = None,
+        with_mtp: bool = False,
     ):
         super().__init__()
         self.config = config
         self.model = Qwen3_5LanguageModel(config, comm_group)
+        # the draft for speculative decoding; its KV is one layer past the stack's
+        self.mtp = (
+            Qwen3_5MTPHead(
+                config, kv_layer_idx=len(config.full_layer_indices),
+                comm_group=self.model.comm_group,
+            )
+            if with_mtp else None
+        )
         # Gathers the vocab so the sampler is TP-oblivious. Its `[vocab/tp,
         # hidden]` shard matches the embedding's, so the tie works per rank.
         self.lm_head = ColumnParallelLinear(

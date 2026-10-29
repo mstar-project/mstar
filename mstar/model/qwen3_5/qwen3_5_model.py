@@ -28,6 +28,7 @@ from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec_decode.config import SpecDecodeConfig, SpecDecodeSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -69,6 +70,7 @@ from mstar.model.qwen3_5.config import (
     LLM_MIXED,
     ROPE,
     SAMPLER,
+    SPEC_DECODE,
     VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -172,6 +174,7 @@ class Qwen3_5DenseModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        num_draft_tokens: int = 0,
         **kwargs: Any,
     ):
         self.model_path_hf = model_path_hf
@@ -179,6 +182,20 @@ class Qwen3_5DenseModel(Model):
 
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
+        # Speculative decoding with the checkpoint's MTP head drafting this
+        # many tokens a step (`model_kwargs: {num_draft_tokens: k}` in the
+        # serving yaml); 0 decodes one token a step. Every process builds the
+        # model from the same kwargs, so the walks, resources and capture
+        # buckets sized from it agree everywhere.
+        if num_draft_tokens < 0:
+            raise ValueError(f"num_draft_tokens={num_draft_tokens} must be >= 0")
+        if num_draft_tokens and self.config.mtp_num_hidden_layers < 1:
+            raise ValueError(
+                f"{model_path_hf} has no MTP head (mtp_num_hidden_layers="
+                f"{self.config.mtp_num_hidden_layers}) to draft with; set "
+                "num_draft_tokens to 0"
+            )
+        self.num_draft_tokens = num_draft_tokens
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
         self.vision_config = Qwen3_5VisionConfig.from_hf_or_none(self.local_dir)
@@ -219,7 +236,9 @@ class Qwen3_5DenseModel(Model):
         return torch.float32
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        num_kv_layers = len(self.config.full_layer_indices)
+        k = self.num_draft_tokens
+        # the MTP head's attention keeps its KV as the cache's last layer
+        num_kv_layers = len(self.config.full_layer_indices) + (1 if k else 0)
         num_gdn_layers = len(self.config.linear_layer_indices)
         return [
             KVSpec(
@@ -254,7 +273,9 @@ class Qwen3_5DenseModel(Model):
                         head_v_dim=self.config.linear_value_head_dim,
                         conv_kernel_size=self.config.linear_conv_kernel_dim
                     ).to_blocks(state_dtype=self._gdn_state_dtype()),
-                    kv_cache=KV_CACHE,
+                    # no snapshots under speculation, where the label isn't keyed (`kv_labels`)
+                    kv_cache=None if k else KV_CACHE,
+                    spec_tokens=k,
                 )
             ),
             LinearAttnSpec(
@@ -262,7 +283,8 @@ class Qwen3_5DenseModel(Model):
                 config=LinearAttnConfig(
                     recurrent_state=GDN_STATE,
                     variant=LinearAttnVariant.GDN,
-                    splits=(_MIXED_SPLIT,),
+                    splits=() if k else (_MIXED_SPLIT,),
+                    spec_decode=SPEC_DECODE if k else None,
                 ),
             ),
             SamplerSpec(
@@ -270,7 +292,21 @@ class Qwen3_5DenseModel(Model):
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
             ),
+            *self._spec_resources(),
             *self._vision_resources(),
+        ]
+
+    def _spec_resources(self) -> list[NodeResourceSpec]:
+        """Speculative decoding's registers, only on a drafting deployment."""
+        if not self.num_draft_tokens:
+            return []
+        return [
+            SpecDecodeSpec(
+                resource_key=SPEC_DECODE, nodes={"LLM"},
+                config=SpecDecodeConfig(num_draft_tokens=self.num_draft_tokens),
+                kv_cache=KV_CACHE, attn=ATTN,
+                stop_token_ids=tuple(self.config.stop_token_ids),
+            ),
         ]
 
     def _vision_resources(self) -> list[NodeResourceSpec]:
@@ -304,6 +340,10 @@ class Qwen3_5DenseModel(Model):
     # Model ABC: walk graph declaration
     # -----------------------------------------------------------------------
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        if self.num_draft_tokens:
+            # a verify row is k + 1 tokens, which the mixed step's split
+            # (one-token decode rows beside prompts) does not take
+            return {}
         return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -575,11 +615,14 @@ class Qwen3_5DenseModel(Model):
             return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
 
         plan = prefill_plan(expand_video_parts(parts, groups))
+        # a verify step writes up to 2k - 1 past the committed length, and the
+        # host counts up to k more until it learns what a step accepted
         layout = LabelLayout(
             spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
             # The keys name `prefill_text` alone, and the preprocess worker refuses
             # a keyed span in any other walk.
             keyed_spans=0 if walk == "prefill_vision" else None,
+            scratch=3 * self.num_draft_tokens,
         )
         # always set, so a `video_groups` the client sent never reaches the schedule
         return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
@@ -588,10 +631,10 @@ class Qwen3_5DenseModel(Model):
         return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_CACHE: {"main": KVLabel(
-            growth=(("decode", "decode_loop"),),
-            keys=PrefixKeys("text_inputs", ("prefill_text",), growth=True),
-        )}}
+        # Not keyed under speculation: the host's length runs ahead of what a
+        # verify step kept, so its pages can't be filed under a prompt's keys.
+        keys = None if self.num_draft_tokens else PrefixKeys("text_inputs", ("prefill_text",), growth=True)
+        return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),), keys=keys)}}
 
     def checkpoint_path(self) -> str:
         return self._resolve_weights()
@@ -604,6 +647,9 @@ class Qwen3_5DenseModel(Model):
             request_kwargs: dict | None = None,
         ) -> bytes:
             if modality == "text":
+                if self.num_draft_tokens:
+                    # a verify step's row holds -1 past the tokens it emitted
+                    output = output[output >= 0]
                 ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
                 if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
                     self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
@@ -892,7 +938,10 @@ class Qwen3_5DenseModel(Model):
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights
 
         model = self._build(
-            lambda: Qwen3_5ForCausalLM(self.config, tp_group), dtype, device,
+            lambda: Qwen3_5ForCausalLM(
+                self.config, tp_group, with_mtp=bool(self.num_draft_tokens),
+            ),
+            dtype, device,
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
@@ -900,7 +949,10 @@ class Qwen3_5DenseModel(Model):
             # collective over the TP group; every rank builds the LLM here
             tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(model, self.config, self.vision_config)
+        return LLMSubmodule(
+            model, self.config, self.vision_config,
+            num_draft_tokens=self.num_draft_tokens,
+        )
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
