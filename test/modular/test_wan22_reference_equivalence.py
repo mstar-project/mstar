@@ -449,7 +449,7 @@ def test_sequential_cfg_trajectory_is_bitexact_vs_oracle(oracle_meta, text_embed
     """Drive the engine path with the reference's sequential batch-1 CFG:
     every one of the 50 per-step latents must be BIT-EXACT vs the oracle.
     This proves the whole mstar implementation (tokenize -> encode ->
-    per-token timesteps -> transformer -> inline UniPC) identical to the
+    per-frame timesteps -> transformer -> inline UniPC) identical to the
     stock pipeline, leaving the batch-2 CFG kernel shape as the suite's ONLY
     priced deviation (tests 2/3/4)."""
     meta = _step_metadata(oracle_meta)
@@ -507,7 +507,7 @@ def test_cfg_batched_matches_sequential(oracle_meta, text_embeds, dit_submodule)
     model_input = latents.to(transformer.dtype)
     t = torch.tensor(999, dtype=torch.int64, device=DEVICE)
     mask = torch.ones(1, 1, *latents.shape[2:], dtype=torch.float32, device=DEVICE)
-    temp_ts = (mask[0, 0][:, ::2, ::2] * t).flatten()
+    temp_ts = mask[0, 0, :, 0, 0] * t  # one per latent frame, as the submodule builds it
     pos, neg = text_embeds["ours_pos"], text_embeds["ours_neg"]
 
     with torch.no_grad():

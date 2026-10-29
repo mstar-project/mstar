@@ -478,9 +478,9 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                 model_input = latents
             model_input = model_input.to(self.transformer.dtype)
 
-            # expand_timesteps: per-token timestep over the post-patch grid
-            # ([:, ::2, ::2] == patch_size (1, 2, 2)); I2V frame-0 tokens get 0.
-            temp_ts = (mask[0, 0][:, ::2, ::2] * t).flatten()
+            # expand_timesteps: every token of a latent frame takes its frame's
+            # timestep (patch_size (1, 2, 2) keeps the frame axis); I2V frame 0 gets 0.
+            temp_ts = mask[0, 0, :, 0, 0] * t
             noise_pred = self._noise_prediction(
                 model_input, temp_ts, text_embeds_pos, text_embeds_neg, guidance_scale
             )

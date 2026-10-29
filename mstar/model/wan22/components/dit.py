@@ -2,8 +2,12 @@
 
 Exact port of diffusers 0.39.0 ``WanTransformer3DModel``, restricted to the
 TI2V-5B checkpoint's configuration: no image-conditioning branch, and the
-per-token timestep path (the dit submodule always feeds a ``[batch, seq]``
-timestep grid).
+per-token timestep path (``expand_timesteps``). Every token of a latent frame
+shares its frame's timestep (I2V zeroes frame 0 only), so the timestep comes in
+per frame, ``[batch, frames]``, and the time embedding and the modulation are
+computed once per frame and broadcast over the frame's tokens. Per-frame rows
+are the reference's per-token rows bit for bit (the rows of a GEMM do not
+depend on how many there are).
 
 Numerics contract (bf16 weights with fp32 islands):
 
@@ -34,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import Wan22Config
 
@@ -214,12 +219,12 @@ class Wan22TimeTextEmbedding(nn.Module):
     def forward(
         self, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``timestep`` ``[B, seq]`` (per-token, ``expand_timesteps``);
-        returns ``temb [B, seq, dim]``, ``timestep_proj [B, seq, 6, dim]``,
+        """``timestep`` ``[B, frames]``, one per latent frame; returns
+        ``temb [B, frames, dim]``, ``timestep_proj [B, frames, 6, dim]``,
         projected text ``[B, 512, dim]`` — all in the text embeds' dtype."""
-        batch, seq_len = timestep.shape
+        batch, frames = timestep.shape
         sincos = _sinusoidal_timestep_embedding(timestep.flatten(), self.freq_dim)
-        temb = self.time_embedder(sincos.unflatten(0, (batch, seq_len)))
+        temb = self.time_embedder(sincos.unflatten(0, (batch, frames)))
         temb = temb.type_as(encoder_hidden_states)
         timestep_proj = self.time_proj(F.silu(temb)).unflatten(2, (6, -1))
         return temb, timestep_proj, self.text_embedder(encoder_hidden_states)
@@ -252,24 +257,29 @@ class Wan22DiTBlock(nn.Module):
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        # [1, 1, 6, dim] + [B, seq, 6, dim] -> six [B, seq, dim] fp32 tensors.
+        # [1, 1, 6, dim] + [B, frames, 6, dim] -> six [B, frames, dim] fp32
+        # tensors, each applied to all of a frame's tokens.
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            (self.scale_shift_table.unsqueeze(0) + timestep_proj.float()).chunk(6, dim=2)
-        )
-        shift_msa, scale_msa, gate_msa = shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2)
-        c_shift_msa, c_scale_msa, c_gate_msa = c_shift_msa.squeeze(2), c_scale_msa.squeeze(2), c_gate_msa.squeeze(2)
+            self.scale_shift_table.unsqueeze(0) + timestep_proj.float()
+        ).unbind(2)
 
-        norm_hidden = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        _, norm_hidden = ada_layer_norm(hidden_states, shift_msa, scale_msa, eps=self.norm1.eps)
         attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
-
-        norm_hidden = self.norm2(hidden_states.float()).type_as(hidden_states)
+        hidden_states, norm_hidden = ada_layer_norm(
+            hidden_states, None, None, eps=self.norm2.eps, weight=self.norm2.weight, bias=self.norm2.bias,
+            residual=attn_output, gate=gate_msa,
+        )
         attn_output = self.cross_attn(norm_hidden, encoder_hidden_states=encoder_hidden_states)
-        hidden_states = hidden_states + attn_output
-
-        norm_hidden = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states)
+        # the cross-attention residual is a plain add in the stream dtype (no gate)
+        hidden_states, norm_hidden = ada_layer_norm(
+            hidden_states, c_shift_msa, c_scale_msa, eps=self.norm3.eps, residual=attn_output,
+        )
         ff_output = self.ffn(norm_hidden)
-        return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        frames = timestep_proj.shape[1]
+        return (
+            hidden_states.unflatten(1, (frames, -1)).float()
+            + ff_output.unflatten(1, (frames, -1)).float() * c_gate_msa.unsqueeze(2)
+        ).type_as(hidden_states).flatten(1, 2)
 
 
 class Wan22DiT(nn.Module):
@@ -330,15 +340,15 @@ class Wan22DiT(nn.Module):
         encoder_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
-        ``[B, post-patch seq]`` per-token grid (``expand_timesteps`` — the
-        only timestep form mstar's dit submodule produces), text embeds
-        ``[B, 512, text_dim]`` bf16. Returns ``[B, C_out, F, H, W]`` bf16."""
+        ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
+        token takes its frame's value), text embeds ``[B, 512, text_dim]``
+        bf16. Returns ``[B, C_out, F, H, W]`` bf16."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
-        if timestep.ndim != 2:
+        if timestep.ndim != 2 or timestep.shape[1] != grid[0]:
             raise ValueError(
-                f"Wan22DiT requires a per-token [batch, seq] timestep grid; got ndim={timestep.ndim}."
+                f"Wan22DiT requires a per-frame [batch, {grid[0]}] timestep; got {tuple(timestep.shape)}."
             )
 
         rotary_emb = self.rope(grid, hidden_states.device)
@@ -353,10 +363,9 @@ class Wan22DiT(nn.Module):
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
-        # bf16 temb promotes), then project and unpatchify.
-        shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
-        shift, scale = shift.squeeze(2), scale.squeeze(2)
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        # bf16 temb promotes, per frame), then project and unpatchify.
+        shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).unbind(2)
+        _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
