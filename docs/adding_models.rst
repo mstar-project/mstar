@@ -635,10 +635,9 @@ The spec types are:
        fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
        calls it through ``LinearAttnCallable``, ``KDACallable`` or ``Mamba2Callable``
        (``mstar/engine/resources/convenience.py``), which hand the kernels the layer's
-       blocks of the pool, so the layer never names one. A KDA pool built with
-       ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
-       (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
-       settles each one's accepted drafts. The layers are shared:
+       blocks of the pool, so the layer never names one. GDN runs draft-verify steps as
+       it is; KDA needs its pool built with ``DeltaNetGeometry.to_blocks(max_drafts=k)``;
+       see `Draft-verify decoding`_. The layers are shared:
        ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
        (``mstar/model/components/distributed/``, over ``KDAConfig``; Kimi K3's full-rank
        output gate is ``full_rank_output_gate``).
@@ -1375,8 +1374,13 @@ over the block, so a captured step records the settle too. ``with_draft_verify``
 ``verify=True`` on every step of the submodule's with a ``verify`` field. The GDN resource
 is one: under ``LinearAttnStep(verify=True)`` it runs each block from the slot without
 writing the state, and its settle runs the block again from the slot with every rejected
-token's gates closed, which leaves the state and conv window after the kept prefix. The
-recurrent pool is storage (``NONE``); a backend that can't settle (Mamba-2 so far) declares
+token's gates closed, which leaves the state and conv window after the kept prefix. KDA
+replays instead: a ``RecurrentStateSpec`` pool built with
+``DeltaNetGeometry.to_blocks(max_drafts=k)`` keeps its ``state`` as a checkpoint before the
+last block's kept tokens and that block's inputs in its verify blocks, the next verify step
+replays the kept ones before it runs its own block, and the pool is the ``DEVICE`` resource
+that settles how many. Any other recurrent pool is storage (``NONE``). A KDA resource on a
+pool without verify blocks, and a backend that can't settle (Mamba-2 so far), declare
 nothing. A resource that declares no ``rewind_kind`` keeps the node from loading, as does a
 combined walk over the verifying walk or a prefix-cache key on its labels.
 

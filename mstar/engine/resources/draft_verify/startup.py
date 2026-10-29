@@ -53,7 +53,8 @@ def verify_walk(
         raise ValueError(
             f"{where}, but {undeclared} declare no rewind_kind, so a verify step's rejected rows "
             "would stay in them; draft verify rewinds paged KV and sequential positions, and "
-            "settles GDN state, so far"
+            "settles GDN state, and KDA state on a pool with verify blocks "
+            "(DeltaNetGeometry.to_blocks(max_drafts=k)), so far"
         )
     if walk in combined_walks:
         raise ValueError(
@@ -69,6 +70,8 @@ def verify_walk(
     for res in resources.values():
         if res.rewind_kind is RewindKind.HOST and hasattr(res, "require_lookahead"):
             res.require_lookahead(policy.loop, policy.lookahead)
+        if res.rewind_kind is RewindKind.DEVICE and hasattr(res, "require_max_drafts"):
+            res.require_max_drafts(policy.max_drafts)
     dv.bind_sampler(sampler)
     dv.bind_settlers([res for res in resources.values() if res.rewind_kind is RewindKind.DEVICE])
     return VerifyWalk(dv, policy, dv.sampler_key)

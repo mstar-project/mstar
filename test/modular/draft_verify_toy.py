@@ -8,7 +8,10 @@ attention skipped, so the target agrees with it often but not always. ``corrupt`
 wrong token at every position divisible by it, and ``skew`` at some others on ranks above 0, so
 a test controls where verify steps reject; ``oracle``, one request's whole stream by position,
 drafts every token right. With ``sampled_drafts`` the head samples its drafts instead
-(``draft_sample``) and hands verify the distributions they came from.
+(``draft_sample``) and hands verify the distributions they came from. With ``linear="kda"`` a
+Kimi delta attention layer runs ahead of the attention layers, on a recurrent pool with verify
+blocks, through the torch reference kernels: a verify step leaves its state for the engine to
+settle.
 
 ``ToyAttention`` is a dense reference over the KV resource's pages for CPU runs; on a GPU the
 toy runs the FlashInfer attention resource, which a graph can capture.
@@ -50,13 +53,34 @@ from mstar.engine.resources import (
     with_draft_verify,
 )
 from mstar.engine.resources.base import AttentionResource, RewindKind
-from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.resources.convenience import AttentionCallable, KDACallable
 from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
+from mstar.engine.resources.linear_attn.config import (
+    LinearAttnBackend,
+    LinearAttnConfig,
+    LinearAttnSpec,
+    LinearAttnStep,
+    LinearAttnVariant,
+)
+from mstar.engine.resources.linear_attn.kda import KDAParams
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
+from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStep,
+)
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, BatchedModelOutput
 
 VOCAB, HIDDEN, HEADS, HEAD_DIM, LAYERS, MAX_POS, PAGE = 64, 128, 2, 64, 2, 512, 4
 KV, ATTN, POS, SAMPLER, DV = "kv", "attn", "pos", "sampler", DRAFT_VERIFY
+# the KDA layer's pool and resource, and its geometry
+STATE, LIN = "state", "lin"
+KDA_HEADS, KDA_DIM, KDA_CONV = 2, 16, 4
+# The KDA layer's residual weight. Its raw output is about 1e-3 of the residual (unit q and
+# k over 16 channels, scaled by 1/4), so it takes this much for its state to move the stream.
+KDA_SCALE = 400.0
 NODE = "llm"
 STOP = 15  # the toy's stop token, which some of its streams reach mid-block
 # weights whose reference streams keep their top two logits 0.015 or more apart, so a run
@@ -154,20 +178,53 @@ class _Block(nn.Module):
         return self.mlp(x + self.attn_scale * self.o(out))
 
 
+class _KDALayer(nn.Module):
+    """A Kimi delta attention layer over the node's recurrent pool, with a residual."""
+
+    def __init__(self):
+        super().__init__()
+        p = KDA_HEADS * KDA_DIM
+        # q | k | v pre-conv, the full-rank forget gate, beta
+        self.in_proj = nn.Linear(HIDDEN, 4 * p + KDA_HEADS, bias=False)
+        self.conv = nn.Parameter(torch.empty(3 * p, KDA_CONV))
+        self.A_log = nn.Parameter(torch.empty(KDA_HEADS))
+        self.dt_bias = nn.Parameter(torch.empty(p))
+        self.out = nn.Linear(p, HIDDEN, bias=False)
+
+    def forward(self, x, mix: KDACallable):
+        p = KDA_HEADS * KDA_DIM
+        qkv, g, beta = self.in_proj(x).split([3 * p, p, KDA_HEADS], -1)
+        params = KDAParams(
+            conv_weight=self.conv, A_log=self.A_log.float(), dt_bias=self.dt_bias.float(),
+            lower_bound=-5.0, num_heads=KDA_HEADS, head_dim=KDA_DIM, scale=KDA_DIM ** -0.5,
+        )
+        out = mix(qkv, g, beta, params, layer_idx=0)
+        return x + KDA_SCALE * self.out(out.reshape(x.shape[0], p).to(x.dtype))
+
+
 class ToySubmodule(ARNodeSubmodule):
     """``k`` drafts per verify step; ``k=0`` decodes one token a step through the sampler."""
 
     def __init__(self, k: int = 3, corrupt: int = 0, skew: int = 0, attn_scale: float = 0.6,
-                 seed: int = SEED, capture_batch_sizes=(1, 2, 4), sampled_drafts: bool = False):
+                 seed: int = SEED, capture_batch_sizes=(1, 2, 4), sampled_drafts: bool = False,
+                 linear: str | None = None):
         super().__init__()
         gen = torch.Generator().manual_seed(seed)
         self.embed = nn.Embedding(VOCAB, HIDDEN)
         self.pos_emb = nn.Embedding(MAX_POS, HIDDEN)
         self.blocks = nn.ModuleList(_Block(attn_scale) for _ in range(LAYERS))
         self.lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
+        if linear not in (None, "kda"):
+            raise ValueError(f"the toy's linear layer is 'kda' or None, not {linear!r}")
+        self.linear = linear
+        # last, so the other weights draw what they draw without it
+        self.kda = _KDALayer() if linear == "kda" else None
         for name, p in self.named_parameters():
             std = 1.0 if name.startswith(("embed", "pos_emb")) else 0.4
             p.data = torch.randn(p.shape, generator=gen) * std / (1 if "embed" in name else p.shape[-1] ** 0.5)
+        if self.kda is not None:
+            # a slow forget gate, so a token's write outlives a few steps
+            self.kda.dt_bias.data -= 3.0
         self.k, self.corrupt, self.skew = k, corrupt, skew
         self.sampled_drafts = sampled_drafts
         self.rank = 0
@@ -177,6 +234,7 @@ class ToySubmodule(ARNodeSubmodule):
         self.attn_dtype: torch.dtype | None = None
         self.capture_batch_sizes = list(capture_batch_sizes)
         self.attend = None
+        self.mix: KDACallable | None = None
 
     @property
     def block(self) -> int:
@@ -185,6 +243,10 @@ class ToySubmodule(ARNodeSubmodule):
     def bind_node_resources(self, resources):
         super().bind_node_resources(resources)
         self.attend = AttentionCallable(kv=resources[KV], attn=resources[ATTN])
+        if self.kda is not None:
+            # the reference kernels on any device; the fused ones need the low-rank gates
+            resources[LIN].set_kernels(TorchKDAKernels())
+            self.mix = KDACallable(resources[STATE], resources[LIN])
 
     def get_draft_policy(self, graph_walk):
         if graph_walk != "decode" or not self.k:
@@ -202,6 +264,8 @@ class ToySubmodule(ARNodeSubmodule):
 
     def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, **kwargs):
         steps = {KV: KVStep(), ATTN: AttentionStep(causal=True), POS: PositionStep()}
+        if self.kda is not None:
+            steps[STATE], steps[LIN] = RecurrentStep(), LinearAttnStep()
         policy = self.get_draft_policy(graph_walk)
         if policy is None:
             steps[SAMPLER] = SamplerStep(apply_penalty=False)
@@ -221,6 +285,9 @@ class ToySubmodule(ARNodeSubmodule):
 
     def _trunk(self, ids, positions):
         x = self.embed(ids) + self.pos_emb(positions)
+        if self.kda is not None:
+            self.mix.bind_step("main")
+            x = self.kda(x, self.mix)
         self.attend.bind_step("main")
         for i, block in enumerate(self.blocks):
             self.attend.set_layer_idx(i)
@@ -296,10 +363,13 @@ class ToySubmodule(ARNodeSubmodule):
 
 def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True,
           kv_heads: int = HEADS, sampled_verify: bool = False,
-          argmax_prefill: bool | None = None) -> list[NodeResourceSpec]:
+          argmax_prefill: bool | None = None, linear: str | None = None,
+          verify_blocks: int = 0,
+          conv_dtype: torch.dtype = torch.float32) -> list[NodeResourceSpec]:
     # ``kv_heads`` before sharding: a lockstep test gives each rank every head.
     # ``argmax_prefill``: the prefill's token is the argmax, so it draws nothing (on CPU always,
-    # where the real draw has no kernel).
+    # where the real draw has no kernel). ``verify_blocks``: the k the KDA pool's verify
+    # blocks hold (``linear="kda"``).
     kv_config = PagedKVConfig(
         num_layers=LAYERS, num_kv_heads=kv_heads, head_dim=HEAD_DIM,
         max_seq_len=MAX_POS, max_num_pages=max_num_pages, page_size=PAGE,
@@ -320,6 +390,18 @@ def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True
             kv_cache=KV, backend=AttnBackend(attn))))
     if draft_verify:
         out.append(DraftVerifySpec(resource_key=DV, nodes={NODE}, sampler=SAMPLER))
+    if linear == "kda":
+        # a head count a lockstep test's two ranks can split
+        heads = KDA_HEADS * kv_heads // HEADS
+        geometry = DeltaNetGeometry(heads, heads, KDA_DIM, KDA_DIM, KDA_CONV)
+        out.append(RecurrentStateSpec(resource_key=STATE, nodes={NODE}, config=RecurrentStateConfig(
+            num_layers=1, max_slots=8,
+            blocks=geometry.to_blocks(conv_dtype=conv_dtype, max_drafts=verify_blocks),
+        )))
+        out.append(LinearAttnSpec(resource_key=LIN, nodes={NODE}, config=LinearAttnConfig(
+            recurrent_state=STATE, variant=LinearAttnVariant.KDA, backend=LinearAttnBackend.TRITON,
+            gate_lower_bound=-5.0,
+        )))
     return out
 
 
@@ -375,6 +457,8 @@ def engine(sub: ToySubmodule, device, attn: str = "toy", comm=None, warmup: bool
     kv_dtype = kv_dtype or dtype
     sub.attn_dtype = kv_dtype
     eng = Engine(None, autocast_dtype=None)
+    if sub.linear is not None:
+        spec_kwargs = {"linear": sub.linear, "verify_blocks": sub.k, "conv_dtype": dtype, **spec_kwargs}
     eng.load_model(
         submodules={NODE: sub}, specs=specs(attn, draft_verify=bool(sub.k), **spec_kwargs),
         parallel_groups=_Group(comm), device=device,
