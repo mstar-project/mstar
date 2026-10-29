@@ -231,18 +231,20 @@ class KindPack:
     tar_bytes: int
 
 
-def pack(root: Path, key: StackKey, dirs: dict[str, Path], note: str | None = None,
-         log: Callable[[str], None] = print) -> tuple[Path, list[KindPack]]:
-    """Add the caches in ``dirs`` to ``key``'s bundle under ``root``: new files,
-    and files whose size or mtime differ from the bundle's last copy (MIOpen
-    rewrites its databases in place; Inductor and Triton entries never change).
-    Run it with no server writing to the caches."""
+def pack(root: Path, key: StackKey, dirs: dict[str, Path], kinds: list[str] | None = None,
+         note: str | None = None, log: Callable[[str], None] = print) -> tuple[Path, list[KindPack]]:
+    """Add the caches in ``dirs`` (``kinds`` of them, default all) to ``key``'s
+    bundle under ``root``: new files, and files whose size or mtime differ from
+    the bundle's last copy (MIOpen rewrites its databases in place; Inductor and
+    Triton entries never change). Run it with no server writing to the caches."""
     bundle = root / key.path
     bundle.mkdir(parents=True, exist_ok=True)
     out = []
     with _locked(bundle / LOCK):
         manifest = read_manifest(bundle) or {"key": asdict(key), "created": _now(), "kinds": {}, "history": []}
         for kind, src in dirs.items():
+            if kinds is not None and kind not in kinds:
+                continue
             if not src.is_dir():
                 log(f"{kind}: {src} does not exist, left out")
                 continue

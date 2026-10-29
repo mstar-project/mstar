@@ -37,14 +37,13 @@ def _pack(args: argparse.Namespace) -> None:
     from mstar.utils import compile_bundle
 
     dirs = compile_bundle.cache_dirs()
-    if args.kinds:
-        wanted = args.kinds.split(",")
-        unknown = sorted(set(wanted) - set(dirs))
-        if unknown:
-            sys.exit(f"error: no {', '.join(unknown)} cache here; kinds here: {', '.join(dirs)}")
-        dirs = {k: v for k, v in dirs.items() if k in wanted}
+    kinds = args.kinds.split(",") if args.kinds else None
+    unknown = sorted(set(kinds or ()) - set(dirs))
+    if unknown:
+        sys.exit(f"error: no {', '.join(unknown)} cache here; kinds here: {', '.join(dirs)}")
     t0 = time.monotonic()
-    bundle, _ = compile_bundle.pack(Path(args.root), compile_bundle.stack_key(), dirs, note=args.note)
+    bundle, _ = compile_bundle.pack(Path(args.root), compile_bundle.stack_key(), dirs, kinds=kinds,
+                                    note=args.note)
     print(f"packed into {bundle} in {time.monotonic() - t0:.1f} s")
 
 
