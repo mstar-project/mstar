@@ -95,8 +95,12 @@ class Bench:
                 results[name] = f"{type(exc).__name__}: {exc}"[:500]
         runs: dict[str, list[float]] = {name: [] for name in runners}
         for _ in range(self.rounds):
-            for name, (run, _, _) in runners.items():
-                runs[name].append(run() * 1e3 / calls)
+            for name, (run, _, _) in list(runners.items()):
+                try:
+                    runs[name].append(run() * 1e3 / calls)
+                except Exception as exc:  # noqa: BLE001  the others keep their rounds
+                    results[name] = f"{type(exc).__name__}: {exc}"[:500]
+                    del runners[name]
         for name, (_, captured, note) in runners.items():
             results[name] = Timing(
                 us=statistics.median(runs[name]), runs_us=runs[name], captured=captured, calls=calls,
