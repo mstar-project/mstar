@@ -7,7 +7,12 @@ but not their best tiles). Inside, configs are keyed by the op's shape class::
 
     {"kernel": "rms_norm", "arch": "gfx942", "product": null,
      "classes": {"decode": {"num_warps": 4}, "default": {"num_warps": 8}},
+     "shapes": {"rows1-hidden4096": {"num_warps": 2}},
      "provenance": {"job": "...", "sha": "...", "stack": "..."}}
+
+The optional ``shapes`` table holds entries for single shapes (keyed by
+``shape_key``), for the shapes a class's one setting serves badly; a shape
+entry wins over its class's.
 
 The kernel harness (``benchmark/kernels``) writes these from its results
 store; a config is promoted only after a model-level A/B.
@@ -58,10 +63,21 @@ def load_config(
     return None
 
 
-def select(config: Mapping[str, Any] | None, shape_class: str | None) -> Mapping[str, Any] | None:
-    """The entry for ``shape_class``, else the config's ``default``."""
+def shape_key(shape: Mapping[str, int]) -> str:
+    """``{"rows": 1, "hidden": 4096}`` -> ``"rows1-hidden4096"``, in the shape's
+    dimension order."""
+    return "-".join(f"{name}{value}" for name, value in shape.items())
+
+
+def select(
+    config: Mapping[str, Any] | None, shape_class: str | None, shape: Mapping[str, int] | None = None,
+) -> Mapping[str, Any] | None:
+    """The entry for ``shape`` itself, else for ``shape_class``, else the
+    config's ``default``."""
     if config is None:
         return None
+    if shape is not None and (entry := config.get("shapes", {}).get(shape_key(shape))) is not None:
+        return entry
     classes = config["classes"]
     if shape_class is not None and shape_class in classes:
         return classes[shape_class]
