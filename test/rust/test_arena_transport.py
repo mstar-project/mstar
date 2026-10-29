@@ -12,7 +12,11 @@ pytest.importorskip("mstar_rust")
 
 from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import CommProtocol
-from mstar.communication.tensor_store import RustTensorBookkeeping, TensorStore
+from mstar.communication.tensor_store import (
+    PythonTensorBookkeeping,
+    RustTensorBookkeeping,
+    TensorStore,
+)
 from mstar.communication.tensors import (
     SharedMemoryCommunicationManager,
     create_tensor_communication_manager,
@@ -1148,3 +1152,257 @@ def test_segments_are_pinned_through_the_platform(monkeypatch):
     assert arena_mod._pin(0x1000, 4096)
     assert arena_mod._unpin(0x1000)
     assert calls == [("register", 0x1000, 4096), ("unregister", 0x1000)]
+
+
+# --- a step's small device tensors share one arena slot ---------------------
+
+@pytest.fixture
+def host_rows_share(monkeypatch):
+    """A CPU manager has no device tensors; let its host ones take the shared
+    path, which is the same code apart from the copy's direction."""
+    from mstar.communication import arena as arena_mod
+
+    monkeypatch.setattr(
+        ArenaShmCommunicationManager, "_shares_slot",
+        staticmethod(lambda t: 0 < t.nbytes <= arena_mod._SHARED_SLOT_MAX_TENSOR))
+    return arena_mod
+
+
+def _stage_rows(prod, n_rows=8, rid0=100):
+    """One decode-like step: per request a state row, an odd-sized mask and a
+    token row, registered in one uuid-driven call."""
+    sent = {}
+    for r in range(n_rows):
+        rid = rid0 + r
+        sent[rid] = {
+            "state": [torch.randn(4, 8) + r],
+            "mask": [torch.tensor([r % 2 == 0, True, False])],
+            "codes": [torch.arange(16, dtype=torch.int64) * r],
+        }
+    infos = {rid: prod.store_and_return_tensor_info(rid, t) for rid, t in sent.items()}
+    prod.register_for_send_uuids(ParallelList(
+        list(infos), [[i.uuid for il in by.values() for i in il] for by in infos.values()]))
+    return sent, infos
+
+
+def _read_back(prod, cons, sent, infos):
+    for rid, by_name in infos.items():
+        edges = [GraphEdge(next_node="B", name=name, tensor_info=[
+            prod.tensor_store.get_info(i.uuid) for i in il]) for name, il in by_name.items()]
+        cons.start_read_tensors(rid, edges)
+        for name, il in by_name.items():
+            for original, info in zip(sent[rid][name], il, strict=True):
+                assert torch.equal(cons.tensor_store.get_tensor(info.uuid), original), (rid, name)
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_a_steps_small_rows_share_one_slot_and_read_back_per_row(tmp_path, host_rows_share, backend):
+    prod = _manager(f"share_{backend}", tmp_path)
+    if backend == "rust":
+        prod.tensor_store = TensorStore(RustTensorBookkeeping())
+    cons = _manager(f"share_cons_{backend}", tmp_path)
+    sent, infos = _stage_rows(prod)
+
+    placed = [prod.tensor_store.get_info(i.uuid) for by in infos.values() for il in by.values() for i in il]
+    assert len({p.shm_segment for p in placed}) == 1
+    assert len({p.shm_offset for p in placed}) == len(placed)
+    assert all(p.shm_offset % 16 == 0 for p in placed)
+    # one reservation for the 24 rows, each holding a share of it
+    assert list(prod._slot_refs.values()) == [len(placed)]
+    assert len(set(prod._arena_locs.values())) == 1
+    _read_back(prod, cons, sent, infos)
+
+
+def test_a_shared_slot_is_freed_with_its_last_row(tmp_path, host_rows_share):
+    prod = _manager("share_free", tmp_path)
+    free_before = prod.stats_summary()["free_bytes"]
+    _, infos = _stage_rows(prod, n_rows=4)
+    uuids = [i.uuid for by in infos.values() for il in by.values() for i in il]
+    held = prod.stats_summary()["free_bytes"]
+    assert held < free_before
+
+    prod.cleanup_collectable(uuids[:-2], [True] * (len(uuids) - 2))
+    prod._cleanup_by_uuid(uuids[-2])
+    assert prod.stats_summary()["free_bytes"] == held, "freed while a row still lives"
+    assert list(prod._slot_refs.values()) == [1]
+    prod._cleanup_by_uuid(uuids[-1])
+    assert prod.stats_summary()["free_bytes"] == free_before
+    assert not prod._slot_refs and not prod._arena_locs
+
+
+def test_a_shared_slot_holds_at_most_its_cap(tmp_path, host_rows_share, monkeypatch):
+    monkeypatch.setattr(host_rows_share, "_SHARED_SLOT_MAX_BYTES", 512)
+    prod = _manager("share_cap", tmp_path)
+    cons = _manager("share_cap_cons", tmp_path)
+    sent, infos = _stage_rows(prod)
+    assert len(prod._slot_refs) > 1
+    # a slot left with a single row is that row's own, not a shared one
+    own = {loc for loc in prod._arena_locs.values() if loc not in prod._slot_refs}
+    assert sum(prod._slot_refs.values()) + len(own) == len(prod._arena_locs) == 24
+    _read_back(prod, cons, sent, infos)
+
+
+def test_rows_too_big_to_share_keep_a_slot_each(tmp_path, host_rows_share, monkeypatch):
+    monkeypatch.setattr(host_rows_share, "_SHARED_SLOT_MAX_TENSOR", 64)
+    prod = _manager("share_big", tmp_path)
+    cons = _manager("share_big_cons", tmp_path)
+    sent, infos = _stage_rows(prod, n_rows=3)
+    # the 3-byte masks share a slot; the 128-byte state and code rows do not
+    assert list(prod._slot_refs.values()) == [3]
+    assert len(set(prod._arena_locs.values())) == 1 + 6
+    _read_back(prod, cons, sent, infos)
+
+
+def test_a_saturated_arena_spills_shared_rows_one_by_one(tmp_path, host_rows_share, monkeypatch):
+    prod = _manager("share_spill", tmp_path)
+    cons = _manager("share_spill_cons", tmp_path)
+    monkeypatch.setattr(prod, "_reserve", lambda nbytes: None)
+    sent, infos = _stage_rows(prod, n_rows=2)
+    assert not prod._slot_refs and not prod._arena_locs
+    assert len(prod._shm_files) == 6
+    _read_back(prod, cons, sent, infos)
+
+
+def test_ttl_reclaims_a_shared_slot_with_its_last_row(tmp_path, host_rows_share, monkeypatch):
+    prod = _manager("share_ttl", tmp_path)
+    free_before = prod.stats_summary()["free_bytes"]
+    _stage_rows(prod, n_rows=2)
+    prod._slot_ttl_s = 1e-9
+    assert prod._reclaim_expired() == 6
+    assert prod.stats_summary()["free_bytes"] == free_before
+    assert not prod._slot_refs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("read_batch", [False, True])
+def test_device_rows_share_a_slot_through_one_gather_and_copy(tmp_path, read_batch):
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    prod = ArenaShmCommunicationManager(
+        my_entity_id="share_gpu", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    cons = ArenaShmCommunicationManager(
+        my_entity_id="share_gpu_cons", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    batch = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
+    sent = {rid: {"state": [batch[rid]], "codes": [torch.arange(16, device="cuda") + rid]} for rid in range(8)}
+    infos = {rid: prod.store_and_return_tensor_info(rid, t) for rid, t in sent.items()}
+    prod.register_for_send_uuids(ParallelList(
+        list(infos), [[i.uuid for il in by.values() for i in il] for by in infos.values()]))
+    assert list(prod._slot_refs.values()) == [16]
+    futures = []
+    if read_batch:
+        cons.begin_read_batch()
+    for rid, by_name in infos.items():
+        futures += cons.start_read_tensors(rid, [GraphEdge(
+            next_node="B", name=n, tensor_info=[prod.tensor_store.get_info(i.uuid) for i in il])
+            for n, il in by_name.items()])
+    if read_batch:
+        assert futures == []
+        futures = cons.end_read_batch()
+        assert len(futures) == 1
+        # the slot's 16 rows came up in one copy
+        assert len({cons.tensor_store.get_tensor(il[0].uuid).untyped_storage().data_ptr()
+                    for by in infos.values() for il in by.values()}) == 1
+    for f in futures:
+        f.result(timeout=30)
+    assert set(cons.get_ready_tensors()) == set(infos)
+    for rid, by_name in infos.items():
+        for name, il in by_name.items():
+            assert torch.equal(cons.tensor_store.get_tensor(il[0].uuid), sent[rid][name][0])
+
+
+# --- a consumer's read batch shares copies across requests ------------------
+
+def _consumer(entity, tmp_path, backend="python"):
+    m = _manager(entity, tmp_path)
+    m.communicator = _RecordingCommunicator()
+    m.tensor_store = TensorStore(
+        RustTensorBookkeeping() if backend == "rust" else PythonTensorBookkeeping())
+    return m
+
+
+def _edges(prod, by_name):
+    return [GraphEdge(next_node="B", name=name, tensor_info=[
+        prod.tensor_store.get_info(i.uuid) for i in il]) for name, il in by_name.items()]
+
+
+def _ref_count(mgr, uuid):
+    return mgr.tensor_store.bookkeeping._ref_info[uuid].ref_cnt
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_batched_reads_store_what_unbatched_reads_do(tmp_path, host_rows_share, backend):
+    prod = _manager(f"rb_prod_{backend}", tmp_path)
+    sent, infos = _stage_rows(prod)
+    plain = _consumer(f"rb_plain_{backend}", tmp_path, backend)
+    batched = _consumer(f"rb_batch_{backend}", tmp_path, backend)
+
+    for rid, by_name in infos.items():
+        plain.start_read_tensors(rid, _edges(prod, by_name))
+    batched.begin_read_batch()
+    for rid, by_name in infos.items():
+        assert batched.start_read_tensors(rid, _edges(prod, by_name)) == []
+    some = next(iter(infos[100].values()))[0].uuid
+    assert not batched.tensor_store.check_uuid_presence(some), "deferred until the batch ends"
+    assert batched.end_read_batch() == []  # host copies: nothing to wait on
+    assert not batched._deferred.reads
+
+    for rid, by_name in infos.items():
+        for name, il in by_name.items():
+            for original, info in zip(sent[rid][name], il, strict=True):
+                for mgr in (plain, batched):
+                    assert torch.equal(mgr.tensor_store.get_tensor(info.uuid), original)
+                if backend == "python":
+                    assert _ref_count(batched, info.uuid) == _ref_count(plain, info.uuid) == 2
+    # the 24 rows of the producer's one slot came up in one copy
+    assert len({batched.tensor_store.get_tensor(i.uuid).untyped_storage().data_ptr()
+                for by in infos.values() for il in by.values() for i in il}) == 1
+    # readiness and acks as without the batch
+    assert batched.get_ready_tensors().keys() == plain.get_ready_tensors().keys() == infos.keys()
+    acked = [(dst, m.body.successful_tensors) for dst, m in batched.communicator.sent]
+    assert acked == [(dst, m.body.successful_tensors) for dst, m in plain.communicator.sent]
+
+
+def test_a_tensor_read_twice_in_a_batch_is_stored_once_with_both_reads_refs(tmp_path, host_rows_share):
+    prod = _manager("rb2_prod", tmp_path)
+    _, infos = _stage_rows(prod, n_rows=2)
+    cons = _consumer("rb2_cons", tmp_path)
+    cons.begin_read_batch()
+    for _ in range(2):
+        cons.start_read_tensors(100, _edges(prod, infos[100]))
+    cons.end_read_batch()
+    uuid = infos[100]["state"][0].uuid
+    assert _ref_count(cons, uuid) == 3  # +1 transit, +1 usage, +1 for the second read
+    assert len(cons.pending) == 2 * len(infos[100])
+
+
+def test_a_row_not_aligned_for_its_dtype_reads_back_whole(tmp_path):
+    prod = _manager("rb3_prod", tmp_path)
+    raw = torch.arange(9, dtype=torch.uint8)
+    infos = prod.store_and_return_tensor_info(1, {"raw": [raw]})
+    prod.register_for_send(1, infos["raw"])
+    odd = prod.tensor_store.get_info(infos["raw"][0].uuid).clone()
+    odd.uuid, odd.offset, odd.nbytes, odd.dims, odd.dtype = odd.uuid + 1, 1, 8, [4], torch.int16
+    cons = _consumer("rb3_cons", tmp_path)
+    cons.begin_read_batch()
+    cons.start_read_tensors(1, [GraphEdge(next_node="B", name="raw", tensor_info=[odd])])
+    cons.end_read_batch()
+    assert torch.equal(cons.tensor_store.get_tensor(odd.uuid), raw[1:].clone().view(torch.int16))
+
+
+def test_teardown_inside_a_batch_acks_the_reads_it_deferred(tmp_path, host_rows_share):
+    prod = _manager("rb4_prod", tmp_path)
+    _, infos = _stage_rows(prod, n_rows=2)
+    cons = _consumer("rb4_cons", tmp_path)
+    cons.register_request(100, ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}))
+    cons.begin_read_batch()
+    cons.start_read_tensors(100, _edges(prod, infos[100]))
+    cons.start_read_tensors(101, _edges(prod, infos[101]))
+    assert not cons.has_inflight_reads(100)  # host reads land in the flush
+    cons.cleanup_request(100)
+    acked = {u for _, m in cons.communicator.sent for u in m.body.successful_tensors}
+    assert acked == {il[0].uuid for il in infos[100].values()}
+    assert [fp.request_id for fp in cons.pending] == [101] * 3
+    cons.end_read_batch()
+    assert [fp.request_id for fp in cons.pending] == [101] * 3

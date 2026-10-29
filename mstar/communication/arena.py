@@ -11,7 +11,11 @@ gated by a CUDA-event future so an edge is never ACKed before its copies
 land. Segments are mapped once and never move, so the one-time host
 registration per segment (``Platform.host_register``, within
 ``MSTAR_SHM_ARENA_PIN_MAX_MB``) holds for its lifetime and keeps the
-side-stream copies truly async.
+side-stream copies truly async. A step's small device tensors share one slot,
+filled by one gather and one D2H copy (``_stage_shared``); placement stays per
+tensor, so only reclaim knows. A consumer reading inside a read batch
+(``begin_read_batch``) copies each contiguous run of a peer segment up once
+and hands out its rows as views (``_flush_reads``).
 
 Capacity degrades in layers: grow by segments up to
 ``MSTAR_SHM_ARENA_MAX_SEGMENTS`` (or until /dev/shm cannot back another
@@ -63,6 +67,62 @@ from mstar.platforms import current_platform
 from mstar.utils.containers import ParallelList
 
 logger = logging.getLogger(__name__)
+
+# Device tensors up to this size, staged by one call, share an arena slot: one
+# gather kernel and one D2H copy for all of them instead of a copy (and a
+# 256-byte-aligned reservation) each.
+_SHARED_SLOT_MAX_TENSOR = 1 << 20
+# A shared slot is freed with its last row, so this bounds what one long-held
+# row (a persisted output, a slow consumer) keeps reserved.
+_SHARED_SLOT_MAX_BYTES = 8 << 20
+# Rows start at a multiple of this inside a slot: any dtype's size, so the
+# consumer's view of a row as its dtype is aligned.
+_SHARED_SLOT_ROW_ALIGN = 16
+# A read batch copies rows of one peer segment up together when they are at
+# most this far apart (one producer slot's rows are 16 bytes apart at most,
+# separate slots' a reservation's 256-byte alignment)...
+_READ_RUN_MAX_GAP = 4096
+# ...into one device buffer of at most this size, which every row read from it
+# keeps alive.
+_READ_RUN_MAX_BYTES = 8 << 20
+
+
+class _SlotRows(NamedTuple):
+    """Device tensors waiting for a shared slot, as index-parallel columns."""
+
+    request_ids: list[Rid]
+    uuids: list[int]
+    tensors: list[torch.Tensor]
+
+    @classmethod
+    def empty(cls) -> "_SlotRows":
+        return cls([], [], [])
+
+    def add(self, request_id: Rid, uuid: int, tensor: torch.Tensor) -> None:
+        self.request_ids.append(request_id)
+        self.uuids.append(uuid)
+        self.tensors.append(tensor)
+
+
+class _DeferredReads(NamedTuple):
+    """A read batch's arena reads waiting for ``_flush_reads``.
+
+    ``request_ids`` and ``infos`` are index-parallel, one entry per tensor to
+    copy up. ``extra_refs`` counts, per such uuid, the batch's later reads of
+    the same tensor, which take a reference once it is stored. ``reads`` is
+    every edge read in the batch, each waiting for the batch's future.
+    """
+
+    request_ids: list[Rid]
+    infos: list[TensorPointerInfo]
+    extra_refs: dict[int, int]
+    reads: list[FutureAndPointers]
+
+    def clear(self) -> None:
+        self.request_ids.clear()
+        self.infos.clear()
+        self.extra_refs.clear()
+        self.reads.clear()
 
 
 class _Placements(NamedTuple):
@@ -330,10 +390,14 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # unregister finalizer below.
         self._own_pinned: list[int] = []
         self._sync_segments()
-        # uuid -> (segment_idx, offset) for sender-side reclaim.
+        # uuid -> (segment_idx, offset) of its slot, for sender-side reclaim.
         # (register_for_send receives the TensorPointerInfos directly and
         # stamps them in place — no side-table needed.)
         self._arena_locs: dict[int, tuple[int, int]] = {}
+        # Shared slot -> rows not yet reclaimed; a slot not in here has one
+        # tensor. Only the worker's main thread stages shared slots and
+        # reclaims them, so the counts need no lock.
+        self._slot_refs: dict[tuple[int, int], int] = {}
         # uuid -> stage time, for the TTL backstop: a request aborted after
         # staging but before every consumer ACKs defers reclaim forever
         # (cleanup_request waits for ACKs that will never come). A slot
@@ -355,6 +419,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # bound on any long-lived consumer.
         self._peer_segments: dict[str, tuple[object, memoryview, int]] = {}
         self._peer_evict_last = 0.0
+        # Read batch (begin_read_batch .. end_read_batch): worker main thread
+        # only. Futures of flushes the batch's end has not returned yet.
+        self._read_batch_open = False
+        self._deferred = _DeferredReads([], [], {}, [])
+        self._deferred_h2d = False
+        self._flushed_futures: list[Future] = []
         # Unregister before the arenas unmap (close(), or when the manager
         # is collected). Not at interpreter exit: the driver drops every
         # registration with the process.
@@ -479,7 +549,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 continue
             self._arena_ts.pop(uuid, None)
             if (loc := self._arena_locs.pop(uuid, None)) is not None:
-                self._arena.free(*loc)
+                self._free_slot(loc)
                 n += 1
             if (path := self._shm_files.pop(uuid, None)) is not None:
                 try:
@@ -511,6 +581,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # live_slots/spill_files climbing while requests finish = reclaim
         # being deferred (e.g. aborts without ACKs) — the soak's leak canary.
         st["live_slots"] = len(self._arena_locs)
+        st["shared_slots"] = len(self._slot_refs)
         st["spill_files"] = len(self._shm_files)
         logger.info("ARENA stats: %s", st)
 
@@ -536,7 +607,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # _reads_active > 1: another thread may have queued an async H2D
         # copy whose future hasn't reached `pending` yet — unmapping under
         # it would be a use-after-free. Only the sole active reader evicts.
-        if (self.pending or self._reads_active > 1
+        # Deferred reads have not even been copied yet.
+        if (self.pending or self._reads_active > 1 or self._deferred.reads
                 or now - self._peer_evict_last < 10.0):
             return
         self._peer_evict_last = now
@@ -643,17 +715,20 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: Rid, uuid: int,
         info_arg: TensorPointerInfo | None,
         placements: _Placements,
+        tensor: torch.Tensor | None = None,
     ) -> bool:
         """Stage one tensor into the arena. Returns whether a D2H was queued.
 
         The caller owns the CUDA sync, the ``_d2h_ctx`` context and the
         trailing stream sync, so a batch pays for each of those once -- and
         the writeback of ``placements``, which is why they are collected here
-        rather than stored one at a time.
+        rather than stored one at a time. A caller that passes ``tensor`` has
+        already checked the uuid is unregistered and fetched its send source.
         """
-        if self.tensor_store.is_registered(uuid):
-            return False
-        tensor = self._send_source(uuid)
+        if tensor is None:
+            if self.tensor_store.is_registered(uuid):
+                return False
+            tensor = self._send_source(uuid)
         t0 = time.perf_counter()
         t = tensor.detach().contiguous()
         nbytes = t.numel() * t.element_size()
@@ -734,6 +809,108 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                      uuid, seg_name, off, nbytes)
         return queued
 
+    @staticmethod
+    def _shares_slot(tensor: torch.Tensor) -> bool:
+        """A device tensor small enough that a copy of its own would cost more
+        in launch than in bytes."""
+        return tensor.is_cuda and 0 < tensor.nbytes <= _SHARED_SLOT_MAX_TENSOR
+
+    def _stage_shared(
+        self, rows: _SlotRows, placements: _Placements,
+    ) -> bool:
+        """Stage device tensors into shared slots, as many rows per slot as
+        ``_SHARED_SLOT_MAX_BYTES`` allows. Returns whether a D2H was queued.
+
+        Each row is placed at its own offset inside the slot, so descriptors,
+        the store's placement columns and consumers are what they would be
+        with a slot per tensor; only reclaim (``_free_slot``) knows."""
+        align = _SHARED_SLOT_ROW_ALIGN
+        queued = False
+        n = len(rows.uuids)
+        start = 0
+        while start < n:
+            offsets: list[int] = []
+            size = 0
+            end = start
+            while end < n:
+                row_off = -(-size // align) * align
+                nbytes = rows.tensors[end].nbytes
+                if end > start and row_off + nbytes > _SHARED_SLOT_MAX_BYTES:
+                    break
+                offsets.append(row_off)
+                size = row_off + nbytes
+                end += 1
+            if end - start == 1:
+                queued |= self._stage_one(
+                    rows.request_ids[start], rows.uuids[start], None,
+                    placements, rows.tensors[start])
+            else:
+                queued |= self._stage_slot(rows, start, offsets, size, placements)
+            start = end
+        return queued
+
+    def _stage_slot(
+        self, rows: _SlotRows, start: int, offsets: list[int], size: int,
+        placements: _Placements,
+    ) -> bool:
+        """One shared slot for rows ``start .. start + len(offsets)``: gather
+        them on the copy stream into one device buffer, laid out as the slot
+        will be, and copy it down once."""
+        end = start + len(offsets)
+        t0 = time.perf_counter()
+        loc = self._reserve(size)
+        if loc is None:
+            # Arena saturated: one at a time, each spilling as it must.
+            queued = False
+            for i in range(start, end):
+                queued |= self._stage_one(
+                    rows.request_ids[i], rows.uuids[i], None, placements,
+                    rows.tensors[i])
+            return queued
+        seg, off = loc
+        try:
+            pieces: list[torch.Tensor] = []
+            cursor = 0
+            for t, row_off in zip(rows.tensors[start:end], offsets, strict=True):
+                if row_off > cursor:  # alignment padding, never read
+                    pieces.append(torch.empty(
+                        row_off - cursor, dtype=torch.uint8, device=t.device))
+                pieces.append(
+                    t.detach().contiguous().reshape(-1).view(torch.uint8))
+                cursor = row_off + t.nbytes
+            host = torch.frombuffer(
+                self._seg_views[seg][off:off + size], dtype=torch.uint8)
+            host.copy_(torch.cat(pieces),
+                       non_blocking=self._d2h_stream is not None)
+        except BaseException:
+            self._arena.free(seg, off)
+            raise
+        now = time.monotonic()
+        locs, stamps = self._arena_locs, self._arena_ts
+        set_metadata = self.tensor_store.set_metadata
+        for uuid, row_off in zip(rows.uuids[start:end], offsets, strict=True):
+            locs[uuid] = loc
+            stamps[uuid] = now
+            placements.add(uuid, seg, off + row_off)
+            set_metadata(uuid, mem_registered=True)
+        self._slot_refs[loc] = end - start
+        if self.enable_prof:
+            dt = (time.perf_counter() - t0) / (end - start)
+            for i in range(start, end):
+                self._record_tx(rows.request_ids[i], rows.uuids[i],
+                                rows.tensors[i].nbytes, dt)
+        return True
+
+    def _free_slot(self, loc: tuple[int, int]) -> None:
+        """Free a tensor's slot, or its share of a shared one."""
+        refs = self._slot_refs.get(loc)
+        if refs is not None:
+            if refs > 1:
+                self._slot_refs[loc] = refs - 1
+                return
+            del self._slot_refs[loc]
+        self._arena.free(*loc)
+
     def _write_back(self, placements: _Placements):
         """One crossing for the batch, not one per tensor."""
         if not placements.uuids:
@@ -774,16 +951,31 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         """Uuid-driven staging: no descriptor is rebuilt to be read for its
         uuid, and placement goes back as two columns rather than a whole
         descriptor. The whole batch stages inside one stream context and syncs
-        once at the end, rather than one host-blocking sync per request."""
+        once at the end, rather than one host-blocking sync per request, and
+        its small device tensors share slots (``_stage_shared``)."""
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         queued = False
         placements = _Placements.empty()
+        shared = _SlotRows.empty()
+        shares_slot = self._shares_slot
+        shared_uuids: set[int] = set()
+        store = self.tensor_store
         self._maybe_log_stats()
         with self._d2h_ctx():
             for request_id, uuids in per_request:
                 for uuid in uuids:
-                    queued |= self._stage_one(request_id, uuid, None, placements)
+                    if store.is_registered(uuid) or uuid in shared_uuids:
+                        continue
+                    tensor = self._send_source(uuid)
+                    if shares_slot(tensor):
+                        shared.add(request_id, uuid, tensor)
+                        shared_uuids.add(uuid)
+                    else:
+                        queued |= self._stage_one(
+                            request_id, uuid, None, placements, tensor)
+            if shared.uuids:
+                queued |= self._stage_shared(shared, placements)
         self._write_back(placements)
         if queued and self._d2h_stream is not None:
             self._d2h_stream.synchronize()
@@ -807,6 +999,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self._evict_dead_peers()
         h2d_did_work = False
         stats = self.transfer_stats
+        deferring = self._read_batch_open
+        deferred = self._deferred
         # one per edge read; the future is filled in once every copy is queued
         reads: list[FutureAndPointers] = []
         ctx = (
@@ -834,6 +1028,17 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     if self.tensor_store.check_uuid_presence(info.uuid):
                         self.tensor_store.increment_ref(info.uuid, 1)
                         continue
+                    if deferring and info.uuid in deferred.extra_refs:
+                        # read earlier in this batch, not stored yet
+                        deferred.extra_refs[info.uuid] += 1
+                        continue
+                    if deferring and info.shm_segment is not None and info.nbytes:
+                        deferred.request_ids.append(request_id)
+                        deferred.infos.append(info)
+                        deferred.extra_refs[info.uuid] = 0
+                        if stats is not None:
+                            fp.count_read(info)
+                        continue
                     if info.shm_segment is None:
                         # Spilled at the producer (arena saturated): read the
                         # per-uuid file, the old protocol's path.
@@ -856,6 +1061,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         fp.count_read(info)
                 fp.rx_time = time.perf_counter() - rx_t0
                 reads.append(fp)
+        if deferring:
+            self._deferred_h2d |= h2d_did_work
+            deferred.reads.extend(reads)
+            return []
         future = None
         if h2d_did_work and self._h2d_stream is not None:
             # Downstream kernels see the data (device-side ordering only).
@@ -879,6 +1088,95 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # re-checks get_ready_tensors immediately instead of on its next
         # poll tick.
         return [self._wake_when_done(future)]
+
+    def begin_read_batch(self) -> None:
+        self._read_batch_open = True
+
+    def end_read_batch(self) -> list[Future]:
+        self._flush_reads()
+        self._read_batch_open = False
+        futures, self._flushed_futures = self._flushed_futures, []
+        return futures
+
+    # A deferred read is in ``pending`` before anything reads ``pending``:
+    # teardown acks a request's pending reads, and readiness polls them.
+
+    def get_ready_tensors(self, graph_walk: str | None = None):
+        self._flush_reads()
+        return super().get_ready_tensors(graph_walk)
+
+    def has_inflight_reads(self, request_id: Rid) -> bool:
+        self._flush_reads()
+        return super().has_inflight_reads(request_id)
+
+    def cleanup_request(self, request_id: Rid, force: bool = False):
+        self._flush_reads()
+        super().cleanup_request(request_id, force=force)
+
+    def _flush_reads(self) -> None:
+        """Copy up what the batch deferred, one H2D per run of nearby rows in
+        one peer segment, and store each row as a view of its run. Every edge
+        read in the batch then waits on one event, as one call's reads do."""
+        d = self._deferred
+        if not d.reads:
+            return
+        h2d = self._deferred_h2d
+        if d.infos:
+            ctx = (torch.cuda.stream(self._h2d_stream)
+                   if self._h2d_stream is not None else _nullcontext())
+            with ctx:
+                self._copy_runs(d)
+            h2d = h2d or self.device != "cpu"
+        reads = list(d.reads)
+        d.clear()
+        self._deferred_h2d = False
+        future = None
+        if h2d and self._h2d_stream is not None:
+            torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
+            future = _CudaEventFuture(self._h2d_stream)
+        for fp in reads:
+            fp.future = future
+        self.pending.extend(reads)
+        if future is not None:
+            self._flushed_futures.append(self._wake_when_done(future))
+
+    def _copy_runs(self, d: _DeferredReads) -> None:
+        infos = d.infos
+        n = len(infos)
+        starts = [info.shm_offset + info.offset for info in infos]
+        order = sorted(range(n), key=lambda k: (infos[k].shm_segment, starts[k]))
+        store = self.tensor_store
+        on_device = self.device != "cpu"
+        i = 0
+        while i < n:
+            first = order[i]
+            seg = infos[first].shm_segment
+            lo = starts[first]
+            hi = lo + infos[first].nbytes
+            j = i + 1
+            while j < n:
+                k = order[j]
+                end = starts[k] + infos[k].nbytes
+                if (infos[k].shm_segment != seg or starts[k] > hi + _READ_RUN_MAX_GAP
+                        or max(hi, end) - lo > _READ_RUN_MAX_BYTES):
+                    break
+                hi = max(hi, end)
+                j += 1
+            run = torch.frombuffer(self._peer_view(seg)[lo:hi], dtype=torch.uint8)
+            # a CPU consumer owns the bytes past reclaim, as _read_from_arena
+            run = run.to(self.device, non_blocking=True) if on_device else run.clone()
+            for k in order[i:j]:
+                info = infos[k]
+                at = starts[k] - lo
+                row = run[at:at + info.nbytes]
+                if at % info.dtype.itemsize:
+                    row = row.clone()  # a view as the dtype must be aligned
+                store.put_tensor(d.request_ids[k], info.uuid,
+                                 row.view(info.dtype).reshape(info.dims), info)
+                store.set_metadata(info.uuid, mem_registered=False)
+                # +1 transit, +1 usage, as in _start_read_tensors
+                store.increment_ref(info.uuid, 2 + d.extra_refs[info.uuid])
+            i = j
 
     def _wake_when_done(self, cuda_future) -> Future:
         with self._wake_lock:   # two callers must not race the create
@@ -977,7 +1275,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     )
                 arena_ts.pop(uuid, None)
                 if (loc := arena_locs.pop(uuid, None)) is not None:
-                    self._arena.free(*loc)
+                    self._free_slot(loc)
                 if (path := shm_files.pop(uuid, None)) is not None:
                     try:
                         os.unlink(path)
@@ -995,7 +1293,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         )
         self._arena_ts.pop(uuid, None)
         if (loc := self._arena_locs.pop(uuid, None)) is not None:
-            self._arena.free(*loc)
+            self._free_slot(loc)
             logger.debug("ARENA: freed %s at %s", uuid, loc)
         if (path := self._shm_files.pop(uuid, None)) is not None:
             try:

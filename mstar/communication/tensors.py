@@ -1299,6 +1299,17 @@ class TensorCommunicationManager(ABC):
     ) -> list[Future]:
         ...
 
+    def begin_read_batch(self) -> None:  # noqa: B027
+        """Open a read batch: until ``end_read_batch``, ``start_read_tensors``
+        may defer copies so that the batch's reads share them, and returns no
+        futures for what it deferred. A transport with nothing to share
+        ignores this."""
+
+    def end_read_batch(self) -> list[Future]:
+        """Issue what the batch deferred and close it. Returns futures that
+        complete when the copies land."""
+        return []
+
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         """``registered`` is the transport's ``mem_registered`` flag, passed in
         by a batched dereference that has already dropped the record it lives
