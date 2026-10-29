@@ -66,10 +66,65 @@ def _aiter_skinny():
     return linear
 
 
+# AITER's bf16 asm GEMMs for gfx942 (hsa/gfx942/bf16gemm), by tile; "auto" lets AITER pick. Their split-K
+# variants reduce through a 16x64 semaphore array, so a grid wider than that (any vocab head) runs unsplit.
+ASM_TILES = ("auto", "32x64_pf3_splitk", "48x64_pf3_splitk", "64x64_pf3_splitk", "96x64_pf3_splitk",
+             "64x64_splitk_clean", "96x64_splitk_clean")
+ASM_SPLITS = (1, 2, 4)
+
+
+def _aiter_asm(tile: str, split_k: int):
+    def build():
+        from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID, gemm_a16w16_asm
+
+        name = None if tile == "auto" else f"bf16gemm_fp32bf16_tn_{tile}"
+        name = None if name is None else f"_ZN5aiter{len(name)}{name}E"
+
+        def linear(x, w):
+            tile_m = 32 if tile == "auto" else int(tile.split("x", maxsplit=1)[0])
+            if split_k > 1 and -(-x.shape[0] // tile_m) * -(-w.shape[0] // 64) > ASM_SPLITK_MAX_GRID:
+                raise ValueError("grid wider than the split-K semaphore array")
+            out = torch.empty((x.shape[0], w.shape[0]), dtype=x.dtype, device=x.device)
+            return gemm_a16w16_asm(x.contiguous(), w, out, None, split_k, name, False)
+
+        return linear
+
+    return build
+
+
+def _aiter_triton():
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+
+    return lambda x, w: gemm_a16w16(x, w, dtype=x.dtype)
+
+
+def _tunableop():
+    """hipBLASLt / rocBLAS through torch's TunableOp: the first (eager) call per shape times every solution and
+    keeps the fastest, which the captured replays then run. On only around this call, so the other candidates'
+    F.linear stays the default solution."""
+    from torch.cuda import tunable
+
+    tunable.tuning_enable(True)
+    tunable.set_max_tuning_iterations(30)
+
+    def linear(x, w):
+        tunable.enable(True)
+        try:
+            return F.linear(x, w)
+        finally:
+            tunable.enable(False)
+
+    return linear
+
+
 def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> list[Candidate]:
     found = [Candidate("torch", {}, _torch)]
     if is_amd(facts):
         found.append(Candidate("aiter_skinny", {}, _aiter_skinny))
+        found.append(Candidate("aiter_triton", {}, _aiter_triton))
+        found += [Candidate("aiter_asm", {"tile": t, "split_k": k}, _aiter_asm(t, k))
+                  for t in ASM_TILES for k in ASM_SPLITS if t != "auto" or k == 1]
+        found.append(Candidate("tunableop", {}, _tunableop))
     return found
 
 
