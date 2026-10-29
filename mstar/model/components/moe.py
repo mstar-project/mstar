@@ -254,11 +254,11 @@ def dispatch_experts_fused(
         expert_idx = expert_idx_t[0]
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states[token_idx]
-        # the (token, top-k) rows of fused_experts' caches these are
-        gathered = token_idx * top_k + top_k_pos
 
         gate_up = torch.mm(current_state, gate_up_proj[expert_idx].T)
         if lora is not None:
+            # the (token, top-k) rows of fused_experts' caches these are
+            gathered = token_idx * top_k + top_k_pos
             lora.gate_up_(current_state, gate_up, gathered=gathered)
         gate, up = gate_up.chunk(2, dim=-1)
         act = F.silu(gate) * up
