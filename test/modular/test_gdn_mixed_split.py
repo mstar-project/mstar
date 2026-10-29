@@ -1,9 +1,12 @@
 """`GDNMixedWrapper` computes what the chunked path computes, on two kernels.
 
-A mixed step runs its one-token rows that carry state on the decode kernel
-and its prompt rows on the chunked one. Against the chunked path over every
-row: the same conv and delta-rule outputs, the same recurrent and conv state
-left in every real slot, and nothing written for a padding row.
+A mixed step runs its leading run of one-token rows that carry state on the
+decode kernel and every other row on the chunked one, both reading the step's
+tokens in place. Against the chunked path over every row: the same conv and
+delta-rule outputs, the same recurrent and conv state left in every real slot,
+and nothing written for a padding row. The engine orders a mixed step decode
+first; any other order is still computed right, a decode row after the run
+taking the chunked kernel.
 """
 
 from __future__ import annotations
@@ -35,16 +38,29 @@ requires_gpu = pytest.mark.skipif(
 
 HEADS, DIM, CONV_DIM, WIDTH, SLOTS = 4, 128, 256, 4, 16
 
-# (span, slot, has_state): decode rows, a continuing chunk, a stateless
-# one-token prompt, a fresh prompt and a tail padding row
-LAYOUT = [
-    (1, 3, True), (1, 5, True), (6, 7, True), (1, 9, True),
-    (1, 11, False), (4, 12, False), (0, SINK_SLOT, False),
-]
-SPANS = [s for s, _, _ in LAYOUT]
-SLOT_IDS = [slot for _, slot, _ in LAYOUT]
-HAS_STATE = [h for _, _, h in LAYOUT]
-REAL = [i for i, s in enumerate(SPANS) if s > 0]
+# (span, slot, has_state)
+LAYOUTS = {
+    # as the engine orders a mixed step: decode rows, then a continuing chunk,
+    # a stateless one-token prompt, a fresh prompt, a final chunk of one token
+    # and a tail padding row
+    "decode_first": [
+        (1, 3, True), (1, 5, True), (1, 9, True), (6, 7, True),
+        (1, 11, False), (4, 12, False), (1, 13, True), (0, SINK_SLOT, False),
+    ],
+    # interleaved: the decode rows after the first prompt run on the chunked kernel
+    "interleaved": [
+        (1, 3, True), (1, 5, True), (6, 7, True), (1, 9, True),
+        (1, 11, False), (4, 12, False), (0, SINK_SLOT, False),
+    ],
+    # every row a prompt row: no decode run
+    "no_decode": [(3, 3, True), (1, 11, False), (5, 12, False), (0, SINK_SLOT, False)],
+}
+MAX_PROMPTS = 5
+
+
+def _cols(layout):
+    spans = [s for s, _, _ in layout]
+    return spans, [slot for _, slot, _ in layout], [h for _, _, h in layout]
 
 
 def _inputs(tokens, device):
@@ -70,7 +86,8 @@ def _pools(device):
     return state, conv
 
 
-def _reference(device, x, weight, inputs):
+def _reference(device, x, weight, inputs, layout):
+    SPANS, SLOT_IDS, HAS_STATE = _cols(layout)
     state, conv = _pools(device)
     # capture-sized: only a captured step carries padding rows, and the eager
     # wrapper does not size its token mask for their borrowed tokens
@@ -88,12 +105,13 @@ def _reference(device, x, weight, inputs):
     return conv_out, out, state, conv
 
 
-def _mixed(device, x, weight, inputs, accelerator_graph, decode_rows=None):
+def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=None):
+    SPANS, SLOT_IDS, HAS_STATE = _cols(layout)
     state, conv = _pools(device)
     tokens = x.shape[0]
     if accelerator_graph:
         # a bucket wider than the step: its padded tail must not leak in
-        bucket_tokens, bucket_bs = 32, 8
+        bucket_tokens, bucket_bs = 32, 10
         pad_rows = bucket_bs - len(SPANS)
         spans = SPANS + [0] * pad_rows
         slots = SLOT_IDS + [SINK_SLOT] * pad_rows
@@ -110,7 +128,7 @@ def _mixed(device, x, weight, inputs, accelerator_graph, decode_rows=None):
     w = GDNMixedWrapper(
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
         num_tokens=bucket_tokens, bs=decode_rows or bucket_bs,
-        accelerator_graph=accelerator_graph, max_prefill_rows=4,
+        accelerator_graph=accelerator_graph, max_prefill_rows=MAX_PROMPTS,
     )
     w.plan(spans, tuple(slots), tuple(has))
     conv_out = w.run_conv(x, conv, weight)[:tokens]
@@ -124,29 +142,99 @@ def _close(a, b, what):
     assert err <= 2e-2 * scale, f"{what}: max err {err:.3g} vs scale {scale:.3g}"
 
 
-@requires_gpu
-@pytest.mark.parametrize("accelerator_graph", [False, True], ids=["eager", "bucket"])
-def test_mixed_split_matches_the_chunked_path(accelerator_graph):
-    device = torch.device("cuda")
-    tokens = sum(SPANS)
+def _step(device, layout):
+    tokens = sum(s for s, _, _ in layout)
     torch.manual_seed(2)
     x = torch.randn(tokens, CONV_DIM, device=device, dtype=torch.bfloat16)
     weight = torch.randn(CONV_DIM, WIDTH, device=device, dtype=torch.bfloat16) * 0.3
-    inputs = _inputs(tokens, device)
+    return x, weight, _inputs(tokens, device)
 
-    ref_conv, ref_out, ref_state, ref_cstate = _reference(device, x, weight, inputs)
-    mix_conv, mix_out, mix_state, mix_cstate = _mixed(device, x, weight, inputs, accelerator_graph)
 
+def _check(layout, mixed, ref):
+    _, SLOT_IDS, _ = _cols(layout)
+    real = [i for i, (s, _, _) in enumerate(layout) if s > 0]
+    mix_conv, mix_out, mix_state, mix_cstate = mixed
+    ref_conv, ref_out, ref_state, ref_cstate = ref
     _close(mix_conv, ref_conv, "conv output")
     _close(mix_out, ref_out, "delta-rule output")
-    real_slots = [SLOT_IDS[i] for i in REAL]
+    real_slots = [SLOT_IDS[i] for i in real]
     _close(mix_state[real_slots], ref_state[real_slots], "recurrent state")
     _close(mix_cstate[real_slots], ref_cstate[real_slots], "conv state")
     # slots no row addresses are left alone
     untouched = [s for s in range(SLOTS) if s not in real_slots and s != SINK_SLOT]
-    fresh_state, fresh_conv = _pools(device)
+    fresh_state, fresh_conv = _pools(mix_state.device)
     assert torch.equal(mix_state[untouched], fresh_state[untouched])
     assert torch.equal(mix_cstate[untouched], fresh_conv[untouched])
+
+
+@requires_gpu
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("accelerator_graph", [False, True], ids=["eager", "bucket"])
+def test_mixed_split_matches_the_chunked_path(accelerator_graph, layout):
+    device = torch.device("cuda")
+    x, weight, inputs = _step(device, LAYOUTS[layout])
+    ref = _reference(device, x, weight, inputs, LAYOUTS[layout])
+    _check(LAYOUTS[layout], _mixed(device, x, weight, inputs, accelerator_graph, LAYOUTS[layout]), ref)
+
+
+@requires_gpu
+def test_a_replay_of_another_layout_matches_the_chunked_path():
+    """Captured over one layout and replayed over another: every buffer the
+    graph reads is planned, so nothing of the captured step survives."""
+    device = torch.device("cuda")
+    bucket_tokens, bucket_bs = 32, 10
+    w = GDNMixedWrapper(
+        device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
+        num_tokens=bucket_tokens, bs=bucket_bs, accelerator_graph=True,
+        max_prefill_rows=MAX_PROMPTS,
+    )
+    state, conv = _pools(device)
+    x_buf = torch.zeros(bucket_tokens, CONV_DIM, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(CONV_DIM, WIDTH, device=device, dtype=torch.bfloat16) * 0.3
+    in_bufs = {
+        k: (v.new_zeros(bucket_tokens, *v.shape[1:]) if v.dim() > 1 else v.clone())
+        for k, v in _inputs(bucket_tokens, device).items()
+    }
+
+    def plan(layout):
+        spans, slots, has = _cols(layout)
+        pad = bucket_bs - len(spans)
+        w.plan(spans + [0] * pad, tuple(slots + [SINK_SLOT] * pad), tuple(has + [False] * pad))
+
+    def stage(layout):
+        x, _, inputs = _step(device, layout)
+        n = x.shape[0]
+        x_buf.zero_()
+        x_buf[:n].copy_(x)
+        for k, v in inputs.items():
+            if v.dim() > 1:
+                in_bufs[k].zero_()
+                in_bufs[k][:n].copy_(v)
+        return x, inputs, n
+
+    def forward():
+        return w.run_conv(x_buf, conv, weight), w.run(state=state, **in_bufs)
+
+    captured = LAYOUTS["interleaved"]
+    plan(captured)
+    stage(captured)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        forward()  # warm the kernels outside the graph
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        conv_out, out = forward()
+
+    layout = LAYOUTS["decode_first"]
+    state.copy_(_pools(device)[0])
+    conv.copy_(_pools(device)[1])
+    plan(layout)
+    x, inputs, n = stage(layout)
+    graph.replay()
+    ref = _reference(device, x, weight, inputs, layout)
+    _check(layout, (conv_out[:n], out[:n], state, conv), ref)
 
 
 @requires_gpu
@@ -155,14 +243,11 @@ def test_the_decode_halfs_width_changes_no_real_rows_result():
     only drops rows that address the null slot: outputs and every slot but the
     sink, which padding rows write as scratch, are bit-identical."""
     device = torch.device("cuda")
-    tokens = sum(SPANS)
-    torch.manual_seed(2)
-    x = torch.randn(tokens, CONV_DIM, device=device, dtype=torch.bfloat16)
-    weight = torch.randn(CONV_DIM, WIDTH, device=device, dtype=torch.bfloat16) * 0.3
-    inputs = _inputs(tokens, device)
+    layout = LAYOUTS["decode_first"]
+    x, weight, inputs = _step(device, layout)
 
-    conv_out, out, state, cstate = _mixed(device, x, weight, inputs, accelerator_graph=True)
-    wide = _mixed(device, x, weight, inputs, accelerator_graph=True, decode_rows=128)
+    conv_out, out, state, cstate = _mixed(device, x, weight, inputs, True, layout)
+    wide = _mixed(device, x, weight, inputs, True, layout, decode_rows=128)
 
     assert torch.equal(conv_out, wide[0]) and torch.equal(out, wide[1])
     kept = [s for s in range(SLOTS) if s != SINK_SLOT]
@@ -218,3 +303,82 @@ def test_a_captured_splits_decode_half_runs_the_buckets_rows():
     decode = manager._get_wrapper("main", is_decode=True, lease=lease("decode", 16, 16))
     assert mixed._decode._bs == 16
     assert decode._bs == 128
+
+
+@requires_gpu
+@pytest.mark.parametrize("accelerator_graph", [False, True], ids=["eager", "bucket"])
+def test_a_mixed_steps_prompt_rows_save_the_snapshots_the_chunked_path_saves(accelerator_graph):
+    """A prompt row's snapshot (its state at a page boundary, for the prefix
+    cache) is addressed by the row's place in the chunked half. With more
+    decode rows than a checkpoint interval, an eager step's chunked half still
+    checkpoints only the prompt rows, which its buffer is sized to."""
+    from mstar.engine.resources.recurrent.pool import checkpoint_rows
+
+    device = torch.device("cuda")
+    every, decode, prompts = 64, 70, (150, 100)
+    snap_slots = [1 + decode + len(prompts) + i for i in range(len(prompts))]
+    slots = snap_slots[-1] + 1
+    layout = [(1, 1 + i, True) for i in range(decode)] + [
+        (n, 1 + decode + i, i == 0) for i, n in enumerate(prompts)
+    ]
+    # (row, offset, slot): each prompt row keeps its last boundary
+    snapshots = [(decode + i, n // every * every, s) for i, (n, s) in enumerate(zip(prompts, snap_slots, strict=True))]
+    spans, slot_ids, has = _cols(layout)
+    tokens = sum(spans)
+    torch.manual_seed(2)
+    x = torch.randn(tokens, CONV_DIM, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(CONV_DIM, WIDTH, device=device, dtype=torch.bfloat16) * 0.3
+    inputs = _inputs(tokens, device)
+
+    def pools():
+        torch.manual_seed(0)
+        return (
+            torch.randn(slots, HEADS, DIM, DIM, device=device) * 0.05,
+            torch.randn(slots, CONV_DIM, WIDTH - 1, device=device, dtype=torch.bfloat16),
+        )
+
+    def checkpoints(n):
+        return torch.empty(n, HEADS, DIM, DIM, dtype=torch.float32, device=device)
+
+    ref_state, ref_conv = pools()
+    ref = GDNPrefillWrapper(
+        device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
+        num_tokens=tokens, bs=len(spans), accelerator_graph=True,
+    )
+    ref.plan(
+        spans, torch.tensor(slot_ids, dtype=torch.int32, device=device),
+        torch.tensor(has, dtype=torch.bool, device=device),
+        snapshots, every, checkpoints(checkpoint_rows(tokens, len(spans), every)),
+    )
+    ref_conv_out = ref.run_conv(x, ref_conv, weight)
+    ref_out = ref.run(state=ref_state, **inputs)
+
+    state, conv = pools()
+    if accelerator_graph:
+        bucket_tokens, bucket_bs = 384, 80
+        pad = bucket_bs - len(spans)
+        spans, slot_ids, has = spans + [0] * pad, slot_ids + [SINK_SLOT] * pad, has + [False] * pad
+        grow = bucket_tokens - tokens
+        x = torch.cat((x, x.new_zeros(grow, x.shape[1])))
+        inputs = {
+            k: torch.cat((v, v.new_zeros(grow, *v.shape[1:]))) if v.shape[0] == tokens else v
+            for k, v in inputs.items()
+        }
+        buffer = checkpoints(checkpoint_rows(bucket_tokens, bucket_bs, every))
+    else:
+        bucket_tokens = bucket_bs = None
+        # as `GDNManager` sizes an eager step's buffer
+        buffer = checkpoints(sum(max(span, 1) // every for span in spans))
+    w = GDNMixedWrapper(
+        device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
+        num_tokens=bucket_tokens, bs=bucket_bs,
+        accelerator_graph=accelerator_graph, max_prefill_rows=MAX_PROMPTS,
+    )
+    w.plan(spans, tuple(slot_ids), tuple(has), snapshots, every, buffer)
+    conv_out = w.run_conv(x, conv, weight)[:tokens]
+    out = w.run(state=state, **inputs)[:tokens]
+
+    _close(conv_out, ref_conv_out, "conv output")
+    _close(out, ref_out, "delta-rule output")
+    assert torch.equal(conv[snap_slots], ref_conv[snap_slots]), "a snapshot saved another conv window"
+    _close(state[snap_slots], ref_state[snap_slots], "snapshot state")

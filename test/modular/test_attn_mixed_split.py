@@ -1,9 +1,11 @@
 """`FlashInferMixedWrapper` attends as the packed prefill wrapper does.
 
-A mixed step plans its one-token rows on the decode wrapper and its prompt
-rows on the prefill wrapper. Against the prefill wrapper over every row of
-the same bucket: the same output at every real token, and the same full
-qo_indptr for `select_last_hidden`.
+A mixed step plans its leading run of one-token rows on the decode wrapper
+and every other row on the prefill wrapper, both reading the step's queries
+in place. Against the prefill wrapper over every row of the same bucket: the
+same output at every real token, and the same full qo_indptr for
+`select_last_hidden`. The engine orders a mixed step decode first; in any
+other order a one-token row after the run is a prefill row.
 """
 
 from __future__ import annotations
@@ -23,12 +25,19 @@ QO_HEADS, KV_HEADS, DIM, PAGE = 8, 2, 256, 16
 BUCKET_BS, BUCKET_TOKENS, MAX_PROMPTS = 8, 64, 4
 WS = 128 << 20
 
-# (new tokens, cached tokens before this step): decode rows, a continuing
-# prompt chunk, a fresh prompt, a one-token prompt, then padding rows
-ROWS = [(1, 37), (1, 5), (9, 20), (1, 64), (6, 0), (1, 0)]
+# (new tokens, cached tokens before this step), then padding rows
+LAYOUTS = {
+    # as the engine orders a mixed step: decode rows, then a continuing prompt
+    # chunk, a fresh prompt and a one-token prompt
+    "decode_first": [(1, 37), (1, 5), (1, 64), (9, 20), (6, 0), (1, 0)],
+    # a decode row after a prompt row runs on the prefill wrapper
+    "interleaved": [(1, 37), (1, 5), (9, 20), (1, 64), (6, 0), (1, 0)],
+    "no_decode": [(9, 20), (6, 0), (1, 0)],
+}
+ROWS = LAYOUTS["interleaved"]
 
 
-def _layout():
+def _layout(ROWS=ROWS):
     """Host index arrays as the KV plan builds them, padding rows on the sink."""
     qo, kvp, idx, last, lens = [0], [0], [], [], []
     page = SINK_PAGE + 1
@@ -62,10 +71,12 @@ def _kw(device):
 
 
 @requires_gpu
+@pytest.mark.parametrize("layout", list(LAYOUTS))
 @pytest.mark.parametrize("window_left", [-1, 7])
-def test_mixed_split_attends_as_the_packed_prefill_does(window_left):
+def test_mixed_split_attends_as_the_packed_prefill_does(window_left, layout):
     device = torch.device("cuda")
-    plan, num_pages = _layout()
+    ROWS = LAYOUTS[layout]
+    plan, num_pages = _layout(ROWS)
     torch.manual_seed(0)
     cache = torch.randn(num_pages, 2, PAGE, KV_HEADS, DIM, device=device, dtype=torch.bfloat16)
     q = torch.randn(BUCKET_TOKENS, QO_HEADS, DIM, device=device, dtype=torch.bfloat16)
@@ -115,3 +126,51 @@ def test_too_many_prompt_rows_for_the_bucket_is_refused():
     mixed._page_size, mixed._sink_page = PAGE, SINK_PAGE
     with pytest.raises(RuntimeError, match="prompt rows"):
         mixed.plan(**plan)
+
+
+@requires_gpu
+def test_a_replay_of_another_layout_attends_as_the_packed_prefill_does():
+    """Captured over one layout and replayed over another: the run's length,
+    the prompt rows and the decode mask all come from the plan."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_pages = 64
+    cache = torch.randn(num_pages, 2, PAGE, KV_HEADS, DIM, device=device, dtype=torch.bfloat16)
+    q = torch.randn(BUCKET_TOKENS, QO_HEADS, DIM, device=device, dtype=torch.bfloat16)
+    mixed = FlashInferMixedWrapper(
+        decode_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
+        prefill_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
+        batch_size=BUCKET_BS, max_total_tokens=BUCKET_TOKENS,
+        max_prefill_rows=MAX_PROMPTS, **_kw(device),
+    )
+    mixed.plan(causal=True, dtype=torch.bfloat16, **_layout(LAYOUTS["no_decode"])[0])
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        mixed.run(q, cache)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = mixed.run(q, cache)
+
+    rows = LAYOUTS["decode_first"]
+    plan, _ = _layout(rows)
+    mixed.plan(causal=True, dtype=torch.bfloat16, **plan)
+    graph.replay()
+
+    n = len(rows)
+    real = int(plan["qo_indptr"][n])
+    kvp = plan["paged_kv_indptr"]
+    ref = FlashInferPrefillWrapper(
+        workspace_buffer=torch.empty(WS, dtype=torch.uint8, device=device), **_kw(device),
+    )
+    ref.plan(
+        causal=True, dtype=torch.bfloat16,
+        qo_indptr=plan["qo_indptr"][: n + 1].clone(),
+        paged_kv_indptr=kvp[: n + 1].clone(),
+        paged_kv_indices=plan["paged_kv_indices"][: int(kvp[n])].clone(),
+        paged_kv_last_page_len=plan["paged_kv_last_page_len"][:n].clone(),
+    )
+    ref_out = ref.run(q[:real], cache)
+    err = (out[:real].float() - ref_out.float()).abs().max().item()
+    assert err <= 2e-2, f"max err {err}"

@@ -418,12 +418,15 @@ class FlashInferMixedWrapper:
 
     The packed prefill planner over every row costs per row about twice what
     the decode planner does, and its kernel runs the one-token rows as
-    prefill queries. Here the decode wrapper takes every row of the bucket
-    (a one-token row attends its own pages; any other row reads one token of
-    the sink page, and its output is dropped), and the prefill wrapper takes
-    at most ``max_prefill_rows`` prompt rows, their tokens moved to the front
-    by a planned permutation. Both are captured at static shapes: the
-    bucket's rows and tokens, and ``max_prefill_rows`` sequences.
+    prefill queries. The engine orders a split walk's rows decode first
+    (``CombinedSplit``), so the step's leading run of one-token rows is its
+    first tokens, row i token i. The decode wrapper takes the bucket's first
+    ``batch_size`` tokens as its rows (a row of the run attends its own pages;
+    any other reads one token of the sink page, and its output is dropped),
+    and the prefill wrapper takes every token: the run as one row on the sink
+    page, at most ``max_prefill_rows`` prompt rows, and a sink-page tail row
+    over the bucket's padding. Both read the step's queries in place, at
+    static shapes, and the decode outputs overwrite the run's.
 
     Every host array is staged in page-locked buffers this wrapper owns: a
     mixed step plans inline on the gpu thread, behind the step in flight.
@@ -462,16 +465,14 @@ class FlashInferMixedWrapper:
             max_num_pages=max_num_pages, accelerator_graph=True,
             use_tensor_cores=use_tensor_cores, **kv,
         )
-        # one row past the prompt rows takes the step's other tokens (see `plan`)
+        # a row ahead of the prompt rows takes the decode run's tokens, and one
+        # behind them the bucket's padding (see `plan`)
         self._prefill = FlashInferPrefillWrapper(
-            workspace_buffer=prefill_workspace, batch_size=max_prefill_rows + 1,
+            workspace_buffer=prefill_workspace, batch_size=max_prefill_rows + 2,
             max_total_tokens=max_total_tokens, max_num_pages=max_num_pages,
             accelerator_graph=True, **kv,
         )
-        i64 = dict(dtype=torch.int64, device=device)
-        self._perm = torch.zeros(max_total_tokens, **i64)
-        self._dec_src = torch.zeros(batch_size, **i64)
-        self._dec_dst = torch.zeros(batch_size, **i64)
+        self._dec_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
         # the whole step's qo_indptr, which `select_last_hidden` reads
         self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
         self._pinned: dict[str, torch.Tensor] = {}
@@ -525,16 +526,18 @@ class FlashInferMixedWrapper:
         spans = np.diff(qo)
         rows = len(spans)
         tokens = max(self._tokens, int(qo[-1]))
-        dec = spans == 1  # a one-token row is a decode query, state or not
-        prompt = np.flatnonzero(spans > 1)
+        one = spans == 1  # a one-token row is a decode query, state or not
+        run = rows if one.all() else int(np.argmin(one))
+        prompt = run + np.flatnonzero(spans[run:] > 0)
         if len(prompt) > self._max_prefill_rows:
             raise RuntimeError(
                 f"FlashInferMixedWrapper: {len(prompt)} prompt rows in a step "
                 f"captured for {self._max_prefill_rows}; the scheduler caps them"
             )
+        dec = np.arange(rows) < run
 
-        # decode: every row of the bucket; a row that is not one token reads
-        # one token of the sink page, and its output lands on a scratch row
+        # decode: every row of the bucket; a row outside the run reads one
+        # token of the sink page, and its output is dropped
         cnt = np.where(dec, npages, 1)
         d_indptr = np.zeros(rows + 1, dtype=np.int32)
         np.cumsum(cnt, out=d_indptr[1:])
@@ -546,42 +549,34 @@ class FlashInferMixedWrapper:
         d_last = np.where(dec, last, 1).astype(np.int32)
         d_lens = np.where(dec, lens, 1).astype(np.int32)
 
-        # prefill: the prompt rows, then a sink-page tail row over the step's
-        # other tokens, so qo_indptr ends at the token count FlashInfer checks
+        # prefill: a sink-page row over the run's tokens, the prompt rows,
+        # empty padding rows, then a sink-page row over the bucket's padding,
+        # so qo_indptr ends at the token count FlashInfer checks
         pad = self._max_prefill_rows - len(prompt)
-        prompt_tokens = int(spans[prompt].sum())
-        tail = tokens - prompt_tokens
-        tail_kv = max(tail, 1)
-        tail_pages = -(-tail_kv // self._page_size)
-        p_spans = np.concatenate([spans[prompt], np.zeros(pad, dtype=np.int64), [tail]])
-        p_qo = np.zeros(self._max_prefill_rows + 2, dtype=np.int32)
+        tail = tokens - run - int(spans[prompt].sum())
+
+        def sink_row(n):
+            n = max(n, 1)
+            pages = -(-n // self._page_size)
+            return pages, n - (pages - 1) * self._page_size, n
+
+        lead_pages, lead_last, lead_kv = sink_row(run)
+        tail_pages, tail_last, tail_kv = sink_row(tail)
+        p_spans = np.concatenate([[run], spans[prompt], np.zeros(pad, dtype=np.int64), [tail]])
+        p_qo = np.zeros(self._max_prefill_rows + 3, dtype=np.int32)
         np.cumsum(p_spans, out=p_qo[1:])
-        p_cnt = np.concatenate([npages[prompt], np.ones(pad, dtype=np.int64), [tail_pages]])
-        p_kvp = np.zeros(self._max_prefill_rows + 2, dtype=np.int32)
+        p_cnt = np.concatenate([[lead_pages], npages[prompt], np.ones(pad, dtype=np.int64), [tail_pages]])
+        p_kvp = np.zeros(self._max_prefill_rows + 3, dtype=np.int32)
         np.cumsum(p_cnt, out=p_kvp[1:])
         p_idx = np.concatenate(
-            [idx[kvp[r]:kvp[r + 1]] for r in prompt]
+            [np.full(lead_pages, self._sink_page, dtype=idx.dtype)]
+            + [idx[kvp[r]:kvp[r + 1]] for r in prompt]
             + [np.full(pad + tail_pages, self._sink_page, dtype=idx.dtype)]
         ).astype(np.int32)
-        tail_last = tail_kv - (tail_pages - 1) * self._page_size
-        p_last = np.concatenate([last[prompt], np.ones(pad), [tail_last]]).astype(np.int32)
-        p_lens = np.concatenate([lens[prompt], np.ones(pad), [tail_kv]]).astype(np.int32)
+        p_last = np.concatenate([[lead_last], last[prompt], np.ones(pad), [tail_last]]).astype(np.int32)
+        p_lens = np.concatenate([[lead_kv], lens[prompt], np.ones(pad), [tail_kv]]).astype(np.int32)
 
-        # the prompt tokens first, then every other position in order
-        front = np.concatenate(
-            [np.arange(qo[r], qo[r + 1]) for r in prompt] or [np.zeros(0, dtype=np.int64)]
-        )
-        rest = np.ones(tokens, dtype=bool)
-        rest[front] = False
-        perm = np.concatenate([front, np.flatnonzero(rest)])
-        dec_src = np.minimum(qo[:-1], max(tokens - 1, 0))
-        dec_dst = np.where(dec, qo[:-1], tokens)
-
-        for name, values, dst in (
-            ("perm", perm, self._perm), ("dec_src", dec_src, self._dec_src),
-            ("dec_dst", dec_dst, self._dec_dst),
-        ):
-            dst[: len(values)].copy_(self._pin(name, values, torch.int64), non_blocking=True)
+        self._dec_mask[:rows].copy_(self._pin("dec_mask", dec, torch.bool), non_blocking=True)
         self._qo_indptr_buf[: rows + 1].copy_(
             self._pin("qo", qo.astype(np.int32), torch.int32), non_blocking=True,
         )
@@ -606,12 +601,12 @@ class FlashInferMixedWrapper:
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
-        n = q.shape[0]
-        front = q.index_select(0, self._perm[:n])
-        rows = q.index_select(0, self._dec_src[: self._num_rows])
-        out_front = self._prefill.run(front, kv_cache_layer)
+        n = self._num_rows
+        rows = q[:n] if q.shape[0] >= n else torch.cat((q, q.new_zeros((n - q.shape[0], *q.shape[1:]))))
+        out = self._prefill.run(q, kv_cache_layer)
         out_rows = self._decode.run(rows, kv_cache_layer)
-        out = out_front.new_empty((n + 1, *out_front.shape[1:]))
-        out.index_copy_(0, self._perm[:n], out_front[:n])
-        out.index_copy_(0, self._dec_dst[: self._num_rows], out_rows.to(out_front.dtype))
-        return out[:n]
+        m = min(n, out.shape[0])
+        out[:m] = torch.where(
+            self._dec_mask[:m].view(-1, 1, 1), out_rows[:m].to(out.dtype), out[:m],
+        )
+        return out[: q.shape[0]]

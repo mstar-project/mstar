@@ -111,6 +111,7 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch):
 
     assert mixed._decode.accelerator_graph and mixed._prefill.accelerator_graph
     assert mixed._decode.batch_size == 8
-    assert mixed._prefill.batch_size == 3
+    # a sink row ahead of the prompt rows and one behind them
+    assert mixed._prefill.batch_size == 4
     assert decode.call_args.kwargs["use_cuda_graph"] is True
     assert prefill.call_args.kwargs["use_cuda_graph"] is True
