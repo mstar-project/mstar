@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -76,15 +77,25 @@ class KVConfig(ABC):
         """
 
 
+DEFAULT_PAGE_SIZE = 128
+# The fewest tokens a page of either group holds when the page size is derived: a window
+# keeps up to a page past it, and a smaller page adds page-table entries and plan work a token.
+MIN_GROUP_PAGE = 64
+
+
 @dataclass(kw_only=True)
 class PagedKVConfig(KVConfig):
     """Fixed-size pages, appended to as a sequence grows. The default."""
 
     max_seq_len: int
+    # Pages of ``page_size`` tokens of every layer, or of DEFAULT_PAGE_SIZE tokens where
+    # ``page_size`` is None: the pool's bytes, whatever page a window derives (`num_units`)
     max_num_pages: int = 2048
-    page_size: int = 128
+    # As declared; None derives the page (`tokens_per_page`)
+    page_size: int | None = None
     layout: KVLayout = KVLayout.NHD
-    # pages of pinned host memory to keep for offloading; 0 disables it
+    # pages of pinned host memory to keep for offloading, counted as ``max_num_pages`` counts;
+    # 0 disables it
     cpu_offload_pages: int = 0
     # folded into the root, not checked at match time
     prefix_cache_salt: str = ""
@@ -96,6 +107,10 @@ class PagedKVConfig(KVConfig):
     # MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which
     # the attention backend would plan; a cache only stored (index keys) needs no query heads
     qo_heads_given: bool = field(default=False, init=False, repr=False, compare=False)
+    # Derived, never declared: the layers cut by page size and retention, the layers no window
+    # is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,
+    # before anything builds or sizes from the pool). One group of every layer until then.
+    groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if self.layout == KVLayout.MLA:
@@ -107,6 +122,72 @@ class PagedKVConfig(KVConfig):
             self.num_kv_heads = 1
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
+        self.keep_window(None, ())
+
+    def keep_window(self, window: int | None, layers: tuple[int, ...]) -> None:
+        """Keep about ``window`` tokens per request of ``layers``, some of the pool's, and every
+        token of the rest; ``layers`` empty keeps every token of every layer.
+
+        A page of either group is the same bytes, so both draw from one arena: with F full and
+        S sliding layers, a page holds ``tokens_per_page`` tokens of the full layers or
+        ``tokens_per_page·F/S`` of the sliding ones. Derived, it is (S/g)·k, g = gcd(F, S), for
+        the smallest k that puts at least MIN_GROUP_PAGE tokens in a page of either group."""
+        full = tuple(i for i in range(self.num_layers) if i not in layers)
+        if layers and not full:
+            raise ValueError("every layer keeps a window; a pool keeps one only beside layers that keep every token")
+        if self.page_size is not None:
+            tokens = self.page_size
+        elif layers:
+            g = math.gcd(len(full), len(layers))
+            tokens = len(layers) // g * -(-MIN_GROUP_PAGE * g // min(len(full), len(layers)))
+        else:
+            tokens = DEFAULT_PAGE_SIZE
+        groups = (KVGroup(full, tokens),)
+        if layers:
+            step = len(layers) // math.gcd(len(full), len(layers))
+            if tokens % step:
+                raise ValueError(
+                    f"page_size {self.page_size} with {len(full)} full layers gives the "
+                    f"{len(layers)} sliding ones {self.page_size * len(full) / len(layers):g}-token "
+                    f"pages; use a multiple of {step}"
+                )
+            page = tokens * len(full) // len(layers)
+            # the window in whole pages: a stream releases its front pages past it at commit
+            groups += (KVGroup(tuple(layers), page, RetentionPolicy(context_budget=-(-window // page) * page)),)
+        self.groups = groups
+
+    @property
+    def tokens_per_page(self) -> int:
+        """Tokens a page of the first group's layers holds: ``page_size``, or where it is None
+        DEFAULT_PAGE_SIZE, or with a window the smallest page whole for both groups
+        (`keep_window`)."""
+        return self.groups[0].page_size
+
+    @property
+    def num_units(self) -> int:
+        """Arena pages, each a page of one group's layers: the bytes of ``max_num_pages``."""
+        return self.units(self.max_num_pages)
+
+    def units(self, pages: int) -> int:
+        """Arena pages in the bytes of ``pages`` pages as ``max_num_pages`` counts them."""
+        return pages * self._counted_page // self._arena_page
+
+    def pages_of(self, units: int, round_up: bool = False) -> int:
+        """``units`` arena pages in pages as ``max_num_pages`` counts them, rounded down (what
+        they hold), or with ``round_up`` up (what holds them)."""
+        if round_up:
+            return -(-units * self._arena_page // self._counted_page)
+        return units * self._arena_page // self._counted_page
+
+    @property
+    def _counted_page(self) -> int:
+        # tokens of every layer in a page as max_num_pages counts it
+        return (DEFAULT_PAGE_SIZE if self.page_size is None else self.page_size) * self.num_layers
+
+    @property
+    def _arena_page(self) -> int:
+        # tokens of every layer in an arena page, a page of the first group's layers
+        return self.tokens_per_page * len(self.groups[0].layers)
 
     @property
     def latent_dim(self) -> int:
@@ -136,6 +217,9 @@ class PagedKVConfig(KVConfig):
         ):
             if value is not None:
                 setattr(self, name, value)
+        if page_size is not None:
+            # every token kept at this page size until the specs derive the window again
+            self.keep_window(None, ())
 
 
 @dataclass(frozen=True)
@@ -397,6 +481,12 @@ class KVSpec(NodeResourceSpec):
         storage strategy, so the config answers for them."""
         self.config.apply_yaml_overrides(**kwargs)
 
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        # the attentions over a pool decide what it keeps, and their module imports this one
+        from mstar.engine.resources.attn.config import derive_kv_groups
+
+        return derive_kv_groups(self.resource_key, self.config, specs)
+
 
 @dataclass(frozen=True)
 class RetentionPolicy:
@@ -423,6 +513,24 @@ class RetentionPolicy:
         if self.protected_prefix < 0:
             raise ValueError(f"protected_prefix must be >= 0, got {self.protected_prefix}")
 
+    def max_pages(self, page_size: int, step: int = 0) -> int:
+        """The most pages of ``page_size`` a stream under this policy holds, with a step of
+        ``step`` tokens past its prefix. `KVManager._apply_retention` leaves less than a page over
+        the budget, so the window peaks at the protected prefix plus the budget, or at the prefix
+        rounded up to a page if that is larger, plus a page of overrun and the step."""
+        prefix = self.protected_prefix
+        window = max(prefix + self.context_budget, -(-prefix // page_size) * page_size)
+        return -(-(window + page_size - 1 + step) // page_size)
+
+
+@dataclass(frozen=True)
+class KVGroup:
+    """Layers of a paged pool that share a page size and a retention (`PagedKVConfig.groups`)."""
+    layers: tuple[int, ...]
+    page_size: int
+    # applied at each commit: what the group's attention can no longer read goes back to the pool
+    retention: RetentionPolicy | None = None
+
 
 @dataclass(frozen=True)
 class StreamLayout:
@@ -444,13 +552,8 @@ class StreamLayout:
         )
 
     def pages(self, caps: Mapping[str, int], page_size: int) -> int:
-        """The most pages the stream can hold, where ``caps`` gives each growth loop's iterations.
-
-        Under ``retention`` the stream holds a window. `KVManager._apply_retention` leaves
-        less than a page over the budget, so the window peaks at the protected prefix plus
-        the budget, or at the prefix rounded up to a page if that is larger. The bound adds
-        a page of overrun and the largest step past the prefix to that peak.
-        """
+        """The most pages the stream can hold, where ``caps`` gives each growth loop's iterations;
+        under ``retention``, its window with the largest step past the prefix."""
         peak, end = self.slots(caps) + self.scratch, 0
         for span in self.spans:
             peak = max(peak, end + span.scratch)
@@ -465,8 +568,7 @@ class StreamLayout:
             if max(end, end - span.length + span.scratch) > prefix:
                 step = max(step, span.length, span.scratch)
         step = max([step, *(slots for _, slots in self.growth)])
-        window = max(prefix + self.retention.context_budget, -(-prefix // page_size) * page_size)
-        return min(pages, -(-(window + page_size - 1 + step) // page_size))
+        return min(pages, self.retention.max_pages(page_size, step))
 
 
 @dataclass(frozen=True)

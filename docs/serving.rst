@@ -378,7 +378,9 @@ travels with its other ``model_kwargs``. Above one rank the cache stays off unle
 ``prefix_cache_tp: true`` is set as well: rank 0 then decides each hit and the other
 ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
 cache's nodes must run in one node group, with no walks placed on other ranks (the
-group's replicas each keep their own cache). Loading fails otherwise.
+group's replicas each keep their own cache). Loading fails otherwise. A cache that keeps
+a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
+``prefix_cache`` goes off (logged at info).
 
 A cached prompt no longer reserves its pages, so the pool no longer limits how many
 requests are admitted. It has to hold the decode of every request allowed to run at once,

@@ -988,7 +988,7 @@ def test_windowed_kv_engine_release_and_psnr() -> None:
         ctx["dit"], resources, ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
     )
 
-    page_size = kv.config.page_size
+    page_size = kv.config.tokens_per_page
     frame_tokens = ctx["md"]["total_latent_units"] * 64  # 64 tokens/unit at 256p
     for label, ids in (("main", ctx["cond"]), ("uncond", ctx["uncond"])):
         stream = kv._streams["r0"][label]

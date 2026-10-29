@@ -122,7 +122,7 @@ def _pages(kv: KVManager, rid: str) -> list[int]:
 
 
 def _host_pages(kv: KVManager, rid: str) -> list[int]:
-    return kv._cpu_pool.offloaded[rid]["main"].cpu_page_indices
+    return kv._cpu_pool.offloaded[rid]["main"].host_pages
 
 
 def test_a_prefix_sixteen_requests_share_is_stored_once():

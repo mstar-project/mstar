@@ -542,6 +542,7 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
     queues the rest. Warnings go to the model's ``log``.
     """
     from mstar.engine.resources import KVSpec, PagedKVConfig
+    from mstar.engine.resources.spec import apply_yaml_overrides
 
     cap = config.get("max_concurrent_requests")
     if cap is None:
@@ -553,22 +554,27 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
         return
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
         raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-    overrides = config.get("resources") or {}
-    for spec in model.get_node_resources():
+    specs = model.get_node_resources()
+    try:
+        # as a server builds them: the deployment's overrides, and what the pools derive
+        apply_yaml_overrides(specs, config)
+    except ValueError:
+        return  # a `resources:` block the validation's resource checks report
+    for spec in specs:
         # paged caches only: a ring buffer is sized by its window, not by requests
         if not isinstance(spec, KVSpec) or not isinstance(spec.config, PagedKVConfig):
             continue
-        kv, override = spec.config, overrides.get(spec.resource_key) or {}
-        page_size = int(override.get("page_size", kv.page_size))
-        max_seq_len = int(override.get("max_seq_len", kv.max_seq_len))
-        max_num_pages = int(override.get("max_num_pages", kv.max_num_pages))
-        need = kv_pages(max_seq_len, page_size, cap)
-        if need > max_num_pages:
+        kv = spec.config
+        # in arena pages: a request at full length holds every token of every group, a window's
+        # too, since a one-step prefill keeps its whole prompt until it commits
+        per_request = sum(-(-kv.max_seq_len // group.page_size) for group in kv.groups)
+        need = 1 + cap * per_request
+        if need > kv.num_units:
             raise ValueError(
                 f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
-                f"need {need} pages of resources.{spec.resource_key} "
-                f"({-(-max_seq_len // page_size)} per request and the sink page), "
-                f"which has {max_num_pages}; raise max_num_pages or lower "
+                f"need {kv.pages_of(need, round_up=True)} pages of resources.{spec.resource_key} "
+                f"({kv.pages_of(per_request, round_up=True)} per request and the sink page), "
+                f"which has {kv.max_num_pages}; raise max_num_pages or lower "
                 "max_concurrent_requests"
             )
 

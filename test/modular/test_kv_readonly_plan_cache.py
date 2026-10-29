@@ -99,8 +99,8 @@ def test_an_identical_read_only_step_reuses_the_plan(kv):
     assert _lengths(first)[:2] == [6, 9]
     assert _read(kv, ("a", "b")) is first
     # its slot's static buffers already hold it: not staged again
-    assert kv._staged_outputs[(0, "main")] is first["main"]
-    assert kv._current_plan_states["main"] is kv._static_plan_state(0, "main")
+    assert kv._staged_outputs[0, ("main", 0)] is first["main"]
+    assert kv._current_plan_states["main", 0] is kv._static_plan_state(0, ("main", 0))
 
 
 def test_the_padding_rows_reset_after_a_replay_keeps_the_plan(kv):
@@ -154,17 +154,17 @@ def test_a_step_with_sink_rows_plans_its_own_views(kv):
     assert sunk is not first and _lengths(sunk)[:2] == [6, 0]
     # the plain step still reuses its plan, staged again over the sink step's
     assert _read(kv, ("a", "b")) is first
-    assert kv._staged_outputs[(0, "main")] is first["main"]
+    assert kv._staged_outputs[0, ("main", 0)] is first["main"]
 
 
 def test_another_slot_stages_the_reused_plan(kv):
     first = _read(kv, ("a", "b"), slot=0)
     # the same step on slot 1 reuses the plan, but slot 1's static buffers
     # do not hold it yet, so it is staged there
-    assert (1, "main") not in kv._staged_outputs
+    assert (1, ("main", 0)) not in kv._staged_outputs
     assert _read(kv, ("a", "b"), slot=1) is first
-    assert kv._staged_outputs[(1, "main")] is first["main"]
-    assert kv._current_plan_states["main"] is kv._static_plan_state(1, "main")
+    assert kv._staged_outputs[1, ("main", 0)] is first["main"]
+    assert kv._current_plan_states["main", 0] is kv._static_plan_state(1, ("main", 0))
 
 
 def test_an_eager_write_step_is_not_staged_and_write_target_addresses_it():
@@ -181,8 +181,8 @@ def test_an_eager_write_step_is_not_staged_and_write_target_addresses_it():
     )
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
-    assert (0, "main") not in kv._staged_outputs
-    assert kv._current_plan_states["main"] is not kv._static_plan_state(0, "main")
+    assert (0, ("main", 0)) not in kv._staged_outputs
+    assert kv._current_plan_states["main", 0] is not kv._static_plan_state(0, ("main", 0))
     layer, pages, slots, n = kv.write_target(layer_idx=0, label="main")
     assert n == 6 and layer.data_ptr() == kv.kv_cache.tensor[0].data_ptr()
     stream = kv._streams["a"]["main"]

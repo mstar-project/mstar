@@ -70,6 +70,7 @@ from mstar.engine.resources import (
     apply_yaml_overrides,
 )
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
+from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
@@ -500,7 +501,10 @@ class NemotronDuplexModel(Model):
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
             raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
         specs = self.get_node_resources()
-        apply_yaml_overrides(specs, config)
+        try:
+            apply_yaml_overrides(specs, config)
+        except ValueError:
+            return  # a `resources:` block the validation's resource checks report
         for spec in specs:
             if isinstance(spec, RecurrentStateSpec):
                 held, knob = spec.config.usable_slots, "max_slots"
@@ -509,7 +513,7 @@ class NemotronDuplexModel(Model):
             elif spec.resource_key in (TALKER_KV, NANO_KV):
                 kv = spec.config
                 pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
-                per_session = pages(kv.page_size, sessions=1) - 1
+                per_session = pages(kv.tokens_per_page, sessions=1) - 1
                 held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
             else:
                 continue
@@ -540,7 +544,7 @@ class NemotronDuplexModel(Model):
             max_seq_len=nano.max_position_embeddings,
             num_qo_heads=nano.num_attention_heads,
             # a session holds its prompt and every frame for life (no eviction)
-            max_num_pages=self.nano_kv_pages(PagedKVConfig.page_size),
+            max_num_pages=self.nano_kv_pages(DEFAULT_PAGE_SIZE),
         )
         return [
             RecurrentStateSpec(
@@ -612,7 +616,7 @@ class NemotronDuplexModel(Model):
                     # the sliding window plus the speaker warm-up, rounded up
                     max_seq_len=eartts.sliding_window + 512,
                     num_qo_heads=eartts.num_attention_heads,
-                    max_num_pages=self.talker_kv_pages(PagedKVConfig.page_size),
+                    max_num_pages=self.talker_kv_pages(DEFAULT_PAGE_SIZE),
                 ),
             ),
             AttentionSpec(

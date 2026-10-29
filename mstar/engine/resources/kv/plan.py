@@ -291,19 +291,29 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
     nowhere else to ride.
     """
 
-    __slots__ = ("pre_forks", "post_forks")
+    __slots__ = ("pre_forks", "post_forks", "later_groups")
 
     def __init__(
         self,
         mapping: dict[str, KVPlanOutput] | None = None,
         pre_forks: tuple[tuple[str, str], ...] = (),
         post_forks: tuple[tuple[str, str], ...] = (),
+        later_groups: tuple[dict[str, KVPlanOutput], ...] = (),
     ):
         super().__init__(mapping or {})
         # applied by `plan`; the consumer mirrors them at plan time
         self.pre_forks = pre_forks
         # applied by `commit`, after this step's spans land
         self.post_forks = post_forks
+        # the labels' plans in each group of the pool past the first (`PagedKVConfig.groups`)
+        self.later_groups = later_groups
+
+    @property
+    def groups(self) -> tuple[dict[str, KVPlanOutput], ...]:
+        """The labels' plans in each group: these, then ``later_groups``, as `CacheStream.groups`
+        holds a stream's pages. Not a field, which would make every step's plan a reference
+        cycle, held with its indptrs until the cyclic GC runs."""
+        return (self, *self.later_groups)
 
 
 # Page the padding tail of a captured step scatters into. Reserved at
