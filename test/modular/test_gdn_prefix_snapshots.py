@@ -23,8 +23,12 @@ from mstar.engine.resources.recurrent import (
     RecurrentStep,
 )
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.platforms import current_platform
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="runs the GDN kernels; needs a GPU")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="runs the GDN kernels; needs a GPU"),
+    pytest.mark.skipif(current_platform.is_rocm(), reason="AITER's GDN kernels keep no state checkpoints"),
+]
 
 POOL, GDN, PAGE = "gdn_state", "linear_attn", 128
 GEOMETRY = DeltaNetGeometry(num_k_heads=2, num_v_heads=4, head_k_dim=128, head_v_dim=128, conv_kernel_size=4)

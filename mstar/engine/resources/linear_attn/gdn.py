@@ -90,6 +90,10 @@ class GDNManager(LinearAttnManager):
 
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         self._pool = resources.get(self._pool_key)
+        if self._pool is not None and not self._kernels.writes_snapshots:
+            self._pool.refuse_snapshots(
+                f"{self._pool_key!r}'s GDN kernels ({type(self._kernels).__name__}) keep no state checkpoints"
+            )
 
     # Step lifecycle
 
