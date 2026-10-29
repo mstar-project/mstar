@@ -150,6 +150,10 @@ class GDNKernels(ABC):
     # kernel that also normalises q and k and reads strided views, so a mixed
     # step's halves both normalise in-kernel (`GDNMixedWrapper`).
     stages_prefill_inputs: bool = False
+    # Whether the prefill kernels save the state checkpoints a recurrent pool's
+    # prefix snapshots are copied from. Without them the pool's prefix cache
+    # stays shut (`snapshot_refusal`, `GDNManager.bind_dependencies`).
+    writes_snapshots: bool = False
 
     def without_qk_l2norm(self) -> GDNKernels:
         """These kernels for a caller that normalises q and k itself, as a
@@ -192,6 +196,8 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 class FlashInferGDNKernels(GDNKernels):
     """FlashInfer's GDN kernels: chunked prefill (captured as is) and the
     pretransposed decode, both against the K-last pool."""
+
+    writes_snapshots = True
 
     def __init__(
         self,
@@ -435,6 +441,26 @@ class FlashInferDecode(GDNDecodeKernel):
             use_qk_l2norm=self._kernels.qk_l2norm,
         )
         return out.squeeze(1)
+
+
+def snapshot_refusal(backend: LinearAttnBackend) -> str | None:
+    """Why the kernels ``backend`` names on this platform keep no state
+    checkpoints (None when they do), decided as `build_gdn_kernels` would but
+    from the platform alone, so a spec can answer before any device is bound
+    (`LinearAttnSpec.restore_refusal`)."""
+    from mstar.engine.resources.linear_attn.base import resolve_linear_attn_backend
+
+    backend = resolve_linear_attn_backend(backend)
+    if backend is LinearAttnBackend.AITER:
+        # imports no kernel library
+        from mstar.engine.resources.linear_attn.gdn_kernels_aiter import AiterGDNKernels
+
+        kernels: type[GDNKernels] = AiterGDNKernels
+    else:
+        kernels = FlashInferGDNKernels
+    if kernels.writes_snapshots:
+        return None
+    return f"{kernels.__name__} keep no state checkpoints"
 
 
 def build_gdn_kernels(

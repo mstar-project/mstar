@@ -22,9 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_linear_attn_backend(
-    backend: LinearAttnBackend, device: torch.device,
+    backend: LinearAttnBackend, device: torch.device | None = None,
 ) -> LinearAttnBackend:
-    """The backend a spec's ``backend`` runs on ``device``.
+    """The backend a spec's ``backend`` runs on ``device`` (None: this
+    process's GPU, for a spec answering before any resource is built).
 
     The one place ``AUTO`` becomes a kernel choice: AITER on an AMD GPU, where
     FlashInfer has no GDN kernels, and FlashInfer everywhere else, as before
@@ -34,7 +35,7 @@ def resolve_linear_attn_backend(
     """
     if backend is not LinearAttnBackend.AUTO:
         return backend
-    if device.type == "cuda" and current_platform.is_rocm():
+    if (device is None or device.type == "cuda") and current_platform.is_rocm():
         return LinearAttnBackend.AITER
     return LinearAttnBackend.FLASHINFER
 
