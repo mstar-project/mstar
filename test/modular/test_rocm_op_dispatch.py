@@ -27,8 +27,8 @@ _ROCM_BACKENDS = (
     "mstar.engine.resources.sampler.rocm",
 )
 _DISPATCHES = (
-    norm_ops._rmsnorm,
-    norm_ops._fused_add_rmsnorm,
+    norm_ops.RMS_NORM.dispatch,
+    norm_ops.FUSED_ADD_RMS_NORM.dispatch,
     norm_ops.run_fused_add_rms_norm,
     rope_ops._rope,
     sampler_utils._top_p_sampling_from_probs,
@@ -133,7 +133,7 @@ def stack(monkeypatch):
 def test_nvidia_rms_norm_is_flashinfers_kernel(stack):
     rec = stack(CudaPlatform(), rocm_fork=False)
     x, w = torch.ones(2, 3, 8), torch.ones(8)
-    norm_ops._rmsnorm(x, w, eps=1e-5)
+    norm_ops.RMS_NORM.dispatch(x, w, eps=1e-5)
     [(name, args, kwargs)] = rec.calls
     assert name == "norm.rmsnorm" and args[0] is x and kwargs == {"eps": 1e-5}
 
@@ -143,12 +143,12 @@ def test_amd_rms_norm_hands_the_fork_2d_rows(stack):
     rec_result = torch.arange(48.0).view(6, 8)
     sys.modules["flashinfer"].norm.rmsnorm = rec.fn("norm.rmsnorm", result=rec_result)
     x = torch.ones(2, 3, 8)
-    out = norm_ops._rmsnorm(x, torch.ones(8), eps=1e-5)
+    out = norm_ops.RMS_NORM.dispatch(x, torch.ones(8), eps=1e-5)
     [(name, args, kwargs)] = rec.calls
     assert name == "norm.rmsnorm" and args[0].shape == (6, 8) and kwargs == {"eps": 1e-5}
     assert out.shape == x.shape and torch.equal(out.view(6, 8), rec_result)
     x2 = torch.ones(4, 8)
-    norm_ops._rmsnorm(x2, torch.ones(8), eps=1e-5)
+    norm_ops.RMS_NORM.dispatch(x2, torch.ones(8), eps=1e-5)
     assert rec.calls[-1][1][0] is x2, "2-D input goes through unchanged"
 
 
@@ -157,7 +157,7 @@ def test_amd_rms_norm_hands_the_fork_2d_rows(stack):
 def test_fused_add_rms_norm_is_flashinfers_in_place_kernel(stack, platform, gemma):
     rec = stack(platform, rocm_fork=platform.is_rocm())
     h, r, w = torch.ones(2, 8), torch.ones(2, 8), torch.ones(8)
-    norm_ops._fused_add_rmsnorm(h, r, w, 1e-5, gemma)
+    norm_ops.FUSED_ADD_RMS_NORM.dispatch(h, r, w, 1e-5, gemma)
     [(name, args, _)] = rec.calls
     assert name == ("norm.gemma_fused_add_rmsnorm" if gemma else "norm.fused_add_rmsnorm")
     assert args[0] is h and args[1] is r and args[2] is w and args[3] == 1e-5
@@ -254,7 +254,7 @@ def test_amd_rope_reads_the_cos_sin_cache(stack, interleave):
 def test_amd_without_the_fork_names_it(stack):
     stack(RocmPlatform(), rocm_fork=False)
     with pytest.raises(RuntimeError, match="amd-flashinfer"):
-        norm_ops._rmsnorm(torch.ones(1, 8), torch.ones(8), eps=1e-5)
+        norm_ops.RMS_NORM.dispatch(torch.ones(1, 8), torch.ones(8), eps=1e-5)
 
 
 class _CacheRecorder:
