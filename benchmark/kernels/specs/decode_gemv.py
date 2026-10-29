@@ -5,7 +5,8 @@ the weight at HBM bandwidth.
 
 The Triton kernel comes as two families, ``triton_fma`` (fp32 multiply-adds,
 a reduction after the loop; for a few rows) and ``triton_dot`` (matrix cores,
-rows padded to 16), so a search can run either alone. The fused gated MLP
+rows padded to 16), so a search can run either alone; ``hip`` is the HIP
+weight stream (``mstar.kernels.hip.gemv``, bf16 on AMD). The fused gated MLP
 projection is timed against the unfused pair the served graph runs: the
 linear, then inductor's one ``silu(gate) * up`` kernel.
 """
@@ -51,6 +52,20 @@ DOT_SPACE = {
     "block_n": (16, 32, 64), "block_k": (64, 128, 256, 512), "num_warps": (2, 4, 8),
     "split_k": (1, 2, 4, 8), "xcd_remap": (False, True), "waves_per_eu": (0, 2), "num_stages": (1, 2),
 }
+
+
+# workgroups of up to four waves, a few per CU; (ytile, unrl) as decode_gemv.cu
+# instantiates them
+HIP_WAVES, HIP_GROUPS = (1, 2, 4), (1, 2, 4, 8)
+
+
+def _hip_points(facts) -> list[dict]:
+    from mstar.kernels.hip.gemv import TILES
+
+    return [
+        {"ytile": y, "unrl": u, "waves": waves, "groups": groups}
+        for (y, u) in TILES for waves in HIP_WAVES for groups in HIP_GROUPS
+    ]
 
 
 def _per_thread(point, facts) -> float:
@@ -137,6 +152,27 @@ def _unfused(linear):
     return run
 
 
+def _hip(knobs):
+    from mstar.kernels.hip import gemv
+
+    gemv.EXTENSION.load()
+    return lambda x, w: gemv.decode_gemv(x, w, None, knobs)
+
+
+def _hip_silu_mul(knobs):
+    from mstar.kernels.hip import gemv
+
+    gemv.EXTENSION.load()
+    return lambda x, w: gemv.decode_gemv_silu_mul(x, w, knobs)
+
+
+def _hip_candidates(facts, budget, seeds, build) -> list[Candidate]:
+    if not is_amd(facts):
+        return []
+    return [Candidate("hip", knobs, functools.partial(build, knobs))
+            for knobs in search_order(_hip_points(facts), seeds.get("hip", ()), budget)]
+
+
 def _triton_candidates(facts, budget, seeds, build) -> list[Candidate]:
     found = []
     for family, knobs_space, ok, use_dot in (
@@ -152,14 +188,17 @@ def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> lis
     found = [Candidate("torch", {}, lambda: F.linear)]
     if is_amd(facts):
         found.append(Candidate("aiter_skinny", {}, _aiter_linear))
-    return found + _triton_candidates(facts, budget, seeds or {}, _triton)
+    seeds = seeds or {}
+    return found + _triton_candidates(facts, budget, seeds, _triton) + _hip_candidates(facts, budget, seeds, _hip)
 
 
 def silu_mul_candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> list[Candidate]:
     found = [Candidate("torch", {}, lambda: _unfused(F.linear))]
     if is_amd(facts):
         found.append(Candidate("aiter_skinny", {}, lambda: _unfused(_aiter_linear())))
-    return found + _triton_candidates(facts, budget, seeds or {}, _triton_silu_mul)
+    seeds = seeds or {}
+    return (found + _triton_candidates(facts, budget, seeds, _triton_silu_mul)
+            + _hip_candidates(facts, budget, seeds, _hip_silu_mul))
 
 
 def _shape_class(shape) -> str | None:
