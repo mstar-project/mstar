@@ -178,9 +178,6 @@ pub struct GraphRuntime {
     /// (node, real walk) -> the combined walk the scheduler batches it under;
     /// a ready-scan target or exclusion may name either.
     combined_walk_of: FxHashMap<(Sym, Sym), Sym>,
-    /// (node, walk) pairs never returned as a speculation target: a chunkable
-    /// walk's rows are measured and cut when scheduled, and a continuing row's
-    /// inputs do not exist yet.
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -1471,7 +1468,6 @@ impl GraphRuntime {
         // (nodes, walks, combined) as columns: `walks[i]` of `nodes[i]` is
         // batched under `combined[i]`
         combined_walks: Option<(Vec<String>, Vec<String>, Vec<String>)>,
-        // (node, walk) pairs speculation never targets
     ) -> PyResult<Self> {
         let mut it = StrToId::default();
         let (nodes, walks, combined) = combined_walks.unwrap_or_default();

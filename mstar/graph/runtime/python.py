@@ -134,9 +134,8 @@ class PythonGraphRuntime(GraphRuntime):
         combined_walk_of: dict[tuple[str, str], str] | None = None,
     ):
         self._my_worker_id = my_worker_id
-        # (node, walk) pairs never a speculation target: a chunkable walk's rows
-        # are measured and cut when scheduled, and a continuing row's inputs
-        # do not exist yet
+        # (node, real walk) -> the combined walk the scheduler batches it under;
+        # a ready-scan target or exclusion may name either
         self._combined_walk_of = dict(combined_walk_of or {})
         self._communicator = communicator
         # Refcount changes go through the manager rather than the bare store,

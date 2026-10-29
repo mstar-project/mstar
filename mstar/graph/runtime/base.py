@@ -814,9 +814,9 @@ class GraphRuntime(ABC):
     ) -> list[SpeculationOutput]:
         """
         The nodes ready for speculation, checking against whether the node is
-        async enabled (known internally, per walk) and TP async compatible,
-        construction. Returns every walk's targets, each naming its walk, for
-        the caller to pick from.
+        async enabled (known internally, per walk) and TP async compatible.
+        Returns every walk's targets, each naming its walk, for the caller to
+        pick from.
 
         ``rids`` are the step's rows grouped by walk, ``walk_counts[i]`` of
         them for ``graph_walks[i]`` (None: one per walk). The first sets the

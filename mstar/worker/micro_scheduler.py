@@ -261,7 +261,7 @@ class ChunkProgress:
     total: int
     # the last chunk scheduled on the normal path
     cursor: ChunkCursor | None = None
-    # a chunk scheduled speculatively, dropped if that speculation is
+    # a chunk scheduled speculatively, dropped if that speculation is cleared
     cursor_spec: ChunkCursor | None = None
     # when its first chunk was cut, for serving prompts in start order
     started: int = 0
@@ -332,7 +332,6 @@ class MicroScheduler:
         self._chunk_starts = itertools.count()
         # (rid, node) -> cached prefix a measured, not yet chunked row starts past
         self.cached_prefix: dict[tuple[int, str], int] = {}
-        # their non-final chunks' outputs, routed with the final chunk
         self._warned_removed_rid = False
         self.sched_type = sched_type
 

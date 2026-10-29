@@ -1111,6 +1111,7 @@ class Engine:
         if mgmt is None:
             return {}
         return mgmt.submodule.inline_client_signals(graph_walk)
+
     def _prepare_chunk(
         self, batch: ExecutingBatch, rid: int, walk: str, chunk: tuple[int, int, int],
     ) -> NodeInputs | None:

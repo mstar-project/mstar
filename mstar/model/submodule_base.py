@@ -306,33 +306,37 @@ def _split_pos_ids(
 
 @dataclass(frozen=True)
 class ChunkingPolicy:
-    """How a walk's prefill may be split across steps; the default is not at all."""
-    # the walks this policy covers. Declared per node at the model level
-    # (``Model.get_chunking_policies``) rather than per walk on the submodule,
-    # because the graph build needs it: a chunkable node is wrapped in a Loop
-    # for exactly these walks, and a chunk is one iteration of it.
+    """How a walk's prefill may be split across steps; the default is not at all.
+
+    ``walks``: the walks this policy covers. Declared per node on the model
+    (``Model.get_chunking_policies``) rather than on the submodule, because
+    the graph build needs it: a chunkable node is wrapped in a Loop for
+    exactly these walks, and a chunk is one iteration of it.
+
+    ``accumulated_outputs``: output edges a consumer needs every chunk of,
+    gathered on the Loop and handed over as one item per chunk when the
+    prompt finishes; the consumer joins the pieces itself. An edge not named
+    here carries the final chunk's tensors alone.
+
+    ``max_chunks``: the chunk Loop's ``max_iters``, a runaway guard rather
+    than the real count, which is not known until the budget cuts each step.
+    Too small a cap reports a longer prompt done early, so the default is
+    effectively none (the runtimes hold ``max_iters`` as a u32).
+
+    ``reserve_whole_prefill``: whether a first chunk reserves the KV the
+    whole prefill needs, so a part-done row cannot wedge on a full arena.
+    Counted in tokens, so a walk whose KV grows by something else sets False
+    and reserves per chunk.
+    """
     walks: tuple[str, ...] = ()
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
     chunkable: bool = False
-    # output edges a consumer needs every chunk of, gathered on the Loop and
-    # handed over as one item per chunk when the prompt finishes. An edge not
-    # named here carries the final chunk's tensors alone, the earlier chunks'
-    # being dropped as the loop advances. A consumer of a gathered edge sees a
-    # list, so it joins the pieces itself -- the engine no longer concatenates.
     accumulated_outputs: frozenset[str] = frozenset()
-    # most chunks one prompt may take, as the chunk Loop's `max_iters`. A
-    # runaway guard, not the real count: the engine ends the loop on the final
-    # chunk, and the count is not known until the budget cuts each step. Too
-    # small a cap reports a longer prompt done early, so the default is
-    # effectively none (the runtimes hold `max_iters` as a u32).
     max_chunks: int = 2**31 - 1
     # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
     max_batch_tokens: int | None = None
     # whether a row may start past its cached prefix, asked before prepare; None is always
     reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
-    # whether a first chunk reserves the KV the whole prefill needs, so a
-    # part-done row cannot wedge on a full arena. Counted in tokens, so a walk
-    # whose KV grows by something else sets False and reserves per chunk.
     reserve_whole_prefill: bool = True
 
 

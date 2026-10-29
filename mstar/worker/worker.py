@@ -3904,11 +3904,8 @@ class Worker:
         """Record what each chunked row ran, and let go of a finished prompt's
         prepared input.
 
-        Holding a non-final chunk's outputs back, pushing its node onto the
-        ready queue and joining the pieces at the end used to live here. The
-        node's Loop does all of it now: a chunk is one iteration, the
-        re-injected prompt re-readies the node, and the Loop's own edges decide
-        whether a chunk's output is dropped or gathered.
+        The chunk Loop does the rest: the re-injected prompt re-readies the
+        node, and the Loop's edges drop or gather each chunk's output.
         """
         batch, node = batch_N.batch, batch_N.node_name
         engine = self.engine_manager.get_engine(node)
