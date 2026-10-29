@@ -17,7 +17,7 @@ import math
 import statistics
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -32,6 +32,13 @@ class Timing:
     calls: int
     copies: int
     note: str = ""
+
+
+class _Runner(NamedTuple):
+    """One candidate, ready to time: ``run()`` times a pass in ms."""
+    run: Callable[[], float]
+    captured: bool
+    note: str
 
 
 def tensor_bytes(args: Sequence[Any]) -> int:
@@ -86,7 +93,7 @@ class Bench:
         calls = max(len(arg_sets), self.calls // len(arg_sets) * len(arg_sets))
         if self.device.type != "cuda":
             return {name: self._time_cpu(fn, arg_sets, calls) for name, fn in fns.items()}
-        runners: dict[str, tuple[Callable[[], float], bool, str]] = {}
+        runners: dict[str, _Runner] = {}
         results: dict[str, Timing | str] = {}
         for name, fn in fns.items():
             try:
@@ -95,21 +102,21 @@ class Bench:
                 results[name] = f"{type(exc).__name__}: {exc}"[:500]
         runs: dict[str, list[float]] = {name: [] for name in runners}
         for _ in range(self.rounds):
-            for name, (run, _, _) in list(runners.items()):
+            for name, runner in list(runners.items()):
                 try:
-                    runs[name].append(run() * 1e3 / calls)
+                    runs[name].append(runner.run() * 1e3 / calls)
                 except Exception as exc:  # noqa: BLE001  the others keep their rounds
                     results[name] = f"{type(exc).__name__}: {exc}"[:500]
                     del runners[name]
-        for name, (_, captured, note) in runners.items():
+        for name, runner in runners.items():
             results[name] = Timing(
-                us=statistics.median(runs[name]), runs_us=runs[name], captured=captured, calls=calls,
-                copies=len(arg_sets), note=note,
+                us=statistics.median(runs[name]), runs_us=runs[name], captured=runner.captured, calls=calls,
+                copies=len(arg_sets), note=runner.note,
             )
         return results
 
-    def _runner(self, fn, arg_sets, calls, capture) -> tuple[Callable[[], float], bool, str]:
-        """(a function timing one pass in ms, captured, note), after a warm-up
+    def _runner(self, fn, arg_sets, calls, capture) -> _Runner:
+        """``fn`` captured (or else eager) over ``calls`` calls, after a warm-up
         that runs every operand set once, outside any capture."""
         side = torch.cuda.Stream(self.device)
         side.wait_stream(torch.cuda.current_stream(self.device))
@@ -127,7 +134,7 @@ class Bench:
                         fn(*arg_sets[i % len(arg_sets)])
                 graph.replay()
                 torch.cuda.synchronize(self.device)
-                return (lambda: self._elapsed_ms(graph.replay)), True, note
+                return _Runner(lambda: self._elapsed_ms(graph.replay), True, note)
             except Exception as exc:  # noqa: BLE001  timed eagerly instead
                 note = f"not capturable ({type(exc).__name__}: {str(exc)[:200]})"
                 torch.cuda.synchronize(self.device)
@@ -137,7 +144,7 @@ class Bench:
                 fn(*arg_sets[i % len(arg_sets)])
 
         eager()
-        return (lambda: self._elapsed_ms(eager)), False, note
+        return _Runner(lambda: self._elapsed_ms(eager), False, note)
 
     def _elapsed_ms(self, run: Callable[[], Any]) -> float:
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
