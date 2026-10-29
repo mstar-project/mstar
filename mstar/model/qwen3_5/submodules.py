@@ -106,7 +106,8 @@ def _mixed_token_buckets(prefill_buckets) -> list[int]:
 
 
 class LLMSubmodule(ARNodeSubmodule):
-    # drafts a decode step verifies with the MTP head; 0 samples a token a step
+    # drafts a speculative decode step verifies (see `__init__`); 0 decodes one
+    # token a step
     num_draft_tokens: int = 0
     # Total tokens of a packed text-prefill (and mixed) step, one captured
     # graph per (bucket, batch size). A prompt past the top bucket prefills
@@ -890,7 +891,7 @@ class LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ):
-        if self._speculative and request_info.graph_walk == "decode":
+        if self.num_draft_tokens and request_info.graph_walk == "decode":
             # The batched check reads the step's own `done`; this fallback
             # sees only the tokens, so it stops on a stop id and leaves the
             # budget to the loop's cap.
@@ -919,7 +920,7 @@ class LLMSubmodule(ARNodeSubmodule):
     ):
         # a verify step's stops come off its own flags (no mixed step runs
         # under speculation, so a step with a decode row has only those)
-        if self._speculative and any(request_infos[rid].graph_walk == "decode" for rid in request_ids):
+        if self.num_draft_tokens and any(request_infos[rid].graph_walk == "decode" for rid in request_ids):
             return self._check_stop_verify(request_ids, request_infos, host_rows)
         return super().check_stop_batched(request_ids, request_infos, host_rows)
 
