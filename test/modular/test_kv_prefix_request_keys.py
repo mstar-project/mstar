@@ -431,7 +431,8 @@ def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
         conductor._do_ingest_request(NewRequestConductor(
             request_id=out, initial_signals={}, initial_input_modalities=["text"],
             initial_output_modalities=[out], input_metadata={},
-            model_kwargs={"kv_layout": {"kv": {"main": layout.row()}}},
+            # as the data worker sends it, so only the streamed partition can turn it off
+            model_kwargs={"prefix_cache": True, "kv_layout": {"kv": {"main": layout.row()}}},
         ))
         cached[out] = conductor.requests[out].resource_configs["kv"].prefix_cache
 
