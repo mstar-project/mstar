@@ -20,7 +20,9 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from torch.distributed import ReduceOp
 
+from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
 from mstar.engine.accelerator_graph_runner import (
@@ -47,11 +49,11 @@ class _Group:
     def barrier(self):
         self.count += 1
 
-    def all_gather(self, tensor, dim=0):
-        del dim
-        peer = torch.tensor(self._peer, dtype=tensor.dtype, device=tensor.device)
-        # rank-major, matching CommGroup.all_gather
-        return torch.cat([tensor, peer])
+    def agree(self, values, op):
+        if self._peer is None:
+            return list(values)
+        pick = min if op == ReduceOp.MIN else max
+        return [int(pick(a, b)) for a, b in zip(values, self._peer, strict=True)]
 
 
 class _FakeRunner:
@@ -83,9 +85,7 @@ class _FakeRunner:
         self._blocked_buckets = []
         self._executables = {}
         self.barrier = _Group(peer_flags)
-        self._comm_group = SimpleNamespace(
-            tp_group=self.barrier, sp_group=self.barrier
-        )
+        self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier)
         self.declared: list = []
         self._dummy_rows = SimpleNamespace(
             released=False,
@@ -393,7 +393,7 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
 
 @requires_cuda
 @pytest.mark.parametrize("fails", [False, True], ids=["captured", "failed"])
-def test_benchmark_is_off_inside_the_capture_and_restored_after(monkeypatch, fails):
+def test_benchmark_is_off_inside_the_capture_and_restored_after(torch_flag, fails):
     """Qwen3-Omni turns cuDNN's benchmark mode on for Code2Wav's warm-up.
     Inside a capture its search fails the capture, which cost Code2Wav its
     bs=32 graph and kept that graph's pool."""
@@ -407,7 +407,7 @@ def test_benchmark_is_off_inside_the_capture_and_restored_after(monkeypatch, fai
         return x + torch.tensor([1.0], device=device) if fails else x * 2
 
     for benchmark in (True, False):
-        monkeypatch.setattr(torch.backends.cudnn, "benchmark", benchmark)
+        torch_flag(torch.backends.cudnn, "benchmark", benchmark)
         with pytest.raises(RuntimeError) if fails else nullcontext():
             capture_into_graph(run, AcceleratorGraphPool(torch.cuda.graph_pool_handle()), device, None)
         assert torch.backends.cudnn.benchmark is benchmark, "the caller's setting must come back"

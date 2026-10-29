@@ -7,7 +7,8 @@ leaves the model-specific parts to a handful of hooks:
   engine contract (base)                          model hooks (subclass)
   ───────────────────────────────────────────     ──────────────────────────────────────
   step index from the engine's loop counter       bucket_key_for(fwd_info)      -> hashable
-  per-request schedule + seeded initial noise     schedule_for(fwd_info, key)   -> FlowMatchSchedule
+  per-request schedule + seeded initial noise,    schedule_for(fwd_info, key)   -> FlowMatchSchedule
+    drawn at ingest under PREFETCH_SEEDS
   overshoot veto (async scheduling)               seed_latents(fwd_info, key, generator) -> [L, C]
   equal-key request batching (can_batch)          request_inputs(fwd_info, inputs, key) -> {name: [..]}
   stacked preprocess / per-row outputs            num_tokens(key)               -> int
@@ -44,9 +45,11 @@ Conventions the base fixes:
 
 from __future__ import annotations
 
+import copy
 import logging
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 
 import torch
@@ -56,8 +59,8 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
-from mstar.model.components.diffusion.noise import NoiseStager
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +111,13 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         "timestep": StepScalar("timesteps", broadcast=False, capture_fill=1000.0),
     }
 
+    # True when :meth:`seed_loop_back` depends on nothing but the bucket key and the
+    # request's seed. The base then draws the seeds when the request reaches the
+    # worker, on a thread of its own and from the ingest-time request info, and
+    # iteration 0 only stages them. Drawn at iteration 0, a CPU randn of a 1024^2
+    # latent holds the GPU thread for milliseconds per joining row.
+    PREFETCH_SEEDS = False
+
     def __init__(
         self,
         *,
@@ -136,9 +146,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self._layouts: dict[Hashable, Any] = {}
         self._uncaptured_layouts: OrderedDict[Hashable, Any] = OrderedDict()
         self.max_uncaptured_layouts = int(max_uncaptured_layouts)
-        # Pinned staging rings for the seeded noise, one per dtype, built on first
-        # use (a stager allocates nothing until it stages something).
-        self._noise_stagers: dict[torch.dtype, NoiseStager] = {}
+        # Draws seeds ahead under PREFETCH_SEEDS; built on first use.
+        self._seed_pool: ThreadPoolExecutor | None = None
         # One callable per attention label for the life of a binding; see
         # :meth:`ragged_for`.
         self._ragged_fns: dict[str, RaggedAttentionCallable] = {}
@@ -162,40 +171,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """Initial noise for one request, ``[L, C]`` on the CPU generator's device."""
         raise NotImplementedError
 
-    def seed_to_device(self, graph_walk: str) -> bool:
-        """Whether :meth:`seed_loop_back` returns tensors already on the device.
-
-        False by default: the base stages the CPU draw itself, which costs one host
-        memcpy and asks nothing of the model. A model whose seeding is layout-only
-        after the draw -- a reshape, a permute -- can override this to draw straight
-        into the stager's pinned buffer (:meth:`noise_stager`) and skip that memcpy.
-        A model doing real host work on the noise must not.
-        """
-        del graph_walk
-        return False
-
-    def noise_stager(self, dtype: torch.dtype) -> NoiseStager:
-        """This node's pinned staging ring for ``dtype``, built on first use.
-
-        A benign race between the plan and GPU threads can build two and keep one;
-        a stager holds no buffers until it stages something, so that costs nothing.
-        """
-        stager = self._noise_stagers.get(dtype)
-        if stager is None:
-            stager = self._noise_stagers[dtype] = NoiseStager(dtype)
-        return stager
-
     def stage_seed(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """Seed tensor on ``device``, copied from pinned memory without stalling.
-
-        ``tensor.to(device)`` would copy from pageable host memory, which blocks the
-        calling thread until it retires -- and this runs on the GPU thread, where
-        that stalls the pre-plan and the overlap with the previous step's
-        postprocess. See :mod:`mstar.model.components.diffusion.noise`.
-        """
-        if tensor.device == device:
-            return tensor
-        return self.noise_stager(tensor.dtype).to_device(tensor, device)
+        """Seed tensor on ``device`` without stalling the GPU thread, where this
+        runs: a pageable copy would hold up the pre-plan and the overlap with the
+        previous step's postprocess (:func:`mstar.utils.h2d.to_device_nonblocking`)."""
+        return to_device_nonblocking(tensor, device)
 
     def seed_loop_back(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, generator: torch.Generator,
@@ -212,11 +192,61 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     ) -> dict[str, torch.Tensor]:
         """Iteration 0's loop-back values, with the step's inputs in view.
 
-        Default: :meth:`seed_loop_back`, i.e. a loop that starts from noise. A loop that
+        Default: :meth:`seed_loop_back`, i.e. a loop that starts from noise, taken from
+        the draw made at ingest when there is one for this bucket key. A loop that
         starts from given latents instead (a refinement stage, image-to-image) overrides
         this and reads them from ``inputs``, the edges the walk routed to this node."""
         del inputs
+        drawn = self._take_drawn_seeds(fwd_info.rid_handle, bucket_key)
+        if drawn is not None:
+            return drawn
         return self.seed_loop_back(fwd_info, bucket_key, generator)
+
+    def on_request_added(self, request_id: int, request_info: CurrentForwardPassInfo) -> None:
+        if not self.PREFETCH_SEEDS:
+            return
+        state = self.request_state(request_id)
+        if "seed_draw" in state:
+            return  # a request arrives once per partition this worker serves
+        # a copy: the worker updates the request's info as its walks advance
+        info = copy.copy(request_info)
+        bucket_key = self.bucket_key_for(info)
+        if self._seed_pool is None:
+            # a CPU randn is single-threaded and releases the GIL
+            self._seed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mstar-seed")
+        state.add("seed_draw", (bucket_key, self._seed_pool.submit(self._draw_seeds, info, bucket_key)))
+
+    def _draw_seeds(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> dict[str, torch.Tensor]:
+        """:meth:`seed_loop_back` as iteration 0 would draw it, made contiguous here so
+        staging it is one memcpy. Host-only: this runs beside the GPU thread."""
+        generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
+        seeds = self.seed_loop_back(fwd_info, bucket_key, generator)
+        return {name: tensor.contiguous() for name, tensor in seeds.items()}
+
+    def _take_drawn_seeds(self, request_id: int, bucket_key: Hashable) -> dict[str, torch.Tensor] | None:
+        """The ingest-time draw, once. None when there is none or it was drawn for
+        another bucket key (a later stage's geometry), which then draws inline."""
+        state = self.request_state(request_id)
+        entry = state.get("seed_draw")
+        if entry is None:
+            return None
+        state.remove("seed_draw")
+        drawn_key, future = entry
+        if drawn_key != bucket_key:
+            # a later stage's geometry draws inline; a draw still queued on the
+            # pool would only delay a live request's
+            future.cancel()
+            return None
+        # usually done long before; waiting releases the GIL and syncs no device
+        return future.result()
+
+    def cleanup_request(self, request_id: str):
+        state = self.request_states.get(request_id)
+        entry = state.get("seed_draw") if state is not None else None
+        if entry is not None:
+            # a request removed before iteration 0 leaves its draw queued otherwise
+            entry[1].cancel()
+        super().cleanup_request(request_id)
 
     def request_inputs(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, bucket_key: Hashable,
@@ -371,7 +401,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     f"entries for {schedule.num_steps} steps, but "
                     f"{scalar.source} has {tensor.shape[0]}."
                 )
-            staged.setdefault(scalar.source, tensor.to(device))
+            staged.setdefault(scalar.source, to_device_nonblocking(tensor, device))
         return staged
 
     def _carried_inputs(
@@ -385,10 +415,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if k == 0:
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
             seeds = self.initial_loop_back(fwd_info, inputs, bucket_key, generator)
-            if self.seed_to_device(fwd_info.graph_walk):
-                # The model drew straight onto the device through a stager; staging
-                # again would copy a device tensor out to the host and back.
-                return dict(seeds)
             return {name: self.stage_seed(tensor, device) for name, tensor in seeds.items()}
         missing = [name for name in self.loop_back_names if not inputs.get(name)]
         if missing:

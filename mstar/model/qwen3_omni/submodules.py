@@ -75,6 +75,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopCheck,
 )
 
 logger = logging.getLogger(__name__)
@@ -1682,7 +1683,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
+    ) -> set[str] | StopCheck:
+        """Stop on codec_eos or the frame limit. The codec_eos frame stays out
+        of the Code2Wav stream: it is not a codebook index, and only this host
+        copy tells it from audio."""
         if "layer0_codes" not in outputs:
             return set()
         token = outputs["layer0_codes"][0].item()
@@ -1690,10 +1694,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         max_tokens = request_info.step_metadata.get(
             "talker_max_tokens", request_info.max_tokens
         )
-        if (eos_token_id is not None and eos_token_id == token) or \
+        is_eos = eos_token_id is not None and eos_token_id == token
+        stops = set()
+        if is_eos or \
                 (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
-            return {"talker_decode_loop"}
-        return set()
+            stops = {"talker_decode_loop"}
+        return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
 
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
@@ -1812,17 +1818,16 @@ class Code2WavSubmodule(NodeSubmodule):
         return meta.stream_chunks.get("codec_tokens") if meta is not None else None
 
     @classmethod
-    def _maybe_context_only(
+    def _context_only(
         cls, request_ids, per_request_input_metadata: Mapping[str, InputMetadata] | None,
     ) -> bool:
-        """Whether every window may be a terminal flush that emits no audio:
-        its new items are at most the Talker's codec_eos frame, which ends
-        every stream the Talker stops itself, so a reply whose frames end on a
-        chunk boundary ends with such a flush. The counts can't tell that
-        frame from a real one, so ``preprocess`` checks the decoded frames."""
+        """Whether every window is a terminal flush with no new frames, which
+        emits no audio: a reply whose frames end on a chunk boundary ends with
+        one. Every stream item is a frame (the Talker withholds codec_eos), so
+        the counts say so."""
         for rid in request_ids:
             chunk = cls._chunk(rid, per_request_input_metadata)
-            if chunk is None or chunk.num_items - chunk.context_items > int(chunk.is_final):
+            if chunk is None or chunk.num_items > chunk.context_items:
                 return False
         return bool(request_ids)
 
@@ -1833,7 +1838,7 @@ class Code2WavSubmodule(NodeSubmodule):
         per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
         **kwargs: Any,
     ) -> Any:
-        if self._maybe_context_only(list(per_request_info), per_request_input_metadata):
+        if self._context_only(list(per_request_info), per_request_input_metadata):
             return self._CONTEXT_ONLY_KEY
         return None
 
@@ -1864,34 +1869,31 @@ class Code2WavSubmodule(NodeSubmodule):
         **kwargs
     ) -> NodeInputs:
         num_quantizers = self.config.code2wav.num_quantizers  # 16
-        codec_eos = self.config.talker.codec_eos_token_id
-        codec_tokens = inputs["codec_tokens"][0]
+        num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
+        # Every item is a frame: the Talker withholds its codec_eos frame
+        # (``TalkerSubmodule.check_stop``).
+        received = inputs.get("codec_tokens")
+        if received:
+            codec_tokens = received[0]
+        else:
+            # a stream whose first frame was codec_eos ends with an empty chunk
+            codec_tokens = torch.zeros((0, num_groups), dtype=torch.long, device=self.get_device())
 
         # Reshape to (num_frames, num_code_groups) if flat
         if codec_tokens.dim() == 1:
-            num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
             if codec_tokens.shape[0] % num_groups == 0:
                 codec_tokens = codec_tokens.view(-1, num_groups)
             else:
                 codec_tokens = codec_tokens.unsqueeze(0)
-
-        # Filter out codec_eos frames
-        if codec_tokens.dim() == 2 and codec_tokens.shape[0] > 0:
-            eos_mask = codec_tokens[:, 0] == codec_eos
-            if eos_mask.any():
-                codec_tokens = codec_tokens[~eos_mask]
 
         # Select first num_quantizers codebook layers
         if codec_tokens.shape[-1] > num_quantizers:
             codec_tokens = codec_tokens[..., :num_quantizers]
 
         # The window's leading frames that an earlier window already decoded.
-        # EOS is only ever a stream's last item, but it can be a context item
-        # of the final flush (the previous window's last new item). The filter
-        # above dropped it, so the clamp keeps the context within the frames.
         chunk = (input_metadata.stream_chunks.get("codec_tokens") if input_metadata is not None else None)
         orig_seq_len = codec_tokens.shape[0]
-        context = min(chunk.context_items if chunk is not None else 0, orig_seq_len)
+        context = chunk.context_items if chunk is not None else 0
 
         # pad sequence to full_seqlen for batching
         pad_len = self.full_seqlen - codec_tokens.shape[0]
@@ -1935,10 +1937,7 @@ class Code2WavSubmodule(NodeSubmodule):
             inp.tensor_inputs["position_ids"] for inp in inputs
         ], dim=0)
         metadata = engine_inputs.per_request_input_metadata
-        if not engine_inputs.captured and self._maybe_context_only(engine_inputs.request_ids, metadata) and all(
-            inp.kwargs["frames"] <= self._chunk(rid, metadata).context_items
-            for rid, inp in zip(engine_inputs.request_ids, inputs, strict=True)
-        ):
+        if not engine_inputs.captured and self._context_only(engine_inputs.request_ids, metadata):
             return {"codec_tokens": batched_codec_tokens[..., :0], "position_ids": position_ids[..., :0]}
         return {"codec_tokens": batched_codec_tokens, "position_ids": position_ids}
 

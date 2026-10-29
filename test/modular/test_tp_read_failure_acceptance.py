@@ -634,11 +634,14 @@ def _tp_group(rank):
 def _worker(rank, scenario, comm, graph, engine, tm, group):
     import torch.distributed as dist
 
+    from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.utils.containers import RecentSet
     from mstar.worker.micro_scheduler import MicroScheduler
     from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
 
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.worker_id = WORKERS[rank]
     w.device = torch.device("cpu")
     w.enable_nvtx = w.enable_prof = False
@@ -656,6 +659,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
         restore_default_timeout=lambda: None,
         get_tp_config_for_node=lambda node: group,
         get_sp_config_for_node=lambda node: SimpleNamespace(world_size=1),
+        get_joint_group_for_node=lambda node: JointGroups(tp_group=group, sp_group=CommGroup.trivial()),
         get_instance_rank_for_node=lambda node: rank,
         get_instance_world_size_for_node=lambda node: 2,
     )
