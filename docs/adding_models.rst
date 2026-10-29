@@ -1647,8 +1647,10 @@ length it would have if N accepted every draft, and its KV write slots, attentio
 lengths, rotary positions and recurrent start slots are corrected from the registers
 on the device. That needs an attention backend whose plan reads per-row KV lengths and
 a block table on the device: AITER's unified attention on AMD GPUs. Verification is
-greedy; a speculative deployment refuses ``temperature > 0`` and
-``repetition_penalty`` until rejection sampling lands.
+greedy, or with ``SpecDecodeConfig(sampling=True)`` a draw of the target's token at each
+position at the request's temperature (with argmax drafts, accepting while the draw
+equals the next draft is rejection sampling); no top-k or top-p, whose cut needs a sort
+that ROCm will not capture, and no ``repetition_penalty``.
 
 Tuning resources per deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
