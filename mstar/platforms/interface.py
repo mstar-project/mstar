@@ -6,6 +6,8 @@ from collections.abc import Mapping
 
 import torch
 
+from mstar.platforms import host_memory
+
 
 class Platform:
     """One accelerator stack; ``current_platform`` is the one this process runs.
@@ -85,6 +87,21 @@ class Platform:
         """
         return {} if devices is None else {"CUDA_VISIBLE_DEVICES": devices}
 
+    def host_register(self, ptr: int, nbytes: int) -> bool:
+        """Page-lock ``nbytes`` of mapped host memory at ``ptr`` for this
+        process's device copies, which then run directly and asynchronously
+        instead of through the runtime's staging buffer. A range already
+        registered counts. False if this platform cannot or the runtime
+        refused; the memory stays pageable and copies still work. Releases the
+        GIL while the runtime pins the pages.
+        """
+        return False
+
+    def host_unregister(self, ptr: int) -> bool:
+        """Undo ``host_register`` of the range that starts at ``ptr``. Must run
+        before the memory is unmapped. False if it was not registered."""
+        return False
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
 
@@ -101,6 +118,12 @@ class CudaPlatform(Platform):
 
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
+
+    def host_register(self, ptr: int, nbytes: int) -> bool:
+        return host_memory.CUDA_HOST.register(ptr, nbytes)
+
+    def host_unregister(self, ptr: int) -> bool:
+        return host_memory.CUDA_HOST.unregister(ptr)
 
 
 class RocmPlatform(Platform):
@@ -176,6 +199,12 @@ class RocmPlatform(Platform):
                 "disagree and HIP uses the first. Unset one or pass --gpus"
             )
         return {}
+
+    def host_register(self, ptr: int, nbytes: int) -> bool:
+        return host_memory.HIP_HOST.register(ptr, nbytes)
+
+    def host_unregister(self, ptr: int) -> bool:
+        return host_memory.HIP_HOST.unregister(ptr)
 
 
 class XpuPlatform(Platform):
