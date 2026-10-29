@@ -2950,17 +2950,20 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
             decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
         return self._to_uint8(decoded)
 
+    @staticmethod
+    def _video_frames(pixels: torch.Tensor) -> torch.Tensor:
+        """``[1, 3, T, H, W]`` pixels -> ``[T, 3, H, W]`` frames for ``video_output``:
+        the layout the API server's encoder takes, so the transpose runs here on
+        the GPU and not as a host copy of the whole clip before the encode."""
+        return pixels[0].transpose(0, 1).contiguous()
+
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
-        image = self._decode_pixels(latents)
-        # Route the decoded tensor to the active walk's emit edge: image_gen
-        # emits "image_output" (one frame); the video walks (plain, sound,
-        # forward-dynamics) emit "video_output".
-        out_name = (
-            "video_output"
-            if graph_walk in (VIDEO_GEN_WALK, VIDEO_SOUND_GEN_WALK, ACTION_VIDEO_GEN_WALK)
-            else "image_output"
-        )
-        return {out_name: [image]}
+        pixels = self._decode_pixels(latents)
+        # image_gen emits "image_output" (one frame); the video walks (plain,
+        # sound, forward-dynamics) emit "video_output".
+        if graph_walk in (VIDEO_GEN_WALK, VIDEO_SOUND_GEN_WALK, ACTION_VIDEO_GEN_WALK):
+            return {"video_output": [self._video_frames(pixels)]}
+        return {"image_output": [pixels]}
 
 
 class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
@@ -3094,12 +3097,12 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
             # nothing is retained across windows.
             chunk = pixels[:, :, : st["ar_out_frames"] - st["ar_emitted"]]
             st.add("ar_emitted", st["ar_emitted"] + chunk.shape[2])
-            return {"video_output": [chunk]} if chunk.shape[2] else {}
+            return {"video_output": [self._video_frames(chunk)]} if chunk.shape[2] else {}
         st["ar_pixels"].append(pixels)
         if index + 1 < st["ar_windows"]:
             return {}
         video = torch.cat(st["ar_pixels"], dim=2)[:, :, : st["ar_out_frames"]]
-        return {"video_output": [video]}
+        return {"video_output": [self._video_frames(video)]}
 
     def _warm_streams_live(self) -> list:
         # A snapshot: the worker's main thread removes request states while

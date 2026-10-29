@@ -1133,10 +1133,11 @@ class Cosmos3Model(Model):
         if modality == "video":
             import os
 
-            # The decoder emits 8-bit frames [B, C, T, H, W]; encode all of them as
-            # an H.264 mp4. The frames already reflect the request fps (it modulates
-            # the temporal positions during generation), and the container carries
-            # that same rate so playback runs at the requested speed.
+            # The decoder emits 8-bit frames [T, C, H, W], torchcodec's layout;
+            # encode all of them as an H.264 mp4. The frames already reflect the
+            # request fps (it modulates the temporal positions during generation),
+            # and the container carries that same rate so playback runs at the
+            # requested speed.
             #
             # CRF 18 keeps the H.264 output near-visually-lossless; libx264
             # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
@@ -1144,21 +1145,13 @@ class Cosmos3Model(Model):
             # but encode several times faster than libx264's default "medium"
             # preset, which otherwise dominates the serving latency for a
             # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
-            x = output[0] if output.ndim == 5 else output  # [C, T, H, W] uint8
+            frames = output.cpu()
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
             try:
                 # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
                 from torchcodec.encoders import VideoEncoder
 
-                from mstar.utils.host_copy import copy_into
-
-                # [T, C, H, W]. The API server keeps torch's intra-op pool small, and
-                # a 121-frame clip is 145 MB, so the transpose copies on copy_into's
-                # threads instead.
-                x = x.cpu()
-                frames = torch.empty((x.shape[1], x.shape[0], *x.shape[2:]), dtype=torch.uint8)
-                copy_into(frames.numpy(), x.numpy().transpose(1, 0, 2, 3))
                 encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
                     "mp4",
                     codec="libx264",
@@ -1177,7 +1170,7 @@ class Cosmos3Model(Model):
                         "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
-                data = encode_mp4_pyav(x.permute(1, 2, 3, 0).cpu(), fps=fps, crf=18, preset=preset)
+                data = encode_mp4_pyav(frames.permute(0, 2, 3, 1), fps=fps, crf=18, preset=preset)
             return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
