@@ -9,19 +9,22 @@ the implementation:
    not executed it yet — which is what "drop if unbuilt / unwind if built"
    means without a gate) is REFUTED: it desyncs the collective order.
    Kept as a negative control so the constraint survives refactors.
+3. Each rank applying its own verdict (B2_LOCAL) is REFUTED as soon as a
+   failure is on one rank only, and the voted verdict (B2_AGREED, what the
+   worker runs) holds there and everywhere B2_LOCAL held.
 """
 
 try:
-    from .tp_async_sim import SCENARIOS, explore
+    from .tp_async_sim import PER_RANK_SCENARIOS, SCENARIOS, explore
 except ImportError:  # collected without package context
     import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from tp_async_sim import SCENARIOS, explore
+    from tp_async_sim import PER_RANK_SCENARIOS, SCENARIOS, explore
 
 
 def _run(mode, scenario, nranks=2):
-    comp0, script, must = SCENARIOS[scenario]
+    comp0, script, must = {**SCENARIOS, **PER_RANK_SCENARIOS}[scenario]
     return explore(mode, nranks, comp0, script, scenario, must)
 
 
@@ -61,6 +64,32 @@ def test_b2_local_pays_no_wasted_forward_on_structural_cancel():
     VOID pays the voided forward on top (3)."""
     assert _run("B2_LOCAL", "structural-cancel").max_waste == 2
     assert _run("B2_VOID", "structural-cancel").max_waste == 3
+
+
+def test_b2_agreed_holds_all_scenarios_2_and_3_ranks():
+    """The protocol with the rank vote: B2_LOCAL, with each rank applying N's
+    verdict once every rank has finished N, and the instance's verdict."""
+    for nranks in (2, 3):
+        for name in (*SCENARIOS, *PER_RANK_SCENARIOS):
+            res = _run("B2_AGREED", name, nranks)
+            assert res.ok, (name, nranks, res.violations[:1])
+
+
+def test_b2_local_is_refuted_by_a_failure_on_one_rank():
+    """A rank that drops the head the others run never joins their collective;
+    the instance diverges whichever rank the failure is on."""
+    for nranks in (2, 3):
+        for name in PER_RANK_SCENARIOS:
+            res = _run("B2_LOCAL", name, nranks)
+            assert res.violations, (name, nranks, "per-rank verdicts unexpectedly held")
+            assert any(kind.startswith(("I1", "I4")) for kind, _ in res.violations), res.violations[:1]
+
+
+def test_b2_agreed_costs_what_b2_local_does_where_both_hold():
+    for name in SCENARIOS:
+        agreed, local = _run("B2_AGREED", name), _run("B2_LOCAL", name)
+        assert agreed.ok and local.ok, name
+        assert agreed.max_waste == local.max_waste, name
 
 
 def test_b2_retract_is_refuted_on_structural_cancel():
