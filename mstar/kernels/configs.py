@@ -7,7 +7,7 @@ but not their best tiles). Inside, configs are keyed by the op's shape class::
 
     {"kernel": "rms_norm", "arch": "gfx942", "product": null,
      "classes": {"decode": {"num_warps": 4}, "default": {"num_warps": 8}},
-     "shapes": {"rows1-hidden4096": {"num_warps": 2}},
+     "shapes": {"hidden4096-rows1": {"num_warps": 2}},
      "provenance": {"job": "...", "sha": "...", "stack": "..."}}
 
 The optional ``shapes`` table holds entries for single shapes (keyed by
@@ -64,9 +64,9 @@ def load_config(
 
 
 def shape_key(shape: Mapping[str, int]) -> str:
-    """``{"rows": 1, "hidden": 4096}`` -> ``"rows1-hidden4096"``, in the shape's
-    dimension order."""
-    return "-".join(f"{name}{value}" for name, value in shape.items())
+    """``{"rows": 1, "hidden": 4096}`` -> ``"hidden4096-rows1"``: dimensions by
+    name, so a key does not depend on the order a shape was built in."""
+    return "-".join(f"{name}{shape[name]}" for name in sorted(shape))
 
 
 def select(
