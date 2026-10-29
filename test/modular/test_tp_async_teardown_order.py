@@ -362,3 +362,85 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     _run(w)
 
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
+
+
+def test_a_teardown_due_after_n_waits_for_the_step_in_flight_to_admit(monkeypatch):
+    """Rank 0 has N+1 in flight once N is post-processed, and the launch wait in
+    front of that has expired. A teardown due then (here one post-processing
+    leaves for a request in no step, which nothing does today) waits for N+1's
+    admit, as every teardown at the top of a pass does, though N+1 is already
+    broadcast and its rows are not touched."""
+    w, log = _rank(monkeypatch, tp_rank=0, inbox=[])
+    w.parallel_nodes = {NODE}
+
+    def _postprocess(pending, outputs):
+        if pending.tp_seq == 0:
+            w._pending_removes.setdefault(HANDLES["idle"])
+
+    w._postprocess_batch = _postprocess
+    _run(w)
+
+    assert log.index(("admit", 1)) < log.index(("teardown", "idle")), log
+
+
+# Under pool pressure the side of an admit a teardown lands on decides the admit:
+# every page is held, N+1 needs one, and only a teardown frees one.
+POOL = {"gone": [0, 1], "kept": [2, 3], "also": [4, 5], "idle": [6, 7]}
+
+
+def _pool_rank(monkeypatch, *, tp_rank: int, inbox: list):
+    """``_rank`` over a full page pool: a teardown frees the request's pages, and
+    N+1's admit, held back a while as a slow GPU thread would, takes one page or
+    is refused. Returns the worker, its log and its admits as (seq, page or None)."""
+    w, log = _rank(monkeypatch, tp_rank=tp_rank, inbox=inbox)
+    w.parallel_nodes = {NODE}
+    pool = PageAllocator(sum(len(p) for p in POOL.values()))
+    pool.allocate(pool.max_num_pages)
+    wire = {handle: rid for rid, handle in HANDLES.items()}
+    tear_down = w.engine_manager.remove_request
+
+    def _release(handle):
+        tear_down(handle)
+        pool.free(POOL[wire[handle]])
+
+    w.engine_manager.remove_request = _release
+    admits: list[tuple[int, int | None]] = []
+
+    def _gpu(batch, node_batch, plan_future=None):
+        if plan_future is not None:
+            plan_future.result()
+        if batch.tp_seq == 1:
+            threading.Event().wait(HOLD_S)
+            got = pool.try_allocate(1)
+            admits.append((1, got[0] if got else None))
+        log.append(("admit", batch.tp_seq))
+        node_batch.launch_started_event.set()
+        return {}
+
+    w._execute_on_gpu_thread = _gpu
+    return w, log, admits
+
+
+@pytest.mark.parametrize("removal, follower_hears_at", [("gone", 1), ("gone", 2), ("idle", 1)])
+def test_both_ranks_admit_alike_under_pool_pressure(monkeypatch, removal, follower_hears_at):
+    """The launch wait is 0 (MSTAR_LAUNCH_WAIT_MS=0), so post-processing N and
+    everything after it runs with N+1's admit still held back. "gone" ran in N, so
+    rank 0 tears it down behind N+1's admit; "idle" ran in nothing, so it goes at
+    once, before N+1 is sent. Rank 0's forward reaches the follower before it pops
+    N+1 or, stamped with N+1 and so sent after it, after. Either way both ranks
+    find the same page free, or none."""
+    leader, log, leader_admits = _pool_rank(
+        monkeypatch, tp_rank=0, inbox=[[], [RemoveRequest(request_id=removal)]],
+    )
+    _run(leader)
+    forwarded = [
+        RemoveRequest(request_id=entry[1], source=MessageSource.TP_RANK_0, after_tp_seq=entry[2])
+        for entry in log if entry[0] == "forward"
+    ]
+    assert len(forwarded) == 1, log
+    inbox: list[list[RemoveRequest]] = [[] for _ in range(follower_hears_at)] + [forwarded]
+    follower, follower_log, follower_admits = _pool_rank(monkeypatch, tp_rank=1, inbox=inbox)
+    _run(follower)
+
+    assert leader_admits == follower_admits, (log, follower_log)
+    assert leader_admits == [(1, None if removal == "gone" else POOL["idle"][0])]
