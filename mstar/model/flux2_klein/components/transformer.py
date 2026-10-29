@@ -201,12 +201,11 @@ class Flux2DiT(nn.Module):
     """The klein flow transformer. Built on the meta device and materialized by
     ``weight_loader.build_transformer``."""
 
-    # The linears over the token stream, which ``linear_dtype: fp8`` runs as fp8 GEMMs; the
-    # modulation, embedding and output projections keep the checkpoint's weights.
+    # The linears over the image and joint token streams, which ``linear_dtype: fp8`` runs as fp8
+    # GEMMs. The text stream's (512 rows, where fp8 is no faster), the modulation, embedding and
+    # output projections keep the checkpoint's weights.
     FP8_LINEARS = (
-        "double_blocks.*.attn.img_qkv", "double_blocks.*.attn.txt_qkv",
-        "double_blocks.*.attn.img_out", "double_blocks.*.attn.txt_out",
-        "double_blocks.*.img_ff.linear_*", "double_blocks.*.txt_ff.linear_*",
+        "double_blocks.*.attn.img_qkv", "double_blocks.*.attn.img_out", "double_blocks.*.img_ff.linear_*",
         "single_blocks.*.qkv_mlp", "single_blocks.*.out",
     )
 
