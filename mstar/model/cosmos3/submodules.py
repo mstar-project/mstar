@@ -398,8 +398,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 dtype=self.transformer.proj_in.weight.dtype,
             ),
             "vision_timesteps": torch.zeros(static["num_noisy_vision_tokens"], device=device),
-            "position_ids_cond": static["vision_mrope_ids"],
-            "position_ids_uncond": static["vision_mrope_ids"],
+            # the step takes the mRoPE table the statics built, not the position ids
+            "rotary_cond": static["rotary"],
+            "rotary_uncond": static["rotary"],
             "vision_token_shapes": static["vision_token_shapes"],
             "vision_noisy_frame_indexes": static["vision_noisy_frame_indexes"],
             "vision_mse_loss_indexes": static["mse_gen_indexes"],
