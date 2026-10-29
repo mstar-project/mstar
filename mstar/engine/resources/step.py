@@ -2,7 +2,10 @@
 from collections.abc import Callable, Collection, KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+
+if TYPE_CHECKING:
+    from mstar.engine.rows import StepRows
 
 
 class Segment(NamedTuple):
@@ -123,6 +126,9 @@ class StepContext:
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+    # a persistent walk's rows for this step, in the order of `request_ids`;
+    # resources write their per-step changes here while they plan
+    rows: "StepRows | None" = None
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
