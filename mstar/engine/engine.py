@@ -1689,6 +1689,7 @@ class Engine:
             per_request_info=req_info,
             resources=submodule_mgmt.resources,
             piecewise_runners=submodule_mgmt.piecewise_runners,
+            piecewise_leases=ctx.piecewise_leases,
             # padding rows get their own states, like their cache streams:
             # the submodule indexes this by step id, not by real rid
             per_request_states=LazyRequestStates(submodule, rids),
