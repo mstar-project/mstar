@@ -34,7 +34,9 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    ASKS,
     AdmitOutcome,
+    AdmitRuntimeError,
     AllocationFailed,
     Segment,
     StepContext,
@@ -148,11 +150,12 @@ class RecurrentStatePool(Resource):
         # resolved here, not written back: the config is the model's, shared by its specs
         return cls(
             device=info.device, config=config, name=spec.resource_key, kv_dtype=info.kv_dtype,
+            world_size=world_size,
         )
 
     def __init__(
         self, device: torch.device, config: RecurrentStateConfig, name: str = "recurrent_state",
-        kv_dtype: torch.dtype | None = None,
+        kv_dtype: torch.dtype | None = None, world_size: int = 1,
     ):
         """``kv_dtype`` (the engine's) stands in for a block's ``dtype=None``."""
         if config.prefix_slots and config.disable_sink_slot:
@@ -186,10 +189,18 @@ class RecurrentStatePool(Resource):
             assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
         # guards `_slots`/`_free` across threads; see `KVManager._lock`
         self._lock = threading.RLock()
-        # (rid, label) -> slot the live admit took fresh, for `rollback_admit`.
-        # Per row like `KVManager._admit_reserved_pages`, and handle-keyed the
-        # same way, so a released request's entries are purged with it.
-        self._admit_taken: dict[tuple[str, str], int] = {}
+        # (rid, label) -> slot the live admit took fresh, and whether it took the
+        # request's reservation, for `rollback_admit`. Per row like
+        # `KVManager._admit_reserved_pages`, and handle-keyed the same way, so a
+        # released request's entries are purged with it.
+        self._admit_taken: dict[tuple[str, str], tuple[int, bool]] = {}
+        # Admission, as `KVManager` decides it: only at one rank, since a
+        # reservation held on rank 0 alone would make the ranks refuse different
+        # allocations. `_reserved` holds, per admitted request, the slots kept
+        # for labels it hasn't taken yet, and `_kept` their sum.
+        self._decides = world_size == 1
+        self._reserved: dict[str, int] = {}
+        self._kept = 0
 
         self._cg_max_bs = 0
         self._cg_max_tokens = 0
@@ -325,6 +336,7 @@ class RecurrentStatePool(Resource):
         self.reset_request(rid, free=True)
         with self._lock:
             self._slots.pop(rid, None)
+            self._kept -= self._reserved.pop(rid, 0)
             self._drop_lease(rid)
             for key in [k for k in self._restores if k[0] == rid]:
                 self._unref(self._restores.pop(key).slot)
@@ -372,13 +384,21 @@ class RecurrentStatePool(Resource):
             slot = labels.get(label)
             if slot is not None:
                 return slot
-            if not self._free:
+            kept = self._reserved.get(rid, 0)
+            if label not in self.config.labels or len(self._free) - self._kept + bool(kept) <= 0:
+                # an undeclared label, or every free slot is kept for an admitted request
                 return None
+            if kept:
+                self._kept -= 1
+                if kept == 1:
+                    del self._reserved[rid]
+                else:
+                    self._reserved[rid] = kept - 1
             # Slot ids must be unique across the batch: kernels assume it rather
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
             slot = labels[label] = SlotState(index=self._free.pop())
-            self._admit_taken[(rid, label)] = slot.index
+            self._admit_taken[(rid, label)] = (slot.index, bool(kept))
             return slot
 
     def _forget_taken(self, is_mine) -> None:
@@ -387,6 +407,32 @@ class RecurrentStatePool(Resource):
         taken = self._admit_taken
         for key in [k for k in taken if is_mine(k[0])]:
             del taken[key]
+
+    # Admission: a slot for each declared label, for a request that holds none
+
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        if not self._decides:
+            return None
+        with self._lock:
+            if self._slots.get(rid) or rid in self._reserved:
+                return None
+        return ASKS
+
+    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        with self._lock:
+            need, room = len(self.config.labels), len(self._free) - self._kept
+            if need > room:
+                return room
+            self._reserved[rid] = need
+            self._kept += need
+            return None
+
+    def unreserve(self, rid: str) -> None:
+        with self._lock:
+            self._kept -= self._reserved.pop(rid, 0)
+
+    def grew_since(self, mark: int) -> bool:
+        return len(self._free) - self._kept > mark
 
     # Step lifecycle
 
@@ -411,7 +457,7 @@ class RecurrentStatePool(Resource):
                 # it neither reads nor writes its own slot
                 continue
             if self._alloc(segment.request_id, segment.label) is None:
-                return self._out_of_slots(segment.request_id, segment.label)
+                return self._refused(segment.request_id, segment.label)
             if page and (segment.request_id in self._leases or segment.span >= page):
                 label = segment.label
                 if label not in every:
@@ -425,7 +471,7 @@ class RecurrentStatePool(Resource):
                 continue
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
-                    return self._out_of_slots(rid, to_label)
+                    return self._refused(rid, to_label)
         return ADMIT_OK
 
     def rollback_admit(self, step: RecurrentStep, ctx: StepContext) -> None:
@@ -440,7 +486,7 @@ class RecurrentStatePool(Resource):
             self._undo_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             taken = self._admit_taken
             for rid, label in [k for k in taken if ctx.is_real_row(k[0])]:
-                index = taken.pop((rid, label))
+                index, reserved = taken.pop((rid, label))
                 labels = self._slots.get(rid)
                 slot = labels.get(label) if labels else None
                 if slot is None or slot.index != index:
@@ -448,8 +494,20 @@ class RecurrentStatePool(Resource):
                 del labels[label]
                 self._zero_slot(index)
                 self._free.append(index)
+                if reserved:
+                    self._reserved[rid] = self._reserved.get(rid, 0) + 1
+                    self._kept += 1
 
-    def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
+    def _refused(self, rid: str, label: str) -> AdmitOutcome:
+        """Why `_alloc` gave ``rid`` no slot for ``label``."""
+        if label not in self.config.labels:
+            return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
+                message=(
+                    f"recurrent state pool {self._name!r}: {rid} opens label {label!r}, which isn't one of "
+                    f"the pool's labels {self.config.labels}, so admission kept no slot for it"
+                ),
+                request_ids=frozenset((rid,)),
+            ))
         return AdmitOutcome(
             ok=False,
             reason=AllocationFailed(
