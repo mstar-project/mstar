@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import tarfile
 import tempfile
@@ -198,6 +199,69 @@ def _add(tar: Path, src: Path, names: list[str]) -> None:
             raise
 
 
+_SQLITE = b"SQLite format 3\0"
+
+
+def _merge_db(old: Path, new: Path, out: Path) -> bool:
+    """Write ``new`` with the records of ``old`` it lacks to ``out``: a text
+    database (MIOpen's find and perf DBs, ``key=value`` lines) or SQLite (its
+    kernel DB). Where both have a record, ``new``'s wins. False when the result
+    holds nothing ``old`` doesn't; True for a file that is neither."""
+    head = new.read_bytes()[:16]
+    if head == _SQLITE:
+        shutil.copyfile(new, out)
+        con = sqlite3.connect(out)
+        try:
+            con.execute("ATTACH DATABASE ? AS old", (str(old),))
+            grew = False
+            tables = [r[0] for r in con.execute("SELECT name FROM old.sqlite_master WHERE type = 'table'")]
+            for table in tables:
+                # an INTEGER PRIMARY KEY is a row id, renumbered on insert; the
+                # tables' unique indexes say which rows are the same record
+                cols = [r[1] for r in con.execute(f"PRAGMA old.table_info(`{table}`)")
+                        if not (r[5] and r[2].upper() == "INTEGER")]
+                names = ", ".join(f"`{c}`" for c in cols)
+                con.execute(f"INSERT OR IGNORE INTO main.`{table}` ({names}) SELECT {names} FROM old.`{table}`")
+                n_old = con.execute(f"SELECT count(*) FROM old.`{table}`").fetchone()[0]
+                grew |= con.execute(f"SELECT count(*) FROM main.`{table}`").fetchone()[0] > n_old
+            con.commit()
+        finally:
+            con.close()
+        return grew
+    if new.name.endswith(".txt"):
+        records: dict[str, str] = {}
+        for line in old.read_text().splitlines() + new.read_text().splitlines():
+            key, sep, _ = line.partition("=")
+            if sep:
+                records[key] = line
+        merged = "".join(f"{line}\n" for line in records.values())
+        out.write_text(merged)
+        return merged != old.read_text()
+    shutil.copyfile(new, out)
+    return True
+
+
+def _merge_miopen(tar: Path, src: Path, names: list[str], have: dict, tmp: Path) -> list[str]:
+    """Stage the files of ``names`` (under ``src``) that differ from the
+    bundle's last copy under ``tmp/merged`` for appending to a MIOpen tar, each
+    database merged with that copy. MIOpen keeps one file per database, so a
+    cache warmed without the bundle's records would otherwise replace them.
+    Returns the names staged."""
+    if have:
+        subprocess.run(["tar", "-xf", str(tar), "-C", str(tmp)], check=True, capture_output=True)
+    keep = []
+    for name in names:
+        new, old, out = src / name, tmp / name, tmp / "merged" / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if new.is_symlink() or name not in have or not old.is_file():
+            shutil.copy2(new, out, follow_symlinks=False)
+            keep.append(name)
+        elif new.read_bytes() != old.read_bytes() and _merge_db(old, new, out):
+            shutil.copystat(new, out)
+            keep.append(name)
+    return keep
+
+
 @contextlib.contextmanager
 def _locked(path: Path) -> Iterator[None]:
     """One writer per bundle at a time, across hosts sharing the filesystem
@@ -235,8 +299,9 @@ def pack(root: Path, key: StackKey, dirs: dict[str, Path], kinds: list[str] | No
          note: str | None = None, log: Callable[[str], None] = print) -> tuple[Path, list[KindPack]]:
     """Add the caches in ``dirs`` (``kinds`` of them, default all) to ``key``'s
     bundle under ``root``: new files, and files whose size or mtime differ from
-    the bundle's last copy (MIOpen rewrites its databases in place; Inductor and
-    Triton entries never change). Run it with no server writing to the caches."""
+    the bundle's last copy (Inductor and Triton entries never change; MIOpen
+    rewrites its databases in place, and a changed one is merged with the
+    bundle's copy). Run it with no server writing to the caches."""
     bundle = root / key.path
     bundle.mkdir(parents=True, exist_ok=True)
     out = []
@@ -254,9 +319,17 @@ def pack(root: Path, key: StackKey, dirs: dict[str, Path], kinds: list[str] | No
             files = _files(src, inner)
             tar = bundle / f"{kind}.tar"
             have = _members(tar) if tar.exists() else {}
-            new = sorted(n for n, stamp in files.items() if have.get(n) != stamp)
-            if new:
-                _add(tar, src, new)
+            if kind.startswith("miopen"):
+                # a few small files, compared by content: two warm-ups can leave
+                # databases of the same size and mtime
+                with tempfile.TemporaryDirectory(dir=bundle) as tmp:
+                    new = _merge_miopen(tar, src, sorted(files), have, Path(tmp))
+                    if new:
+                        _add(tar, Path(tmp) / "merged", new)
+            else:
+                new = sorted(n for n, stamp in files.items() if have.get(n) != stamp)
+                if new:
+                    _add(tar, src, new)
             members = len(have.keys() | set(new))
             result = KindPack(kind, str(src), len(new), members, tar.stat().st_size if tar.exists() else 0)
             out.append(result)
