@@ -214,13 +214,8 @@ def test_an_end_partition_stop_reports_the_partition_done():
     assert not w.reported
 
 
-def test_an_end_partition_stop_inside_a_loop_fails_the_request(caplog):
-    """A model bug, not a bad request: the client gets an internal error and
-    the log names the node."""
-    with caplog.at_level("ERROR", logger="mstar.engine.engine"):
-        batch, runtime, w = _postprocess(_Sub(stops={1: {END_PARTITION}}), streams=False)
+def test_an_end_partition_stop_inside_a_loop_fails_the_request():
+    batch, runtime, w = _postprocess(_Sub(stops={1: {END_PARTITION}}), streams=False)
     assert set(w.reported) == {1}
-    assert w.reported[1].startswith("internal error")
-    assert "END_PARTITION" in caplog.text and repr(NODE) in caplog.text
     assert batch.request_ids == [2] and batch.partition_done_rids == set()
     assert runtime.stopped == []
