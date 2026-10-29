@@ -250,12 +250,14 @@ def _run_four_ranks(target, args) -> dict:
     return results
 
 
-@pytest.mark.parametrize("sizes", [{"tp_size": 4}, {"tp_size": 2, "sp_size": 2}], ids=["tp4", "tp2sp2"])
+@pytest.mark.parametrize("sizes", [{"tp_size": 4}, {"tp_size": 2, "sp_size": 2}, {"cfg_size": 2, "tp_size": 2}],
+                         ids=["tp4", "tp2sp2", "cfg2tp2"])
 def test_every_rank_takes_out_the_rows_any_rank_could_not_read(sizes):
     """Rank 2's read of row 11 and rank 3's of row 13 failed. Every rank, rank
     0 and rank 1 included, takes out both rows and fails both, and keeps the
-    other two in rank 0's order. Under TP2 x SP2 rank 1 shares no axis group
-    with rank 2: the vote runs on the instance's own gloo group."""
+    other two in rank 0's order. Under CFG2 x TP2 the vote has to cross the CFG
+    axis, which a vote over TP then SP misses: it runs on the instance's own
+    gloo group."""
     failed = {2: {11}, 3: {13}}
     results = _run_four_ranks(_check_rank, lambda r, port: (sizes, port, failed.get(r, set())))
     for rank, rest in results.items():
