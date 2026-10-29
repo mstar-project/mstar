@@ -49,6 +49,7 @@ DECLARING_MODULES = (
     "mstar.engine.resources.rms_norm.rms_norm",
     "mstar.engine.resources.sampler.unfiltered",
     "mstar.engine.resources.spec_decode.kernels",
+    "mstar.kernels.fp8_gemm",
     "mstar.platforms.rocm_gemm",
 )
 
