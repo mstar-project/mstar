@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.plan import KVPlanState
+from mstar.engine.resources.kv.manager import KVPlanState
 from mstar.engine.resources.linear_attn import (
     LinearAttnConfig,
     LinearAttnManager,
