@@ -78,7 +78,8 @@ def _manager(prefix_cache: bool = True, walks=None) -> KVManager:
         ),
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    kv.enable_prefix_cache(ROOT, walks)
+    if prefix_cache:  # as the engine opens only the caches that open
+        kv.enable_prefix_cache(ROOT, walks)
     return kv
 
 

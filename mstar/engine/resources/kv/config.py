@@ -394,36 +394,44 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
 def opening_prefix_caches(
     specs: Iterable[NodeResourceSpec], instance: Mapping[str, int], checkpoint_named: bool,
 ) -> frozenset[str]:
-    """The paged KV caches whose prefix cache opens. Every input is fixed at
-    startup, so the workers, the conductor's routing and the data worker agree.
+    """The prefix caches that open: paged KV caches, and the recurrent pools
+    whose snapshots serve their hits. Every input is fixed at startup, so the
+    engines, the conductor's routing and the data worker agree.
 
-    ``instance`` is each node's lockstep instance (1 where absent); a spec is
-    sized by the smallest of its nodes'. A cache opens where its
-    ``prefix_cache_opens`` says so and no node of it carries a recurrent pool
-    that keeps no snapshots (no ``prefix_slots``, above one rank, or over a
-    cache that doesn't open): a hit there would skip tokens the state never
-    saw. ``Engine._close_unservable_nodes`` closes the same caches on the
-    built resources.
+    ``instance`` is the lockstep instance of each node the caller places; a
+    spec is sized by the smallest of its nodes there, 1 where it has none. A
+    KV cache opens where its ``prefix_cache_opens`` says so and none of its
+    nodes carries a pool that keeps no snapshots, or a resource over pools
+    alone that don't all keep them: a hit there would skip tokens the state
+    never saw. A pool keeps snapshots with ``prefix_slots``, at one rank, over
+    an opening cache on every node of the pool.
     """
     from mstar.engine.resources.recurrent.config import RecurrentStateSpec
 
     specs = list(specs)
 
     def size(spec: NodeResourceSpec) -> int:
-        return min((instance.get(node, 1) for node in spec.nodes), default=1)
+        return min((instance[node] for node in spec.nodes if node in instance), default=1)
 
     opens = {
         spec.resource_key: spec.nodes for spec in specs
         if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
         and spec.config.prefix_cache_opens(size(spec), checkpoint_named)
     }
+    pools = {spec.resource_key: spec for spec in specs if isinstance(spec, RecurrentStateSpec)}
+    keeping = {
+        key for key, spec in pools.items()
+        if spec.config.prefix_slots and size(spec) == 1
+        and spec.nodes <= opens.get(spec.config.kv_cache, frozenset())
+    }
     unrestorable = {
         node for spec in specs
-        if isinstance(spec, RecurrentStateSpec)
-        and not (spec.config.prefix_slots and size(spec) == 1 and spec.config.kv_cache in opens)
+        if spec.resource_key in pools.keys() - keeping
+        or (spec.depends_on() and spec.depends_on() <= pools.keys() and not spec.depends_on() <= keeping)
         for node in spec.nodes
     }
-    return frozenset(key for key, nodes in opens.items() if nodes.isdisjoint(unrestorable))
+    kv = {key for key, nodes in opens.items() if nodes.isdisjoint(unrestorable)}
+    return frozenset(kv | {key for key in keeping if pools[key].config.kv_cache in kv})
 
 
 @dataclass

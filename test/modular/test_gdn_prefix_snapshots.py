@@ -57,7 +57,6 @@ def _build(device):
     ))
     pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=device, dependencies={"kv": kv}))
     pool.bind_kv(_StubChains())
-    assert pool.enable_prefix_cache(b"a root")
     manager = LinearAttnManager.build(
         LinearAttnSpec(GDN, {"llm"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.GDN)),
         EngineResourceInfo(device=device, dependencies={POOL: spec}),

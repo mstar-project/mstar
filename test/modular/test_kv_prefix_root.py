@@ -115,9 +115,10 @@ def _checkpoint(root, config: bytes) -> str:
 
 
 def _kv(dtype=torch.float32, **overrides) -> KVManager:
+    """A salted pool, so it opens for a model that names no checkpoint."""
     cfg = dict(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
-        max_num_pages=16, page_size=16,
+        max_num_pages=16, page_size=16, prefix_cache_salt="a salt",
     )
     cfg.update(overrides)
     return KVManager(
@@ -132,8 +133,9 @@ def _rope(**overrides) -> RopeManager:
     return rope
 
 
-def _root(kv=None, rope=None, model=None) -> bytes:
-    """Run the engine's fold over one KV resource and one resource above it."""
+def _root(kv=None, rope=None, model=None, instance=None) -> bytes:
+    """Run the engine's fold over one KV resource and one resource above it, on
+    nodes whose lockstep instances are ``instance`` (one rank by default)."""
     kv = kv or _kv()
     rope = rope or _rope()
     engine = Engine.__new__(Engine)
@@ -144,7 +146,7 @@ def _root(kv=None, rope=None, model=None) -> bytes:
             resource_key=ROPE, nodes={"LLM"}, config=rope._config,
         ),
     }
-    engine._open_prefix_caches(specs, model or _Model())
+    engine._open_prefix_caches(specs, model or _Model(), instance or {"LLM": 1})
     return kv._prefix_root
 
 
@@ -195,9 +197,8 @@ def test_the_root_changes_with_the_checkpoint(tmp_path):
 
 def test_a_rank_above_one_never_opens_its_index():
     kv = _kv()
-    kv._world_size = 2
 
-    _root(kv=kv)
+    _root(kv=kv, instance={"LLM": 2})
 
     assert kv._index is None and kv._prefix_root is None, (
         "the index opened at a world size that cannot agree on a match length"
@@ -215,7 +216,7 @@ def test_a_deployment_can_turn_the_cache_off():
 
 
 def test_a_model_naming_no_checkpoint_keeps_its_cache_shut(caplog):
-    kv = _kv()
+    kv = _kv(prefix_cache_salt="")
 
     with caplog.at_level(logging.INFO, logger=Engine.__module__):
         _root(kv=kv, model=_Declaring())
@@ -239,7 +240,7 @@ def test_a_salt_opens_the_cache_of_a_model_naming_no_checkpoint():
 
 
 def test_a_model_naming_a_checkpoint_opens_its_cache(tmp_path):
-    kv = _kv()
+    kv = _kv(prefix_cache_salt="")
 
     _root(kv=kv, model=_Declaring(checkpoint=_checkpoint(tmp_path / "a", b"{}")))
 
@@ -367,20 +368,6 @@ def test_the_engine_hands_each_cache_the_walks_its_streams_name():
 # ── which resources are offered the root ────────────────────────────────
 
 
-class _Recording(Resource):
-    """Keeps state across requests of its own, and records the root it is handed."""
-
-    def __init__(self):
-        self.roots: list[bytes] = []
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
-
-    def enable_prefix_cache(self, root, walks=None):
-        self.roots.append(root)
-
-
 class _Plain(Resource):
     """Keeps nothing across requests, so has nothing to open."""
 
@@ -394,17 +381,7 @@ def _open(resources: dict) -> None:
     engine._resources = resources
     kv = resources[KV]
     engine._open_prefix_caches(
-        {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config)}, _Model(),
-    )
-
-
-def test_every_resource_is_offered_the_root_not_just_the_kv_cache():
-    other = _Recording()
-
-    _open({KV: _kv(), "other": other})
-
-    assert len(other.roots) == 1 and isinstance(other.roots[0], bytes), (
-        "a resource that is not a KVManager was never asked to open its cache"
+        {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config)}, _Model(), {"LLM": 1},
     )
 
 
@@ -491,7 +468,7 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
     engine._resources = {}
     engine._device = torch.device("cuda")
     kv = _kv(prefix_cache_salt=salt).config
-    engine._open_prefix_caches({KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv)}, _laid_out())
+    engine._open_prefix_caches({KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv)}, _laid_out(), {})
     # "vae" is an encoder that no layout walk runs, like an edit's.
     engine._submodules = {
         name: SimpleNamespace(submodule=SimpleNamespace(forward=None, forward_batched=None))
@@ -518,7 +495,7 @@ def test_an_encoder_that_marks_its_own_dims_compiles_with_the_default_while_its_
     spec = KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
     ))
-    engine._open_prefix_caches({KV: spec}, _laid_out())
+    engine._open_prefix_caches({KV: spec}, _laid_out(), {})
     vit = SimpleNamespace(forward="eager", forward_batched="eager", marks_dynamic_dims=True)
     engine._submodules = {"vit": SimpleNamespace(submodule=vit, forward="eager")}
 

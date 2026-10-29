@@ -127,13 +127,14 @@ class Resource(ABC):
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
-        """Open whatever this resource keeps across requests, under ``root``;
-        True if anything opened."""
-        return False
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
+        """Open whatever this resource keeps across requests, under ``root``. The
+        engine calls it, before any request, on the caches `opening_prefix_caches` opens."""
+        return
 
     def close_prefix_cache(self) -> None:
-        """Undo `enable_prefix_cache`. Called before any request."""
+        """Keep nothing across requests. The engine calls it, before any
+        request, on every other resource."""
         return
 
     def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:

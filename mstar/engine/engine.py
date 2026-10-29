@@ -36,9 +36,10 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
-from mstar.engine.resources.kv.config import opening_prefix_caches
+from mstar.engine.resources.kv.config import PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.recurrent.config import RecurrentStateSpec
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -574,7 +575,9 @@ class Engine:
             enable_nvtx=self._enable_nvtx,
         )
 
-        self._open_prefix_caches(specs_by_key, model)
+        self._open_prefix_caches(specs_by_key, model, {
+            node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names
+        })
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
@@ -869,9 +872,11 @@ class Engine:
             runners[label] = runner
         return runners
 
-    def _open_prefix_caches(self, specs_by_key, model) -> None:
-        """Root each resource's cache in the weights, the preprocessing, and the
-        config of every resource its pages were planned against."""
+    def _open_prefix_caches(self, specs_by_key, model, instance: Mapping[str, int]) -> None:
+        """Open exactly the caches `opening_prefix_caches` opens, ``instance`` being
+        the lockstep instance of each node here. Each is rooted in the weights,
+        the preprocessing, and the config of every resource its pages were
+        planned against."""
         checkpoint = model.checkpoint_path() if model is not None else None
         shared = [
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
@@ -879,34 +884,24 @@ class Engine:
         ]
         declared = keyed_labels(model) if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on, from the keys of every label on a cache the node uses
+        # a cache only another engine holds counts here at one rank: its own engine sizes it
+        opened = opening_prefix_caches(specs_by_key.values(), instance, checkpoint_named=checkpoint is not None)
+        opened_keys = opened & declared.keys()
+        self._log_shut_caches(specs_by_key, declared.keys() - opened, opened, instance, checkpoint is not None)
+        # node -> the walks a probe may run on, from the keys of every label on an open cache the node uses
         self._keyed_walks: dict[str, set[str]] = {}
-        for key, by_label in declared.items():
+        for key in opened_keys:
             for node in specs_by_key[key].nodes:
                 self._keyed_walks.setdefault(node, set()).update(
-                    walk for label in by_label.values() for walk in label.keys.walks
+                    walk for label in declared[key].values() for walk in label.keys.walks
                 )
-        # a cache another engine holds is taken as open when the rule says so at
-        # one rank: that pool's world size is its own engine's to apply
-        elsewhere = opening_prefix_caches(specs_by_key.values(), {}, checkpoint_named=checkpoint is not None)
-        opened_keys = {key for key in declared if key not in self._resources and key in elsewhere}
-        # resources that aren't keyed but opened, such as a recurrent pool's snapshots
-        restoring: set[str] = set()
         for key, spec in specs_by_key.items():
             if key in self._resources and spec.depends_on() <= self._resources.keys():
                 self._resources[key].bind_dependencies({dep: self._resources[dep] for dep in spec.depends_on()})
         for key, resource in self._resources.items():
-            if checkpoint is None and declared.get(key):
-                config = specs_by_key[key].config
-                # the world-size half of the rule is the pool's own (enable_prefix_cache)
-                if config.prefix_cache and not config.prefix_cache_opens(1, checkpoint_named=False):
-                    logger.info(
-                        "KV %s: prefix cache off: %s names no checkpoint, so "
-                        "builds that differ only in their weights cannot be "
-                        "told apart; set prefix_cache_salt to enable it",
-                        key, self._prefix_model,
-                    )
-                    continue
+            if key not in opened:
+                resource.close_prefix_cache()
+                continue
             # its own, then its dependents' in key order, so the root does not
             # move with the order the engine happened to build them in
             parts = [resource.fingerprint()]
@@ -916,15 +911,12 @@ class Engine:
                     mark = built.fingerprint() if built is not None else None
                     if mark is not None:
                         parts.append(mark)
-            opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
+            resource.enable_prefix_cache(fingerprint(*shared, *parts), {
                 label: KeyedWalks(
                     kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth),
                 )
                 for label, kv_label in declared.get(key, {}).items()
             })
-            if opened:
-                (opened_keys if declared.get(key) else restoring).add(key)
-        self._close_unservable_nodes(specs_by_key, opened_keys, restoring)
         for key in sorted(opened_keys & self._resources.keys()):
             resource = self._resources[key]
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
@@ -951,36 +943,37 @@ class Engine:
                     nodes = model.get_graph_walk_graphs()[walk].get_nodes()
                     self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
 
-    def _close_unservable_nodes(
-        self, specs_by_key: dict[str, NodeResourceSpec], opened_keys: set[str], restoring: set[str],
+    def _log_shut_caches(
+        self, specs_by_key: dict[str, NodeResourceSpec], shut: set[str], opened: frozenset[str],
+        instance: Mapping[str, int], checkpoint_named: bool,
     ) -> None:
-        """Close every prefix cache on a keyed node with a resource that can't
-        serve a cached prefix: on the built resources, what
-        ``opening_prefix_caches`` decides from the specs.
-
-        A resource that opened but isn't keyed serves a hit only when every cache
-        it depends on opened, and so does a resource that depends only on such
-        resources.
-        """
-        restorers = {key for key in restoring if specs_by_key[key].depends_on() <= opened_keys}
-        serving = opened_keys | restorers | {
-            key for key, resource in self._resources.items() if resource.prefix_skip_safe
-        } | {
-            key for key, spec in specs_by_key.items()
-            if spec.depends_on() and spec.depends_on() <= restorers
-        }
-        for node in sorted(self._keyed_walks):
-            on_node = {key for key, spec in specs_by_key.items() if node in spec.nodes and key in self._resources}
-            if on_node <= serving:
+        """Say why each keyed cache here that asks for a prefix cache stays shut."""
+        for key in sorted(shut & self._resources.keys()):
+            spec = specs_by_key[key]
+            config = spec.config
+            if not isinstance(config, PagedKVConfig) or not config.prefix_cache:
                 continue
-            del self._keyed_walks[node]
-            for key in sorted(on_node - serving):
-                logger.info("%s on %s can't serve a cached prefix: the prefix caches on %s stay off",
-                            key, node, node)
-            for key in sorted(on_node & (opened_keys | restoring)):
-                self._resources[key].close_prefix_cache()
-                opened_keys.discard(key)
-                restoring.discard(key)
+            size = min((instance[node] for node in spec.nodes if node in instance), default=1)
+            nodes = ", ".join(sorted(spec.nodes))
+            if not config.prefix_cache_opens(size, checkpoint_named=True):
+                logger.info("KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)", key, size)
+            elif not config.prefix_cache_opens(size, checkpoint_named):
+                logger.info(
+                    "KV %s: prefix cache off: %s names no checkpoint, so "
+                    "builds that differ only in their weights cannot be "
+                    "told apart; set prefix_cache_salt to enable it",
+                    key, self._prefix_model,
+                )
+            else:
+                pools = sorted(
+                    other for other, pool in specs_by_key.items()
+                    if isinstance(pool, RecurrentStateSpec) and other not in opened
+                    and not pool.nodes.isdisjoint(spec.nodes)
+                )
+                logger.info(
+                    "KV %s: prefix cache off: %s on %s can't restore a cached prefix",
+                    key, ", ".join(pools) or "a recurrent state pool", nodes,
+                )
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.

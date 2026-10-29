@@ -21,7 +21,6 @@ from mstar.engine.resources.base import (
     CGSlotKey,
     CGSlotSpec,
     EngineResourceInfo,
-    KeyedWalks,
     Resource,
 )
 from mstar.engine.resources.kv.config import opening_prefix_caches
@@ -140,9 +139,9 @@ class RecurrentStatePool(Resource):
         config.shard(info.head_shards)
         world_size = 1 if info.joint_comm_group is None else info.joint_comm_group.world_size
         specs = [spec, *info.dependencies.values()]
-        # no snapshot slots where the prefix cache can't open. A model that names
-        # no checkpoint has its cache closed by the engine, as the KV manager assumes.
-        if config.kv_cache not in opening_prefix_caches(
+        # no snapshot slots where they can't serve a hit. A model that names no
+        # checkpoint keeps them here and has the engine close the pool.
+        if spec.resource_key not in opening_prefix_caches(
             specs, {node: world_size for s in specs for node in s.nodes}, checkpoint_named=True,
         ):
             config = replace(config, prefix_slots=0)
@@ -604,14 +603,9 @@ class RecurrentStatePool(Resource):
         return self._kv.keyed_walks(label) if self._kv is not None else frozenset()
 
     def bind_kv(self, kv: "KVManager") -> None:
-        """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names."""
-        self._kv = kv
-
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
-        del root, walks
-        if not self.config.prefix_slots:
-            self._kv = None
-        return self._kv is not None
+        """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names.
+        A pool with no snapshot slots keys none."""
+        self._kv = kv if self.config.prefix_slots else None
 
     def close_prefix_cache(self) -> None:
         self._kv = None

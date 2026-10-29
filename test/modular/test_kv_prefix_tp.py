@@ -21,7 +21,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import StepRunner, apply_yaml_overrides
 from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
@@ -271,22 +271,16 @@ def test_above_one_rank_a_commit_caches_no_image_end():
     )
 
 
-def test_above_one_rank_the_cache_stays_off_unless_the_deployment_opts_in():
-    assert _manager(0, opt_in=False)._index is None
-    assert _manager(0)._index is not None
-
-
-def test_the_serving_config_turns_on_prefix_cache_tp():
+def test_above_one_rank_the_cache_opens_only_where_the_serving_config_opts_in():
     spec = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2, max_num_pages=32,
         page_size=PAGE_SIZE,
     ))
+    assert "kv" not in opening_prefix_caches([spec], {NODE: 2}, checkpoint_named=True)
     apply_yaml_overrides([spec], yaml.safe_load("resources:\n  kv:\n    prefix_cache_tp: true\n"))
-    kv = KVManager(
-        cfg=spec.config, name="kv", joint_comm_group=SimpleNamespace(rank=0, world_size=2),
-        transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
+    assert "kv" in opening_prefix_caches([spec], {NODE: 2}, checkpoint_named=True), (
+        "the serving config's prefix_cache_tp never reached the rule"
     )
-    assert kv.enable_prefix_cache(ROOT, WALKS), "the serving config's prefix_cache_tp never reached the pool"
 
 
 def test_host_offload_or_a_pool_on_more_than_one_tp_group_is_refused_at_load(monkeypatch):

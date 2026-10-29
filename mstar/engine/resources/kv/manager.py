@@ -675,7 +675,7 @@ class KVManager(AttentionResource):
             )
         return state
 
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
         """Open the index under ``root``, the identity every key hangs from."""
         self._keyed_walks = {}
         for label, named in (walks or {}).items():
@@ -685,17 +685,8 @@ class KVManager(AttentionResource):
             if self._world_size == 1:
                 keyed.update(named.growth)
             self._keyed_walks[label] = frozenset(keyed)
-        # the engine has closed the cache of a model that names no checkpoint before this
-        if not self.config.prefix_cache_opens(self._world_size, checkpoint_named=True):
-            if self.config.prefix_cache:
-                logger.info(
-                    "KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)",
-                    self.name, self._world_size,
-                )
-            return False
         self._prefix_root = root
         self._index = PrefixIndex(self._arena)
-        return True
 
     def close_prefix_cache(self) -> None:
         self._index = None

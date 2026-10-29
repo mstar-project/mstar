@@ -44,7 +44,7 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
-from mstar.engine.resources.kv.config import opening_prefix_caches
+from mstar.engine.resources.kv.config import KVSpec, opening_prefix_caches
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
@@ -200,7 +200,10 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
         for node in group.get("node_names") or []:
             instance[node] = min(size, instance.get(node, size))
     opened = opening_prefix_caches(specs, instance, names_checkpoint(model))
-    return {spec.resource_key: spec.config.page_size for spec in specs if spec.resource_key in opened}
+    return {
+        spec.resource_key: spec.config.page_size for spec in specs
+        if isinstance(spec, KVSpec) and spec.resource_key in opened
+    }
 
 
 class PreprocessWorker:

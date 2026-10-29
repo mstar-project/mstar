@@ -20,7 +20,7 @@ import torch
 from mstar.engine.engine import Engine
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
@@ -71,7 +71,7 @@ def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool
     kv.config.prefix_cache = prefix_cache
     group = type("Group", (), {"world_size": world_size})() if world_size > 1 else None
     return RecurrentStatePool.build(
-        RecurrentStateSpec(resource_key="state", nodes={NODE}, config=config),
+        RecurrentStateSpec(resource_key="state", nodes=set(kv.nodes), config=config),
         EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=group, dependencies={"kv": kv}),
     )
 
@@ -83,7 +83,6 @@ def _pool(prefix_slots: int = 2, world_size: int = 1, prefix_cache: bool = True)
     )
     pool = _build(config, world_size, prefix_cache)
     pool.bind_kv(_StubChains())
-    pool.enable_prefix_cache(b"a root")
     return pool
 
 
@@ -171,9 +170,9 @@ def test_a_full_set_evicts_the_oldest_snapshot_nothing_holds():
 @pytest.mark.parametrize("closed", [{"world_size": 2}, {"prefix_cache": False}, {"prefix_slots": 0}])
 def test_snapshots_stay_off_and_unallocated_where_the_cache_cant_open(closed):
     pool = _pool(**closed)
-    assert not pool.enable_prefix_cache(b"a root")
+    assert pool._kv is None, "a pool that can't restore keys snapshots"
     assert pool.block("state", 0).shape[0] == pool.config.max_slots, "allocated snapshot slots nothing can use"
-    assert _pool().enable_prefix_cache(b"a root")
+    assert _pool()._kv is not None
 
 
 def test_a_negative_prefix_slots_override_is_refused():
@@ -286,9 +285,10 @@ def _specs(prefix_slots: int) -> dict[str, NodeResourceSpec]:
         max_slots=4, prefix_slots=prefix_slots, kv_cache="kv",
     )
     return {
+        # prefix_cache_tp, so above one rank only the pool keeps the cache shut
         "kv": KVSpec(resource_key="kv", nodes={"LLM"}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=8,
-            page_size=PAGE, prefix_cache_salt="a salt",
+            page_size=PAGE, prefix_cache_salt="a salt", prefix_cache_tp=True,
         )),
         "state": RecurrentStateSpec(resource_key="state", nodes={"LLM"}, config=state),
         "gdn": LinearAttnSpec(resource_key="gdn", nodes={"LLM"}, config=LinearAttnConfig(
@@ -307,7 +307,7 @@ def _open(monkeypatch, prefix_slots: int = 2, world_size: int = 1) -> Engine:
         "state": _build(specs["state"].config, world_size),
         "gdn": _StubGDN(),
     }
-    engine._open_prefix_caches(specs, _Keyed())
+    engine._open_prefix_caches(specs, _Keyed(), {"LLM": world_size})
     return engine
 
 
@@ -325,6 +325,93 @@ def test_a_node_whose_pool_keeps_no_snapshots_opens_no_cache(monkeypatch, caplog
     assert engine._resources["kv"]._index is None, "a KV hit would skip tokens the GDN state never saw"
     assert "LLM" not in engine._keyed_walks
     assert "state on LLM" in caplog.text
+
+
+def _kv_spec(key: str, nodes: set[str], **overrides) -> KVSpec:
+    return KVSpec(resource_key=key, nodes=nodes, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=8,
+        page_size=PAGE, prefix_cache_salt="a salt", **overrides,
+    ))
+
+
+def _pool_specs(nodes: set[str], kv_cache: str = "kv", prefix_slots: int = 2) -> list[NodeResourceSpec]:
+    """A pool and the GDN resource over it."""
+    return [
+        RecurrentStateSpec(resource_key="state", nodes=nodes, config=RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
+            max_slots=4, prefix_slots=prefix_slots, kv_cache=kv_cache,
+        )),
+        LinearAttnSpec(resource_key="gdn", nodes=nodes, config=LinearAttnConfig(
+            recurrent_state="state", variant=LinearAttnVariant.GDN,
+        )),
+    ]
+
+
+class _KeyedOn(_Keyed):
+    def __init__(self, keys):
+        self._keys = keys
+
+    def kv_labels(self):
+        return {key: super(_KeyedOn, self).kv_labels()["kv"] for key in self._keys}
+
+
+# specs, the keyed caches, each local node's lockstep instance, and the caches that open here
+_SHAPES = {
+    "snapshots": ([_kv_spec("kv", {"LLM"}), *_pool_specs({"LLM"})], {"kv"}, {"LLM": 1}, {"kv", "state"}),
+    "no_prefix_slots": ([_kv_spec("kv", {"LLM"}), *_pool_specs({"LLM"}, prefix_slots=0)], {"kv"}, {"LLM": 1}, set()),
+    "two_ranks": (
+        [_kv_spec("kv", {"LLM"}, prefix_cache_tp=True), *_pool_specs({"LLM"})], {"kv"}, {"LLM": 2}, set(),
+    ),
+    "kv_not_opening": (
+        [_kv_spec("kv", {"LLM"}, prefix_cache=False), *_pool_specs({"LLM"})], {"kv"}, {"LLM": 1}, set(),
+    ),
+    "node_shared_by_two_caches": (
+        [_kv_spec("kv", {"LLM"}), _kv_spec("kv2", {"LLM"}), *_pool_specs({"LLM"}, prefix_slots=0)],
+        {"kv", "kv2"}, {"LLM": 1}, set(),
+    ),
+    "kv_cache_names_another_key": (
+        [_kv_spec("kv", {"LLM"}), _kv_spec("kv2", {"LLM"}), *_pool_specs({"LLM"}, kv_cache="kv2")],
+        {"kv", "kv2"}, {"LLM": 1}, {"kv", "kv2", "state"},
+    ),
+    # the pool's cache is on a node another engine holds, so nothing here keys its snapshots
+    "cross_engine_pool": (
+        [_kv_spec("kv", {"Y"}), _kv_spec("kv2", {"X"}), *_pool_specs({"X"})], {"kv2"}, {"X": 1}, set(),
+    ),
+}
+
+
+@pytest.mark.parametrize(("specs", "keyed", "instance", "opens"), _SHAPES.values(), ids=_SHAPES.keys())
+def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, keyed, instance, opens):
+    """The conductor's routing and the data worker read the rule, so a cache the
+    engine kept shut would be mirrored and hashed for hits nothing serves."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    by_key = {spec.resource_key: spec for spec in specs}
+    local = [spec for spec in specs if not spec.nodes.isdisjoint(instance)]
+    engine = Engine.__new__(Engine)
+    engine._resources = {}
+    for spec in local:
+        size = min(instance[node] for node in spec.nodes & instance.keys())
+        if isinstance(spec, KVSpec):
+            engine._resources[spec.resource_key] = KVManager(
+                cfg=spec.config, name=spec.resource_key, joint_comm_group=None,
+                transfer_engine_info=None, device=torch.device("cpu"),
+            )
+        elif isinstance(spec, RecurrentStateSpec):
+            group = type("Group", (), {"world_size": size})() if size > 1 else None
+            engine._resources[spec.resource_key] = RecurrentStatePool.build(spec, EngineResourceInfo(
+                device=torch.device("cpu"), joint_comm_group=group,
+                dependencies={dep: by_key[dep] for dep in spec.depends_on()},
+            ))
+        else:
+            engine._resources[spec.resource_key] = _StubGDN()
+    engine._open_prefix_caches(by_key, _KeyedOn(keyed), instance)
+    opened = {
+        key for key, resource in engine._resources.items()
+        if (isinstance(resource, KVManager) and resource._index is not None)
+        or (isinstance(resource, RecurrentStatePool) and resource._kv is not None)
+    }
+    assert opened == opening_prefix_caches(specs, instance, checkpoint_named=False) & engine._resources.keys()
+    assert opened == opens
 
 
 def test_a_keyed_node_loads_with_a_recurrent_pool_and_the_resource_over_it():
