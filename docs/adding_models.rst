@@ -1004,7 +1004,10 @@ placed exactly as weights are.
   block runs, traces and guards exactly as before (tests hold the aten ops, the dynamo
   graph and its guards). Anything else holding weight matrices (MoE experts, a router, a
   depthwise conv, ``nn.Embedding``, a forward overridden on an instance or hooked) takes
-  none: the walk records why, and an adapter touching it is refused with that reason.
+  none: the walk records why, and an adapter touching it is refused with that reason. So
+  does a child its parent runs through the weight itself rather than its forward (folded at
+  load, an ``F.linear`` over it), which the parent names in ``lora_unservable`` (child name
+  -> reason; MLA's absorbed projections, SigLIP's patch embedding).
 - **Targets.** One per role in a layer stack (``layers.N.<role>`` / ``blocks.N.<role>``,
   ``layers`` set where a role is on some layers only), named by the role's last
   component (``names`` overrides), plus one per module outside the stacks.

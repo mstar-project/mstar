@@ -59,6 +59,8 @@ class SiglipLayer(nn.Module):
 
 
 class SiglipEmbeddings(nn.Module):
+    lora_unservable = {"patch_embedding": "run as a matmul over its weight, never its own forward"}
+
     def __init__(self, config: CommandAPlusVisionConfig) -> None:
         super().__init__()
         self.patch_embedding = nn.Conv2d(
