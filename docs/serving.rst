@@ -340,8 +340,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold`` and ``pre_plan``
-       (``true``/``false`` or an integer). Each one's environment variable
+       ``gc_gen0_threshold``, ``pre_plan`` and ``step_thread_core``
+       (``true``/``false`` or an integer; ``step_thread_core`` also takes
+       ``auto``, the default, or ``off``, and an integer there is a CPU
+       number). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,

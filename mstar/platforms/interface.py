@@ -9,6 +9,7 @@ import torch
 
 from mstar.platforms.facts import DeviceFacts, device_facts
 from mstar.platforms.ptxas import blackwell_ptxas_env
+from mstar.utils.cpu_list import parse_cpu_list
 
 logger = logging.getLogger(__name__)
 
@@ -136,8 +137,25 @@ class Platform:
         ValueError where this platform has no way."""
         raise ValueError(f"mps: true needs an NVIDIA or AMD GPU, not {self!r}")
 
+    def local_cpus(self, device_index: int) -> frozenset[int] | None:
+        """The CPUs on the device's NUMA node, as the host lists them; None
+        where the platform or the host doesn't say."""
+        return None
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
+
+
+def _pci_local_cpus(device_index: int) -> frozenset[int] | None:
+    """The device's ``local_cpulist`` in sysfs, found by the PCI address torch
+    reports. ROCm builds report it the same way, so this needs no NVML."""
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        bdf = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+        with open(f"/sys/bus/pci/devices/{bdf}/local_cpulist") as f:
+            return parse_cpu_list(f.read()) or None
+    except (AssertionError, AttributeError, OSError, RuntimeError, ValueError):
+        return None
 
 
 class CudaPlatform(Platform):
@@ -163,6 +181,9 @@ class CudaPlatform(Platform):
         from mstar.conductor.mps import MpsDaemon
 
         return MpsDaemon()
+
+    def local_cpus(self, device_index: int) -> frozenset[int] | None:
+        return _pci_local_cpus(device_index)
 
 
 class RocmPlatform(Platform):
@@ -258,6 +279,9 @@ class RocmPlatform(Platform):
 
     def colocated_workers(self) -> WorkerColocation:
         return HardwareQueueColocation()
+
+    def local_cpus(self, device_index: int) -> frozenset[int] | None:
+        return _pci_local_cpus(device_index)
 
 
 class XpuPlatform(Platform):
