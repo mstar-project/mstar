@@ -43,7 +43,7 @@ class FlashInferManager(AttentionManager):
         self._splits = {split.combined_walk: split for split in splits}
         self._max_rows_in_combined = max_rows_in_combined or {}
         # False where decode without tensor cores is faster (FlashInfer on
-        # ROCm, see `flashinfer_kwargs`)
+        # ROCm, see `attn.aiter.flashinfer_rocm_kwargs`)
         self._decode_tensor_cores = decode_tensor_cores
         self._device = device
         self._dtype = dtype
