@@ -1928,7 +1928,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    36 to 44 GiB compiled.
 
 ``linear_dtype``
-   ``bf16`` (default), ``mxfp8`` or ``nvfp4``; klein 4B, 9B and Z-Image. Runs the block linears
+   ``bf16`` (default), ``fp8``, ``mxfp8`` or ``nvfp4``; klein 4B, 9B and Z-Image. Runs the block linears
    the model declares (``QUANTIZABLE_LINEARS`` beside each transformer) in that format: a
    ``QuantLinear`` holding the weight quantized once at load, after any ``lora``, whose forward
    is one op (``mstar::mxfp8_linear`` / ``mstar::nvfp4_linear``) that quantizes the activation
@@ -1953,6 +1953,14 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    and images per second at 8 concurrent requests rise 25% or 39%. Device memory after 8
    concurrent requests falls by 2.3 GiB on klein 4B with MXFP8 (5.1 GiB with NVFP4), 7.6 GiB on
    9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``attention_backend: sdpa``).
+
+   ``fp8`` is the format every fp8 GEMM takes natively (MI300X/MI325X, Hopper and up;
+   ``mstar.model.components.fp8_rowwise``): e4m3 weights in the GPU's own variant
+   (``Platform.fp8_dtype``: FNUZ on gfx942, OCP elsewhere) with one scale per output channel,
+   activations quantised per token in plain torch so the compiled forward fuses that into the
+   producing norm, and the product on ``mstar::fp8_rowwise_mm`` (hipBLASLt / cuBLASLt). It
+   needs N and K multiples of 16. The text stream's linears (512 rows, where fp8 is no faster
+   on MI325X) are worth keeping bf16 with ``linear_keep_bf16``; the shipped AMD configs do.
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one
