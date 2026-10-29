@@ -96,11 +96,13 @@ def _partials_kernel(
         score = tl.where(mask, score, -float("inf"))
     else:
         score = x
+    # a NaN logit never wins, so a row of them still draws an id inside the vocab
+    score = tl.where(score == score, score, -float("inf"))  # noqa: PLR0124  (NaN test)
     best = tl.max(score, axis=0)
     # the first index among equal maxima, as the full sampler's greedy rows
     idx = tl.argmax(score, axis=0)
     tl.store(part_val_ptr + row * NSPLIT + split, best)
-    tl.store(part_idx_ptr + row * NSPLIT + split, split * BLOCK + idx)
+    tl.store(part_idx_ptr + row * NSPLIT + split, tl.minimum(split * BLOCK + idx, V - 1))
 
 
 @triton.jit
@@ -221,7 +223,7 @@ def _reference(logits, temperature, seed, offset, tokens, offset_step, slot_inde
             # x * (1 / T) in fp32, as the kernel rounds it
             inv = 1.0 / temperature[r:r + 1].float()
             x = x * inv + gumbel_reference(int(seed[r]), off, x.shape[0], x.device)
-        token = int(torch.argmax(x))
+        token = int(torch.argmax(torch.nan_to_num(x, nan=-float("inf"))))
         tokens[r] = token
         offset[r] = off + offset_step
         if rows is not None:

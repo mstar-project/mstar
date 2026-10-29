@@ -123,3 +123,18 @@ def test_slot_masters_through_a_captured_graph():
         torch.cuda.synchronize()
         assert tokens[:2].tolist() == expected[s].tolist(), f"replay {s}"
     assert offset_master.tolist()[:4] == [0, 10 + steps, 0, 20 + steps]
+
+
+def test_rows_of_nan_still_draw_an_id_inside_the_vocab():
+    """Garbage logits (a broken layer, a capture's dummy rows) must not turn into an out-of-range id, which the
+    next step's embedding would read out of bounds."""
+    vocab = 248320
+    logits = torch.randn(4, vocab, device=DEV).to(torch.bfloat16)
+    logits[0] = float("nan")
+    logits[1, : vocab // 2] = float("nan")
+    logits[2, -5:] = float("nan")
+    tokens, _ = _run(logits, torch.tensor([0.0, 0.7, 0.0, 0.7], device=DEV), torch.arange(4, device=DEV),
+                     torch.zeros(4, dtype=torch.int64, device=DEV))
+    assert ((tokens >= 0) & (tokens < vocab)).all(), tokens.tolist()
+    assert int(tokens[1]) >= vocab // 2
+    assert int(tokens[2]) == int(torch.nan_to_num(logits[2].float(), nan=-float("inf")).argmax())
