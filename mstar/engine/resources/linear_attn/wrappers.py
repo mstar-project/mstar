@@ -717,3 +717,201 @@ class GDNMixedWrapper(GDNWrapper):
         front_out = self._prefill.run(qf, kf, vf, af, bf, state, a_log, dt_bias)
         rows_out = self._decode.run(qd, kd, vd, ad, bd, state, a_log, dt_bias)
         return self._merge(front_out, rows_out, n)
+
+
+# a gate this low makes a token a no-op on the state: no decay (softplus(a + dt_bias) is 0, so
+# exp(g) is 1) and no write (sigmoid(b) is 0), exactly, in fp32
+_CLOSED_GATE = -1.0e4
+# a null id no slot has: the conv update kernel then skips no row
+NO_PAD_SKIP = -2
+
+
+@dataclass(frozen=True)
+class GDNVerifyPlan:
+    """A draft-verify step: every row is a block of ``block`` tokens."""
+
+    # [n] int32, straight off the pool's addressing (padding rows: the sink); a captured graph
+    # reads it in place, so anything derived from it is derived in the forward
+    slots: torch.Tensor
+    num_rows: int
+    block: int
+
+
+class GDNVerifyWrapper(GDNWrapper):
+    """The rows of a draft-verify step: each a block of the last emitted token and its drafts,
+    of which the verdict keeps a prefix it decides only after the forward.
+
+    The forward runs the conv over each slot's window and the block, keeping the slot's window
+    as it found it beside the block's inputs, and the delta rule over the block from the slot's
+    state without writing it back (`run`). ``settle`` then writes, per row, the conv window
+    after its accepted prefix, and the delta rule's state by running the block again from the
+    slot with every rejected token's gates closed, so those tokens leave the state as it was.
+    That second pass reads and writes the state once a row, where keeping the state after
+    every token of the block would write it ``block`` times. Each layer's inputs stay
+    referenced from its forward call to the settle, in the same graph.
+
+    The kernels need the pool's sink: a padding row reads and writes it.
+    """
+
+    qk_l2norm_in_kernel: bool = True
+    # FlashInfer's multi-token decode kernel reads the projection's column views as they are
+    takes_strided_inputs: bool = True
+
+    def __init__(
+        self,
+        device: torch.device,
+        pad_slot_id: int,
+        sm_scale: float | None = None,
+        qk_l2norm: bool = True,
+        bs: int | None = None,
+        accelerator_graph: bool = False,
+        null_slot_id: int = 0,
+    ):
+        super().__init__(
+            device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale, qk_l2norm=qk_l2norm,
+            num_tokens=bs, bs=bs, accelerator_graph=accelerator_graph, null_slot_id=null_slot_id,
+        )
+        if null_slot_id < 0:
+            raise ValueError("a GDN verify step needs the pool's sink slot; unset disable_sink_slot")
+        self._plan_state: GDNVerifyPlan | None = None
+        # the slots as int64, derived once per forward (a graph reads the addressing in place)
+        self._index: torch.Tensor | None = None
+        self._closed: dict[torch.dtype, torch.Tensor] = {}
+        # per layer, by its block's address: what `settle` needs of the step's forward
+        self._conv: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._delta: dict[int, tuple] = {}
+
+    def plan(self, spans: list[int], slots: torch.Tensor):
+        block = spans[0] if spans else 0
+        if block < 2 or any(span != block for span in spans):
+            raise ValueError(f"a GDN verify step runs blocks of one length, at least 2; got spans {spans}")
+        self._plan_state = GDNVerifyPlan(slots=slots, num_rows=len(spans), block=block)
+        self._index = None
+        self._conv.clear()
+        self._delta.clear()
+
+    def _slot_index(self) -> torch.Tensor:
+        if self._index is None:
+            self._index = self._plan_state.slots.to(torch.int64)
+        return self._index
+
+    def run_conv(
+        self,
+        x: torch.Tensor,
+        conv_layer: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        activation: str | None = "silu",
+    ) -> torch.Tensor:
+        plan = self._plan_state
+        rows, block = plan.num_rows, plan.block
+        dim = x.shape[1]
+        # the slot's window (every tap but the current token's) as the step found it
+        old = conv_layer.index_select(0, self._slot_index())
+        self._conv[conv_layer.data_ptr()] = (conv_layer, old, x)
+        if x.device.type != "cuda":
+            window = torch.cat([old, x.view(rows, block, dim).transpose(1, 2).to(old.dtype)], dim=2)
+            out = torch.nn.functional.conv1d(
+                window.float(), weight.float().unsqueeze(1), None if bias is None else bias.float(), groups=dim,
+            )
+            if activation in ("silu", "swish"):
+                out = torch.nn.functional.silu(out)
+            return out.transpose(1, 2).reshape(rows * block, dim).to(x.dtype)
+        from mstar.utils.causal_conv1d import causal_conv1d_update
+
+        # Through the whole block, writing the window after it into the slot, which the settle
+        # corrects; padding rows too (into the sink), so no row's output is left unwritten.
+        out = torch.empty(rows, block, dim, dtype=x.dtype, device=x.device)
+        causal_conv1d_update(
+            x.view(rows, block, dim).transpose(1, 2), conv_layer, weight, bias, activation,
+            conv_state_indices=plan.slots, null_block_id=NO_PAD_SKIP, out=out.transpose(1, 2),
+        )
+        return out.view(rows * block, dim)
+
+    def run(self, q, k, v, a, b, state, a_log, dt_bias):
+        plan = self._plan_state
+        rows, block = plan.num_rows, plan.block
+        q, k, v = (t.reshape(rows, block, *t.shape[1:]) for t in (q, k, v))
+        a, b = (t.reshape(rows, block, -1) for t in (a, b))
+        out = self._delta_rule(q, k, v, a, b, state, a_log, dt_bias, update=False)
+        self._delta[state.data_ptr()] = (state, q, k, v, a, b, a_log, dt_bias)
+        return out.reshape(rows * block, *out.shape[2:])
+
+    def settle(self, accepted: torch.Tensor) -> None:
+        """Each row's state after its accepted prefix: the input token and ``accepted[i]``
+        drafts. Inside the forward, after the verify; capturable."""
+        plan = self._plan_state
+        if plan is None or not (self._conv or self._delta):
+            return
+        rows, block = plan.num_rows, plan.block
+        accepted = accepted[:rows].to(torch.int64)
+        index = self._slot_index()
+        at = None
+        for conv_layer, old, x in self._conv.values():
+            taps = conv_layer.shape[2]
+            if at is None:
+                # the window after token `accepted`: positions accepted + 1 .. accepted + taps
+                at = (accepted + 1)[:, None] + torch.arange(taps, device=accepted.device)
+                at = at[:, None, :].expand(rows, conv_layer.shape[1], taps)
+            window = torch.cat([old, x.view(rows, block, -1).transpose(1, 2).to(old.dtype)], dim=2)
+            conv_layer.index_copy_(0, index, window.gather(2, at))
+        keep = (torch.arange(block, device=accepted.device)[None, :] <= accepted[:, None])[..., None]
+        for state, q, k, v, a, b, a_log, dt_bias in self._delta.values():
+            closed = self._closed.get(a.dtype)
+            if closed is None:
+                closed = self._closed[a.dtype] = torch.full((), _CLOSED_GATE, dtype=a.dtype, device=a.device)
+            self._delta_rule(
+                q, k, v, torch.where(keep, a, closed), torch.where(keep, b, closed),
+                state, a_log, dt_bias, update=True,
+            )
+        self._conv.clear()
+        self._delta.clear()
+
+    def _delta_rule(self, q, k, v, a, b, state, a_log, dt_bias, update: bool) -> torch.Tensor:
+        slots = self._plan_state.slots
+        if q.device.type != "cuda":
+            return _gated_delta_rule_reference(
+                q, k, v, a, b, state, slots, a_log, dt_bias,
+                self._sm_scale, self._qk_l2norm, update,
+            )
+        from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+
+        out, _ = gated_delta_rule_decode_pretranspose(
+            q=q, k=k, v=v, state=None, A_log=a_log, a=a, dt_bias=dt_bias, b=b,
+            scale=self._sm_scale, use_qk_l2norm=self._qk_l2norm,
+            initial_state=state, initial_state_indices=slots,
+            disable_state_update=not update,
+        )
+        return out
+
+
+def _gated_delta_rule_reference(
+    q, k, v, a, b, state, slots, a_log, dt_bias, scale, qk_l2norm, update,
+) -> torch.Tensor:
+    """The gated delta rule over ``[rows, T, ...]`` blocks from the pool's slots, token by
+    token in fp32, as the FlashInfer kernels compute it: decay, then the delta write, then
+    the read. Where there is no kernel (CPU)."""
+    rows, block, heads, dim_k = q.shape
+    v_heads = v.shape[2]
+    group = v_heads // heads
+    scale = dim_k ** -0.5 if scale is None else scale
+    qf, kf = q.float(), k.float()
+    if qk_l2norm:
+        qf = qf * torch.rsqrt((qf * qf).sum(-1, keepdim=True) + 1e-6)
+        kf = kf * torch.rsqrt((kf * kf).sum(-1, keepdim=True) + 1e-6)
+    qf = qf.repeat_interleave(group, dim=2) * scale
+    kf = kf.repeat_interleave(group, dim=2)
+    g = -torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float())
+    beta = torch.sigmoid(b.float())
+    index = slots.to(torch.int64)
+    s = state.index_select(0, index).float()  # [rows, HV, V, K]
+    out = torch.empty(rows, block, v_heads, v.shape[3], dtype=torch.float32, device=q.device)
+    for t in range(block):
+        s = s * torch.exp(g[:, t])[:, :, None, None]
+        recalled = torch.einsum("nhvk,nhk->nhv", s, kf[:, t])
+        delta = (v[:, t].float() - recalled) * beta[:, t, :, None]
+        s = s + delta[..., None] * kf[:, t, :, None, :]
+        out[:, t] = torch.einsum("nhvk,nhk->nhv", s, qf[:, t])
+    if update:
+        state.index_copy_(0, index, s.to(state.dtype))
+    return out.to(q.dtype)

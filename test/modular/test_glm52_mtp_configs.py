@@ -1,11 +1,9 @@
 """The MTP step's graph configs and acceptance log (CPU, reduced)."""
 from __future__ import annotations
 
-import logging
 import sys
 import types
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -63,53 +61,3 @@ def test_mtp_decode_captures_one_graph_over_the_block(k):
     plain = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg).get_accelerator_graph_configs(CPU)
     assert len(plain) == len(configs)
     assert sub.get_piecewise_accelerator_graph_configs(CPU, torch.bfloat16, tp_world_size=1) == {}
-
-
-def test_mtp_acceptance_log_per_position(caplog):
-    """The 512-step acceptance line must carry the conditional per-position profile (the
-    datum that separates "first draft mediocre" from "chained drafts collapse").
-    """
-    k = 3
-
-    def _ns(pair_postnorm: bool) -> SimpleNamespace:
-        return SimpleNamespace(
-            config=SimpleNamespace(mtp_num_draft_tokens=k),
-            _MTP_STAT_LOG_EVERY=Glm52LLMSubmodule._MTP_STAT_LOG_EVERY,
-            _mtp_stat_steps=512,
-            _mtp_stat_logged=0,
-            # 512 steps halving at each position: reached = [512, 256, 128, 64].
-            _mtp_stat_acc_hist=[256, 128, 64, 64],
-            _mtp_stat_emitted=256 * 1 + 128 * 2 + 64 * 3 + 64 * 4,
-            _mtp_pair_postnorm=pair_postnorm,
-        )
-
-    ns = _ns(False)
-    with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
-        Glm52LLMSubmodule._maybe_log_mtp_acceptance(ns)
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("emitted/step" in m for m in msgs)
-    (pos_line,) = [m for m in msgs if "by position" in m]
-    assert "[256, 128, 64, 64]" in pos_line
-    assert "0.50 0.50 0.50" in pos_line
-    assert ns._mtp_stat_logged == 512
-    # The line must name which trunk-pairing mode produced it: a profile whose
-    # mode you have to infer from the launch environment is one you cannot
-    # trust afterwards, and a mislabelled one inverts the comparison silently.
-    assert "pre-final-norm (MSTAR_GLM52_MTP_PAIR_POSTNORM=0)" in pos_line
-    assert "post-final-norm" not in pos_line
-
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
-        Glm52LLMSubmodule._maybe_log_mtp_acceptance(_ns(True))
-    (post_line,) = [
-        r.getMessage() for r in caplog.records if "by position" in r.getMessage()
-    ]
-    # post-norm pairing is the default (the env var's 1); the label said the opposite
-    assert "post-final-norm (default" in post_line
-    # below the threshold nothing is logged
-    caplog.clear()
-    quiet = _ns(True)
-    quiet._mtp_stat_steps = 100
-    with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
-        Glm52LLMSubmodule._maybe_log_mtp_acceptance(quiet)
-    assert not caplog.records

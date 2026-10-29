@@ -189,7 +189,7 @@ class Glm5NextModel(Model):
         ).to_blocks(
             conv_dtype=self.kda_conv_dtype,
             # an MTP decode step verifies k + 1 tokens per request
-            speculative_tokens=self.config.mtp_num_draft_tokens,
+            max_drafts=self.config.mtp_num_draft_tokens,
         )
         if self.config.mtp_num_draft_tokens > 0:
             # the next step's draft seed, in the model's dtype (the KDA projections')

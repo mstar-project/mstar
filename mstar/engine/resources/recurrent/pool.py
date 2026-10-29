@@ -15,8 +15,11 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource, RewindKind
 from mstar.engine.resources.recurrent.config import (
+    VERIFY_LEN,
+    VERIFY_SIDE,
+    DeltaNetGeometry,
     RecurrentStateConfig,
     RecurrentStateSpec,
     RecurrentStep,
@@ -70,6 +73,9 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
+    # storage only: what a slot holds is its backend's to settle after a verify step
+    rewind_kind = RewindKind.NONE
+
     @classmethod
     def build(
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,
@@ -94,6 +100,13 @@ class RecurrentStatePool(Resource):
         self._comm_group = comm_group
         # the resource key, for errors
         self._name = name
+        # With verify blocks (DeltaNetGeometry.to_blocks(max_drafts=k), KDA's) a slot's
+        # state is a checkpoint plus the last verify block's inputs, which the next step
+        # replays up to the accepted count; the verify forward settles that count
+        # (`settle_verify`). Without them the pool is storage (NONE).
+        self.max_drafts = DeltaNetGeometry.max_drafts_of(config.blocks)
+        if self.max_drafts:
+            self.rewind_kind = RewindKind.DEVICE
 
         # One [num_layers, max_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
@@ -215,6 +228,31 @@ class RecurrentStatePool(Resource):
             index = rows.scatter_index[capturing] = rows.slot_indices[: rows.num_rows].long()
         block = self.block(name, layer_idx)
         block.index_copy_(0, index, value.to(block.dtype))
+
+    @torch.compiler.disable
+    def settle_verify(self, accepted: torch.Tensor, label: str = "main") -> None:
+        """After a verify step, ``accepted [rows]`` each row's accepted drafts: its first
+        ``accepted + 1`` tokens (the drafts and the target's token after them) are the prefix
+        the next step replays, from the side this step wrote. Device ops at the step's slots,
+        so a captured step records them; padding rows write the sink. Every layer shares the
+        count and the side."""
+        rows = self.addressing(label)
+        n = rows.num_rows
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        index = rows.scatter_index.get(capturing)
+        if index is None:
+            index = rows.scatter_index[capturing] = rows.slot_indices[:n].long()
+        count, side = self._blocks[VERIFY_LEN], self._blocks[VERIFY_SIDE]
+        count.index_copy_(0, index, (accepted[:n] + 1).to(count.dtype).unsqueeze(1))
+        side.index_copy_(0, index, 1 - side.index_select(0, index))
+
+    def require_max_drafts(self, max_drafts: int) -> None:
+        """Refuse a walk that drafts more than the verify blocks hold."""
+        if max_drafts > self.max_drafts:
+            raise ValueError(
+                f"recurrent state pool {self._name!r} keeps verify blocks for {self.max_drafts} drafts, "
+                f"but a walk drafts {max_drafts}; build its blocks with max_drafts={max_drafts}"
+            )
 
     def _need_sink(self, op: str) -> None:
         # Without a sink, rows with no slot address NO_SLOT, which index_select

@@ -27,7 +27,6 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
-from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
@@ -116,8 +115,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._keep_stager = PinnedStager(torch.float32)
         # capture slot (None: eager) -> the pinned verdict table and step number the host reads
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
-        # the KDA pool and resource, which settle each verify step's accepted drafts
-        self._kda: KDACallable | None = None
 
     @property
     def mtp_block(self) -> int:
@@ -129,7 +126,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         kda = resources.get(KDA)
         if kda is not None and not _fused_kda(self.config):
             kda.set_kernels(TorchKDAKernels())
-        self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
 
     # -- CUDA-graph configs ----------------------------------------------
 
@@ -364,7 +360,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # the verify and the drafts are argmaxes in the forward; the KDA layers first
             # replay what the last step accepted
             del steps[SAMPLER]
-            steps[KDA] = LinearAttnStep(speculative=True)
+            steps[KDA] = LinearAttnStep(verify=True)
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
@@ -550,7 +546,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block], verdict[:, block]
-        self._kda.set_prefix_len(accepted)
+        pool.settle_verify(accepted)
 
         # The host's copy: the verdict first, then its step number.
         verdicts, seq = self._mailboxes[self._mailbox_key(engine_inputs)]
