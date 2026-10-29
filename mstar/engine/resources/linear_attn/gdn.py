@@ -23,6 +23,7 @@ from mstar.engine.resources.linear_attn.wrappers import (
     GDNMixedWrapper,
     GDNPrefillWrapper,
     GDNWrapper,
+    PrefillStagers,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import (
@@ -76,6 +77,7 @@ class GDNManager(LinearAttnManager):
 
         # (label, is_decode) -> wrapper
         self._eager_wrappers: dict[tuple[str, bool], GDNWrapper] = {}
+        self._prefill_stagers = PrefillStagers()
 
         self._current: dict[str, GDNWrapper] = {}
 
@@ -192,6 +194,7 @@ class GDNManager(LinearAttnManager):
                     has_sink_state=self._has_sink,
                     null_slot_id=null_slot_id,
                     kernels=self._kernels,
+                    stagers=self._prefill_stagers,
                 )
         return store[key]
 
