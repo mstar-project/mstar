@@ -242,8 +242,13 @@ def _inputs(shape, dtype, device, generator=None):
     temperature = torch.zeros(batch, dtype=torch.float32, device=device)
     seed = torch.arange(batch, dtype=torch.int64, device=device) + 7
     offset = torch.zeros(batch, dtype=torch.int64, device=device)
-    tokens = torch.empty(batch, dtype=torch.int64, device=device)
-    return logits, temperature, seed, offset, tokens, 1
+    tokens = torch.zeros(batch, dtype=torch.int64, device=device)
+    # the in-graph scatter's arguments too, so every argument the op writes is compared: rows on
+    # slots 1..batch, slot 0 left as the trash row
+    slots = torch.arange(1, batch + 1, dtype=torch.int64, device=device)
+    offset_master = torch.arange(batch + 1, dtype=torch.int64, device=device) * 3
+    token_master = torch.zeros(batch + 1, dtype=torch.int64, device=device)
+    return logits, temperature, seed, offset, tokens, 1, slots, offset_master, token_master
 
 
 SAMPLE_UNFILTERED = KernelOp(
