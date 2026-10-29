@@ -616,10 +616,12 @@ Worker scheduling
        worker main loop (speculate, await_gpu, submit_spec, ...).
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
-     - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping against the streams
-       holding the pages, and each commit against its request's layout. Logs a
-       label left under its footprint at removal. Tests and debugging only.
+     - ``1``: after every ``admit``, ``commit``, ``reset_request``, ``remove_request``
+       and change to an admitted request's pages, check the KV page bookkeeping against
+       the streams holding the pages, the reservations against the free and evictable
+       pages, and each commit against its request's layout. A recurrent snapshot's key is
+       checked against the KV chain's key at its boundary. Logs a label left under its
+       footprint at removal. Tests and debugging only.
 
 Compilation
 -----------

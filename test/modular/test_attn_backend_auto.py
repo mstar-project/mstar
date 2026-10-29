@@ -193,6 +193,7 @@ def _clear_fa3_caches():
     from mstar.engine.resources.attn.ragged import dense as ragged_dense
 
     ragged_dense._warn_ragged_dense_fallback.cache_clear()
+    ragged_dense._warn_dense_on_flashinfer.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -238,7 +239,7 @@ def test_explicit_ragged_dense_falls_back_when_the_kernel_is_missing(
     finally:
         _clear_fa3_caches()
     assert type(manager) is manager_class
-    assert "using the ragged 'flashinfer' backend" in caplog.text
+    assert "running it on FlashInfer's ragged prefill" in caplog.text
 
 
 def test_block_causal_dense_falls_back_even_with_the_kernel_present(monkeypatch, caplog):

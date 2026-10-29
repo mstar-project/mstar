@@ -536,8 +536,9 @@ Qwen3-TTS notes
   overlap, which raised c=32 throughput by about a fifth on an H100.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
-  deployment YAML halves its GPU time when throughput matters more than
-  bit-exactness (the Talker is bf16 either way).
+  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
+  B300 that is slower, not faster: cuDNN's heuristics run several of its
+  convs on a kernel without tensor cores, so measure before switching.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 
@@ -929,11 +930,21 @@ Cosmos3 environment requirements
   (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
-  one matching your environment. When it is not importable, the engine logs a
-  warning at startup and automatically falls back to the paged ``flashinfer``
-  backend — serving still works, only the bs=1 dense fast path is lost.
-  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects
-  the paged backend explicitly.
+  one matching your environment. It ships kernels for sm_80 and sm_90a only.
+  Where it is not importable or has no kernel for the GPU (Blackwell), the
+  same dense pass runs on FlashInfer's ragged prefill, whose ``auto`` kernel on
+  a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
+  against 6.3 ms for the paged prefill. ``resources: attn_gen:
+  flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``); the
+  server checks it at startup with a tiny plan and run, and a backend this GPU or
+  FlashInfer build cannot run (a typo, ``fa3`` on Blackwell, ``cutlass`` on
+  Hopper) stops it with a ``ValueError`` naming the backend.
+  Without a usable FlashInfer either, the engine logs a warning and switches to
+  the paged backend, but that is FlashInfer too (the default backend on every
+  platform for now), so it cannot run there either: the dense pass needs
+  fa3-fwd (AITER on ROCm) or FlashInfer.
+  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects the
+  paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
@@ -995,6 +1006,32 @@ arithmetic — under classifier-free guidance the branch rounding is amplified,
 so an image or clip produced alongside other requests differs from its solo
 result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
 request at a time when outputs must be bitwise repeatable.
+
+The denoise step is compiled (``compile_denoise``) in Inductor's deterministic
+mode by default (``denoise_compile_mode: deterministic``, the engine's compile
+mode of that name): kernel configs are picked by rule, so a seed gives the same
+video from every server process. ``default`` is torch.compile's own defaults,
+and ``level`` takes the ``mstar serve -O`` level's options (``-O2``:
+max-autotune).
+
+Video clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
+one decoder call per latent, channels-last, in the decode dtype (bf16 with
+cuDNN >= 9.16, otherwise fp32; see above), on the decoder-only copy of the VAE
+the channels-last decoders on a GPU share. The first two calls (the clip-start latent and the one after it)
+run eager; every later call is compiled in Inductor's deterministic mode. An
+image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
+is faster for a single frame. False decodes everything with the compiled stock
+``vae.decode`` on the shared instance.
+
+Two or more requests at the same denoise step run one cross-request forward
+(``max_gen_batch_size``, default 8) for video, image and sound; the action step
+runs eager. With ``compile_denoise_batched`` (default on) its layer stack is
+compiled with the same mode, once, while the server starts, with the packed
+length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
+per-request patchify, rotary tables and unpatchify around it run eager. At
+832x480x121 one request's guidance pair is 24k tokens, which already fills the
+GPU's GEMM and attention throughput, so a batch of N costs about N single
+steps: batching keeps requests in step rather than adding throughput.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:

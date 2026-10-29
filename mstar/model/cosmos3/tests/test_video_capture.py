@@ -17,13 +17,15 @@ from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
 from mstar.model.submodule_base import ARNodeInputs
 
 
-def _fake_transformer():
+def _fake_transformer(cfg):
     return SimpleNamespace(
         proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
         sp_group=SimpleNamespace(world_size=1), comm_group=SimpleNamespace(world_size=1),
+        _rotary=stand_in_rotary(cfg),
     )
 
 
@@ -32,9 +34,8 @@ def _dit_with_buckets(monkeypatch):
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_VIDEO", "64x64x9")
     monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", "1")
     monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
-    sub = Cosmos3DiTSubmodule(
-        transformer=_fake_transformer(), config=Cosmos3Config(compile_denoise=False), scheduler=None,
-    )
+    cfg = Cosmos3Config(compile_denoise=False)
+    sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
     configs = sub.get_accelerator_graph_configs("cpu")
     return sub, configs
 
@@ -111,9 +112,8 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
 def test_postprocess_captured_video_step(monkeypatch) -> None:
     """The captured tail zeroes the clean frames' velocity, re-pins masked
     frames, and closes a chained window at its last step."""
-    sub = Cosmos3DiTSubmodule(
-        transformer=_fake_transformer(), config=Cosmos3Config(compile_denoise=False), scheduler=None,
-    )
+    cfg = Cosmos3Config(compile_denoise=False)
+    sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
     # No VAE here: the next window's head is the raw tail (test_windowed pins the real head).
     sub._window_head = lambda w, units: w[:, :, -units:]
     ch = sub.config.latent_channel
@@ -185,14 +185,16 @@ def test_masked_capture_matches_eager_layout() -> None:
         res.commit()
         res.causal = False
         t_noisy = torch.full((eager["num_noisy_vision_tokens"],), 600.0)
+        rot_e = model._rotary(eager["gen_position_ids"], latents.device, latents.dtype)
+        rot_g = model._rotary(graph["gen_position_ids"], latents.device, latents.dtype)
         cond_e, uncond_e = model.denoise_step_batched_cfg(
-            latents, t_noisy, eager["vision_mrope_ids"], eager["vision_mrope_ids"],
+            latents, t_noisy, rot_e, rot_e,
             eager["vision_token_shapes"], eager["vision_noisy_frame_indexes"],
             eager["vision_mse_loss_indexes"] - eager["und_len"], "main", res,
         )
         t_all = torch.full((n_all,), 600.0)
         cond_g, uncond_g = model.denoise_step_batched_cfg(
-            latents, t_all, graph["vision_mrope_ids"], graph["vision_mrope_ids"],
+            latents, t_all, rot_g, rot_g,
             graph["vision_token_shapes"], graph["vision_noisy_frame_indexes"],
             graph["vision_mse_loss_indexes"] - graph["und_len"], "main", res,
             noisy_token_mask=mask,
