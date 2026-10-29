@@ -98,11 +98,10 @@ def _entry(value: np.ndarray) -> dict:
 class Gr00tN17Model(Model):
     """`nvidia/GR00T-N1.7-3B` on M\\*."""
 
-    # `process_prompt` turns these three into tensor edges, so the conductor has
-    # no use for the originals and `_dynamic` (`wire.py`) refuses a tensor in
-    # control metadata outright. The data worker keeps its own copy either way
+    # `process_prompt` turns these two into tensor edges, so the conductor has no
+    # use for the originals. The data worker keeps its own copy
     # (`PreprocessWorkerThread._process_input`), which is where `postprocess`
-    # reads the tag back to unnormalise the actions. `walk` is deliberately
+    # reads the tag and the raw state back to unnormalise the actions. `walk` is deliberately
     # **not** here: the schedule is chosen on the conductor side
     # (`Conductor._do_ingest_request`), after the strip.
     PREPROCESS_ONLY_KWARGS = ("state", "embodiment_tag")
@@ -603,7 +602,7 @@ class Gr00tN17Model(Model):
                 "gr00t_n17 needs `state`, a JSON object of joint groups: an observation is a "
                 "language instruction plus the camera views and the robot's proprioceptive state"
             )
-        # The reference asserts the history length (`gr00t_n1d7.py`, `prepare_input`);
+        # The reference asserts the history length (`gr00t_n1d7.py`, `_encode_features`);
         # here it is the client's input, so a 400. Past this point a wrong `T` fails in the
         # state encoder's forward, which fails every request in that worker step, and a
         # bare `(D,)` fails the decode's `[:, -1]` after the whole forward has run.
@@ -687,9 +686,9 @@ class Gr00tN17Model(Model):
         `msgpack` is already a core dependency. Each group carries its own dtype
         and shape so a client reconstructs it exactly:
         `np.frombuffer(g["data"], g["dtype"]).reshape(g["shape"])`.
-        `mstar.communication.wire` is deliberately not reused -- that is the
-        control plane's serializer, and it refuses array payloads outright
-        (`_dynamic` in `wire.py`).
+        `mstar.communication.wire` is deliberately not reused: that is the
+        control plane's serializer, whose numpy extension type a client outside
+        M* could not decode; plain msgpack maps and bytes need nothing but msgpack.
 
         The two kwargs this reads are why they are in `PREPROCESS_ONLY_KWARGS`:
         stripping them from the conductor's copy leaves the data worker's
@@ -777,10 +776,11 @@ class Gr00tN17Model(Model):
             # The routed inputs are the obvious half; the rest matter just as
             # much, because `PreprocessWorkerThread._store_persisted` persists
             # *every* initial signal and only the model can say it is done with one.
-            # Two kinds never reach a node: `action_mask`, which the processor
-            # always produces (`Gr00tN17Preprocessor.__call__`) and no node reads,
-            # and -- on a reuse walk -- whatever that walk's nodes cannot consume.
-            # Releasing by uuid rather than by edge covers both without naming either.
+            # Some never reach a node: what the processor always produces and no
+            # node reads (`action_mask`; the backbone processor's `attention_mask`
+            # and, in some transformers versions, `mm_token_type_ids`), and -- on a
+            # reuse walk -- whatever that walk's nodes cannot consume. Releasing by
+            # uuid rather than by edge covers all of them without naming any.
             unpersist_tensors=[
                 info for infos in input_signals.values() for info in infos
                 if info.uuid not in parked

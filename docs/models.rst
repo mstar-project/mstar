@@ -80,9 +80,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        not passed in ``model_kwargs``**: one lossless image per camera view per
        timestep, in time-major order over the embodiment's view order — ``(t0,v0)``,
        ``(t0,v1)``, ``(t1,v0)``, … — so a two-camera robot sends four. The format
-       must be **lossless** (PNG or lossless WebP) and a lossy one
-       is refused: the pixels are compared against the reference's bit for bit, so
-       JPEG moves them 167x further than PNG while passing every other check. The
+       must be **lossless** (PNG or lossless WebP): the pixels are compared against
+       the reference's bit for bit, so JPEG moves them 167x further than PNG while
+       passing every other check. JPEG is refused; a lossy WebP is not detected
+       (Pillow reports one format for both WebP modes), so send WebP lossless. The
        backbone's config **and its tokenizer and image
        processor** come from the **gated** ``nvidia/Cosmos-Reason2-2B``; accept its
        terms on the Hub first. Needs the ``gr00t_n17`` extra: OpenCV for the

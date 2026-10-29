@@ -305,8 +305,8 @@ class DiT(nn.Module):
 
         ``attends`` maps a span label to the attention it is read with, built
         once per resource binding by whoever owns this stack. A label with no
-        entry falls back to SDPA, which is how the parity backend runs and how
-        a deployment that declares no ragged resource still serves.
+        entry falls back to SDPA, which is how the CPU parity tests run; a served
+        model always binds its ragged resources.
 
         Passing the *same* rows as ``vl_text`` and ``vl_image`` makes every
         cross block read all of them, which is the reference's plain
