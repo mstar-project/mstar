@@ -3,13 +3,15 @@ attention runs on the engine's ragged attention resources).
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
-    dit          -> Wan22DitSubmodule         (native 5B DiT + inline UniPC step)
+    dit          -> Wan22DenoiseSubmodule     (the DiT scaffold's loop: native 5B DiT + UniPC,
+                                               batched, captured per served shape)
+                    Wan22DitSubmodule         (the one-request loop, bit-exact; dit_loop: legacy)
     vae_decoder  -> Wan22VaeDecoderSubmodule  (Wan2.2-VAE decode)
 
-All four set ``disable_torch_compile``, so the engine never wraps their forwards: the
-three wrapped nodes run once per request with no graph to amortize, and the dit's whole
-forward trips Inductor on the CPU-resident UniPC sigma. Instead the dit compiles its inner
-transformer region alone (``config.compile_dit``) for the shapes in
+All of them set ``disable_torch_compile``, so the engine never wraps their forwards: the
+three wrapped nodes run once per request with no graph to amortize, and the legacy dit's
+whole forward trips Inductor on the CPU-resident UniPC sigma. Instead the dit compiles its
+inner transformer region alone (``config.compile_dit``) for the shapes in
 ``config.compile_dit_sizes``, leaving the solver and every other shape eager.
 
 Numerics are governed by the checkpoint dtypes, not by the engine.
