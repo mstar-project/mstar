@@ -12,6 +12,7 @@ import torch
 from mstar.api_server.data_worker import InlineToken, PreprocessWorker, PreprocessWorkerThread
 from mstar.api_server.request_types import APIServerMessage, ResultChunk, ResultTokens
 from mstar.communication import wire
+from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.submodule_base import HostRows
 from mstar.worker.worker import Worker
@@ -29,7 +30,7 @@ def test_result_tokens_round_trips_through_the_codec():
         body=ResultTokens(
             request_ids=["r1", "r2", "r3"], values=[5, 151645, 7],
             loop_indices=[_loop(3), None, _loop(9)],
-            signal="text_inputs", modality="text",
+            signal="text_inputs", modality="text", logprobs=[-0.25, None, -1.0],
         ),
     )
     back = wire.decode(wire.encode(msg))
@@ -41,6 +42,7 @@ def test_result_tokens_round_trips_through_the_codec():
     assert back.body.loop_indices[0].loop_indices == {"decode_loop": 3}
     assert back.body.loop_indices[2].wg_fwd_pass_idx == 10
     assert back.body.signal == "text_inputs" and back.body.modality == "text"
+    assert back.body.logprobs == [-0.25, None, -1.0]
 
 
 # -- api server --------------------------------------------------------------
@@ -141,6 +143,20 @@ def test_a_draining_request_drops_its_inline_tokens():
         thread.join(timeout=5)
     assert chunk.request_id == "live" and chunk.data == b"<2>"
     assert worker.out_queue.empty()
+
+
+def test_an_inline_logprob_lands_in_its_chunks_metadata():
+    worker, stop = _thread()
+    worker.result_tensor_queue.put(InlineToken("req", 11, None, "text", logprob=-0.5))
+    worker.result_tensor_queue.put(InlineToken("req", 12, None, "text"))
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+    try:
+        chunks = [worker.out_queue.get(timeout=5) for _ in range(2)]
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    assert [c.metadata for c in chunks] == [{"logprob": -0.5}, {}]
 
 
 def test_the_facade_accounts_an_inline_token_like_a_tensor():
@@ -252,3 +268,18 @@ def test_a_mixed_step_falls_back_when_a_decode_row_has_no_value():
     assert _worker()._inline_emit_values(
         _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
     ) == ("text_inputs", [70, 0])
+
+
+def test_row_logprobs_follow_the_batch_order():
+    nan = float("nan")
+    # a padded replay's rows: three real, one padding
+    rows = HostRows((7, 8, 9), {
+        "new_token": torch.tensor([70, 80, 90, 0]),
+        SAMPLED_LOGPROB: torch.tensor([-0.5, nan, -0.25, nan]),
+    })
+    assert Worker._row_logprobs(rows, [9, 7, 8]) == [-0.25, -0.5, None]
+    assert Worker._row_logprobs(rows, [7, 6]) == [-0.5, None], "a rid with no row has none"
+    # empty when no row has one
+    assert Worker._row_logprobs(None, [7]) == []
+    assert Worker._row_logprobs(HostRows((7,), {"new_token": torch.tensor([70])}), [7]) == []
+    assert Worker._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []

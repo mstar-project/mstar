@@ -166,6 +166,7 @@ class InlineToken:
     value: int
     loop_indices: NestedLoopIndices | None
     modality: str
+    logprob: float | None = None
 
 
 def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
@@ -366,6 +367,7 @@ class PreprocessWorker:
     def new_result_token(
         self, request_id: str, value: int,
         loop_indices: NestedLoopIndices | None, signal: str, modality: str,
+        logprob: float | None = None,
         wake: bool = True,
     ):
         """A value that rode inline: same accounting as a result tensor, no
@@ -379,7 +381,7 @@ class PreprocessWorker:
         counts[signal] = counts.get(signal, 0) + 1
         self.per_request_reading_tensors[request_id] += 1
         self.result_tensor_input_queue.put(
-            InlineToken(request_id, value, loop_indices, modality)
+            InlineToken(request_id, value, loop_indices, modality, logprob)
         )
         if wake:
             self._signal()
@@ -1217,7 +1219,7 @@ class PreprocessWorkerThread:
                     request_id=request_id,
                     modality=item.modality,
                     data=postprocessed,
-                    metadata={},
+                    metadata={} if item.logprob is None else {"logprob": item.logprob},
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — must reach the client

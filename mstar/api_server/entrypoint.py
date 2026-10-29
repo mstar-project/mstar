@@ -979,7 +979,9 @@ class APIServer:
                                     self.preprocess_worker.new_result_token(
                                         rid, body.values[i],
                                         body.loop_indices[i],
-                                        body.signal, body.modality, wake=False,
+                                        body.signal, body.modality,
+                                        logprob=body.logprobs[i] if body.logprobs else None,
+                                        wake=False,
                                     )
                                     queued = True
                                 elif rid not in self.recently_completed:

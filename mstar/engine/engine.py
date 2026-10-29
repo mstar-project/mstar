@@ -1,5 +1,6 @@
 
 
+import functools
 import logging
 import os
 import threading
@@ -457,6 +458,14 @@ class ExecutingBatch:
         self.step_context.slot_lease = slot_lease
         if self.slot is None:
             self.set_slot(slot_lease.slot)
+
+
+@functools.cache
+def _warn_host_rows_dropped(resource_key: str) -> None:
+    logger.warning(
+        "resource %r has rows for the host (e.g. log-probs), but this node's forward hands over "
+        "no row-addressed stop buffers, so they are dropped", resource_key,
+    )
 
 
 class Engine:
@@ -1400,6 +1409,7 @@ class Engine:
                 phase_end("engine.collect_outputs", t0)
                 if self._enable_nvtx:
                     range_pop()
+            self._add_resource_host_rows(submodule_mgmt, out)
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
             # Not for correctness — downstream reads already gate on the
             # completion event, so the token exists before it is read. This just
@@ -1424,6 +1434,19 @@ class Engine:
             if lease is not None:
                 cg_runner.release(lease, real_bs)
             laps.lap("release")
+
+    @staticmethod
+    def _add_resource_host_rows(
+        submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput,
+    ) -> None:
+        """Adds ``Resource.step_host_rows`` to the step's stop buffers."""
+        for key, resource in submodule_mgmt.resources.items():
+            if not (rows := resource.step_host_rows()):
+                continue
+            if out.check_stop_buffers is None:
+                _warn_host_rows_dropped(key)
+            else:
+                out.check_stop_buffers = {**out.check_stop_buffers, **rows}
 
     def _exec_per_request(
         self, batch: ExecutingBatch

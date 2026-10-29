@@ -18,6 +18,10 @@ from mstar.engine.resources.step import ResourceStep
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
+# The sampler's ``step_host_rows`` entry: each row's sampled-token log-prob,
+# NaN in a row that did not ask for one.
+SAMPLED_LOGPROB = "sampled_logprob"
+
 
 # knob -> (rule text, predicate); the one copy, also applied at the API by normalize_generation_kwargs
 REAL_KNOB_RULES = {
@@ -29,7 +33,7 @@ REAL_KNOB_RULES = {
 INT_KNOB_RULES = {
     "top_k": (">= 0 (0 is off)", lambda v: v >= 0),
 }
-BOOL_KNOBS = ("ignore_eos", "penalize_prompt")
+BOOL_KNOBS = ("ignore_eos", "penalize_prompt", "return_logprobs")
 
 
 def check_real_knob(key: str, value, rule: str, ok) -> None:
@@ -94,6 +98,14 @@ class SamplerSpec(NodeResourceSpec):
     min_tokens_stop_ids: tuple[int, ...] = ()
     # Allows ``top_p_first`` / ``top_p_min_keep``.
     enable_top_p_first: bool = False
+    # Allows ``return_logprobs``. The captured sampler then scores every step,
+    # asked or not, so a deployment turns it on in its ``resources:`` block.
+    enable_logprobs: bool = False
+
+    def apply_yaml_overrides(self, enable_logprobs: bool | None = None) -> None:
+        if enable_logprobs is not None:
+            check_bool_knob("enable_logprobs", enable_logprobs)
+            self.enable_logprobs = enable_logprobs
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -129,6 +141,10 @@ class SamplingReqConfig(ResourceReqConfig):
     # A node whose step declares no ``prefill_tracked_tokens`` only ever has the
     # generated ones to count.
     penalize_prompt: bool = True
+    # Report each sampled token's log-prob. "raw" scores softmax(logits / T)
+    # before the penalty and filters, at T = 1 for greedy requests.
+    return_logprobs: bool = False
+    logprobs_mode: str = "raw"
     _seed: int = 0 # set by the conductor
 
     def apply_conductor_config(
@@ -154,11 +170,15 @@ class SamplingReqConfig(ResourceReqConfig):
         for name in BOOL_KNOBS:
             if (value := getattr(self, name)) is not None:
                 check_bool_knob(name, value)
+        if self.logprobs_mode not in (None, "raw"):
+            raise ValueError(f"logprobs_mode must be 'raw'; got {self.logprobs_mode!r}")
         if spec is None:
             return
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
+        if self.return_logprobs and not spec.enable_logprobs:
+            raise ValueError("this deployment does not report logprobs; leave return_logprobs unset")
         # a windowed penalty counts the generation history, not the seen-token mask
         windowed = self.repetition_window > 0 and spec.max_repetition_window > 0
         if self.repetition_penalty not in (None, 1) and not (spec.enable_repetion_penalty or windowed):
