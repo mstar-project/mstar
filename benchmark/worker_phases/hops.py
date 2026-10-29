@@ -45,6 +45,7 @@ HOPS = (
     "wk.submit",      # its first step handed to the GPU thread
     "wk.launch",      # GPU thread: prepared, about to launch
     "wk.enqueued",    # GPU thread: kernels queued
+    "wk.postprocess", # main thread: postprocess began (after submitting the next step)
     "wk.gpu_done",    # main thread: the step's completion event passed
     "wk.sent",        # main thread: outputs sent
     "api.result_in",  # API message thread read the result
