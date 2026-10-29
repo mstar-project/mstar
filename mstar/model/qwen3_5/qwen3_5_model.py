@@ -869,15 +869,13 @@ class Qwen3_5DenseModel(Model):
         if self.num_draft_tokens and (
             (sampling.temperature and not self.spec_sampling)
             or sampling.repetition_penalty not in (None, 1)
-            or (sampling.temperature and (sampling.top_p not in (None, 1) or sampling.top_k))
         ):
             # Verify steps take the target's argmax unless the deployment
-            # samples (`spec_sampling`, temperature only: no top-k/top-p cut),
-            # and track no tokens for a penalty.
+            # samples (`spec_sampling`), and track no tokens for a penalty.
             raise ValueError(
-                "this deployment decodes speculatively; it takes temperature 0, or "
-                "with spec_sampling any temperature at top_p 1 and top_k 0, and no "
-                "repetition_penalty. Serve it without num_draft_tokens for those"
+                "this deployment decodes speculatively; it takes temperature 0 "
+                "(or any, with spec_sampling) and no repetition_penalty. Serve it "
+                "without num_draft_tokens for those"
             )
         return {SAMPLER: sampling}
 

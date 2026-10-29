@@ -32,8 +32,8 @@ class SpecDecodeConfig:
     draft: DraftKind = DraftKind.MTP
     # requests this node can hold at once, each with one row of device registers
     max_requests: int = 256
-    # Whether verify steps can sample the target at a request's temperature
-    # (no top-k or top-p cut), not only take its argmax. A capability: the model captures a sampled
+    # Whether verify steps can sample the target (temperature, top-k, top-p),
+    # not only take its argmax. A capability: the model captures a sampled
     # decode variant beside the greedy one and routes a batch by its rows.
     sampling: bool = False
 
@@ -97,7 +97,7 @@ class SpecDecodeStep(ResourceStep):
     # the requests that run past stop ids (`ignore_eos`)
     budgets: Mapping[int, int] = field(default_factory=dict)
     ignore_stop: frozenset[int] = frozenset()
-    # seed rows of a sampling node: rid -> (temperature, top_p, top_k); a row
+    # seed rows of a sampling node: rid -> (temperature, top_p, top_k, seed); a row
     # left out (or at temperature 0) verifies greedily
     sampling: Mapping[int, tuple[float, float, int]] = field(default_factory=dict)
 
