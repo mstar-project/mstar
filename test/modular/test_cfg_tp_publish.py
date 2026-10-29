@@ -57,6 +57,7 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
     )
     conductor = Conductor.__new__(Conductor)
     conductor.enable_prof = False
+    conductor.producer_triggered_partitions = set()
     conductor.requests = {"request": request}
 
     for rank in (1, 0):

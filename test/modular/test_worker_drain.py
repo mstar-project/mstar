@@ -34,6 +34,8 @@ def _worker(
     pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(),
 ):
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.worker_id = "w0"
     w._phase_period = 0
     w.is_tp_follower = is_follower
@@ -397,6 +399,8 @@ def test_add_new_request_skips_draining_rid():
 
 def test_add_new_request_hands_off_the_handle_not_the_string():
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.worker_id = "w0"
     w._draining_rids = set()
     w._unprocessed_messages = {}
