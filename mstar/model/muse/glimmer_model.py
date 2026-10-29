@@ -126,9 +126,16 @@ class MuseGlimmerModel(MultimodalDecoderModel):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         cfg = self.config
         vision = self.vision_config
-        max_patches = self._processor["max_tokens"] * self._processor["merge_size"] ** 2
-        # a window per 32x32 patches; at most a few more at the edges
-        max_windows = max_patches // vision.window_patches ** 2 + 8
+        # Segments a captured block-loop replay plans under each label
+        # (windows, frames). Every replay plans for this many, so it is sized
+        # to real prompts rather than the worst case: the top bucket's patches
+        # in whole windows, four times over for partial edge windows and
+        # several images. A prompt with more runs the block loop eagerly
+        # (`PackedBlockLoopEncoder._fits_capture`); YAML can raise it.
+        from mstar.model.muse.submodules import VisionEncoderSubmodule
+
+        top_bucket = VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
+        max_segments = 4 * (top_bucket // vision.window_patches ** 2)
         # each layer of the stack is the cache's layer at its stack index; the cache keeps
         # only the window of the ones the sliding attention runs
         sliding = tuple(i for i, s in enumerate(cfg.is_sliding) if s)
@@ -167,7 +174,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                     num_qo_heads=vision.num_attention_heads,
                     num_kv_heads=vision.num_attention_heads,
                     head_dim=vision.head_dim,
-                    max_segments_per_request=max_windows,
+                    max_segments_per_request=max_segments,
                 ),
             ),
         ]
