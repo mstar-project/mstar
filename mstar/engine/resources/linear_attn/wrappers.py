@@ -20,6 +20,7 @@ from mstar.engine.resources.linear_attn.gdn_kernels import (
     GDNPrefillKernel,
     GDNPrefillPlan,
 )
+from mstar.utils.h2d import PinnedStager
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
@@ -102,6 +103,18 @@ class ConvMetadata:
     token_chunk_offset_ptr: torch.Tensor
 
 
+class PrefillStagers:
+    """Pinned staging for the host-built index arrays a prefill plan uploads,
+    one ring per dtype, shared by a resource's prefill wrappers. Each buffer
+    goes up in one copy with its padding written on the host, rather than a
+    device fill followed by a copy (see mstar.utils.h2d)."""
+
+    def __init__(self):
+        self.i32 = PinnedStager(torch.int32)
+        self.i64 = PinnedStager(torch.int64)
+        self.f32 = PinnedStager(torch.float32)
+
+
 class GDNPrefillWrapper(GDNWrapper):
     def __init__(
         self,
@@ -116,6 +129,7 @@ class GDNPrefillWrapper(GDNWrapper):
         accelerator_graph: bool=False,
         null_slot_id: int = 0,
         kernels: GDNKernels | None = None,
+        stagers: PrefillStagers | None = None,
     ):
         super().__init__(
             device=device,
@@ -126,6 +140,7 @@ class GDNPrefillWrapper(GDNWrapper):
             null_slot_id=null_slot_id,
         )
         self._has_sink_state = has_sink_state
+        self._stagers = stagers if stagers is not None else PrefillStagers()
         if kernels is None:
             kernels = FlashInferGDNKernels(
                 sm_scale=sm_scale, qk_l2norm=qk_l2norm,
@@ -175,19 +190,9 @@ class GDNPrefillWrapper(GDNWrapper):
             self._offset_ptr = torch.zeros(capacity, **i32)
             self._capacity = capacity
 
-        pin = torch.accelerator.is_available()
-        self._batch_ptr.fill_(self._pad_slot_id)
-        self._offset_ptr.fill_(self._pad_slot_id)
-
-        if rows:
-            self._batch_ptr[: len(rows)].copy_(
-                torch.tensor(rows, dtype=torch.int32, pin_memory=pin),
-                non_blocking=True,
-            )
-            self._offset_ptr[: len(offsets)].copy_(
-                torch.tensor(offsets, dtype=torch.int32, pin_memory=pin),
-                non_blocking=True,
-            )
+        # the whole buffer each time: chunks past this step's point at the pad slot
+        self._stagers.i32.copy_(self._batch_ptr, rows, pad_value=self._pad_slot_id)
+        self._stagers.i32.copy_(self._offset_ptr, offsets, pad_value=self._pad_slot_id)
 
         self._seqlens_cpu = torch.tensor(spans, dtype=torch.int32)
         self._conv_metadata = ConvMetadata(
@@ -225,14 +230,7 @@ class GDNPrefillWrapper(GDNWrapper):
         for span in spans:
             cu.append(cu[-1] + span)
 
-        # same dtype as the device buffer: a converting copy is staged through
-        # a pageable temporary and stops being asynchronous
-        self._cu_buffer[: len(cu)].copy_(
-            torch.tensor(
-                cu, dtype=torch.int64, pin_memory=torch.accelerator.is_available()
-            ),
-            non_blocking=True,
-        )
+        self._stagers.i64.copy_(self._cu_buffer[: len(cu)], cu)
 
     def _build_mask(
         self, total_tokens: int
@@ -247,8 +245,9 @@ class GDNPrefillWrapper(GDNWrapper):
                 capacity, dtype=torch.float32, device=self._device
             )
             self._mask_capacity = capacity
-        self._mask[:total_tokens].fill_(1.0)
-        self._mask[total_tokens:].zero_()
+        self._stagers.f32.copy_(
+            self._mask, np.ones(total_tokens, dtype=np.float32), pad_value=0.0,
+        )
 
     def plan(
         self,
