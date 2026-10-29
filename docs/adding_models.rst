@@ -449,9 +449,11 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   least recently used snapshot that no request holds.
 
 Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
-cache, or when that cache's ``prefix_cache`` is off; in those three cases the pool allocates
+cache, or when that cache's prefix cache doesn't open; in those cases the pool allocates
 no snapshot slots. Every cache on the node then stays shut, and the engine logs which
-resource kept it shut.
+resource kept it shut. ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py``
+is that rule over the specs, which the conductor's routing and the API server's prompt
+hashing read too.
 
 A model with a keyed label is checked at load time. Loading fails in two more cases:
 
@@ -1854,9 +1856,9 @@ spec, so models declare nothing for it.
 **The hook.** ``NodeResourceSpec.routing_mirror(ctx)`` returns a ``RoutingMirror`` or
 ``None``, the default. The router asks once per set of node groups with replicas that
 holds one of the spec's nodes, and ``ctx`` (a ``RoutingContext``) gives the replica count,
-the ranks per replica, the walks of the worker graphs there that hold the spec's nodes,
-and the model's KV declarations: the resource's keyed labels with the walks that key each
-(empty for a resource that is not a KV cache), and whether the model names a checkpoint.
+the walks of the worker graphs there that hold the spec's nodes, and the model's KV
+declarations: the resource's keyed labels with the walks that key each (empty for a
+resource that is not a KV cache), and whether the workers open its prefix cache.
 A mirror is conductor-side bookkeeping that follows the resource's own rules as far as
 the conductor's inputs allow. The module that defines one must stay free of kernels,
 since the conductor builds it.
@@ -1882,7 +1884,7 @@ than the KV ones, which then becomes a ``RoutingContext`` field that ``ReplicaRo
 fills. ``KVSpec`` with a ``PagedKVConfig`` is the one implementation. Its mirror runs the
 worker's own ``PrefixIndex`` per replica over a count of the pool's pages, takes each
 request's lease, pages and index entries at dispatch, and exists only where a walk keying
-the cache runs and ``PagedKVConfig.prefix_cache_opens`` says the workers open it.
+the cache runs and ``opening_prefix_caches`` says the workers open it.
 
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~

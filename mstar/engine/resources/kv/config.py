@@ -5,7 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -112,8 +112,8 @@ class PagedKVConfig(KVConfig):
         """Whether a pool of this config opens its prefix cache. Every input is
         fixed at startup: ``world_size`` is the pool's lockstep instance, and a
         model that names no checkpoint needs a salt, or builds that differ only
-        in their weights could not be told apart. The conductor's routing reads
-        the same rule the workers open their caches by."""
+        in their weights could not be told apart. ``opening_prefix_caches``
+        adds what the other resources on its nodes decide."""
         return (
             self.prefix_cache
             and (world_size == 1 or self.prefix_cache_tp)
@@ -390,6 +390,42 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
         for key, config in configs.items()
     }
 
+
+def opening_prefix_caches(
+    specs: Iterable[NodeResourceSpec], instance: Mapping[str, int], checkpoint_named: bool,
+) -> frozenset[str]:
+    """The paged KV caches whose prefix cache opens. Every input is fixed at
+    startup, so the workers, the conductor's routing and the data worker agree.
+
+    ``instance`` is each node's lockstep instance (1 where absent); a spec is
+    sized by the smallest of its nodes'. A cache opens where its
+    ``prefix_cache_opens`` says so and no node of it carries a recurrent pool
+    that keeps no snapshots (no ``prefix_slots``, above one rank, or over a
+    cache that doesn't open): a hit there would skip tokens the state never
+    saw. ``Engine._close_unservable_nodes`` closes the same caches on the
+    built resources.
+    """
+    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
+
+    specs = list(specs)
+
+    def size(spec: NodeResourceSpec) -> int:
+        return min((instance.get(node, 1) for node in spec.nodes), default=1)
+
+    opens = {
+        spec.resource_key: spec.nodes for spec in specs
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+        and spec.config.prefix_cache_opens(size(spec), checkpoint_named)
+    }
+    unrestorable = {
+        node for spec in specs
+        if isinstance(spec, RecurrentStateSpec)
+        and not (spec.config.prefix_slots and size(spec) == 1 and spec.config.kv_cache in opens)
+        for node in spec.nodes
+    }
+    return frozenset(key for key, nodes in opens.items() if nodes.isdisjoint(unrestorable))
+
+
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
@@ -413,9 +449,7 @@ class KVSpec(NodeResourceSpec):
     def routing_mirror(self, ctx: RoutingContext):
         """A mirror of the prefix cache where it opens and a walk that keys it runs."""
         labels = [label for label, walks in ctx.keyed.items() if ctx.walks.intersection(walks)]
-        if not labels or not isinstance(self.config, PagedKVConfig) or not self.config.prefix_cache_opens(
-            ctx.instance_size, ctx.checkpoint_named,
-        ):
+        if not labels or not ctx.prefix_cache_opens:
             return None
         from mstar.engine.resources.kv.routing import KVRoutingMirror
 

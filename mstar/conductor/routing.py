@@ -26,6 +26,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
+from mstar.engine.resources.kv.config import opening_prefix_caches
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -129,7 +130,13 @@ class ReplicaRouter:
             key: {label: kv_label.keys.walks for label, kv_label in labels.items()}
             for key, labels in keyed_labels(model).items()
         }
-        checkpoint_named = names_checkpoint(model)
+        # each node's smallest lockstep instance among the groups that run it, as the data worker sizes it
+        instance: dict[str, int] = {}
+        for wg in worker_graphs:
+            size = len(wg.replica_ranks[0])
+            for node in wg.section.get_nodes():
+                instance[node] = min(size, instance.get(node, size))
+        opened = opening_prefix_caches(specs, instance, names_checkpoint(model))
         self._units: list[_Unit] = []
         for instances, wgs in units.items():
             mirrors = []
@@ -139,8 +146,7 @@ class ReplicaRouter:
                     continue
                 walks = frozenset().union(*(wg.graph_walks for wg in holding))
                 mirror = spec.routing_mirror(RoutingContext(
-                    len(instances), len(instances[0]), walks,
-                    keyed.get(spec.resource_key, {}), checkpoint_named,
+                    len(instances), walks, keyed.get(spec.resource_key, {}), spec.resource_key in opened,
                 ))
                 if mirror is not None:
                     mirrors.append(_Mirror(spec.resource_key, frozenset(wg._group_id for wg in holding), mirror))

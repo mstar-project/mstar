@@ -41,14 +41,12 @@ class RoutingContext(NamedTuple):
     """The data-parallel replicas a routing mirror is built for, and the KV
     declarations a mirror reads, which ``ReplicaRouter`` reads from the model."""
     num_replicas: int
-    # ranks per replica: its lockstep instance
-    instance_size: int
     # the walks of the worker graphs that hold the resource's nodes on these replicas
     walks: frozenset[str]
     # the resource's keyed labels, each with the walks whose writes it keys
     keyed: Mapping[str, Collection[str]]
-    # whether the model names a checkpoint (`names_checkpoint`)
-    checkpoint_named: bool
+    # whether the workers open the resource's prefix cache (`opening_prefix_caches`)
+    prefix_cache_opens: bool
 
 
 class RoutingFacts(NamedTuple):

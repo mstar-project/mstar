@@ -23,6 +23,11 @@ from mstar.engine.resources.kv.config import (  # noqa: E402
 )
 from mstar.engine.resources.kv.keys import chain  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
+from mstar.engine.resources.recurrent.config import (  # noqa: E402
+    RecurrentBlockConfig,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+)
 from mstar.engine.resources.spec import RoutingContext, RoutingFacts  # noqa: E402
 from mstar.engine.resources.step import Segment, StepContext  # noqa: E402
 from mstar.model.base import WorkerGraph  # noqa: E402
@@ -381,6 +386,18 @@ def test_a_cache_has_a_mirror_where_a_walk_that_keys_it_runs(worker_graphs, node
     assert place("P")[0] == a, "a request did not follow its prefix to the replica its node cached it on"
 
 
+@pytest.mark.parametrize("prefix_slots, mirrored", [(0, False), (2, True)])
+def test_a_cache_on_a_node_whose_recurrent_pool_keeps_no_snapshots_has_no_mirror(prefix_slots, mirrored):
+    """As Qwen3.5's GDN state beside its KV cache: without snapshots the workers
+    keep the node's caches shut, so a mirror would predict hits nothing serves."""
+    pool = RecurrentStateSpec(resource_key="state", nodes={"llm"}, config=RecurrentStateConfig(
+        num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=None)},
+        prefix_slots=prefix_slots, kv_cache="kv",
+    ))
+    router = ReplicaRouter(_Model(), [_wg(0, [0, 1])], specs=[_kv_spec(), pool])
+    assert bool(_mirrors(router)) == mirrored
+
+
 # ── the KV mirror beside the real cache ──────────────────────────────────
 
 
@@ -412,7 +429,7 @@ def test_the_kv_mirror_predicts_the_hits_the_real_cache_serves(monkeypatch):
     )
     kv.enable_prefix_cache(b"a root")
     mirror = KVSpec(resource_key="kv", nodes={node}, config=config).routing_mirror(
-        RoutingContext(1, 1, frozenset({walk}), {"main": (walk,)}, True),
+        RoutingContext(1, frozenset({walk}), {"main": (walk,)}, True),
     )
 
     def request_config(first):

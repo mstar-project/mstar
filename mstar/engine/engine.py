@@ -36,6 +36,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.kv.config import opening_prefix_caches
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -887,11 +888,8 @@ class Engine:
                 )
         # a cache another engine holds is taken as open when the rule says so at
         # one rank: that pool's world size is its own engine's to apply
-        opened_keys = {
-            key for key in declared
-            if key not in self._resources
-            and specs_by_key[key].config.prefix_cache_opens(1, checkpoint_named=checkpoint is not None)
-        }
+        elsewhere = opening_prefix_caches(specs_by_key.values(), {}, checkpoint_named=checkpoint is not None)
+        opened_keys = {key for key in declared if key not in self._resources and key in elsewhere}
         # resources that aren't keyed but opened, such as a recurrent pool's snapshots
         restoring: set[str] = set()
         for key, spec in specs_by_key.items():
@@ -957,7 +955,8 @@ class Engine:
         self, specs_by_key: dict[str, NodeResourceSpec], opened_keys: set[str], restoring: set[str],
     ) -> None:
         """Close every prefix cache on a keyed node with a resource that can't
-        serve a cached prefix.
+        serve a cached prefix: on the built resources, what
+        ``opening_prefix_caches`` decides from the specs.
 
         A resource that opened but isn't keyed serves a hit only when every cache
         it depends on opened, and so does a resource that depends only on such
