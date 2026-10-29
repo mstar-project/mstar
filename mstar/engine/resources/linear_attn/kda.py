@@ -7,8 +7,8 @@ The math is a kernel bundle's: ``kda_triton.TritonKDAKernels`` on CUDA at a head
 dim it is validated for, ``kda_torch.TorchKDAKernels`` elsewhere, or one installed
 with ``set_kernels``. A bundle implements ``layout(spans, num_tokens, fixed)``,
 the token layout its prefill reads on device (or None), ``run_paged(qkv, g,
-beta, plan, conv, state, params, gate=None)``, and for a speculative step
-``run_verify`` with the layer's ``SpecBlocks`` after the state. The plan stages
+beta, plan, conv, state, params, gate=None)``, and for a draft-verify step
+``run_verify`` with the layer's ``VerifyBlocks`` after the state. The plan stages
 the layout, into buffers that stay put under CUDA-graph capture.
 """
 
@@ -22,11 +22,11 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, RewindKind
 from mstar.engine.resources.linear_attn import kda_torch, kda_triton
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
-from mstar.engine.resources.recurrent.config import DeltaNetGeometry
+from mstar.engine.resources.recurrent.config import VERIFY_LEN, VERIFY_SIDE, DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.utils.h2d import PinnedStager
@@ -55,10 +55,10 @@ class KDAParams:
     norm_eps: float = 1e-5
 
 
-class SpecBlocks(NamedTuple):
-    """One layer's speculative blocks (``DeltaNetGeometry.to_blocks(speculative_tokens=k)``),
-    slot-major: the last verify block's inputs on two sides, then the per-slot count and
-    side, which every layer shares."""
+class VerifyBlocks(NamedTuple):
+    """One layer's verify blocks (``DeltaNetGeometry.to_blocks(max_drafts=k)``), slot-major:
+    the last verify block's inputs on two sides, then the per-slot count and side, which every
+    layer shares and the pool settles (``RecurrentStatePool.settle_verify``)."""
 
     prefix: torch.Tensor  # [S, 2, k + 1, 3P] pre-conv q | k | v
     g: torch.Tensor  # [S, 2, k + 1, H, K] the forget gate before its activation
@@ -68,11 +68,11 @@ class SpecBlocks(NamedTuple):
     side: torch.Tensor  # [S, 1] int32: the side holding them
 
     @classmethod
-    def of(cls, pool, layer: int) -> SpecBlocks:
+    def of(cls, pool, layer: int) -> VerifyBlocks:
         """``layer``'s blocks of a ``RecurrentStatePool``."""
         return cls(
-            *(pool.block(f"spec_{name}", layer) for name in ("prefix", "g", "beta", "conv")),
-            pool.block("spec_len"), pool.block("spec_side"),
+            *(pool.block(f"dv_{name}", layer) for name in ("prefix", "g", "beta", "conv")),
+            pool.block(VERIFY_LEN), pool.block(VERIFY_SIDE),
         )
 
 
@@ -86,7 +86,7 @@ class KDAPlan:
     num_tokens: int  # tokens the forward runs over: a capture bucket's under a lease
     is_decode: bool  # every row appends exactly one token
     layout: torch.Tensor | None = None  # the bundle's token layout on device
-    # every row is a verify block of `block` tokens (LinearAttnStep.speculative)
+    # every row is a verify block of `block` tokens (LinearAttnStep.verify)
     is_verify: bool = False
     block: int = 1
     _cache: dict = field(default_factory=dict, repr=False)
@@ -119,7 +119,7 @@ class KDAManager(LinearAttnManager):
         state_dtype: torch.dtype,
         device: torch.device,
         kernels=None,
-        speculative_tokens: int = 0,
+        max_drafts: int = 0,
     ):
         if (geometry.num_k_heads != geometry.num_v_heads
                 or geometry.head_k_dim != geometry.head_v_dim):
@@ -138,8 +138,13 @@ class KDAManager(LinearAttnManager):
         self._device = device
         self._pool_key = config.recurrent_state
         self.kernels = kernels if kernels is not None else _default_kernels(device, geometry.head_k_dim)
-        # k of the pool's speculative blocks: a verify block spans up to k + 1 tokens
-        self.speculative_tokens = speculative_tokens
+        # k of the pool's verify blocks: a verify block spans up to k + 1 tokens
+        self.max_drafts = max_drafts
+        if max_drafts:
+            # plans only: a verify step's state lives in the pool, which settles it. Without
+            # verify blocks this declares no rewind_kind, so a node that verifies drafts
+            # refuses it at load.
+            self.rewind_kind = RewindKind.NONE
 
         # per (bucket, slot, label): a captured graph reads its layout here
         self._cg_layout: dict[CGSlotKey, torch.Tensor] = {}
@@ -182,7 +187,7 @@ class KDAManager(LinearAttnManager):
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
             self._current[label] = self._build_plan(
-                label, segments, addressing[label], ctx, step.speculative,
+                label, segments, addressing[label], ctx, step.verify,
             )
         if ctx.is_preplan:
             self._preplanned = True
@@ -202,7 +207,7 @@ class KDAManager(LinearAttnManager):
 
     def _build_plan(
         self, label: str, segments: list[Segment],
-        addressing: RecurrentAddressing, ctx: StepContext, speculative: bool = False,
+        addressing: RecurrentAddressing, ctx: StepContext, verify: bool = False,
     ) -> KDAPlan:
         spans = tuple(max(seg.span, 0) for seg in segments)
         rows = len(spans)
@@ -212,21 +217,26 @@ class KDAManager(LinearAttnManager):
             # A replay runs the kernels its bucket was captured with, so the walk decides,
             # not this step's spans: a prefill bucket of as many tokens as rows captures
             # one-token spans (decode kernels, before) and replays uneven ones.
-            is_decode = not speculative and ctx.graph_walk == "decode"
+            is_decode = not verify and ctx.graph_walk == "decode"
         else:
-            is_decode = (not speculative and rows > 0 and num_tokens == rows
+            is_decode = (not verify and rows > 0 and num_tokens == rows
                          and all(s == 1 for s in spans))
         plan = KDAPlan(
             slot_ids=addressing.slot_indices[:rows],
             has_state=addressing.has_state[:rows],
             spans=spans, num_tokens=num_tokens, is_decode=is_decode,
         )
-        if speculative:
-            block = spans[0] if spans else 1
-            if not 1 <= block <= self.speculative_tokens + 1 or any(s != block for s in spans):
+        if verify:
+            if not self.max_drafts:
                 raise ValueError(
-                    f"kda: a verify step runs one block of 1..{self.speculative_tokens + 1} "
-                    f"tokens per row (the pool's speculative blocks); got spans {spans}"
+                    "kda: a verify step replays from the pool's verify blocks, and this pool has "
+                    "none; build it with DeltaNetGeometry.to_blocks(max_drafts=k)"
+                )
+            block = spans[0] if spans else 1
+            if not 1 <= block <= self.max_drafts + 1 or any(s != block for s in spans):
+                raise ValueError(
+                    f"kda: a verify step runs one block of 1..{self.max_drafts + 1} "
+                    f"tokens per row (the pool's verify blocks); got spans {spans}"
                 )
             assert num_tokens == rows * block, (num_tokens, rows, block)
             plan.is_verify, plan.block = True, block
@@ -307,7 +317,7 @@ class KDAManager(LinearAttnManager):
         params: KDAParams,
         gate: torch.Tensor | None = None,
         label: str | None = None,
-        spec: SpecBlocks | None = None,
+        verify_blocks: VerifyBlocks | None = None,
     ) -> torch.Tensor:
         """One layer's KDA over this step's packed tokens.
 
@@ -315,17 +325,17 @@ class KDAManager(LinearAttnManager):
         sigmoid, and ``g`` the forget gate before its activation: ``[T, H, D]``,
         or its low-rank factor ``[T, D]`` with ``params.f_b``. ``conv_layer``
         and ``state_layer`` are this layer's ``pool.block`` views, updated in
-        place, and ``spec`` its speculative blocks, which a verify step needs;
+        place, and ``verify_blocks`` its verify blocks, which a verify step needs;
         ``KDACallable`` resolves all three. Returns ``[T, H, D]``, or the
         gated-normed ``[T, P]`` when ``gate``, the output gate's low-rank
         factor, comes with ``params.g_b``.
         """
         plan = self.current_plan(label)
         if plan.is_verify:
-            if spec is None:
-                raise ValueError("kda: a verify step needs the layer's SpecBlocks")
+            if verify_blocks is None:
+                raise ValueError("kda: a verify step needs the layer's VerifyBlocks")
             return self.kernels.run_verify(
-                qkv, g, beta, plan, conv_layer, state_layer, spec, params, gate=gate,
+                qkv, g, beta, plan, conv_layer, state_layer, verify_blocks, params, gate=gate,
             )
         return self.kernels.run_paged(
             qkv, g, beta, plan, conv_layer, state_layer, params, gate=gate,

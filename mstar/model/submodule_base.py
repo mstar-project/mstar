@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.resources.draft_verify.config import DraftPolicy
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -803,6 +804,19 @@ class NodeSubmodule(torch.nn.Module, ABC):
         loop-back signals on the device (``device_loopback_signals``). None
         (the default) prepares row by row."""
         del graph_walk, has_loopback
+        return None
+
+    def get_draft_policy(self, graph_walk: str) -> DraftPolicy | None:
+        """How this walk drafts and verifies (speculative decoding); None, the default, is
+        plain decoding. Asked once per walk, when the engine loads the node.
+
+        A walk with a policy runs ``policy.block`` tokens per row (``prepare_inputs``), wraps
+        its step in ``with_draft_verify`` (``declare_step``), and in its forward drafts, has
+        the node's ``DraftVerifyResource`` agree on them (``agree``), runs the target over
+        ``block_ids`` and hands the logits to ``verify``, whose ``next_inputs`` are the
+        loop-back. The engine rewinds the rejected rows and emits each row's tokens under
+        ``policy.emit``, and the walk's stop is the engine's, not ``check_stop``'s."""
+        del graph_walk
         return None
 
     def step_is_input_free(self, graph_walk: str) -> bool:

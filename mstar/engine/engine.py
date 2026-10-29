@@ -37,6 +37,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.draft_verify.startup import VerifyWalk, verify_walk
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -153,6 +154,10 @@ class SubmoduleManagement:
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
+
+    # the submodule overrides `get_draft_policy`, and what each walk answered
+    declares_drafts: bool = False
+    verify_walks: dict[str, VerifyWalk | None] = field(default_factory=dict)
 
     def __post_init__(self):
         # Two hazards want a second slot, both of them the host running ahead of
@@ -325,6 +330,8 @@ class ExecutingBatch:
     admit_error: AdmitFailedReason | None = None
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
+    # a verify step's stops, settled with its emitted tokens (see `Engine._emit_verified`)
+    verify_stops: dict[int, set[str]] | None = None
 
     # Every output signal of this step stays on the device (the node's
     # ``device_loopback_signals``): collect builds no per-request output
@@ -493,6 +500,8 @@ class Engine:
         # that is not sharded is in neither: it owns its own eviction.
         self._tp_leader_nodes: set[str] = set()
         self._tp_follower_nodes: set[str] = set()
+        # node -> the walks its combined walks batch together
+        self._combined_members: dict[str, set[str]] = {}
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
@@ -595,6 +604,39 @@ class Engine:
                     enable = getattr(resource, "enable_device_loopback_reader", None)
                     if enable is not None:
                         enable()
+            self._submodules[node_name].declares_drafts = (
+                type(submodule).get_draft_policy is not NodeSubmodule.get_draft_policy
+            )
+        self._check_draft_verify(model)
+
+    def _check_draft_verify(self, model: "Model | None") -> None:
+        """Ask every walk of a node that declares drafts for its policy and check the node
+        can verify it, so a deployment that can't fails here rather than at its first step.
+        Without the model (a bare engine) each walk is asked at its first step instead, before
+        the step's forward."""
+        if model is None:
+            return
+        for node, combined in model.get_combined_graph_walks().items():
+            self._combined_members[node] = set().union(*combined.values())
+        walks: dict[str, list[str]] = {}
+        for walk, graph in model.get_graph_walk_graphs().items():
+            for node in graph.get_nodes():
+                walks.setdefault(node, []).append(walk)
+        for node, mgmt in self._submodules.items():
+            if mgmt.declares_drafts:
+                for walk in walks.get(node, ()):
+                    self._verify_walk(node, mgmt, walk)
+
+    def _verify_walk(self, node: str, mgmt: SubmoduleManagement, walk: str) -> VerifyWalk | None:
+        """The walk's `VerifyWalk`, asked of the submodule once per walk."""
+        try:
+            return mgmt.verify_walks[walk]
+        except KeyError:
+            found = mgmt.verify_walks[walk] = verify_walk(
+                node, mgmt.submodule, mgmt.resources, walk, self._combined_members.get(node, ()),
+                keyed=bool(getattr(self, "_keyed_walks", {}).get(node)),
+            )
+            return found
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -1250,6 +1292,13 @@ class Engine:
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
                 laps.lap("reserve_slot")
+                mgmt = self._submodules[batch.node_name]
+                # before the forward, whose verify reads what the walk binds (an engine loaded
+                # without its model asks a walk at its first step)
+                verifying = (
+                    self._verify_walk(batch.node_name, mgmt, batch.step_context.graph_walk)
+                    if getattr(mgmt, "declares_drafts", False) else None
+                )
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
@@ -1261,6 +1310,9 @@ class Engine:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
+                batch.verify_stops = None
+                if verifying is not None and batch.admit_error is None:
+                    self._emit_verified(batch, verifying)
             laps = PhaseLaps("engine.exec.")
             if batch.admit_error is None:
                 self._record_loopback(batch)
@@ -1281,6 +1333,32 @@ class Engine:
             batch.release_waiters()
             if nvtx:
                 range_pop()
+
+    def _emit_verified(self, batch: ExecutingBatch, verifying: VerifyWalk) -> None:
+        """A verify step's emitted tokens as each request's ``policy.emit`` output, and its
+        stops. Waits for the step's verdict, which the next step's rewinds wait for too."""
+        rids = batch.request_ids
+        info = batch.per_request_info_wrapped
+        sampler = verifying.sampler
+        rows = verifying.resource.emitted_rows(
+            rids,
+            [info[rid].max_tokens for rid in rids],
+            [
+                getattr(info[rid].resource_configs.get(sampler), "ignore_eos", False) or False
+                for rid in rids
+            ],
+            verifying.policy,
+        )
+        emit = verifying.policy.emit
+        per_rid = batch.outputs.per_rid_outputs
+        # numpy gives an empty mask result a stride of 0, which the transport can't view as bytes
+        emitted = torch.from_numpy(rows.tokens) if rows.tokens.size else torch.empty(0, dtype=torch.long)
+        for rid, tokens in zip(rids, emitted.split(rows.counts.tolist()), strict=True):
+            per_rid.setdefault(rid, {})[emit] = [tokens]
+        loops = {verifying.policy.loop}
+        batch.verify_stops = {
+            rid: set(loops) for rid, done in zip(rids, rows.done.tolist(), strict=True) if done
+        }
 
     def _exec_single(
         self, batch: ExecutingBatch
@@ -1861,6 +1939,10 @@ class Engine:
         if it raises, the per-request path runs so a failure lands on its own
         request.
         """
+        stops = getattr(batch, "verify_stops", None)
+        if stops is not None:
+            # settled with the step's emitted tokens; the engine owns a verify step's stop
+            return {rid: stops[rid] for rid in batch.request_ids if rid in stops}
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
             try:
@@ -2451,7 +2533,14 @@ class Engine:
             stream = cg_runner.plan_stream()
             with stream if stream is not None else nullcontext():
                 self._runner.pre_plan(step)
-            laps.skip()
+                laps.skip()
+                # a verify step planned ahead of its rows' last verdicts: wait for them here,
+                # rewind, and correct what was staged, before the event the replay waits on
+                if not self._runner.settle_preplan(step):
+                    laps.lap("settle")
+                    self.reset_pre_plan_for_batch(batch)
+                    return False
+                laps.lap("settle")
             batch.preplan_event = torch.Event(device=self._device)
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)

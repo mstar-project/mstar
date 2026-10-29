@@ -316,7 +316,7 @@ returns each request's layout from ``process_prompt``.
 ``KVReqConfig`` can name on any node and walk, ``main`` when it names none. A layout may be
 empty where an opened label is never written. It may also name labels the request opens
 only on another deployment, as an unguided BAGEL generation does for a CFG-parallel one.
-A layout has five fields:
+A layout has six fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A
   :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
@@ -330,11 +330,18 @@ A layout has five fields:
 - ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
 - ``keyed_spans``: how many leading spans the label's keys cover, by default every span
   before the first ``rows`` span.
+- ``lookahead``: the most slots a committing step writes past the tokens the request keeps,
+  before a trim takes them back. A draft-verify step commits its whole block and its
+  rejected drafts are trimmed, so ``growth`` counts one slot per kept token and the
+  lookahead the rows written ahead of them. A layout can't have both a lookahead and a
+  ``retention``: retention releases at commit, before the trim.
 
-The footprint adds the spans, the growth at each loop's iterations and the scratch, and
-rounds up to whole pages per label. A span's own scratch counts only with the spans before
-it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
-takes the window's peak instead.
+The footprint adds the spans, the growth at each loop's iterations, the lookahead and the
+scratch, and rounds up to whole pages per label. A span's own scratch counts only with the
+spans before it, so a window's denoise steps and its commit count once. Under a
+``RetentionPolicy`` it takes the window's peak instead. The lookahead's rows have positions
+too, so the conductor holds the positions at the caps plus the lookahead to the pool's
+``max_seq_len``.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
@@ -610,7 +617,13 @@ The spec types are:
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SamplingReqConfig`` above. ``loopback_state`` declares per-request state a
        decode loop keeps on the device beside its last sampled token. See
-       `Device loop-back`_.
+       `Device loop-back`_. ``draft_verify`` marks the sampler of a node that verifies
+       drafts, and ``enable_sampled_verify`` is the capability to verify at temperature > 0.
+       See `Draft-verify decoding`_.
+   * - ``DraftVerifySpec(sampler=...)``
+     - Carries a verify step's verdict from the forward to the host, for a node whose
+       decode walk verifies drafts (speculative decoding). ``sampler`` names the node's
+       sampler, which verifies. See `Draft-verify decoding`_.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
@@ -632,10 +645,9 @@ The spec types are:
        fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
        calls it through ``LinearAttnCallable``, ``KDACallable`` or ``Mamba2Callable``
        (``mstar/engine/resources/convenience.py``), which hand the kernels the layer's
-       blocks of the pool, so the layer never names one. A KDA pool built with
-       ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
-       (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
-       settles each one's accepted drafts. The layers are shared:
+       blocks of the pool, so the layer never names one. GDN runs draft-verify steps as
+       it is; KDA needs its pool built with ``DeltaNetGeometry.to_blocks(max_drafts=k)``;
+       see `Draft-verify decoding`_. The layers are shared:
        ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
        (``mstar/model/components/distributed/``, over ``KDAConfig``; Kimi K3's full-rank
        output gate is ``full_rank_output_gate``).
@@ -1332,6 +1344,79 @@ address rows the same way, and the model never sees a slot index.
    that frame once per layer and exceeds the recompile limit. The shared ``Attention``
    layer creates one callable per layer. That is safe only because the callable is never
    passed into a traced function.
+
+Draft-verify decoding
+~~~~~~~~~~~~~~~~~~~~~
+
+A decode walk can draft ``k`` tokens per step and verify them in the same forward
+(speculative decoding: MTP heads, a DSpark or EAGLE drafter). The model keeps its
+drafter's forward. The engine owns the rest: the verdict, taking the rejected rows back
+out of every resource, the tokens each request emits, and the stop.
+
+- ``get_draft_policy(graph_walk)`` returns a ``DraftPolicy`` for the walk, or None (the
+  default) for plain decoding: ``max_drafts`` (``k``), the ``stop_ids`` that end a reply,
+  the ``loop`` the stop ends and the ``emit`` signal the tokens go out on. It is asked
+  once per walk, when the engine loads the node.
+- ``prepare_inputs`` gives a decode row ``input_seq_len = policy.block`` (``k + 1``) and
+  one input id, the last emitted token. The capture config does the same, so a decode
+  bucket holds ``block`` tokens per row.
+- ``declare_step`` wraps the decode step in ``with_draft_verify(step, policy)``, which adds
+  the ``VerifyStep`` and the sampler's step (``sampler=`` names the sampler, ``"sampler"``
+  by default). The model declares no ``SamplerStep`` on a verify step.
+- The forward drafts ``[n, k]`` tokens and hands them to the node's
+  ``DraftVerifyResource``: ``agree`` (rank 0's drafts on a lockstep instance), then
+  ``block_ids`` (``[n, k + 1]``), the target over those rows, and ``verify(request_ids,
+  block, logits)``. Its ``next_inputs`` are the loop-back edge, produced for every row.
+  A drafter that samples draws each draft with ``draft_sample(request_ids, logits)``, which
+  returns the token and the distribution it came from, and passes the distributions
+  stacked as ``verify(..., draft_probs=...)``. Drafts given without them are taken as
+  certain (a point mass), which is exact for any drafter.
+- The model's ``get_node_resources`` declares a ``DraftVerifySpec`` on the node and
+  ``SamplerSpec(draft_verify=True)``. Its layout for the label the walk grows declares
+  ``lookahead=policy.lookahead`` (``2k + 1``, see `Paged KV layouts`_).
+
+Each verify step commits its whole block. Before the request's next step admits, the
+runner takes the rejected rows back from every resource of the node that declares
+``rewind_kind = RewindKind.HOST`` (paged KV and positions so far). State a forward updates
+in place declares ``RewindKind.DEVICE``: ``verify`` hands it each row's accepted count and
+the step's label inside the forward (``Resource.settle_verify``), after the target has run
+over the block, so a captured step records the settle too. ``with_draft_verify`` sets
+``verify=True`` on every step of the submodule's with a ``verify`` field. The GDN resource
+is one: under ``LinearAttnStep(verify=True)`` it runs each block from the slot without
+writing the state, and its settle runs the block again from the slot with every rejected
+token's gates closed, which leaves the state and conv window after the kept prefix. KDA
+replays instead: a ``RecurrentStateSpec`` pool built with
+``DeltaNetGeometry.to_blocks(max_drafts=k)`` keeps its ``state`` as a checkpoint before the
+last block's kept tokens and that block's inputs in its verify blocks, the next verify step
+replays the kept ones before it runs its own block, and the pool is the ``DEVICE`` resource
+that settles how many. Any other recurrent pool is storage (``NONE``). A KDA resource on a
+pool without verify blocks, and a backend that can't settle (Mamba-2 so far), declare
+nothing. A resource that declares no ``rewind_kind`` keeps the node from loading, as does a
+combined walk over the verifying walk or a prefix-cache key on its labels.
+
+Under the async worker, the next step is pre-planned while the current one runs, before its
+verdict is known: from the lengths the current step committed, as if it kept its whole block.
+Once the verdict lands, the runner rewinds and each pre-planned resource corrects its staged
+plan (``Resource.correct_preplan``; paged KV, positions, FlashInfer attention and the sampler
+do). A node pre-plans this way only when every pre-planning resource of its verify step sets
+``corrects_preplan``; otherwise its pre-plan waits for the verdict first. A resource that adds
+state to a verifying node and pre-plans should implement it: what the pre-plan read of a
+length the rewind moved has to be put right there, in place.
+
+Verification is greedy unless the sampler declares ``enable_sampled_verify=True``: a
+greedy verify keeps the drafts that equal the target's argmax, and refuses a request with a
+``temperature``. A sampled verify runs rejection sampling against the target filtered as the
+request samples (temperature, ``min_p``, ``top_k`` and ``top_p``): draft ``i`` stays with
+probability ``min(1, p_i(d_i) / q_i(d_i))``, the first one refused is replaced by a draw
+from ``max(0, p_i - q_i)``, and a row that keeps every draft draws one more token from the
+target. The tokens it emits are distributed as sampling the target one token at a time;
+greedy requests come out as under the greedy verify. It filters every row of a verify block
+each step, which a node serving greedy requests only doesn't need. It runs FlashInfer's
+chain kernel and reads each request's seed and RNG offset as the sampler does, so a seed
+reproduces a request's stream in the same batch layout. Either way ``repetition_penalty``
+and ``min_tokens`` are refused: they depend on the tokens before each draft, which the
+verify doesn't track. The tiny model in ``test/modular/draft_verify_toy.py`` is the
+reference consumer.
 
 Loading weights
 ~~~~~~~~~~~~~~~

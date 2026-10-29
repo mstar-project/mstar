@@ -1,9 +1,10 @@
-"""glm5_next MTP through the real ``Engine`` on CPU: greedy output with drafting on equals
-greedy output with it off, whatever the drafts (the MTP layer's own, an oracle that is always
-right, one that is right for a prefix), and every verify step keeps its whole block in the
-KV cache (rejected rows as holes)."""
+"""glm5_next MTP through the real ``Engine`` on CPU, on the engine's draft-verify: greedy output
+with drafting on equals greedy output with it off, whatever the drafts (the MTP layer's own, an
+oracle that is always right, one that is right for a prefix), and the KV cache keeps only the
+tokens each verify step accepted (the engine rewinds the rest before the next step)."""
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sys
 import types
@@ -16,10 +17,10 @@ from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
-from mstar.engine.resources import SamplingReqConfig
-from mstar.engine.resources.base import Resource
+from mstar.engine.resources import DRAFT_VERIFY, SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextModelConfig
@@ -42,13 +43,31 @@ def _batch(**kwargs) -> ExecutingBatch:
 _WEIGHT_STD = 0.1
 
 
-class _GreedySampler(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
+class _GreedySampler(SamplerResource):
+    """The sampler resource with its draw replaced by an argmax, for CPU: the real one samples
+    on CUDA only. Its verify (greedy on these requests) is its own."""
 
     def sample(self, request_ids, logits, **kwargs):
         return logits.argmax(-1)
+
+    def can_capture(self) -> bool:
+        # as any resource on CPU, where warmup captures nothing
+        return True
+
+
+@dataclasses.dataclass
+class _GreedySamplerSpec(SamplerSpec):
+    @property
+    def resource_class(self):
+        return _GreedySampler
+
+
+def _greedy_specs(specs):
+    return [
+        _GreedySamplerSpec(**{f.name: getattr(s, f.name) for f in dataclasses.fields(s)})
+        if type(s) is SamplerSpec else s
+        for s in specs
+    ]
 
 
 class _StubTransfer:
@@ -103,7 +122,7 @@ def _build_engine(k: int, seed: int = 0):
     sub = Glm5NextLLMSubmodule(lm, cfg)
     engine = Engine(None)  # no offload, so no runtime
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, _greedy_specs(model.get_node_resources()),
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -112,10 +131,6 @@ def _build_engine(k: int, seed: int = 0):
         ),
         kv_cache_type=torch.float32,
     )
-    greedy = _GreedySampler()
-    engine._resources[SAMPLER] = greedy
-    engine._submodules["LLM"].resources[SAMPLER] = greedy
-    sub.node_resources[SAMPLER] = greedy
     engine.warmup()
     return engine, sub, cfg
 
@@ -140,12 +155,12 @@ def _step(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_e
     )
     engine.prepare_inputs(batch)
     assert not batch.failed_requests, batch.failed_requests
-    # The cache holds the prompt and every step's whole block, rejected rows included (holes,
-    # masked on the device), and the request's context counts them.
-    kv, sub = engine._resources[KV_CACHE], engine._submodules["LLM"].submodule
+    # Before this step's admit, the cache holds the prompt, every token kept so far but the last
+    # (its row is this step's first), and the last verify step's whole block, which the
+    # admit's rewind takes back to what that step kept.
+    kv = engine._resources[KV_CACHE]
     for rid, want in (cached or {}).items():
         assert kv._streams[rid]["main"].stored_len == want, (rid, want)
-        assert sub.request_state(rid).get("context") == want, (rid, want)
     outputs = engine.exec_and_postprocess(batch)
     assert batch.admit_error is None, batch.admit_error
     engine.finalize_batch(batch)
@@ -153,17 +168,22 @@ def _step(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_e
     return outputs.per_rid_outputs, stops
 
 
-def _generate(engine, prompts: dict[str, torch.Tensor], max_tokens: int) -> dict[str, list]:
+def _generate(engine, prompts: dict[str, torch.Tensor], max_tokens: int,
+              seqs: dict | None = None) -> dict[str, list]:
+    """``seqs``: filled as the requests emit, which the oracle reads."""
     for rid in prompts:
         engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
     out, stops = _step(engine, "prefill", prompts, max_tokens)
-    seqs = {rid: out[rid]["new_token"][0].tolist() for rid in prompts}
+    seqs = {} if seqs is None else seqs
+    seqs.update({rid: out[rid]["new_token"][0].tolist() for rid in prompts})
     nxt = {rid: out[rid]["text_inputs"][0] for rid in prompts}
     live = [rid for rid in prompts if not stops.get(rid)]
     block = engine._submodules["LLM"].submodule.mtp_block
     step = 0
+    before = {rid: len(seqs[rid]) for rid in prompts}  # emitted before the last step
     while live:
-        cached = {rid: len(prompts[rid]) + block * step for rid in live}
+        cached = {rid: len(prompts[rid]) + (before[rid] - 1) + (block if step else 0) for rid in live}
+        before = {rid: len(seqs[rid]) for rid in prompts}
         out, stops = _step(engine, "decode", {rid: nxt[rid] for rid in live}, max_tokens,
                            step, cached)
         step += 1
@@ -188,11 +208,11 @@ def reference():
     return _generate(engine, dict(PROMPTS), MAX_TOKENS)
 
 
-def _oracle(sub, reference, wrong_every: int | None):
+def _oracle(sub, reference, wrong_every: int | None, seqs: dict):
     """Drafts from the reference continuation at each request's position, wrong at every
     ``wrong_every``-th call when given. A step drafts d2..dk in its draft loop, then the next
     step's d1 once its verdict is in (the prefill: the first d1); wrapping the two passes tells
-    the oracle which call is which and how far each request is."""
+    the oracle which call is which, and ``seqs`` (``_generate``'s) how far each request is."""
     calls = {"n": 0}
     where: dict = {}
     given: dict[str, list[int]] = {}  # each request's drafts for its current step, d1 first
@@ -217,8 +237,7 @@ def _oracle(sub, reference, wrong_every: int | None):
     def decode(engine_inputs, *args):
         rids = list(engine_inputs.request_ids)
         # tokens emitted before this step: its first draft is the one at that position
-        where.update(rids=rids, row=0,
-                     done={rid: sub.request_state(rid).get("mtp_generated") for rid in rids})
+        where.update(rids=rids, row=0, done={rid: len(seqs[rid]) for rid in rids})
         return real_decode(engine_inputs, *args)
 
     def draft(hidden, prev):
@@ -257,10 +276,19 @@ def test_reference_depends_on_context(reference):
 @pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
 def test_mtp_output_equals_greedy_without_mtp(reference, k, drafts):
     engine, sub, _ = _build_engine(k)
+    seqs = {}
     if drafts != "mtp":
-        _oracle(sub, reference, wrong_every=3 if drafts == "oracle_partial" else None)
-    got = _generate(engine, dict(PROMPTS), MAX_TOKENS)
+        _oracle(sub, reference, wrong_every=3 if drafts == "oracle_partial" else None, seqs=seqs)
+    got = _generate(engine, dict(PROMPTS), MAX_TOKENS, seqs)
     assert got == reference
+    dv = engine._resources[DRAFT_VERIFY]
+    # the engine settles the KDA pool from each verdict
+    assert dv._settlers == [engine._resources[KDA_STATE]]
+    if drafts == "oracle":
+        # every row but each request's last, whose drafts run past the reference
+        assert dv.drafts_accepted >= k * (dv.rows_verified - len(PROMPTS))
+    elif drafts == "oracle_partial":
+        assert 0 < dv.drafts_accepted < k * dv.rows_verified
 
 
 def test_oracle_drafts_are_all_accepted():
@@ -269,113 +297,25 @@ def test_oracle_drafts_are_all_accepted():
     engine, sub, _ = _build_engine(k)
     ref_engine, _, _ = _build_engine(0)
     reference = _generate(ref_engine, {"a": PROMPTS["a"]}, MAX_TOKENS)
-    _oracle(sub, reference, wrong_every=None)
+    seqs = {}
+    _oracle(sub, reference, wrong_every=None, seqs=seqs)
     engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
     out, _ = _step(engine, "prefill", {"a": PROMPTS["a"]}, MAX_TOKENS)
-    first = out["a"]["new_token"][0].tolist()
+    seqs["a"] = out["a"]["new_token"][0].tolist()
     for step in range(2):
         out, _ = _step(engine, "decode", {"a": out["a"]["text_inputs"][0]}, MAX_TOKENS, step)
         emitted = out["a"]["new_token"][0].tolist()
         assert len(emitted) == k + 1
-        assert first + emitted == reference["a"][:len(first) + len(emitted)]
-        first += emitted
+        assert seqs["a"] + emitted == reference["a"][:len(seqs["a"]) + len(emitted)]
+        seqs["a"] += emitted
 
 
-def test_decode_stops_while_the_next_block_fits():
-    """The context counts emitted tokens against index_topk (the cache's holes don't):
-    decode stops while the step that may already be scheduled still fits, and that step
-    runs."""
-    k = 3
-    engine, sub, cfg = _build_engine(k)
-    block, limit = k + 1, cfg.index_topk
-    prompt = torch.arange(2, limit - 2 * block - 9)
-    engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0)})
-    out, stops = _step(engine, "prefill", {"r": prompt}, 10 * limit, ignore_eos=True)
-    step = 0
-    while not stops.get("r"):
-        out, stops = _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit,
-                           step, ignore_eos=True)
-        step += 1
-    real = len(prompt) + sub.request_state("r").get("mtp_generated")
-    assert real + block <= limit < real + 2 * block
-    _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit, step,
-          ignore_eos=True)
-    assert sub.request_state("r").get("context") <= cfg.kv_rows
-    engine.remove_request("r")
-
-
-def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=4096):
-    """(verify steps, tokens emitted) when _mtp_check_stop ends a request that emits
-    ``per_step`` tokens per step, ignore_eos."""
-    from mstar.model.submodule_base import PerRequestState
-
-    state = PerRequestState()
-    state.add("prompt_len", prompt_len)
-    sub = types.SimpleNamespace(
-        request_state=lambda rid: state, mtp_block=k + 1,
-        config=types.SimpleNamespace(eos_token_ids=(), index_topk=index_topk, kv_rows=kv_rows),
-    )
-    sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
-
-    def stops(walk, steps, tokens):
-        info = types.SimpleNamespace(graph_walk=walk, resource_configs=sampler,
-                                     dynamic_loop_iter_counts={"decode_loop": steps},
-                                     max_tokens=max_tokens)
-        return Glm5NextLLMSubmodule._mtp_check_stop(sub, "r", info, torch.tensor(tokens))
-
-    if stops("prefill", 0, [7]):
-        return 0, 1
-    generated = 1
-    for step in range(1, 100_000):
-        generated += per_step
-        state.add("mtp_generated", generated)
-        if stops("decode", step - 1, [7] * per_step):
-            return step, generated
-    raise AssertionError("never stopped")
-
-
-@pytest.mark.parametrize("per_step", [1, 2, 3])
-def test_rejected_drafts_do_not_cut_the_output_short(per_step):
-    # 1024 in / 512 out: every token arrives however few drafts are accepted
-    assert _stop_after(1024, 512, per_step)[1] >= 512
-
-
-def test_rejected_drafts_stop_at_the_cache_rows():
-    # a short prompt with no draft accepted fills the cache's rows before the context
-    steps, generated = _stop_after(16, 100_000, 1)
-    rows = 16 + steps * 4
-    assert rows <= 4096 < rows + 2 * 4
-    assert 16 + generated < 2048
-
-
-def test_acceptance_is_logged(caplog):
-    engine, sub, _ = _build_engine(3)
-    sub._mtp_logged = float("-inf")  # the first step logs
-    with caplog.at_level("INFO", logger="mstar.model.glm5_next.submodules"):
-        _generate(engine, {"a": PROMPTS["a"]}, 4)
-    assert any("drafts accepted per step" in r.getMessage() for r in caplog.records)
-
-
-def test_temperature_is_refused_under_mtp(caplog):
-    engine, _, _ = _build_engine(2)
-    engine.add_request("t", {SAMPLER: SamplingReqConfig(temperature=0.7)})
-    batch = _batch(
-        node_name="LLM",
-        per_request_info={"t": CurrentForwardPassInfo(
-            request_id="wire-t", rid_handle="t", graph_walk="prefill", fwd_index=0, random_seed=0,
-            max_tokens=4,
-            resource_configs={SAMPLER: SamplingReqConfig(temperature=0.7)})},
-        per_request_input_tensors={"t": {"text_inputs": [PROMPTS["b"]]}},
-        step_context=StepContext(request_ids=("t",), graph_walk="prefill", slot=0,
-                                 capture=False),
-    )
-    with caplog.at_level(logging.ERROR, logger="mstar.engine.engine"):
-        engine.prepare_inputs(batch)
-    # process_prompt refuses this as a 400; past it, the client sees an error id, the log the reason
-    error = batch.failed_requests["t"]
-    assert error.startswith("internal error (error id ")
-    error_id = error.removeprefix("internal error (error id ").removesuffix(")")
-    assert any(error_id in r.getMessage() and "greedy only" in r.getMessage() for r in caplog.records)
+def test_the_engine_counts_the_acceptance(caplog):
+    """The acceptance the model used to log is the draft-verify resource's now."""
+    engine, _, _ = _build_engine(3)
+    _generate(engine, {"a": PROMPTS["a"]}, 6)
+    dv = engine._resources[DRAFT_VERIFY]
+    assert dv.rows_verified > 0 and "tokens per step" in dv.stats()
 
 
 def test_prompts_leave_two_blocks_of_index_topk():
@@ -438,33 +378,6 @@ def test_a_padding_row_writes_its_real_rows_token():
     nxt = torch.arange(12)
     nxt.index_copy_(0, last, _real_row_values(last, torch.tensor([100, 101, 102, 999])))
     assert nxt[last].tolist() == [100, 101, 102, 102]
-
-
-def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
-    """The next step is in flight when this one is checked, and the GPU thread's count may
-    already include its tokens. 1 + 4 + 4 tokens reach max_tokens=9 at the second verify
-    step, not the first."""
-    from mstar.model.submodule_base import PerRequestState
-
-    state = PerRequestState()
-    state.add("prompt_len", 16)
-    sub = types.SimpleNamespace(
-        request_state=lambda rid: state, mtp_block=4,
-        config=types.SimpleNamespace(eos_token_ids=(), index_topk=2048, kv_rows=4096),
-    )
-    sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
-
-    def check(walk, steps, n):
-        info = types.SimpleNamespace(graph_walk=walk, resource_configs=sampler,
-                                     dynamic_loop_iter_counts={"decode_loop": steps},
-                                     max_tokens=9)
-        return Glm5NextLLMSubmodule._mtp_check_stop(sub, "r", info, torch.tensor([7] * n))
-
-    state.add("mtp_generated", 5)  # the first verify step already unpacked
-    assert not check("prefill", 0, 1)
-    state.add("mtp_generated", 9)  # and the second
-    assert not check("decode", 0, 4)
-    assert check("decode", 1, 4)
 
 
 # -- a stop on the prefill walk -----------------------------------------------
