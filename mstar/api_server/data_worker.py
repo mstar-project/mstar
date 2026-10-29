@@ -738,10 +738,12 @@ class PreprocessWorkerThread:
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV. Likewise
-        # only process_prompt sets the model's INTERNAL_KWARGS.
+        # only process_prompt sets the model's INTERNAL_KWARGS, and only this
+        # worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "open_streams", *internal):
             model_kwargs.pop(name, None)
+        open_streams = self._client_edges - input.ends
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -750,6 +752,7 @@ class PreprocessWorkerThread:
                 tensors=tensors,
                 input_metadata=input_metadata,
                 prompt_parts=input.prompt_parts,
+                open_streams=open_streams,
                 **model_kwargs,
             )
             if isinstance(prompt_tensors, ProcessPromptOutput):
@@ -804,7 +807,7 @@ class PreprocessWorkerThread:
                 input_metadata=input_metadata,
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
-                input_open=bool(self._client_edges - input.ends),
+                input_open=bool(open_streams),
             ),
         )
         self.communicator.send("conductor", msg)
@@ -856,7 +859,7 @@ class PreprocessWorkerThread:
             if call is None or self._torn_down(request_id):
                 return  # ended, failed or aborted: nothing will read it
             items: NameToTensorList = {}
-            if chunk.file_paths or chunk.text:
+            if chunk.file_paths or chunk.text or chunk.model_kwargs:
                 items = self.model.process_stream_chunk(self._client_chunk(chunk))
                 unknown = set(items) - self._client_edges
                 if unknown:  # the model's bug, not the client's: a 500
@@ -864,8 +867,9 @@ class PreprocessWorkerThread:
                         f"process_stream_chunk returned {sorted(unknown)}, which are "
                         f"not client streams ({sorted(self._client_edges)})"
                     )
-                if chunk.text and not any(items.values()):
-                    raise ValueError("this model takes no text in an append")
+                # model_kwargs beside end_input end the input whether or not the model reads them
+                if (chunk.text or not (chunk.file_paths or chunk.ends)) and not any(items.values()):
+                    raise ValueError("this model takes no text or model_kwargs in an append")
                 items = self._without_ended_streams(call, chunk, items)
                 self._charge_stream_items(call, items)
             items = {name: tensors for name, tensors in items.items() if tensors}

@@ -164,6 +164,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Overworld/Waypoint-1.5-1B``
      - Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
        frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.
+       A request carries a seed image and ``model_kwargs.actions`` (1 to ``max_frames``,
+       512 latent frames, controller dicts); it generates one frame per action. A live
+       ``/generate/ws`` call (opened with ``end_input: false``) appends more as
+       ``{"append": {"model_kwargs": {"actions": [...]}}}`` and plays until it ends its
+       input, or for at most ``max_frames`` actions in all.
    * - ``lingbot_world_1_3b``
      - ``robbyant/lingbot-world-v2-1.3b-causal-fast``
      - LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed
@@ -505,6 +510,15 @@ Qwen3-TTS notes
 - Text layout follows the reference defaults: CustomVoice and VoiceDesign put
   the whole text in the prefill; Base feeds it one token per frame. Override
   per request with ``non_streaming_mode``.
+- Live text: with ``non_streaming_mode: false`` (Base, or x-vector-only
+  cloning), a ``/generate/ws`` call opened with ``end_input: false`` takes the
+  rest of its text as ``append`` messages, one token per frame as it arrives,
+  through the ``text_in`` client stream (see :doc:`clients`). Each append is
+  tokenized alone, which matches tokenizing the whole text when the cut falls
+  before a space or at punctuation. In ``non_streaming_mode`` and for an
+  in-context clone, the prefill's pairing fixes the text's length and where TTS
+  EOS sits, so a live opening (``end_input: false``) gets a 400; send those
+  one-shot.
 - ``/v1/audio/speech`` inputs of 600 or more characters are synthesized as
   ordered sentence chunks of about 400 characters (one Talker request each,
   two kept in flight while the current one streams); set
@@ -735,9 +749,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
 - Inputs are user-only 16 kHz mono audio plus an optional system prompt (the
   request's text, primed before the first frame exactly as the reference
   does): one clip uploaded with the request, a live call over
-  ``/generate/ws``, ``append`` messages until ``end_input`` (see
-  :doc:`clients`; a one-shot request over the socket carries ``end_input:
-  true`` on its opening message, or it waits for appends), or an OpenAI
+  ``/generate/ws`` (an opening with ``end_input: false``, then ``append``
+  messages until ``end_input``; see :doc:`clients`), or an OpenAI
   Realtime conversation over ``/v1/realtime``, which takes PCM16 at one of
   the eight rates :doc:`clients` lists (8 to 48 kHz) or G.711, resamples it
   to 16 kHz, appends it in 80 ms frames, and sends each agent reply as one

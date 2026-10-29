@@ -274,12 +274,22 @@ def test_inline_values_follow_the_batch_order_off_the_host_rows():
     assert sig == "text_inputs" and vals == [90, 70, 80]
 
 
-def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():
+def test_a_row_that_ran_no_forward_takes_the_tensor_path_alone():
+    # 8 ran no forward (the cache served it, or it declined its stream's final
+    # chunk), so it has no host row; on a rows-only step the tensor path has
+    # nothing for 7 and 9, so they must still go inline
+    rows = HostRows((7, 9), {"new_token": torch.tensor([[70], [90]])})
+    sig, vals = _worker()._inline_emit_values(
+        _Engine({"text_inputs": "new_token"}), _Batch(), rows, [7, 8, 9], ["text_inputs"],
+    )
+    assert sig == "text_inputs" and vals == [70, None, 90]
+
+
+def test_inline_values_fall_back_when_nothing_applies():
     rows = HostRows((7, 8), {"new_token": torch.tensor([70, 80])})
     w = _worker()
     eng = _Engine({"text_inputs": "new_token"})
     none = (None, [])
-    assert w._inline_emit_values(eng, _Batch(), rows, [7, 8, 9], ["text_inputs"]) == none
     assert w._inline_emit_values(eng, _Batch(), rows, [7], ["other"]) == none
     assert w._inline_emit_values(_Engine({}), _Batch(), rows, [7], ["text_inputs"]) == none
     assert w._inline_emit_values(eng, _Batch(), None, [7], ["text_inputs"]) == none
@@ -302,14 +312,10 @@ def test_a_mixed_step_inlines_its_decode_rows():
     assert sig == "text_inputs" and vals == [70, 80, 90]
 
 
-def test_a_mixed_step_falls_back_when_a_decode_row_has_no_value():
+def test_a_mixed_step_row_with_no_value_takes_the_tensor_path():
     rows = HostRows((7,), {"new_token": torch.tensor([[70]])})
-    batch = _Batch({7: "prefill_text", 9: "decode"}, label="mixed")
-    assert _worker()._inline_emit_values(
-        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
-    ) == (None, [])
-    # a row of a walk that sends no inline value needs none
-    batch = _Batch({7: "decode", 9: "prefill_text"}, label="mixed")
-    assert _worker()._inline_emit_values(
-        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
-    ) == ("text_inputs", [70, 0])
+    for walks in ({7: "prefill_text", 9: "decode"}, {7: "decode", 9: "prefill_text"}):
+        assert _worker()._inline_emit_values(
+            _Engine({"text_inputs": "new_token"}), _Batch(walks, label="mixed"), rows, [7, 9],
+            ["text_inputs"],
+        ) == ("text_inputs", [70, None])

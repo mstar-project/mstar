@@ -2565,9 +2565,10 @@ class Worker:
         # A rid prepare_inputs dropped (vetoed, as a loop's extra step past
         # the rid's own count is, or failed) has no step to retry: on success
         # the routing drops it too. Re-queued, it would run again with its
-        # loop-back inputs already spent. A row the cache served is retried,
-        # because its walk completes only on a step that runs.
-        prepared = set(node_batch.request_ids) | node_batch.cached_rids
+        # loop-back inputs already spent. A row the cache served, or one that
+        # declined its stream's final chunk, is retried, because its node
+        # completes only on a step that runs.
+        prepared = set(node_batch.request_ids) | node_batch.no_forward_rids
         for rid in list(batch.request_to_worker_graph):
             if rid not in prepared:
                 batch.discard_rid(rid)
@@ -3611,13 +3612,14 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.pending_loop_stops", synchronize=False)
         # If any nodes in the batch have "overstayed" their loop stop, then make
-        # sure to not route their outputs
-        valid_rids = set(batch_N.node_batch.request_ids) | batch_N.node_batch.cached_rids
+        # sure to not route their outputs. A row the cache served, or one that
+        # declined its stream's final chunk, ran no forward but completes its node.
+        valid_rids = set(batch_N.node_batch.request_ids) | batch_N.node_batch.no_forward_rids
         if batch_N.speculative_new_iter:
             stopped_rids = self._graph_runtime.pending_loop_stop_rids(
                 list(batch_N.batch.rids_by_walk()), batch_N.loop_name,
             )
-            stopped_rids &= set(batch_N.node_batch.request_ids)
+            stopped_rids &= valid_rids
             for stopped_rid in stopped_rids:
                 outputs.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
@@ -3665,8 +3667,8 @@ class Worker:
         # An engine can drop rids that were skipped during execution (a
         # submodule's prepare_inputs returned None) from node_batch.request_ids,
         # but it cannot reach the worker-side ScheduledBatch. Reconcile it here so
-        # the routing/output loops below only touch rids that ran or that the
-        # cache served.
+        # the routing/output loops below only touch rids that ran or that
+        # complete without a forward.
         for rid in list(batch_N.batch.request_to_worker_graph):
             if rid not in valid_rids:
                 batch_N.batch.discard_rid(rid)
@@ -3761,7 +3763,7 @@ class Worker:
             # stopping one would finalize state the drop just removed
             for rid in failed:
                 stops.pop(rid, None)
-            if not batch_N.node_batch.request_ids and not batch_N.node_batch.cached_rids:
+            if not batch_N.batch.request_to_worker_graph:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 return
@@ -4174,52 +4176,46 @@ class Worker:
     def _inline_emit_values(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
         rids: list[int], signals,
-    ) -> tuple[str | None, list[int]]:
+    ) -> tuple[str | None, list[int | None]]:
         """The values of a client signal that can ride inline this step.
 
-        Taken off the stop check's host copy, one ``tolist`` for the batch.
-        Every rid must have a row, or the step keeps the tensor path for the
-        whole batch: the runtime applies the values positionally.
+        Taken off the stop check's host copy, one ``tolist`` for the batch,
+        in ``rids`` order. A row with no host row ran no forward (see
+        ``ExecutingBatch.no_forward_rids``): its value is None, so it alone
+        takes the tensor path.
         """
         if host_rows is None or not self._graph_runtime.supports_inline_emit:
             return None, []
         if not batch_N.batch.request_walks:
             return self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
         # Per real walk: a combined walk is no walk of the submodule's.
-        walk_of = batch_N.batch.walk_of
         walks = list(batch_N.batch.rids_by_walk()) or [batch_N.graph_walk]
-        candidates: dict[str, tuple[str, set[str]]] = {}
+        candidates: dict[str, str] = {}
         for walk in walks:
             for signal, buffer_name in engine.inline_client_signals(
                 batch_N.node_name, walk,
             ).items():
-                candidates.setdefault(signal, (buffer_name, set()))[1].add(walk)
-        if not candidates:
-            return None, []
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        for signal, (buffer_name, inline_walks) in candidates.items():
+                candidates.setdefault(signal, buffer_name)
+        for signal, buffer_name in candidates.items():
             if signal not in signals:
                 continue
             buf = host_rows.buffers.get(buffer_name)
             if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
                 continue
             values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
-            out = []
-            for rid in rids:
-                i = row_of.get(rid)
-                if i is not None and i < len(values):
-                    out.append(values[i])
-                elif walk_of(rid) in inline_walks:
-                    return None, []  # an inline row with no value: tensor path
-                else:
-                    out.append(0)  # its walk sends this signal no inline value
-            return signal, out
+            return signal, self._values_by_rid(values, host_rows, rids)
         return None, []
+
+    @staticmethod
+    def _values_by_rid(values: list[int], host_rows: "HostRows", rids: list[int]) -> list[int | None]:
+        """``values``, in host-row order, in ``rids`` order; None for a rid with no host row."""
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids[:len(values)])}
+        return [values[row_of[rid]] if rid in row_of else None for rid in rids]
 
     def _inline_emit_one_walk(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows",
         rids: list[int], signals,
-    ) -> tuple[str | None, list[int]]:
+    ) -> tuple[str | None, list[int | None]]:
         """`_inline_emit_values` for a step of one walk: every row takes the
         value, so one comprehension, and a slice when the host rows are in
         the batch's order (the usual case)."""
@@ -4233,14 +4229,8 @@ class Worker:
             values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
             n = len(rids)
             if len(values) >= n and list(host_rows.request_ids[:n]) == rids:
-                out = values[:n]
-            else:
-                row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-                try:
-                    out = [values[row_of[rid]] for rid in rids]
-                except (KeyError, IndexError):
-                    return None, []
-            return signal, out
+                return signal, values[:n]
+            return signal, self._values_by_rid(values, host_rows, rids)
         return None, []
 
     def _stage_host_rows(self, outputs: "BatchedModelOutput") -> None:

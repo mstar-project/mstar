@@ -1207,11 +1207,12 @@ pub struct RouteArg {
     /// One output signal whose per-request value is a scalar the worker
     /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
     /// then rides inline in one frame per step instead of as a tensor per
-    /// request; `inline_values` are in `rids` order, or empty for none.
+    /// request; `inline_values` are in `rids` order, or empty for none. A
+    /// row whose value is None (it ran no forward) takes the tensor path.
     /// Both keys may be absent or None: a caller with no inline signal sends
     /// the plain route input.
     inline_signal: Option<String>,
-    inline_values: Vec<i64>,
+    inline_values: Vec<Option<i64>>,
     /// Rows of several walks in one call: `rids[i]` ran `walks[rid_walk_idx[i]]`.
     /// None, every row ran `graph_walk`.
     walks: Option<Vec<String>>,
@@ -2502,6 +2503,7 @@ impl GraphRuntime {
         let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
 
         for (i, &rid) in input.rids.iter().enumerate() {
+            let inline_value = if inline_on { input.inline_values[i] } else { None };
             let ctx = &ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
             let (wg, node, g, walk_sym, walk_wgs) = (ctx.0, ctx.1, &ctx.2, ctx.3, &ctx.4);
             let walk = walk_sym.unwrap_or_default();
@@ -2857,14 +2859,12 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let inline_edge = inline_on
+                let inline_edge = inline_value.is_some()
                     && matches!(e.dest, Dest::EmitToClient)
                     && Some(e.name) == inline_sym
                     && !e.persist;
-                if inline_edge {
-                    emit_inline.insert(
-                        rid, (e.name, e.modality, input.inline_values[i]),
-                    );
+                if let (true, Some(value)) = (inline_edge, inline_value) {
+                    emit_inline.insert(rid, (e.name, e.modality, value));
                 }
                 let remote = (e.persist && has_remote)
                     || e.declined_local
@@ -2927,7 +2927,7 @@ impl GraphRuntime {
                         // An inline emit holds no reference: nothing reads
                         // the tensor on the api server's behalf.
                         Dest::EmitToClient => i64::from(
-                            !(inline_on && Some(e.name) == inline_sym && !e.persist),
+                            !(inline_value.is_some() && Some(e.name) == inline_sym && !e.persist),
                         ),
                         // One reference per destination WORKER, minus this
                         // one when the edge was already ingested into a local

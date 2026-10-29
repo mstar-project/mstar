@@ -23,7 +23,7 @@ from mstar.worker.worker import Speculation, Worker  # noqa: E402
 NODE = "decoder"
 
 
-_CHUNK = StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=False)
+_CHUNK = StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=False, chunk_index=0)
 
 
 def _edge(name: str) -> StreamingEdge:

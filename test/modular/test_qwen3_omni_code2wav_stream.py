@@ -1,9 +1,10 @@
-"""Qwen3-Omni Code2Wav streaming: the stitched chunks are one continuous decode.
+"""Qwen3-Omni streaming: the Talker's text conditioning past the Thinker's
+stream, and Code2Wav's stitched chunks as one continuous decode.
 
-Each test drives Talker codec frames through the edge's real
+The Code2Wav tests drive Talker codec frames through the edge's real
 ``LeftContextChunkPolicy`` and ``StreamBuffer``, then through
-``Code2WavSubmodule``'s ``cg_key_info`` / ``prepare_inputs`` / ``preprocess``
-/ ``forward_batched`` / ``postprocess``, and compares the concatenated audio
+``Code2WavSubmodule``'s ``prepare_inputs`` / ``preprocess`` /
+``forward_batched`` / ``postprocess``, and compares the concatenated audio
 with one decode of the whole stream.
 
 The decoder's ``ConvTranspose1d(2r, stride r, padding r)`` blocks look one
@@ -23,6 +24,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.qwen3_omni.components import code2wav as code2wav_module
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig
@@ -30,6 +32,8 @@ from mstar.model.qwen3_omni.submodules import Code2WavSubmodule, TalkerSubmodule
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, StopCheck
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
+from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.worker import Worker
 
 UPSAMPLE = 1920
 
@@ -70,8 +74,8 @@ def _stream_batched(
     Every step batches the requests that still have a chunk, the way the
     scheduler batches Code2Wav; a request joins at step ``starts[rid]``
     (default 0). Returns, per request, its ``(chunk_info, audio, decoded)``
-    per step (``decoded``: whether the step ran the vocoder), and each step's
-    ``cg_key_info``."""
+    per step (``decoded``: whether the step ran the vocoder for it; a declined
+    flush emits no audio), and the number of steps that ran a forward."""
     starts = starts or {}
     cfg = submodule.config.code2wav
     if policy is None:
@@ -89,7 +93,7 @@ def _stream_batched(
 
     fwd_infos = {rid: SimpleNamespace(request_id=rid, rid_handle=rid) for rid in frames}
     steps = {rid: [] for rid in frames}
-    keys = []
+    forwards = 0
     step = -1
     while any(buffer.has_chunk_ready() for buffer in buffers.values()):
         step += 1
@@ -98,35 +102,37 @@ def _stream_batched(
             continue
         chunks = {rid: buffers[rid].pop_chunk() for rid in rids}
         meta = {rid: InputMetadata(stream_chunks={"codec_tokens": chunk.info}) for rid, chunk in chunks.items()}
-        # The engine replays the captured 50-frame graph when the batch's key
-        # names a capture (None), and runs the eager forward otherwise.
-        key = submodule.cg_key_info(
-            "code2wav_chunk", {rid: fwd_infos[rid] for rid in rids}, per_request_input_metadata=meta,
-        )
-        keys.append(key)
-        engine_inputs = ModelInputsFromEngine(
-            request_ids=rids, per_request_info={}, per_request_input_metadata=meta, captured=key is None,
-        )
-        # an empty chunk reaches the node as an edge with no tensors
-        items = [
-            submodule.prepare_inputs(
+        prepared = {
+            rid: submodule.prepare_inputs(
                 "code2wav_chunk", fwd_infos[rid],
+                # an empty chunk reaches the node as an edge with no tensors
                 {"codec_tokens": [] if chunks[rid].data["data"] is None else [chunks[rid].data["data"]]},
                 input_metadata=meta[rid],
             )
             for rid in rids
-        ]
-        assert submodule.can_batch(None, items)
-        packed = submodule.preprocess("code2wav_chunk", engine_inputs, items)
-        decoded = packed["codec_tokens"].shape[-1] > 0
-        with torch.no_grad():
-            outputs = submodule.forward_batched("code2wav_chunk", engine_inputs, **packed)
-        for rid, item in zip(rids, items, strict=True):
-            submodule.postprocess(rid, fwd_infos[rid], outputs[rid], inputs=item)
-            steps[rid].append((chunks[rid].info, outputs[rid]["audio_chunk"][0], decoded))
+        }
+        # as the engine does: a declined chunk runs no forward
+        for rid in rids:
+            if prepared[rid] is None:
+                steps[rid].append((chunks[rid].info, torch.empty(0, dtype=torch.int16), False))
+        run = [rid for rid in rids if prepared[rid] is not None]
+        if run:
+            forwards += 1
+            items = [prepared[rid] for rid in run]
+            engine_inputs = ModelInputsFromEngine(
+                request_ids=run, per_request_info={}, per_request_input_metadata=meta, captured=True,
+            )
+            assert submodule.can_batch(None, items)
+            packed = submodule.preprocess("code2wav_chunk", engine_inputs, items)
+            with torch.no_grad():
+                outputs = submodule.forward_batched("code2wav_chunk", engine_inputs, **packed)
+            for rid, item in zip(run, items, strict=True):
+                submodule.postprocess(rid, fwd_infos[rid], outputs[rid], inputs=item)
+                steps[rid].append((chunks[rid].info, outputs[rid]["audio_chunk"][0], True))
+        for rid in rids:
             if chunks[rid].is_final:
                 submodule.cleanup_request(rid)
-    return steps, keys
+    return steps, forwards
 
 
 def _stream(submodule: Code2WavSubmodule, frames: torch.Tensor, policy=None) -> list[tuple]:
@@ -233,28 +239,33 @@ def test_the_talker_withholds_codec_eos_from_the_stream(num_frames):
         assert final_decoded and final_audio.numel() == _expected_samples_per_step(steps, decoder.TAIL)[-1] > 0
 
 
-def test_a_stream_of_only_codec_eos_ends_with_an_empty_chunk():
-    """The Talker's first frame was codec_eos: the stream gets no item, and its
-    final chunk reaches Code2Wav with no tensor, decodes nothing and emits no audio."""
+def test_a_stream_of_only_codec_eos_ends_with_an_empty_chunk(monkeypatch):
+    """The Talker's first frame was codec_eos: the stream gets no item, and
+    Code2Wav declines its final chunk, which reaches it with no tensor, before
+    building any: it decodes nothing and emits no audio."""
     decoder = _LookaheadDecoder()
     config = Qwen3OmniModelConfig()
     submodule = Code2WavSubmodule(decoder, config)
+
+    def no_device():
+        raise AssertionError("Code2Wav built a device tensor")
+
+    monkeypatch.setattr(submodule, "get_device", no_device)
     eos = torch.full((1, 16), config.talker.codec_eos_token_id)
 
     streamed_frames, _ = _talker_streamed(config, eos)
-    steps, keys = _stream_batched(submodule, {"r": streamed_frames})
+    steps, forwards = _stream_batched(submodule, {"r": streamed_frames})
 
     ((info, audio, decoded),) = steps["r"]
-    assert info == StreamChunkInfo(0, 0, 0, True)
-    assert keys == [Code2WavSubmodule._CONTEXT_ONLY_KEY]
-    assert not decoded and audio.numel() == 0 and decoder.calls == 0
+    assert info == StreamChunkInfo(0, 0, 0, True, 0)
+    assert forwards == decoder.calls == 0
+    assert not decoded and audio.numel() == 0
 
 
 @pytest.mark.parametrize("num_frames", [25, 50, 125])
 def test_terminal_flush_without_new_frames_skips_the_decode(num_frames):
     """A stream of k * 25 frames ends with a flush of the 25 retained context
-    frames. It emits nothing, so its batch is keyed off the captures and runs
-    no decode."""
+    frames. It emits nothing, so it is declined and runs no decode."""
     decoder = _LookaheadDecoder()
     submodule = Code2WavSubmodule(decoder, Qwen3OmniModelConfig())
 
@@ -267,43 +278,25 @@ def test_terminal_flush_without_new_frames_skips_the_decode(num_frames):
     assert all(decoded for _, _, decoded in steps[:-1])
 
 
-def test_a_batch_with_any_new_frames_keeps_the_capture():
-    """Only a batch made entirely of context-only flushes leaves the capture.
-    Every item is a frame, so a final chunk with one new item has audio."""
-    submodule = Code2WavSubmodule(_LookaheadDecoder(), Qwen3OmniModelConfig())
-    flush = InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(50, 25, 25, True)})
-    final_one_new = InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(50, 25, 26, True)})
-    steady = InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(25, 25, 50, False)})
-    one_new = InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(50, 25, 26, False)})
-    infos = {"a": None, "b": None}
-
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": flush}) is not None
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": final_one_new}) is None
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": one_new}) is None
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": steady}) is None
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush}) is None
-    assert submodule.cg_key_info("code2wav_chunk", infos, None) is None
-
-
 def test_mixed_batch_of_a_terminal_flush_and_a_live_window():
     """Request a (50 frames) reaches its context-only flush in the same step
     as request b (76 frames, distinct codes) decodes a full window; b ends a
-    step later. The mixed step keeps the capture and decodes both rows; a's
-    row emits nothing and both streams stitch into their own full decodes."""
+    step later. The mixed step decodes b's row alone: a's flush is declined
+    and emits nothing, and both streams stitch into their own full decodes."""
     decoder = _LookaheadDecoder()
     submodule = Code2WavSubmodule(decoder, Qwen3OmniModelConfig())
     codes = {"a": _codes(50), "b": _codes(76) + 200}
 
-    steps, keys = _stream_batched(submodule, codes)
+    steps, forwards = _stream_batched(submodule, codes)
 
     assert [len(steps["a"]), len(steps["b"])] == [3, 4]
     flush_info, flush_audio, flush_decoded = steps["a"][2]
     live_info, live_audio, live_decoded = steps["b"][2]
     assert flush_info.is_final and flush_info.context_items == flush_info.num_items
     assert not live_info.is_final and live_info.num_items - live_info.context_items == 25
-    # The mixed step replays the capture, and so does b's flush of one new frame.
-    assert keys == [None, None, None, None]
-    assert flush_decoded and live_decoded and decoder.calls == 4
+    # b's flush of one new frame still decodes
+    assert forwards == decoder.calls == 4
+    assert not flush_decoded and live_decoded
     assert flush_audio.numel() == 0 and live_audio.numel() == 25 * UPSAMPLE
     for rid, request_codes in codes.items():
         full = _to_pcm(decoder(request_codes.t()[None], torch.arange(request_codes.shape[0])[None]))[0, 0]
@@ -476,9 +469,8 @@ def test_a_batch_mixes_windows_from_different_ramp_stages():
     submodule = Code2WavSubmodule(decoder, _config())
     codes = {"a": _codes(90), "b": _codes(70) + 200, "c": _codes(3) + 400}
 
-    steps, keys = _stream_batched(submodule, codes, _scheduled_policy, starts={"a": 0, "b": 1, "c": 2})
+    steps, _ = _stream_batched(submodule, codes, _scheduled_policy, starts={"a": 0, "b": 1, "c": 2})
 
-    assert keys == [None] * len(keys)
     # step 2 batches a's third window (12 + 13), b's second (4 + 8) and c's whole stream
     assert [steps[rid][2 - start][0][1:3] for rid, start in (("a", 0), ("b", 1), ("c", 2))] == [
         (12, 25), (4, 12), (0, 3),
@@ -729,3 +721,83 @@ def test_ramp_boundaries_are_no_worse_than_25_frame_chunks(long_reach_code2wav):
     assert statistics.median(steady) >= statistics.median(base_steady) - 1
     assert min(steady) >= min(base_steady) - 2
     assert len(ramp) == 8 and min(ramp) > 80
+
+
+def test_a_talker_step_refused_at_the_streams_end_feeds_the_text_eos_on_every_retry():
+    """The first decode step past the Thinker's stream is conditioned on TTS
+    EOS, later ones on pad. A step whose admit is refused is prepared again
+    with the same inputs while the worker keeps polling the stream: every retry
+    must feed EOS again, or the Talker never sees the end of the text. Drives
+    the worker's own stream polling, with a one-slot stand-in for the Talker
+    node (a streamed chunk is refused while the pending step holds one)."""
+    from mstar.model.qwen3_omni.qwen3_omni_model import _thinker_to_talker_policy
+
+    hidden, rid, edge = 4, 7, "thinker_states"
+    # the edge as the worker builds it: walk-driven, so a chunk past the
+    # stream's end is released only to the decode walk
+    sbuf = StreamBuffer(request_id=rid, edge_name=edge, from_partition="Thinker",
+                        policy=_thinker_to_talker_policy(), walk_tagged=True)
+    for i in range(2):  # the Thinker streams two states, then ends
+        sbuf.pre_read_register(f"t{i}", "talker_decode")
+        sbuf.put(f"t{i}", torch.zeros(1, hidden))
+    sbuf.signal_done(2)
+
+    class TalkerNode:
+        holds_chunk = False
+
+        def ingest_inputs_batch(self, block, can_buffer=True, is_streaming=False):
+            assert not can_buffer and is_streaming
+            if self.holds_chunk:
+                return list(range(len(block.rids)))
+            self.holds_chunk = True
+            return []
+
+    request_state = RequestStateManager(node_to_partition={"Talker": "Talker"})
+    request_state.add_request(rid, CurrentForwardPassInfo(
+        request_id="r", graph_walk="talker_decode", fwd_index=0, random_seed=0, max_tokens=0,
+        partition_name="Talker",
+    ))
+    request_state.per_request_info[rid].stream_buffers[edge] = sbuf
+    request_state.per_request_info[rid].stream_buffers_by_consumer["Talker"] = {edge: sbuf}
+    worker = Worker.__new__(Worker)
+    worker.__dict__.update(
+        request_state=request_state,
+        _consumer_node_cache={edge: "Talker"}, _walk_driven_edges={edge: "Talker"}, _graph_runtime=TalkerNode(),
+        tensor_manager=SimpleNamespace(
+            store_and_return_tensor_info=lambda r, t, skip_cuda_sync: {edge: [SimpleNamespace(uuid=0)]},
+        ),
+    )
+
+    class TextProjection:
+        # fp32 like the loop-back input, so .to() hands back that very tensor
+        linear_fc1 = SimpleNamespace(weight=torch.zeros(1))
+
+        def __call__(self, states):
+            return torch.full((1, hidden), 3.0)
+
+    talker = TalkerSubmodule(
+        talker_model=SimpleNamespace(model=SimpleNamespace(codec_embedding=None), text_projection=TextProjection()),
+        code_predictor=None, config=SimpleNamespace(code_predictor=SimpleNamespace(num_code_groups=1)),
+    )
+    talker.__dict__.update(
+        _cached_device=torch.device("cpu"),
+        _tts_eos_embed_cached=torch.ones(hidden), _tts_pad_embed_cached=torch.zeros(hidden),
+    )
+
+    loop_back = torch.zeros(1, hidden)  # a pushed-back step holds the same tensor
+    fed, refusals = [], 3
+    while len(fed) < 8:
+        worker._poll_stream_buffers()
+        chunks = worker._stream_chunks_for(rid, "Talker", {edge: []})
+        states = [torch.zeros(1, hidden)] if chunks[edge].num_items else []
+        embeds = talker.prepare_inputs(
+            "talker_decode", SimpleNamespace(rid_handle=rid), {"talker_input_embeds": [loop_back], edge: states},
+            input_metadata=InputMetadata(stream_chunks=chunks),
+        ).input_embeds
+        fed.append(embeds.sum().item() / hidden)  # 3 text, 1 EOS, 0 pad
+        if not chunks[edge].num_items and refusals:
+            refusals -= 1  # admit refused: pushed back holding its inputs
+            continue
+        worker._graph_runtime.holds_chunk = False  # the step ran
+
+    assert fed == [3, 3, 1, 1, 1, 1, 0, 0], "a retried step lost the text EOS embed"

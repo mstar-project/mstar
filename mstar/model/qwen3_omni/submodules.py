@@ -69,6 +69,7 @@ from mstar.model.qwen3_omni.config import (
 )
 from mstar.model.qwen3_omni.qwen3_omni_model import image_span
 from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
     ARNodeInputs,
     ARNodeSubmodule,
     InputMetadata,
@@ -1227,11 +1228,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         # with True at positions to suppress.  Cached on first forward.
         self._suppress_mask: torch.Tensor | None = None
 
-        # Per-request flag: whether we've already sent tts_eos_embed as
-        # the text conditioning for this request. We use this flag to
-        # inject tts_eos_embed for ONE step before falling back to pad.
-        self._eos_embed_sent: set[str] = set()
-
         # Lazy-built CodePredictor scratch KV cache, overwritten every step.
         self._cp_kv_cache: torch.Tensor | None = None
 
@@ -1371,6 +1367,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
@@ -1397,21 +1394,22 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         elif graph_walk == "talker_decode":
             dtype = self.model.text_projection.linear_fc1.weight.dtype
-            input_embeds = inputs["talker_input_embeds"][0].to(dtype)
-
             thinker_states = inputs.get("thinker_states", [])
-            rid = fwd_info.rid_handle
             if thinker_states:
                 # Decode is always text → text_projection.
                 text_hidden = self.model.text_projection(
                     thinker_states[0].to(dtype)
                 )
-            elif rid not in self._eos_embed_sent:
-                text_hidden = self._tts_eos_embed_cached
-                self._eos_embed_sent.add(rid)
             else:
-                text_hidden = self._tts_pad_embed_cached
-            input_embeds += text_hidden
+                # TTS EOS on the first chunk past the Thinker's stream, then
+                # pad. The chunk says which, so a step the engine prepares
+                # again feeds the same embed.
+                chunk = input_metadata.stream_chunks.get("thinker_states")
+                assert chunk is not None, "a talker_decode step without its thinker_states chunk"
+                text_hidden = self._tts_eos_embed_cached if chunk.first_past_end else self._tts_pad_embed_cached
+            # out of place: when the dtypes match, .to() returns the loop-back
+            # tensor itself, which a step prepared again reads a second time
+            input_embeds = inputs["talker_input_embeds"][0].to(dtype) + text_hidden
             seq_len = 1
 
         return ARNodeInputs(
@@ -1701,11 +1699,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             stops = {"talker_decode_loop"}
         return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
 
-    def cleanup_request(self, request_id: str) -> None:
-        """Remove per-request state when a request completes."""
-        super().cleanup_request(request_id)
-        self._eos_embed_sent.discard(request_id)
-
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk in [
             "talker_decode", "talker_last_prefill"
@@ -1784,10 +1777,6 @@ class Code2WavSubmodule(NodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    # No capture carries this key, so a batch of terminal flushes runs eager
-    # and skips the decode when none of its windows has a new frame.
-    _CONTEXT_ONLY_KEY = "context_only"
-
     def __init__(self, code2wav_model: Qwen3OmniMoeCode2Wav, config: Qwen3OmniModelConfig):
         super().__init__()
         self.code2wav = code2wav_model
@@ -1811,36 +1800,6 @@ class Code2WavSubmodule(NodeSubmodule):
         # lengths of a full window (bf16 cuDNN convs go wrong at some other
         # odd lengths on B200).
         self.full_seqlen = self.config.code2wav.codec_max_window
-
-    @staticmethod
-    def _chunk(rid, per_request_input_metadata: Mapping[str, InputMetadata] | None):
-        meta = (per_request_input_metadata or {}).get(rid)
-        return meta.stream_chunks.get("codec_tokens") if meta is not None else None
-
-    @classmethod
-    def _context_only(
-        cls, request_ids, per_request_input_metadata: Mapping[str, InputMetadata] | None,
-    ) -> bool:
-        """Whether every window is a terminal flush with no new frames, which
-        emits no audio: a reply whose frames end on a chunk boundary ends with
-        one. Every stream item is a frame (the Talker withholds codec_eos), so
-        the counts say so."""
-        for rid in request_ids:
-            chunk = cls._chunk(rid, per_request_input_metadata)
-            if chunk is None or chunk.num_items > chunk.context_items:
-                return False
-        return bool(request_ids)
-
-    def cg_key_info(
-        self,
-        graph_walk: str,
-        per_request_info: Mapping[str, CurrentForwardPassInfo],
-        per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        if self._context_only(list(per_request_info), per_request_input_metadata):
-            return self._CONTEXT_ONLY_KEY
-        return None
 
     def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         num_quantizers = self.config.code2wav.num_quantizers
@@ -1867,17 +1826,20 @@ class Code2WavSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         input_metadata: InputMetadata | None = None,
         **kwargs
-    ) -> NodeInputs:
+    ) -> NodeInputs | None:
+        # The window's leading frames that an earlier window already decoded.
+        chunk = (input_metadata.stream_chunks.get("codec_tokens") if input_metadata is not None else None)
+        context = chunk.context_items if chunk is not None else 0
+        if chunk is not None and chunk.is_final and chunk.num_items <= context:
+            # a terminal flush with no new frame (a reply whose frames end on a
+            # chunk boundary, or whose first frame was codec_eos): nothing to
+            # decode, and declined it still ends the stream
+            return None
         num_quantizers = self.config.code2wav.num_quantizers  # 16
         num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
         # Every item is a frame: the Talker withholds its codec_eos frame
         # (``TalkerSubmodule.check_stop``).
-        received = inputs.get("codec_tokens")
-        if received:
-            codec_tokens = received[0]
-        else:
-            # a stream whose first frame was codec_eos ends with an empty chunk
-            codec_tokens = torch.zeros((0, num_groups), dtype=torch.long, device=self.get_device())
+        codec_tokens = inputs["codec_tokens"][0]
 
         # Reshape to (num_frames, num_code_groups) if flat
         if codec_tokens.dim() == 1:
@@ -1890,10 +1852,7 @@ class Code2WavSubmodule(NodeSubmodule):
         if codec_tokens.shape[-1] > num_quantizers:
             codec_tokens = codec_tokens[..., :num_quantizers]
 
-        # The window's leading frames that an earlier window already decoded.
-        chunk = (input_metadata.stream_chunks.get("codec_tokens") if input_metadata is not None else None)
         orig_seq_len = codec_tokens.shape[0]
-        context = chunk.context_items if chunk is not None else 0
 
         # pad sequence to full_seqlen for batching
         pad_len = self.full_seqlen - codec_tokens.shape[0]
@@ -1936,9 +1895,6 @@ class Code2WavSubmodule(NodeSubmodule):
         position_ids = torch.stack([
             inp.tensor_inputs["position_ids"] for inp in inputs
         ], dim=0)
-        metadata = engine_inputs.per_request_input_metadata
-        if not engine_inputs.captured and self._context_only(engine_inputs.request_ids, metadata):
-            return {"codec_tokens": batched_codec_tokens[..., :0], "position_ids": position_ids[..., :0]}
         return {"codec_tokens": batched_codec_tokens, "position_ids": position_ids}
 
     def forward_batched(
@@ -1958,18 +1914,10 @@ class Code2WavSubmodule(NodeSubmodule):
         the first chunk has no overlap. The overlap lets the vocoder warm up
         at chunk boundaries; ``postprocess`` cuts each request's new audio
         out of the window.
-
-        A zero-frame batch (terminal flushes with no new frames, see
-        ``preprocess``) decodes nothing and emits empty chunks.
         """
         request_ids = engine_inputs.request_ids
         if codec_tokens is None:
             return {rid: {} for rid in request_ids}
-        if codec_tokens.numel() == 0:
-            return {
-                rid: {"audio_chunk": [torch.empty(0, dtype=torch.int16, device=codec_tokens.device)]}
-                for rid in request_ids
-            }
 
         wavs = self.code2wav(
             codec_tokens, position_ids
@@ -2030,9 +1978,6 @@ class Code2WavSubmodule(NodeSubmodule):
         orig_seq_len = int(inputs.kwargs["frames"])
         left_context_size = int(inputs.kwargs["context"])
         audio = outputs["audio_chunk"][0].reshape(-1)
-        if audio.numel() == 0:
-            outputs["audio_chunk"][0] = audio
-            return
         # Each decoder block's ConvTranspose1d(2r, stride r, padding r) needs
         # the next frame, so a window decodes to ``tail`` samples (555 for
         # Qwen3-Omni) short of window * total_upsample. The next window

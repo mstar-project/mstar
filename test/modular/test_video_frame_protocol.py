@@ -585,7 +585,6 @@ def test_rollout_harness_submits_and_consumes_typed_sdk_stream(tmp_path):
         "input_modalities": ("image",),
         "output_modalities": ("video_frame",),
         "request_id": "rid",
-        "num_steps": 1,
         "actions": [{"mouse": [-12.0, 0.0], "buttons": [0], "scroll": 0.0}],
         "seed": 17,
     }
@@ -664,10 +663,6 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
         [
             "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
             "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
-            "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
-            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-a runs 2 steps)",
-            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-b runs 2 steps)",
-            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-c runs 2 steps)",
         ]
     )
     assert interleaving_failure(three_way, ("rid-a", "rid-b", "rid-c")) is None

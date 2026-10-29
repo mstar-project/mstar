@@ -212,7 +212,7 @@ def cosmos_policy():
 
 def waypoint_rollout(mouse, size):
     actions = [{"mouse": [mouse, 0], "buttons": [], "scroll": 0}] * 2
-    return generate("", "video_frame", {"num_steps": 2, "seed": 7, "actions": actions},
+    return generate("", "video_frame", {"seed": 7, "actions": actions},
                     lambda: ("seed.png", scene_png(*size)), streaming=True)
 
 

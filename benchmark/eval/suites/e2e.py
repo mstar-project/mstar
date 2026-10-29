@@ -179,7 +179,7 @@ class E2ESuite(Suite):
             form.add_field("text", "")
             form.add_field("output_modalities", "video_frame")
             mouse = [-24, 24, 0, 12][i % 4]
-            kwargs = {"num_steps": 2, "seed": 7, "actions": [{"mouse": [mouse, 0], "buttons": [], "scroll": 0}] * 2}
+            kwargs = {"seed": 7, "actions": [{"mouse": [mouse, 0], "buttons": [], "scroll": 0}] * 2}
         form.add_field("streaming", "true")
         form.add_field("model_kwargs", json.dumps({**kwargs, **self.extra}))
         return form

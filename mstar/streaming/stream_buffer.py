@@ -26,6 +26,7 @@ class StreamChunk:
     def info(self) -> "StreamChunkInfo":
         return StreamChunkInfo(
             self.start_offset, self.context_items, self.num_items, self.is_final,
+            self.chunk_index,
         )
 
 
@@ -35,6 +36,16 @@ class StreamChunkInfo(NamedTuple):
     context_items: int
     num_items: int
     is_final: bool
+    # how many chunks were popped before this one, the empty chunks a
+    # ``continue_after_done`` stream keeps popping included
+    chunk_index: int
+
+    @property
+    def first_past_end(self) -> bool:
+        """The first empty chunk of a ``continue_after_done`` stream of one-item
+        chunks: until it, every chunk carried one item, so its index still equals
+        its offset. A step prepared again reads the same chunk."""
+        return self.num_items == 0 and self.chunk_index == self.start_offset
 
 
 class StreamingEdge(NamedTuple):

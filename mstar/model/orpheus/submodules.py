@@ -295,22 +295,27 @@ class SNACDecoderSubmodule(NodeSubmodule):
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         is_final_stream_chunk: bool = False,
         **kwargs
-    ) -> ARNodeInputs:
+    ) -> ARNodeInputs | None:
         """One window's tokens -> ``(frames, 7)`` codes plus the frames to emit.
 
         A trailing partial frame (the EOS token the LLM streams last) is not
         audio and is dropped. Without stream chunk info the window is treated
         as a whole utterance.
         """
+        chunk = self._stream_chunk(input_metadata)
+        received = inputs.get("new_token")
+        if not received:
+            # an empty final chunk (a no-context stream cut at a chunk boundary
+            # without EOS): nothing to decode, and declined it still ends the walk
+            assert is_final_stream_chunk or (chunk is not None and chunk.is_final), (
+                "an empty chunk before the end of the stream"
+            )
+            return None
+        final = is_final_stream_chunk or chunk is None or chunk.is_final
         tpf = self.config.tokens_per_frame
         right = self.config.snac_right_context_frames
-        # an empty final chunk (a no-context stream cut at a chunk boundary
-        # without EOS) arrives as no tensor at all
-        received = inputs.get("new_token") or [self.idx_14.new_empty(0)]
         tokens = received[0].flatten()
-        chunk = self._stream_chunk(input_metadata)
         frames = tokens.numel() // tpf
-        final = is_final_stream_chunk or chunk is None or chunk.is_final
         start = max((chunk.context_items if chunk is not None else 0) // tpf - right, 0)
         end = max(frames if final else frames - right, start)
         codes = (tokens[: frames * tpf].view(frames, tpf) - self.config.custom_token_base_id - 10) % 4096

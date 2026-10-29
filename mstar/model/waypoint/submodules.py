@@ -1,5 +1,3 @@
-import logging
-
 import torch
 
 from mstar.communication.tensors import NameToTensorList
@@ -20,11 +18,11 @@ from mstar.model.waypoint.components.taehv import (
 )
 from mstar.model.waypoint.config import WaypointConfig
 
-logger = logging.getLogger(__name__)
-
 PRIME_WALK = "prime"
 ROLLOUT_WALK = "rollout"
 ROLLOUT_LOOP_NAME = "rollout_loop"
+# the client stream of per-frame controller rows (see WaypointModel._action_rows)
+ACTIONS_STREAM = "actions"
 
 # Resource labels this node declares.
 KV_RESOURCE = "kv"
@@ -192,9 +190,11 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs | None:
-        """This frame's row: the ring clock, its controller slice, and either
+        """This frame's row: the ring clock, its controller row, and either
         the noise to denoise from (rollout) or the latent to prime with. Also
-        the nine decoder histories the fused decode reads and writes.
+        the nine decoder histories the fused decode reads and writes. A
+        rollout step on the actions stream's empty final chunk is declined,
+        which ends the loop.
 
         Runs on the host, outside any captured region, which is why the noise
         is drawn here rather than in ``forward``: a captured region cannot
@@ -208,33 +208,18 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         dtype = self.dit.dtype
         # The clock is per request and lives on the host
         state = self.request_state(fwd_info.rid_handle)
-
-        if graph_walk == ROLLOUT_WALK:
-            requested = int(fwd_info.step_metadata.get("num_steps", 0) or 0)
-            rollout_step = int(state.get("rollout_step", 0))
-            if requested and rollout_step >= requested:
-                # Async scheduling can dispatch iteration N+1 before
-                # check_stop(N) registers the loop's finish signal. Veto here,
-                # before any tensor work: None skips the forward, so the
-                # overshoot never commits a frame into the ring.
-                logger.info(
-                    "Waypoint dit: skipping async-overshoot rollout step %d "
-                    "(request %s runs %d steps)",
-                    rollout_step, fwd_info.request_id, requested,
-                )
-                return None
-
         frame_pos = int(state.get("frame_pos", 0))
 
         if graph_walk == PRIME_WALK:
-            # Prime has its own idle action and must not consume the
-            # client's action zero.
+            # Prime has its own idle action; the client's first action is the
+            # first rollout frame's.
             mouse, button, scroll = self._idle_controller(device, dtype)
         else:
-            action_index = int(state.get("rollout_step", 0))
-            mouse, button, scroll = self._controller_slice(
-                inputs, action_index, device, dtype
-            )
+            rows = inputs.get(ACTIONS_STREAM)
+            if not rows:
+                assert kwargs.get("is_final_stream_chunk"), "an empty chunk before the end of the stream"
+                return None
+            mouse, button, scroll = self._controller_row(rows[0], device, dtype)
         tensor_inputs = {
             # [1], never []: see the class docstring.
             "frame_pos": torch.full((1,), frame_pos, dtype=torch.int64, device=device),
@@ -308,41 +293,13 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
             dtype=dtype,
         )
 
-    def _controller_slice(
-        self,
-        inputs: NameToTensorList,
-        action_index: int,
-        device: torch.device,
-        dtype: torch.dtype,
+    def _controller_row(
+        self, row: torch.Tensor, device: torch.device, dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """This frame's ``(mouse, button, scroll)``, each ``[1, 1, *]``.
-
-        The request carries the whole scripted action stream as ``[1, F, *]``
-        and one frame is sliced out per step; the conductor re-injects the
-        same loop-external tensor every iteration while the rollout counter
-        advances through it. Prime never calls this method.
-        """
-        widths = {"mouse": 2, "button": self.config.n_buttons, "scroll": 1}
-        out = []
-        for name, width in widths.items():
-            supplied = inputs.get(name) if inputs is not None else None
-            if not supplied:
-                raise ValueError(f"Waypoint rollout is missing its {name!r} action stream.")
-            stream = supplied[0]
-            if stream.ndim != 3 or stream.shape[0] != 1 or stream.shape[2] != width:
-                raise ValueError(
-                    f"Waypoint {name!r} stream must have shape [1, steps, {width}]; "
-                    f"got {tuple(stream.shape)}."
-                )
-            if not 0 <= action_index < stream.shape[1]:
-                raise IndexError(
-                    f"Waypoint action index {action_index} is outside the {name!r} "
-                    f"stream of length {stream.shape[1]}."
-                )
-            out.append(
-                stream[:, action_index : action_index + 1].to(device=device, dtype=dtype)
-            )
-        return tuple(out)
+        """One action row, ``[mouse dx, dy | buttons | scroll]``, as this
+        frame's ``(mouse, button, scroll)``, each ``[1, 1, *]``."""
+        row = row.to(device=device, dtype=dtype).reshape(1, 1, -1)
+        return tuple(row.split((2, self.config.n_buttons, 1), dim=-1))
 
     def _idle_controller(
         self, device: torch.device, dtype: torch.dtype,
@@ -599,11 +556,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         same fixed-address tensors ``prepare_inputs`` reads back next call --
         neither syncs.
         """
-        del inputs, kwargs
+        del request_info, inputs, kwargs
         state = self.request_state(request_id)
         state.add("frame_pos", int(state.get("frame_pos", 0)) + 1)
-        if request_info.graph_walk == ROLLOUT_WALK:
-            state.add("rollout_step", int(state.get("rollout_step", 0)) + 1)
         for idx in range(9):
             key = f"{DECODER_HISTORY_PREFIX}{idx}"
             values = outputs.get(key)
@@ -614,28 +569,6 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
                 state.add(key, values[0].clone())
             else:
                 target.copy_(values[0])
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        """Stop the rollout loop after exactly ``num_steps`` iterations.
-
-        Iteration k (0-based) is still being postprocessed when the loop
-        counter reads k, so N frames means firing at ``k + 1 >= N``. Under
-        async scheduling an overshoot iteration this signal is too late to
-        stop is vetoed instead in ``prepare_inputs``.
-        """
-        del request_id, outputs
-        if request_info.graph_walk != ROLLOUT_WALK:
-            return set()
-        iter_idx = request_info.dynamic_loop_iter_counts.get(ROLLOUT_LOOP_NAME, 0)
-        requested = int(request_info.step_metadata.get("num_steps", 0) or 0)
-        if requested > 0 and iter_idx + 1 >= requested:
-            return {ROLLOUT_LOOP_NAME}
-        return set()
 
     def cleanup_request(self, request_id: str):
         """Drop the request's clock. The ring itself is released by the

@@ -449,10 +449,11 @@ class RouteInput(NamedTuple):
     # One output signal whose per-rid value is a host scalar the worker
     # already has (the sampled token): its EMIT_TO_CLIENT edge then rides
     # inline in one frame per step instead of as a tensor per request. The
-    # values are in wg_ids.keys() order; empty means none. A runtime without
+    # values are in wg_ids.keys() order; empty means none, and a row whose
+    # value is None takes the tensor path. A runtime without
     # `supports_inline_emit` ignores both.
     inline_signal: str | None = None
-    inline_values: tuple[int, ...] | list[int] = ()
+    inline_values: tuple[int | None, ...] | list[int | None] = ()
     # Rows of several walks in one call: wg_ids.keys[i] ran
     # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
     walks: list[str] | None = None

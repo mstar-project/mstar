@@ -441,17 +441,17 @@ class CodecSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
-    ) -> ARNodeInputs:
+    ) -> ARNodeInputs | None:
         """Lay the window out as ``[10, frames]``. Every item is a frame: the
         AR withholds its ``<|im_end|>`` frame (``ARSubmodule.check_stop``)."""
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
-        received = inputs.get("codec_tokens")
-        if received:
-            codes = received[0].to(device=self.get_device(), dtype=torch.long)
-        else:
-            # a stream whose first frame was <|im_end|> ends with an empty chunk
-            codes = torch.zeros(0, self.config.num_codebooks, dtype=torch.long, device=self.get_device())
+        if chunk is not None and chunk.is_final and chunk.num_items <= chunk.context_items:
+            # a terminal flush with no new frame (a stream that ends on a window
+            # boundary, or whose first frame was <|im_end|>): nothing to decode,
+            # and declined it still ends the stream
+            return None
+        codes = inputs["codec_tokens"][0].to(device=self.get_device(), dtype=torch.long)
         codes = codes.view(-1, self.config.num_codebooks)
         frames = codes.shape[0]
         context = chunk.context_items if chunk is not None else 0
@@ -476,21 +476,13 @@ class CodecSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        """Stack the batch's windows, zero-padded on the right to the widest.
-
-        A batch whose windows carry no new frames (a stream's context-only
-        terminal flush) gets width 0 and decodes nothing.
-        """
+        """Stack the batch's windows, zero-padded on the right to the widest."""
         del graph_walk, engine_inputs
         windows = [item.tensor_inputs["codec_tokens"] for item in inputs]
-        has_new = any(item.kwargs["frames"] > item.kwargs["context"] for item in inputs)
-        width = max(window.shape[-1] for window in windows) if has_new else 0
+        width = max(window.shape[-1] for window in windows)
         device = windows[0].device
         codec_tokens = torch.stack(
-            [
-                torch.nn.functional.pad(window[:, :width], (0, width - min(width, window.shape[-1])))
-                for window in windows
-            ]
+            [torch.nn.functional.pad(window, (0, width - window.shape[-1])) for window in windows]
         )
 
         geometry = torch.empty(2, len(inputs), dtype=torch.long, device=device)
@@ -503,8 +495,6 @@ class CodecSubmodule(ARNodeSubmodule):
     def _decode(self, codec_tokens: torch.Tensor, start_offset: torch.Tensor, conv_start: torch.Tensor) -> torch.Tensor:
         """``[B, 10, W]`` windows -> int16 PCM ``[B, conv_frames * hop]``."""
         width = codec_tokens.shape[-1]
-        if width == 0:
-            return codec_tokens.new_zeros((codec_tokens.shape[0], 0), dtype=torch.int16)
         guard = full_fp32() if self.exact_fp32 else contextlib.nullcontext()
         with guard:
             wav = self.decoder.decode_window(codec_tokens, start_offset, conv_start, self.conv_frames(width))
@@ -552,9 +542,6 @@ class CodecSubmodule(ARNodeSubmodule):
         frames, context = int(inputs.kwargs["frames"]), int(inputs.kwargs["context"])
         conv_start = int(inputs.kwargs["conv_start"])
         audio = outputs["audio_chunk"][0].reshape(-1)
-        if frames <= context:
-            outputs["audio_chunk"][0] = audio[:0]
-            return
         start, end = (context - conv_start) * self.hop, (frames - conv_start) * self.hop
         if audio.numel() < end:
             raise ValueError(

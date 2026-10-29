@@ -45,6 +45,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import ClientChunk
 from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.waypoint.components.attention import WaypointAttention
 from mstar.model.waypoint.components.dit import WaypointDiT
@@ -55,6 +56,7 @@ from mstar.model.waypoint.config import (
     waypoint_1_5_1b_720p,
 )
 from mstar.model.waypoint.submodules import (
+    ACTIONS_STREAM,
     ATTN_RESOURCE,
     KV_RESOURCE,
     PRIME_WALK,
@@ -69,6 +71,7 @@ from mstar.model.waypoint.waypoint_model import (
     VAE_ENCODER_NODE,
     WaypointModel,
 )
+from mstar.validation.client_streams import check_client_streams
 
 
 @pytest.fixture(scope="module")
@@ -136,8 +139,6 @@ def _fwd_info(
     request_id: str = "r0",
     graph_walk: str = ROLLOUT_WALK,
     random_seed: int = 1234,
-    num_steps: int = 8,
-    loop_iter: int | None = None,
 ) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id=request_id,
@@ -149,21 +150,16 @@ def _fwd_info(
         random_seed=random_seed,
         max_tokens=0,
         resource_configs={},
-        step_metadata={"is_prefill": graph_walk == PRIME_WALK, "num_steps": num_steps},
+        step_metadata={"is_prefill": graph_walk == PRIME_WALK},
         resource_publish_info={},
-        dynamic_loop_iter_counts=(
-            {} if loop_iter is None else {ROLLOUT_LOOP_NAME: loop_iter}
-        ),
     )
 
 
-def _controller_stream(config, frames: int) -> dict[str, list[torch.Tensor]]:
-    """A scripted stream shaped the way ``process_prompt`` emits it."""
-    return {
-        "mouse": [torch.zeros((1, frames, 2))],
-        "button": [torch.zeros((1, frames, config.n_buttons))],
-        "scroll": [torch.zeros((1, frames, 1))],
-    }
+def _action(config, scroll: float = 0.0) -> dict[str, list[torch.Tensor]]:
+    """One frame's ``actions`` chunk, a row shaped the way ``process_prompt`` emits it."""
+    row = torch.zeros(2 + config.n_buttons + 1)
+    row[-1] = scroll
+    return {ACTIONS_STREAM: [row]}
 
 
 # ---------------------------------------------------------------------------
@@ -259,56 +255,53 @@ def test_prime_encodes_commits_and_initializes_decoder_without_emitting(model):
     encoder, dit = prime.sections
     assert encoder.input_names == {"image_inputs"}
     assert [(e.name, e.next_node) for e in encoder.outputs] == [("latent", DIT_NODE)]
-    # The dit node's contract is unchanged by the node bracketing it.
-    assert dit.input_names == {"latent", "mouse", "button", "scroll"}
+    # Prime runs on its own idle action; the client's actions are the rollout's.
+    assert dit.input_names == {"latent"}
     # Nothing to route: the decode happens inside this forward, and the
     # reconstructed seed frames it produces are internal-only.
     assert dit.outputs == []
 
     io = prime.get_inputs_outputs()
-    assert io.ext_inputs == {
-        ("image_inputs", VAE_ENCODER_NODE),
-        ("mouse", DIT_NODE), ("button", DIT_NODE), ("scroll", DIT_NODE),
-    }
+    assert io.ext_inputs == {("image_inputs", VAE_ENCODER_NODE)}
     assert io.ext_outputs == []
 
 
 def test_the_rollout_loop_decodes_and_emits_every_iteration(model, config):
     rollout = model.get_graph_walk_graphs()[ROLLOUT_WALK]
     assert isinstance(rollout, Loop)
-    assert rollout.name == ROLLOUT_LOOP_NAME  # what check_stop's signal is keyed by
+    assert rollout.name == ROLLOUT_LOOP_NAME
     assert rollout.max_iters == config.max_frames
 
     dit = rollout.section
     assert dit.name == DIT_NODE
-    assert dit.input_names == {"mouse", "button", "scroll", "clock"}
+    assert dit.input_names == {ACTIONS_STREAM, "clock"} and dit.consumes_stream
     assert {(e.name, e.next_node) for e in dit.outputs} == {
         ("clock", DIT_NODE), ("video_output", EMIT_TO_CLIENT),
     }
     assert rollout.accumulated_outputs == []
     # The "clock" self loop-back makes the dit a same-node speculation target
     # (see below), so async scheduling can dispatch iteration N+1 before N
-    # finishes; overshoot is vetoed host-side in prepare_inputs, not by this.
+    # finishes; a step past the stream's last row finds none.
     assert dit.enable_async_scheduling is True
-    # The controller streams stay loop-external; "clock" is the only
-    # loop-back, or the conductor would try to re-inject it every walk step.
-    assert rollout._external_inputs == {
-        ("mouse", DIT_NODE), ("button", DIT_NODE), ("scroll", DIT_NODE),
-    }
+    # The actions stream is loop-external; "clock" is the only loop-back.
+    assert rollout._external_inputs == {(ACTIONS_STREAM, DIT_NODE)}
     assert rollout._loop_back_inputs == {("clock", DIT_NODE)}
+    # one client stream, one row per frame, capped at the horizon
+    (stream,) = model.get_partition_topology().client_connections()
+    assert stream.edge_name == ACTIONS_STREAM and stream.limits.max_items == config.max_frames
+    assert check_client_streams(model, {}) == []
 
 
 def test_the_clock_loop_back_makes_dit_a_same_node_speculation_target(model):
     """``ingest_for_speculation`` must propose the dit as ready for its own
-    next iteration once the loop-external streams are ready and the empty
-    "clock" loop-back (iteration 0) has been ingested -- the self-edge this
-    graph shape depends on for speculation to fire at all.
+    next iteration once its actions chunk is in and the empty "clock"
+    loop-back (iteration 0) has been ingested -- the self-edge this graph
+    shape depends on for speculation to fire at all.
     """
     rollout = model.get_graph_walk_graphs()[ROLLOUT_WALK]
     wgio = WorkerGraphIO(rollout)
     dit = wgio.get_node(DIT_NODE)
-    for name in ("mouse", "button", "scroll"):
-        wgio.ingest_input(GraphEdge(next_node=DIT_NODE, name=name, persist=True))
+    wgio.ingest_input(GraphEdge(next_node=DIT_NODE, name=ACTIONS_STREAM))
     wgio.ingest_input(GraphEdge(next_node=DIT_NODE, name="clock"))
     assert wgio.ready_node_names == {DIT_NODE}
 
@@ -317,30 +310,22 @@ def test_the_clock_loop_back_makes_dit_a_same_node_speculation_target(model):
     ]
 
 
-def test_the_rollout_loop_closes_after_exactly_num_steps_frames(model):
-    """Driven through ``WorkerGraphIO``: exercises the loop's own
-    iteration/finish-signal bookkeeping, not node ordering (there's only one
-    node, so nothing can decode a frame twice or skip one).
-
-    ``register_loop_finish_signal`` (what ``check_stop`` calls) fires during
-    postprocess of the loop's last iteration, so that iteration's frame must
-    still be emitted before the loop reports done. The overshoot guard for a
-    speculative iteration dispatched before the signal lands is separate --
-    the host-side veto in ``prepare_inputs``, checked below.
-    """
-    num_steps = 3
+def test_the_rollout_loop_closes_on_the_stream_s_last_row(model):
+    """Driven through ``WorkerGraphIO``: one actions chunk per iteration, and
+    the stream-terminated stop (``register_loop_finish_signal``) on the last
+    one, whose frame must still be emitted before the loop reports done."""
+    frames = 3
     rollout = model.get_graph_walk_graphs()[ROLLOUT_WALK]
     wgio = WorkerGraphIO(rollout)
-    for name in ("mouse", "button", "scroll"):
-        wgio.ingest_input(GraphEdge(next_node=DIT_NODE, name=name, persist=True))
     wgio.ingest_input(GraphEdge(next_node=DIT_NODE, name="clock"))
 
     emitted = []
-    for step in range(num_steps):
+    for step in range(frames):
+        wgio.ingest_input(GraphEdge(next_node=DIT_NODE, name=ACTIONS_STREAM))
         assert wgio.ready_node_names == {DIT_NODE}
         wgio.ready_node_names.discard(DIT_NODE)
-        if step == num_steps - 1:
-            wgio.register_loop_finish_signal(ROLLOUT_LOOP_NAME)  # what check_stop does
+        if step == frames - 1:
+            wgio.register_loop_finish_signal(ROLLOUT_LOOP_NAME)  # the stream's final chunk
         completion = wgio.mark_node_complete(DIT_NODE)
         # mark_node_complete already stripped filtered_signals (e.g. the final
         # iteration's "clock" loop-back) from output_edges; the rest is ours to route.
@@ -349,47 +334,22 @@ def test_the_rollout_loop_closes_after_exactly_num_steps_frames(model):
                 emitted.append(edge.name)
                 continue
             wgio.ingest_input(edge)
-        assert rollout.is_done == (step == num_steps - 1)
+        assert rollout.is_done == (step == frames - 1)
 
-    assert emitted == ["video_output"] * num_steps
+    assert emitted == ["video_output"] * frames
 
 
-def test_the_overshoot_veto_fires_only_past_num_steps(submodule):
-    """The other half of the guarantee above: a speculative iteration must
-    never reach a forward once ``num_steps`` is spent, and never fires
-    during prime (no ``rollout_step`` to overshoot).
-    """
-    num_steps = 3
-    rid = "overshoot"
+def test_a_rollout_step_on_the_empty_final_chunk_is_declined(submodule):
+    """The stream's end can arrive after its last row was taken: the empty
+    final chunk is declined, which ends the loop with nothing committed into
+    the ring. Prime takes no actions at all."""
+    rid = "end"
     submodule.request_states.pop(rid, None)
-    inputs = _controller_stream(submodule.config, frames=num_steps)
-
-    for expected_step in range(num_steps):
-        prepared = submodule.prepare_inputs(
-            ROLLOUT_WALK, _fwd_info(request_id=rid, num_steps=num_steps), inputs
-        )
-        assert prepared is not None, f"step {expected_step} must not be vetoed"
-        submodule.postprocess(
-            rid, _fwd_info(request_id=rid, num_steps=num_steps),
-            {"video_output": [torch.zeros(1)], **_history_outputs(submodule)},
-        )
-
-    vetoed = submodule.prepare_inputs(
-        ROLLOUT_WALK, _fwd_info(request_id=rid, num_steps=num_steps), inputs
-    )
-    assert vetoed is None, "an async-overshoot iteration must be vetoed, not run"
-
-    # Prime never overshoots: it has no num_steps to compare rollout_step
-    # against, regardless of how far along the rollout counter is.
-    prime_inputs = {
-        **_controller_stream(submodule.config, frames=1),
-        "latent": [torch.zeros((1, 1, *submodule.config.latent_shape))],
-    }
     assert submodule.prepare_inputs(
-        PRIME_WALK, _fwd_info(request_id=rid, graph_walk=PRIME_WALK, num_steps=num_steps),
-        prime_inputs,
-    ) is not None
-
+        ROLLOUT_WALK, _fwd_info(request_id=rid), {ACTIONS_STREAM: []}, is_final_stream_chunk=True,
+    ) is None
+    prime = {"latent": [torch.zeros((1, 1, *submodule.config.latent_shape))]}
+    assert submodule.prepare_inputs(PRIME_WALK, _fwd_info(request_id=rid, graph_walk=PRIME_WALK), prime) is not None
     submodule.cleanup_request(rid)
 
 
@@ -403,8 +363,7 @@ def test_no_prepared_tensor_is_rank_zero(submodule, config, walk):
     """A 0-dim tensor reaches ``_intern_static_buffer`` (reads
     ``stored.shape[0]``) and the worker's output fanout (reads ``dims[0]``)
     -- both IndexError at capture/warmup, far from the line that made it."""
-    inputs = _controller_stream(config, frames=4)
-    inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
+    inputs = {**_action(config), "latent": [torch.zeros((1, 1, *config.latent_shape))]}
     node_inputs = submodule.prepare_inputs(walk, _fwd_info(graph_walk=walk), inputs)
 
     assert node_inputs.tensor_inputs, "prepare_inputs emitted no tensors"
@@ -431,8 +390,7 @@ def test_no_prepared_tensor_carries_tokens_per_frame_in_its_shape(
     that case is handled via the config's ``input_seq_dims`` override instead
     (see ``get_cuda_graph_configs`` and ``test_cuda_graph_capture.py``).
     """
-    inputs = _controller_stream(config, frames=4)
-    inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
+    inputs = {**_action(config), "latent": [torch.zeros((1, 1, *config.latent_shape))]}
     node_inputs = submodule.prepare_inputs(walk, _fwd_info(graph_walk=walk), inputs)
 
     assert node_inputs.input_seq_len == config.tokens_per_frame
@@ -452,8 +410,7 @@ def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, 
         cfg.capture_graph_walk: cfg.single_request_inputs
         for cfg in submodule.get_accelerator_graph_configs(torch.device("meta"))
     }
-    inputs = _controller_stream(config, frames=4)
-    inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
+    inputs = {**_action(config), "latent": [torch.zeros((1, 1, *config.latent_shape))]}
 
     for walk, template in templates.items():
         prepared = submodule.prepare_inputs(walk, _fwd_info(graph_walk=walk), inputs)
@@ -526,18 +483,12 @@ def test_noise_differs_across_frames_and_across_seeds(submodule, config):
 def test_prime_is_idle_and_rollout_zero_receives_action_zero(
     host_submodule, config
 ):
-    """Prime advances the ring clock but not the user-action cursor."""
+    """Prime advances the ring clock and takes no action; each rollout frame
+    takes its own chunk's row."""
     rid = "clock"
     host_submodule.request_states.pop(rid, None)
-    inputs = _controller_stream(config, frames=2)
-    # Distinguishable rows, so a slice off by one is visible.
-    for row in range(2):
-        inputs["scroll"][0][0, row, 0] = float(row + 1)
 
-    prime_inputs = {
-        **inputs,
-        "latent": [torch.zeros((1, 1, *config.latent_shape), dtype=torch.float32)],
-    }
+    prime_inputs = {"latent": [torch.zeros((1, 1, *config.latent_shape), dtype=torch.float32)]}
     prime = host_submodule.prepare_inputs(
         PRIME_WALK, _fwd_info(request_id=rid, graph_walk=PRIME_WALK), prime_inputs
     )
@@ -549,9 +500,10 @@ def test_prime_is_idle_and_rollout_zero_receives_action_zero(
     )
 
     seen = []
-    for _ in range(2):
+    for row in range(2):
+        # distinguishable rows, so a row off by one is visible
         node_inputs = host_submodule.prepare_inputs(
-            ROLLOUT_WALK, _fwd_info(request_id=rid), inputs
+            ROLLOUT_WALK, _fwd_info(request_id=rid), _action(config, scroll=float(row + 1))
         )
         seen.append((
             int(node_inputs.tensor_inputs["frame_pos"][0]),
@@ -562,10 +514,6 @@ def test_prime_is_idle_and_rollout_zero_receives_action_zero(
         )
 
     assert seen == [(1, 1.0), (2, 2.0)]
-    with pytest.raises(IndexError, match="action index 2"):
-        host_submodule.prepare_inputs(
-            ROLLOUT_WALK, _fwd_info(request_id=rid), inputs
-        )
 
     host_submodule.cleanup_request(rid)
     assert rid not in host_submodule.request_states
@@ -584,7 +532,7 @@ def test_declare_step_carries_the_same_clock_prepare_inputs_reads(
     """
     rid = "declare"
     host_submodule.request_states.pop(rid, None)
-    inputs = _controller_stream(config, frames=3)
+    inputs = _action(config)
 
     for expected in range(3):
         node_inputs = host_submodule.prepare_inputs(
@@ -635,42 +583,6 @@ def test_declare_step_names_a_clock_for_every_request_in_the_batch(host_submodul
     assert step.get(KV_RESOURCE).frames == (("a", 0), ("b", 2), ("c", 4))
     for rid in ("a", "b", "c"):
         host_submodule.cleanup_request(rid)
-
-
-# ---------------------------------------------------------------------------
-# Stop condition
-# ---------------------------------------------------------------------------
-
-
-def test_check_stop_fires_at_exactly_num_steps(submodule):
-    """N frames means firing while iteration N-1 is postprocessed: the loop
-    counter still reads N-1 there and the stop ends that iteration. One early
-    truncates the video; one late commits an extra frame into the ring."""
-    num_steps = 6
-    fired = [
-        bool(
-            submodule.check_stop(
-                "r0", _fwd_info(num_steps=num_steps, loop_iter=k), {}
-            )
-        )
-        for k in range(num_steps + 2)
-    ]
-    assert fired == [False] * (num_steps - 1) + [True, True, True]
-    assert submodule.check_stop(
-        "r0", _fwd_info(num_steps=num_steps, loop_iter=num_steps - 1), {}
-    ) == {ROLLOUT_LOOP_NAME}
-
-
-def test_check_stop_never_signals_rollout_loop_during_prime(submodule):
-    assert submodule.check_stop(
-        "r0",
-        _fwd_info(
-            graph_walk=PRIME_WALK,
-            num_steps=1,
-            loop_iter=0,
-        ),
-        {},
-    ) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1146,20 +1058,19 @@ def _engine_inputs(
 
 def _decode(
     decoder, *, request_id="r0", graph_walk=ROLLOUT_WALK,
-    seed_latent: torch.Tensor | None = None, num_steps: int = 8,
+    seed_latent: torch.Tensor | None = None,
 ):
     """Drive the fused submodule through one real
     ``prepare_inputs``/``forward``/``postprocess`` cycle -- the same sequence
     the engine runs -- rather than poking ``taehv`` directly, since several
     tests below check that this cycle threads the nine histories correctly.
     """
-    info = _fwd_info(request_id, graph_walk=graph_walk, num_steps=num_steps)
+    info = _fwd_info(request_id, graph_walk=graph_walk)
     if graph_walk == PRIME_WALK:
         inputs = {"latent": [seed_latent]}
     else:
-        inputs = _controller_stream(decoder.config, frames=num_steps)
+        inputs = _action(decoder.config)
     prepared = decoder.prepare_inputs(graph_walk, info, inputs)
-    assert prepared is not None, "must not be vetoed inside num_steps"
     outputs = decoder.forward(
         graph_walk,
         _engine_inputs(request_id, graph_walk),
@@ -1358,13 +1269,13 @@ def test_prime_and_rollout_use_the_same_fixed_tensor_histories(decoder, ae_confi
     latent = torch.full(
         (1, 1, ae_config.channels, *ae_config.latent_shape[1:]), 0.125, dtype=torch.bfloat16,
     )
-    _decode(decoder, graph_walk=PRIME_WALK, seed_latent=latent, num_steps=1)
+    _decode(decoder, graph_walk=PRIME_WALK, seed_latent=latent)
     state = decoder.request_state("r0")
     keys = [f"decoder_history_{idx}" for idx in range(9)]
     assert set(state.tensors) == set(keys)
     addresses = [state[key].data_ptr() for key in keys]
 
-    _decode(decoder, graph_walk=ROLLOUT_WALK, num_steps=8)
+    _decode(decoder, graph_walk=ROLLOUT_WALK)
     assert [state[key].data_ptr() for key in keys] == addresses
     assert all(state[key].dtype == torch.bfloat16 for key in keys)
     decoder.cleanup_request("r0")
@@ -1374,17 +1285,16 @@ def test_fused_decode_histories_are_isolated_interleaved_and_cleaned_up(decoder,
     latent = torch.full(
         (1, 1, ae_config.channels, *ae_config.latent_shape[1:]), 0.125, dtype=torch.bfloat16,
     )
-    first = _decode(decoder, request_id="a", graph_walk=PRIME_WALK, seed_latent=latent, num_steps=1)
-    second = _decode(decoder, request_id="b", graph_walk=PRIME_WALK, seed_latent=latent, num_steps=1)
+    first = _decode(decoder, request_id="a", graph_walk=PRIME_WALK, seed_latent=latent)
+    second = _decode(decoder, request_id="b", graph_walk=PRIME_WALK, seed_latent=latent)
     assert torch.equal(first["video_output"][0], second["video_output"][0])
     before_b = {
         key: value.clone() for key, value in decoder.request_state("b").tensors.items()
     }
-    # A generous num_steps: what's under test is address/isolation stability
-    # across interleaved requests, not the overshoot veto (covered above).
+    # what's under test is address/isolation stability across interleaved requests
     for _ in range(20):
-        _decode(decoder, request_id="a", graph_walk=ROLLOUT_WALK, num_steps=100)
-        _decode(decoder, request_id="b", graph_walk=ROLLOUT_WALK, num_steps=100)
+        _decode(decoder, request_id="a", graph_walk=ROLLOUT_WALK)
+        _decode(decoder, request_id="b", graph_walk=ROLLOUT_WALK)
     assert all(
         not torch.equal(before_b[key], value)
         for key, value in decoder.request_state("b").tensors.items()
@@ -1397,7 +1307,7 @@ def test_fused_decode_histories_are_isolated_interleaved_and_cleaned_up(decoder,
 
     decoder.cleanup_request("a")
     assert "a" not in decoder.request_states
-    restarted = _decode(decoder, request_id="a", graph_walk=PRIME_WALK, seed_latent=latent, num_steps=1)
+    restarted = _decode(decoder, request_id="a", graph_walk=PRIME_WALK, seed_latent=latent)
     assert torch.equal(restarted["video_output"][0], first["video_output"][0])
     decoder.cleanup_request("a")
     decoder.cleanup_request("b")
@@ -1412,7 +1322,7 @@ def test_the_encoder_and_the_fused_decode_share_only_weights(
         PRIME_WALK, _fwd_info(), {"image_inputs": [_seed_clip(ae_config)]}
     ).tensor_inputs["image"]
     latent = encoder.forward(PRIME_WALK, _engine_inputs(), image)["latent"][0]
-    _decode(decoder, graph_walk=PRIME_WALK, seed_latent=latent, num_steps=1)
+    _decode(decoder, graph_walk=PRIME_WALK, seed_latent=latent)
     assert encoder.taehv is decoder.taehv is taehv_weights
     assert encoder.request_states == {}
     assert len(decoder.request_state("r0").tensors) == 9
@@ -1478,66 +1388,55 @@ def test_the_shell_builds_without_the_taehv_package(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_process_prompt_materializes_the_whole_action_stream(model, config):
-    """The rollout is scripted, so the stream is built once at
-    request time and sliced per frame. Validated here rather than in
-    ``prepare_inputs`` because this runs at the API boundary, where a
-    ValueError becomes a 400 instead of killing a rollout mid-flight."""
+def test_process_prompt_sends_the_actions_as_the_stream_s_first_chunk(model, config):
+    """One row per action, ``[mouse | buttons one-hot | scroll]``, the DiT
+    splits by column. Validated here rather than in ``prepare_inputs`` because
+    this runs at the API boundary, where a ValueError becomes a 400 instead of
+    killing a rollout mid-flight."""
     actions = [
         {"mouse": (1.0, -2.0), "buttons": [3, 5], "scroll": 0.5},
         {"buttons": [3]},
     ]
     seed = torch.zeros((720, 1280, 3), dtype=torch.uint8)
     out = model.process_prompt(
-        None, ["image"], ["video_frame"],
-        tensors={"image_inputs": [seed]}, num_steps=2, actions=actions,
+        None, ["image"], ["video_frame"], tensors={"image_inputs": [seed]}, actions=actions,
     )
-    assert set(out) == {"image_inputs", "mouse", "button", "scroll"}
-    mouse, button, scroll = out["mouse"][0], out["button"][0], out["scroll"][0]
-    assert mouse.shape == (1, 2, 2)
-    assert button.shape == (1, 2, config.n_buttons)
-    assert scroll.shape == (1, 2, 1)
-    assert mouse[0, 0].tolist() == [1.0, -2.0]
-    assert button[0, 0].nonzero().flatten().tolist() == [3, 5]
-    assert button[0, 1].nonzero().flatten().tolist() == [3]
+    assert set(out) == {"image_inputs", ACTIONS_STREAM}
+    first, second = out[ACTIONS_STREAM]
+    assert first.shape == second.shape == (2 + config.n_buttons + 1,)
+    assert first[:2].tolist() == [1.0, -2.0] and float(first[-1]) == 0.5
+    assert first[2:-1].nonzero().flatten().tolist() == [3, 5]
+    assert second[2:-1].nonzero().flatten().tolist() == [3]
     with pytest.raises(ValueError, match="out of range"):
         model.process_prompt(
             None, ["image"], ["video_frame"],
-            tensors={"image_inputs": [seed]}, num_steps=1,
-            actions=[{"buttons": [config.n_buttons]}],
-        )
-    with pytest.raises(ValueError, match="exactly one action"):
-        model.process_prompt(
-            None, ["image"], ["video_frame"],
-            tensors={"image_inputs": [seed]}, num_steps=1, actions=actions,
+            tensors={"image_inputs": [seed]}, actions=[{"buttons": [config.n_buttons]}],
         )
 
 
-@pytest.mark.parametrize("num_steps", [None, 0, -1, True, 1.5, "1"])
-def test_process_prompt_rejects_non_positive_integer_steps(model, num_steps):
+@pytest.mark.parametrize("count", ["none", 0, "past the horizon"])
+def test_process_prompt_takes_one_to_max_frames_actions(model, config, count):
+    actions = {"none": None, 0: [], "past the horizon": [{}] * (config.max_frames + 1)}[count]
     seed = torch.zeros((720, 1280, 3), dtype=torch.uint8)
-    with pytest.raises(ValueError, match="num_steps > 0"):
+    with pytest.raises(ValueError, match=f"1 to {config.max_frames} actions"):
         model.process_prompt(
-            None,
-            ["image"],
-            ["video_frame"],
-            tensors={"image_inputs": [seed]},
-            num_steps=num_steps,
-            actions=[],
+            None, ["image"], ["video_frame"], tensors={"image_inputs": [seed]}, actions=actions,
         )
 
 
-def test_process_prompt_rejects_steps_past_the_checkpoint_horizon(model, config):
-    seed = torch.zeros((720, 1280, 3), dtype=torch.uint8)
-    with pytest.raises(ValueError, match="exceeds the checkpoint horizon"):
-        model.process_prompt(
-            None,
-            ["image"],
-            ["video_frame"],
-            tensors={"image_inputs": [seed]},
-            num_steps=config.max_frames + 1,
-            actions=[],
-        )
+def test_a_live_append_carries_its_actions_in_model_kwargs(model, config):
+    def chunk(**fields):
+        return ClientChunk(**{
+            "text": None, "tensors": {}, "input_metadata": {}, "streams": {},
+            "model_kwargs": {}, "request_kwargs": {}, **fields,
+        })
+
+    (row,) = model.process_stream_chunk(chunk(model_kwargs={"actions": [{"scroll": 2.0}]}))[ACTIONS_STREAM]
+    assert row.shape == (2 + config.n_buttons + 1,) and float(row[-1]) == 2.0
+    with pytest.raises(ValueError, match="model_kwargs actions only"):
+        model.process_stream_chunk(chunk(text="left"))
+    with pytest.raises(ValueError, match="model_kwargs.actions"):
+        model.process_stream_chunk(chunk(model_kwargs={"actions": {"scroll": 1}}))
 
 
 @pytest.mark.parametrize(
@@ -1565,7 +1464,6 @@ def test_process_prompt_rejects_invalid_action_values(model, action, message):
             ["image"],
             ["video_frame"],
             tensors={"image_inputs": [seed]},
-            num_steps=1,
             actions=[action],
         )
 
@@ -1585,7 +1483,6 @@ def test_the_seed_clip_is_one_latent_frame_of_uint8_rgb(model, config):
             ["image"],
             ["video_frame"],
             tensors={"image_inputs": [image]},
-            num_steps=2,
             actions=[{}, {}],
         )
 
@@ -1607,8 +1504,7 @@ def test_the_seed_clip_is_one_latent_frame_of_uint8_rgb(model, config):
 
     with pytest.raises(ValueError, match="requires one RGB seed"):
         model.process_prompt(
-            None, ["tensor"], ["video_frame"], tensors=None,
-            num_steps=2, actions=[{}, {}],
+            None, ["tensor"], ["video_frame"], tensors=None, actions=[{}, {}],
         )
 
 
@@ -1620,40 +1516,27 @@ def _pointer_info(dims: list[int]) -> TensorPointerInfo:
 
 
 def test_the_required_prime_walk_addresses_the_seed_to_the_encoder(model):
-    """The seed clip is addressed to the vae_encoder. The
-    controller streams stay addressed to the dit on both walks: they are read
-    once per frame for the whole rollout, and the encoder never sees them."""
-    signals = {name: [object()] for name in ("mouse", "button", "scroll")}
-
+    """The seed clip is addressed to the vae_encoder; the actions arrive on
+    the client stream, not as a walk input."""
     seeded = model.get_initial_forward_pass_args(
-        "p", ["image"], ["video_frame"],
-        {**signals, "image_inputs": [_pointer_info([720, 1280, 3])]}, {"num_steps": 2},
+        "p", ["image"], ["video_frame"], {"image_inputs": [_pointer_info([720, 1280, 3])]}, {},
     )
 
     assert seeded.full_metadata.kwargs["walk_schedule"] == [PRIME_WALK, ROLLOUT_WALK]
     assert seeded.full_metadata.graph_walk == PRIME_WALK
     assert seeded.full_metadata.is_prefill is True
-    assert [(e.name, e.next_node) for e in seeded.inputs] == [
-        ("image_inputs", VAE_ENCODER_NODE),
-        ("mouse", DIT_NODE), ("button", DIT_NODE), ("scroll", DIT_NODE),
-    ]
+    assert [(e.name, e.next_node) for e in seeded.inputs] == [("image_inputs", VAE_ENCODER_NODE)]
 
     with pytest.raises(ValueError, match="required seed clip"):
-        model.get_initial_forward_pass_args(
-            "p", ["tensor"], ["video_frame"], signals, {"num_steps": 2},
-        )
-    # Nothing is unpersisted: the streams are re-read every frame, and the seed
-    # clip goes with the request.
+        model.get_initial_forward_pass_args("p", ["tensor"], ["video_frame"], {}, {})
+    # the seed clip goes with the request
     assert seeded.unpersist_tensors == []
 
 
 def test_get_initial_forward_pass_args_reads_the_seed_hw_off_the_signal_dims(model):
-    signals = {name: [object()] for name in ("mouse", "button", "scroll")}
-
     for dims in ([720, 1280, 3], [4, 720, 1280, 3]):
         fwd_args = model.get_initial_forward_pass_args(
-            "p", ["image"], ["video_frame"],
-            {**signals, "image_inputs": [_pointer_info(dims)]}, {"num_steps": 2},
+            "p", ["image"], ["video_frame"], {"image_inputs": [_pointer_info(dims)]}, {},
         )
         assert fwd_args.step_metadata["seed_hw"] == (720, 1280)
 

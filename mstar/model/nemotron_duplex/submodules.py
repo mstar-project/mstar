@@ -224,31 +224,31 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         is_final_stream_chunk: bool = False,
         **kwargs,
-    ) -> ARNodeInputs:
+    ) -> ARNodeInputs | None:
         """Host-side bookkeeping only; the embedding lookups and AddFusion run in
         ``preprocess`` on the GPU thread."""
         cfg = self.config
         if "audio_frame" in inputs:
+            frames = inputs.get("audio_frame") or []
+            if not frames:
+                # the terminal stream chunk is empty when the stream's last frame
+                # was taken before its end reached this worker; declined, it
+                # still ends the loop
+                assert is_final_stream_chunk, "an empty chunk before the end of the stream"
+                return None
             tensors = {
                 "prev_text": self._tok(inputs, "prev_text", cfg.text_bos_id),
                 "prev_func": self._tok(inputs, "prev_func", cfg.text_pad_id),
+                "audio_frame": frames[0].reshape(1, -1),
             }
-            # The terminal stream chunk is empty when the stream's last frame
-            # was taken before its end reached this worker: run a no-audio step,
-            # which ends the loop (postprocess drops what it samples).
-            frames = inputs.get("audio_frame") or []
-            if frames:
-                tensors["audio_frame"] = frames[0].reshape(1, -1)
-            ends_loop = bool(is_final_stream_chunk) and not frames
             # The system prompt rides the loop as ``text_inputs``: real ids on
             # the session's first step, the NO_PROMPT sentinel afterwards.
             prompt = self._prompt_ids(inputs)
             if prompt is not None:
                 tensors["prompt_ids"] = prompt
                 return ARNodeInputs(input_seq_len=int(prompt.numel()) + 1, tensor_inputs=tensors,
-                                    kwargs={"mode": _MODE_PROMPT_FRAME, "ends_loop": ends_loop})
-            return ARNodeInputs(input_seq_len=1, tensor_inputs=tensors,
-                                kwargs={"mode": _MODE_FRAME, "ends_loop": ends_loop})
+                                    kwargs={"mode": _MODE_PROMPT_FRAME})
+            return ARNodeInputs(input_seq_len=1, tensor_inputs=tensors, kwargs={"mode": _MODE_FRAME})
         if "combined_embeds" in inputs:
             emb = inputs["combined_embeds"][0]
             return ARNodeInputs(input_embeds=emb, input_seq_len=emb.shape[0], kwargs={"mode": _MODE_EMBEDS})
@@ -272,8 +272,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             return fused
         t = inp.tensor_inputs
         fused = self.embeddings(t["prev_text"].to(device)) * cfg.agent_text_weight
-        if "audio_frame" in t:
-            fused = fused + t["audio_frame"].to(device=device, dtype=fused.dtype) * cfg.user_audio_weight
+        fused = fused + t["audio_frame"].to(device=device, dtype=fused.dtype) * cfg.user_audio_weight
         if cfg.use_function_head:
             fused = fused + self.embeddings(t["prev_func"].to(device)) * cfg.function_weight
         if mode == _MODE_PROMPT_FRAME:
@@ -317,15 +316,9 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         # the host, later ones are the fed-back GPU token), so move each first
         prev_text = torch.cat([t["prev_text"].reshape(-1).to(device) for t in tensors])          # [N]
         fused = self.embeddings(prev_text) * cfg.agent_text_weight                                # [N, H]
-        frames = [t.get("audio_frame") for t in tensors]
-        present = [f for f in frames if f is not None]
-        if present:
-            # a row past the end of its audio (the stream closed, the loop
-            # still runs on the fed-back text) has no frame: its audio term is 0
-            zero = torch.zeros(1, fused.shape[1], device=device, dtype=fused.dtype)
-            audio = torch.cat([zero if f is None else f.reshape(1, -1).to(device=device, dtype=fused.dtype)
-                               for f in frames])                                                  # [N, H]
-            fused = fused + audio * cfg.user_audio_weight
+        audio = torch.cat([t["audio_frame"].reshape(1, -1).to(device=device, dtype=fused.dtype)
+                           for t in tensors])                                                     # [N, H]
+        fused = fused + audio * cfg.user_audio_weight
         if cfg.use_function_head:
             prev_func = torch.cat([t["prev_func"].reshape(-1).to(device) for t in tensors])
             fused = fused + self.embeddings(prev_func) * cfg.function_weight
@@ -403,12 +396,6 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         # frame's AddFusion (the decode loop's prev_text / prev_func edges).
         # The prompt, if any, went with this step. Later steps use the capture.
         self.request_state(request_id).add(self.PROMPT_DONE_KEY, True)
-        inputs = kwargs.get("inputs")
-        if inputs is not None and inputs.kwargs.get("ends_loop"):
-            # the empty terminal chunk's step only ends the loop: one token per
-            # frame, as offline, so nothing it sampled leaves the node
-            outputs.clear()
-            return
         if "new_token" in outputs:
             outputs["prev_text"] = outputs["new_token"]
         if "new_func" in outputs:
@@ -535,8 +522,8 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         else:
             # The token stream ends on an empty chunk when its last token was
             # taken before its end reached this worker (or the clip yielded no
-            # token). Run a PAD frame, since a skipped rid in a stream-ended loop
-            # breaks the stop; it only ends the loop, so postprocess drops it.
+            # token). Run a PAD frame rather than declining: its step flushes
+            # the call's ``audio_end`` (see postprocess).
             dev = self.talker.embed_code.weight.device
             tok = torch.tensor([self.config.text_pad_id], dtype=torch.long, device=dev)
         first = self._is_first_step(fwd_info.rid_handle)

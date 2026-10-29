@@ -1020,7 +1020,8 @@ def test_an_inline_emit_is_not_staged_for_the_client():
     assert rt.pop_rids("dec", WALK, [rid]) is not None
 
 
-def test_inline_values_must_cover_every_rid_or_are_ignored():
+@pytest.mark.parametrize("inline_values", [[], [None]])
+def test_a_row_with_no_inline_value_takes_the_tensor_path(inline_values):
     rt = _client_loop_runtime()
     rid = _admit(rt)
     _reach_dec(rt, rid, 200)
@@ -1030,10 +1031,31 @@ def test_inline_values_must_cover_every_rid_or_are_ignored():
     out = rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=WALK, node_name="dec",
         output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
-        tensors=[201], num_tensors=[1], inline_signal="token", inline_values=[],
+        tensors=[201], num_tensors=[1], inline_signal="token", inline_values=inline_values,
     ))
-    assert 201 in out.register_uuids, "no values, so the tensor path"
+    assert 201 in out.register_uuids, "no value, so the tensor path"
     rt.send_outputs(_send_input(rid, out.completion_id))
+
+
+def test_inline_values_route_per_row():
+    """A row with a value rides inline while a row with None takes the tensor
+    path in the same step, rather than the step taking one path for all."""
+    rt = _client_loop_runtime()
+    rids = [_admit(rt, "r1"), _admit(rt, "r2")]
+    rt._communicator = _Recorder()
+    for rid, uuid in zip(rids, (210, 211), strict=True):
+        _reach_dec(rt, rid, uuid)
+    bk = rt._bookkeeping_for_test
+    for uuid in (212, 213):
+        bk.put_tensor(uuid, _tensor_info(uuid))
+        bk.increment_ref(uuid, 1)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"], wg_ids=ParallelList(rids, [WG_ID, WG_ID]),
+        tensors=[212, 213], num_tensors=[1, 1], inline_signal="token", inline_values=[7, None],
+    ))
+    assert 212 not in out.register_uuids, "r1's value rides inline"
+    assert 213 in out.register_uuids, "r2 has none, so the tensor path"
 
 
 def test_a_loop_back_routed_with_no_tensor_keeps_the_loop_going():

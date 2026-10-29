@@ -263,7 +263,6 @@ def _measure_stream(
         input_modalities=("image",),
         output_modalities=("video_frame",),
         request_id=request_id,
-        num_steps=num_steps,
         actions=rollout._actions(num_steps),
         seed=rng_seed,
     )

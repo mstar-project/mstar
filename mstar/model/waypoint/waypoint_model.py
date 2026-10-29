@@ -15,7 +15,8 @@ Graph walks (2):
     rollout - Loop("rollout_loop") over a single dit.generate_frame(+decode)
               node with a self loop-back ("clock") and
               ``enable_async_scheduling=True``; one latent frame decoded and
-              emitted per iteration.
+              emitted per iteration, for each row of the client's ``actions``
+              stream. The loop ends with the stream.
 
 Prime also decodes (not just encodes): the functional decoder's first call
 spends ``frames_to_trim`` of temporal memory priming itself, so an
@@ -38,6 +39,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
+    DEFAULT_PARTITION,
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
@@ -59,7 +61,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ClientChunk, ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.media_limits import read_image
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.config import (
@@ -72,6 +74,7 @@ from mstar.model.waypoint.config import (
 )
 from mstar.model.waypoint.ring_geometry import describe_ring_memory
 from mstar.model.waypoint.submodules import (
+    ACTIONS_STREAM,
     ATTN_RESOURCE,
     KV_RESOURCE,
     PRIME_WALK,
@@ -80,16 +83,13 @@ from mstar.model.waypoint.submodules import (
     WaypointDitSubmodule,
     WaypointVaeEncoderSubmodule,
 )
+from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.topology import CLIENT, ClientStreamLimits, Connection, PartitionTopology
 
 logger = logging.getLogger(__name__)
 
 DIT_NODE = "dit"
 VAE_ENCODER_NODE = "vae_encoder"
-
-# The scripted action stream, one row per frame. Named once since walk
-# declarations, arg validation and the edge builder must all agree with
-# WaypointDitSubmodule._controller_slice on these names.
-_CONTROLLER_STREAMS = ("mouse", "button", "scroll")
 
 _VARIANT_FACTORIES = {
     WAYPOINT_VARIANT_720P: waypoint_1_5_1b_720p,
@@ -102,10 +102,9 @@ class WaypointModel(Model):
 
     PRIME_WALK = PRIME_WALK
     ROLLOUT_WALK = ROLLOUT_WALK
+    # the opening's actions are the stream's first chunk; nothing past the data worker reads them
+    PREPROCESS_ONLY_KWARGS = ("actions",)
 
-    # Referenced by ``WaypointDitSubmodule.check_stop`` via
-    # ``request_info.dynamic_loop_iter_counts[...]``.
-    ROLLOUT_LOOP_NAME = ROLLOUT_LOOP_NAME
 
     def __init__(
         self,
@@ -243,39 +242,48 @@ class WaypointModel(Model):
             ),
             GraphNode(
                 name=DIT_NODE,
-                input_names={"latent", *_CONTROLLER_STREAMS},
+                input_names={"latent"},
                 outputs=[],
             ),
         ])
 
-        # rollout: one frame decoded and emitted per iteration, from a single
-        # node. The "clock" self loop-back carries no data (frame_pos and
-        # rollout_step live in host state); it only makes the dit a same-node
-        # speculation target (GraphNode.is_ready_for_speculation). Under
-        # enable_async_scheduling=True the worker can build iteration N+1
-        # before check_stop(N) registers the loop's finish signal; that
-        # overshoot is vetoed host-side in
-        # WaypointDitSubmodule.prepare_inputs before it can commit into the
-        # ring, which has no undo.
+        # rollout: one frame decoded and emitted per action row, from a single
+        # node. The "clock" self loop-back carries no data (frame_pos lives in
+        # host state); it only makes the dit a same-node speculation target
+        # (GraphNode.is_ready_for_speculation). The loop ends with the actions
+        # stream: on its last row, or on the empty chunk the dit declines when
+        # the stream's end arrives after its last row. A speculative step past
+        # the end finds no row, so nothing overshoots into the ring.
         rollout = Loop(
             name=ROLLOUT_LOOP_NAME,
             section=GraphNode(
                 name=DIT_NODE,
-                input_names=set(_CONTROLLER_STREAMS) | {"clock"},
+                input_names={ACTIONS_STREAM, "clock"},
+                consumes_stream=True,
                 outputs=[
                     GraphEdge(next_node=DIT_NODE, name="clock"),
                     self._emit_frames(),
                 ],
                 enable_async_scheduling=True,
             ),
-            # Ceiling only; num_steps stops the loop early via
-            # WaypointDitSubmodule.check_stop.
+            # the stream's own cap (max_items) is the same horizon
             max_iters=self.config.max_frames,
             outputs=[],
             accumulated_outputs=[],
         )
 
         return {PRIME_WALK: prime, ROLLOUT_WALK: rollout}
+
+    def get_partition_topology(self) -> PartitionTopology:
+        """The client's actions, one row per rollout frame. A one-shot request
+        sends them all with its opening; a live call appends them as it plays."""
+        return PartitionTopology(partitions=[DEFAULT_PARTITION], connections=[
+            Connection(
+                from_partition=CLIENT, to_partition=DEFAULT_PARTITION, edge_name=ACTIONS_STREAM,
+                chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                limits=ClientStreamLimits(max_items=self.config.max_frames, unit="actions"),
+            ),
+        ])
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse to serve unless the deployment caps concurrency at the number
@@ -347,16 +355,16 @@ class WaypointModel(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Materialize the request's scripted controller stream (and its seed
-        clip, if any) as the edges the walk's first nodes consume.
+        """The request's seed clip, and its actions as the first chunk of the
+        ``actions`` stream.
 
         ``prompt`` is ignored: this checkpoint has ``prompt_conditioning=None``
         and carries no cross-attention.
 
-        ``actions`` is a list of per-step dicts, one per generated latent:
-        ``{"mouse": [dx, dy], "buttons": [id, ...], "scroll": s}``; buttons are
-        one-hot scattered into ``n_buttons`` columns and an omitted field is
-        that control's neutral value. Prime never consumes action zero.
+        ``actions`` is a list of 1 to ``max_frames`` per-frame dicts, one per
+        generated latent: ``{"mouse": [dx, dy], "buttons": [id, ...], "scroll":
+        s}``. A one-shot request generates one frame per action; a live call
+        appends more (``process_stream_chunk``) until it ends its input.
         """
         del prompt, input_modalities
         if output_modalities != ["video_frame"]:
@@ -365,39 +373,56 @@ class WaypointModel(Model):
                 f"got {output_modalities!r}. Raw RGB frames are served only by "
                 "the native streaming endpoint, not as encoded video."
             )
-        num_steps = self._resolve_num_steps(kwargs)
         actions = kwargs.get("actions")
-        if not isinstance(actions, list) or len(actions) != num_steps:
+        if not isinstance(actions, list) or not 1 <= len(actions) <= self.config.max_frames:
             actual = len(actions) if isinstance(actions, list) else 0
             raise ValueError(
-                "Waypoint requires exactly one action object per generated latent "
-                f"step; got {actual} actions for "
-                f"num_steps={num_steps}."
+                f"Waypoint requires 1 to {self.config.max_frames} actions, one per "
+                f"generated latent frame; got {actual}."
             )
+        out: NameToTensorList = {ACTIONS_STREAM: self._action_rows(actions)}
 
-        mouse = torch.zeros((1, num_steps, 2), dtype=torch.float32)
-        button = torch.zeros((1, num_steps, self.config.n_buttons), dtype=torch.float32)
-        scroll = torch.zeros((1, num_steps, 1), dtype=torch.float32)
+        if not tensors or not tensors.get("image_inputs"):
+            raise ValueError("Waypoint requires one RGB seed image or four-frame seed clip.")
+        out["image_inputs"] = [self._seed_clip(tensors["image_inputs"][0])]
+        return out
+
+    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
+        """A live call's next actions, from the append's ``model_kwargs``."""
+        if chunk.text or chunk.tensors:
+            raise ValueError("Waypoint takes appends of model_kwargs actions only")
+        actions = chunk.model_kwargs.get("actions")
+        if not isinstance(actions, list):
+            raise ValueError("a Waypoint append carries model_kwargs.actions, a list of action objects")
+        return {ACTIONS_STREAM: self._action_rows(actions, "append action")}
+
+    def _action_rows(self, actions: list, label: str = "action") -> list[torch.Tensor]:
+        """Validate ``actions`` and lay each out as one stream item, float32
+        ``[mouse dx, dy | n_buttons one-hot | scroll]``; an omitted field is
+        that control's neutral value. ``label`` names an action in an error."""
+        n_buttons = self.config.n_buttons
+        rows = torch.zeros((len(actions), 2 + n_buttons + 1), dtype=torch.float32)
+        mouse, button, scroll = rows[:, :2], rows[:, 2:2 + n_buttons], rows[:, 2 + n_buttons]
         float32_max = torch.finfo(torch.float32).max
         for step, action in enumerate(actions):
             if not isinstance(action, dict):
-                raise ValueError(f"action {step} must be an object; got {type(action).__name__}")
+                raise ValueError(f"{label} {step} must be an object; got {type(action).__name__}")
             unknown = set(action) - {"mouse", "buttons", "scroll"}
             if unknown:
-                raise ValueError(f"action {step} has unknown field(s) {sorted(unknown)}")
+                raise ValueError(f"{label} {step} has unknown field(s) {sorted(unknown)}")
             motion = action.get("mouse", (0.0, 0.0))
             if not isinstance(motion, (list, tuple)) or len(motion) != 2:
-                raise ValueError(f"action {step} mouse must contain exactly [dx, dy]")
+                raise ValueError(f"{label} {step} mouse must contain exactly [dx, dy]")
             if any(
                 isinstance(value, bool) or not isinstance(value, (int, float))
                 for value in motion
             ):
-                raise ValueError(f"action {step} mouse values must be numbers")
+                raise ValueError(f"{label} {step} mouse values must be numbers")
             try:
                 dx, dy = map(float, motion)
             except OverflowError:
                 raise ValueError(
-                    f"action {step} mouse values must be finite and representable "
+                    f"{label} {step} mouse values must be finite and representable "
                     "as float32"
                 ) from None
             if (
@@ -407,48 +432,42 @@ class WaypointModel(Model):
                 or abs(dy) > float32_max
             ):
                 raise ValueError(
-                    f"action {step} mouse values must be finite and representable "
+                    f"{label} {step} mouse values must be finite and representable "
                     "as float32"
                 )
-            mouse[0, step, 0] = dx
-            mouse[0, step, 1] = dy
+            mouse[step, 0] = dx
+            mouse[step, 1] = dy
             pressed_ids = action.get("buttons", ())
             if not isinstance(pressed_ids, (list, tuple)):
-                raise ValueError(f"action {step} buttons must be a list of ids")
+                raise ValueError(f"{label} {step} buttons must be a list of ids")
             seen: set[int] = set()
             for pressed in pressed_ids:
                 if isinstance(pressed, bool) or not isinstance(pressed, int):
-                    raise ValueError(f"action {step} button ids must be integers")
+                    raise ValueError(f"{label} {step} button ids must be integers")
                 if not 0 <= pressed < self.config.n_buttons:
                     raise ValueError(
                         f"button id {pressed} out of range for n_buttons="
-                        f"{self.config.n_buttons} (action {step})."
+                        f"{self.config.n_buttons} ({label} {step})."
                     )
                 if pressed in seen:
-                    raise ValueError(f"action {step} repeats button id {pressed}")
+                    raise ValueError(f"{label} {step} repeats button id {pressed}")
                 seen.add(pressed)
-                button[0, step, pressed] = 1.0
+                button[step, pressed] = 1.0
             raw_scroll = action.get("scroll", 0.0)
             if isinstance(raw_scroll, bool) or not isinstance(raw_scroll, (int, float)):
-                raise ValueError(f"action {step} scroll must be a number")
+                raise ValueError(f"{label} {step} scroll must be a number")
             try:
                 scroll_value = float(raw_scroll)
             except OverflowError:
                 raise ValueError(
-                    f"action {step} scroll must be finite and representable as float32"
+                    f"{label} {step} scroll must be finite and representable as float32"
                 ) from None
             if not math.isfinite(scroll_value) or abs(scroll_value) > float32_max:
                 raise ValueError(
-                    f"action {step} scroll must be finite and representable as float32"
+                    f"{label} {step} scroll must be finite and representable as float32"
                 )
-            scroll[0, step, 0] = scroll_value
-
-        out: NameToTensorList = {"mouse": [mouse], "button": [button], "scroll": [scroll]}
-
-        if not tensors or not tensors.get("image_inputs"):
-            raise ValueError("Waypoint requires one RGB seed image or four-frame seed clip.")
-        out["image_inputs"] = [self._seed_clip(tensors["image_inputs"][0])]
-        return out
+            scroll[step] = scroll_value
+        return list(rows.unbind(0))
 
     def _seed_clip(self, image: torch.Tensor) -> torch.Tensor:
         """The prime walk's ``[temporal_compression, H, W, 3]`` uint8 clip.
@@ -512,28 +531,10 @@ class WaypointModel(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
-    def _resolve_num_steps(self, model_kwargs: dict | None) -> int:
-        """Validate the generated-latent count against the trained horizon."""
-        model_kwargs = model_kwargs or {}
-        requested = model_kwargs.get("num_steps")
-        if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
-            raise ValueError(f"Waypoint requires num_steps > 0; got {requested!r}.")
-        if requested > self.config.max_frames:
-            raise ValueError(
-                f"num_steps={requested} exceeds the checkpoint horizon "
-                f"({self.config.max_frames})."
-            )
-        return requested
-
     def _get_step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        """Per-pass metadata the submodule reads off ``request_info``.
-
-        ``num_steps`` is what ``check_stop`` counts the rollout loop against;
-        nothing else in the shell is per-request.
-        """
+        """Per-pass metadata the submodule reads off ``request_info``."""
         return {
             "is_prefill": metadata.is_prefill,
-            "num_steps": metadata.kwargs["num_steps"],
             "seed_hw": metadata.kwargs.get("seed_hw"),
         }
 
@@ -551,16 +552,6 @@ class WaypointModel(Model):
                 "Waypoint requires exactly one output modality, 'video_frame'; "
                 f"got {output_modalities!r}."
             )
-        # Backstop: process_prompt already rejects a malformed request (400).
-        # A raise here runs at the conductor, whose main loop swallows it, so
-        # the client would hang instead.
-        for name in _CONTROLLER_STREAMS:
-            if not input_signals.get(name):
-                raise ValueError(
-                    f"Waypoint needs the {name!r} controller stream; "
-                    "process_prompt emits all three."
-                )
-
         if not input_signals.get("image_inputs"):
             raise ValueError("Waypoint cannot start without its required seed clip.")
         schedule = [PRIME_WALK, ROLLOUT_WALK]
@@ -572,7 +563,6 @@ class WaypointModel(Model):
         kwargs = {
             "walk_schedule": schedule,
             "walk_step": 0,
-            "num_steps": self._resolve_num_steps(model_kwargs),
             "seed_hw": seed_hw,
         }
         full_metadata = CurrentForwardConductorMetadata(
@@ -586,11 +576,7 @@ class WaypointModel(Model):
         return ForwardPassArgs(
             full_metadata=full_metadata,
             inputs=inputs,
-            # Nothing is released after the first pass: the controller streams
-            # are re-read by every frame of the rollout, and the seed clip is
-            # dropped with the request. Unpersisting either here would strand
-            # the rollout walk with no inputs and the node would never become
-            # ready.
+            # the seed clip is dropped with the request
             unpersist_tensors=[],
             step_metadata=self._get_step_metadata(full_metadata),
         )
@@ -598,24 +584,15 @@ class WaypointModel(Model):
     def _walk_inputs(
         self, walk: str, signals: dict[str, list[TensorPointerInfo]],
     ) -> list[GraphEdge]:
-        """The external edges seeding one walk. Both walks read the controller
-        streams at the dit; only ``prime`` reads the seed clip, and it reads it
-        at the vae_encoder; only ``rollout`` seeds the dit's self loop-back."""
-        inputs = [
-            GraphEdge(next_node=DIT_NODE, name=name, persist=True)
-            for name in _CONTROLLER_STREAMS
-        ]
+        """The external edges seeding one walk: ``prime`` reads the seed clip at
+        the vae_encoder, and ``rollout`` seeds the dit's self loop-back (its
+        actions arrive on the client stream)."""
         if walk == PRIME_WALK:
-            inputs.insert(
-                0,
-                GraphEdge(
-                    next_node=VAE_ENCODER_NODE, name="image_inputs", persist=True
-                ),
-            )
+            inputs = [GraphEdge(next_node=VAE_ENCODER_NODE, name="image_inputs", persist=True)]
         else:
             # Sent empty, like wan22's denoise loop-back edges: the dit
             # submodule never reads its value, only its name (F4 pattern).
-            inputs.append(GraphEdge(next_node=DIT_NODE, name="clock"))
+            inputs = [GraphEdge(next_node=DIT_NODE, name="clock")]
         for edge in inputs:
             edge.tensor_info = signals.get(edge.name, [])
         return inputs
@@ -649,8 +626,6 @@ class WaypointModel(Model):
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
-            # The rollout is the last walk, so its inputs are consumed for the
-            # last time here.
             unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
             step_metadata=self._get_step_metadata(metadata),
         )
