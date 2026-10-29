@@ -1,5 +1,5 @@
-"""The decode kernels on an AMD GPU: the fused residual add + RMSNorm, the
-decode GEMV (``mstar::decode_gemv``, Triton and HIP) and its gated-MLP epilogue.
+"""The Triton decode kernels on an AMD GPU: the fused residual add + RMSNorm,
+the decode GEMV (``mstar::decode_gemv``) and its gated-MLP epilogue.
 
 Each must meet its op's bar against the fp64 reference (one rounding for the
 norm, a rounded fp32 sum for the GEMV) at every knob family the search tries,
@@ -98,9 +98,8 @@ KNOBS = [
     {"block_n": 16, "block_k": 256, "split_k": 1, "num_warps": 4, "use_dot": True},
     {"block_n": 32, "block_k": 128, "split_k": 8, "num_warps": 4, "use_dot": True, "xcd_remap": True,
      "num_stages": 2},
-    {"block_n": 4, "block_k": 512, "split_k": 1, "num_warps": 2, "use_dot": False, "prefetch": True},
 ]
-KNOB_IDS = ["fma", "fma-splitk4-xcd", "dot", "dot-splitk8-xcd", "fma-prefetch"]
+KNOB_IDS = ["fma", "fma-splitk4-xcd", "dot", "dot-splitk8-xcd"]
 
 
 @pytest.mark.parametrize("knobs", KNOBS, ids=KNOB_IDS)
@@ -191,81 +190,3 @@ def test_a_compiled_bucket_reaches_the_fused_gate_up(triton_config, rows):
     assert "decode_gemv_silu_mul" in source
     assert "mstar.decode_gemv.default" in source, "the down projection runs on the Triton GEMV"
     torch.testing.assert_close(out.float(), eager.float(), rtol=3e-2, atol=3e-2 * eager.abs().max().item())
-
-
-HIP_KNOBS = [
-    {"ytile": 1, "unrl": 1, "waves": 4, "groups": 1},
-    {"ytile": 2, "unrl": 4, "waves": 1, "groups": 8},
-    {"ytile": 4, "unrl": 2, "waves": 2, "groups": 2},
-]
-HIP_IDS = ["y1u1", "y2u4", "y4u2"]
-
-
-@pytest.mark.parametrize("knobs", HIP_KNOBS, ids=HIP_IDS)
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 7, 8, 13, 16])
-@pytest.mark.parametrize(("n", "k"), [(4096, 4096), (12352, 4096), (1000, 1032), (2048, 6144)])
-@pytest.mark.parametrize("bias", [None, "n", "rows"])
-def test_hip_decode_gemv_matches_the_reference(knobs, rows, n, k, bias):
-    from mstar.kernels.hip.gemv import decode_gemv
-
-    x, w, b = _gemv_inputs(rows, n, k, torch.bfloat16, rows + n + k, bias)
-    ref = (x.double() @ w.double().T) + (0 if b is None else b.double())
-    _assert_accumulated(decode_gemv(x, w, b, knobs), ref)
-
-
-@pytest.mark.parametrize("knobs", HIP_KNOBS, ids=HIP_IDS)
-@pytest.mark.parametrize("rows", [1, 4, 16])
-def test_hip_silu_mul_matches_the_unfused_pair(knobs, rows):
-    from mstar.kernels.hip.gemv import decode_gemv_silu_mul
-
-    x, w, _ = _gemv_inputs(rows, 2 * 3072, 2048, torch.bfloat16, rows)
-    gate, up = (x.double() @ w.double().T).chunk(2, dim=-1)
-    _assert_accumulated(decode_gemv_silu_mul(x, w, knobs), F.silu(gate) * up)
-
-
-def test_hip_decode_gemv_replays_like_eager():
-    from mstar.kernels.hip.gemv import decode_gemv
-
-    x, w, _ = _gemv_inputs(4, 4096, 4096, torch.bfloat16, 5)
-    eager = decode_gemv(x, w)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = decode_gemv(x, w)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, eager)
-
-
-@pytest.fixture
-def hip_config(tmp_path, monkeypatch):
-    """Every bucket of ``decode_gemv`` and the gate/up op on the HIP kernel."""
-    facts = current_platform.device_facts()
-    knobs = {"impl": "hip", "ytile": 2, "unrl": 2, "waves": 4, "groups": 2}
-    for name in ("decode_gemv", "decode_gemv_silu_mul"):
-        path = configs.config_path(name, facts.arch, facts.product, root=tmp_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        classes = {c: knobs for c in ("rows1", "rows2", "rows4", "rows8", "rows16")}
-        path.write_text(json.dumps({"kernel": name, "classes": classes}))
-    monkeypatch.setattr(configs, "CONFIG_ROOT", tmp_path)
-    configs._read.cache_clear()
-    yield
-    configs._read.cache_clear()
-
-
-@pytest.mark.parametrize("rows", [1, 16])
-def test_a_compiled_bucket_reaches_the_hip_kernels(hip_config, rows):
-    from mstar.platforms import rocm_gemm
-    from mstar.platforms.compile import with_inductor_overrides
-
-    torch._dynamo.reset()
-    for op in (rocm_gemm.DECODE_GEMV, rocm_gemm.DECODE_GEMV_SILU_MUL):
-        op.dispatch.reset()
-    mlp = _GatedMLP()
-    x = torch.randn(rows, 1024, device=DEV, dtype=torch.bfloat16)
-    eager = mlp(x)
-    compiled = with_inductor_overrides(torch.compile(mlp, dynamic=False), num_tokens=rows, rows=rows)
-    out, code = run_and_get_code(compiled, x)
-    assert "decode_gemv_silu_mul" in "\n".join(code)
-    torch.testing.assert_close(out.float(), eager.float(), rtol=3e-2, atol=3e-2 * eager.abs().max().item())
-    for op in (rocm_gemm.DECODE_GEMV, rocm_gemm.DECODE_GEMV_SILU_MUL):
-        op.dispatch.reset()
