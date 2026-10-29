@@ -32,6 +32,8 @@ model_kwargs:
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
+  # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.34x images/s at
+  # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst)
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
 
