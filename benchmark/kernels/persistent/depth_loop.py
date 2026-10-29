@@ -26,6 +26,7 @@ The float64 evaluation interprets the same ``StepProgram`` the kernel runs
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import math
 import statistics
@@ -246,8 +247,9 @@ class ModelLoop:
             emb_sum.add_(embed)
 
 
-def time_graph(fn, replays: int = 30, warmup: int = 3) -> dict[str, Any]:
-    """``fn`` captured once and replayed one replay per sync."""
+def time_graph(fn, replays: int = 30, warmup: int = 3, before=None) -> dict[str, Any]:
+    """``fn`` captured once and replayed one replay per sync; ``before`` (not
+    timed) runs ahead of each timed replay, e.g. to evict the caches."""
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -262,6 +264,8 @@ def time_graph(fn, replays: int = 30, warmup: int = 3) -> dict[str, Any]:
         torch.cuda.synchronize()
     times = []
     for _ in range(replays):
+        if before is not None:
+            before()
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         a.record()
         graph.replay()
@@ -430,6 +434,24 @@ def run(args) -> dict[str, Any]:
                 timings[f"{name}_{mode}"] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
             result["timing"] = timings
             _stage(args, result, f"timing {name}_{mode}")
+    # the served step streams the talker's experts between frames, so the depth loop's weights start outside the
+    # memory-side cache: the same arms after reading 1 GiB before each frame
+    flush_buf = torch.empty(1 << 28, dtype=torch.float32, device=device)
+    cold = {"per_op_sampled_cold": per_op_frame}
+    for groups, scope in ((8, ds.SCOPE_XCD), (4, ds.SCOPE_AGENT)):
+        kc = Kernel(program, w, codebook, bs, groups, scope, ds.default_grid(cus, groups), device, top_k, top_p,
+                    temperature)
+        name = f"kernel_g{groups}_{'xcd' if scope else 'agent'}_grid{kc.grid}_sampled_cold"
+        cold[name] = functools.partial(kc.run, last_hidden, embed0, emb_sum_t, codes_t, seed=7)
+    for name, fn in cold.items():
+        try:
+            t = time_graph(fn, args.replays, before=flush_buf.sum)
+            t.pop("graph")
+            timings[name] = t
+        except Exception as exc:  # noqa: BLE001  recorded
+            timings[name] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        result["timing"] = timings
+        _stage(args, result, f"timing {name}")
     result["timing"] = timings
     base = timings.get("per_op_sampled", {}).get("ms")
     if base:
