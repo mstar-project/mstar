@@ -217,9 +217,12 @@ class _Manager:
 class _Engine:
     def __init__(
         self, max_bs=None, not_ready=frozenset(), unservable=frozenset(),
-        groups=None, row_caps=None,
+        groups=None, row_caps=None, offloaded=frozenset(),
     ):
         self._max_bs = max_bs
+        # rids whose pages are off the device: ready only once a reload runs
+        self.offloaded = set(offloaded)
+        self.reloads = []
         # real walk -> rows of it a mixed step may hold
         self._row_caps = dict(row_caps or {})
         self.not_ready = set(not_ready)
@@ -252,7 +255,7 @@ class _Engine:
         return self.groups.get(rid)
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
-        del allow_reload, node_name, fwd_info
+        del node_name, fwd_info
         self.checked.append(rid)
         if rid in self.unservable:
             return FullAdmitOutcome(
@@ -264,6 +267,10 @@ class _Engine:
             )
         if rid in self.not_ready:
             return FULL_ADMIT_NOT_READY
+        if rid in self.offloaded:
+            if not allow_reload:
+                return FULL_ADMIT_NOT_READY
+            self.reloads.append(rid)
         return FULL_ADMIT_OK
 
 
@@ -644,6 +651,121 @@ def test_room_for_continuing_is_unbounded_without_a_cap():
     sched.backlog[(NODE, WALK)] = _batch(["b0"])
 
     assert sched.room_for_continuing((NODE, WALK)) is None
+
+
+def _room(sched, manager, continuing):
+    sched.runtime = manager.runtime
+    # the chain's rows are in flight, but still this worker's requests
+    manager.per_request_info.update(dict.fromkeys(continuing, object()))
+    return sched.room_for_continuing((NODE, WALK), manager, continuing)
+
+
+def test_a_full_chain_gives_way_to_a_row_on_the_queue():
+    """A row on the queue is as unreachable as a backlogged one once the
+    chain's own rows fill the step; at a cap of one it would wait for the
+    chain's whole loop."""
+    sched = _scheduler(_Engine(max_bs=1))
+
+    assert _room(sched, _Manager(["w0"]), ["c0"]) == 0
+
+
+def test_a_backlog_that_fills_the_step_leaves_no_room_not_less():
+    """The room goes to the runtime as an unsigned count."""
+    engine = _Engine(max_bs=1)
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch(["b0"])
+
+    assert _room(sched, _Manager(["w0", "w1"]), ["c0"]) == 0
+    assert engine.checked == []
+
+
+def test_a_full_chain_gives_way_only_as_far_as_rows_wait():
+    sched = _scheduler(_Engine(max_bs=4))
+
+    assert _room(sched, _Manager(["w0"]), ["c0", "c1", "c2", "c3"]) == 3
+
+
+def test_a_chain_with_room_to_spare_keeps_its_rows():
+    """The merge takes waiting rows into the room the chain leaves, so a
+    chain short of its cap is unchanged (and nothing is scanned for it)."""
+    engine = _Engine(max_bs=4)
+    sched = _scheduler(engine)
+
+    assert _room(sched, _Manager(["w0", "w1"]), ["c0", "c1"]) == 4
+    assert engine.checked == []
+
+
+def test_a_full_chain_keeps_its_rows_with_nothing_waiting():
+    sched = _scheduler(_Engine(max_bs=1))
+
+    assert _room(sched, _Manager([]), ["c0"]) == 1
+
+
+def test_a_chain_holding_every_request_skips_the_scan():
+    engine = _Engine(max_bs=1)
+    sched = _scheduler(engine)
+    manager = _Manager([])
+    manager.runtime.get_ready_nodes = None  # a scan would raise
+
+    assert _room(sched, manager, ["c0"]) == 1
+
+
+def test_a_row_that_cannot_run_yet_does_not_displace_the_chain():
+    sched = _scheduler(_Engine(max_bs=1, not_ready={"w0"}))
+
+    assert _room(sched, _Manager(["w0"]), ["c0"]) == 1
+
+
+def test_an_offloaded_row_does_not_displace_the_chain_or_start_a_reload():
+    """KV pressure is the engine's to resolve; the row comes back the way it
+    would without this rule, once its pages fit."""
+    engine = _Engine(max_bs=1, offloaded={"w0"})
+    sched = _scheduler(engine)
+
+    assert _room(sched, _Manager(["w0"]), ["c0"]) == 1
+    assert engine.reloads == []
+
+
+def test_a_full_chain_yields_to_a_row_of_another_capture_group():
+    """Its merge would never take that row, so only a step the scheduler
+    builds fresh can run it."""
+    sched = _scheduler(_Engine(max_bs=2, groups={"c0": "g", "c1": "g", "w0": "u"}))
+
+    assert _room(sched, _Manager(["w0"]), ["c0", "c1"]) == 0
+
+
+def test_a_capped_step_takes_the_rows_that_waited_longest():
+    """The scan order is the runtime's (handles, on the Rust one), not how
+    long a row has waited; past the cap, the step and its backlog follow the
+    step each row last ran in."""
+    sched = _scheduler(_Engine(max_bs=1))
+    for rid in ["r2", "r0", "r1"]:  # r2 has waited longest
+        sched.note_ran(_batch([rid]))
+
+    batch = _next_batch(sched, _Manager(["r0", "r1", "r2"]))
+
+    assert list(batch.request_to_worker_graph) == ["r2"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r0", "r1"]
+
+
+def test_rows_that_all_fit_keep_the_scan_order():
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.note_ran(_batch(["r1"]))
+
+    batch = _next_batch(sched, _Manager(["r0", "r1", "r2"]))
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r1", "r2"]
+
+
+def test_clear_rid_forgets_when_the_rid_last_ran():
+    """Handles are recycled: the next request given this one must not
+    inherit its place in line."""
+    sched = _scheduler(_Engine(max_bs=1))
+    sched.note_ran(_batch(["r0"]))
+
+    sched.clear_rid("r0", "wire-r0")
+
+    assert "r0" not in sched.last_ran
 
 
 def test_the_reserved_room_is_exactly_what_the_backlog_then_fills():

@@ -3029,20 +3029,27 @@ class Worker:
         new_request_to_worker_graph: dict[int, int] = {}
         per_request_inputs: dict[int, NameToTensorList] = {}
         consumed_streaming_edges: dict[int, list[StreamingEdge]] = {}
-        # Backlogged rids for this target get first claim on the batch: they
-        # have already waited a step, and the chain only ever continues its own
-        # rids, so at the cap they would never be reached. None => uncapped.
         spec_target = (spec_node_name, graph_walk)
         # The merge below takes only this chain's capture group; another
         # group's backlog runs only once the chain yields to it.
         if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid):
             return None
-        max_continuing = self.scheduler.room_for_continuing(spec_target)
-        laps.lap("backlog_check")
-
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that.
         candidates = [r for r in walk_rids if not self._is_tearing_down(r)]
+        # Rows waiting for this target (backlogged, or on its queues when the
+        # chain would fill the step) get first claim: the chain only ever
+        # continues its own rids, so at the cap they would never be reached.
+        # None => uncapped.
+        max_continuing = self.scheduler.room_for_continuing(
+            spec_target, self.request_state, candidates,
+        )
+        if max_continuing is not None and max_continuing < len(candidates):
+            # prep keeps the first `max_continuing`; the rows that have run
+            # longest come first in the step, so they are the ones to give way
+            displaced = len(candidates) - max_continuing
+            candidates = candidates[displaced:] + candidates[:displaced]
+        laps.lap("backlog_check")
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
@@ -5171,6 +5178,7 @@ class Worker:
                             # the plan future resolves and after prepare; see
                             # _execute_on_gpu_thread.
 
+                            self.scheduler.note_ran(spec_batch)
                             # Hold the main thread off the GIL until the GPU
                             # thread reaches the forward launch; see exec.
                             spec_launch_started = threading.Event()
@@ -5303,6 +5311,7 @@ class Worker:
                 broadcast_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
                 fallthrough_tp_seq = broadcast_seq if broadcast_seq >= 0 else batch.tp_seq
 
+                self.scheduler.note_ran(batch)
                 # Unlike the spec submit, this path doesn't hold off the GIL for
                 # the launch — but it still has to be fenceable, or the next
                 # iteration schedules against an admit that hasn't run.

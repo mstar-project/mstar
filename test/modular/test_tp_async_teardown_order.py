@@ -98,6 +98,9 @@ class _Scheduler:
     def take_admit_errors(self):
         return {}
 
+    def note_ran(self, batch):
+        del batch
+
     def clear_batch_limit(self, node_name, graph_walk, rows, walks=()):
         # an admitted step lifts its refusal limit; this stub has none
         del node_name, graph_walk, rows, walks

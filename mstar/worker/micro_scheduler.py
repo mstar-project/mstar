@@ -2,7 +2,7 @@ import functools
 import logging
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple
@@ -278,6 +278,11 @@ class MicroScheduler:
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
 
         self.node_and_walk_to_last_batch_num = {}
+        # rid -> the step it last ran in (`note_ran`). Rows competing for a
+        # capped step go longest-waiting first, so a looping node at its cap
+        # serves its rows in turn.
+        self.last_ran: dict[int, int] = {}
+        self._steps_run = 0
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
         # (node, graph walk) -> most rows a batch may take while its admits are
@@ -362,6 +367,16 @@ class MicroScheduler:
             ready, default=None,
             key=lambda key: self.node_and_walk_to_last_batch_num.get(key, 0),
         )
+
+    def note_ran(self, batch: ScheduledBatch) -> None:
+        """Stamp ``batch``'s rows with this step; every submitted step calls it."""
+        self._steps_run += 1
+        self.last_ran.update(dict.fromkeys(batch.request_to_worker_graph, self._steps_run))
+
+    def _waited_since(self, rid: int) -> int:
+        """Sort key, longest-waiting first: the step ``rid`` last ran in, 0
+        if it never ran here."""
+        return self.last_ran.get(rid, 0)
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -941,6 +956,12 @@ class MicroScheduler:
             if not backlogged:
                 backlogged = None  # every row failed
         walk_caps = self._walk_caps(node_walk)
+        limit = self._scan_limit(node_walk, pre_existing_batch_size)
+        if entries and limit is not None and len(entries) + len(backlogged or ()) > limit:
+            # Not every row fits: the ones that waited longest go first, and the
+            # rest park in that order. The runtime's scan order (handles, which
+            # are recycled) says nothing about how long a row has waited.
+            entries = sorted(entries, key=lambda e: self._waited_since(e.request_id))
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
@@ -1357,9 +1378,63 @@ class MicroScheduler:
                 return True
         return False
 
-    def room_for_continuing(self, target: tuple[str, str]) -> int | None:
-        """How many of a speculative batch's own rids fit in ``target``'s step
-        beside its backlog; see ``BaseBatchBuilder.room_for_continuing``."""
+    def room_for_continuing(
+        self, target: tuple[str, str],
+        request_state: RequestStateManager | None = None,
+        continuing: Sequence[int] = (),
+    ) -> int | None:
+        """How many of a speculation chain's ``continuing`` rids fit in
+        ``target``'s step: what its backlog leaves (see
+        ``BaseBatchBuilder.room_for_continuing``), less the rows waiting on
+        ``target``'s queues when the chain's own rows would fill the step.
+
+        The chain only continues its own rids and its merge only fills the
+        room it leaves, so at the cap a queued row is as unreachable as a
+        backlogged one; at a cap of one the node would run one request to
+        the end of its loop while the rest wait. A waiting row of another
+        capture group makes the chain yield the step, since its merge would
+        never take it.
+        """
+        room = self._room_beside_backlog(target)
+        if not room or request_state is None or len(continuing) < room:
+            return room  # uncapped, already given to the backlog, or short of the cap
+        if len(request_state.per_request_info) <= len(continuing):
+            return room  # the chain holds every request here; nothing can be waiting
+        waiting = self._waiting_rows(request_state, target, continuing, room)
+        if not waiting:
+            return room
+        group = functools.partial(self._capture_group, request_state, *self._key(*target))
+        chain_group = group(continuing[0])
+        if any(group(rid) != chain_group for rid in waiting):
+            return 0
+        return room - len(waiting)
+
+    def _waiting_rows(
+        self, request_state: RequestStateManager, target: tuple[str, str],
+        continuing: Sequence[int], limit: int,
+    ) -> list[int]:
+        """Up to ``limit`` engine-ready rows of ``target``'s own walk on its
+        queues, longest-waiting first. Checked without a reload, so an
+        offloaded row waits for its pages as it would without this."""
+        exclude = self.failed_rids.union(self.pending_removes, self.held_until, continuing)
+        rids = [
+            rid for spec in self._ready_specs(exclude, target, None)
+            if spec.node_name in self.parallel_leader_nodes
+            for rid in spec.rids
+        ]
+        if not rids:
+            return []
+        partition = request_state.get_partition_for_node(target[0])
+        ready = []
+        for rid in sorted(rids, key=self._waited_since):
+            fwd_info = request_state.get_fwd_info(rid, partition)
+            if self._check_ready(target[0], rid, fwd_info, allow_reload=False):
+                ready.append(rid)
+                if len(ready) == limit:
+                    break
+        return ready
+
+    def _room_beside_backlog(self, target: tuple[str, str]) -> int | None:
         key = self._key(*target)
         backlog = self.backlog.get(key)
         cap = self._max_batch_size(*target)
@@ -1515,6 +1590,7 @@ class MicroScheduler:
         self.read_failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
+        self.last_ran.pop(rid, None)
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)
 

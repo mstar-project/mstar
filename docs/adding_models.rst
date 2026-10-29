@@ -1408,7 +1408,9 @@ into one GPU call. A submodule controls this behavior with three methods:
   performs the batched compute. It returns per-request outputs, keyed by ``request_id``.
   When a batch runs, the engine calls this method instead of the single-request
   ``forward``.
-- ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
+- ``max_batch_size(self, graph_walk)`` sets an optional upper limit. When more rows are ready than
+  it allows, they take turns, longest-waiting first: a looping node capped at one row
+  advances its requests a step each in rotation rather than one to the end of its loop.
 
 **Combined walks.** By default a step holds one walk. A model lets several walks of a node
 share a step by returning ``{node: {combined_walk: {walks}}}`` from

@@ -127,7 +127,7 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        room_for_continuing=lambda target: None,
+        room_for_continuing=lambda *a: None,
         get_next_batch=lambda *a, **k: fresh,
     )
     runtime, target = _runtime()
