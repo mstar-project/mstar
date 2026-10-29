@@ -1359,7 +1359,14 @@ class Worker:
                 self._metrics.start_counting()
 
     def _process_messages(self) -> None:
-        self._process_message_list(self.communicator.get_all_new_messages())
+        # One read batch per pass: the per-request INPUT_SIGNALS of one
+        # producer step carry rows of one arena slot, which then share a copy.
+        self.tensor_manager.begin_read_batch()
+        try:
+            self._process_message_list(self.communicator.get_all_new_messages())
+        finally:
+            if futures := self.tensor_manager.end_read_batch():
+                self.wakeup_event.register_futures(futures)
 
     # ------------------------------------------------------------------
     # Tensor readiness
