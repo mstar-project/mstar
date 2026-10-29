@@ -98,8 +98,9 @@ KNOBS = [
     {"block_n": 16, "block_k": 256, "split_k": 1, "num_warps": 4, "use_dot": True},
     {"block_n": 32, "block_k": 128, "split_k": 8, "num_warps": 4, "use_dot": True, "xcd_remap": True,
      "num_stages": 2},
+    {"block_n": 4, "block_k": 512, "split_k": 1, "num_warps": 2, "use_dot": False, "prefetch": True},
 ]
-KNOB_IDS = ["fma", "fma-splitk4-xcd", "dot", "dot-splitk8-xcd"]
+KNOB_IDS = ["fma", "fma-splitk4-xcd", "dot", "dot-splitk8-xcd", "fma-prefetch"]
 
 
 @pytest.mark.parametrize("knobs", KNOBS, ids=KNOB_IDS)

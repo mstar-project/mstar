@@ -33,10 +33,12 @@ import torch
 import triton
 import triton.language as tl
 
-KNOBS = ("block_n", "block_k", "split_k", "num_warps", "waves_per_eu", "use_dot", "xcd_remap", "num_stages")
+KNOBS = (
+    "block_n", "block_k", "split_k", "num_warps", "waves_per_eu", "use_dot", "xcd_remap", "num_stages", "prefetch",
+)
 DEFAULT_KNOBS: Mapping[str, Any] = {
     "block_n": 16, "block_k": 256, "split_k": 1, "num_warps": 4, "waves_per_eu": 0, "use_dot": False,
-    "xcd_remap": False, "num_stages": 1,
+    "xcd_remap": False, "num_stages": 1, "prefetch": False,
 }
 # column tiles whose split-K counters live in the per-device workspace; a
 # launch with more tiles runs without split-K
@@ -45,33 +47,59 @@ _DOT_MIN_ROWS = 16
 
 
 @triton.jit
+def _fma_step(acc3, w, x_ptr, offs_m, m_mask, ks, stride_xm, K):
+    x = tl.load(x_ptr + offs_m[:, None] * stride_xm + ks[None, :], mask=m_mask[:, None] & (ks[None, :] < K), other=0.0)
+    return acc3 + w[None, :, :].to(tl.float32) * x[:, None, :].to(tl.float32)
+
+
+@triton.jit
 def _tile_product(
     x_ptr, w_rows, offs_m, m_mask, k_start, k_stop, stride_xm, n_mask, K,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    USE_DOT: tl.constexpr, EVEN: tl.constexpr,
+    USE_DOT: tl.constexpr, PREFETCH: tl.constexpr, EVEN: tl.constexpr,
 ):
     """This program's [BLOCK_N, BLOCK_M] fp32 slice of ``w @ x.T`` over K in
     [k_start, k_stop)."""
     offs_k = tl.arange(0, BLOCK_K)
     if USE_DOT:
         acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
-    else:
-        acc3 = tl.zeros((BLOCK_M, BLOCK_N, BLOCK_K), dtype=tl.float32)
-    for k0 in range(k_start, k_stop, BLOCK_K):
-        ks = k0 + offs_k
-        if EVEN:
-            w = tl.load(w_rows + ks[None, :])
-        else:
-            w = tl.load(w_rows + ks[None, :], mask=n_mask[:, None] & (ks[None, :] < K), other=0.0)
-        if USE_DOT:
+        for k0 in range(k_start, k_stop, BLOCK_K):
+            ks = k0 + offs_k
+            if EVEN:
+                w = tl.load(w_rows + ks[None, :])
+            else:
+                w = tl.load(w_rows + ks[None, :], mask=n_mask[:, None] & (ks[None, :] < K), other=0.0)
             xt = tl.load(x_ptr + offs_m[None, :] * stride_xm + ks[:, None],
                          mask=m_mask[None, :] & (ks[:, None] < K), other=0.0)
             acc += tl.dot(w, xt)
+    else:
+        acc3 = tl.zeros((BLOCK_M, BLOCK_N, BLOCK_K), dtype=tl.float32)
+        if PREFETCH:
+            # Triton pipelines only loops around tl.dot: carry the next tile's
+            # loads across the multiply-adds so two are in flight
+            ks = k_start + offs_k
+            if EVEN:
+                w = tl.load(w_rows + ks[None, :])
+            else:
+                w = tl.load(w_rows + ks[None, :], mask=n_mask[:, None] & (ks[None, :] < K), other=0.0)
+            for k0 in range(k_start + BLOCK_K, k_stop, BLOCK_K):
+                ks_next = k0 + offs_k
+                if EVEN:
+                    w_next = tl.load(w_rows + ks_next[None, :])
+                else:
+                    w_next = tl.load(w_rows + ks_next[None, :], mask=n_mask[:, None] & (ks_next[None, :] < K),
+                                     other=0.0)
+                acc3 = _fma_step(acc3, w, x_ptr, offs_m, m_mask, ks, stride_xm, K)
+                w, ks = w_next, ks_next
+            acc3 = _fma_step(acc3, w, x_ptr, offs_m, m_mask, ks, stride_xm, K)
         else:
-            x = tl.load(x_ptr + offs_m[:, None] * stride_xm + ks[None, :],
-                        mask=m_mask[:, None] & (ks[None, :] < K), other=0.0)
-            acc3 += w[None, :, :].to(tl.float32) * x[:, None, :].to(tl.float32)
-    if not USE_DOT:
+            for k0 in range(k_start, k_stop, BLOCK_K):
+                ks = k0 + offs_k
+                if EVEN:
+                    w = tl.load(w_rows + ks[None, :])
+                else:
+                    w = tl.load(w_rows + ks[None, :], mask=n_mask[:, None] & (ks[None, :] < K), other=0.0)
+                acc3 = _fma_step(acc3, w, x_ptr, offs_m, m_mask, ks, stride_xm, K)
         acc = tl.trans(tl.sum(acc3, axis=2))
     return acc
 
@@ -81,7 +109,7 @@ def _decode_gemv(
     x_ptr, w_ptr, out_ptr, bias_ptr, part_ptr, count_ptr,
     M, N, K, stride_xm, stride_wn, stride_om, stride_bm, up_rows,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
-    SILU_MUL: tl.constexpr, HAS_BIAS: tl.constexpr, USE_DOT: tl.constexpr,
+    SILU_MUL: tl.constexpr, HAS_BIAS: tl.constexpr, USE_DOT: tl.constexpr, PREFETCH: tl.constexpr,
     XCD_REMAP: tl.constexpr, NUM_XCDS: tl.constexpr, EVEN: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -100,10 +128,10 @@ def _decode_gemv(
 
     w_rows = w_ptr + offs_n[:, None].to(tl.int64) * stride_wn
     acc = _tile_product(x_ptr, w_rows, offs_m, m_mask, k_start, k_stop, stride_xm, n_mask, K,
-                        BLOCK_M, BLOCK_N, BLOCK_K, USE_DOT, EVEN)
+                        BLOCK_M, BLOCK_N, BLOCK_K, USE_DOT, PREFETCH, EVEN)
     if SILU_MUL:
         acc_up = _tile_product(x_ptr, w_rows + up_rows * stride_wn, offs_m, m_mask, k_start, k_stop, stride_xm,
-                               n_mask, K, BLOCK_M, BLOCK_N, BLOCK_K, USE_DOT, EVEN)
+                               n_mask, K, BLOCK_M, BLOCK_N, BLOCK_K, USE_DOT, PREFETCH, EVEN)
     else:
         acc_up = acc
 
@@ -203,7 +231,7 @@ def _launch(x, weight, out, bias, n_out, up_rows, silu_mul, knobs) -> torch.Tens
         x, weight, out, bias, part, counters,
         rows, n_out, k, x.stride(0), weight.stride(0), out.stride(0), stride_bm, up_rows,
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, SPLIT_K=split_k,
-        SILU_MUL=silu_mul, HAS_BIAS=bias is not out, USE_DOT=use_dot,
+        SILU_MUL=silu_mul, HAS_BIAS=bias is not out, USE_DOT=use_dot, PREFETCH=bool(knobs.get("prefetch", False)),
         XCD_REMAP=remap, NUM_XCDS=num_xcds, EVEN=even, **options,
     )
     return out
