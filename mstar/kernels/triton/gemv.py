@@ -5,16 +5,18 @@ the kernel's job is to keep enough loads in flight to stream the weight at
 HBM speed. Each program reads a ``block_n`` x ``block_k`` weight tile per step
 along K, for ``block_n`` output columns and one of ``split_k`` slices of K.
 Split-K adds programs where a narrow weight has too few column tiles to fill
-the GPU; its partial sums go to an fp32 workspace and the last program of a
-column tile to arrive (an atomic counter per tile) adds them in order and
-writes the output, so results do not depend on arrival order. The counters
-are reset by that last program, so a captured graph replays without a memset.
+the GPU. Its partial sums go to an fp32 workspace and a second, small kernel
+adds them in order and writes the output, so results do not depend on which
+program finished first. A last-arriving program cannot finish the tile
+instead: the release that would publish its partners' partials writes back
+the whole L2 of each program's XCD, which on MI325X cost more than the GEMV.
 
 ``xcd_remap`` renumbers programs so that consecutive tiles, and so the split-K
 partners of a tile, land on one XCD of an AMD GPU (the hardware hands out
 workgroup ids round-robin across XCDs). ``use_dot`` computes each step on the
 matrix cores with the rows padded to 16; without it each thread multiplies and
-adds in fp32 and the reduction over K happens once, after the loop.
+adds in fp32 and the reduction over K happens once, after the loop, and
+``prefetch`` keeps the next step's loads in flight during this one's math.
 
 Epilogues fold the op that follows a linear into its store: ``silu_mul`` takes
 a stacked ``[gate; up]`` weight and writes ``silu(gate) * up``, with both
@@ -25,7 +27,6 @@ residual folded into it) is added before the one rounding.
 from __future__ import annotations
 
 import functools
-import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -40,10 +41,9 @@ DEFAULT_KNOBS: Mapping[str, Any] = {
     "block_n": 16, "block_k": 256, "split_k": 1, "num_warps": 4, "waves_per_eu": 0, "use_dot": False,
     "xcd_remap": False, "num_stages": 1, "prefetch": False,
 }
-# column tiles whose split-K counters live in the per-device workspace; a
-# launch with more tiles runs without split-K
-MAX_COUNTED_TILES = 1 << 16
 _DOT_MIN_ROWS = 16
+# output columns per program of the split-K reduction
+_REDUCE_BLOCK_N = 256
 
 
 @triton.jit
@@ -111,8 +111,26 @@ def _tile_product(
 
 
 @triton.jit
+def _epilogue(
+    acc, acc_up, out_ptr, bias_ptr, offs_m, offs_n, mask, stride_om, stride_bm,
+    SILU_MUL: tl.constexpr, HAS_BIAS: tl.constexpr,
+):
+    """Store a [BLOCK_N, BLOCK_M] fp32 tile of the output, rounded once."""
+    dtype = out_ptr.dtype.element_ty
+    if SILU_MUL:
+        gate = acc.to(dtype).to(tl.float32)
+        up = acc_up.to(dtype).to(tl.float32)
+        y = gate * tl.sigmoid(gate) * up
+    else:
+        y = acc
+        if HAS_BIAS:
+            y += tl.load(bias_ptr + offs_m[None, :] * stride_bm + offs_n[:, None], mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + offs_m[None, :] * stride_om + offs_n[:, None], y.to(dtype), mask=mask)
+
+
+@triton.jit
 def _decode_gemv(
-    x_ptr, w_ptr, out_ptr, bias_ptr, part_ptr, count_ptr,
+    x_ptr, w_ptr, out_ptr, bias_ptr, part_ptr,
     M, N, K, stride_xm, stride_wn, stride_om, stride_bm, up_rows,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
     SILU_MUL: tl.constexpr, HAS_BIAS: tl.constexpr, USE_DOT: tl.constexpr, PREFETCH: tl.constexpr,
@@ -140,62 +158,34 @@ def _decode_gemv(
                                n_mask, K, BLOCK_M, BLOCK_N, BLOCK_K, USE_DOT, PREFETCH, EVEN)
     else:
         acc_up = acc
-
-    mn_mask = n_mask[:, None] & m_mask[None, :]
-    last = True
+    mask = n_mask[:, None] & m_mask[None, :]
     if SPLIT_K > 1:
-        # [SPLIT_K, (gate, up), M, N] partial sums
-        part = part_ptr + offs_m[None, :] * N + offs_n[:, None]
-        slot = 2 * M * N
-        tl.store(part + split * slot, acc, mask=mn_mask)
+        # [SPLIT_K, (gate, up), M, N] partial sums, finished by _split_k_reduce
+        part = part_ptr + split * 2 * M * N + offs_m[None, :] * N + offs_n[:, None]
+        tl.store(part, acc, mask=mask)
         if SILU_MUL:
-            tl.store(part + split * slot + M * N, acc_up, mask=mn_mask)
-        # release this program's partials, acquire every earlier arrival's
-        arrived = tl.atomic_add(count_ptr + tile, 1, sem="acq_rel", scope="gpu")
-        last = arrived == SPLIT_K - 1
-        if last:
-            acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
-            acc_up = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
-            for s in tl.static_range(SPLIT_K):
-                acc += tl.load(part + s * slot, mask=mn_mask, other=0.0)
-                if SILU_MUL:
-                    acc_up += tl.load(part + s * slot + M * N, mask=mn_mask, other=0.0)
-            tl.store(count_ptr + tile, 0)
-    if last:
-        dtype = out_ptr.dtype.element_ty
+            tl.store(part + M * N, acc_up, mask=mask)
+    else:
+        _epilogue(acc, acc_up, out_ptr, bias_ptr, offs_m, offs_n, mask, stride_om, stride_bm, SILU_MUL, HAS_BIAS)
+
+
+@triton.jit
+def _split_k_reduce(
+    part_ptr, out_ptr, bias_ptr, M, N, stride_om, stride_bm,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr,
+    SILU_MUL: tl.constexpr, HAS_BIAS: tl.constexpr,
+):
+    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    mask = (offs_n < N)[:, None] & (offs_m < M)[None, :]
+    part = part_ptr + offs_m[None, :] * N + offs_n[:, None]
+    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        acc += tl.load(part + s * 2 * M * N, mask=mask, other=0.0)
         if SILU_MUL:
-            gate = acc.to(dtype).to(tl.float32)
-            up = acc_up.to(dtype).to(tl.float32)
-            y = gate * tl.sigmoid(gate) * up
-        else:
-            y = acc
-            if HAS_BIAS:
-                y += tl.load(bias_ptr + offs_m[None, :] * stride_bm + offs_n[:, None], mask=mn_mask,
-                             other=0.0).to(tl.float32)
-        tl.store(out_ptr + offs_m[None, :] * stride_om + offs_n[:, None], y.to(dtype), mask=mn_mask)
-
-
-class _Counters:
-    """One zeroed int32 counter per column tile, per device; the kernel leaves
-    them zeroed. Allocated on first use, which must not be inside a capture
-    (the warm-up runs every shape first)."""
-
-    def __init__(self):
-        self._by_device: dict[torch.device, torch.Tensor] = {}
-        self._lock = threading.Lock()
-
-    def get(self, device: torch.device) -> torch.Tensor:
-        counters = self._by_device.get(device)
-        if counters is None:
-            with self._lock:
-                counters = self._by_device.get(device)
-                if counters is None:
-                    counters = torch.zeros(MAX_COUNTED_TILES, dtype=torch.int32, device=device)
-                    self._by_device[device] = counters
-        return counters
-
-
-_COUNTERS = _Counters()
+            acc_up += tl.load(part + s * 2 * M * N + M * N, mask=mask, other=0.0)
+    _epilogue(acc, acc_up, out_ptr, bias_ptr, offs_m, offs_n, mask, stride_om, stride_bm, SILU_MUL, HAS_BIAS)
 
 
 @functools.cache
@@ -213,33 +203,35 @@ def _launch(x, weight, out, bias, n_out, up_rows, silu_mul, knobs) -> torch.Tens
     use_dot = bool(knobs.get("use_dot", False))
     block_m = max(_DOT_MIN_ROWS if use_dot else 1, triton.next_power_of_2(rows))
     tiles = triton.cdiv(n_out, block_n)
-    split_k = int(knobs.get("split_k", 1))
-    split_k = max(1, min(split_k, triton.cdiv(k, block_k)))
-    if tiles > MAX_COUNTED_TILES:
-        split_k = 1
+    split_k = max(1, min(int(knobs.get("split_k", 1)), triton.cdiv(k, block_k)))
     programs = tiles * split_k
     num_xcds = _num_xcds(x.device.index or 0) if torch.version.hip else 1
     remap = bool(knobs.get("xcd_remap", False)) and num_xcds > 1 and programs % num_xcds == 0
+    part = out
     if split_k > 1:
         part = torch.empty((split_k, 2, rows, n_out), dtype=torch.float32, device=x.device)
-        counters = _COUNTERS.get(x.device)
-    else:
-        part = counters = out
     if bias is not None:
         stride_bm = bias.stride(0) if bias.dim() == 2 else 0
     else:
         bias, stride_bm = out, 0
+    has_bias = bias is not out
     even = n_out % block_n == 0 and k % (block_k * split_k) == 0
     options = {"num_warps": int(knobs.get("num_warps", 4)), "num_stages": int(knobs.get("num_stages", 1))}
     if torch.version.hip:
         options["waves_per_eu"] = int(knobs.get("waves_per_eu", 0))
     _decode_gemv[(programs,)](
-        x, weight, out, bias, part, counters,
+        x, weight, out, bias, part,
         rows, n_out, k, x.stride(0), weight.stride(0), out.stride(0), stride_bm, up_rows,
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, SPLIT_K=split_k,
-        SILU_MUL=silu_mul, HAS_BIAS=bias is not out, USE_DOT=use_dot, PREFETCH=bool(knobs.get("prefetch", False)),
+        SILU_MUL=silu_mul, HAS_BIAS=has_bias, USE_DOT=use_dot, PREFETCH=bool(knobs.get("prefetch", False)),
         XCD_REMAP=remap, NUM_XCDS=num_xcds, EVEN=even, **options,
     )
+    if split_k > 1:
+        _split_k_reduce[(triton.cdiv(n_out, _REDUCE_BLOCK_N),)](
+            part, out, bias, rows, n_out, out.stride(0), stride_bm,
+            BLOCK_M=triton.next_power_of_2(rows), BLOCK_N=_REDUCE_BLOCK_N, SPLIT_K=split_k,
+            SILU_MUL=silu_mul, HAS_BIAS=has_bias, num_warps=4,
+        )
     return out
 
 
