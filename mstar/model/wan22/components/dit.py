@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion.modulation import ada_layer_norm
+from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import Wan22Config
 
@@ -121,7 +122,7 @@ class Wan22RoPE3D:
         return self._tables[device]
 
     def __call__(self, grid: tuple[int, int, int], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-grid frequencies, each ``[1, t*h*w, 1, head_dim]`` fp32
+        """Per-grid frequencies, each ``[t*h*w, head_dim]`` fp32
         (reference ``WanRotaryPosEmbed.forward``)."""
         ppf, pph, ppw = grid
         freqs_cos, freqs_sin = self.tables(device)
@@ -132,25 +133,9 @@ class Wan22RoPE3D:
             f = split[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
             h = split[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
             w = split[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
-            return torch.cat([f, h, w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+            return torch.cat([f, h, w], dim=-1).reshape(ppf * pph * ppw, -1)
 
         return expand_axes(split_cos), expand_axes(split_sin)
-
-
-def _apply_rotary_emb(
-    hidden_states: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
-) -> torch.Tensor:
-    """Interleaved-pair rotary application (reference ``WanAttnProcessor``
-    inner ``apply_rotary_emb``): fp32 math via type promotion against the
-    fp32 tables, cast back to the input dtype at the output-buffer
-    assignment."""
-    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-    cos = freqs_cos[..., 0::2]
-    sin = freqs_sin[..., 1::2]
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
-    return out.type_as(hidden_states)
 
 
 class Wan22DiTAttention(nn.Module):
@@ -177,17 +162,16 @@ class Wan22DiTAttention(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
-        query = self.q_norm(self.q_proj(hidden_states))
-        key = self.k_norm(self.k_proj(kv_source))
-        value = self.v_proj(kv_source)
-
-        query = query.unflatten(2, (self.num_heads, -1))
-        key = key.unflatten(2, (self.num_heads, -1))
-        value = value.unflatten(2, (self.num_heads, -1))
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(kv_source)
+        value = self.v_proj(kv_source).unflatten(2, (self.num_heads, -1))
 
         if rotary_emb is not None:
-            query = _apply_rotary_emb(query, *rotary_emb)
-            key = _apply_rotary_emb(key, *rotary_emb)
+            # across-heads RMSNorm, then the interleaved-pair rotation
+            query, key = rms_norm_rope(query, key, self.q_norm, self.k_norm, *rotary_emb, self.num_heads)
+        else:
+            query = self.q_norm(query).unflatten(2, (self.num_heads, -1))
+            key = self.k_norm(key).unflatten(2, (self.num_heads, -1))
 
         # [B, S, H, D] -> [B, H, S, D] SDPA -> back (the reference's
         # dispatch_attention_fn native path; bidirectional, no mask).
@@ -351,7 +335,7 @@ class Wan22DiT(nn.Module):
                 f"Wan22DiT requires a per-frame [batch, {grid[0]}] timestep; got {tuple(timestep.shape)}."
             )
 
-        rotary_emb = self.rope(grid, hidden_states.device)
+        rotary_emb = tuple(t.contiguous() for t in self.rope(grid, hidden_states.device))
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
