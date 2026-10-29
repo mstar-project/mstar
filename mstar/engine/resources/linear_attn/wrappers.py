@@ -271,15 +271,16 @@ class GDNPrefillWrapper(GDNWrapper):
         spans = [span or 1 for span in spans]
 
         self._stage.begin()
-        self._plan_conv(spans)
-        self._build_cu_buffer(spans)
-        # a captured graph checkpoints whether or not the step keeps any
-        self._every = every if snapshots or self._accelerator_graph else 0
-        if self._every:
-            self._plan_snapshots(spans, snapshots, checkpoints)
-
-        self._build_mask(self._plan_tokens)
-        self._stage.end()
+        try:
+            self._plan_conv(spans)
+            self._build_cu_buffer(spans)
+            # a captured graph checkpoints whether or not the step keeps any
+            self._every = every if snapshots or self._accelerator_graph else 0
+            if self._every:
+                self._plan_snapshots(spans, snapshots, checkpoints)
+            self._build_mask(self._plan_tokens)
+        finally:
+            self._stage.end()  # also on a raise; see `_PinnedIndexStage`
         num_rows = len(spans)
         self._plan_state = GDNPrefillPlan(
             slots=slots,
@@ -583,7 +584,9 @@ class _PinnedIndexStage:
     the wrapper owns. A packed step plans inline on the gpu thread behind the
     step still in flight, where a copy out of pageable memory would wait for
     that step to finish. ``done`` is recorded once the copies are issued; the
-    next stage waits on it before rewriting the buffers."""
+    next stage waits on it before rewriting the buffers. Callers pair
+    ``begin`` with ``end`` in a ``finally``: a plan that raises after an
+    upload still has that copy in flight."""
 
     def __init__(self):
         self._bufs: dict[str, torch.Tensor] = {}
@@ -741,11 +744,13 @@ class GDNMixedWrapper(GDNWrapper):
         pslot_buf = self._buf("pre_slots", seqs, torch.int32)
         phas_buf = self._buf("pre_has", seqs, torch.bool)
         self._stage.begin()
-        self._stage.upload("dec_slots", dec_slots, dslot_buf)
-        self._stage.upload("dec_mask", np.arange(width) < run, dmask_buf)
-        self._stage.upload("pre_slots", pre_slots, pslot_buf)
-        self._stage.upload("pre_has", pre_has, phas_buf)
-        self._stage.end()
+        try:
+            self._stage.upload("dec_slots", dec_slots, dslot_buf)
+            self._stage.upload("dec_mask", np.arange(width) < run, dmask_buf)
+            self._stage.upload("pre_slots", pre_slots, pslot_buf)
+            self._stage.upload("pre_has", pre_has, phas_buf)
+        finally:
+            self._stage.end()  # also on a raise; see `_PinnedIndexStage`
 
         self._num_rows = width
         self._num_seqs = seqs

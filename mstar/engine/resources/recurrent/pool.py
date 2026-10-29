@@ -370,7 +370,6 @@ class RecurrentStatePool(Resource):
             labels = self._slots.get(rid)
             if not labels:
                 return
-            self._version += 1
             for slot in labels.values():
                 self._zero_slot(slot.index)
                 if free:
@@ -381,6 +380,8 @@ class RecurrentStatePool(Resource):
                 for slot in labels.values():
                     slot.has_state = False
                     slot.tokens = 0
+            # after the change: an unlocked build reading this version must see it
+            self._version += 1
 
     def _zero_slot(self, index: int) -> None:
         for tensor in self._blocks.values():

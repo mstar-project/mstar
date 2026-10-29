@@ -282,11 +282,14 @@ class FlashInferPrefillWrapper:
                     kv_lens, paged_kv_indices,
                 )
             )
-            self._plan_staged(
-                qo_indptr, paged_kv_indptr, self._pinned["indices"][:n],
-                paged_kv_last_page_len, kv_lens, causal, dtype, window_left,
-            )
-            self._pinned_done.record()
+            try:
+                self._plan_staged(
+                    qo_indptr, paged_kv_indptr, self._pinned["indices"][:n],
+                    paged_kv_last_page_len, kv_lens, causal, dtype, window_left,
+                )
+            finally:
+                # also on a raise: copies already issued still read the pinned buffers
+                self._pinned_done.record()
             return
         self.dtype = dtype
         self.attn_wrapper.plan(
@@ -800,44 +803,47 @@ class FlashInferMixedWrapper:
         p_last = np.concatenate([[lead_last], last[prompt], np.ones(pad), [tail_last]]).astype(np.int32)
         p_lens = np.concatenate([[lead_kv], lens[prompt], np.ones(pad), [tail_kv]]).astype(np.int32)
 
-        self._dec_mask[:rows].copy_(self._pin("dec_mask", dec, torch.bool), non_blocking=True)
-        self._qo_indptr_buf[: rows + 1].copy_(
-            self._pin("qo", qo.astype(np.int32), torch.int32), non_blocking=True,
-        )
-        self._num_rows = rows
+        try:
+            self._dec_mask[:rows].copy_(self._pin("dec_mask", dec, torch.bool), non_blocking=True)
+            self._qo_indptr_buf[: rows + 1].copy_(
+                self._pin("qo", qo.astype(np.int32), torch.int32), non_blocking=True,
+            )
+            self._num_rows = rows
 
-        if self._tensor_cores:
-            # the run's rows one token each, and the last row the rest, so
-            # qo_indptr ends at the row count FlashInfer checks
-            d_qo = np.zeros(rows + 1, dtype=np.int32)
-            d_qo[1 : run + 1] = np.arange(1, run + 1)
-            d_qo[run + 1 :] = run
-            d_qo[-1] = rows
-            self._decode.plan(
-                qo_indptr=torch.from_numpy(d_qo),
-                paged_kv_indptr=torch.from_numpy(d_indptr),
-                paged_kv_indices=torch.from_numpy(d_indices),
-                paged_kv_last_page_len=torch.from_numpy(d_last),
-                kv_lens=torch.from_numpy(d_lens).as_subclass(HostLens),
-                causal=False, dtype=dtype, window_left=window_left,
+            if self._tensor_cores:
+                # the run's rows one token each, and the last row the rest, so
+                # qo_indptr ends at the row count FlashInfer checks
+                d_qo = np.zeros(rows + 1, dtype=np.int32)
+                d_qo[1 : run + 1] = np.arange(1, run + 1)
+                d_qo[run + 1 :] = run
+                d_qo[-1] = rows
+                self._decode.plan(
+                    qo_indptr=torch.from_numpy(d_qo),
+                    paged_kv_indptr=torch.from_numpy(d_indptr),
+                    paged_kv_indices=torch.from_numpy(d_indices),
+                    paged_kv_last_page_len=torch.from_numpy(d_last),
+                    kv_lens=torch.from_numpy(d_lens).as_subclass(HostLens),
+                    causal=False, dtype=dtype, window_left=window_left,
+                )
+            else:
+                self._decode.plan(
+                    paged_kv_indptr=self._pin("d_indptr", d_indptr, torch.int32),
+                    paged_kv_indices=self._pin("d_indices", d_indices, torch.int32),
+                    paged_kv_last_page_len=self._pin("d_last", d_last, torch.int32),
+                    kv_lens=self._pin("d_lens", d_lens, torch.int32).as_subclass(HostLens),
+                    dtype=dtype, window_left=window_left,
+                )
+            self._prefill.plan(
+                qo_indptr=torch.from_numpy(p_qo),
+                paged_kv_indptr=torch.from_numpy(p_kvp),
+                paged_kv_indices=torch.from_numpy(p_idx),
+                paged_kv_last_page_len=torch.from_numpy(p_last),
+                kv_lens=torch.from_numpy(p_lens).as_subclass(HostLens),
+                causal=causal, dtype=dtype, window_left=window_left,
             )
-        else:
-            self._decode.plan(
-                paged_kv_indptr=self._pin("d_indptr", d_indptr, torch.int32),
-                paged_kv_indices=self._pin("d_indices", d_indices, torch.int32),
-                paged_kv_last_page_len=self._pin("d_last", d_last, torch.int32),
-                kv_lens=self._pin("d_lens", d_lens, torch.int32).as_subclass(HostLens),
-                dtype=dtype, window_left=window_left,
-            )
-        self._prefill.plan(
-            qo_indptr=torch.from_numpy(p_qo),
-            paged_kv_indptr=torch.from_numpy(p_kvp),
-            paged_kv_indices=torch.from_numpy(p_idx),
-            paged_kv_last_page_len=torch.from_numpy(p_last),
-            kv_lens=torch.from_numpy(p_lens).as_subclass(HostLens),
-            causal=causal, dtype=dtype, window_left=window_left,
-        )
-        self._done.record()
+        finally:
+            # also on a raise: copies already issued still read the pinned buffers
+            self._done.record()
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
