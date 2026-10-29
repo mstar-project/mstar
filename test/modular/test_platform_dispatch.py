@@ -258,7 +258,7 @@ class _GraphRunner:
 def _bucket(num_tokens: int, bs: int | None = None):
     return SimpleNamespace(
         config=SimpleNamespace(
-            compile=True, compile_mode=None, capture_forward_method="forward_batched",
+            compile=True, compile_mode=None, capture_forward_method="forward_batched", compile_dynamic=False,
         ),
         config_idx=0,
         num_tokens=num_tokens,
