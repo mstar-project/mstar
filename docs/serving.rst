@@ -524,6 +524,10 @@ next start's compile. On a quota-limited or network-mounted home (NFS), or a vol
 concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
 path and copy a warm cache in at job start.
 
+To give a new host or container these caches warm, pack them into a bundle for the stack
+on a host that has served the configs, and unpack it on the new one before serving
+(:doc:`compile_cache`).
+
 .. _tensor-transport:
 
 Tensor transport
