@@ -8,9 +8,8 @@ so the runner's foreign-step guard stays the backstop it is meant to be.
 from __future__ import annotations
 
 import sys
-import threading
 from collections import defaultdict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -151,14 +150,18 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
         Worker._execute_on_gpu_thread(w, batch, node_batch, None)
     assert resets == []
 
-    # A plan that raised fails the step before prepare_inputs; its launch event is
-    # set anyway, or the admit fence on it would never lift.
-    node_batch.launch_started_event = threading.Event()
+    # A plan that raised fails the step before prepare_inputs. It still releases
+    # the plan thread, and its launch event is set when it ends, or the admit
+    # fence on it would never lift.
+    released.clear()
     failed_plan: Future = Future()
     failed_plan.set_exception(RuntimeError("plan failed"))
-    with pytest.raises(RuntimeError, match="plan failed"):
-        Worker._execute_on_gpu_thread(w, batch, node_batch, failed_plan)
+    with ThreadPoolExecutor(max_workers=1) as gpu:
+        future = Worker._submit_gpu_step(w, gpu, batch, node_batch, failed_plan)
+        with pytest.raises(RuntimeError, match="plan failed"):
+            future.result()
     assert node_batch.launch_started_event.is_set()
+    assert released == [True]
 
 
 def _exec_fake(runner, raise_with):
