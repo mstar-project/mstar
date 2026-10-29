@@ -19,6 +19,7 @@ down (correctness/summary.json).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import subprocess
@@ -74,9 +75,13 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default=None, help="serving config instead of the row's (e.g. a resources override)")
     ap.add_argument("--ktrace-ms", type=int, default=0, help="trace each cell in an extra, unmeasured run")
     ap.add_argument("--correctness", action="store_true", help="greedy text pass after startup, scored at the end")
+    ap.add_argument("--waves", type=int, default=None, help="requests per cell = waves x concurrency (the workload's"
+                    " own otherwise); more waves make a short cell less sensitive to one slow step")
     args = ap.parse_args(argv)
 
     row, arm, wl = catalog.ROWS[args.row], catalog.ARMS["mstar"], tables.WORKLOADS[args.workload]
+    if args.waves:
+        wl = dataclasses.replace(wl, waves=args.waves)
     if wl.family != row.family:
         raise SystemExit(f"{wl.name} is a {wl.family} workload and {row.name} a {row.family} row")
     conc = [int(c) for c in args.concurrency.split(",")]
