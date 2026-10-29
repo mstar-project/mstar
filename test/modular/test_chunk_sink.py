@@ -18,6 +18,7 @@ class _PreprocessWorker:
 
     def __init__(self):
         self.chunks: list[ResultChunk] = []
+        self.aborted: list[str] = []
 
     def get_profile_updates(self):
         return []
@@ -37,6 +38,9 @@ class _PreprocessWorker:
 
     def abort_request(self, rid):
         pass
+
+    def forward_abort(self, rid):
+        self.aborted.append(rid)
 
 
 class _Comm:
@@ -172,5 +176,30 @@ def test_chunks_the_handler_already_took_are_not_relayed_again(monkeypatch):
         assert sink.calls == []
         assert req.chunks == []
         await batches.aclose()
+
+    asyncio.run(run())
+
+
+def test_a_relay_that_raises_fails_its_requests(monkeypatch):
+    """The relay runs as a loop callback, whose exception asyncio only logs,
+    and its chunks are already off the requests: they fail in-band, and the
+    engine requests are aborted, rather than finishing with output missing."""
+    async def run():
+        server = _server()
+        sink = _Sink(asyncio.get_running_loop())
+
+        def broken(tags, chunks):
+            raise RuntimeError("bridge gone")
+
+        sink.relay = broken
+        _register(server, "A")
+        server.relay_chunks_to("A", sink, 1)
+        server.preprocess_worker.chunks = [_chunk("A", b"a1")]
+        handler = server.iter_result_chunks("A")
+        _one_pass(server, monkeypatch)
+        await asyncio.sleep(0)  # the sink's callback
+        rest = [c async for c in handler]
+        assert [(c.modality, c.metadata.get("status")) for c in rest] == [("error", 500)]
+        assert server.preprocess_worker.aborted == ["A"]
 
     asyncio.run(run())

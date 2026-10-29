@@ -5,7 +5,7 @@ import re
 from collections.abc import Container
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from safetensors.torch import safe_open
@@ -374,6 +374,14 @@ class ByteLevelDetokenizer:
                 continue
             if decoded == text:
                 self.verbatim[i] = text.encode("utf-8")
+        self._token_bytes: dict[int, bytes] = {}
+
+    def token_bytes(self, token_id: int) -> bytes:
+        """``to_bytes([token_id])``, memoized: a decode step's chunk is one token."""
+        data = self._token_bytes.get(token_id)
+        if data is None:
+            data = self._token_bytes[token_id] = self.to_bytes([token_id])
+        return data
 
     def _byte_map(self, token: str) -> bytes:
         try:
@@ -419,7 +427,7 @@ class TextChunkDetokenizer:
     per-step ``decode``.
     """
 
-    __slots__ = ("tokenizer", "_bytes")
+    __slots__ = ("tokenizer", "_bytes", "_decoded")
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -427,11 +435,31 @@ class TextChunkDetokenizer:
             ByteLevelDetokenizer(tokenizer, keep_special=True)
             if ByteLevelDetokenizer.is_byte_level(tokenizer) else None
         )
+        self._decoded: dict[int, bytes] = {}
 
     def to_bytes(self, token_ids: list[int]) -> bytes:
         if self._bytes is None:
             return self.tokenizer.decode(token_ids).encode("utf-8")
         return self._bytes.to_bytes(token_ids)
+
+    def token_bytes(self, token_id: int) -> bytes:
+        """``to_bytes([token_id])``, memoized."""
+        if self._bytes is not None:
+            return self._bytes.token_bytes(token_id)
+        data = self._decoded.get(token_id)
+        if data is None:
+            data = self._decoded[token_id] = self.to_bytes([token_id])
+        return data
+
+
+class TextOutput(NamedTuple):
+    """How a model's text output, token ids, becomes bytes: ``Model.text_output``
+    declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
+    derive their text paths from it."""
+
+    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer
+    # ids that end a reply, dropped unless the request sets ``ignore_eos``
+    stop_token_ids: Container[int] = frozenset()
 
 
 def drop_stop_tokens(

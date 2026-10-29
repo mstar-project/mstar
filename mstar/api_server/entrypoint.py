@@ -321,8 +321,8 @@ class _SinkBatch(NamedTuple):
     """One sink's requests with chunks to relay in a message pass."""
 
     sink: ChunkSink
-    # by ``id``, so a request with several chunks in the pass is relayed once
-    reqs: dict[int, PendingRequest]
+    # by key, so a request with several chunks in the pass is relayed once
+    reqs: dict[str, PendingRequest]
 
 
 def _set_events(wakes: list) -> None:
@@ -1125,7 +1125,7 @@ class APIServer:
                 # the handlers are woken once per pass, after every chunk of
                 # the pass has been appended, not once per chunk
                 to_wake: dict[int, PendingRequest] = {}
-                to_relay: dict[int, _SinkBatch] = {}
+                to_relay: dict[int, _SinkBatch] = {}  # by the sink's id
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
@@ -1168,7 +1168,7 @@ class APIServer:
                             batch = to_relay.get(id(sink))
                             if batch is None:
                                 batch = to_relay[id(sink)] = _SinkBatch(sink, {})
-                            batch.reqs[id(req)] = req
+                            batch.reqs[rid] = req
                         else:
                             to_wake[id(req)] = req
 
@@ -1195,7 +1195,7 @@ class APIServer:
                     notify_many(to_wake.values())
                 for sink, reqs in to_relay.values():
                     try:
-                        sink.loop.call_soon_threadsafe(self._relay_chunks, sink, reqs.values())
+                        sink.loop.call_soon_threadsafe(self._relay_chunks, sink, reqs)
                     except RuntimeError:
                         pass  # the loop is closed: its clients are gone
             except Exception:
@@ -1220,21 +1220,49 @@ class APIServer:
             if req is not None:
                 req.sink, req.sink_tag = sink, tag
 
-    def _relay_chunks(self, sink: ChunkSink, reqs) -> None:
+    def _relay_chunks(self, sink: ChunkSink, reqs: dict[str, PendingRequest]) -> None:
         """On ``sink``'s loop: drain its requests' chunks into it, up to an
         error chunk, which stays for the handler with what follows it."""
         tags: list = []
         chunks: list[ResultChunk] = []
+        relayed: list[str] = []
         with self.request_lock:
-            for req in reqs:
+            for key, req in reqs.items():
                 pending = req.chunks
                 n = next((i for i, c in enumerate(pending) if c.modality == "error"), len(pending))
                 if n:
                     tags += [req.sink_tag] * n
                     chunks += pending[:n]
                     req.chunks = pending[n:]
-        if chunks:
+                    relayed.append(key)
+        if not chunks:
+            return
+        try:
             sink.relay(tags, chunks)
+        except Exception:
+            # asyncio only logs a callback's exception, and these chunks are
+            # off their requests already: fail the requests, or they would
+            # finish as successes with output missing
+            logger.exception("Relaying %d result chunks failed", len(chunks))
+            for key in relayed:
+                self._fail_request(key, "internal error while streaming the response", 500)
+
+    def _fail_request(self, key: str, error: str, status: int) -> None:
+        """Fail submission ``key`` in-band, as ``reject_input`` does, and abort
+        the engine request if it is still running."""
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is None:
+                return
+            running = not req.event.is_set()
+            if req.error is None:
+                req.error, req.error_status = error, status
+            req.event.set()
+            if running:
+                self.recently_completed[key] = time.time()
+        req.notify()
+        if running:
+            self.preprocess_worker.forward_abort(key)
 
     def iter_result_chunks(self, request_id: str):
         """Yield raw :class:`ResultChunk` objects as they arrive, one at a time.

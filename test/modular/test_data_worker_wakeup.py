@@ -22,6 +22,7 @@ class _Model:
         return PartitionTopology(partitions=["default"])
     # the inline path's per-value default, over the stub's postprocess
     postprocess_inline = Model.postprocess_inline
+    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
