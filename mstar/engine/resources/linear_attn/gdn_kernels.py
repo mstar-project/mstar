@@ -124,6 +124,10 @@ class GDNKernels(ABC):
 
     # whether a kernel that can L2-normalise q and k does it
     qk_l2norm: bool
+    # Whether the prefill kernels save the state checkpoints a recurrent pool's
+    # prefix snapshots are copied from. Without them the pool's prefix cache
+    # stays shut (see `GDNManager.bind_dependencies`).
+    writes_snapshots: bool = False
 
     def without_qk_l2norm(self) -> GDNKernels:
         """These kernels for a caller that normalises q and k itself, as a
@@ -166,6 +170,8 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 class FlashInferGDNKernels(GDNKernels):
     """FlashInfer's GDN kernels: chunked prefill (captured as is) and the
     pretransposed decode, both against the K-last pool."""
+
+    writes_snapshots = True
 
     def __init__(
         self,

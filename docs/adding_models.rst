@@ -453,7 +453,9 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
 
 Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
 cache, or when that cache's ``prefix_cache`` is off; in those three cases the pool allocates
-no snapshot slots. Every cache on the node then stays shut, and the engine logs which
+no snapshot slots. They also stay off when a resource over the pool can't write them, as
+AITER's GDN kernels on AMD GPUs can't (they keep no state checkpoints), though the slots are
+allocated by then. Every cache on the node then stays shut, and the engine logs which
 resource kept it shut.
 
 A model with a keyed label is checked at load time. Loading fails in two more cases:
