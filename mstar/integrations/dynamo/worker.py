@@ -74,6 +74,13 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
+    if model.get_partition_topology().client_connections():
+        # a live call appends input to a running request, which no Dynamo
+        # surface carries; refused before any GPU worker starts
+        raise SystemExit(
+            f"model {model_name!r} takes live client input (a full-duplex call), which the Dynamo "
+            "worker does not serve; serve it with `mstar serve` and use /v1/realtime or /generate/ws"
+        )
 
     server = APIServer(
         socket_path_prefix=args.socket_path_prefix,

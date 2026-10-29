@@ -214,10 +214,6 @@ class PerceptionConfig:
 
     encoder: FastConformerConfig = field(default_factory=_voicechat_encoder)
     output_dim: int = 4480
-    # Frames ``DuplexStream`` holds back until more audio arrives: the newest
-    # encoder frame reads mel frames that later audio still changes (the
-    # subsampling's small future receptive field), so it is not final yet.
-    streaming_lookahead_frames: int = 1
 
     # --- featurizer (``perception.preprocessor``) ---
     sample_rate: int = 16000
@@ -318,7 +314,7 @@ class NemotronDuplexConfig:
     stt: PerceptionConfig = field(default_factory=PerceptionConfig)
     codec: CodecConfig = field(default_factory=CodecConfig)
 
-    # generation defaults (text path); keep in sync with create_stream, offline_inference and realtime_api.
+    # generation defaults (text path); keep in sync with offline_inference.
     temperature: float = 0.7
     top_p: float = 0.9
     repetition_penalty: float = 1.0

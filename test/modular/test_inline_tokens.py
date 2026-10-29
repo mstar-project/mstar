@@ -9,9 +9,10 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar.api_server.data_worker import InlineToken, PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import InlineToken, PreprocessWorker, PreprocessWorkerThread, RequestOutputState
 from mstar.api_server.request_types import APIServerMessage, ResultChunk, ResultTokens
 from mstar.communication import wire
+from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.submodule_base import HostRows
 from mstar.worker.worker import Worker
@@ -125,6 +126,66 @@ def test_inline_tokens_are_detokenized_in_order_without_a_read():
     assert [c.data for c in chunks if c.request_id == "other"] == [b"<99>"]
     state = worker.request_output_state["req"]
     assert state.next_sequence == 3 and state.next_emit == 3 and not state.pending
+
+
+def test_turn_tokens_mark_their_text_chunks():
+    """A model's declared turn tokens mark the chunks they arrive in, though
+    postprocess may drop the tokens themselves; other chunks are unmarked.
+    Every chunk carries its loop iteration as its step."""
+    worker, stop = _thread()
+    worker.model.turn_tokens = (1, 2)
+    for i, v in enumerate((12, 1, 13, 2, 12)):
+        worker.result_tensor_queue.put(InlineToken("req", v, _loop(i), "text"))
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+    try:
+        chunks = [worker.out_queue.get(timeout=5) for _ in range(5)]
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    assert [c.metadata.get("turn") for c in chunks] == [None, ["start"], None, ["end"], None]
+    assert [c.metadata["step"] for c in chunks] == [0, 1, 2, 3, 4]
+    # a chunk of several tokens keeps every mark, in order
+    assert worker._turn_metadata([2, 12, 1], None) == {"turn": ["end", "start"]}
+
+
+def test_turn_tokens_stamp_read_text_and_audio_with_their_step():
+    """Chunks read as tensors (text without inline tokens, and all audio)
+    carry their loop step as the inline path's do."""
+    class _ReadModel(_Model):
+        turn_tokens = (1, 2)
+
+        def postprocess(self, output, modality, request_kwargs=None):
+            return b"pcm" if modality == "audio" else super().postprocess(output, modality)
+
+        def get_output_sample_rate(self, modality="audio"):
+            return 24000
+
+        def get_output_audio_channels(self, modality="audio"):
+            return 1
+
+    tensors = {"t": torch.tensor([1]), "a": torch.zeros(4, dtype=torch.int16)}
+
+    class _ReadTM(_TM):
+        def get_ready_tensors(self):
+            return {"req": [GraphEdge(next_node="api", name=f"{modality}_output", tensor_info=[SimpleNamespace(uuid=u)])
+                            for modality, u in (("text", "t"), ("audio", "a"))]}
+
+        def get_tensor(self, uuid):
+            return tensors[uuid]
+
+        def dereference(self, uuid):
+            pass
+
+    worker, _ = _thread()
+    worker.model, worker.tensor_manager = _ReadModel(), _ReadTM()
+    worker.request_output_state = {"req": RequestOutputState(order={"t": (0, _loop(3)), "a": (1, _loop(5))},
+                                                             next_sequence=2)}
+    worker.tensor_uuid_to_metadata_per_request = {"req": {"t": {}, "a": {}}}
+    assert worker._process_read_tensors() is True
+    text, audio = worker.out_queue.get_nowait(), worker.out_queue.get_nowait()
+    assert text.metadata == {"step": 3, "turn": ["start"]}
+    assert audio.modality == "audio" and audio.metadata["step"] == 5
 
 
 def test_a_draining_request_drops_its_inline_tokens():

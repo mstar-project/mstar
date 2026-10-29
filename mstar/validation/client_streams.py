@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model
 from mstar.streaming.topology import ClientStreamLimits, Connection
 
@@ -27,7 +28,8 @@ def check_client_streams(model: Model, config: Mapping[str, Any]) -> list[str]:
 
 def _consumer_problems(model: Model, connections: list[Connection]) -> list[str]:
     """What would otherwise fail every live call: each client stream needs
-    the one node that consumes it, in the partition it flows into."""
+    the one node that consumes it, in the partition it flows into, and a
+    ``ClientAudio`` stream needs text and audio emitted from inside a loop."""
     if not connections:
         return []
     problems = []
@@ -36,6 +38,22 @@ def _consumer_problems(model: Model, connections: list[Connection]) -> list[str]
             f"{type(model).__name__} declares client streams but does not implement process_stream_chunk"
         )
     walks = model.get_graph_walk_graphs()
+    if any(conn.audio is not None for conn in connections):
+        # /v1/realtime pairs a declared-audio model's text with its audio by the emitting loop's step
+        loops = [loop for walk in walks.values() for loop in walk.get_loops().values()]
+        looped = {name for loop in loops for name in loop.get_nodes()}
+        nested = {name for loop in loops for name in loop.section.get_loops()}
+        # a top-level loop's own outputs are emitted at its exit, outside any loop
+        emitters = [(node.name, node.outputs) for walk in walks.values() for node in walk.get_nodes().values()
+                    if node.name not in looped]
+        emitters += [(loop.name, loop.outputs + loop.accumulated_outputs) for loop in loops if loop.name not in nested]
+        unlooped = sorted({
+            name for name, edges in emitters if any(
+                edge.next_node == EMIT_TO_CLIENT and edge.output_modality in ("text", "audio") for edge in edges)
+        })
+        if unlooped:
+            problems.append(f"{type(model).__name__} declares a ClientAudio client stream, so its text and audio "
+                            f"must come from inside a loop; {unlooped} emit outside one")
     partitions = {p.name: p for p in model.get_partitions()}
     seen = set()
     for conn in connections:

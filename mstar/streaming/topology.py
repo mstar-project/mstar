@@ -67,11 +67,21 @@ class ProducerWalkCtx:
     fwd_info: CurrentForwardPassInfo | None = None
 
 
+class ClientAudio(NamedTuple):
+    """What an audio client stream carries: mono audio at ``sample_rate``.
+    ``frame_samples`` is the frame its consumer computes on, which a route
+    that translates a client's own codec and rate (``/v1/realtime``) cuts the
+    audio into, one frame per item."""
+    sample_rate: int
+    frame_samples: int
+
+
 @dataclass
 class Connection:
     """Defines a streaming connection between two partitions, or from the
     client (``from_partition=CLIENT``) into one. Only a client stream takes
-    ``limits``: a partition's output is bounded by the model itself."""
+    ``limits`` (a partition's output is bounded by the model itself) or
+    ``audio``."""
     from_partition: str
     to_partition: str
     edge_name: str
@@ -82,6 +92,7 @@ class Connection:
     # pass's items run under the consumer walk it returns: the producer, which
     # owns the consumer's walk, decides it, and the consumer only applies it.
     consumer_walk: Callable[[ProducerWalkCtx], str] | None = None
+    audio: ClientAudio | None = None
 
 
 @dataclass
@@ -100,8 +111,11 @@ class PartitionTopology:
         for conn in self.connections:
             if conn.to_partition == CLIENT:
                 raise ValueError(f"the client only produces streams; {conn.edge_name!r} flows into it")
-            if conn.limits is not None and conn.from_partition != CLIENT:
-                raise ValueError(f"{conn.edge_name!r} has limits but is not a client stream")
+            if (conn.limits is not None or conn.audio is not None) and conn.from_partition != CLIENT:
+                raise ValueError(f"{conn.edge_name!r} has limits or audio but is not a client stream")
+            frame = None if conn.audio is None else conn.audio.frame_samples
+            if frame is not None and (isinstance(frame, bool) or not isinstance(frame, int) or frame < 1):
+                raise ValueError(f"{conn.edge_name!r}'s audio frame_samples must be a positive integer, not {frame!r}")
             if conn.consumer_walk is not None and conn.from_partition == CLIENT:
                 # the hook runs on the producer worker, and the client has none
                 raise ValueError(f"client stream {conn.edge_name!r} cannot drive its consumer's walk")

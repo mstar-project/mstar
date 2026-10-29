@@ -2395,12 +2395,36 @@ streams (audio and video, say): each has its own buffer and its own end.
   session cap of its own. Declare the most the consumer can take: a deployment may
   lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise
   it.
+- An audio client stream may declare what its audio is,
+  ``Connection(..., audio=ClientAudio(sample_rate, frame_samples))``: mono audio at
+  ``sample_rate``, whose consumer computes on frames of ``frame_samples``. ``/v1/realtime``
+  then serves the model as a conversation (:doc:`clients`), when only one of its client
+  streams declares it: the route decodes the caller's codec, resamples to
+  ``sample_rate`` and appends exactly one frame of ``frame_samples`` per item, holding a
+  partial frame for the next message, and turns the model's output back into the
+  caller's format from ``get_output_sample_rate``. Nemotron VoiceChat declares
+  ``ClientAudio(16000, 1280)``: its encoder's 80 ms frame, taken from the encoder's own
+  hop and subsampling.
+- A model that declares ``ClientAudio`` decides when to speak (full duplex). To serve
+  ``/v1/realtime`` conversations it also declares ``turn_tokens = (start_id, end_id)`` on
+  the model (a property when the ids come from its config): the text tokens that open and
+  close each reply. Without them ``/generate/ws`` still serves it, and a conversation is
+  refused. The data worker marks the text chunks they arrive in with
+  ``metadata["turn"]``, their marks (``"start"`` / ``"end"``) in token order, on every
+  route, before ``postprocess`` (which may decode them to nothing), and stamps each text
+  and audio chunk with ``metadata["step"]``, the iteration of the loop that emitted it.
+  ``/v1/realtime`` frames one response per reply from the marks and puts step ``k``'s
+  audio in the reply whose text steps hold ``k``, so the text and the audio node must
+  each emit from a loop that steps once per input item (startup refuses one that emits
+  outside a loop).
 - A stream ends when the client ends it: ``end_input: true`` ends all of the call's
   streams, a list of names only those. The consumer gets ``producer_done`` for that edge
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
   Over ``/generate/ws`` the client appends and ends input explicitly (see
-  :doc:`clients`); every other route ends the input as soon as the request is submitted.
-  ``/generate/ws`` is on the Python frontend only, not ``--rust-frontend``.
+  :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open for the call's life;
+  every other route ends the input as soon as the request is submitted. ``/generate/ws``
+  and ``/v1/realtime`` are on the Python frontend only, not ``--rust-frontend``, and the
+  Dynamo worker refuses a model with client streams.
 - The API server's data worker is the stream's producer. The conductor tells it the
   consuming node and its ranks once per call, when it dispatches the request, and the data
   worker sends each append's items to every one of those ranks itself, and then the

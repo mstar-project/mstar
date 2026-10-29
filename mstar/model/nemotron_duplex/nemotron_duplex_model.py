@@ -21,19 +21,16 @@ natural turn-taking and barge-in/interruptions.
 
 Input:  optional system prompt + user speech.  Output: agent text + agent speech.
 
-INFERENCE PATHS (all live, verified vs the NeMo reference):
-    * ``offline_inference`` — batched offline S2S (frame-synchronous perception →
-      AddFusion → nano no-cache re-prefill → sample → talker RVQ → codec).
-    * ``create_stream`` / ``DuplexStream`` — online streaming duplex with a
-      persistent nano cache (attn KV + Mamba conv/ssm state) and per-frame talker;
-      matches the offline text path and vocalizes with CFG + noise sampling.
-    * ``realtime_api`` — OpenAI Realtime-API WebSocket server over ``DuplexStream``.
+``offline_inference`` is batched offline S2S outside the engine
+(frame-synchronous perception → AddFusion → nano no-cache re-prefill → sample →
+talker RVQ → codec), verified against the NeMo reference and kept as the
+parity oracle.
 
 The M* serving path is the walk graphs below: three async partitions
 (Encoder → LLM → Talker) joined by ``StreamingGraphEdge``s, with the nano
 decode loop consuming one encoder frame per step. The user's audio is a client
-stream into the Encoder, so a call can stream live over ``/generate/ws``; a
-one-shot upload is a stream of one chunk. ``get_node_resources`` declares
+stream into the Encoder, so a call can stream live over ``/generate/ws`` or
+``/v1/realtime``; a one-shot upload is a stream of one chunk. ``get_node_resources`` declares
 the encoder's bounded KV (each call's attention window) and two recurrent-state
 pools (its conv tails, and its audio / mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
 conv + SSM slots), the Mamba-2 resource and the sampler, and the talker's paged
@@ -102,6 +99,7 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import (
     CLIENT,
+    ClientAudio,
     ClientStreamLimits,
     Connection,
     PartitionTopology,
@@ -157,200 +155,6 @@ def _sample_text_token(
             lg[s_idx[rm]] = float("-inf")
         sampled[b] = torch.multinomial(torch.softmax(lg, dim=-1), num_samples=1).item()
     return sampled
-
-
-class _StreamOutput:
-    """One streaming step's agent output: an int16 PCM audio chunk and/or a text delta."""
-
-    __slots__ = ("audio", "text")
-
-    def __init__(self, audio: bytes | None = None, text: str | None = None):
-        self.audio = audio
-        self.text = text
-
-
-class DuplexStream:
-    """Online (streaming) duplex inference session — the Phase-B/C path.
-
-    Audio is fed in chunks via ``append_audio``; each new ~80 ms perception frame
-    runs one duplex step (fuse -> nano cached-decode step -> sample text/function
-    -> talker frame -> codec frame) and yields agent audio + text deltas. The
-    nano attention-KV + Mamba conv/ssm state and the talker KV state persist
-    across the whole stream (O(1) per frame). Perception is re-encoded over a
-    growing buffer each chunk — correct because the Conformer is causal
-    (att_context [70,0]); a true streaming Conformer cache is a later perf item.
-
-    Produces the SAME result as ``offline_inference`` on the concatenated audio.
-    """
-
-    def __init__(self, model, device: str, voice: str, temperature: float, top_p: float,
-                 repetition_penalty: float, prompt_tokens: torch.Tensor | None = None):
-        self.m = model
-        self.cfg = model.config
-        self.device = device
-        self.voice = voice
-        self.temperature = temperature
-        self.top_p = top_p
-        self.repetition_penalty = repetition_penalty
-        self.special_ids = {self.cfg.text_pad_id, self.cfg.text_bos_id, self.cfg.text_eos_id}
-        # System-prompt tokens (fed via the audio channel, gen_text held at PAD,
-        # exactly as offline_inference prepends the prompt). Primes the nano cache.
-        self.prompt_tokens = None if prompt_tokens is None else prompt_tokens.to(device).view(-1)
-
-        self.encoder = model.get_submodule("conformer_encoder", device=device)
-        self.nano = model.get_submodule("nano_llm", device=device).language_model
-        self.talker = model.get_submodule("eartts_talker", device=device).talker
-        self.codec = model.get_submodule("eartts_talker", device=device).codec
-
-        # talker char-vocab conditioning maps (built once)
-        tok = model._talker_tokenizer()
-        from mstar.model.nemotron_duplex.components.eartts_talker import build_char_vocab, subword_to_char_ids
-        cv = build_char_vocab(tok)
-        self._s2c, _ = subword_to_char_ids(tok, cv)
-        self._char_pad = len(cv)
-
-        self.reset()
-
-    def reset(self):
-        self._wav = torch.zeros(0)
-        self._processed = 0                    # perception frames already stepped
-        self._nano_cache = None                # nano decode cache (B.1)
-        self._gen_text = []                    # sampled agent text tokens (all frames)
-        self._prev_func = self.cfg.text_pad_id
-        self._talker_state = None
-        self._prev_codes = None
-        self._codes_hist = None                # (1, n, num_q) accumulated RVQ codes
-        self._emitted = 0                      # waveform samples already emitted
-        self._t = 0
-        # Dedicated seeded RNG for the talker's stochastic MoG sampling — keeps the
-        # audio reproducible and off the rare collapse-to-constant-code states an
-        # uncontrolled global RNG hits (mirrors the reference's manual_seed).
-        self._talker_gen = torch.Generator(device=self.device).manual_seed(self.cfg.eartts.inference_seed)
-        self._prime_prompt()                   # feed the system prompt (if any) first
-
-    @torch.no_grad()
-    def _prime_prompt(self):
-        """Prime the nano cache with the system prompt, mirroring how
-        ``_infer_one`` prepends ``prompt_emb`` to the audio channel and holds
-        ``gen_text`` at PAD across the prompt region (no sampling, no talker).
-        Frame 0's agent channel is BOS; later prompt frames use PAD."""
-        if self.prompt_tokens is None or self.prompt_tokens.numel() == 0:
-            return
-        nano, cfg = self.nano, self.cfg
-        embed_tokens = nano.embed_tokens
-        prompt_emb = embed_tokens(self.prompt_tokens)          # (P, H)
-        for i in range(prompt_emb.shape[0]):
-            prev_text = cfg.text_bos_id if i == 0 else cfg.text_pad_id
-            agent_emb = embed_tokens(torch.tensor([prev_text], device=self.device))
-            func_emb = embed_tokens(torch.tensor([cfg.text_pad_id], device=self.device))
-            fused = agent_emb * cfg.agent_text_weight + prompt_emb[i].unsqueeze(0) * cfg.user_audio_weight
-            if cfg.use_function_head:
-                fused = fused + func_emb * cfg.function_weight
-            self._nano_hidden(fused)                           # primes cache; no sampling
-            self._gen_text.append(cfg.text_pad_id)             # prompt region held at PAD
-
-    def append_audio(self, pcm_int16: bytes) -> list[_StreamOutput]:
-        chunk = torch.frombuffer(bytearray(pcm_int16), dtype=torch.int16).float() / 32768.0
-        self._wav = torch.cat([self._wav, chunk])
-        return self._step_new_frames()
-
-    def flush(self) -> list[_StreamOutput]:
-        # End of input: no more audio will arrive, so the held-back trailing frames
-        # are now final — consume them too (matches offline's zero-padded tail).
-        return self._step_new_frames(final=True)
-
-    @torch.no_grad()
-    def _step_new_frames(self, final: bool = False) -> list[_StreamOutput]:
-        if self._wav.numel() < self.encoder.log_mel.min_samples:   # too short to featurize
-            return []
-        audio_embeds = self.encoder.encode_clip(self._wav)[None]   # (1, T, H) — causal, re-encoded
-        T = audio_embeds.shape[1]
-        nano, cfg = self.nano, self.cfg
-        embed_tokens = nano.embed_tokens
-        outs: list[_StreamOutput] = []
-
-        # Hold back the encoder's right-context lookahead frames: the newest
-        # `streaming_lookahead_frames` are not yet final (they change as more audio
-        # arrives), so consuming them now would permanently diverge from offline.
-        # At `final` (flush) there is no future audio, so consume everything.
-        limit = T if final else max(self._processed, T - cfg.stt.streaming_lookahead_frames)
-        for t in range(self._processed, limit):
-            # Global position — with a primed system prompt, gen_text already holds
-            # `prompt_len` PADs, so the first audio frame's prev is the last prompt
-            # PAD (not BOS). BOS applies only at true global frame 0 (no prompt).
-            prev_text = cfg.text_bos_id if len(self._gen_text) == 0 else self._gen_text[-1]
-            agent_emb = embed_tokens(torch.tensor([prev_text], device=self.device))
-            func_emb = embed_tokens(torch.tensor([self._prev_func], device=self.device))
-            fused = agent_emb * cfg.agent_text_weight + audio_embeds[0, t].unsqueeze(0) * cfg.user_audio_weight
-            if cfg.use_function_head:
-                fused = fused + func_emb * cfg.function_weight   # (1, H) == (L=1, H)
-
-            hidden = self._nano_hidden(fused)           # (1, H)
-            text_logits = nano.lm_head(hidden)          # (1, vocab)
-            func_logits = nano.function_head(hidden)
-            gt = torch.tensor(self._gen_text, device=self.device).view(1, -1)
-            text_tok = int(_sample_text_token(
-                text_logits, gt, len(self._gen_text), self.temperature, self.top_p,
-                self.repetition_penalty, special_ids=self.special_ids,
-            )[0])
-            self._gen_text.append(text_tok)
-            self._prev_func = int(func_logits.argmax(-1)[0])
-
-            outs.append(self._talker_codec_frame(text_tok))
-            self._t += 1
-        self._processed = limit   # held-back frames stay unconsumed until finalized
-        return outs
-
-    def _nano_hidden(self, fused: torch.Tensor) -> torch.Tensor:
-        """One nano step with persistent cache (B.1 cached decode; re-prefill fallback)."""
-        if hasattr(self.nano.llm, "decode_step") and hasattr(self.nano.llm, "prefill"):
-            if self._nano_cache is None:
-                h, self._nano_cache = self.nano.llm.prefill(fused)
-                return h[-1:]
-            return self.nano.llm.decode_step(fused, self._nano_cache)
-        # Fallback (pre-B.1): accumulate fused embeds and re-prefill (O(T^2)).
-        self._fused_hist = fused if self._nano_cache is None else torch.cat([self._nano_cache, fused], 0)
-        self._nano_cache = self._fused_hist
-        return self.nano.llm.offline_forward(self._fused_hist)[-1:]
-
-    def _talker_codec_frame(self, text_tok: int) -> _StreamOutput:
-        talker, cfg = self.talker, self.cfg
-        if self._talker_state is None:
-            self._talker_state = talker.init_state(
-                1, speaker=self.voice, device=self.device,
-                subword_id_to_char_ids=self._s2c, char_pad_idx=self._char_pad,
-                text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id,
-                speech_pad_id=cfg.eartts.codebook_size,
-            )
-            self._prev_codes = self._talker_state.get("prev_codes")
-            if self._prev_codes is None:
-                self._prev_codes = talker.initial_prev_codes(1, device=self.device)
-        cur = torch.tensor([[text_tok]], device=self.device)
-        mask = torch.ones_like(cur, dtype=torch.bool)
-        cond = talker.text_conditioning(cur, mask, self._s2c, self._char_pad)
-        codes, self._talker_state = talker.infer_codes_one_step(
-            self._talker_state, cur, cur, self._prev_codes, cond=cond,
-            text_eos_id=cfg.text_eos_id, temperature=self.temperature,
-            num_iter=talker.config.inference_num_iter,
-            guidance_scale=talker.config.inference_guidance_scale,
-            noise_scale=talker.config.inference_noise_scale,
-            top_p=talker.config.inference_top_p,
-            generator=self._talker_gen,
-        )
-        self._prev_codes = codes
-        # Codec has a multi-frame (causal) receptive field, so decode the full code
-        # history and emit only the newly-produced tail (matches offline decode).
-        frame = codes.unsqueeze(1)                                      # (1, 1, num_q)
-        self._codes_hist = frame if self._codes_hist is None else torch.cat([self._codes_hist, frame], dim=1)
-        with torch.autocast(device_type="cuda", enabled=False):
-            audio, _ = self.codec.decode(
-                self._codes_hist, torch.tensor([self._codes_hist.shape[1]], device=self.device),
-            )                                                          # (1, 1, samples)
-        wav = audio.squeeze(1)[0]                                       # (samples,)
-        new = wav[self._emitted:]
-        self._emitted = wav.shape[0]
-        pcm = (new.clamp(-1, 1) * 32767).to(torch.int16).cpu().numpy().tobytes()
-        return _StreamOutput(audio=pcm, text=self.m.tokenizer.decode([text_tok]))
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -743,13 +547,17 @@ class NemotronDuplexModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
+        stt = self.config.stt
+        # the streaming encoder's frame (FastConformerStreamSubmodule.frame_samples)
+        frame = stt.hop_length * stt.encoder.subsampling_factor
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker"], connections=[
             # the user's audio, one item per uploaded file or append, at most a
             # session's samples: past them the talker KV and the decode loops run out
             Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
                        limits=ClientStreamLimits(max_items=self.max_session_samples,
-                                                 item_size=torch.numel, unit="samples")),
+                                                 item_size=torch.numel, unit="samples"),
+                       audio=ClientAudio(stt.sample_rate, frame_samples=frame)),
             # one audio frame per nano decode step. continue_after_done=False:
             # the duplex nano text loop is 1:1 with audio frames, so when the
             # encoder's frames are exhausted the decode loop must terminate
@@ -993,38 +801,17 @@ class NemotronDuplexModel(Model):
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.eartts.sample_rate
 
-    # -------------------------------------------------------------------
-    # Online (streaming) duplex inference — Phase B/C.
-    # -------------------------------------------------------------------
+    @property
+    def turn_tokens(self) -> tuple[int, int]:
+        # the agent channel's BOS / EOS open and close each reply
+        return self.config.text_bos_id, self.config.text_eos_id
 
-    def prepare_streaming(self, device: str = "cuda"):
-        """Warm (build + load) all three submodules so streaming starts promptly."""
-        for node in ("conformer_encoder", "nano_llm", "eartts_talker"):
-            self.get_submodule(node, device=device)
+    def get_voices(self) -> list[str]:
+        from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
+        return [EarTTSTalkerSubmodule.SPEAKER]
 
-    def encode_prompt(self, system_prompt: str, device: str = "cuda") -> torch.Tensor | None:
-        """Tokenize a system prompt to nano text-token ids: ``[bos] + ids + [eos]``
-        (mirrors the reference ``encode_system_prompt``). Returns ``(1, P)`` or None."""
-        if not system_prompt or not system_prompt.strip():
-            return None
-        tok = self.tokenizer
-        ids = tok.encode(system_prompt, add_special_tokens=False)
-        ids = [tok.bos_token_id] + ids + [tok.eos_token_id]
-        return torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-
-    def create_stream(
-        self, device: str = "cuda", voice: str = "Aria",
-        temperature: float = 0.7, top_p: float = 0.9, repetition_penalty: float = 1.0,
-        prompt_tokens: torch.Tensor | None = None, system_prompt: str | None = None,
-    ) -> DuplexStream:
-        """Open an online duplex streaming session (see ``DuplexStream``).
-
-        A system prompt may be passed either pre-tokenized (``prompt_tokens``,
-        ``(1, P)`` nano text ids) or as raw text (``system_prompt``); it primes
-        the nano cache before any audio, exactly as offline prepends it."""
-        if prompt_tokens is None and system_prompt is not None:
-            prompt_tokens = self.encode_prompt(system_prompt, device=device)
-        return DuplexStream(self, device, voice, temperature, top_p, repetition_penalty, prompt_tokens)
+    def get_default_voice(self) -> str:
+        return self.get_voices()[0]
 
     # -------------------------------------------------------------------
     # Standalone offline inference (Phase A — mirrors the reference

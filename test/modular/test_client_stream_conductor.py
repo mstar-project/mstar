@@ -36,6 +36,7 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
     CLIENT,
+    ClientAudio,
     ClientStream,
     ClientStreamLimits,
     Connection,
@@ -370,6 +371,33 @@ def test_client_streams_without_process_stream_chunk_fail_at_startup():
     assert _refused(_NoHook(), "process_stream_chunk")
 
 
+def test_a_client_stream_that_declares_audio_needs_looped_output():
+    """/v1/realtime would fail such a call at the first chunk without a loop
+    step. Turn tokens are not needed to start: only a conversation needs them."""
+    class _Unmarked(_DuplexToy):
+        def get_partition_topology(self):
+            conn = _client_connection("audio_in")
+            conn.audio = ClientAudio(16000, 1280)
+            return PartitionTopology(partitions=["Ear"], connections=[conn])
+
+    class _Marked(_Unmarked):
+        turn_tokens = (1, 2)
+
+    class _Unlooped(_Marked):
+        def get_graph_walk_graphs(self):
+            return {"listen": super().get_graph_walk_graphs()["listen"].section}
+
+    class _AtLoopExit(_Marked):
+        def get_graph_walk_graphs(self):
+            return {"listen": Loop(
+                name="listen_loop", max_iters=1000, section=super().get_graph_walk_graphs()["listen"].section,
+                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="text", output_modality="text")])}
+
+    assert _refused(_Unlooped(), "['ear'] emit outside one")
+    assert _refused(_AtLoopExit(), "['listen_loop'] emit outside one")
+    assert check_client_streams(_Unmarked(), {}) == check_client_streams(_Marked(), {}) == []
+
+
 def test_a_client_stream_into_no_partition_fails_at_startup():
     class _Nowhere(_DuplexToy):
         def get_partition_topology(self):
@@ -532,9 +560,14 @@ def test_bad_client_stream_settings_fail_startup(config, match):
     assert _refused(_Bounded(ClientStreamLimits()), match, config)
 
 
-def test_only_a_client_stream_takes_limits():
-    with pytest.raises(ValueError, match="not a client stream"):
+@pytest.mark.parametrize("producer, declared, match", [
+    ("A", {"limits": ClientStreamLimits(max_items=1)}, "not a client stream"),
+    ("A", {"audio": ClientAudio(16000, 1280)}, "not a client stream"),
+    *((CLIENT, {"audio": ClientAudio(16000, frame)}, "positive integer") for frame in (0, -4, True, 2.5)),
+])
+def test_a_topology_refuses_a_stream_declaration_it_cannot_serve(producer, declared, match):
+    with pytest.raises(ValueError, match=match):
         PartitionTopology(partitions=["A", "B"], connections=[Connection(
-            from_partition="A", to_partition="B", edge_name="x",
-            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), limits=ClientStreamLimits(max_items=1),
+            from_partition=producer, to_partition="B", edge_name="x",
+            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), **declared,
         )])

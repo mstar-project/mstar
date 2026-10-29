@@ -207,13 +207,3 @@ def test_mstar_serve_forwards_the_key_and_never_prints_it(monkeypatch, capsys):
     assert argv[argv.index("--api-key") + 1] == KEY
     printed = capsys.readouterr().err
     assert KEY not in printed and 'api_key="<your key>"' in printed
-
-
-def test_nemotron_realtime_server_checks_the_handshake():
-    from mstar.model.nemotron_duplex.realtime_api import build_app
-
-    client = TestClient(build_app(model=None, api_key=KEY))
-    with pytest.raises(WebSocketDisconnect) as info:
-        with client.websocket_connect("/v1/realtime"):
-            pass
-    assert info.value.code == 1008
