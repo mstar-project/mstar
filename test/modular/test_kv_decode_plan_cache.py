@@ -317,13 +317,18 @@ def test_plans_and_streams_are_freed_by_refcount():
     when the last reference does, not at the cyclic GC's next pass."""
     kv = _manager(0)
     gc.collect()
+    # another test's module may keep its managers, and their streams, for the session
+    before = {id(o) for o in gc.get_objects() if isinstance(o, (KVPlanOutputs, CacheStream))}
     gc.disable()
     try:
         _prefill(kv, "a", 5)
         for t in range(4):
             _decode(kv, ("a",), slot=t % 2)
         kv.remove_request("a")
-        alive = [type(o).__name__ for o in gc.get_objects() if isinstance(o, (KVPlanOutputs, CacheStream))]
+        alive = [
+            type(o).__name__ for o in gc.get_objects()
+            if isinstance(o, (KVPlanOutputs, CacheStream)) and id(o) not in before
+        ]
     finally:
         gc.enable()
     assert alive == []

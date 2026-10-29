@@ -1731,7 +1731,7 @@ class KVManager(AttentionResource):
                     pages = stream.pages()
                     drop = self._arena.any_sealed(pages)
                     if drop:
-                        # before the reset, which clears the lists ``pages`` may be
+                        # before the reset, which clears the lists ``pages`` may alias
                         self._release(rid, stream, pages)
                     stream.reset(freed=drop)
                     stream.forget_chain()
@@ -2130,22 +2130,22 @@ class KVManager(AttentionResource):
                 stream = self._streams.get(rid, {}).get(label)
                 if stream is None:
                     continue  # reset or removed under us; its pages went with it
-                stream = stream.group(g)
-                if stream.page_indices[-len(pages):] != pages:
+                part = stream.group(g)
+                if part.page_indices[-len(pages):] != pages:
                     logger.error(
                         "KV %s: cannot unwind %s/%s's admit — its pages are no "
                         "longer the tail of the stream (%d reserved, stream has "
                         "%d). Leaving them; the free pool is short by that much.",
                         self.name, rid, label, len(pages),
-                        len(stream.page_indices),
+                        len(part.page_indices),
                     )
                     continue
-                del stream.page_indices[-len(pages):]
+                del part.page_indices[-len(pages):]
                 self._release(rid, stream, pages)
                 self._recount(rid)
                 # so an offload that claimed this stream mid-admit notices its
                 # host copy no longer describes it and aborts
-                stream.generation += 1
+                part.generation += 1
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -3682,7 +3682,7 @@ class KVManager(AttentionResource):
                 pages = stream.pages()
                 drop = free or self._arena.any_sealed(pages)
                 if drop:
-                    # before the reset, which clears the lists ``pages`` may be
+                    # before the reset, which clears the lists ``pages`` may alias
                     self._release(rid, stream, pages)
                 stream.reset(freed=drop)
                 # a stale cursor or generated key would misfile what the rerun writes
@@ -4060,7 +4060,7 @@ class KVManager(AttentionResource):
         return pages
 
     def _release(self, rid: str, stream: CacheStream, pages: list[int], refund: bool = True) -> None:
-        """Release ``pages``, which the caller has already taken off ``stream``.
+        """Release ``pages`` of ``stream``, which the caller takes off the stream before it recounts.
 
         A page not in ``stream.lent`` shrinks the allotment by one when its release leaves
         the page neither free nor evictable, and always when ``refund`` is False. Otherwise
