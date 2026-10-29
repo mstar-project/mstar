@@ -1149,7 +1149,14 @@ class Cosmos3Model(Model):
                 # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
                 from torchcodec.encoders import VideoEncoder
 
-                frames = x.permute(1, 0, 2, 3).contiguous().cpu()  # [T, C, H, W] uint8
+                from mstar.utils.host_copy import copy_into
+
+                # [T, C, H, W]. The API server keeps torch's intra-op pool small, and
+                # a 121-frame clip is 145 MB, so the transpose copies on copy_into's
+                # threads instead.
+                x = x.cpu()
+                frames = torch.empty((x.shape[1], x.shape[0], *x.shape[2:]), dtype=torch.uint8)
+                copy_into(frames.numpy(), x.numpy().transpose(1, 0, 2, 3))
                 encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
                     "mp4",
                     codec="libx264",

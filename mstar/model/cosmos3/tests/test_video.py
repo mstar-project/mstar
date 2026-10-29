@@ -301,3 +301,36 @@ def test_video_postprocess_falls_back_to_pyav(monkeypatch) -> None:
         codec, rate = stream.codec_context.name, float(stream.average_rate)
     assert len(frames) == 9 and (frames[0].width, frames[0].height) == (64, 48)
     assert codec == "h264" and rate == 12.0
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_video_postprocess_hands_torchcodec_time_major_frames(monkeypatch, parallel) -> None:
+    """torchcodec gets the decoder's [C, T, H, W] clip as contiguous [T, C, H, W]
+    frames, whether copy_into copies it in one go or in slices."""
+    import sys
+    import types
+
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+    from mstar.utils import host_copy
+
+    seen = []
+
+    class _Encoder:
+        def __init__(self, frames, *, frame_rate):
+            seen.append(frames.clone())
+
+        def to_tensor(self, *args, **kwargs):
+            return torch.zeros(4, dtype=torch.uint8)
+
+    package = types.ModuleType("torchcodec")
+    encoders = types.ModuleType("torchcodec.encoders")
+    encoders.VideoEncoder = _Encoder
+    monkeypatch.setitem(sys.modules, "torchcodec", package)
+    monkeypatch.setitem(sys.modules, "torchcodec.encoders", encoders)
+    if parallel:
+        monkeypatch.setattr(host_copy, "PARALLEL_COPY_BYTES", 0)
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    video = torch.randint(0, 255, (1, 3, 9, 48, 64), dtype=torch.uint8)
+    assert model.postprocess(video, "video", {"fps": 12.0}) == bytes(4)
+    (frames,) = seen
+    assert frames.is_contiguous() and torch.equal(frames, video[0].permute(1, 0, 2, 3))

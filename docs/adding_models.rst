@@ -1823,6 +1823,12 @@ default:
 The setting applies only to the API server process. The conductor and workers keep
 torch's default.
 
+A pool that small is slow for a large copy: a 121-frame 832x480 video is 145 MB. The
+arena read of an output, and any layout change a ``postprocess`` makes to a video before
+encoding it, should go through ``mstar.utils.host_copy.copy_into``, which copies anything
+over 16 MB in slices on up to 8 threads of its own (Cosmos3's ``[C, T, H, W]`` to
+``[T, C, H, W]`` transpose does).
+
 .. _tensor-parallelism:
 
 Tensor parallelism (sharding)
