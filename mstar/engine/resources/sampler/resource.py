@@ -596,6 +596,22 @@ class SamplerResource(Resource):
         loop-back needs. False on an eager-only node or with the knob off."""
         return self._cg_buffers is not None and self._keep_last_token
 
+    @property
+    def loopback_in_graph(self) -> bool:
+        """Whether a captured step may read its loop-back tokens inside the
+        graph: the slot masters exist and never move, which holds when the
+        in-graph scatter allocated them once."""
+        return self.has_slot_masters and self._cg_buffers.ingraph_scatter
+
+    def write_loopback_tokens(self, rows: list[int], tokens: torch.Tensor) -> None:
+        """Put the tokens of this step's ``rows`` (positions in the planned
+        batch) that arrived from elsewhere in their slot masters, for a
+        replay that reads them there (``loopback_in_graph``)."""
+        rids = self._planned_rows()
+        self._cg_buffers.write_last_tokens([rids[i] for i in rows], tokens)
+
+    # out of dynamo: a captured forward calls it to record the gather itself
+    @torch.compiler.disable
     def loopback_tokens(self) -> torch.Tensor:
         """The last sampled token of each row of this step, as its input ids,
         read on the device. Under a slot lease the planned slot's index row

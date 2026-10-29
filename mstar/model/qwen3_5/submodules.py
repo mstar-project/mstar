@@ -426,13 +426,27 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
         captured = self._captured_decode(engine_inputs, graph_walk)
+        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+        if captured and ingraph_decode_rope() and sampler.loopback_in_graph:
+            # The captured forward reads each row's last token off the slot
+            # masters itself (`_forward`), so nothing is staged. A row that
+            # brought its token has it written there first; a capture's rows
+            # bring dummies the graph never reads.
+            routed = [
+                i for i, inp in enumerate(inputs)
+                if inp.input_ids is not None and inp.input_seq_len
+            ]
+            if routed and not engine_inputs.step.ctx.capture:
+                sampler.write_loopback_tokens(
+                    routed, torch.cat([inputs[i].input_ids for i in routed]),
+                )
+            return out
         first = inputs[0]
         if first.input_embeds is None and (
             first.input_ids is None or any(inp.input_ids is None for inp in inputs)
         ):
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)
-            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             ids = sampler.loopback_tokens()
             # rows whose last step ran elsewhere brought their token
