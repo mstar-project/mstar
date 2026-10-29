@@ -475,3 +475,71 @@ def test_requests_hold_slot_groups_and_return_them():
         h.spec.remove_request(r)
     assert h.pool.num_free_slots == free
     assert h.spec.pending_retract(0) == 0 and not h.spec._row_of
+
+
+def _filtered(logits: torch.Tensor, temperature: float, top_p: float, top_k: int) -> torch.Tensor:
+    """The sampler's distribution: top-k, then top-p over the renormalised rest."""
+    probs = (logits.double() / temperature).softmax(-1)
+    order = probs.argsort(descending=True)
+    keep = torch.zeros_like(probs, dtype=torch.bool)
+    if top_k > 0:
+        keep[order[:top_k]] = True
+    else:
+        keep[:] = True
+    probs = torch.where(keep, probs, 0.0)
+    probs = probs / probs.sum()
+    sorted_p = probs[order]
+    mass_before = sorted_p.cumsum(0) - sorted_p
+    cut = torch.zeros_like(keep)
+    cut[order] = mass_before < top_p
+    probs = torch.where(cut & keep, probs, 0.0)
+    return probs / probs.sum()
+
+
+@pytest.mark.parametrize("params", [(1.0, 1.0, 0), (0.7, 0.9, 0), (1.3, 1.0, 5), (0.8, 0.6, 4)])
+def test_sampled_verification_follows_the_target_distribution(params):
+    """k = 1 against fixed logits: the first emitted token is a draw from the
+    target's filtered distribution at position 0, whether or not the draft is
+    accepted, and the token after an accepted draft one from position 1's."""
+    torch.manual_seed(0)
+    temperature, top_p, top_k = params
+    rows, vocab, draws = 400, 12, 30
+    spec = SpecDecodeResource(device=CPU, num_draft_tokens=1, max_requests=rows, page_size=PAGE,
+                              kv_key="kv", attn_key="attn", sampling=True)
+    for r in range(rows):
+        spec.ingest_request(r)
+    image = spec._new_image(rows)
+    image.rows.copy_(torch.tensor([spec._row_of[r] for r in range(rows)], dtype=torch.int32))
+    image.real.fill_(1)
+    table = torch.arange(1, rows * 4 + 1, dtype=torch.int32).view(rows, 4)
+    state = torch.zeros(rows * 2, dtype=torch.long)
+    from mstar.engine.resources.spec_decode.resource import SpecDecodePlan
+
+    spec._current = SpecDecodePlan(
+        phase=SpecPhase.VERIFY, num_rows=rows, image=image, block_table=table,
+        kv_lens=torch.zeros(rows, dtype=torch.int32), write_pages=state, write_offsets=state.clone(),
+    )
+    regs = slice(1, rows + 1)
+    spec._temperature[regs], spec._top_p[regs], spec._top_k[regs] = temperature, top_p, top_k
+    spec._budget[regs] = 1 << 20
+    logits = torch.randn(2, vocab) * 2
+    p0, p1 = (_filtered(logits[i], temperature, top_p, top_k) for i in range(2))
+    draft = int(p0.argmax())
+    first, after = torch.zeros(vocab), torch.zeros(vocab)
+    for _ in range(draws):
+        spec._tokens[regs] = torch.tensor([3, draft])
+        spec._seq_len[regs] = 10
+        spec.verify_inputs()
+        out = spec.accept(logits.repeat(rows, 1), sample=True)
+        first += torch.bincount(out.tokens[:, 0], minlength=vocab)
+        accepted = out.accepted == 2
+        after += torch.bincount(out.tokens[accepted, 1], minlength=vocab)
+    n = rows * draws
+    tv_first = 0.5 * (first / n - p0).abs().sum()
+    tv_after = 0.5 * (after / after.sum() - p1).abs().sum()
+    assert tv_first < 0.02, (tv_first, first / n, p0)
+    assert tv_after < 0.03, (tv_after, after / after.sum(), p1)
+    # filtered-out tokens are never drawn
+    assert not first[p0 == 0].any() and not after[p1 == 0].any()
+    # the draft is accepted as often as the target would have drawn it
+    assert abs(float(accepted.float().mean()) - float(p0[draft])) < 0.1
