@@ -102,6 +102,7 @@ class Wan22Model(Model):
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
         attention_backend: str = "auto",
         linear_dtype: str = "bf16",
+        fp8_keep_bf16: list[str] | None = None,
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -122,6 +123,8 @@ class Wan22Model(Model):
         self.attention_backend = attention_backend
         # fp8: the DiT blocks' linears (Wan22DiT.FP8_LINEARS) run as fp8 GEMMs where the GPU has them
         self.linear_dtype = check_linear_dtype(linear_dtype)
+        # fp8 linears kept in bf16 anyway (module-name patterns, block ranges like single_blocks.0-3.*)
+        self.fp8_keep_bf16 = [str(p) for p in (fp8_keep_bf16 or [])]
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
@@ -767,7 +770,9 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            apply_linear_dtype(transformer, self.linear_dtype, transformer.FP8_LINEARS, "Wan2.2 transformer")
+            apply_linear_dtype(
+                transformer, self.linear_dtype, transformer.FP8_LINEARS, "Wan2.2 transformer", keep=self.fp8_keep_bf16,
+            )
             return Wan22DitSubmodule(transformer, self.config, use_ragged_attention=self.use_ragged_attention)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None

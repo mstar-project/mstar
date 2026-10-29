@@ -103,6 +103,7 @@ class Flux2KleinModel(Model):
         async_scheduling: bool = True,
         lora: list | None = None,
         linear_dtype: str = "bf16",
+        fp8_keep_bf16: list[str] | None = None,
         **kwargs,
     ):
         # the DiT's attention: the engine's ragged resource (the platform's kernel), or torch's SDPA inline
@@ -145,6 +146,8 @@ class Flux2KleinModel(Model):
         self.loras = [LoraSpec.parse(item) for item in (lora or [])]
         # fp8: the DiT blocks' linears (Flux2DiT.FP8_LINEARS) run as fp8 GEMMs where the GPU has them
         self.linear_dtype = check_linear_dtype(linear_dtype)
+        # fp8 linears kept in bf16 anyway (module-name patterns, block ranges like single_blocks.0-3.*)
+        self.fp8_keep_bf16 = [str(p) for p in (fp8_keep_bf16 or [])]
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None
@@ -491,7 +494,9 @@ class Flux2KleinModel(Model):
                 from mstar.model.flux2_klein.weight_loader import apply_transformer_loras
 
                 apply_transformer_loras(transformer, self.loras)
-            apply_linear_dtype(transformer, self.linear_dtype, transformer.FP8_LINEARS, "FLUX.2 transformer")
+            apply_linear_dtype(
+                transformer, self.linear_dtype, transformer.FP8_LINEARS, "FLUX.2 transformer", keep=self.fp8_keep_bf16,
+            )
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.use_ragged_attention else None,

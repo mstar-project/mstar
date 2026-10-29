@@ -71,6 +71,7 @@ class ZImageModel(Model):
         vae_compile: bool = False,
         async_scheduling: bool = True,
         linear_dtype: str = "bf16",
+        fp8_keep_bf16: list[str] | None = None,
         **kwargs,
     ):
         # the DiT's attention: the engine's ragged resource (the platform's kernel), or torch's SDPA inline
@@ -96,6 +97,8 @@ class ZImageModel(Model):
         self.async_scheduling = bool(async_scheduling)
         # fp8: the DiT blocks' linears (ZImageDiT.FP8_LINEARS) run as fp8 GEMMs where the GPU has them
         self.linear_dtype = check_linear_dtype(linear_dtype)
+        # fp8 linears kept in bf16 anyway (module-name patterns, block ranges like single_blocks.0-3.*)
+        self.fp8_keep_bf16 = [str(p) for p in (fp8_keep_bf16 or [])]
         self._snapshot = None
         self._config: ZImageConfig | None = None
         self.tokenizer = None
@@ -313,7 +316,9 @@ class ZImageModel(Model):
             )
         if node_name == "dit":
             transformer = build_transformer(self.config, self.snapshot, device)
-            apply_linear_dtype(transformer, self.linear_dtype, transformer.FP8_LINEARS, "Z-Image transformer")
+            apply_linear_dtype(
+                transformer, self.linear_dtype, transformer.FP8_LINEARS, "Z-Image transformer", keep=self.fp8_keep_bf16,
+            )
             return ZImageDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.use_ragged_attention else None,
