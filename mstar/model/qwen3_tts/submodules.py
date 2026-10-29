@@ -36,7 +36,7 @@ from __future__ import annotations
 import itertools
 import logging
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -575,9 +575,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         if piecewise is not None:
             all_codes, codec_embed_sum = piecewise
         else:
-            all_codes, codec_embed_sum = self._depth_loop(
-                last_hidden, layer0_codes,
-                code_pred_sampler.sample,
+            all_codes, codec_embed_sum = self.code_predictor.run_depth_loop(
+                last_hidden, layer0_codes, self.model.model.codec_embedding,
+                code_pred_sampler.sample, self.MAX_BATCH_SIZE,
             )
 
         return {
@@ -585,24 +585,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             "codec_tokens": all_codes,
             "new_token": layer0_codes,
         }
-
-    def _depth_loop(
-        self,
-        last_hidden: torch.Tensor,
-        layer0_codes: torch.Tensor,
-        sample_codes: "Callable[[torch.Tensor], torch.Tensor]",
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Walk residual groups 1..N-1, returning (all_codes, codec_embed_sum).
-
-        ``sample_codes`` maps one group's logits to codes. Every op here is
-        graph-safe, so this body is captured verbatim — inside the whole-walk
-        decode graph, or on its own by the piecewise runner.
-        """
-        batch_size = layer0_codes.shape[0]
-        return self.code_predictor.run_depth_loop(
-            last_hidden, layer0_codes, self.model.model.codec_embedding, sample_codes,
-            self.code_predictor.depth_kv_cache(batch_size, self.MAX_BATCH_SIZE),
-        )
 
     def _code_predictor_piecewise_capture(
         self, call: PiecewiseCallInputs,
@@ -614,9 +596,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         hoisted out as a static input.
         """
         code_pred_sampler: SamplerResource = call.resources[CODE_PRED_SAMPLER]
-        all_codes, codec_embed_sum = self._depth_loop(
+        all_codes, codec_embed_sum = self.code_predictor.run_depth_loop(
             call.static_inputs["last_hidden"], call.static_inputs["layer0_codes"],
-            code_pred_sampler.sample,
+            self.model.model.codec_embedding, code_pred_sampler.sample, self.MAX_BATCH_SIZE,
         )
         return {"all_codes": all_codes, "codec_embed_sum": codec_embed_sum}
 

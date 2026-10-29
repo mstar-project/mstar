@@ -310,7 +310,9 @@ def mstar_code_predictor_logits(talker, hidden: torch.Tensor, codes: torch.Tenso
             collected.append(cp_logits[0])
             return cp_logits.new_tensor([next(target)], dtype=torch.long)
 
-        talker._depth_loop(hidden[t:t + 1], codes[t:t + 1, 0], teacher)
+        talker.code_predictor.run_depth_loop(
+            hidden[t:t + 1], codes[t:t + 1, 0], talker.model.model.codec_embedding, teacher, talker.MAX_BATCH_SIZE,
+        )
         out.append(torch.stack(collected))
     return torch.stack(out)
 

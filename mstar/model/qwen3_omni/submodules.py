@@ -1460,10 +1460,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         # "code_predictor" aux sampler's static buffers, so per-request values
         # survive graph replay. The embedding sum is kept in fp32 and rounded once,
         # when the next step's prepare_inputs casts it.
-        bs = layer0_codes.shape[0]
         all_codes, codec_emb_sum = self.code_predictor.run_depth_loop(
             last_hidden, layer0_codes, self.talker_code_emb, code_pred_sampler.sample,
-            self.code_predictor.depth_kv_cache(bs, self.MAX_BATCH_SIZE), sum_dtype=torch.float32,
+            self.MAX_BATCH_SIZE, sum_dtype=torch.float32,
         )
 
         return {
