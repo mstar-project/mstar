@@ -7,6 +7,7 @@ target must be fed exactly the token the draft was told would come next.
 from __future__ import annotations
 
 import itertools
+import math
 
 import pytest
 import torch
@@ -109,7 +110,9 @@ def test_greedy_speculation_matches_plain_greedy(k, seed):
     assert stats.tokens == len(generated)
     # Each step emits accepted + 1 tokens, except a final step cut short by the stop token or the length cap.
     assert 0 <= stats.steps + stats.accepted_total - (len(generated) - 1) <= 1
-    assert stats.position_rates() == stats.position_expected_rates()
+    # Greedy decisions have accept_prob 0 or 1, so both estimators agree where a position was reached at all.
+    for rate, expected in zip(stats.position_rates(), stats.position_expected_rates(), strict=True):
+        assert rate == expected or (math.isnan(rate) and math.isnan(expected))
     assert all(stats.evaluated[j] >= stats.accepted[j] for j in range(k))
     assert all(stats.evaluated[j + 1] <= stats.accepted[j] for j in range(k - 1))
     assert sum(stats.accepted) == stats.accepted_total
