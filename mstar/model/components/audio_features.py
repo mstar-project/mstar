@@ -355,7 +355,7 @@ NEMO_MEL_SETTINGS = dict(
 )
 # NeMo's ``AudioToMelSpectrogramPreprocessor`` defaults for the checked settings
 # its configs usually leave out
-_NEMO_PREPROCESSOR_DEFAULTS = dict(
+NEMO_PREPROCESSOR_DEFAULTS = dict(
     mag_power=2.0, exact_pad=False, log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
     preemph=0.97, pad_to=16,
 )
@@ -364,11 +364,12 @@ _NEMO_PREPROCESSOR_DEFAULTS = dict(
 def check_nemo_preprocessor(preprocessor: dict[str, Any], **model_settings: Any) -> None:
     """Refuse a NeMo ``preprocessor`` config whose settings differ from
     ``NEMO_MEL_SETTINGS`` and the model's own, the only ones compared. A key it
-    leaves out reads as NeMo's default where ``_NEMO_PREPROCESSOR_DEFAULTS``
+    leaves out reads as NeMo's default where ``NEMO_PREPROCESSOR_DEFAULTS``
     has one, and is refused otherwise."""
     expected = {**NEMO_MEL_SETTINGS, **model_settings}
-    got = {k: preprocessor.get(k, _NEMO_PREPROCESSOR_DEFAULTS.get(k)) for k in expected}
-    unsupported = {k: v for k, v in got.items() if v != expected[k]}
+    got = {k: preprocessor.get(k, NEMO_PREPROCESSOR_DEFAULTS.get(k)) for k in expected}
+    unsupported = {k if k in preprocessor else f"{k} (not in config)": v
+                   for k, v in got.items() if v != expected[k]}
     if unsupported:
         raise ValueError(f"unsupported NeMo preprocessor settings {unsupported}; expected {expected}")
 
