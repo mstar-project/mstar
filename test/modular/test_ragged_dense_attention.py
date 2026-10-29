@@ -29,7 +29,7 @@ from mstar.engine.resources import (
     StepContext,
     cross_label,
 )
-from mstar.engine.resources.attn.dense import _fa3_unavailable_reason
+from mstar.engine.resources.attn.dense import _varlen_unavailable_reason
 from mstar.engine.resources.attn.ragged.dense import DenseRaggedCrossManager, DenseRaggedManager
 from mstar.engine.resources.attn.ragged.dense_wrappers import (
     _ZERO_BLOCK,
@@ -39,7 +39,7 @@ from mstar.engine.resources.attn.ragged.dense_wrappers import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
-_FA3_REASON = _fa3_unavailable_reason()
+_FA3_REASON = _varlen_unavailable_reason()
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="ragged dense attention requires CUDA"),

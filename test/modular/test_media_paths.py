@@ -537,9 +537,15 @@ def test_omnivoice_without_torchcodec_refuses_a_low_rate_wav_without_decoding_it
 @pytest.mark.parametrize("seconds", [59, 61])
 @pytest.mark.parametrize("clip", [("WAV", "FILE", None), ("OGG", "FILE", "VORBIS")])
 def test_omnivoice_without_torchcodec_refuses_a_clip_past_the_cap(clip, seconds, dirs, monkeypatch):
-    """The cap holds from the header too, and an accepted clip's probe decode
-    is mono at 16 kHz and stops just past the cap."""
+    """A clip libsndfile cannot open goes to the FFmpeg decoders (PyAV here): the
+    cap holds from the header too, and an accepted clip's probe decode is mono
+    at 16 kHz and stops just past the cap."""
     model_media = _without_torchcodec(monkeypatch)
+
+    def not_a_libsndfile_container(path):
+        raise RuntimeError("Error opening: Format not recognised.")
+
+    monkeypatch.setattr(media_io, "_check_ref_audio_soundfile", not_a_libsndfile_container)
     real_decode = model_media._FallbackAudio.decode
     probes = []
 

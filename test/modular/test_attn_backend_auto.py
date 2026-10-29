@@ -188,7 +188,7 @@ def test_ragged_attention_builds_flashinfer(spec_class, manager_class, backend):
 
 
 def _clear_fa3_caches():
-    dense_module._fa3_unavailable_reason.cache_clear()
+    dense_module._varlen_unavailable_reason.cache_clear()
     from mstar.engine.resources.attn.ragged import dense as ragged_dense
 
     ragged_dense._warn_ragged_dense_fallback.cache_clear()

@@ -639,7 +639,7 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     from mstar.engine.resources.sampler.resource import SamplerResource
 
     sampler = type("S", (), {
-        "loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13])),
+        "loopback_tokens": staticmethod(lambda: torch.tensor([11, 12, 13])),
         "overwrite_rows": SamplerResource.overwrite_rows, "_row_stager": None,
     })()
     ids = sub.preprocess(DECODE_WALK, ModelInputsFromEngine(

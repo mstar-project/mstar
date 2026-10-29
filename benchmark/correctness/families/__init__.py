@@ -274,8 +274,16 @@ CONFIG_FAMILIES: dict[str, type[Family]] = {
 
 _OMNILINGUAL = "no family yet, its reference (omnilingual-asr on fairseq2) needs its own venv"
 
+_NO_ASR_REFERENCE = "no family yet: its reference transcripts (the asr family's WER baseline) have not been built here"
+
 UNSUPPORTED: dict[str, str] = {
+    "canary": _NO_ASR_REFERENCE,
+    "canary_qwen": _NO_ASR_REFERENCE,
+    "command_a_plus": "no family yet, a 4-8 GPU text model this cluster has not served",
     "fish_s2_pro": "no family yet, it needs a reference build of Fish Audio's S2-Pro",
+    "qwen3_asr": _NO_ASR_REFERENCE,
+    "qwen3_asr_realtime": _NO_ASR_REFERENCE,
+    "whisper_large_v3_turbo": _NO_ASR_REFERENCE,
     "lingbot_world_1_3b": "no family yet, its camera-controlled world video needs its own reference",
     "omnilingual_asr_ctc_300m": _OMNILINGUAL,
     "omnilingual_asr_ctc_1b": _OMNILINGUAL,
