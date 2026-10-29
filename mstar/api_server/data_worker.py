@@ -162,6 +162,8 @@ class InlineTokens:
     request_ids: list[str]
     values: list[int]
     modality: str
+    # per request, or None when no request of the frame asked
+    logprobs: list[float | None] | None = None
 
 
 def _answer_late(on_late: Callable[[str], None] | None, streams: list[str]) -> None:
@@ -400,6 +402,7 @@ class PreprocessWorker:
 
     def new_result_tokens(
         self, request_ids: list[str], values: list[int], signal: str, modality: str,
+        logprobs: list[float | None] | None = None,
     ):
         """A frame's values that rode inline: the same accounting per request
         as a result tensor, no transport read and nothing to ack. A request
@@ -408,7 +411,8 @@ class PreprocessWorker:
         reading = self.per_request_reading_tensors
         kept_ids: list[str] = []
         kept_values: list[int] = []
-        for rid, value in zip(request_ids, values, strict=True):
+        kept_logprobs: list[float | None] = []
+        for i, (rid, value) in enumerate(zip(request_ids, values, strict=True)):
             counts = counts_by_rid.get(rid)
             if counts is None:
                 logger.debug("Late token for cleaned-up request %s dropped", rid)
@@ -417,8 +421,12 @@ class PreprocessWorker:
             reading[rid] += 1
             kept_ids.append(rid)
             kept_values.append(value)
+            if logprobs:
+                kept_logprobs.append(logprobs[i])
         if kept_ids:
-            self.result_tensor_input_queue.put(InlineTokens(kept_ids, kept_values, modality))
+            self.result_tensor_input_queue.put(
+                InlineTokens(kept_ids, kept_values, modality, kept_logprobs or None)
+            )
             self._signal()
 
     def discard_result_tensors(self, input: ResultTensors):
@@ -1343,11 +1351,12 @@ class PreprocessWorkerThread:
     def _emit_inline_tokens(self, item: InlineTokens) -> None:
         """Postprocess a frame's inline values in one model call and queue each
         request's chunk, in arrival order with its tensor results."""
-        rids, values = item.request_ids, item.values
+        rids, values, logprobs = item.request_ids, item.values, item.logprobs
         if self._draining_rids:
             keep = [i for i, rid in enumerate(rids) if rid not in self._draining_rids]
             rids = [rids[i] for i in keep]
             values = [values[i] for i in keep]
+            logprobs = logprobs and [logprobs[i] for i in keep]
         kwargs = self.request_model_kwargs
         try:
             datas = self.model.postprocess_inline(
@@ -1374,7 +1383,8 @@ class PreprocessWorkerThread:
                     request_id,
                     sequence,
                     ResultChunk(
-                        request_id=request_id, modality=item.modality, data=data, metadata={},
+                        request_id=request_id, modality=item.modality, data=data,
+                        metadata={} if not logprobs or logprobs[i] is None else {"logprob": logprobs[i]},
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client

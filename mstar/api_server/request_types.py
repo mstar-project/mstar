@@ -39,6 +39,9 @@ class ResultTokens:
     signal: str
     modality: str
     metadata: dict = field(default_factory=dict)
+    # per request, its sampled token's log-prob or None; empty when no
+    # request of the frame asked
+    logprobs: list[float | None] = field(default_factory=list)
 
 
 @dataclass
