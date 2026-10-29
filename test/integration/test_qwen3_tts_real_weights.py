@@ -142,17 +142,40 @@ def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):
     assert prepared.input_seq_len == prepared.input_embeds.shape[0]
 
 
-def test_real_codec_decodes_expected_number_of_pcm_samples(codec, model):
-    frames = 2
-    codes = torch.zeros(
-        1,
-        model.config.codec.num_quantizers,
-        frames,
-        dtype=torch.long,
-        device="cuda:0",
+def test_real_codec_streams_like_one_whole_decode(codec, model):
+    """The incremental decoder on the real codec: six frames decoded as chunks of
+    1, 2 and 3, each from the state the one before left, give the reference
+    decoder's audio for all six within 1 LSB of PCM16 (TF32 off on both)."""
+    config = model.config.codec
+    frames = 6
+    generator = torch.Generator(device="cuda:0").manual_seed(0)
+    codes = torch.randint(
+        0, config.codebook_size, (1, config.num_quantizers, frames),
+        device="cuda:0", generator=generator,
     )
-    pcm = codec._decode(codes)
-    torch.cuda.synchronize()
+    state = {
+        name: torch.zeros((1, *block.shape), dtype=block.dtype, device="cuda:0")
+        for name, block in codec.incremental.state_blocks().items()
+    }
+    tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+    try:
+        chunks, start = [], 0
+        with torch.no_grad():
+            for width in (1, 2, 3):
+                lengths = torch.full((1,), width, dtype=torch.long, device="cuda:0")
+                wav, new = codec.incremental(codes[:, :, start:start + width], state, lengths)
+                state = {**state, **new}
+                chunks.append(wav)
+                start += width
+            whole = codec.decoder(codes).clamp(-1, 1).reshape(1, -1)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
 
-    assert pcm.shape == (1, frames * model.config.codec.decode_upsample_rate)
-    assert pcm.dtype == torch.int16
+    got = (torch.cat(chunks, 1) * 32767).to(torch.int16)
+    expected = (whole * 32767).to(torch.int16)
+    assert got.shape == expected.shape == (1, frames * config.decode_upsample_rate)
+    assert state["frames"].item() == frames
+    assert expected.float().std() > 100   # a signal, not silence
+    diff = (got.int() - expected.int()).abs().max().item()
+    assert diff <= 1, f"streamed audio differs from the whole decode by {diff} LSB"
