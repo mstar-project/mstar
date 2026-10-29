@@ -139,6 +139,7 @@ class ResultsStore:
         tuned: str = "triton",
         margin: float = 0.02,
         dims: tuple[str, ...] | None = None,
+        class_default: Callable[[str], Mapping[str, Any]] | None = None,
         root: Path | None = None,
         per_product: bool = True,
         provenance: Mapping[str, Any] | None = None,
@@ -151,8 +152,11 @@ class ResultsStore:
         for families that cannot ship (a torch expression). The ``tuned``
         implementation replaces the fastest other one only where it is at least
         ``margin`` faster. Each class gets the entry most of its shapes chose,
-        and a shape that chose otherwise its own entry. ``dims`` names the shape
-        dimensions the op's configs are keyed by (all of them by default).
+        and a shape that chose otherwise its own entry; with ``class_default``,
+        each class gets ``class_default(class)`` instead, so only the measured
+        shapes change (for an op that also serves shapes nobody searched).
+        ``dims`` names the shape dimensions the op's configs are keyed by (all of
+        them by default).
         """
         chosen: dict[str, tuple[str, dict]] = {}
         for record in self.records(facts, kernel):
@@ -179,7 +183,10 @@ class ResultsStore:
         for klass, entry in chosen.values():
             key = json.dumps(entry, sort_keys=True)
             votes.setdefault(klass, {})[key] = votes.setdefault(klass, {}).get(key, 0) + 1
-        classes = {k: json.loads(max(v.items(), key=lambda item: item[1])[0]) for k, v in votes.items()}
+        if class_default is None:
+            classes = {k: json.loads(max(v.items(), key=lambda item: item[1])[0]) for k, v in votes.items()}
+        else:
+            classes = {k: dict(class_default(k)) for k in votes}
         shapes = {
             config_shape_key(json.loads(shape)): entry
             for shape, (klass, entry) in chosen.items() if entry != classes[klass]
