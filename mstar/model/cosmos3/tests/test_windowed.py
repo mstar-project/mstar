@@ -667,8 +667,8 @@ def test_video_streaming_ndjson_lines() -> None:
     streaming_req = VideoGenerationRequest(prompt="x", num_frames=57, window_mode="chained", stream_video=True)
 
     async def _lines(api):
-        gen = await create_videos(api, "cosmos3", adapter, streaming_req)
-        return [json.loads(line) async for line in gen]
+        response = await create_videos(api, "cosmos3", adapter, streaming_req)
+        return [json.loads(line) async for line in response.body_iterator]
 
     api = _Api([
         ResultChunk(request_id="r", modality="video", data=b"w0"),

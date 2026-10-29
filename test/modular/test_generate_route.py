@@ -28,6 +28,12 @@ class _RecordingServer:
             yield b'{"modality": "text"}\n'
         return body()
 
+    def submission_key(self, request_id):
+        return request_id
+
+    def release_submission(self, key):
+        pass
+
     async def collect_results(self, request_id, request):
         return []
 
