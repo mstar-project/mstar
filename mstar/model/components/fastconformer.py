@@ -404,7 +404,7 @@ class FastConformerBlock(nn.Module):
         tails: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Offline: ``pos_emb``, ``mask`` and ``valid``. A stream step: ``tails``
-        for the conv (see its), which also streams the attention."""
+        (see ``ConvModule.forward``), which streams the attention as well."""
         stream = tails is not None
         if use_triton(x):
             # each residual add runs in the kernel of the norm that reads it
