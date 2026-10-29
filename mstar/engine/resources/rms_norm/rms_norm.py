@@ -1,12 +1,14 @@
-"""Backend-neutral RMSNorm custom operator.
+"""Backend-neutral RMSNorm operator.
 
-The operator keeps fused accelerator implementations behind one stable
-``mstar::rms_norm`` graph boundary. CUDA currently dispatches to FlashInfer,
-XPU dispatches to vllm-xpu-kernels, and other devices use the portable
-PyTorch implementation.
+``mstar::rms_norm`` keeps fused accelerator implementations behind one graph
+boundary, declared once in the kernel registry (``mstar.kernels``). GPUs run
+FlashInfer, XPU runs vllm-xpu-kernels, and CPU tensors the portable PyTorch
+reference.
 """
 
 import torch
+
+from mstar.kernels import KernelOp, ShapePolicy, Tolerance
 
 
 def _prepare_inputs(
@@ -28,49 +30,19 @@ def _prepare_inputs(
     return x, weight, orig_dtype
 
 
-@torch.library.custom_op("mstar::rms_norm", mutates_args=())
-def rms_norm(
+def _rms_norm_reference(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
     norm_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Portable RMSNorm fallback, returned in ``x``'s original dtype."""
+    """Portable RMSNorm, returned in ``x``'s original dtype."""
     x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
     variance = x.float().pow(2).mean(dim=-1, keepdim=True)
     output = x * torch.rsqrt(variance + eps).to(x.dtype)
     return (output * weight).to(orig_dtype)
 
 
-@torch.library.register_kernel(rms_norm, "cuda")
-def _rms_norm_cuda(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    norm_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    import flashinfer
-
-    x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
-    return flashinfer.norm.rmsnorm(x, weight, eps=eps).to(orig_dtype)
-
-
-@torch.library.register_kernel(rms_norm, "xpu")
-def _rms_norm_xpu(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    norm_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    import vllm_xpu_kernels._C  # noqa: F401
-
-    x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
-    output = torch.empty_like(x)
-    torch.ops._C.rms_norm(output, x, weight, eps)
-    return output.to(orig_dtype)
-
-
-@rms_norm.register_fake
 def _rms_norm_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -78,6 +50,63 @@ def _rms_norm_fake(
     norm_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+def _flashinfer():
+    import flashinfer
+
+    def rms_norm(x, weight, eps, norm_dtype=None):
+        x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
+        return flashinfer.norm.rmsnorm(x, weight, eps=eps).to(orig_dtype)
+
+    return rms_norm
+
+
+def _vllm_xpu():
+    import vllm_xpu_kernels._C  # noqa: F401
+
+    def rms_norm(x, weight, eps, norm_dtype=None):
+        x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
+        output = torch.empty_like(x)
+        torch.ops._C.rms_norm(output, x, weight, eps)
+        return output.to(orig_dtype)
+
+    return rms_norm
+
+
+def _rows_hidden(x, weight, eps, norm_dtype=None) -> dict[str, int]:
+    hidden = x.shape[-1]
+    return {"rows": x.numel() // hidden if hidden else 0, "hidden": hidden}
+
+
+def _inputs(shape, dtype, device, generator=None):
+    x = torch.randn(shape["rows"], shape["hidden"], dtype=dtype, device=device, generator=generator)
+    weight = torch.randn(shape["hidden"], dtype=dtype, device=device, generator=generator)
+    return x * 3, weight, 1e-6, None
+
+
+RMS_NORM = KernelOp(
+    "rms_norm",
+    "(Tensor x, Tensor weight, float eps, ScalarType? norm_dtype=None) -> Tensor",
+    fake=_rms_norm_fake,
+    reference=_rms_norm_reference,
+    # torch calls AMD GPUs "cuda" devices, so they run FlashInfer's API too
+    impls={"cuda": _flashinfer, "rocm": _flashinfer, "xpu": _vllm_xpu},
+    shapes=ShapePolicy(
+        dims=("rows", "hidden"),
+        key=_rows_hidden,
+        inputs=_inputs,
+        # decode steps up to the largest decode capture bucket; prompts above
+        classes=(("decode", lambda s: s["rows"] <= 128), ("prefill", lambda s: s["rows"] > 128)),
+        warm=(
+            {"rows": 1, "hidden": 4096}, {"rows": 64, "hidden": 4096},
+            {"rows": 512, "hidden": 4096}, {"rows": 8 * 16, "hidden": 128},
+        ),
+        dtypes=(torch.bfloat16, torch.float16),
+    ),
+    # FlashInfer's numerics: fp32 math, one round-to-nearest-even store
+    tolerance=Tolerance.rounded_once(),
+)
 
 
 def run_rms_norm(

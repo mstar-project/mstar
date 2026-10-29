@@ -458,6 +458,7 @@ exclude = ["tests*", "benchmark*", "examples*"]
 # works from a pip install.
 [tool.setuptools.package-data]
 "mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp", "configs/*.json"]
+"mstar.kernels" = ["configs/*/*.json", "configs/*/*/*.json"]
 "mstar.default_configs" = ["*.yaml"]
 
 [tool.ruff]
