@@ -270,11 +270,11 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
         self._delivered = 0  # new items handed to the consumer so far
 
     def prime(self, context_items: int) -> None:
-        if not 0 <= context_items <= self._left_context or self._chunks_popped:
-            raise ValueError(
-                f"can prime 0..{self._left_context} context items before the first chunk, "
-                f"got {context_items}"
-            )
+        """The first chunk leads with ``context_items`` context-only items, however
+        many ``left_context`` allows later chunks (a stateful consumer warms up
+        on them once and needs no context after)."""
+        if context_items < 0 or self._chunks_popped:
+            raise ValueError(f"can prime context items only before the first chunk, got {context_items}")
         self._delivered = context_items
 
     def _new_items(self) -> int:
@@ -283,6 +283,8 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
         return self._chunk
 
     def _context(self) -> int:
+        if not self._chunks_popped:
+            return self._delivered   # what was primed
         return min(self._left_context, self._delivered)
 
     def is_ready(self, buffer_len: int) -> bool:
