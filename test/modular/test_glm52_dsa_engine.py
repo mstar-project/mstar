@@ -69,28 +69,21 @@ def _ctx(needs_selection: bool) -> DSAContext:
 
 
 def test_cleanup_request_drops_per_request_state():
-    """Retirement leaves NO per-request growth: the engine's request removal
-    calls cleanup_request on every managed submodule, which must drop the
-    prefix-hit mark, the MTP counters, the MTP token budget and the prefill's stop."""
+    """Retirement leaves NO per-request growth: the engine's request removal calls
+    cleanup_request on every managed submodule, which drops the prefix-hit mark, the MTP seed
+    slot and the prefill's stop (the index keys are the DSA resource's and the verdicts the
+    draft-verify resource's, which remove_request drops)."""
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
     sub._prefix_hits = {"r0"}
-    sub._mtp_emitted = {"r0": 7}
-    sub._mtp_checked = {"r0": 7}
-    sub._mtp_max_tokens = {"r0": 32}
-    sub._mtp_ignore_eos = {"r0": False}
-    sub._mtp_pending, sub._mtp_verdict, sub._mtp_trimmed = {"r0": (3, 0, 0)}, {"r0": ()}, {"r0": 3}
     sub._mtp_slot, sub._mtp_free_slots = {"r0": 5}, []
 
-    sub.request_state("r0").add_all(token_budget=20, ended_at_prefill=True)
+    sub.request_state("r0").add_all(ended_at_prefill=True)
     sub.cleanup_request("r0")
     assert sub._prefix_hits == set()
     assert sub.request_states == {}
-    assert sub._mtp_emitted == {}
-    assert sub._mtp_max_tokens == {}
-    assert sub._mtp_ignore_eos == {}
-    assert not (sub._mtp_pending or sub._mtp_verdict or sub._mtp_trimmed or sub._mtp_slot)
+    assert not sub._mtp_slot
     assert sub._mtp_free_slots == [5]  # the seed slot goes back
     sub.cleanup_request("r0")  # idempotent, like the base hook
 

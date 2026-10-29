@@ -4,7 +4,7 @@ Both entry points take the layer's merged in-projection row, q | k | v | beta | 
 and fuse the whole layer between that projection and ``o_proj``: the causal conv, the
 forget gate's up-projection, the delta rule on the pooled fp32 state and the gated
 RMSNorm. ``kda_decode`` is one program per (token, head). ``kda_prefill`` runs every span
-of a step in one varlen pass per layer. ``kda_verify`` runs a speculative verify block per
+of a step in one varlen pass per layer. ``kda_verify`` runs a draft-verify block per
 row: it replays the accepted part of the row's last block from the state before it, then the
 new block. The pool holds each head's state V-first, ``[V, K]``, as ``DeltaNetGeometry``
 declares it and fla's kernels read it.
@@ -704,29 +704,29 @@ if _HAS_TRITON:
 
 
 def kda_verify(proj, gpre, conv_pool, conv_w, g_b, dt_bias, a_log, norm_w, state_pool, slot_ids,
-               spec, *, block, num_heads, head_dim, lower_bound, scale, norm_eps):
+               blocks, *, block, num_heads, head_dim, lower_bound, scale, norm_eps):
     """Fused KDA for a verify step over ``proj (N * block, 3P + H + 2D)``, rows grouped by
     request, with ``gpre (N * block, P)`` the forget gate's ``f_b(f_a)``; returns the
     gated-normed ``(N * block, P)``. ``state_pool (S, H, V, K)`` fp32 holds the checkpoint and
     advances over each row's accepted prefix; ``conv_pool (S, 3P, 3)`` is read on a request's
-    first verify step only; ``spec`` is the layer's ``SpecBlocks``."""
+    first verify step only; ``blocks`` is the layer's ``VerifyBlocks``."""
     rows = proj.shape[0]
     H, D = num_heads, head_dim
-    kmax = spec.prefix.shape[2]
+    kmax = blocks.prefix.shape[2]
     assert rows % block == 0 and block <= kmax, (rows, block, kmax)
     assert conv_pool.shape[-1] == 3 and conv_w.shape[-1] == 4, "width-4 conv only"
     assert state_pool.is_contiguous() and conv_pool.is_contiguous() and proj.stride(1) == 1
-    assert all(t.is_contiguous() for t in spec) and D % BV_VERIFY == 0
-    assert spec.conv.dtype == conv_pool.dtype == spec.g.dtype == torch.bfloat16
+    assert all(t.is_contiguous() for t in blocks) and D % BV_VERIFY == 0
+    assert blocks.conv.dtype == conv_pool.dtype == blocks.g.dtype == torch.bfloat16
     o = torch.empty(rows, H * D, dtype=proj.dtype, device=proj.device)
     out = torch.empty_like(o)
     if rows:
         assert gpre.shape == (rows, H * D) and gpre.stride(1) == 1 and gpre.dtype == torch.bfloat16
         _kda_verify_kernel[(rows // block, H, D // BV_VERIFY)](
             proj, proj.stride(0), gpre, gpre.stride(0),
-            spec.prefix, *spec.prefix.stride()[:3], spec.g, *spec.g.stride()[:3],
-            spec.beta, *spec.beta.stride()[:3], spec.conv, *spec.conv.stride()[:2],
-            spec.prefix_len, spec.side,
+            blocks.prefix, *blocks.prefix.stride()[:3], blocks.g, *blocks.g.stride()[:3],
+            blocks.beta, *blocks.beta.stride()[:3], blocks.conv, *blocks.conv.stride()[:2],
+            blocks.prefix_len, blocks.side,
             conv_pool, conv_pool.stride(0), conv_w, dt_bias, a_log,
             state_pool, state_pool.stride(0), slot_ids, o, o.stride(0),
             float(lower_bound), float(scale),
@@ -793,13 +793,13 @@ class TritonKDAKernels:
                            p.norm_weight, rec_state, varlen, cfg=self.config, **kwargs)
 
     @torch.compiler.disable
-    def run_verify(self, qkv, g, beta, plan, conv_state, rec_state, spec, p, gate=None):
+    def run_verify(self, qkv, g, beta, plan, conv_state, rec_state, blocks, p, gate=None):
         """``run_paged``'s arguments for a verify step (``plan.is_verify``), plus the layer's
-        ``SpecBlocks``; the state advances over each row's accepted prefix only."""
+        ``VerifyBlocks``; the state advances over each row's accepted prefix only."""
         proj = _merged_row(qkv, g, beta, gate, p)
         # the forget gate's up-projection as one GEMM; the kernel caches it for the replay
         gpre = F.linear(g, p.f_b)
         return kda_verify(proj, gpre, conv_state, p.conv_weight, p.g_b, p.dt_bias, p.A_log,
-                          p.norm_weight, rec_state, plan.slot_ids, spec, block=plan.block,
+                          p.norm_weight, rec_state, plan.slot_ids, blocks, block=plan.block,
                           num_heads=p.num_heads, head_dim=p.head_dim, lower_bound=p.lower_bound,
                           scale=p.scale, norm_eps=p.norm_eps)

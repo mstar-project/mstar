@@ -5,8 +5,9 @@ import dataclasses
 
 import torch
 
-from mstar.engine.resources.base import AttentionResource, Resource
+from mstar.engine.resources.base import AttentionResource, Resource, RewindKind
 from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
 
@@ -183,7 +184,14 @@ class ReferenceAttentionResource(AttentionResource):
 
 
 class GreedySampler(Resource):
-    """Argmax per row; enough for the greedy paths the CPU tests drive."""
+    """Argmax per row, and the sampler resource's own greedy verify; enough for the greedy
+    paths the CPU tests drive."""
+
+    rewind_kind = RewindKind.NONE
+    # one rank: the verify's broadcast is a no-op; a test may set a stand-in
+    _comm_group = None
+    # the greedy verify (SamplerSpec.enable_sampled_verify off)
+    _sampled_verify = False
 
     @classmethod
     def build(cls, spec, info):
@@ -192,6 +200,8 @@ class GreedySampler(Resource):
     def sample(self, request_ids, logits, **kwargs):
         del request_ids, kwargs
         return logits.argmax(dim=-1)
+
+    verify = SamplerResource.verify
 
 
 class _StubTransferManager:
@@ -301,6 +311,12 @@ def build_cpu_resources(
                       sm_scale=config.qk_head_dim ** -0.5, dense_below_topk=True),
             kv_cfg, device,
         )
+    if config.mtp_num_draft_tokens > 0:
+        from mstar.engine.resources import DRAFT_VERIFY
+        from mstar.engine.resources.draft_verify.resource import DraftVerifyResource
+
+        dv = resources[DRAFT_VERIFY] = DraftVerifyResource(device)
+        dv.bind_sampler(resources[SAMPLER_RESOURCE])
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     for rid in request_ids:
         runner.ingest_request(rid)

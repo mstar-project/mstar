@@ -417,16 +417,6 @@ def test_long_context_refuses_pools_per_page_off_a_power_of_two():
         cfg.check_long_context(page_size=cfg.index_kpool * 3)
 
 
-def test_long_context_mtp_refuses_a_page_no_longer_than_a_block():
-    """Padding requests write the sink page's first k + 1 rows, and its last row is the
-    masked one: a page of k + 1 rows would unmask it."""
-    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), mtp_num_draft_tokens=3)
-    assert cfg.mtp_trims and cfg.index_kpool == 4
-    with pytest.raises(ValueError, match="exceed an MTP block"):
-        cfg.check_long_context(page_size=4)
-    cfg.check_long_context(page_size=8)
-
-
 @pytest.mark.parametrize("version, refused", [("0.6.17", True), ("0.6.18", False), (None, False)])
 def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, version, refused):
     # None: a stub module with no version, as the CPU tests install

@@ -1,7 +1,7 @@
 model: "glm5_next"
-# glm5_next_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-45 MTP module (greedy
-# requests only). A verify step's next block overwrites its rejected rows, and the MTP layer
-# selects its tokens with its own indexer, as the trunk's layers do.
+# glm5_next_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-45 MTP module, verified by
+# the engine's draft-verify, which takes a verify step's rejected rows back before the next step.
+# The MTP layer selects its tokens with its own indexer, as the trunk's layers do.
 max_seq_len: 1048576
 # One request per KDA slot below, as glm5_next_tp8_longctx.yaml. The KV pool admits by prompt: when
 # the live contexts outgrow it, decode holds requests until they time out (no eviction).
@@ -17,8 +17,8 @@ model_kwargs:
   dsa_long_context: true
   # each rank selects a block of a long prompt's rows (the indexer grows as the prompt squared)
   dsa_shard_prefill: true
-  # Rows a request may hold, prompt and output together. Each verify step takes a whole
-  # block of them, so at 3 tokens a step three quarters of the room past a prompt is output.
+  # Rows a request may hold, prompt and output together, and the 7 verify rows written ahead
+  # of the engine's trim.
   max_seq_len: 1048576
   # Prompts up to the largest captured bucket (4096 tokens) prefill captured, several to a
   # step; a longer prompt takes a step of its own and runs eager, 8192 tokens at a time.
@@ -26,10 +26,9 @@ model_kwargs:
   prefill_max_step_tokens: "auto"
 resources:
   kv_cache:
-    # 12 latent planes + 12 index planes (the MTP layer's too), one 576-wide bf16 row per
-    # token each (512 + the rope slot that masks the sparse plan's padding): 27.6 KB per token
-    # per rank. 8960 pages x 128 tokens = one 1M-token request plus ~100k tokens of others,
-    # ~32 GB/rank next to ~38 GB of weights.
+    # 12 latent planes + 12 index planes (the MTP layer's too), one 512-wide bf16 row per
+    # token each: 24.6 KB per token per rank. 8960 pages x 128 tokens = one 1M-token request
+    # plus ~100k tokens of others, ~28 GB/rank next to ~38 GB of weights.
     max_num_pages: 8960
     page_size: 128
   kda_state:

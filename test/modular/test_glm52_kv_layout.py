@@ -76,8 +76,27 @@ def test_a_request_decodes_one_step_fewer_than_its_max_tokens(tmp_path, monkeypa
     assert new_request.request_info.max_tokens == 30
 
 
-# the reduced variant's window (index_topk 64) is smaller than its max_seq_len (512)
-_WINDOWS = pytest.mark.parametrize("kwargs", [{}, {"config_variant": "reduced"}], ids=["full", "reduced"])
+# the reduced variant's window (index_topk 64) is smaller than its max_seq_len (512); under MTP
+# the verify rows past the kept tokens (the layout's lookahead) take their share of it
+_WINDOWS = pytest.mark.parametrize(
+    "kwargs",
+    [
+        {}, {"config_variant": "reduced"},
+        {"mtp_num_draft_tokens": 3}, {"config_variant": "reduced", "mtp_num_draft_tokens": 2},
+    ],
+    ids=["full", "reduced", "mtp3", "reduced_mtp2"],
+)
+
+
+@pytest.mark.parametrize("k", [0, 1, 3])
+def test_mtp_lays_out_its_verify_rows_as_a_lookahead(k):
+    model = _model(mtp_num_draft_tokens=k)
+
+    [row] = _preprocess(model, {"max_output_tokens": 30})["kv_layout"][KV_RESOURCE].values()
+
+    # a slot per kept token, and the lookahead last only under MTP
+    assert row[1] == [["decode_loop", 1]]
+    assert row[5:] == ([2 * k + 1] if k else [])
 
 
 @pytest.mark.parametrize(
@@ -94,7 +113,7 @@ def test_the_kv_pool_holds_exactly_the_window(kwargs):
 @_WINDOWS
 def test_a_request_that_asks_no_length_runs_to_the_window(tmp_path, monkeypatch, kwargs):
     model = _model(**kwargs)
-    window = model.context_limit()
+    window = model.context_limit() - model.config.mtp_kv_lookahead
 
     new_request = _dispatched(_conduct(model, _preprocess(model, {}), tmp_path, monkeypatch))
 
@@ -106,8 +125,9 @@ def test_a_request_that_asks_no_length_runs_to_the_window(tmp_path, monkeypatch,
 @pytest.mark.parametrize("past", [0, 1])
 def test_max_tokens_past_the_window_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past, kwargs):
     model = _model(**kwargs)
-    # the prompt's rows and one per decode step fill the window; the last token is never stored
-    fits = model.context_limit() - PROMPT + 1
+    # the prompt's rows, one per decode step and the lookahead fill the window; the last token
+    # is never stored
+    fits = model.context_limit() - model.config.mtp_kv_lookahead - PROMPT + 1
 
     sent = _conduct(model, _preprocess(model, {"max_output_tokens": fits + past}), tmp_path, monkeypatch)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -18,7 +19,25 @@ if TYPE_CHECKING:
         AcceleratorGraphConfig,
         PiecewiseAcceleratorGraphConfig,
     )
+    from mstar.engine.resources.draft_verify.config import VerdictBatch
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+
+
+class RewindKind(Enum):
+    """What a resource keeps per token, as a draft-verify node's rewind sees it.
+
+    A verify step commits its whole block of ``k + 1`` rows, and the verdict
+    takes the rejected ones back (``Resource.rewind``, or ``settle_verify`` on
+    the device). A resource on a node that verifies drafts has to say which of
+    these it is, or the node refuses to load.
+    """
+    # nothing per token: planned from another resource, or per request only
+    NONE = "none"
+    # a host length the rewind moves back (paged KV, positions)
+    HOST = "host"
+    # state the forward updates in place (recurrent): the verdict settles it inside the
+    # forward, through ``Resource.settle_verify``
+    DEVICE = "device"
 
 
 @dataclass(frozen=True)
@@ -116,6 +135,43 @@ class Resource(ABC):
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
+
+    # what a verify step's rejected rows leave here; None (undeclared) keeps the
+    # resource off a node that verifies drafts
+    rewind_kind: RewindKind | None = None
+
+    def rewind(self, verdicts: VerdictBatch) -> None:
+        """Take back each row's rejected tail of its last verify step.
+
+        Called by the runner for a ``HOST`` resource, once per verdict: before
+        the request's next step is admitted on any resource, or, when that step
+        is planned ahead of the verdict, after its pre-plan and before
+        ``correct_preplan``. Never undone: a discarded pre-plan does not bring
+        the rejected rows back.
+        """
+        raise NotImplementedError(f"{type(self).__name__} declares no rewind")
+
+    def settle_verify(self, accepted: torch.Tensor, label: str) -> None:
+        """Keep each row's accepted part of the verify step running now: ``accepted [rows]``,
+        the drafts the verdict kept per row of ``label`` (device, rank 0's on a lockstep
+        instance; a replay's padding rows included). Called for a ``DEVICE`` resource by
+        ``DraftVerifyResource.verify``, inside the forward and so inside a captured graph:
+        device ops only, at the step's planned rows."""
+        raise NotImplementedError(f"{type(self).__name__} declares no device settle")
+
+    # whether `correct_preplan` can put right a staged plan made before a rewind; a verify
+    # step is pre-planned ahead of its rows' last verdict only when every one of its
+    # pre-planning resources can
+    corrects_preplan: bool = False
+
+    def correct_preplan(self, verdicts: VerdictBatch, step: ResourceStep, ctx: StepContext) -> bool:
+        """The step staged by the last pre-plan was planned from lengths ``verdicts`` has
+        since taken rows back from (``rewind``, on every rewinding resource first): make the
+        staged plan the one ``plan`` would give now, in place (a changed plan output is
+        updated where ``ctx.plan_results`` holds it). False when it can't, and the runner
+        drops the pre-plan."""
+        del verdicts, step, ctx
+        return False
 
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;

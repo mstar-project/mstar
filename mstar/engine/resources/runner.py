@@ -11,7 +11,7 @@ import logging
 from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
-from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource, RewindKind
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
@@ -113,6 +113,12 @@ class StepRunner:
         self._staged: tuple | None = None
         # (step key, ready) of the last pre_admit whose stage is still up
         self._pre_admitted: tuple | None = None
+        # draft-verify resource -> the resources of its nodes that rewind; empty without one
+        self._rewinders = self._draft_verify_rewinders(node_resources)
+        # keyset -> [(draft-verify resource, the step's resources it rewinds)]
+        self._rewind_cache: dict[frozenset[str], list[tuple[Resource, list[Resource]]]] = {}
+        # keyset -> whether a pre-plan of such a step runs ahead of its rows' verdicts
+        self._plan_ahead_cache: dict[frozenset[str], bool] = {}
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -231,6 +237,92 @@ class StepRunner:
         """Tell the node's resources that the cache served this walk whole."""
         for key in self._sweep(self._node_order, self._order, node_name):
             self._resources[key].complete_cached_walk(rid, node_name, graph_walk)
+
+    def _draft_verify_rewinders(
+        self, node_resources: Mapping[str, Collection[str]] | None,
+    ) -> dict[str, list[str]]:
+        from mstar.engine.resources.draft_verify.resource import DraftVerifyResource
+
+        out: dict[str, list[str]] = {}
+        for key, resource in self._resources.items():
+            if not isinstance(resource, DraftVerifyResource):
+                continue
+            if node_resources is None:
+                shared = set(self._resources)
+            else:
+                shared = set().union(*(keys for keys in node_resources.values() if key in keys))
+            out[key] = [
+                k for k in self._order
+                if k in shared and self._resources[k].rewind_kind is RewindKind.HOST
+            ]
+        return out
+
+    def _rewind_hooks(self, keyset: frozenset[str]) -> list[tuple[Resource, list[Resource]]]:
+        hooks = self._rewind_cache.get(keyset)
+        if hooks is None:
+            hooks = self._rewind_cache[keyset] = [
+                (self._resources[dv], [self._resources[k] for k in keys if k in keyset])
+                for dv, keys in self._rewinders.items()
+                if any(k in keyset for k in keys)
+            ]
+        return hooks
+
+    def _rewind(self, step: SubmoduleStep) -> list:
+        """Take back the rejected rows of the step's requests' last verify steps, on every
+        resource of the step that rewinds, before any of them admits the step (or, for a step
+        planned ahead, after its pre-plan: `settle_preplan`). Each verdict is taken once and
+        never given back, so a step admitted again, or a dropped pre-plan, finds nothing more.
+        The same verdict on every rank of a lockstep instance, rewound at the same point of
+        the same step, keeps their streams alike. Returns the verdicts it rewound."""
+        rewound = []
+        for dv, targets in self._rewind_hooks(frozenset(step.keys())):
+            verdicts = dv.settle(step.ctx.request_ids)
+            if verdicts is not None:
+                for target in targets:
+                    target.rewind(verdicts)
+                rewound.append(verdicts)
+        return rewound
+
+    def plans_ahead(self, step: SubmoduleStep) -> bool:
+        """Whether a pre-plan of ``step`` runs before its rows' last verdicts are read: the
+        step verifies drafts and every one of its pre-planning resources can correct its
+        staged plan for the rewind that follows (`settle_preplan`). Fixed per resource set."""
+        if not self._rewinders:
+            return False
+        keyset = frozenset(step.keys())
+        ahead = self._plan_ahead_cache.get(keyset)
+        if ahead is None:
+            ahead = self._plan_ahead_cache[keyset] = bool(self._rewind_hooks(keyset)) and all(
+                self._resources[key].corrects_preplan for key in self._preplan_keys_for(step)
+            )
+        return ahead
+
+    def settle_preplan(self, step: SubmoduleStep) -> bool:
+        """After the pre-plan of a step planned ahead: wait for its rows' last verdicts, rewind
+        them, and have each pre-planned resource correct its staged plan, in plan order. False
+        when one can't; the stage is dropped then, and the step plans inline (the rewind
+        stays, as it would after a dropped pre-plan anyway)."""
+        if not self.plans_ahead(step):
+            return True
+        rewound = self._rewind(step)
+        if not rewound:
+            return True
+        verdicts = rewound[0] if len(rewound) == 1 else _merged(rewound)
+        for key in self._preplan_keys_for(step):
+            t0 = phase_start()
+            try:
+                ok = self._resources[key].correct_preplan(verdicts, step.get(key), step.ctx)
+            finally:
+                if t0 is not None:
+                    phase_end(f"res.correct.{key}", t0)
+            if not ok:
+                logger.warning(
+                    "resource %s could not correct a step planned ahead of its verdict; "
+                    "planning it inline", key,
+                )
+                self.clear_preplan()
+                return False
+        return True
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -432,6 +524,8 @@ class StepRunner:
         the step reserved.
         """
         staged_key = self._drop_stale_preplan(step)
+        if self._rewinders:
+            self._rewind(step)
         # A step whose ``pre_admit`` ran a step ahead, and whose stage is still
         # up for it, skips the resources that sweep covered: each would only
         # find its own reservation and no-op (0.1 ms of Python per step at
@@ -510,8 +604,12 @@ class StepRunner:
         the later full `admit` covers the rest; these resources see their own
         state as already reserved and no-op
 
-        Unwound on refusal exactly as ``admit`` is.
+        Unwound on refusal exactly as ``admit`` is. A step planned ahead of its
+        rows' verdicts admits from the lengths their last step committed, its
+        rewind waiting for ``settle_preplan``.
         """
+        if self._rewinders and not self.plans_ahead(step):
+            self._rewind(step)
         ready = True
         admitted: list[str] = []
         for key in self._preplan_keys_for(step):
@@ -709,3 +807,13 @@ class StepRunner:
             self._resources[key].build_accelerator_graph_buffers(
                 slots, max_bs, max_seq_len
             )
+
+
+def _merged(batches: list) -> Any:
+    """Several draft-verify resources' verdicts as one batch."""
+    first = batches[0]
+    return type(first)(
+        [rid for b in batches for rid in b.request_ids],
+        [label for b in batches for label in b.labels],
+        [r for b in batches for r in b.rejected],
+    )

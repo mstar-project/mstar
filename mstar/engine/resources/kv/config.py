@@ -294,8 +294,10 @@ class KVReqConfig(ResourceReqConfig):
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
                     keyed_spans=keyed_spans,
+                    # a row carries a lookahead only when there is one
+                    lookahead=lookahead[0] if lookahead else 0,
                 )
-                for label, (spans, growth, scratch, retention, keyed_spans) in kv_layout.items()
+                for label, (spans, growth, scratch, retention, keyed_spans, *lookahead) in kv_layout.items()
                 if label in opened
             }
         if loop_caps is not None and self.kv_layout is not None:
@@ -312,21 +314,23 @@ class KVReqConfig(ResourceReqConfig):
             if layout.retention is not None:
                 continue
             for loop, slots in layout.growth:
-                n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
+                free = spec.config.max_seq_len - layout.positions(caps) - layout.lookahead
+                n = (free + slots * caps[loop]) // slots
                 room[loop] = min(n, room.get(loop, n))
         return room
 
     def validate(self, spec: "KVSpec | None" = None) -> None:
-        """``ValueError`` (a 400) when a label would hold more positions at the request's caps
-        than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
-        the one model that declares one, computes its positions in each forward."""
+        """``ValueError`` (a 400) when a label would hold more positions at the request's caps,
+        with its lookahead, than its pool's ``max_seq_len``. A label under retention is left out,
+        since Cosmos3, the one model that declares one, computes its positions in each forward."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
-            positions = layout.positions(self.loop_caps or {})
+            positions = layout.positions(self.loop_caps or {}) + layout.lookahead
             if layout.retention is None and positions > spec.config.max_seq_len:
+                ahead = f" ({layout.lookahead} written ahead and trimmed)" if layout.lookahead else ""
                 raise ValueError(
-                    f"this request needs {positions} positions of {label!r}, "
+                    f"this request needs {positions} positions of {label!r}{ahead}, "
                     f"past the model's context of {spec.config.max_seq_len}"
                 )
 
@@ -445,13 +449,17 @@ class StreamLayout:
     scratch: int = 0
     retention: RetentionPolicy | None = None
     keyed_spans: int = 0
+    lookahead: int = 0
 
     def slots(self, caps: Mapping[str, int]) -> int:
+        """The most slots the stream holds committed, rows written ahead of a trim included."""
         return sum(span.length for span in self.spans) + sum(
             slots * caps[loop] for loop, slots in self.growth
-        )
+        ) + self.lookahead
 
     def positions(self, caps: Mapping[str, int]) -> int:
+        """The positions the kept tokens reach. The lookahead's rows are trimmed, so it is
+        left out; the context checks add it."""
         return sum(span.advance for span in self.spans) + sum(
             slots * caps[loop] for loop, slots in self.growth
         )
@@ -462,7 +470,8 @@ class StreamLayout:
         Under ``retention`` the stream holds a window. `KVManager._apply_retention` leaves
         less than a page over the budget, so the window peaks at the protected prefix plus
         the budget, or at the prefix rounded up to a page if that is larger. The bound adds
-        a page of overrun and the largest step past the prefix to that peak.
+        a page of overrun and the largest step past the prefix to that peak, a growth step's
+        lookahead included.
         """
         peak, end = self.slots(caps) + self.scratch, 0
         for span in self.spans:
@@ -477,7 +486,7 @@ class StreamLayout:
             end += span.length
             if max(end, end - span.length + span.scratch) > prefix:
                 step = max(step, span.length, span.scratch)
-        step = max([step, *(slots for _, slots in self.growth)])
+        step = max([step, *(slots + self.lookahead for _, slots in self.growth)])
         window = max(prefix + self.retention.context_budget, -(-prefix // page_size) * page_size)
         return min(pages, -(-(window + page_size - 1 + step) // page_size))
 
@@ -506,6 +515,9 @@ class KVStep(ResourceStep):
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.
     retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
+    # a draft-verify block (``with_draft_verify`` sets it): every row spans the same few
+    # tokens, whose write slots a leased step computes on the host
+    verify: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)

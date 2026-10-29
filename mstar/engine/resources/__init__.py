@@ -29,6 +29,13 @@ from mstar.engine.resources.attn.ragged.config import (
     cross_label,
 )
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.draft_verify.config import (
+    DRAFT_VERIFY,
+    DraftPolicy,
+    DraftVerifySpec,
+    VerifyStep,
+    with_draft_verify,
+)
 from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
     AuxPlanes,
@@ -93,6 +100,9 @@ __all__ = [
     "CGSlotSpec",
     "CrossAttentionConfig",
     "CrossAttentionSpec",
+    "DRAFT_VERIFY",
+    "DraftPolicy",
+    "DraftVerifySpec",
     "DSAConfig",
     "DSASpec",
     "DSAStep",
@@ -130,8 +140,10 @@ __all__ = [
     "StepContext",
     "StepRunner",
     "SubmoduleStep",
+    "VerifyStep",
     "apply_yaml_overrides",
     "cross_label",
     "resolve_spec_dependencies",
     "topo_sort",
+    "with_draft_verify",
 ]
