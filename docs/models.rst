@@ -1474,14 +1474,17 @@ implementation on GH200 and H100 GPUs:
 - The LM's generate step runs from CUDA graphs captured at batch sizes up to
   ``max_batch_size`` (conditioning frames run eagerly). On one H100 over HTTP
   (``benchmark.runner``, closed loop, a 17.7 s clip, ``max_batch_size`` 32;
-  measured before audio streaming was added), M* delivered 3.8 to 4.1 seconds of audio per second at one request, 11.4 to
-  12.1 at four and 30 to 32 at 32, against 1.2 to 1.3, 4.0 to 4.5 and 19 to 21
-  with the graphs and the depformer cut both off, in one container. The eager
-  step is bound by CPU overhead (``benchmark/worker_phases``), so its speed
-  also varies between hosts (a second host ran approximately 13 to 30% slower across the measured cells). Streaming
-  the audio costs an estimated 0 to 8% of that throughput, more at higher
-  concurrency; 16 concurrent streamed requests played back without underruns
-  (the whole clip uploaded at once, not live input).
+  measured before audio streaming was added), M* delivered 3.8 to 4.1 seconds
+  of audio per second at one request, 11.4 to 12.1 at four and 30 to 32 at 32,
+  against 1.2 to 1.3, 4.0 to 4.5 and 19 to 21 with the graphs and the
+  depformer cut both off, in one container. The eager step is bound by CPU
+  overhead (``benchmark/worker_phases``), so speed also varies between hosts.
+  Streaming the audio costs an estimated 0 to 8% of that throughput, more at
+  higher concurrency. On a later H100 host, with streaming, the same clip gave
+  3.4 seconds of audio per second at one request and 25 at 32 (medians of
+  three fresh server runs). In streamed playback (the whole clip uploaded at
+  once, not live input; a 320 ms client buffer), 8 concurrent sessions played
+  without underruns; at 16, 17 of 48 sessions had at least one.
 - Audio quality has not been formally assessed. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge; no listening study
