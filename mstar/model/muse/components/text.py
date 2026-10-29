@@ -6,8 +6,9 @@ SwiGLU MLP. Queries and keys are RMS-normed without a weight before RoPE, which
 only the sliding layers apply; the full layers are NoPE. The query multiplier
 ``qk_scale_factor`` is folded into the attention resources' softmax scale.
 
-All 52 layers write one paged KV cache; the sliding layers attend it through
-a windowed attention resource, the full ones through an unwindowed one.
+All 52 layers write one paged KV cache, which keeps only the window of the
+sliding layers' K/V; they attend it through a windowed attention resource, the
+full ones through an unwindowed one.
 
 TP shards by head, as Qwen3.5 does. The post-norms sit between each
 row-parallel projection and its residual add, so those projections reduce
@@ -143,7 +144,7 @@ class MuseGlimmerTextModel(nn.Module):
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
-        sliding = config.sliding_layers
+        sliding = config.is_sliding
         self.config = config
         self.comm_group = comm_group
         self.embed_tokens = VocabParallelEmbedding(

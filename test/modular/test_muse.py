@@ -126,7 +126,8 @@ def test_rope_off_the_sliding_layers_or_at_another_theta_is_refused(tmp_path, ch
      "rope is a default one"),
     ({"vision_config": {"layer_types": ["window_attention"] * 3 + ["sliding_attention"]}},
      "window and full attention layers"),
-], ids=["projector act", "mlp act", "all sliding", "scaled rope", "vision layer kind"])
+    ({"text_config": {"num_hidden_layers": N_LAYERS + 1}}, "layer_types names"),
+], ids=["projector act", "mlp act", "all sliding", "scaled rope", "vision layer kind", "layer count"])
 def test_a_checkpoint_fact_the_port_builds_in_is_checked(tmp_path, change, match):
     raw = _raw_config()
     for key, value in change.items():
@@ -170,7 +171,7 @@ def test_a_config_reads_as_the_reference_s(tmp_path, caplog):
 
 def test_config_reads_the_checkpoint(ckpt_dir):
     cfg = MuseGlimmerConfig.from_hf(ckpt_dir)
-    assert cfg.sliding_layers == [True, True, True, False] * 2
+    assert cfg.is_sliding == [True, True, True, False] * 2
     assert cfg.sliding_window == 5
     assert cfg.attn_scale == pytest.approx(3.87 / 4)
     # the tokenizer's eos and generation_config's <|eot|>
@@ -265,7 +266,7 @@ def _reference_logits(model: MuseGlimmerForCausalLM, ids: torch.Tensor, cfg: Mus
         if cfg.layer_rope_theta[i]:
             pos = torch.arange(ids.shape[0])
             q, k = _rope(q, pos, cfg.rope_theta), _rope(k, pos, cfg.rope_theta)
-        window = cfg.sliding_window - 1 if cfg.sliding_layers[i] else -1
+        window = cfg.sliding_window - 1 if cfg.is_sliding[i] else -1
         a = _attend(q, k, v, hd ** -0.5, window).reshape(-1, nh * hd)
         a = (a * torch.sigmoid(x @ g_w.T)) @ layer.self_attn.o_proj.weight.T
         h = h + _gemma(a, layer.post_attention_layernorm.weight, cfg.post_norm_eps)
@@ -672,3 +673,43 @@ def test_smart_resize_matches_the_reference_example():
     # the cap holds for any aspect ratio, a 1 x 89M-pixel image's too
     for size in ((4000, 3000), (1, 89_000_000), (89_000_000, 1)):
         assert math.prod(smart_resize(*size, 28, 4096)) // 28 ** 2 <= 4096
+
+
+def test_the_kv_pool_keeps_only_the_window_of_the_sliding_layers(model_dir, monkeypatch):
+    """At the checkpoint's layers (39 sliding and 13 full), the cache keeps only the
+    window of the config's sliding layers (by stack index), and each layer of the
+    stack attends through the attention over its own group of the cache."""
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from mstar.engine.resources.attn.base import AttentionManager
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.engine.resources.spec import resolve_spec_dependencies
+    from mstar.model.registry import get_model_class
+
+    raw = _raw_config(52)
+    model = get_model_class("muse_glimmer")(str(_write(model_dir, raw)))
+    # resolved as a server resolves them, so the pool takes its windows from the attentions
+    specs = resolve_spec_dependencies(model.get_node_resources())
+    types = raw["text_config"]["layer_types"]
+    assert specs[KV_CACHE].config.groups[-1].layers == tuple(
+        i for i, t in enumerate(types) if t == "sliding_attention"
+    )
+    # the managers' plans need no kernels to tell which layers they read
+    wrapper = MagicMock(side_effect=lambda *a, **kw: MagicMock())
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(
+        BatchPrefillWithPagedKVCacheWrapper=wrapper, BatchDecodeWithPagedKVCacheWrapper=wrapper,
+    ))
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    info = EngineResourceInfo(device=torch.device("cpu"), dependencies={KV_CACHE: specs[KV_CACHE]})
+    attn = {key: AttentionManager.build(specs[key], info) for key in (ATTN_SLIDING, ATTN_FULL)}
+    lm = MuseGlimmerForCausalLM(model.config)
+    # the LLM node's resources, handed to every module that binds them as bind_node_resources does
+    resources = {KV_CACHE: MagicMock(), ROPE: MagicMock(), **attn}
+    for module in lm.modules():
+        if hasattr(module, "bind_resources"):
+            module.bind_resources(resources)
+    for i, layer in enumerate(lm.model.layers):
+        # what the stack's forward sets; the attention refuses a layer of the other group
+        layer.self_attn.attend.set_layer_idx(i)

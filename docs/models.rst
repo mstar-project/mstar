@@ -322,11 +322,12 @@ Meta's Muse Glimmer 30B: text-and-image chat (video is refused), on ``POST
 
 Three in four layers attend a 2048-token sliding window; every layer writes the
 one paged KV cache, and the sliding layers attend it through a windowed
-attention resource. The paged KV cache has no per-layer-group retention yet (a
-group of sliding-window layers releasing the pages behind its window; see #855
-and #379), so the sliding layers hold their whole history: at 32k tokens about
-3.4x the KV the model needs, which costs concurrent requests, not
-correctness. Sampling defaults to the checkpoint's (temperature 1,
+attention resource. The cache keeps only the window of the sliding layers'
+K/V (``AttentionConfig.layers``) and returns the pages behind it to the
+pool, so a 32k-token request holds about 3.4x less KV than with every layer's
+history. A page holds 192 tokens of the full layers, or 64 of the sliding
+ones. Such a cache doesn't prefix cache yet, so the configs set
+``prefix_cache: false``. Sampling defaults to the checkpoint's (temperature 1,
 top_p 0.95, top_k 64); a request's ``min_p`` above 0 is refused (a 400)
 unless the checkpoint's generation_config sets a ``min_p``, which turns the
 sampler's min-p filter on. ``reasoning_effort`` (``low``, ``medium``, ``high``,

@@ -192,6 +192,8 @@ class MuseGlimmerConfig:
         if tc.get("attention_bias"):
             raise ValueError("the attention projections have no bias here")
         config = cls(**_known(cls, merged, "text_config"))
+        if len(config.layer_types) != config.num_hidden_layers:
+            raise ValueError(f"layer_types names {len(config.layer_types)} layers, not {config.num_hidden_layers}")
         config._check_rope()
         gen = Path(path) / "generation_config.json" if Path(path).is_dir() else None
         if gen is not None and gen.exists():
@@ -234,7 +236,7 @@ class MuseGlimmerConfig:
                 )
 
     @property
-    def sliding_layers(self) -> list[bool]:
+    def is_sliding(self) -> list[bool]:
         return [t == SLIDING_ATTENTION for t in self.layer_types]
 
     @property

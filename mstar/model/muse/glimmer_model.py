@@ -129,6 +129,9 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         max_patches = self._processor["max_tokens"] * self._processor["merge_size"] ** 2
         # a window per 32x32 patches; at most a few more at the edges
         max_windows = max_patches // vision.window_patches ** 2 + 8
+        # each layer of the stack is the cache's layer at its stack index; the cache keeps
+        # only the window of the ones the sliding attention runs
+        sliding = tuple(i for i, s in enumerate(cfg.is_sliding) if s)
         return [
             KVSpec(
                 resource_key=KV_CACHE, nodes={"LLM"},
@@ -143,8 +146,8 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             AttentionSpec(
                 resource_key=ATTN_SLIDING, nodes={"LLM"},
                 config=AttentionConfig(
-                    kv_cache=KV_CACHE, sliding_window=cfg.sliding_window, sm_scale=cfg.attn_scale,
-                    splits=(MIXED_SPLIT,),
+                    kv_cache=KV_CACHE, sliding_window=cfg.sliding_window, layers=sliding,
+                    sm_scale=cfg.attn_scale, splits=(MIXED_SPLIT,),
                 ),
             ),
             AttentionSpec(
