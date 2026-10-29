@@ -329,20 +329,45 @@ def test_fused_loop_replays_from_a_captured_graph(build):
 
 @pytest.mark.parametrize("build", [_omni_random, _tts_random], ids=["omni", "tts"])
 def test_fused_loop_kernel_count(build):
+    """Kernels one frame launches, eager, with a greedy sampler (argmax), and the frame's time replayed from a
+    captured graph at 27 rows padded to the 32-row bucket. The per-position forward runs uncompiled here, so its
+    numbers are an upper bound for the served path, where Inductor fuses parts of it."""
     from torch.profiler import ProfilerActivity, profile
 
+    from mstar.model.components.depth_decoder import DepthDecoder
+
     cp, group0, sum_dtype = build()
-    rows = 27
+    rows = 32
     width = cp.input_projection.in_features if cp.input_projection is not None else group0.weight.shape[1]
     last_hidden = torch.randn(rows, width, device=DEV).to(torch.bfloat16)
-    codes = torch.randint(0, 2048, (rows, cp.num_code_groups), device=DEV)
-    counts = {}
+    layer0 = torch.randint(0, group0.num_embeddings, (rows,), device=DEV)
+    kv = cp.depth_kv_cache(rows, 32)
+    sum_dtype = sum_dtype or group0.weight.dtype
+    counts, times = {}, {}
     for fn in ("_fused_loop", "_reference_loop"):
-        _loop(fn, cp, group0, last_hidden, codes, sum_dtype)
-        torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            _loop(fn, cp, group0, last_hidden, codes, sum_dtype)
+        def run(loop=getattr(DepthDecoder, fn)):
+            return loop(cp, last_hidden, layer0, group0, lambda x: x.argmax(-1), kv, sum_dtype)
+
+        with torch.no_grad(), torch.autocast(DEV, dtype=torch.bfloat16):
+            run()
             torch.cuda.synchronize()
-        counts[fn] = sum(1 for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA)
-    print(f"{build.__name__}: kernels per frame (teacher-forced, sampler excluded) {counts}")
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                run()
+                torch.cuda.synchronize()
+            counts[fn] = sum(1 for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            for _ in range(5):
+                graph.replay()
+            start.record()
+            for _ in range(50):
+                graph.replay()
+            end.record()
+            torch.cuda.synchronize()
+            times[fn] = start.elapsed_time(end) / 50
+    print(f"{build.__name__}: kernels per frame (argmax sampler) {counts}; captured frame ms at 32 rows "
+          f"{ {k: round(v, 3) for k, v in times.items()} }")
     assert counts["_fused_loop"] < 0.65 * counts["_reference_loop"]
+    assert times["_fused_loop"] < times["_reference_loop"]
