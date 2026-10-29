@@ -334,7 +334,10 @@ A layout has five fields:
 The footprint adds the spans, the growth at each loop's iterations and the scratch, and
 rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
-takes the window's peak instead.
+takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
+is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default
+length of a request that asks for none until it fits. With every loop at 0 iterations, the
+same sum is the prompt a request reserves when its pool admits it.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
@@ -524,6 +527,9 @@ The spec types are:
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
        ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
+       A spec whose nodes can run on several workers, as Bagel's LLM nodes do under CFG
+       parallel, sets ``leader`` to the node whose pool admits each request. Left unset, each
+       worker's pool admits requests on its own.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
@@ -632,8 +638,10 @@ The spec types are:
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
-       state, a streaming encoder's caches): one slot per request and label, ``blocks``
-       naming a shape and dtype for each piece (dtype None: the engine's compute dtype,
+       state, a streaming encoder's caches): one slot per request and label, ``labels``
+       naming every label a request's steps address or fork into (``("main",)`` by default)
+       so that admission reserves a slot for each, ``blocks`` naming a shape and dtype for
+       each piece (dtype None: the engine's compute dtype,
        what its KV caches store), ``num_layers`` copies of each, ``max_slots`` slots
        (deployment-tunable) with slot 0 the sink that padding rows address. A recurrent
        kernel reads the step's ``addressing``. ``declare_step`` gives each row a
@@ -2027,7 +2035,7 @@ that its block loop can be CUDA-graph captured:
        return [
            RaggedAttentionSpec(resource_key=VIT_ATTN, nodes={"vit_encoder"},
                                config=RaggedAttentionConfig(...)),
-           KVSpec(resource_key="kv", nodes=nodes, config=self._kv_config()),
+           KVSpec(resource_key="kv", nodes=nodes, config=self._kv_config(), leader="LLM"),
            AttentionSpec(resource_key="attn", nodes=nodes,
                          config=AttentionConfig(kv_cache="kv")),
            PositionSpec(resource_key="rope", nodes=nodes,

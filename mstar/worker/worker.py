@@ -3035,8 +3035,18 @@ class Worker:
         if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid):
             return None
         # Removes, aborts and failures are filtered here; prep_spec_rids
-        # assumes that.
-        candidates = [r for r in walk_rids if not self._is_tearing_down(r)]
+        # assumes that. A rid is also filtered when the target node isn't ready
+        # to run it, since the target's admit would otherwise skip the readiness
+        # check. The teardown filter comes first, since the readiness check would
+        # queue a torn-down rid or reload its pages.
+        partition = None if speculating_same_node else self.request_state.get_partition_for_node(spec_node_name)
+        candidates = [
+            r for r in walk_rids
+            if not self._is_tearing_down(r)
+            and (speculating_same_node or self.scheduler._check_ready(
+                spec_node_name, r, self.request_state.get_fwd_info(r, partition),
+            ))
+        ]
         # Rows waiting for this target (backlogged, or on its queues when the
         # chain would fill the step) get first claim: the chain only ever
         # continues its own rids, so at the cap they would never be reached.
