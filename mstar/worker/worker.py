@@ -370,6 +370,12 @@ class Worker:
     # per-row stream polls; None (a bare instance) means unknown, so poll.
     _stream_buffer_rids: set[int] | None = None
 
+    # Set in __init__; a bare instance runs no lockstep-parallel node and has
+    # TP async scheduling off.
+    parallel_nodes: frozenset[str] | set[str] = frozenset()
+    tp_async_sched: bool = False
+    tp_async_nodes: frozenset[str] | None = None
+
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
     _metrics: WorkerMetrics | None = None
@@ -2224,21 +2230,34 @@ class Worker:
 
         Separate from the submitter's ``MSTAR_LAUNCH_WAIT_MS`` wait on the same
         event: that one is a GIL throttle and is meant to expire early. This
-        one is for correctness, so it waits out the step.
+        one is for correctness, so it waits out the step, and for a lockstep
+        step it never gives up: an admit can take minutes (a kernel built on
+        first use), and moving pages before it would have the ranks admit
+        against different free lists.
         """
         if pending is None:
             return
         event = pending.node_batch.launch_started_event
         if event is None or event.is_set():
             return
+        lockstep = pending.node_name in self.parallel_nodes
+        waited = 0.0
         with self._span("worker.await_admit_settled"):
-            settled = event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S)
-        if not settled:
-            logger.warning(
-                "Worker %s: timed out waiting for node=%s walk=%s to admit "
-                "before scheduling; page moves may diverge across TP ranks",
-                self.worker_id, pending.node_name, pending.graph_walk,
-            )
+            while not event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S):
+                waited += _ADMIT_FENCE_TIMEOUT_S
+                if not lockstep:
+                    logger.warning(
+                        "Worker %s: timed out waiting for node=%s walk=%s to admit "
+                        "before scheduling", self.worker_id, pending.node_name,
+                        pending.graph_walk,
+                    )
+                    return
+                logger.warning(
+                    "Worker %s: node=%s walk=%s (seq %d) has not admitted after %.0fs; "
+                    "holding page moves until it does",
+                    self.worker_id, pending.node_name, pending.graph_walk,
+                    pending.tp_seq, waited,
+                )
 
     def _drop_rows_whose_loop_stopped(self, pending: PendingBatch) -> None:
         """Take a refused speculative step's rows whose loop stopped at N out
@@ -4781,6 +4800,12 @@ class Worker:
                     # are safe to apply now.
                     laps.lap("step_done")
                     in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
+                    if spec_pending is not None and spec_pending.node_name in self.parallel_nodes:
+                        # The launch wait above may have expired, and no page may move
+                        # between a lockstep step's broadcast and its admit. The next
+                        # pass opens on this same wait.
+                        self._await_admit_settled(spec_pending)
+                        laps.skip()
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     laps.lap("post_removes")
