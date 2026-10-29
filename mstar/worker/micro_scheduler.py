@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 REMOVED_RID = -1
 
 
+def parse_batch_wait_ms(setting: Mapping[str, Any] | None) -> dict[str, float]:
+    """The serving config's ``batch_wait_ms``: node name -> milliseconds."""
+    out = {}
+    for node, ms in (setting or {}).items():
+        if isinstance(ms, bool) or not isinstance(ms, (int, float)) or ms < 0:
+            raise ValueError(f"batch_wait_ms for {node!r}: {ms!r} is not a number of milliseconds >= 0")
+        if ms:
+            out[str(node)] = float(ms)
+    return out
+
+
 @dataclass
 class ReadyNodeEntry:
     """A ready node entry for a single request."""
@@ -220,6 +231,7 @@ class MicroScheduler:
         batch_builder_type: BatchBuilderType = BatchBuilderType.FIFO,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
         speculation_mixes_walks: Mapping[str, Any] | None = None,
+        batch_wait_ms: Mapping[str, Any] | None = None,
     ):
         self.engine_manager = engine_manager
         # (node, real walk) -> combined walk; scheduling keys use the combined one
@@ -232,6 +244,15 @@ class MicroScheduler:
         self._mixing_chains = self._parse_speculation_mixes_walks(
             speculation_mixes_walks or {},
         )
+        # node -> seconds its ready rows may wait for more to join their step
+        # (the serving config's ``batch_wait_ms``; see `_waits`)
+        self._batch_wait_s = {
+            node: ms / 1000 for node, ms in parse_batch_wait_ms(batch_wait_ms).items()
+        }
+        # scheduling key -> monotonic time its current ready rows started waiting
+        self._waiting_since: dict[tuple[str, str], float] = {}
+        # node -> handles that have had a step there. Purged by `clear_rid`.
+        self._stepped: dict[str, set[int]] = {node: set() for node in self._batch_wait_s}
         self._max_bs: dict[tuple[str, str], int | None] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
@@ -345,6 +366,24 @@ class MicroScheduler:
             ready, default=None,
             key=lambda key: self.node_and_walk_to_last_batch_num.get(key, 0),
         )
+
+    def _waits(self, key: tuple[str, str], rids: list[int], now: float) -> bool:
+        """Whether ``key``'s ready rows wait for more rows to join their step
+        (``batch_wait_ms``). They wait until the node's window, counted from
+        when they were first seen ready, runs out, unless they fill a step or
+        one of them has not had a step at this node yet: a request's first
+        output there (a vocoder's first audio, say) is latency-bound, and
+        whatever else is ready joins it."""
+        wait = self._batch_wait_s.get(key[0])
+        if wait is None:
+            return False
+        if now - self._waiting_since.setdefault(key, now) >= wait:
+            return False
+        cap = self._walk_caps(key)[key[1]]
+        if cap is not None and len(rids) >= cap:
+            return False
+        stepped = self._stepped[key[0]]
+        return all(rid in stepped for rid in rids)
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -659,7 +698,10 @@ class MicroScheduler:
         # A walk with no room (a cap of 0) takes nothing, so it stays the least
         # recent; picked anyway, it would starve the walk that frees the room.
         rr_key = self._select_node_rr({
-            key: rows for key, rows in ready.items() if self._walk_caps(key)[key[1]] != 0
+            key: rows for key, rows in ready.items()
+            if self._walk_caps(key)[key[1]] != 0
+            and not (target is None and self._batch_wait_s
+                     and self._waits(key, [e.request_id for e in rows], now))
         })
         if rr_key is None or rr_key in keys:
             return None
@@ -984,6 +1026,9 @@ class MicroScheduler:
             )
         if result.scheduled is not None:
             self._mark_scheduled(*node_walk, len(result.scheduled))
+            if request.node_name in self._batch_wait_s:
+                self._waiting_since.pop(node_walk, None)
+                self._stepped[request.node_name].update(result.scheduled.request_to_worker_graph)
             result.scheduled.relabel_if_uniform()
         return result.scheduled
 
@@ -1258,17 +1303,23 @@ class MicroScheduler:
         # final and skips the engine pass.
         if not self.runtime.has_ready_excluding(exclude, scan_exclude):
             return False
+        # rows of a ``batch_wait_ms`` node, by key: they count only once they
+        # would stop waiting, or a chain would yield for a step that is not taken
+        waiting: dict[tuple[str, str], list[int]] = {}
         for spec in self._ready_specs(exclude, None, scan_exclude):
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
+            waits = spec.node_name in self._batch_wait_s
             for rid in spec.rids:
                 fwd_info = request_state.get_fwd_info(
                     rid, node_partition
                 )
                 if self._check_ready(spec.node_name, rid, fwd_info):
-                    return True
-        return False
+                    if not waits:
+                        return True
+                    waiting.setdefault(self._key(spec.node_name, spec.graph_walk), []).append(rid)
+        return any(not self._waits(key, rids, now) for key, rids in waiting.items())
 
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
@@ -1327,6 +1378,8 @@ class MicroScheduler:
         self.failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
+        for stepped in self._stepped.values():
+            stepped.discard(rid)
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)
 

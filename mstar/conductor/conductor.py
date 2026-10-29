@@ -503,6 +503,18 @@ class Conductor:
                 if node.consumes_stream:
                     self.streaming_consumers.add(name)
 
+        # checked here so a bad entry fails once, not in every worker
+        from mstar.worker.micro_scheduler import parse_batch_wait_ms
+
+        unknown = set(parse_batch_wait_ms(self.model_config.get("batch_wait_ms"))) - {
+            name for name, _ in self.node_walk_to_wg
+        }
+        if unknown:
+            raise ValueError(
+                f"batch_wait_ms in {model_config_file} names {sorted(unknown)}, "
+                "which are not nodes of this deployment"
+            )
+
         # v1: one sharding group per worker graph. Track which group "owns"
         # each wg so we can assert single-group-per-wg.
         wg_to_owning_group: dict[int, str] = {}

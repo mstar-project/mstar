@@ -725,3 +725,21 @@ def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeyp
     model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
     conductor = _start_conductor(model, str(config_path), tmp_path, monkeypatch)
     assert conductor.worker_graphs
+
+
+@pytest.mark.parametrize("wait, error", [
+    ({"Code2Wav": 40}, None),
+    ({"Vocoder": 40}, r"names \['Vocoder'\], which are not nodes"),
+    ({"Code2Wav": "soon"}, "not a number of milliseconds"),
+])
+def test_batch_wait_ms_is_checked_at_startup(wait, error, tmp_path, monkeypatch, _drop_stubbed_imports):
+    config = yaml.safe_load((ROOT / "configs" / "qwen3omni_2gpu_split.yaml").read_text())
+    config["batch_wait_ms"] = wait
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(config))
+    model = _qwen3_omni(config["model"], {}, tmp_path, monkeypatch)
+    if error is None:
+        assert _start_conductor(model, str(path), tmp_path, monkeypatch).worker_graphs
+    else:
+        with pytest.raises(ValueError, match=error):
+            _start_conductor(model, str(path), tmp_path, monkeypatch)

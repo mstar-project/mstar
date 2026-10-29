@@ -34,13 +34,14 @@ from mstar.graph.runtime.base import (
     RequestWalks,
 )
 from mstar.utils.containers import ParallelList
+from mstar.worker import micro_scheduler
 from mstar.worker.batch_builder import (
     BaseBatchBuilder,
     BatchBuildRequest,
     BatchBuildResult,
     FIFOBatchBuilder,
 )
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch, parse_batch_wait_ms
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -1586,3 +1587,126 @@ def test_a_mixing_yield_away_skips_the_whole_combined_walk():
 def test_a_bad_mixing_setting_is_refused(mixes, error):
     with pytest.raises(ValueError, match=error):
         _combined_scheduler(_Engine(max_bs=8), mixes)
+
+
+# ── batch_wait_ms ───────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """The scheduler's monotonic clock, set by hand."""
+    now = SimpleNamespace(t=100.0)
+    monkeypatch.setattr(micro_scheduler, "time", SimpleNamespace(monotonic=lambda: now.t))
+    return now
+
+
+def _waiting_scheduler(engine: _Engine, ms=50) -> MicroScheduler:
+    return MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: engine),
+        parallel_leader_nodes={NODE}, batch_wait_ms={NODE: ms},
+    )
+
+
+def _step_done(manager: _Manager, *rids):
+    """The step finished and each rid's next input arrived."""
+    manager.in_flight.clear()
+    for rid in rids:
+        manager.per_request_info.setdefault(rid, object())
+        manager.ingest(rid)
+
+
+def test_rows_that_have_stepped_wait_out_the_window_and_go_together(clock):
+    sched = _waiting_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["r0", "r1"])
+    assert len(_next_batch(sched, manager)) == 2  # first steps at the node go at once
+
+    _step_done(manager, "r0")
+    assert _next_batch(sched, manager) is None
+    clock.t += 0.03
+    _step_done(manager, "r1")
+    assert _next_batch(sched, manager) is None
+    clock.t += 0.021  # 51 ms since r0 was first seen ready
+    batch = _next_batch(sched, manager)
+
+    assert sorted(batch.request_to_worker_graph) == ["r0", "r1"]
+    _step_done(manager, "r0")
+    assert _next_batch(sched, manager) is None, "the next window starts afresh"
+
+
+def test_a_request_s_first_step_does_not_wait_and_takes_the_waiting_rows(clock):
+    sched = _waiting_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["r0"])
+    _next_batch(sched, manager)
+    _step_done(manager, "r0")
+    assert _next_batch(sched, manager) is None
+
+    _step_done(manager, "r1")  # new request
+
+    assert sorted(_next_batch(sched, manager).request_to_worker_graph) == ["r0", "r1"]
+
+
+def test_rows_that_fill_a_step_do_not_wait(clock):
+    sched = _waiting_scheduler(_Engine(max_bs=2))
+    manager = _Manager(["r0", "r1"])
+    _next_batch(sched, manager)
+
+    _step_done(manager, "r0", "r1")
+
+    assert len(_next_batch(sched, manager)) == 2
+
+
+def test_a_waiting_row_does_not_make_a_chain_yield(clock):
+    sched = _waiting_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["r0"])
+    _next_batch(sched, manager)
+    _step_done(manager, "r0")
+
+    assert not _has_ready(sched, manager)
+    clock.t += 0.051
+    assert _has_ready(sched, manager)
+
+
+def test_a_targeted_call_does_not_wait(clock):
+    sched = _waiting_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["r0"])
+    _next_batch(sched, manager)
+    _step_done(manager, "r0")
+
+    assert len(_next_batch(sched, manager, target=(NODE, WALK))) == 1
+
+
+def test_a_recycled_handle_s_first_step_does_not_wait(clock):
+    sched = _waiting_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["r0"])
+    _next_batch(sched, manager)
+    sched.clear_rid("r0", "wire-r0")
+
+    _step_done(manager, "r0")
+
+    assert len(_next_batch(sched, manager)) == 1
+
+
+def test_a_node_without_a_wait_is_unaffected(clock):
+    sched = _waiting_scheduler(_Engine(max_bs=8))
+    sched._batch_wait_s = {"other": 0.05}
+    sched._stepped = {"other": set()}
+    manager = _Manager(["r0"])
+    _next_batch(sched, manager)
+    _step_done(manager, "r0")
+
+    assert len(_next_batch(sched, manager)) == 1
+
+
+@pytest.mark.parametrize("setting, error", [
+    ({NODE: -1}, "not a number"),
+    ({NODE: "20"}, "not a number"),
+    ({NODE: True}, "not a number"),
+])
+def test_a_bad_batch_wait_is_refused(setting, error):
+    with pytest.raises(ValueError, match=error):
+        parse_batch_wait_ms(setting)
+
+
+def test_a_zero_batch_wait_is_off():
+    assert parse_batch_wait_ms({NODE: 0, "b": 12.5}) == {"b": 12.5}
+    assert parse_batch_wait_ms(None) == {}

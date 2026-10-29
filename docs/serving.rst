@@ -263,6 +263,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        keeps to its own walk and yields to the others, and a step mixes walks only
        when the scheduler builds one fresh. Naming a node with no combined walk, or a
        walk outside its combined walks, fails loading.
+   * - ``batch_wait_ms``
+     - *(optional)* Per node, milliseconds its ready rows may wait for more rows to
+       join their step, e.g. ``{Code2Wav: 40}``. For a node whose step costs about
+       the same at any batch size, such as a vocoder that decodes padded windows,
+       fewer and larger steps leave more of the GPU to the nodes it shares it with.
+       A row's first step at the node never waits (a vocoder's first audio, say),
+       and neither does a step the rows already fill. Keep the wait well under the
+       time a chunk of output lasts, or playback stalls. Off by default; naming a
+       node the deployment doesn't have fails loading.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
