@@ -316,13 +316,16 @@ __device__ bool group_barrier(const Params& P, const Group& G, unsigned epoch, u
     const unsigned target = epoch * (unsigned)G.members;
     const uint64_t t0 = now();
     int ok = 1;
-    while (true) {
+    // the abort flag and the clock are read every 32 polls, so a satisfied barrier is seen one poll late at most
+    for (unsigned spins = 1;; ++spins) {
       if (poll_counter(G.sync, P.scope) >= target) break;
-      if (aborted(P)) { ok = 0; break; }
-      if (now() - t0 > kSpinTicks) {
-        __hip_atomic_store(P.ctl, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        ok = 0;
-        break;
+      if ((spins & 31u) == 0u) {
+        if (aborted(P)) { ok = 0; break; }
+        if (now() - t0 > kSpinTicks) {
+          __hip_atomic_store(P.ctl, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          ok = 0;
+          break;
+        }
       }
     }
     if (P.scope == AGENT) {
