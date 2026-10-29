@@ -86,6 +86,9 @@ logger = logging.getLogger(__name__)
 class LLMSubmodule(ARNodeSubmodule):
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
+    # drafts a speculative decode step verifies (see `__init__`); 0 decodes one
+    # token a step
+    num_draft_tokens: int = 0
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
@@ -805,7 +808,7 @@ class LLMSubmodule(ARNodeSubmodule):
         # only a decode row's stop can end decode_loop; a prefill is not in it yet
         if request_info.graph_walk != "decode" or "new_token" not in outputs:
             return set()
-        if self._speculative:
+        if self.num_draft_tokens:
             # The batched check reads the step's own `done`; this fallback
             # sees only the tokens, so it stops on a stop id and leaves the
             # budget to the loop's cap.
@@ -846,7 +849,7 @@ class LLMSubmodule(ARNodeSubmodule):
         """``check_stop`` for every request off one ``tolist``."""
         if step_walk is not None and step_walk != "decode":
             return {}  # as check_stop: only a decode row's stop ends decode_loop
-        if self._speculative:
+        if self.num_draft_tokens:
             return self._check_stop_verify(request_ids, request_infos, host_rows)
         tokens = host_rows.buffers.get("new_token")
         if not torch.is_tensor(tokens) or tokens.dim() == 0:
