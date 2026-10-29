@@ -599,9 +599,12 @@ def test_options_name_the_backends_that_honour_them():
     assert ATTN_BACKENDS.supporting("sm_scale") == ["flashinfer_mla"]
 
 
-def test_sliding_window_elsewhere_is_refused():
+def test_sliding_window_elsewhere_is_refused_before_the_kv_dependency_is_read():
     with pytest.raises(ValueError, match="sliding_window is unsupported .* use the flashinfer backend"):
         AttentionManager.build(attention_spec(backend=AttnBackend.DENSE, sliding_window=64), kv_info(paged_config()))
+    no_kv = EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="sliding_window is unsupported .*FLEX"):
+        AttentionManager.build(attention_spec(backend=AttnBackend.FLEX, sliding_window=64), no_kv)
 
 
 def test_sm_scale_is_read_by_mla_only():

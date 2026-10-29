@@ -117,15 +117,14 @@ class AttnBackendRegistry:
 
     def build(self, spec: AttentionSpec, info: EngineResourceInfo):
         """The manager ``spec`` asks for, after the checks every backend gets."""
+        # An unhonoured window is refused before the KV dependency is read;
+        # AUTO then resolves again with the cache's page size.
+        self._check_window(spec, self.resolve(spec.config.backend))
         kv_config = info.dependency(spec.config.kv_cache).config
         page_size = getattr(kv_config, "page_size", None)
         backend = self.resolve(spec.config.backend, page_size)
+        self._check_window(spec, backend)
         entry = self.entry(backend)
-        if spec.config.sliding_window is not None and not entry.sliding_window:
-            raise ValueError(
-                f"sliding_window is unsupported for attention backend {backend!r}; "
-                f"use the {' or '.join(self.supporting('sliding_window'))} backend"
-            )
         # Before `shard`, so a mismatch is reported rather than half-applied
         # to a config the KV resource also holds.
         self._check(entry, spec, kv_config)
@@ -156,6 +155,13 @@ class AttnBackendRegistry:
             entry = self.entry(fallback)
             self._check(entry, spec, kv_config)
         return _load(entry.builder)(spec, info, kv_config)
+
+    def _check_window(self, spec: AttentionSpec, backend: AttnBackend) -> None:
+        if spec.config.sliding_window is not None and not (backend in self and self.entry(backend).sliding_window):
+            raise ValueError(
+                f"sliding_window is unsupported for attention backend {backend!r}; "
+                f"use the {' or '.join(self.supporting('sliding_window'))} backend"
+            )
 
     def _check(self, entry: AttnBackendEntry, spec: AttentionSpec, kv_config: KVConfig) -> None:
         if not isinstance(kv_config, entry.kv_config):
