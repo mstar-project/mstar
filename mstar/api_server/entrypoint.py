@@ -697,10 +697,10 @@ class APIServer:
                 f"Output modality {names} requires streaming=True; raw frame "
                 "chunks cannot be returned as an aggregated response."
             )
-        model_kwargs = self.lora_kwargs(model, model_kwargs)
         # here, before anything is queued: null is unset, types and ranges are
         # checked once for every endpoint, and an over-wide seed cannot be packed
         model_kwargs = normalize_generation_kwargs(model_kwargs)
+        model_kwargs = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
 
         if file_streams:
