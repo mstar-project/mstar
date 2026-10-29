@@ -60,6 +60,7 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.components.diffusion.attention import uses_ragged_attention
+from mstar.model.components.fp8_linear import apply_linear_dtype, check_linear_dtype
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import DIT_ATTN, DIT_XATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
@@ -100,6 +101,7 @@ class Wan22Model(Model):
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
         attention_backend: str = "auto",
+        linear_dtype: str = "bf16",
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -118,6 +120,8 @@ class Wan22Model(Model):
         # the DiT's attention: the engine's ragged resources (the platform's kernel), or torch's SDPA inline
         self.use_ragged_attention = uses_ragged_attention(attention_backend)
         self.attention_backend = attention_backend
+        # fp8: the DiT blocks' linears (Wan22DiT.FP8_LINEARS) run as fp8 GEMMs where the GPU has them
+        self.linear_dtype = check_linear_dtype(linear_dtype)
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
@@ -763,6 +767,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
+            apply_linear_dtype(transformer, self.linear_dtype, transformer.FP8_LINEARS, "Wan2.2 transformer")
             return Wan22DitSubmodule(transformer, self.config, use_ragged_attention=self.use_ragged_attention)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
