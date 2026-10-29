@@ -2167,7 +2167,7 @@ def main(argv: list[str] | None = None):
         # The API server drops these until enable_metrics(), after the warmups.
         kwargs={
             "status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None,
-            "engine_cpus": engine_cpus,
+            **({"engine_cpus": engine_cpus} if engine_cpus else {}),
         },
     )
     conductor_proc.start()

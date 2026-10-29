@@ -1285,6 +1285,9 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
         def __init__(self, **kwargs):
             pass
 
+        def max_input_files(self):
+            return {}
+
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text(text)
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
