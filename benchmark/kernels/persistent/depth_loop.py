@@ -200,6 +200,52 @@ def phase_checks(kernel: Kernel, program, w, codebook, last_hidden, embed0, forc
     return out
 
 
+class ModelLoop:
+    """The code predictor's own depth loop as the served Talker step runs it
+    (``Qwen3OmniCodePredictor.forward_depth_unrolled`` per position, the LM head,
+    the SamplerResource kernels, the embedding and its sum), on the same weights."""
+
+    def __init__(self, w, codebook, bs, device, state: perop.PerOpState):
+        from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
+        from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+
+        cfg = Qwen3OmniModelConfig()
+        cp_cfg = cfg.code_predictor
+        cp_cfg.rms_norm_eps, cp_cfg.rope_theta = OMNI.eps, OMNI.rope_theta
+        with torch.device("meta"):
+            cp = Qwen3OmniCodePredictor(cfg)
+        cp = cp.to(torch.bfloat16).to_empty(device=device)
+        with torch.no_grad():
+            for name, t in cp.named_parameters():
+                if name.startswith("model.codec_embedding."):
+                    t.copy_(codebook[int(name.split(".")[2])])
+                elif name.startswith("lm_head."):
+                    t.copy_(w["lm_head_weight"][int(name.split(".")[1])])
+                else:
+                    t.copy_(w[name])
+        cp.consolidate_stacked_weights()
+        self.cp, self.state, self.bs = cp.eval(), state, bs
+        self.kv = torch.zeros(OMNI.layers, bs, 2, OMNI.positions, OMNI.kv_heads, OMNI.head_dim, dtype=torch.bfloat16,
+                              device=device)
+        self.pos = torch.zeros(bs, 1, dtype=torch.long, device=device)
+
+    @torch.no_grad()
+    def frame(self, last_hidden, embed0, emb_sum, codes):
+        cp = self.cp
+        self.pos.zero_()
+        cp.forward_depth_unrolled(last_hidden.unsqueeze(1), self.pos, self.kv, cache_pos=0)
+        self.pos += 1
+        embed = embed0
+        for g in range(1, OMNI.positions):
+            hidden = cp.forward_depth_unrolled(embed.unsqueeze(1), self.pos, self.kv, cache_pos=g).squeeze(1)
+            self.pos += 1
+            logits = torch.matmul(hidden, cp.lm_head_weight[g - 1].t())
+            tokens = perop.sampler(self.state, logits)
+            codes[:, g] = tokens
+            embed = cp.model.codec_embedding[g - 1](tokens)
+            emb_sum.add_(embed)
+
+
 def time_graph(fn, replays: int = 30, warmup: int = 3) -> dict[str, Any]:
     """``fn`` captured once and replayed one replay per sync."""
     side = torch.cuda.Stream()
@@ -358,6 +404,15 @@ def run(args) -> dict[str, Any]:
             timings[name] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
         result["timing"] = timings
         _stage(args, result, f"timing {name}")
+    try:
+        loop = ModelLoop(w, codebook, bs, device, state)
+        t = time_graph(lambda: loop.frame(last_hidden, embed0, emb_sum_t, codes_t), args.replays)
+        t.pop("graph")
+        timings["model_loop_sampled"] = t
+    except Exception as exc:  # noqa: BLE001  recorded
+        timings["model_loop_sampled"] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    result["timing"] = timings
+    _stage(args, result, "timing model_loop_sampled")
     configs = [(8, ds.SCOPE_XCD, 1), (8, ds.SCOPE_XCD, 2), (8, ds.SCOPE_AGENT, 1), (4, ds.SCOPE_AGENT, 1),
                (4, ds.SCOPE_AGENT, 2), (2, ds.SCOPE_AGENT, 1), (2, ds.SCOPE_AGENT, 2)]
     for groups, scope, per_cu in configs:
