@@ -157,11 +157,19 @@ class RocmPlatform(Platform):
         if num_tokens > limit:
             return {}
         overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
-        from mstar.platforms.rocm_gemm import SKINNY_MAX_ROWS, skinny_gemm_passes
+        from mstar.platforms.rocm_gemm import (
+            DECODE_LINEAR_MAX_ROWS,
+            SKINNY_MAX_ROWS,
+            decode_linear_pass,
+            skinny_gemm_passes,
+        )
 
         if num_tokens <= SKINNY_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
             # 1-2 row linears on AITER's skinny GEMM
             overrides["pre_grad_custom_pass"], overrides["post_grad_custom_post_pass"] = passes
+        elif decode and num_tokens <= DECODE_LINEAR_MAX_ROWS and (tuned := decode_linear_pass()) is not None:
+            # wider decode rows on the device's tuned hipBLASLt solutions, where it has them
+            overrides["post_grad_custom_post_pass"] = tuned
         return overrides
 
     def process_env_defaults(self) -> dict[str, str]:

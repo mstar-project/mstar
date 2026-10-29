@@ -206,6 +206,118 @@ class SkinnyGemmPass(CustomGraphPass):
         return get_hash_for_files((__file__,))
 
 
+# --- decode linears past the skinny rows ---------------------------------------------------
+#
+# From three rows on, a decode linear runs hipBLASLt's own pick, which at a few rows can sit well off the best of
+# hipBLASLt's solutions for the shape. A product's table (mstar/kernels/configs/<arch>/<product>/decode_linear.json,
+# from benchmark/kernels' linear search) names, per "rows{r}-n{n}-k{k}", the solution to run instead; shapes it
+# does not name keep F.linear. The indices are hipBLASLt's, so a table tuned on another stack is ignored.
+DECODE_LINEAR_MAX_ROWS = 128
+
+
+def _stack() -> str:
+    import triton
+
+    return f"torch-{torch.__version__}-hip-{torch.version.hip}-triton-{triton.__version__}".replace("+", "_")
+
+
+@functools.cache
+def decode_linear_table(device_index: int = 0) -> dict[str, dict]:
+    """This device's tuned decode-linear entries by shape key; empty without a table for this stack."""
+    from mstar.kernels import configs
+    from mstar.platforms import current_platform
+
+    facts = current_platform.device_facts(device_index)
+    config = configs.load_config("decode_linear", facts.arch, facts.product)
+    if config is None:
+        return {}
+    stack = (config.get("provenance") or {}).get("stack")
+    if stack != _stack():
+        logger.warning("decode_linear table for %s/%s was tuned on %s, not %s: not used",
+                       facts.arch, facts.product, stack, _stack())
+        return {}
+    return {k: v for k, v in config["classes"].items() if k != "default" and v.get("impl") == "hipblaslt"}
+
+
+def _decode_key(rows: int, n: int, k: int) -> str:
+    return f"rows{rows}-n{n}-k{k}"
+
+
+def _hipblaslt_decode_linear():
+    import aiter
+
+    aiter.hipb_create_extension()
+
+    def decode_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        entry = decode_linear_table(x.device.index or 0).get(_decode_key(x.shape[0], weight.shape[0], x.shape[1]))
+        if entry is None:
+            return torch.nn.functional.linear(x, weight, bias)
+        return aiter.hipb_mm(x, weight.t(), int(entry["solution"]), bias=bias)
+
+    return decode_linear
+
+
+DECODE_LINEAR = KernelOp(
+    "decode_linear",
+    "(Tensor x, Tensor weight, Tensor? bias) -> Tensor",
+    fake=_skinny_gemm_fake,
+    reference=_skinny_gemm_reference,
+    impls={f"rocm:{arch}": _hipblaslt_decode_linear for arch in ("gfx942", "gfx950")},
+    shapes=ShapePolicy(
+        dims=("rows", "n", "k"),
+        key=_gemm_shape,
+        inputs=_gemm_inputs,
+        warm=({"rows": 4, "n": 4096, "k": 4096}, {"rows": 64, "n": 24576, "k": 4096}),
+        dtypes=(torch.bfloat16,),
+    ),
+    tolerance=Tolerance.accumulated(),
+)
+
+
+class DecodeLinearPass(CustomGraphPass):
+    """The lowered graph: ``mm(x, w.T)`` whose shape the device's table names, for decode buckets past the
+    skinny rows. A table change changes the pass's hash, so inductor recompiles what it touches."""
+
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        table = decode_linear_table(torch.cuda.current_device())
+        for node in list(graph.nodes):
+            if node.op != "call_function" or node.target is not torch.ops.aten.mm.default:
+                continue
+            x, wt = node.args
+            weight = _weight_of(wt)
+            xv, wv = _val(x), _val(weight)
+            if not isinstance(xv, torch.Tensor) or not isinstance(wv, torch.Tensor) or xv.dim() != 2:
+                continue
+            if xv.dtype != torch.bfloat16 or wv.dtype != xv.dtype or not wv.is_contiguous():
+                continue
+            if not all(isinstance(d, int) for d in (*xv.shape, *wv.shape)):
+                continue
+            if _decode_key(xv.shape[0], wv.shape[0], xv.shape[1]) not in table:
+                continue
+            with graph.inserting_before(node):
+                new = graph.call_function(torch.ops.mstar.decode_linear.default, (x, weight, None))
+            new.meta.update(node.meta)
+            node.replace_all_uses_with(new)
+            graph.erase_node(node)
+            if not wt.users:
+                graph.erase_node(wt)
+
+    def uuid(self) -> bytes:
+        return get_hash_for_files((__file__,)) + repr(sorted(decode_linear_table(0).items())).encode()
+
+
+@functools.cache
+def decode_linear_pass() -> DecodeLinearPass | None:
+    """The pass, or None where nothing would change (no AITER, another arch, no table for this device)."""
+    if importlib.util.find_spec("aiter") is None or not torch.cuda.is_available():
+        return None
+    from mstar.platforms import current_platform
+
+    if not current_platform.is_rocm() or current_platform.arch() not in ("gfx942", "gfx950"):
+        return None
+    return DecodeLinearPass() if decode_linear_table(torch.cuda.current_device()) else None
+
+
 @functools.cache
 def skinny_gemm_passes() -> tuple[SkinnyLinearPrePass, SkinnyGemmPass] | None:
     """The (pre-grad, post-grad) passes, or None where the kernel can't run
