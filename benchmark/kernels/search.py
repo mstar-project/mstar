@@ -29,6 +29,7 @@ from typing import Any, NamedTuple
 
 import torch
 
+from benchmark.kernels import candidates
 from benchmark.kernels.bench import Bench, Timing
 from benchmark.kernels.candidates import Candidate
 from benchmark.kernels.roofline import roofline
@@ -230,7 +231,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--json", help="also write the records here")
     parser.add_argument("--job", default=os.environ.get("SLURM_JOB_ID"), help="recorded with every result")
     parser.add_argument("--list", action="store_true", help="print the candidates and exit")
+    parser.add_argument("--shuffle-seed", type=int, default=0,
+                        help="the shuffle a budget is drawn from (another reaches untried points)")
     args = parser.parse_args(argv)
+    candidates.SHUFFLE_SEED = args.shuffle_seed
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
     shapes = load_shapes(args.shapes, args.spec) if args.shapes else None
