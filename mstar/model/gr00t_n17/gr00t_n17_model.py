@@ -491,7 +491,10 @@ class Gr00tN17Model(Model):
             )
         # the engine's own reader, so this inherits its decode limits and its
         # RGB coercion (an RGBA or CMYK frame has no placeable channel axis)
-        img = read_image(filepath, rgb=True)  # uint8 CxHxW
+        try:
+            img = read_image(filepath, rgb=True)  # uint8 CxHxW
+        except (RuntimeError, OSError) as exc:  # the base loader's mapping: a 400, not a 500
+            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
         return TensorAndMetadata(img.permute(1, 2, 0).contiguous().to(device))
 
     def warmup_preprocess(self) -> None:
@@ -540,9 +543,32 @@ class Gr00tN17Model(Model):
                 f"for views {list(views)}, time-major -- but the request carried "
                 f"{len(frames)}"
             )
-        stacked = np.stack([np.asarray(f.cpu()) for f in frames])  # (T*V, H, W, 3)
+        # The resize scales each frame's short side to `image_edge` with no bound on the
+        # long side, so a thin frame well inside the decode budget (2 x 100000) would
+        # resize to gigabytes in the API server. Its resized pixels, rounded as the
+        # resize rounds them, are charged against the same per-request budget.
+        from mstar.model.media_limits import max_image_pixels
+
+        edge, budget = self.processor.image_edge, max_image_pixels()
+        resized = sum(
+            round(w * edge / min(h, w)) * round(h * edge / min(h, w))
+            for h, w in (tuple(f.shape[:2]) for f in frames)
+        )
+        if resized > budget:
+            raise ValueError(
+                f"gr00t_n17 resizes each frame's short side to {edge}; these frames "
+                f"({[tuple(f.shape[:2]) for f in frames]}) would resize to {resized} pixels, "
+                f"over the request's image budget of {budget} (MSTAR_MAX_IMAGE_PIXELS)"
+            )
+        # per view: cameras may differ in size (same aspect ratio, which the processor
+        # checks); a camera's own frames may not
+        for j, view in enumerate(views):
+            shapes = {tuple(f.shape) for f in frames[j::len(views)]}
+            if len(shapes) > 1:
+                raise ValueError(f"gr00t_n17 camera {view!r} sent frames of different sizes: {sorted(shapes)}")
         return {
-            view: stacked[j::len(views)][None] for j, view in enumerate(views)
+            view: np.stack([np.asarray(f.cpu()) for f in frames[j::len(views)]])[None]
+            for j, view in enumerate(views)
         }
 
     # ------------------------------------------------------------------ I/O

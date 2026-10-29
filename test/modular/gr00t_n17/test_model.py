@@ -1374,6 +1374,71 @@ def test_any_other_frame_format_is_refused_before_it_is_decoded(tmp_path, fmt):
         _model().load_image(str(path), "cpu")
 
 
+def test_a_truncated_frame_is_a_400_not_a_500(tmp_path):
+    """The header parses, so the format check passes; the decoder's RuntimeError would be a 500."""
+    from PIL import Image
+
+    path = tmp_path / "frame.png"
+    Image.fromarray(np.zeros((60, 80, 3), np.uint8)).save(path, format="PNG")
+    path.write_bytes(path.read_bytes()[:80])
+    with pytest.raises(ValueError, match="corrupt or truncated"):
+        _model().load_image(str(path), "cpu")
+
+
+def test_a_thin_frame_is_refused_before_the_resize_allocates_it(monkeypatch):
+    """2 x 40 resizes to 256 x 5120 here: within any decode budget, past this one once the
+    short side is scaled up. Refused before ``image`` runs, so nothing is allocated."""
+    model, _, state = _observation_model()
+    monkeypatch.setenv("MSTAR_MAX_IMAGE_PIXELS", str(1_000_000))
+    monkeypatch.setattr(model.processor, "image", lambda img: pytest.fail("resized before the check"))
+    thin = [torch.zeros((2, 40, 3), dtype=torch.uint8)] * 2
+    with pytest.raises(ValueError, match="image budget"):
+        model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": thin},
+                             embodiment_tag="bot", state=state)
+
+
+def test_cameras_may_differ_in_size_but_not_one_cameras_frames():
+    """The reference takes ``video[view]`` per view; only a view's own frames must agree."""
+    model, _, _ = _observation_model()
+    two_cameras = json.loads(json.dumps(_DECODE_KWARGS))
+    two_cameras["modality_configs"]["bot"]["video"]["modality_keys"] = ["cam", "wrist"]
+    model.processor = Gr00tN17Preprocessor(two_cameras, _DECODE_STATS, {"bot": 0}, 8, 6)
+    views, steps = model.processor.frame_layout("bot")
+    assert len(views) == 2  # one view would never stack two resolutions
+    sizes = [(30 + 10 * j, 40 + 10 * j) for j in range(len(views))]
+    frames = [torch.full((*sizes[j], 3), 10 * t + j, dtype=torch.uint8)
+              for t in range(steps) for j in range(len(views))]
+    got = model._views_from_frames("bot", frames)
+    for j, view in enumerate(views):
+        assert got[view].shape == (1, steps, *sizes[j], 3)
+        assert [int(got[view][0, t, 0, 0, 0]) for t in range(steps)] == [10 * t + j for t in range(steps)]
+
+
+def test_a_camera_whose_frames_differ_in_size_is_named():
+    model, _, _ = _observation_model()
+    frames = [torch.zeros((30, 40, 3), dtype=torch.uint8), torch.zeros((60, 80, 3), dtype=torch.uint8)]
+    with pytest.raises(ValueError, match="camera 'cam' sent frames of different sizes"):
+        model._views_from_frames("bot", frames)
+
+
+@pytest.mark.parametrize("wrist, accepted", [((360, 640), True), ((240, 320), False)],
+                         ids=["same aspect, twice the size", "another aspect"])
+def test_cameras_must_share_an_aspect_ratio_as_the_reference_stacks_them(wrist, accepted):
+    """NVIDIA's processor stacks every view's transformed frames, so a camera at another aspect
+    ratio fails there (``stack expects each tensor to be equal size``); here it is a 400."""
+    two_cameras = json.loads(json.dumps(_DECODE_KWARGS))
+    two_cameras["modality_configs"]["bot"]["video"]["modality_keys"] = ["cam", "wrist"]
+    pre = Gr00tN17Preprocessor(two_cameras, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
+    video = {"cam": np.zeros((1, 2, 180, 320, 3), np.uint8), "wrist": np.zeros((1, 2, *wrist, 3), np.uint8)}
+    state = {"arm": np.zeros((1, 1, 2), np.float32), "grip": np.zeros((1, 1, 1), np.float32)}
+    call = lambda: pre(embodiment_tag="bot", video=video, language=[""], state=state)  # noqa: E731
+    if accepted:
+        call()
+    else:
+        with pytest.raises(ValueError, match="one aspect ratio"):
+            call()
+
+
 # each JSON type a client field can arrive as
 _JSON_TYPES = {"an object": {"a": 1}, "a list": [1.0], "a number": 3, "a string": "x", "null": None}
 
