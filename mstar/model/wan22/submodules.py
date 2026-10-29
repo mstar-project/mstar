@@ -169,6 +169,16 @@ def _loop_step(fwd_info: CurrentForwardPassInfo, time_index: torch.Tensor) -> in
     return int(time_index.reshape(-1)[0].item())
 
 
+def _to_device_without_sync(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``t.to(device)`` for a small host table. Nothing in the denoise step
+    may wait on the GPU, or the worker cannot queue the step behind the one
+    still running: a blocking copy from pageable memory syncs the stream, so
+    the table goes up through pinned memory instead (the same bits)."""
+    if device.type == "cuda":
+        return t.pin_memory().to(device, non_blocking=True)
+    return t.to(device)
+
+
 def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, int]:
     """(T_lat, H_lat, W_lat) for the request's pixel-space dims (diffusers
     ``prepare_latents``: T=(F-1)//4+1, spatial /16)."""
@@ -459,15 +469,17 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         image_latent: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        step_metadata = engine_inputs.single_request_info.step_metadata
+        fwd_info = engine_inputs.single_request_info
+        step_metadata = fwd_info.step_metadata
         num_steps = int(step_metadata["num_inference_steps"])
         guidance_scale = float(step_metadata["guidance_scale"])
-        k = int(time_index.item())
+        k = _loop_step(fwd_info, time_index)
         device = latents.device
 
         with _inference_ctx():
             sigmas, timesteps = make_unipc_tables(num_steps, self.config.flow_shift)
-            t = timesteps[k].to(device)
+            sigmas_device = _to_device_without_sync(sigmas, device)
+            t = _to_device_without_sync(timesteps, device)[k]
 
             # All-ones for T2V; frame 0 zeroed for I2V.
             mask = torch.ones(1, 1, *latents.shape[2:], dtype=torch.float32, device=device)
@@ -493,7 +505,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                     UniPCState(model_outputs=unipc_model_outputs, last_sample=unipc_last_sample),
                     this_model_output=m_k,
                     this_sample=sample,
-                    sigmas=sigmas,
+                    sigmas=sigmas_device,
                     step_index=k,
                     order=unipc_effective_order(k - 1, num_steps),
                 )
@@ -501,7 +513,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
             new_latents = unipc_predictor_step(
                 UniPCState(model_outputs=new_ring, last_sample=sample),
                 sample=sample,
-                sigmas=sigmas,
+                sigmas=sigmas_device,
                 step_index=k,
                 order=unipc_effective_order(k, num_steps),
             )
