@@ -28,7 +28,9 @@ def _norm_rope(x: torch.Tensor, w: torch.Tensor, pos: torch.Tensor, eps: float, 
     return torch.cat([first * angle.cos() - second * angle.sin(), second * angle.cos() + first * angle.sin()], -1)
 
 
-@pytest.mark.parametrize("bs,seq_len,cache_pos", [(1, 1, 0), (5, 1, 7), (32, 1, 15), (64, 1, 3), (3, 2, 0), (5, 2, 4)])
+@pytest.mark.parametrize(
+    "bs,seq_len,cache_pos", [(1, 1, 0), (5, 1, 7), (32, 1, 15), (64, 1, 3), (128, 1, 9), (3, 2, 0), (5, 2, 4)],
+)
 def test_cp_attend_matches_the_unfused_ops(bs, seq_len, cache_pos):
     """q/k RMSNorm + RoPE, the step's k/v written into the dense cache, and
     causal attention over the depth positions so far, against the same math
@@ -37,7 +39,7 @@ def test_cp_attend_matches_the_unfused_ops(bs, seq_len, cache_pos):
     from mstar.model.components.code_predictor_kernels import cp_attend
 
     torch.manual_seed(0)
-    hq, hkv, d, layers, max_bs, max_s = 16, 8, 128, 5, 64, 16
+    hq, hkv, d, layers, max_bs, max_s = 16, 8, 128, 5, 128, 16
     dev, dt = "cuda", torch.bfloat16
     qkv = torch.randn(bs, seq_len, (hq + 2 * hkv) * d, device=dev, dtype=dt)
     wq = torch.randn(d, device=dev, dtype=dt)
@@ -70,12 +72,14 @@ def test_cp_attend_matches_the_unfused_ops(bs, seq_len, cache_pos):
         torch.testing.assert_close(out[:, s].float(), ref, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("bs,projected,init", [(1, False, False), (8, False, True), (32, True, False), (5, True, True)])
+@pytest.mark.parametrize(
+    "bs,projected,init", [(1, False, False), (8, False, True), (32, True, False), (5, True, True), (128, True, False)],
+)
 def test_cp_embed_accumulate_matches_the_unfused_ops(bs, projected, init):
     """The index_select + add (or, with ``init``, the sum's first term), the
     code recorded, and the next input: the embedding, or its row of the
-    projected table."""
-    from mstar.model.components.code_predictor_kernels import cp_embed_accumulate
+    projected table, with its row sums of squares per 256-wide chunk."""
+    from mstar.model.components.code_predictor_kernels import EMBED_BLOCK, cp_embed_accumulate, depth_partials
 
     torch.manual_seed(2)
     weight = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
@@ -89,13 +93,16 @@ def test_cp_embed_accumulate_matches_the_unfused_ops(bs, projected, init):
     ref_emb = torch.nn.functional.embedding(tokens, weight)
     ref_sum = ref_emb.float() if init else ref_sum.add_(ref_emb)
 
-    emb = cp_embed_accumulate(tokens, weight, emb_sum, codes, 5, inputs=table, init=init)
+    partials = depth_partials(torch.device("cuda"))
+    emb = cp_embed_accumulate(tokens, weight, emb_sum, codes, 5, inputs=table, init=init, partials=partials)
     assert torch.equal(emb, ref_emb if table is None else torch.nn.functional.embedding(tokens, table))
     assert torch.equal(emb_sum, ref_sum)
     assert torch.equal(codes, ref_codes)
+    chunks = emb.float().view(bs, -1, EMBED_BLOCK).pow(2).sum(-1).t()
+    torch.testing.assert_close(partials[:chunks.shape[0], :bs], chunks, rtol=1e-5, atol=1e-3)
 
 
-@pytest.mark.parametrize("rows", [1, 16, 37, 64])
+@pytest.mark.parametrize("rows", [1, 16, 37, 64, 65, 96, 128])
 def test_cp_linear_matches_the_unfused_ops(rows):
     """Each ``cp_linear`` mode against its op sequence in fp32: the folded
     RMSNorm (row sums of squares from x, and from a producer's partials), the
@@ -133,6 +140,10 @@ def test_cp_linear_matches_the_unfused_ops(rows):
     close(out, a.float() @ w_res.float().t() + bias.float())
     on = out.float() * torch.rsqrt(out.float().pow(2).mean(-1, keepdim=True) + 1e-6)
     close(cp_linear(out, folded, norm_eps=1e-6, partials=partials, n_part=h // STREAM_TILE), on @ folded.float().t())
+    if rows > 64:
+        # past 64 rows a launch tiles the rows: the first 64 come out as a 64-row call's
+        assert torch.equal(cp_linear(x, folded, norm_eps=1e-6)[:64], cp_linear(x[:64], folded, norm_eps=1e-6))
+
 
 
 def test_cp_linear_norm_from_x_holds_with_more_programs_than_sms():
