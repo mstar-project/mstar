@@ -1,0 +1,21 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+# qwen3omni_2gpu_split.yaml plus a second Talker on the Thinker's GPU. The
+# Talker bounds throughput at high concurrency while the Thinker's GPU idles,
+# so each request runs its Talker walks on one of the two (rank 0 on GPU 0,
+# rank 3 on GPU 1), and each Talker steps about half the rows. One Code2Wav
+# worker serves both. Each Talker has its own KV pool.
+resources:
+  thinker_kv:
+    max_num_pages: 1024
+    cpu_offload_pages: 1024
+node_groups:
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [1]
+  - node_names: [Thinker]
+    ranks: [1]
+  - node_names: [Talker]
+    ranks: [0, 3]
+  - node_names: [Code2Wav]
+    ranks: [2]
+rank_devices: {2: 0, 3: 1}
