@@ -5,10 +5,10 @@ In place, like FlashInfer's kernel: ``residual += hidden_states``, then
 The sum stays in fp32 for the norm and each output is rounded once, to nearest
 even, so the numerics match FlashInfer's.
 
-A program normalizes ``rows_per_program`` whole rows. ``elems_per_thread``
-sets the workgroup size from the row width, so one setting carries across
-hidden sizes: the warps are the padded row over (warp size x elements per
-thread), between 1 and 16.
+A program normalizes ``rows_per_program`` whole rows as one tile.
+``elems_per_thread`` sets the workgroup size from the tile, so one setting
+carries across hidden sizes: the warps are the padded tile over (warp size x
+elements per thread), between 1 and 16.
 """
 
 from __future__ import annotations
@@ -29,20 +29,22 @@ def _fused_add_rms_norm(
     h_ptr, r_ptr, w_ptr, rows, hidden, h_stride, r_stride, eps,
     GEMMA: tl.constexpr, BLOCK_N: tl.constexpr, ROWS: tl.constexpr,
 ):
+    # one [ROWS, BLOCK_N] tile, so every row's loads are in flight before the
+    # first store (a loop over rows would wait on each row's stores)
     cols = tl.arange(0, BLOCK_N)
+    row = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     in_row = cols < hidden
+    mask = (row < rows)[:, None] & in_row[None, :]
     w = tl.load(w_ptr + cols, mask=in_row, other=0.0).to(tl.float32)
     if GEMMA:
         w = w + 1.0
-    for i in tl.static_range(ROWS):
-        row = (tl.program_id(0) * ROWS + i).to(tl.int64)
-        mask = in_row & (row < rows)
-        h = tl.load(h_ptr + row * h_stride + cols, mask=mask, other=0.0).to(tl.float32)
-        r = tl.load(r_ptr + row * r_stride + cols, mask=mask, other=0.0).to(tl.float32)
-        total = h + r
-        tl.store(r_ptr + row * r_stride + cols, total.to(r_ptr.dtype.element_ty), mask=mask)
-        rms_rcp = tl.rsqrt(tl.sum(total * total, axis=0) / hidden + eps)
-        tl.store(h_ptr + row * h_stride + cols, (total * rms_rcp * w).to(h_ptr.dtype.element_ty), mask=mask)
+    h = tl.load(h_ptr + row[:, None] * h_stride + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(r_ptr + row[:, None] * r_stride + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    total = h + r
+    tl.store(r_ptr + row[:, None] * r_stride + cols[None, :], total.to(r_ptr.dtype.element_ty), mask=mask)
+    rms_rcp = tl.rsqrt(tl.sum(total * total, axis=1) / hidden + eps)
+    out = total * rms_rcp[:, None] * w[None, :]
+    tl.store(h_ptr + row[:, None] * h_stride + cols[None, :], out.to(h_ptr.dtype.element_ty), mask=mask)
 
 
 def _warp_size() -> int:
@@ -52,9 +54,9 @@ def _warp_size() -> int:
 def launch_options(hidden: int, knobs: Mapping[str, Any]) -> dict[str, int]:
     """The block width, rows per program and Triton launch options for rows of
     ``hidden`` columns at ``knobs``."""
-    block = triton.next_power_of_2(hidden)
-    warps = block // (_warp_size() * int(knobs["elems_per_thread"]))
-    options = {"BLOCK_N": block, "ROWS": int(knobs["rows_per_program"]), "num_warps": max(1, min(16, warps))}
+    block, rows = triton.next_power_of_2(hidden), int(knobs["rows_per_program"])
+    warps = block * rows // (_warp_size() * int(knobs["elems_per_thread"]))
+    options = {"BLOCK_N": block, "ROWS": rows, "num_warps": max(1, min(16, warps))}
     if torch.version.hip:
         options["waves_per_eu"] = int(knobs.get("waves_per_eu", 0))
     return options
