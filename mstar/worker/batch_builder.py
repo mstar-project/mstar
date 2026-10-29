@@ -162,6 +162,15 @@ class FIFOBatchBuilder(BaseBatchBuilder):
     for any other reason -- OOM backoff, pending remove, a foreign capture
     group, a walk the combined cap left out -- always parks: it cannot run
     this step whoever holds it.
+
+    A row the token budget leaves out always parks too, ahead of the cap's
+    leftovers, because a budgeted walk's backlog is its line: the Rust
+    runtime scans ready rows in handle order, so a row sent back rejoins
+    behind rows that arrived after it. Under start order, which leaves out
+    most prompts every step, the first prompts of a burst then started last.
+    Such a backlog can stay non-empty under sustained load; the worker's
+    fairness peek still hands the step after a prompt step to other ready
+    work.
     """
 
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
@@ -189,9 +198,7 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             return BatchBuildResult(None, backlog=batch)  # the caller's rows fill it
         scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
         # A fresh row the cap pushed out goes back to its ready queue only on
-        # a step that served a backlog; with none it parks, as main did. The
-        # token budget below does the same for the rows it drops, so both
-        # kinds of leftover accumulate into `returned`.
+        # a step that served a backlog; with none it parks, as main did.
         returned: dict[int, int] | None = None
         if remainder is not None and had_backlog:
             give_back = {
@@ -221,17 +228,9 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
         }
         if dropped:
-            # a fresh row that missed the budget goes back to its queue; a backlogged one stays parked
+            # parked ahead of the cap's leftovers (see the class docstring)
             scheduled, out = scheduled.split_off_first(None, exclude_rids=dropped)
-            backlogged = () if request.backlog is None else request.backlog.request_to_worker_graph
-            back, fresh_out = out.split_off_first(
-                None, exclude_rids=set(out.request_to_worker_graph).difference(backlogged),
-            )
-            if back is not None:
-                remainder = back if remainder is None else _merged(remainder, back)
-            if fresh_out is not None:
-                # accumulated, not replaced: the cap may already have given rows back
-                returned = (returned or {}) | dict(fresh_out.request_to_worker_graph)
+            remainder = _merged(out, remainder)
         return BatchBuildResult(
             scheduled, backlog=remainder, returned=returned, chunk_tokens=chunk_tokens,
         )

@@ -1779,6 +1779,29 @@ def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
 
 
 @pytest.mark.usefixtures("no_chunk_floor")
+def test_prompts_left_out_of_a_step_start_in_arrival_order():
+    """A prompt the budget leaves out keeps its place: it is parked ahead of
+    the rows the row cap pushed out, not sent back behind them."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=4))
+    sched.get_tensor = lambda uuid: uuid
+    rids = [f"p{i}" for i in range(8)]
+    manager = _Manager(rids, walks=dict.fromkeys(rids, "prefill"))
+    queue = manager.queues["wg0"]._ready
+    started = []
+    for _ in range(40):
+        batch = _next_batch(sched, manager)
+        if batch is None:
+            break
+        for rid, (start, end, total) in batch.chunk_ranges.items():
+            if start == 0:
+                started.append(rid)
+            sched.advance_chunk(rid, NODE, end)
+            if end < total:
+                queue[rid] = {NODE}
+    assert started == rids
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
 def test_a_prompt_finishes_before_the_next_one_starts():
     """Start order: the prompt already mid-prefill takes the budget again,
     even queued behind one that has not started."""
