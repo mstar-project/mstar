@@ -136,9 +136,9 @@ chooses per shape. On AMD GPUs:
   config.
 - Decode buckets of up to 16 rows send each linear where the
   ``decode_gemv`` entry for its ``(rows, n, k)`` says: ``"aiter"`` (AITER's
-  skinny GEMM), ``"triton"`` or ``"hip"`` (``mstar::decode_gemv``,
-  ``mstar/kernels/{triton,hip}/gemv``) or ``"hipblaslt"`` (left to
-  inductor), and a gated MLP's gate/up projection and ``silu(gate) * up``
+  skinny GEMM), ``"triton"`` (``mstar::decode_gemv``,
+  ``mstar/kernels/triton/gemv.py``) or ``"hipblaslt"`` (left to inductor),
+  and a gated MLP's gate/up projection and ``silu(gate) * up``
   become one ``mstar::decode_gemv_silu_mul`` where that op's entry names a
   kernel. Without a config, 1-2 row linears go to AITER and the rest to
   hipBLASLt. The graph passes are in ``mstar/platforms/rocm_gemm.py``; their
