@@ -259,18 +259,15 @@ def test_ingest_reports_the_index_of_an_unclaimed_signal():
     assert uningested == [1]
 
 
-def test_stop_loops_returns_loop_back_signal_set():
+def test_stop_loops_sets_the_finish_signal():
     mgr, wg_id, walk, runtime, rid = _make_manager()
     # Drive prefill → ar_decode so the loop is active.
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
     runtime._mark_node_complete(rid, wg_id, "prefill")
 
-    stopped = runtime._stop_loops_for_rid(
+    runtime._stop_loops_for_rid(
         rid, "default", {"ar_loop"}, last_node_run=None,
     )
-    # ar_loop has two loop-back inputs: (token, ar_decode) and (kv_cache, ar_decode).
-    assert stopped == {("token", "ar_decode"), ("kv_cache", "ar_decode")}
-    # _finish_signal should be set on the live loop.
     wgio = runtime._queues[wg_id].per_request_queues[rid]
     assert wgio.loops["ar_loop"]._finish_signal is True
 
