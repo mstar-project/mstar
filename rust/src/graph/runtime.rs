@@ -3657,11 +3657,6 @@ impl GraphRuntime {
         Ok(plan)
     }
 
-    fn partition_done(&self, rid: u32, partition: &str) -> bool {
-        let Some(p) = self.interner.get(partition) else { return false };
-        self.info(rid).is_some_and(|i| i.partition_done(p))
-    }
-
     /// Parked routing awaiting a send. Non-zero between
     /// complete_and_route_batch and send_outputs; a number that only grows
     /// means sends are being abandoned.
