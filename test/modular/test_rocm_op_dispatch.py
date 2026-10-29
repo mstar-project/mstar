@@ -7,6 +7,7 @@ tests point ``current_platform`` at a chosen platform and replace ``flashinfer``
 with a recording stand-in, so they run without a GPU or FlashInfer.
 """
 
+import json
 import sys
 import types
 
@@ -19,7 +20,9 @@ from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.rms_norm import rms_norm as norm_ops
 from mstar.engine.resources.sampler import utils as sampler_utils
+from mstar.kernels import configs
 from mstar.platforms import CudaPlatform, RocmPlatform
+from mstar.platforms.facts import DeviceFacts
 
 _ROCM_BACKENDS = (
     "mstar.engine.resources.rms_norm.rocm",
@@ -152,15 +155,55 @@ def test_amd_rms_norm_hands_the_fork_2d_rows(stack):
     assert rec.calls[-1][1][0] is x2, "2-D input goes through unchanged"
 
 
-@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform()], ids=repr)
+class _Gfx942(RocmPlatform):
+    """An MI300X-class GPU with no tuned configs, without a device."""
+
+    def __init__(self, product="mi300x"):
+        self.product = product
+
+    def arch(self, device=None):
+        return "gfx942"
+
+    def device_facts(self, device=None):
+        return DeviceFacts(platform="rocm", arch="gfx942", product=self.product)
+
+    def __repr__(self):
+        return f"_Gfx942({self.product})"
+
+
+@pytest.mark.parametrize("platform", [CudaPlatform(), _Gfx942()], ids=repr)
 @pytest.mark.parametrize("gemma", [False, True])
-def test_fused_add_rms_norm_is_flashinfers_in_place_kernel(stack, platform, gemma):
+def test_fused_add_rms_norm_is_flashinfers_in_place_kernel(stack, platform, gemma, tmp_path, monkeypatch):
+    """A product without a config keeps FlashInfer (its ROCm fork on AMD)."""
+    monkeypatch.setattr(configs, "CONFIG_ROOT", tmp_path)
+    configs._read.cache_clear()
     rec = stack(platform, rocm_fork=platform.is_rocm())
     h, r, w = torch.ones(2, 8), torch.ones(2, 8), torch.ones(8)
     norm_ops.FUSED_ADD_RMS_NORM.dispatch(h, r, w, 1e-5, gemma)
     [(name, args, _)] = rec.calls
     assert name == ("norm.gemma_fused_add_rmsnorm" if gemma else "norm.fused_add_rmsnorm")
     assert args[0] is h and args[1] is r and args[2] is w and args[3] == 1e-5
+    configs._read.cache_clear()
+
+
+def test_a_config_sends_its_shape_classes_to_the_triton_norm(stack, tmp_path, monkeypatch):
+    from mstar.kernels.triton import norm as triton_norm
+
+    path = configs.config_path("fused_add_rms_norm", "gfx942", "mi325x", root=tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"classes": {"decode": {"impl": "triton", "elems_per_thread": 8, "rows_per_program": 1},
+                                            "prefill": {"impl": "fork"}}}))
+    monkeypatch.setattr(configs, "CONFIG_ROOT", tmp_path)
+    configs._read.cache_clear()
+    rec = stack(_Gfx942("mi325x"))
+    monkeypatch.setattr(triton_norm, "fused_add_rms_norm", rec.fn("triton.fused_add_rms_norm"))
+    w = torch.ones(8)
+    norm_ops.FUSED_ADD_RMS_NORM.dispatch(torch.ones(2, 8), torch.ones(2, 8), w, 1e-5, True)
+    norm_ops.FUSED_ADD_RMS_NORM.dispatch(torch.ones(300, 8), torch.ones(300, 8), w, 1e-5, True)
+    assert [name for name, _, _ in rec.calls] == ["triton.fused_add_rms_norm", "norm.gemma_fused_add_rmsnorm"]
+    assert rec.calls[0][1][-1] == {"elems_per_thread": 8, "rows_per_program": 1}, "the class's knobs"
+    assert "triton" in norm_ops.FUSED_ADD_RMS_NORM.implementation().kernel_selection
+    configs._read.cache_clear()
 
 
 @pytest.mark.parametrize("gemma", [False, True])
