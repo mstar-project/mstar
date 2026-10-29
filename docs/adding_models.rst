@@ -650,6 +650,12 @@ The spec types are:
        so a prefill capture bucket larger than ``max_captured_prefill_tokens`` (512
        by default) runs eagerly; smaller ones capture a sequential kernel whose cost
        grows with the longest row.
+   * - ``SpecDecodeSpec(config=SpecDecodeConfig(num_draft_tokens=k), kv_cache=..., attn=...)``
+     - Speculative decoding: one row of device registers per request (its committed
+       length, how much its last verify step accepted, the next step's tokens, its
+       budget) and the in-graph operations a verify step and its draft passes call. See
+       `Speculative decoding`_. Declare it only on a deployment that drafts; nothing
+       else changes when it is absent.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
@@ -1815,6 +1821,47 @@ Run it with:
 .. code-block:: bash
 
    mstar-serve --config configs/your_model.yaml --host 0.0.0.0 --port 8000
+
+Speculative decoding
+~~~~~~~~~~~~~~~~~~~~
+
+A model whose checkpoint carries a draft (Qwen3.5's one-layer MTP head) can decode
+speculatively: each decode step verifies ``k`` drafted tokens with the target and drafts
+the next ``k``, inside one captured graph and with no host sync.
+``SpecDecodeResource`` (``mstar/engine/resources/spec_decode/``) has the design in its
+module docstring. What a model declares and calls:
+
+- **Resources.** A ``SpecDecodeSpec`` over the node's paged KV and attention
+  resources; the recurrent pool with ``RecurrentStateConfig(spec_tokens=k)`` (a request
+  holds ``k + 1`` state slots, and conv windows grow by ``k``) and the linear-attention
+  spec with ``LinearAttnConfig(spec_decode=<key>)``; one more KV layer for the draft
+  head's attention; no combined walk mixing prompts with decode rows. ``k`` is a
+  model kwarg (``model_kwargs: {num_draft_tokens: k}`` in the serving config), since
+  these shapes are sized from it.
+- **Decode steps.** Every row is ``k + 1`` tokens. ``declare_step`` gives each row a
+  ``SpecDecodeStep(phase=VERIFY)`` with ``retract`` set from
+  ``pending_retract(rid)``, the same amounts negated on ``KVStep.commit_adjust``, and
+  ``AttentionStep(row_queries=k + 1)``; no sampler or position step. The forward calls
+  ``verify_inputs()`` (tokens and positions), runs the target, ``accept(logits)``,
+  then for each draft pass ``begin_draft_pass(j)``, the draft head, and
+  ``record_draft(j, tokens)``. Pass ``j`` sits at the verify positions plus ``j``.
+- **The prompt's last step.** It declares ``SpecDecodeStep(phase=SEED)`` (budgets
+  and ``ignore_eos`` rows) and ``KVStep.commit_adjust`` of ``seed_lookahead`` tokens,
+  runs the draft head over the prompt, and calls ``seed(first_token, first_draft)``.
+- **Stops.** ``accept`` returns each row's emitted tokens (-1 past the last), how
+  many positions the target accepted and a ``done`` flag (a stop id or the budget);
+  ``check_stop_batched`` reads ``done`` and hands the accepted counts to ``learn``,
+  which is how the host gives back the KV it reserved optimistically. A step emits a
+  varying number of tokens, so it takes the per-request tensor path to the client,
+  not the inline one, and the API side drops the -1s.
+
+The async worker plans step N+1 while N runs, so a verify step is planned against the
+length it would have if N accepted every draft, and its KV write slots, attention
+lengths, rotary positions and recurrent start slots are corrected from the registers
+on the device. That needs an attention backend whose plan reads per-row KV lengths and
+a block table on the device: AITER's unified attention on AMD GPUs. Verification is
+greedy; a speculative deployment refuses ``temperature > 0`` and
+``repetition_penalty`` until rejection sampling lands.
 
 Tuning resources per deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
