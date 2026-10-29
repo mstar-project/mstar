@@ -250,3 +250,28 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     fake.reset_pre_plan_for_batch(batch)
     assert batch.step is None and batch.preplanned_rids is None and batch.preplan_event is None
     assert cleared == [True]
+
+
+def test_a_discarded_pre_plans_copies_are_waited_on_by_the_forward() -> None:
+    # a re-plan may skip a copy whose bytes the discarded pre-plan staged on
+    # the plan stream, so the replay must still wait on that stream's event
+    fake = SimpleNamespace(
+        _enable_nvtx=False,
+        _submodules={"dit": SimpleNamespace(accelerator_graph_runner=None)},
+        _runner=SimpleNamespace(clear_preplan=lambda: None),
+    )
+    fake.reset_pre_plan_for_batch = Engine.reset_pre_plan_for_batch.__get__(fake)
+    event = object()
+    batch = SimpleNamespace(
+        request_ids=["a"], node_name="dit", step=object(),
+        preplanned_rids=("a",), preplan_event=event, discarded_preplan_event=None,
+        step_context=SimpleNamespace(slot_lease=None, graph_walk="decode"),
+    )
+    fake.reset_pre_plan_for_batch(batch)
+    assert batch.preplan_event is None and batch.discarded_preplan_event is event
+    waited = []
+    runner = SimpleNamespace(
+        run_forward=lambda lease, pre, plan_done_event, launch_started_event: waited.append(plan_done_event),
+    )
+    Engine._forward(fake, batch, None, runner, None, {}, object(), True, ["a"])
+    assert waited == [event]

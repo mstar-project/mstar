@@ -41,7 +41,12 @@ class H2DMirror:
 
     def record(self, key: tuple, values: np.ndarray) -> None:
         self._key = key
-        self._values = values.copy()
+        # into the kept array when it fits, rather than a new copy a record
+        kept = self._values
+        if kept is not None and kept.shape == values.shape and kept.dtype == values.dtype:
+            np.copyto(kept, values)
+        else:
+            self._values = values.copy()
 
     def invalidate(self) -> None:
         """The destination was written some other way."""
@@ -148,7 +153,12 @@ class PinnedStager:
         if mirror is not None:
             values = np.asarray(values, dtype=self._np_dtype)
             key = (total, pad_value)
-        direct = self._memcpy is not None and dst.is_cuda
+        # raw bytes only into a destination laid out as the arena is; the torch
+        # copy converts a dtype and refuses a strided destination
+        direct = (
+            self._memcpy is not None and dst.is_cuda
+            and dst.dtype == self.dtype and dst.is_contiguous()
+        )
         if direct:
             stream = torch._C._cuda_getCurrentRawStream(dst.get_device())
         elif self._pinned and DeviceCapability.of(dst.device).is_accelerator:
