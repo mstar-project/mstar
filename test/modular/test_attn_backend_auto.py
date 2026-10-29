@@ -472,10 +472,13 @@ def test_auto_resolves_to_a_registered_backend_on_every_platform(monkeypatch, ro
         assert resolved is not AttnBackend.AUTO and resolved in ATTN_BACKENDS
 
 
-def test_which_device_types_each_backend_runs_on():
+def test_where_each_backend_runs():
     devices = {entry.backend: entry.devices for entry in ATTN_BACKENDS}
     assert devices.pop(AttnBackend.XPU_PAGED) == ("xpu",)
     assert set(devices.values()) == {()}
+    where = {entry.backend: entry.platforms for entry in ATTN_BACKENDS}
+    assert where.pop(AttnBackend.AITER) == ("rocm",)
+    assert set(where.values()) == {()}
 
 
 def test_options_name_the_backends_that_honour_them():
@@ -586,6 +589,18 @@ def test_a_failed_probe_falls_back_to_auto_or_raises(stub_registry):
     xpu = EngineResourceInfo(device=torch.device("xpu"), kv_dtype=torch.bfloat16, dependencies=xpu.dependencies)
     with pytest.raises(RuntimeError, match=r"'xpu_paged' requires a working stub library \(ImportError: no kernel\)"):
         stub_registry.build(attention_spec(backend=AttnBackend.XPU_PAGED), xpu)
+
+
+def test_an_entry_for_one_platform_is_refused_on_another(stub_registry, monkeypatch):
+    stub_registry.register(AttnBackendEntry(
+        AttnBackend.FLEX, builder=f"{_HERE}:_stub_build", kv_config=RingKVConfig, platforms=("rocm",),
+    ))
+    spec, info = attention_spec(backend=AttnBackend.FLEX), kv_info(ring_config())
+    monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
+    with pytest.raises(RuntimeError, match="'flex' runs on rocm; this process runs on cuda"):
+        stub_registry.build(spec, info)
+    monkeypatch.setattr(platforms, "resolve_platform", RocmPlatform)
+    assert stub_registry.build(spec, info)[1] is AttnBackend.FLEX
 
 
 def test_the_table_refuses_what_it_cannot_serve(stub_registry):
