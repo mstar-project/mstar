@@ -142,6 +142,18 @@ def test_env_defaults_keep_a_value_already_set(monkeypatch):
     assert os.environ["PLATFORM_ENV_TEST_SET"] == "user"
 
 
+def test_a_callable_env_default_adds_to_the_value_already_set(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    monkeypatch.setattr(
+        RocmPlatform, "process_env_defaults",
+        lambda self: {"PLATFORM_ENV_TEST_SET": lambda current: f"{current}-default"},
+    )
+    monkeypatch.setenv("PLATFORM_ENV_TEST_SET", "user")
+
+    platforms.apply_process_env_defaults()
+    assert os.environ["PLATFORM_ENV_TEST_SET"] == "user-default"
+
+
 def test_a_worker_sets_its_env_defaults_before_anything_else(monkeypatch):
     from mstar.conductor import conductor
 
@@ -202,6 +214,7 @@ def test_the_conductor_sets_env_defaults_before_spawning_workers(monkeypatch, ro
         _dist_init_method="", model=None, enable_nvtx=False, enable_prof=False, device_type="cuda",
         rank_devices=None, log_level="INFO", tensor_comm_protocol=None, tcp_transfer_device="",
         _status_interval_s=None,
+        _mps_requested=False, _mps=None,
         shutdown=None,
     )
     conductor.Conductor._launch_workers(spawner)

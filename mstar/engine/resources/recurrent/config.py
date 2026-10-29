@@ -7,7 +7,6 @@ layer, so capacity is a slot count and a fork is a fixed-size copy.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from math import prod
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,16 +23,22 @@ class RecurrentBlockConfig:
     """One per-slot, per-layer tensor block.
 
     ``shape`` is opaque to the pool. ``shard_dims`` names the axes divided
-    across ranks.
+    across ranks. A ``dtype`` of None is the engine's compute dtype (what its
+    KV caches store), resolved by ``resolved_dtype`` and never written back.
     """
 
     shape: tuple[int, ...]
-    dtype: torch.dtype
+    dtype: torch.dtype | None
     shard_dims: tuple[int, ...] = ()
 
     def __post_init__(self):
         self.shape = tuple(self.shape)
         self._unsharded_shape = self.shape
+
+    def resolved_dtype(self, kv_dtype: torch.dtype | None) -> torch.dtype:
+        """The dtype the pool stores this block in; a resource planned against
+        the pool reads it here rather than from ``dtype``."""
+        return self.dtype or kv_dtype or torch.get_default_dtype()
 
     def shard(self, num_shards: int) -> None:
         from mstar.distributed.utils import divide
@@ -42,14 +47,6 @@ class RecurrentBlockConfig:
         for dim in self.shard_dims:
             shape[dim] = divide(self._unsharded_shape[dim], num_shards)
         self.shape = tuple(shape)
-
-    @property
-    def numel(self) -> int:
-        return prod(self.shape)
-
-    @property
-    def nbytes(self) -> int:
-        return self.numel * torch.empty((), dtype=self.dtype).element_size()
 
 
 class RecurrentGeometry(ABC):
@@ -91,7 +88,7 @@ class DeltaNetGeometry(RecurrentGeometry):
 
     def to_blocks(
         self,
-        state_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype | None = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
     ) -> dict[str, RecurrentBlockConfig]:
         """Pool blocks for this geometry; head counts are pre-sharding."""
@@ -183,7 +180,7 @@ class Mamba2Geometry(RecurrentGeometry):
 
     def to_blocks(
         self,
-        state_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype | None = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
     ) -> dict[str, RecurrentBlockConfig]:
         """Pool blocks for this geometry; head counts pre-sharding (heads and
@@ -256,6 +253,11 @@ class RecurrentStateConfig:
     # TODO: derive this from (backend, dtype, ...) automatically.
     disable_sink_slot: bool = False
 
+    # Snapshots kept for prefix reuse, in slots past max_slots: the state a
+    # prompt reached at a page boundary of `kv_cache`, under that page's key.
+    prefix_slots: int = 0
+    kv_cache: str | None = None
+
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
@@ -276,14 +278,6 @@ class RecurrentStateConfig:
         for block in self.blocks.values():
             block.shard(num_shards)
 
-    @property
-    def slot_bytes(self) -> int:
-        return self.num_layers * sum(b.nbytes for b in self.blocks.values())
-
-    @property
-    def total_bytes(self) -> int:
-        return self.slot_bytes * self.max_slots
-
 
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):
@@ -295,10 +289,15 @@ class RecurrentStateSpec(NodeResourceSpec):
 
         return RecurrentStatePool
 
+    def depends_on(self) -> set[str]:
+        return {self.config.kv_cache} if self.config.kv_cache else set()
+
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
+        prefix_slots: int | None = None,
     ):
-        """How many slots this deployment gets, and the state's dtype.
+        """How many slots this deployment gets, the state's dtype, and how
+        many snapshots it keeps for prefix reuse.
 
         Block shapes are the model's and not tunable. The dtype trades
         accumulated precision against bandwidth and decides which kernels the
@@ -306,6 +305,10 @@ class RecurrentStateSpec(NodeResourceSpec):
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
+        if prefix_slots is not None:
+            if prefix_slots < 0:
+                raise ValueError(f"prefix_slots={prefix_slots} must be >= 0")
+            self.config.prefix_slots = prefix_slots
         if state_dtype is not None:
             try:
                 dtype = getattr(torch, state_dtype)

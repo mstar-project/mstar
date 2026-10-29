@@ -3,6 +3,7 @@
 This script never downloads weights. Run `reference` in one process, let it exit,
 then run `mstar` with torchrun using the saved reference directory. Both modes
 require an explicitly supplied local checkpoint. Outputs belong in scratch space.
+`--images` adds image prompts, tokenized by the HF processor for the reference.
 """
 
 import argparse
@@ -25,6 +26,29 @@ PROMPTS = [
 ]
 
 
+def get_cases(images):
+    cases = [dict(prompt=prompt, images=[]) for prompt in PROMPTS]
+    cases += [dict(prompt="Describe this image in one sentence.", images=[str(path)]) for path in images]
+    if len(images) > 1:
+        cases.append(dict(prompt="What do these images have in common?", images=[str(path) for path in images]))
+    return cases
+
+
+def image_messages(case):
+    content = [{"type": "image"} for _ in case["images"]] + [{"type": "text", "text": case["prompt"]}]
+    return [{"role": "user", "content": content}]
+
+
+def encode(adapter, case):
+    """M*'s prompt ids and, for image prompts, its tiles."""
+    if not case.get("images"):
+        return adapter.process_prompt(case["prompt"], ["text"], ["text"]).new_input_tensors["text_inputs"][0], None
+    images = [adapter.load_image(path, "cpu").data for path in case["images"]]
+    inputs, _ = adapter.process_prompt(None, ["image"] * len(images), ["text"], tensors={"image_inputs": images},
+                                       messages=image_messages(case))
+    return inputs["text_inputs"][0], torch.cat(inputs["pixel_values"])
+
+
 def sync_all():
     for device in range(torch.cuda.device_count()):
         torch.cuda.synchronize(device)
@@ -36,7 +60,8 @@ def write_json(path, value):
 
 @torch.inference_mode()
 def reference(args):
-    from transformers import Cohere2VisionForConditionalGeneration
+    from PIL import Image
+    from transformers import AutoProcessor, Cohere2VisionForConditionalGeneration
 
     adapter = CommandAPlusModel(str(args.checkpoint))
     tokenizer = adapter._get_tokenizer()
@@ -67,17 +92,28 @@ def reference(args):
     if any(loading.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         raise RuntimeError(f"HF loading was not exact: {loading}")
     print(f"HF loaded in {load_seconds:.1f}s", flush=True)
+    processor = AutoProcessor.from_pretrained(args.checkpoint, local_files_only=True)
     tensors, cases = {}, []
-    for case_index, prompt in enumerate(PROMPTS):
-        ids = adapter.process_prompt(prompt, ["text"], ["text"]).new_input_tensors["text_inputs"][0]
-        rendered = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
-        )
+    for case_index, case in enumerate(get_cases(args.images)):
+        prompt, pixels = case["prompt"], None
+        if case["images"]:
+            rendered = processor.apply_chat_template(image_messages(case), tokenize=False, add_generation_prompt=True)
+            images = [Image.open(path).convert("RGB") for path in case["images"]]
+            # The rendered template already starts with BOS.
+            hf_inputs = processor(text=rendered, images=images, add_special_tokens=False, return_tensors="pt")
+            ids, pixels = hf_inputs["input_ids"][0], hf_inputs["pixel_values"].to("cuda:0", torch.bfloat16)
+        else:
+            ids = adapter.process_prompt(prompt, ["text"], ["text"]).new_input_tensors["text_inputs"][0]
+            rendered = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+            )
         inputs, cache, generated, logits_rows, timings = ids[None].cuda(0), None, [], [], []
         for _step in range(args.tokens):
             sync_all()
             start = time.perf_counter()
-            output = model(input_ids=inputs, past_key_values=cache, use_cache=True, logits_to_keep=1)
+            output = model(input_ids=inputs, pixel_values=pixels, past_key_values=cache, use_cache=True,
+                           logits_to_keep=1)
+            pixels = None
             sync_all()
             timings.append((time.perf_counter() - start) * 1000)
             cache = output.past_key_values
@@ -92,7 +128,7 @@ def reference(args):
                 break
         tensors[f"case_{case_index}"] = torch.stack(logits_rows)
         top = logits_rows[0].topk(10)
-        case = dict(prompt=prompt, rendered_prompt=rendered, input_ids=ids.tolist(),
+        case = dict(prompt=prompt, images=case["images"], rendered_prompt=rendered, input_ids=ids.tolist(),
                     generated_ids=generated, text=tokenizer.decode(generated, skip_special_tokens=False),
                     first_top_ids=top.indices.tolist(), first_top_logits=top.values.tolist(),
                     step_ms=timings)
@@ -122,6 +158,9 @@ class Runtime:
         torch.cuda.synchronize()
         self.load_seconds = time.perf_counter() - started
         print(f"rank {group.rank}: weights loaded in {self.load_seconds:.1f}s", flush=True)
+        # Every rank runs its own encoder here, instead of receiving rank 0's output.
+        self.vision = self.model.get_submodule("vision_encoder", device=torch.device("cuda", group.rank),
+                                               autocast_dtype=torch.bfloat16) if args.images else None
         specs = {spec.resource_key: spec for spec in self.model.get_node_resources()}
         specs[KV_CACHE].config.max_num_pages = 256
         specs[KV_CACHE].config.page_size = 128
@@ -143,14 +182,18 @@ class Runtime:
             temperature=0, top_p=1, repetition_penalty=1, ignore_eos=True,
         )})
 
-    def step(self, rids, rows, iteration):
+    def step(self, rids, rows, iteration, pixels=None):
         from mstar.engine.resources.step import StepContext
         from mstar.model.command_a_plus.config import LOCAL_ATTN, SAMPLER
         from mstar.model.submodule_base import ModelInputsFromEngine
 
-        walk = "prefill" if iteration == 0 else "decode"
+        walk = "decode" if iteration else "prefill" if pixels is None else "prefill_image"
         started = time.perf_counter()
-        inputs = [self.node.prepare_inputs(walk, None, {"text_inputs": [row]}) for row in rows]
+        extra = {}
+        if pixels is not None:
+            vision = self.vision.prepare_inputs(walk, None, {"pixel_values": [pixels]})
+            extra = self.vision.forward(walk, None, **self.vision.preprocess(walk, None, [vision]))
+        inputs = [self.node.prepare_inputs(walk, None, {"text_inputs": [row], **extra}) for row in rows]
         step = self.node.declare_step(walk, rids, inputs)
         step.set_ctx(StepContext(rids, walk, iteration % 2, False))
         admitted = self.runner.admit(step)
@@ -159,9 +202,10 @@ class Runtime:
         self.runner.plan(step)
         planned = time.perf_counter()
         engine = ModelInputsFromEngine(rids, {}, self.resources)
-        ids = self.node.preprocess(walk, engine, inputs)["text_inputs"]
+        batch = self.node.preprocess(walk, engine, inputs)
         lm = self.node.language_model
-        hidden = lm(lm.model.embed(ids), label="main")
+        embeds = batch["input_embeds"] if "input_embeds" in batch else lm.model.embed(batch["text_inputs"])
+        hidden = lm(embeds, label="main")
         if iteration == 0:
             hidden = self.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
         logits = lm.compute_logits(hidden)
@@ -206,14 +250,14 @@ def mstar(args):
         expected = load_file(args.output / "hf_logits.safetensors")
         results, tensors = [], {}
         for index, case in enumerate(reference_info["cases"]):
-            ids = runtime.model.process_prompt(case["prompt"], ["text"], ["text"]).new_input_tensors["text_inputs"][0]
+            ids, pixels = encode(runtime.model, case)
             if ids.tolist() != case["input_ids"]:
                 raise AssertionError("HF and M* input tokens differ")
             rid = f"parity_{index}"
             runtime.start(rid)
             rows, metrics, logits_rows = [ids.cuda()], [], []
             for step, reference_token in enumerate(case["generated_ids"]):
-                logits, tokens, timing = runtime.step([rid], rows, step)
+                logits, tokens, timing = runtime.step([rid], rows, step, pixels if step == 0 else None)
                 ours = logits[0].float().cpu()
                 theirs = expected[f"case_{index}"][step]
                 if not torch.isfinite(ours).all() or not torch.isfinite(theirs).all():
@@ -254,9 +298,10 @@ def mstar(args):
         for index, case in enumerate(reference_info["cases"]):
             rid = f"greedy_{index}"
             runtime.start(rid)
-            rows, generated, timings = [torch.tensor(case["input_ids"], device="cuda")], [], []
+            ids, pixels = encode(runtime.model, case)
+            rows, generated, timings = [ids.cuda()], [], []
             for step in range(args.tokens):
-                _, tokens, timing = runtime.step([rid], rows, step)
+                _, tokens, timing = runtime.step([rid], rows, step, pixels if step == 0 else None)
                 token = tokens.item()
                 generated.append(token)
                 timings.append(timing)
@@ -315,6 +360,7 @@ def main():
     parser.add_argument("--tokens", type=int, default=16)
     parser.add_argument("--context", type=int, default=8192)
     parser.add_argument("--lengths", type=int, nargs="*", default=[])
+    parser.add_argument("--images", type=Path, nargs="*", default=[], help="local images to add as prompts")
     parser.add_argument("--benchmark-tokens", type=int, default=32)
     parser.add_argument("--max-rmse", type=float, default=0.25)
     parser.add_argument("--max-abs", type=float, default=1.0)

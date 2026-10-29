@@ -1,4 +1,14 @@
 # Carry the default deployment configs into the sdist so a wheel built from it
 # can copy them into mstar/default_configs/ (see setup.py).
 graft configs
+# rust/ and the pinned toolchain, so the Rust wheels can be built from the
+# sdist too (setup.py compiles them under CIBUILDWHEEL=1). Such a build must
+# first run release.yml's two `cargo about generate` commands, or its wheels
+# carry no third-party notices.
+graft rust
+prune rust/target
+prune rust/server/target
+include rust-toolchain.toml
+# the cargo [env] that builds the vendored libzmq correctly (see the file)
+include .cargo/config.toml
 global-exclude __pycache__ *.py[cod]
