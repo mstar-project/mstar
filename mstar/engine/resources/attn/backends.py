@@ -50,7 +50,9 @@ class AttnBackendEntry:
     builder: Ref
     # the KV config the backend reads its cache through
     kv_config: type[KVConfig]
-    # the device types it runs on; empty for any
+    # the platforms (``current_platform.name``) and device types it runs on;
+    # empty for any
+    platforms: tuple[str, ...] = ()
     devices: tuple[str, ...] = ()
     # (device) -> why it cannot run there, or None
     probe: Ref | None = None
@@ -130,6 +132,11 @@ class AttnBackendRegistry:
         if info.joint_comm_group is not None:
             # per-rank head counts; `shard` is idempotent, so both builders can call it
             kv_config.shard(info.joint_comm_group.world_size)
+        if entry.platforms and current_platform.name not in entry.platforms:
+            raise RuntimeError(
+                f"attention backend {backend.value!r} runs on {' or '.join(entry.platforms)}; "
+                f"this process runs on {current_platform.name}"
+            )
         if entry.devices and info.device.type not in entry.devices:
             raise RuntimeError(
                 f"attention backend {backend.value!r} requires an "
