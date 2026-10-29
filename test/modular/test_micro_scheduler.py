@@ -23,6 +23,7 @@ import pytest
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
+    FULL_ADMIT_QUEUED,
     AdmitOutcome,
     AdmitRuntimeError,
     FullAdmitOutcome,
@@ -265,6 +266,28 @@ class _Engine:
         if rid in self.not_ready:
             return FULL_ADMIT_NOT_READY
         return FULL_ADMIT_OK
+
+
+class _QueuingEngine(_Engine):
+    """Queues the rids in ``queued`` until `admit` lets them in, as the runner does."""
+
+    def __init__(self, queued):
+        super().__init__()
+        self.queued, self.admitted = set(queued), []
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        if rid in self.queued:
+            self.checked.append(rid)
+            return FULL_ADMIT_QUEUED
+        return super().check_ready(node_name, rid, fwd_info, allow_reload)
+
+    def admit(self, rid):
+        self.queued.discard(rid)
+        self.admitted.append((NODE, rid))
+
+    def admit_waiting(self, published_of):
+        admitted, self.admitted = self.admitted, []
+        return admitted
 
 
 def _scheduler(engine: _Engine) -> MicroScheduler:
@@ -1608,3 +1631,26 @@ def test_a_mixing_yield_away_skips_the_whole_combined_walk():
 def test_a_bad_mixing_setting_is_refused(mixes, error):
     with pytest.raises(ValueError, match=error):
         _combined_scheduler(_Engine(max_bs=8), mixes)
+
+
+
+def test_a_queued_request_is_not_asked_again_until_the_engine_admits_it():
+    engine = _QueuingEngine(queued={"b"})
+    sched = _scheduler(engine)
+    for _ in range(3):
+        assert not sched._check_ready(NODE, "b", None)
+    assert engine.checked == ["b"], "every pass asked the engine about a request it had queued"
+
+    engine.admit("b")
+    sched._unpark(_Manager(["b"]))
+
+    assert sched._check_ready(NODE, "b", None), "an admitted request stayed parked"
+
+
+def test_removal_forgets_a_parked_request():
+    sched = _scheduler(_QueuingEngine(queued={"b"}))
+    assert not sched._check_ready(NODE, "b", None)
+
+    sched.clear_rid("b", "b")
+
+    assert not any(sched.parked.values()), "a recycled handle would start parked"
