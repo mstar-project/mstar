@@ -39,6 +39,7 @@ from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM  # 
 from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel  # noqa: E402
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
 from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
+from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP, VisionEncoderSubmodule  # noqa: E402
 from mstar.model.submodule_base import declared_step  # noqa: E402
 
@@ -114,8 +115,10 @@ def _released(name: str, size: str | None = None):
     entry = QWEN3_5_SIZES[size]
     text = Qwen3_5Config(**entry["text_config"], tie_word_embeddings=entry["tie_word_embeddings"])
     vision = Qwen3_5VisionConfig(**entry["vision_config"])
-    # what `get_node_resources` declares, without the HF image processor its vision specs load
-    return qwen3_5_lora_spec(text, vision), text, [
+    # the model's own declaration; its vision attention reads only these two processor fields
+    processor = SimpleNamespace(size={"shortest_edge": 65536}, patch_size=vision.patch_size)
+    model = H.model_object(Qwen3_5DenseModel, text, vision_config=vision, _image_processor=processor)
+    return lora_spec(model.get_node_resources()), text, [
         (lambda g: Qwen3_5ForCausalLM(text, g), True), (lambda g: Qwen3_5VisionModel(vision), False),
     ]
 
