@@ -512,7 +512,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             self._preplan_plans = {}
             self._preplanned = False
             self._preplan_delegated = False
-            return
+            return self._current_plans
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, (
@@ -534,7 +534,9 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             plans = dict.fromkeys(rows, _DELEGATED)
         elif lease is not None:
             plans = {
-                label: self._stage_captured(label, r, lease, ctx.force_prefill)
+                label: self._stage_captured(
+                    label, r, lease, ctx.force_prefill, step.row_queries,
+                )
                 for label, r in rows.items()
             }
         else:
@@ -546,6 +548,9 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             self._preplanned = True
         else:
             self._current_plans = plans
+        # label -> `_Staged` (or the fallback's marker): the device views a
+        # speculative step rewrites in-graph (`SpecDecodeResource`)
+        return plans
 
     def _check_kind(self, lease: SlotLease, label: str, kind: object) -> None:
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
@@ -559,6 +564,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
 
     def _stage_captured(
         self, label: str, rows: _Rows, lease: SlotLease, force_prefill: bool,
+        row_queries: int | None = None,
     ) -> _Staged:
         num_rows = rows.qo_indptr.shape[0] - 1
         # a decode bucket always has one token per row, while one row of a
@@ -566,6 +572,14 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         # as many rows as tokens and replays mixed steps (`force_prefill`)
         num_tokens = lease.bucket.num_tokens
         max_q = 1 if num_rows == num_tokens and not force_prefill else num_tokens
+        if row_queries is not None and not force_prefill:
+            # every row declared the same query count (a verify step)
+            max_q = row_queries
+            if num_rows and int(np.diff(rows.qo_indptr).max()) > row_queries:
+                raise RuntimeError(
+                    f"AITER attention: bucket {lease.bucket} planned a row with "
+                    f"more than the {row_queries} queries its step declared"
+                )
         if max_q == 1 and not single_query_rows(rows.qo_indptr):
             raise RuntimeError(
                 f"AITER attention: decode bucket {lease.bucket} planned a row "
