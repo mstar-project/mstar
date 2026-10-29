@@ -380,9 +380,14 @@ ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
 ranks. Loading fails otherwise.
 
-A cached prompt no longer reserves its pages, so the pool no longer limits how many
-requests are admitted. It has to hold the decode of every request allowed to run at once,
-and a decode step that finds no free page holds its requests until they time out.
+On a single rank, a request waits at the head of its pool's queue until its prompt fits
+beside the prompts already admitted, and no request behind it starts first. A cache hit on
+a page only the prefix index holds counts as a page the request takes. A request that
+can't fit in its pool at its full output length gets a 400 if it asked for that length,
+and otherwise has the model's default length cut until it fits. The pool
+reserves only prompts, so it still has to hold the decode of every request allowed to run
+at once, and a decode step that finds no page outside the admitted prompts holds its
+requests until they time out.
 ``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a
 safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload

@@ -334,7 +334,10 @@ A layout has five fields:
 The footprint adds the spans, the growth at each loop's iterations and the scratch, and
 rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
-takes the window's peak instead.
+takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
+is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default
+length of a request that asks for none until it fits. With every loop at 0 iterations, the
+same sum is the prompt a request reserves when its pool admits it.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
@@ -524,6 +527,9 @@ The spec types are:
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
        ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
+       A spec whose nodes can run on several workers, as Bagel's LLM nodes do under CFG
+       parallel, sets ``leader`` to the node whose pool admits each request. Left unset, each
+       worker's pool admits requests on its own.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
@@ -545,7 +551,14 @@ The spec types are:
        ``AttnBackend.DENSE``, ``AttnBackend.FLEX`` or ``AttnBackend.FLASHINFER_MLA``.
        Leave it at ``AUTO`` unless the model needs a specific kernel. FlashInfer, dense
        and MLA attention require a ``PagedKVConfig``; FlexAttention requires a
-       ``RingKVConfig``.
+       ``RingKVConfig``. ``DENSE`` runs one varlen pass over each stream's frozen
+       prefix (gathered from the pages once) and the step's fresh K/V, eager only:
+       FA3 (AITER on ROCm), or FlashInfer's ragged prefill where FA3 has no kernel for
+       the GPU, the same choice the ragged resources make (``dense_or_flashinfer``), with
+       ``flashinfer_backend`` picking its kernel. The engine plans and runs a tiny layout on
+       that kernel when it builds the resource, so a backend the GPU or FlashInfer build
+       cannot run stops the server with a ``ValueError`` naming it. Its wrappers share one
+       workspace, taken at build.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
        ``"fa3"`` when the FlashInfer backend is selected. ``decode_tensor_cores``
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
@@ -625,8 +638,10 @@ The spec types are:
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
-       state, a streaming encoder's caches): one slot per request and label, ``blocks``
-       naming a shape and dtype for each piece (dtype None: the engine's compute dtype,
+       state, a streaming encoder's caches): one slot per request and label, ``labels``
+       naming every label a request's steps address or fork into (``("main",)`` by default)
+       so that admission reserves a slot for each, ``blocks`` naming a shape and dtype for
+       each piece (dtype None: the engine's compute dtype,
        what its KV caches store), ``num_layers`` copies of each, ``max_slots`` slots
        (deployment-tunable) with slot 0 the sink that padding rows address. A recurrent
        kernel reads the step's ``addressing``. ``declare_step`` gives each row a
@@ -1467,9 +1482,15 @@ Both types share the base ``CudaGraphConfig`` fields:
 - ``compile_mode`` is that ``torch.compile``'s mode. The default, ``None``, takes the
   deployment's compile level (``mstar serve -O``, ``MSTAR_COMPILE_LEVEL``); naming a
   mode takes the config out of that level. ``default`` keeps Inductor's fusion but takes cuBLAS for
-  every GEMM and skips autotuning. Building the config refuses an unknown mode, and one
-  that turns on Inductor's own CUDA graphs (``reduce-overhead``, ``max-autotune``), which
-  fail inside the runner's capture.
+  every GEMM and skips autotuning. ``deterministic`` is the engine's own: Inductor's
+  defaults in its deterministic mode, which picks kernel configs by rule rather than timing
+  them on the device, so every process compiles the same kernels (a torch without the mode
+  logs a warning and compiles with the defaults). A compile outside the runner takes the same
+  options from ``accelerator_graph_runner.compile_kwargs("deterministic")``, or
+  ``deterministic_inductor_options()`` where it builds its own; the Wan VAE decode, the DiT
+  scaffold's ``compile_blocks`` and Cosmos3's denoise step do. Building the config refuses
+  an unknown mode, and one that turns on Inductor's own CUDA graphs (``reduce-overhead``,
+  ``max-autotune``), which fail inside the runner's capture.
 - ``required`` makes every bucket in the config mandatory. If capture fails locally or
   on another participating rank, warmup raises after rank-wide agreement instead of
   dropping the bucket and falling back to eager execution. The default is ``False``.
@@ -2018,7 +2039,7 @@ that its block loop can be CUDA-graph captured:
        return [
            RaggedAttentionSpec(resource_key=VIT_ATTN, nodes={"vit_encoder"},
                                config=RaggedAttentionConfig(...)),
-           KVSpec(resource_key="kv", nodes=nodes, config=self._kv_config()),
+           KVSpec(resource_key="kv", nodes=nodes, config=self._kv_config(), leader="LLM"),
            AttentionSpec(resource_key="attn", nodes=nodes,
                          config=AttentionConfig(kv_cache="kv")),
            PositionSpec(resource_key="rope", nodes=nodes,
