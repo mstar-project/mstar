@@ -105,11 +105,11 @@ class StreamBuffer:
         only the first. Counted as one registration, so the producer's item
         total still matches.
         """
-        if not tensor_ids:
-            return
         if len(tensor_ids) == 1 or self.join_dim is None:
             for tensor_id in tensor_ids:
                 self.pre_read_register(tensor_id)
+            return
+        if not tensor_ids:
             return
         # Counted in the producer's units, one per piece, because that is what
         # it reports in ``signal_done`` -- the buffer holding them as one item
@@ -126,7 +126,15 @@ class StreamBuffer:
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
             entry = self._tensor_ids_in_order[0]
-            ids = entry if isinstance(entry, tuple) else (entry,)
+            # a lone tensor is every item of an unjoined stream: keep it cheap
+            if not isinstance(entry, tuple):
+                if entry not in self._id_to_tensor:
+                    return
+                self._tensor_ids_in_order.popleft()
+                self._buffer.append(self._id_to_tensor.pop(entry))
+                self._num_buffer_writes += 1
+                continue
+            ids = entry
             if any(tensor_id not in self._id_to_tensor for tensor_id in ids):
                 return
             self._tensor_ids_in_order.popleft()

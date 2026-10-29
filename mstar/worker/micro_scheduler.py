@@ -1462,6 +1462,8 @@ class MicroScheduler:
         range at all. The worker reads an absent range as having run whole,
         which is what ends its chunk Loop.
         """
+        if not (chunk_tokens or self.chunk_progress or self.cached_prefix):
+            return
         for rid in batch.request_to_worker_graph:
             key = (rid, batch.node_name)
             progress = self.chunk_progress.get(key)
@@ -1528,9 +1530,10 @@ class MicroScheduler:
         there is nothing else to undo. ``node_name`` None means every node,
         for a caller holding a request rather than a step.
         """
-        for rid in rids:
-            for key, progress in self.chunk_progress.items():
-                if key[0] == rid and node_name in (None, key[1]):
+        if self.chunk_progress:
+            rids = set(rids)
+            for (rid, node), progress in self.chunk_progress.items():
+                if rid in rids and node_name in (None, node):
                     progress.cursor = progress.cursor_spec = None
         # a do-not-speculate mark is a lookahead too; the retry is marked again
         if self.chunk_loop_walks:
