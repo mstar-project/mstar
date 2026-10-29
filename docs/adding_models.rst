@@ -625,7 +625,10 @@ The spec types are:
        blocks of the pool, so the layer never names one. A KDA pool built with
        ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
        (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
-       settles each one's accepted drafts.
+       settles each one's accepted drafts. The layers are shared:
+       ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
+       (``mstar/model/components/distributed/``, over ``KDAConfig``; Kimi K3's full-rank
+       output gate is ``full_rank_output_gate``).
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
