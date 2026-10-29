@@ -258,9 +258,10 @@ class Harness:
         targets = self._target(plan, b, positions)
         out = self.spec.accept_tokens(targets)
         drafted = out.target.reshape(-1)
+        verify_positions = positions
         for j in range(self.k):
-            if j:
-                positions = self.spec.draft_positions(j)
+            self.spec.begin_draft_pass(j)
+            positions = verify_positions + j
             self._write(plan, drafted, layer=1)
             drafted = self.spec.record_draft(j, self._draft(plan, b, positions))
         self.kv.commit(kv_step, ctx)
