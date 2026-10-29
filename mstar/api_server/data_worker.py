@@ -711,6 +711,7 @@ class PreprocessWorkerThread:
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
     ):
+        profiler.hop_stamp(input.request_id, "dw.start")
         file_states: dict[str, list[tuple[int, int, int]]] = {}
         self._live_requests[input.request_id] = self._live_requests.get(input.request_id, 0) + 1
         self.in_flight_requests.add(input.request_id)
@@ -772,6 +773,7 @@ class PreprocessWorkerThread:
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
 
+        profiler.hop_stamp(input.request_id, "dw.tokenized")
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
         # conductor, so a failure here still finds no remote reader.
@@ -802,6 +804,7 @@ class PreprocessWorkerThread:
             ),
         )
         self.communicator.send("conductor", msg)
+        profiler.hop_stamp(input.request_id, "dw.sent")
 
         # Record preprocess-side profiling: the moment the fully preprocessed
         # request was handed off to the conductor, plus the per-modality sizes of
@@ -1436,6 +1439,8 @@ class PreprocessWorkerThread:
                             request_id,
                             loop_indices,
                         )
+                        if sequence == 0:
+                            profiler.hop_stamp(request_id, "dw.read")
                         if self.enable_nvtx:
                             profiler.range_push(f"dataworker.get_tensor.{modality}")
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)

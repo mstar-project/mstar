@@ -750,6 +750,7 @@ class APIServer:
         if self.metrics is not None:
             mark_submitted()
 
+        profiler.hop_stamp(key, "api.submit")
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=key,
             client_request_id=request_id,
@@ -1039,6 +1040,7 @@ class APIServer:
                     with self.request_lock:
                         if rid in self.pending_requests:
                             if message.message_type == "result_tensors":
+                                profiler.hop_stamp(rid, "api.result_in")
                                 logger.debug(
                                     "Got new tensors of %s modality for request %s",
                                     message.body.modality, rid
@@ -1158,6 +1160,7 @@ class APIServer:
                         now = time.perf_counter()
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
+                            profiler.hop_stamp(rid, "api.chunk", now)
                         req.profile.timing.last_chunk_time = now
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
