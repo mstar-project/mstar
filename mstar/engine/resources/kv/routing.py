@@ -25,6 +25,10 @@ when it is placed and its end, and is approximate for that reason:
   the one that ran first: requests sharing a prefix that all end unrun leave
   the entries a later one leased, and when only a later one runs, the first
   one's end takes back an entry the worker keeps.
+- on a node with a recurrent state pool a hit is served only up to the longest
+  snapshot of that state the pool holds under it (``cap_cached_prefix``), and
+  the pool keeps a few per prefill in ``prefix_slots``; the mirror counts the
+  KV hit whole, so it over-predicts there.
 
 Only the GPU pool is modelled; the host pool (``cpu_offload_pages``) holds
 offloaded live requests, not a cache.

@@ -428,8 +428,8 @@ ingest), plus the price of what the conductor predicts about the request there. 
 at random. Every term is in request-equivalents. Groups whose replicas sit on the same
 ranks, replica for replica, take one pick together.
 
-Today the one prediction is the KV prefix cache's, on the replicas that run a walk keying
-the cache (BAGEL's ``LLM``, also with CFG-parallel nodes): ``routing_weights.prefix``
+Today the one prediction is the KV prefix cache's, on the replicas that run any walk a
+KV label keys the cache on (``kv_labels``): ``routing_weights.prefix``
 times minus the share of the request's prompt positions (every label's, keyed or not)
 the replica's caches are predicted to hold, all the caches on the replica together. At
 the default weights a prompt held whole is worth up to 8 live requests: a request
@@ -444,9 +444,10 @@ pages. Its end releases its pages; a request that ends before a pass of it comes
 (aborted while queued, say) also takes back the entries only it made. Workers send
 nothing for it, so it does not see admit timing, decode growth, preemption or a reply's
 tokens, and it is approximate: a wrong prediction makes a request slower, never wrong.
-With no cache that opens (one replica, ``prefix_cache: false``, no walk that keys it, or
+With no cache that opens (one replica, ``prefix_cache: false``, no walk that keys it,
 replicas above one rank, where the cache stays off: ``prefix_cache_tp`` on a pool with
-replicas fails at startup) the pick is the replica with the fewest live requests.
+replicas fails at startup, or a keyed node whose recurrent state pool keeps no snapshots,
+``prefix_slots: 0``) the pick is the replica with the fewest live requests.
 
 **Single GPU.** Everything on rank 0:
 
