@@ -21,6 +21,8 @@ model_kwargs:
   # transformer was bit-exact with the eager one (measured while the q/k norms were graph breaks; the
   # activations add nothing but graph breaks), and with vae_compile: false so was every served image
   # (see compile_exact_ops in docs/models.rst)
+  # On AMD GPUs this is not applied (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M kernel choice
+  # keeps the output off the reference bit for bit either way.
   compile_exact_ops: [norms]
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
