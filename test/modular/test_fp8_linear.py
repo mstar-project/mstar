@@ -174,9 +174,9 @@ def _flux_dit():
     from mstar.model.flux2_klein.components.transformer import Flux2DiT
     from mstar.model.flux2_klein.config import Flux2TransformerConfig
 
-    return Flux2DiT(Flux2TransformerConfig()), 5 * 8 + 20 * 2, (
+    return Flux2DiT(Flux2TransformerConfig()), 5 * 4 + 20 * 2, (
         "time_embed.", "mod_double_img", "mod_double_txt", "mod_single", "img_in", "txt_in", "norm_out_mod",
-        "proj_out")
+        "proj_out", ".txt_")
 
 
 def _z_image_dit():
@@ -193,7 +193,8 @@ def _wan_dit():
     from mstar.model.wan22.config import Wan22Config
 
     config = Wan22Config()
-    return Wan22DiT(config), config.num_layers * 10, ("condition_embedder.", "proj_out", "patch_embedding")
+    return Wan22DiT(config), config.num_layers * 8, (
+        "condition_embedder.", "proj_out", "patch_embedding", "cross_attn.k_proj", "cross_attn.v_proj")
 
 
 @pytest.mark.parametrize("build", [_flux_dit, _z_image_dit, _wan_dit], ids=["flux2_klein", "z_image", "wan22"])
@@ -278,7 +279,7 @@ def test_a_compiled_fp8_flux_dit_tracks_the_bf16_one():
     for p in dit.parameters():
         nn.init.normal_(p, std=0.05)
     fp8 = copy.deepcopy(dit)
-    assert len(quantize_linears(fp8, Flux2DiT.FP8_LINEARS, _gpu_fp8_dtype())) == 12
+    assert len(quantize_linears(fp8, Flux2DiT.FP8_LINEARS, _gpu_fp8_dtype())) == 8
     compile_transformer_forward(fp8, exact_ops=["norms"])
     img = torch.randn(1, 256, 64, device="cuda", dtype=torch.bfloat16)
     txt = torch.randn(1, 32, 256, device="cuda", dtype=torch.bfloat16)
