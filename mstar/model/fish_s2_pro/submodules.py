@@ -60,6 +60,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopCheck,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 from mstar.utils.h2d import PinnedStager
@@ -253,8 +254,8 @@ class ARSubmodule(ARNodeSubmodule):
         semantic = torch.where(is_eos, torch.zeros_like(head_index), head_index)
         codes = self.fast_ar(last_hidden, semantic, self._get_fast_kv(semantic.shape[0]))
         next_embeds = self.next_input_embeds(head_index, codes)
-        # The codec stream carries the head index in codebook 0, so the frame
-        # that ends the stream (<|im_end|>) is recognizable and dropped.
+        # The codec stream carries the head index in codebook 0; the frame
+        # that ends the stream (<|im_end|>) is withheld by ``check_stop``.
         stream = codes.clone()
         stream[:, 0] = head_index
         return {"ar_input_embeds": next_embeds, "codec_tokens": stream, "new_token": head_index}
@@ -315,12 +316,14 @@ class ARSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
+    ) -> set[str] | StopCheck:
         """Stop on ``<|im_end|>`` or the request's frame limit.
 
         Frames are counted here, not in ``postprocess``: a speculative step's
         ``postprocess`` can run before the previous step's stop check, and a
-        discarded speculative step never reaches this.
+        discarded speculative step never reaches this. The ``<|im_end|>``
+        frame (head index ``eos_code`` in codebook 0) stays out of the codec
+        stream, which then carries only frames to decode.
         """
         if "head_index" not in outputs:
             return set()
@@ -330,11 +333,13 @@ class ARSubmodule(ARNodeSubmodule):
         state.add("generated_frames", generated)
         max_tokens = request_info.max_tokens
         sampling = request_info.resource_configs.get(AR_SAMPLER)
-        reached_eos = head_index == self.eos_code and not bool(getattr(sampling, "ignore_eos", False))
+        is_eos = head_index == self.eos_code
+        reached_eos = is_eos and not bool(getattr(sampling, "ignore_eos", False))
+        stops = set()
         if reached_eos or generated >= max_tokens:
             logger.debug("fish ar %s: stop after %d frames (eos=%s)", request_id, generated, reached_eos)
-            return {"ar_decode_loop"}
-        return set()
+            stops = {"ar_decode_loop"}
+        return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return (
@@ -456,15 +461,19 @@ class CodecSubmodule(ARNodeSubmodule):
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        """Drop the end-of-stream frame and lay the window out as ``[10, frames]``."""
+        """Lay the window out as ``[10, frames]``. Every item is a frame: the
+        AR withholds its ``<|im_end|>`` frame (``ARSubmodule.check_stop``)."""
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
-        codes = inputs["codec_tokens"][0].to(device=self.get_device(), dtype=torch.long)
+        received = inputs.get("codec_tokens")
+        if received:
+            codes = received[0].to(device=self.get_device(), dtype=torch.long)
+        else:
+            # a stream whose first frame was <|im_end|> ends with an empty chunk
+            codes = torch.zeros(0, self.config.num_codebooks, dtype=torch.long, device=self.get_device())
         codes = codes.view(-1, self.config.num_codebooks)
-        # A sync: which window holds the end-of-stream frame is not known on the host.
-        codes = codes[codes[:, 0] < self.config.eos_code]
         frames = codes.shape[0]
-        context = min(chunk.context_items if chunk is not None else 0, frames)
+        context = chunk.context_items if chunk is not None else 0
         start_offset = chunk.start_offset if chunk is not None else 0
         conv_start = context - min(context, self.conv_context)
         logger.debug(

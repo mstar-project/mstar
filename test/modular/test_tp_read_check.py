@@ -161,10 +161,7 @@ ROWS = (10, 11, 12, 13)
 def _four_rank_groups(rank, sizes, port):
     """This rank's groups of a four-rank instance, as ``GlobalParallelConfig``
     lays them out and the real ``init_dist`` creates them, over gloo."""
-    import hashlib
-
     import torch.distributed as dist
-    import torch.distributed.distributed_c10d as c10d
 
     from mstar.distributed.communication import GlobalParallelConfig
     from mstar.model.base import WorkerGraph
@@ -178,14 +175,6 @@ def _four_rank_groups(rank, sizes, port):
     init = dist.init_process_group
     # torch binds a world to an accelerator only: it refuses a CPU device_id
     dist.init_process_group = lambda device_id, **kwargs: init(**kwargs)
-    # Until upstream PR #705 lands, a non-member makes no gloo twin of an axis
-    # group, so the twins' members count their groups differently and torch's
-    # names for them differ: name a group by its ranks alone. A group of one
-    # rank (a non-member's stand-in) keeps torch's name, unique in its process.
-    hash_ranks = c10d._hash_ranks_to_str
-    c10d._hash_ranks_to_str = lambda ranks: hash_ranks(ranks) if len(ranks) == 1 else (
-        hashlib.sha1(("ranks:" + "_".join(map(str, ranks))).encode()).hexdigest()
-    )
     groups.init_dist(init_method=f"tcp://127.0.0.1:{port}", device=torch.device("cpu"))
     return groups
 
@@ -195,6 +184,8 @@ def _check_rank(rank, sizes, port, failed_here, out):
     try:
         w = Worker.__new__(Worker)
         w.parallel_groups = _four_rank_groups(rank, sizes, port)
+        w._walk_drivers = {}
+        w._walk_driven_edges = {}
         w.scheduler = SimpleNamespace(read_failed_rids=set(failed_here))
         # a follower that could not read a row left it out; the others hold it
         rows = [r for r in ROWS if r not in failed_here]
@@ -368,6 +359,8 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     sched.fail_rids({"r1"})
     tm, _ = _shm_manager(tmp_path)
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.scheduler, w.request_state, w.tensor_manager = sched, manager, tm
     w.wakeup_event = SimpleNamespace(drain=lambda: None)
     w.enable_nvtx = False
@@ -403,6 +396,8 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
         ready=[r for r in fresh if r not in read_failed], read_failed=read_failed,
     )
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.scheduler, w.request_state, w.enable_nvtx = sched, manager, False
     w._in_flight_rids = set()
     w.preps, w.assembled = [], []
@@ -544,6 +539,8 @@ FOLLOWERS = ["w0", "w1"]
 def _leader(tmp_path, streamed=()):
     tm, _ = _shm_manager(tmp_path)
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = {NODE}, {NODE}
     w.is_tp_follower, w.enable_nvtx = False, False

@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, release_unread, rid
+from mstar.utils.generation_kwargs import offset_seed
 
 
 async def create_images(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
@@ -27,7 +28,7 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
     for i in range(n):
         model_kwargs = dict(args.model_kwargs)
         if seed is not None and i > 0:
-            model_kwargs["seed"] = int(seed) + i
+            model_kwargs["seed"] = offset_seed(int(seed), i)
         request_id = rid("img")
         # Listed before submitting: submit_request registers the request
         # before handing it on, so a failed submit still holds an entry.

@@ -18,7 +18,6 @@ Run: COSMOS3_NANO_DIR=<snap> python3 test_engine_cache.py
 
 from __future__ import annotations
 
-import dataclasses
 import math
 import os
 
@@ -679,18 +678,15 @@ def _check_compile_vae(num_frames, tag):
     from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderSubmodule
 
     model, lat = ctx["model"], ctx["lat_fused"]
-    # the stock vae.decode on both arms (vae_decode_fast routes around it), each on
-    # its own VAE instance
-    config = dataclasses.replace(model.config, vae_decode_fast=False)
+    vae, config = model._build_vae(ctx["device"]), model.config
     walk = "video_gen" if num_frames > 1 else "image_gen"
     out_key = "video_output" if num_frames > 1 else "image_output"
     had = os.environ.pop("COSMOS3_COMPILE_VAE", None)
     try:
-        os.environ["COSMOS3_COMPILE_VAE"] = "0"
-        eager = Cosmos3VAEDecoderSubmodule(vae=model._build_vae(ctx["device"]), config=config)
+        eager = Cosmos3VAEDecoderSubmodule(vae=vae, config=config)
         img_eager = eager.forward(walk, None, latents=lat.clone())[out_key][0]
         os.environ["COSMOS3_COMPILE_VAE"] = "1"
-        compiled = Cosmos3VAEDecoderSubmodule(vae=model._build_decoder_only_vae(ctx["device"]), config=config)
+        compiled = Cosmos3VAEDecoderSubmodule(vae=vae, config=config)
         img_comp = compiled.forward(walk, None, latents=lat.clone())[out_key][0]
     except Exception as exc:  # noqa: BLE001
         print(f"  (skipped {tag} compile-VAE parity: VAE/compile unavailable: {exc})")

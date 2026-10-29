@@ -37,6 +37,7 @@ from mstar.model.fish_s2_pro.config import (
 from mstar.model.fish_s2_pro.fish_s2_pro_model import FishS2ProModel, clip_digest, load_fast_ar_weights
 from mstar.model.fish_s2_pro.submodules import ARSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
+from mstar.model.submodule_base import StopCheck
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "fish_s2_pro.yaml"
 SEMANTIC_START, SEMANTIC_CODES, EOS_ID = 100, 32, 99
@@ -457,8 +458,9 @@ def test_check_stop_on_im_end_on_the_frame_limit_and_not_with_ignore_eos():
         return ar.check_stop(rid, info(ignore_eos), outputs)
 
     assert step("a", 4) == set()
-    assert step("a", ar.eos_code) == {"ar_decode_loop"}
-    assert step("b", ar.eos_code, ignore_eos=True) == set()
+    # the <|im_end|> frame stays out of the codec stream, stopping or not
+    assert step("a", ar.eos_code) == StopCheck({"ar_decode_loop"}, ("codec_tokens",))
+    assert step("b", ar.eos_code, ignore_eos=True) == StopCheck(set(), ("codec_tokens",))
     assert step("b", 1) == set()
     assert step("b", 2) == {"ar_decode_loop"}
 

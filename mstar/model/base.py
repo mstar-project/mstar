@@ -440,6 +440,8 @@ class Model(ABC):
     # Request keys that set an output length. A request that sets one is refused when it
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
+    # Request keys the conductor reads for every model, never logged as ignored.
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache")
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -857,8 +859,8 @@ class Model(ABC):
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an
         OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key named in the ``X-MStar-Ignored-Params`` response header.
-        None (the default) declares nothing, so nothing is reported.
+        and the key logged as ignored. None (the default) declares nothing, so
+        nothing is logged.
         """
         return None
 

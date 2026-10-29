@@ -42,6 +42,7 @@ from mstar.model.base import (
     KVLabel,
     LabelLayout,
     Model,
+    PrefixKeys,
     ProcessPromptOutput,
     Span,
     TensorAndMetadata,
@@ -256,6 +257,7 @@ class Qwen3_5DenseModel(Model):
                         head_v_dim=self.config.linear_value_head_dim,
                         conv_kernel_size=self.config.linear_conv_kernel_dim
                     ).to_blocks(state_dtype=self._gdn_state_dtype()),
+                    kv_cache=KV_CACHE,
                 )
             ),
             LinearAttnSpec(
@@ -616,7 +618,12 @@ class Qwen3_5DenseModel(Model):
             return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
 
         plan = prefill_plan(expand_video_parts(parts, groups))
-        layout = LabelLayout(spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),))
+        layout = LabelLayout(
+            spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
+            # The keys name `prefill_text` alone, and the preprocess worker refuses
+            # a keyed span in any other walk.
+            keyed_spans=0 if walk == "prefill_vision" else None,
+        )
 
         # always set, so a `video_groups` the client sent never reaches the
         # schedule; the grids ride to the nodes as step metadata
@@ -633,7 +640,11 @@ class Qwen3_5DenseModel(Model):
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(
             growth=(("decode", "decode_loop"),),
+            keys=PrefixKeys("text_inputs", ("prefill_text",), growth=True),
         )}}
+
+    def checkpoint_path(self) -> str:
+        return self._resolve_weights()
 
 
     def postprocess(

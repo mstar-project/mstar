@@ -51,12 +51,14 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    BatchedStopCheck,
     HostRows,
     InputMetadata,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopCheck,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -332,6 +334,9 @@ class ExecutingBatch:
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
     failed_requests: dict[int, str] = field(default_factory=dict)
+    # rid -> outputs the stop check found are not data this step
+    # (``StopCheck.withheld``); the worker does not route them
+    withheld_outputs: dict[int, tuple[str, ...]] = field(default_factory=dict)
     # A lockstep step whose rows' input reads every rank checks before
     # preparing it: the leader's rows in its order (see
     # ``Worker._drop_rows_whose_read_failed``); None for no check
@@ -557,6 +562,7 @@ class Engine:
                             spec.nodes, relevant_nodes
                         )
                     ),
+                    nodes=frozenset(relevant_nodes),
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
@@ -783,6 +789,9 @@ class Engine:
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules()
+        for submodule_mgmt in self._submodules.values():
+            with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                submodule_mgmt.submodule.warmup_compiles()
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
@@ -932,6 +941,11 @@ class Engine:
             key for key in declared
             if key not in self._resources and specs_by_key[key].config.prefix_cache
         }
+        # resources that aren't keyed but opened, such as a recurrent pool's snapshots
+        restoring: set[str] = set()
+        for key, spec in specs_by_key.items():
+            if key in self._resources and spec.depends_on() <= self._resources.keys():
+                self._resources[key].bind_dependencies({dep: self._resources[dep] for dep in spec.depends_on()})
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
@@ -958,9 +972,11 @@ class Engine:
                 )
                 for label, kv_label in declared.get(key, {}).items()
             })
-            if not opened or not declared.get(key):
-                continue
-            opened_keys.add(key)
+            if opened:
+                (opened_keys if declared.get(key) else restoring).add(key)
+        self._close_unservable_nodes(specs_by_key, opened_keys, restoring)
+        for key in sorted(opened_keys & self._resources.keys()):
+            resource = self._resources[key]
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
@@ -984,6 +1000,36 @@ class Engine:
                 for walk in label.keys.walks:
                     nodes = model.get_graph_walk_graphs()[walk].get_nodes()
                     self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
+
+    def _close_unservable_nodes(
+        self, specs_by_key: dict[str, NodeResourceSpec], opened_keys: set[str], restoring: set[str],
+    ) -> None:
+        """Close every prefix cache on a keyed node with a resource that can't
+        serve a cached prefix.
+
+        A resource that opened but isn't keyed serves a hit only when every cache
+        it depends on opened, and so does a resource that depends only on such
+        resources.
+        """
+        restorers = {key for key in restoring if specs_by_key[key].depends_on() <= opened_keys}
+        serving = opened_keys | restorers | {
+            key for key, resource in self._resources.items() if resource.prefix_skip_safe
+        } | {
+            key for key, spec in specs_by_key.items()
+            if spec.depends_on() and spec.depends_on() <= restorers
+        }
+        for node in sorted(self._keyed_walks):
+            on_node = {key for key, spec in specs_by_key.items() if node in spec.nodes and key in self._resources}
+            if on_node <= serving:
+                continue
+            del self._keyed_walks[node]
+            for key in sorted(on_node - serving):
+                logger.info("%s on %s can't serve a cached prefix: the prefix caches on %s stay off",
+                            key, node, node)
+            for key in sorted(on_node & (opened_keys | restoring)):
+                self._resources[key].close_prefix_cache()
+                opened_keys.discard(key)
+                restoring.discard(key)
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
@@ -1893,6 +1939,9 @@ class Engine:
         With ``host_rows``, ``check_stop_batched`` checks the batch in one call;
         if it raises, the per-request path runs so a failure lands on its own
         request.
+
+        Outputs the check withholds (``StopCheck`` / ``BatchedStopCheck``) go
+        on ``batch.withheld_outputs``, for the caller to leave unrouted.
         """
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
@@ -1906,9 +1955,14 @@ class Engine:
                     batch.node_name, exc_info=True,
                 )
                 batched = None
+            if isinstance(batched, BatchedStopCheck):
+                if batched.withheld:
+                    batch.withheld_outputs = batched.withheld
+                return batched.stops
             if batched is not None:
                 return batched
         stops: dict[str, set[str]] = {}
+        withheld: dict[str, tuple[str, ...]] = {}
         for rid in batch.request_ids:
             rid_outputs = outputs.get(rid)
             if not rid_outputs:
@@ -1920,8 +1974,14 @@ class Engine:
             except Exception as error:
                 batch.register_failure(rid, error)
                 continue
+            if isinstance(rid_stops, StopCheck):
+                if rid_stops.withheld:
+                    withheld[rid] = rid_stops.withheld
+                rid_stops = rid_stops.stops
             if rid_stops:
                 stops[rid] = rid_stops
+        if withheld:
+            batch.withheld_outputs = withheld
         return stops
 
     def finalize_batch(
@@ -2337,6 +2397,13 @@ class Engine:
             graph_walk=request_info.graph_walk,
             published=request_info.resource_publish_info,
         )
+
+    def admit_waiting(
+        self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
+    ) -> list[tuple[str, str]]:
+        """The (node, rid) pairs admitted since `check_ready` answered them ``queued``; see
+        `Admission.admit_waiting`."""
+        return self._runner.admit_waiting(published_of)
 
     def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:
         """Lease the slot this batch will replay on, before it is dispatched.

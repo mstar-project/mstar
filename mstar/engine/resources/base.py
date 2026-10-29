@@ -62,6 +62,8 @@ class EngineResourceInfo:
     kv_dtype: torch.dtype = torch.bfloat16
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
+    # this resource's local nodes
+    nodes: "frozenset[str] | None" = None
     # the specs this one named in `depends_on`, by resource key
     dependencies: "Mapping[str, NodeResourceSpec]" = field(
         default_factory=dict
@@ -130,6 +132,14 @@ class Resource(ABC):
         True if anything opened."""
         return False
 
+    def close_prefix_cache(self) -> None:
+        """Undo `enable_prefix_cache`. Called before any request."""
+        return
+
+    def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:
+        """The live resources this one's spec names in `depends_on`, once all are built."""
+        return
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs: Any,
     ) -> CachedPrefix | None:
@@ -138,6 +148,13 @@ class Resource(ABC):
         None leaves the answer to other resources; 0 tokens means nothing can be skipped.
         """
         return None
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """The longest prefix up to ``prefix`` this resource can serve, for a
+        resource that holds only some lengths."""
+        return prefix
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -225,6 +242,30 @@ class Resource(ABC):
         Returns whether the retrieve has completed.
         """
         return ADMIT_OK
+
+    # Admission. A resource with limited capacity answers for it, and the runner decides who
+    # gets it and when: one order across resources, a request takes all it asks or none, and
+    # nothing is retrieved for it before then.
+
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        """`ASKS` while ``rid`` waits for this resource's capacity to start on ``node_name``, None
+        when it needs none, or the outcome that fails it when it can never fit."""
+        return None
+
+    def reserve(
+        self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
+    ) -> object | None:
+        """Take what ``rid`` asked for and return None, or return a mark of what it didn't fit
+        against for `grew_since`."""
+        return None
+
+    def unreserve(self, rid: str) -> None:
+        """Give back what `reserve` took, because another resource ``rid`` asks didn't fit."""
+        return
+
+    def grew_since(self, mark: object) -> bool:
+        """Whether a request that didn't fit against ``mark`` may fit now."""
+        return True
 
     # Step lifecycle
 
