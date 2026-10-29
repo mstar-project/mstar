@@ -443,8 +443,8 @@ class SpecDecodeResource(Resource):
     def accept(self, logits: torch.Tensor, sample: bool = False) -> AcceptedTokens:
         """Verification of this step's drafts against ``logits`` (``[rows *
         (k + 1), vocab]``, the target's at each verify position): its argmax,
-        or with ``sample`` a draw from each row's filtered distribution
-        (greedy where the row's temperature is 0).
+        or with ``sample`` a draw at each row's temperature (greedy where the
+        row's temperature is 0).
 
         The drafts are the draft head's argmax, a point mass, for which
         rejection sampling is: draw the target's token at every position
@@ -461,26 +461,16 @@ class SpecDecodeResource(Resource):
         return self.accept_tokens(self._sample(logits))
 
     def _sample(self, logits: torch.Tensor) -> torch.Tensor:
-        """One draw per row of ``logits``: top-k, then top-p over what is
-        left (FlashInfer's order, the sampler's), at the row's temperature,
-        by the Gumbel-max trick over the vocabulary sorted once."""
+        """One draw per row of ``logits`` at the row's temperature, by the
+        Gumbel-max trick over the whole vocabulary. No top-k or top-p: their
+        cut needs the vocabulary sorted, and the sort cannot be captured on
+        every platform (ROCm refuses it inside a graph)."""
         plan = self._plan_now(SpecPhase.VERIFY)
         rows, _ = self._rows(plan)
-        t = self.tokens_per_row
-        temperature = self._temperature[rows].repeat_interleave(t)
-        top_p = self._top_p[rows].repeat_interleave(t)[:, None]
-        top_k = self._top_k[rows].repeat_interleave(t)[:, None]
+        temperature = self._temperature[rows].repeat_interleave(self.tokens_per_row)
         scaled = logits.float() / temperature.clamp_min(1e-5)[:, None]
-        values, order = scaled.sort(dim=-1, descending=True)
-        rank = torch.arange(values.shape[-1], device=values.device)[None, :]
-        keep = (top_k <= 0) | (rank < top_k)
-        values = values.masked_fill(~keep, float("-inf"))
-        probs = values.softmax(dim=-1)
-        # a token stays while the mass before it is under top_p: the first always does
-        keep &= (probs.cumsum(dim=-1) - probs) < top_p
-        noise = -torch.empty_like(values).exponential_().log()
-        choice = (values.masked_fill(~keep, float("-inf")) + noise).argmax(dim=-1)
-        sampled = order.gather(1, choice[:, None]).squeeze(1)
+        noise = -torch.empty_like(scaled).exponential_().log()
+        sampled = (scaled + noise).argmax(dim=-1)
         return torch.where(temperature > 0, sampled, logits.argmax(dim=-1))
 
     @torch.compiler.disable
