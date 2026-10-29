@@ -143,6 +143,34 @@ profiler window in a running worker, ``trace/ktrace.py`` turns the trace into
 a per-step kernel table, and ``trace/harvest.py`` collects shapes from a model
 config, the server log and traces into ``benchmark/kernels/shapes/``.
 
+Resident (persistent) steps
+---------------------------
+
+A captured step can also run as one resident kernel instead of a replayed
+graph of per-op kernels. The step is described as a ``StepProgram``
+(``mstar/engine/step_program.py``): its phases in order, each naming the
+submodule parameters it reads, its output tiles and K chunks, and the
+per-row sums of squares it reads and writes for the RMSNorms between phases.
+It is built from the submodule's own modules (``program_for_talker`` for the
+Qwen3-Omni and Qwen3-TTS code predictors' depth loop), checked (``check``),
+lowered to a kernel's phase table (``lower``) and interpreted in float64
+(``interpret``), which is the reference any executor is tested against.
+``mstar/engine/persistent_executor.py`` has the executors: ``GraphExecutor``
+(the default everywhere) and ``PersistentExecutor`` (ROCm gfx942 / gfx950,
+``mstar/kernels/hip/depth_step.cu``), chosen per node by
+``PersistentStepConfig`` and falling back to the graph, with the reason
+logged, wherever the kernel does not serve the step.
+
+``python -m benchmark.kernels.probes.sync`` measures what such a kernel pays
+on a device: a producer-to-consumer handoff inside one XCD's L2 and across
+XCDs, barriers by algorithm, scope and group size, and streaming reads by
+reader set (one XCD alone, every XCD reading the same bytes).
+``python -m benchmark.kernels.persistent.depth_loop`` checks the resident
+depth loop phase by phase against a float64 mirror of its rounding, its
+logits against float64 beside the per-op path's, its sampler's
+distribution, and times both captured, with the memory-side cache warm and
+evicted. The executor is not wired into the engine's capture yet.
+
 Checklist
 ---------
 
