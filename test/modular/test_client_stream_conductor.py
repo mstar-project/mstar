@@ -351,6 +351,8 @@ def _stub_worker(sbuf):
         ),
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
+    # the real one, not a copy: it reads the stub's scheduler and tensor manager
+    stub._ack_unbuffered = Worker._ack_unbuffered.__get__(stub)
     return stub, reads
 
 

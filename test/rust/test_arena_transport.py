@@ -1330,3 +1330,35 @@ def test_a_frames_small_items_are_read_as_one_gathered_copy(tmp_path):
     r1 = sent["r1"][0].uuid
     assert r1 not in cons.tensor_store.dereference_batch_uniform([r1], 2)[0]
     assert r1 in cons.tensor_store.dereference_batch_uniform([r1], 1)[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gathered read is for a device consumer")
+@pytest.mark.parametrize("numel,dtype", [
+    (1, torch.int64),      # 8 B: gathered by 8-byte words
+    (3, torch.int32),      # 12 B: not a whole number of words, a slice each
+    (300, torch.int32),    # 1200 B: past the word gather, a slice each
+    (4096, torch.int32),   # 16 KB: the largest gathered item
+])
+def test_gathered_items_of_every_size_keep_their_values(tmp_path, numel, dtype):
+    prod = _manager("w0", tmp_path)
+    sent = {}
+    for i, rid in enumerate(("r1", "r2", "r3")):
+        t = torch.arange(numel, dtype=dtype) * (i + 1) + i
+        infos = prod.store_and_return_tensor_info(rid, {"tok": [t]})
+        prod.register_for_send(rid, infos["tok"])
+        sent[rid] = (infos["tok"], t)
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    cons = ArenaShmCommunicationManager(
+        my_entity_id="w1", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    cons.start_read_tensors_multi([
+        (rid, [GraphEdge(next_node="B", name="tok", tensor_info=il, is_streaming=True)])
+        for rid, (il, _) in sent.items()
+    ])
+    torch.cuda.synchronize()
+    got = [cons.tensor_store.get_tensor(il[0].uuid) for il, _ in sent.values()]
+    for g, (_, t) in zip(got, sent.values(), strict=True):
+        assert torch.equal(g.cpu(), t)
+    assert len({g.untyped_storage().data_ptr() for g in got}) == 1, "one copy for the frame's items"

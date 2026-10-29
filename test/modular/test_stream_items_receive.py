@@ -3,8 +3,10 @@ per row, each a single streamed edge. Same reads started, same items
 registered with each stream buffer in the same order, the same rows parked
 (request not here yet) or dropped and ACKed (request removed), and nothing for
 a request being drained -- only the reads start in one call."""
+import logging
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.communication.stream_items import StreamItemsBuilder, row_input_signals, rows
@@ -51,6 +53,7 @@ def _worker():
         h: SimpleNamespace(stream_buffers={EDGE: StreamBuffer(h, EDGE, "LLM", FixedChunkPolicy(1))})
         for h in HANDLES.values()
     })
+    w.scheduler = SimpleNamespace(failed_rids=set())
     w.reads, w.acked = [], []
 
     def start_read_tensors(rid, edges, graph_walk=None):
@@ -76,7 +79,8 @@ def _worker():
 def _state(w):
     return (
         w.reads, w.acked,
-        {h: list(i.stream_buffers[EDGE]._tensor_ids_in_order) for h, i in w.request_state.per_request_info.items()},
+        {h: list(i.stream_buffers[EDGE]._tensor_ids_in_order) for h, i in w.request_state.per_request_info.items()
+         if EDGE in i.stream_buffers},
         {r: [m.body for m in ms] for r, ms in w._unprocessed_messages.items()},
     )
 
@@ -106,3 +110,34 @@ def test_a_frame_starts_its_reads_in_one_call():
     assert [[(rid, [i.uuid for e in edges for i in e.tensor_info]) for rid, edges in c] for c in calls] == [
         [(1, [1, 2]), (2, [6])],
     ]
+
+
+@pytest.mark.parametrize("failed", [True, False])
+def test_a_known_request_with_no_stream_buffer_is_acked_unread(failed, caplog):
+    """A request whose ingest failed here is known but has no stream buffer:
+    its rows are acked unread (warning unless the ingest failure is known),
+    as INPUT_SIGNALS does, and the frame's other rows still read."""
+    def worker():
+        w = _worker()
+        w.request_state.per_request_info[1].stream_buffers = {}
+        if failed:
+            w.scheduler.failed_rids.add(1)
+        return w
+
+    frame = _frame()
+    batched = worker()
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
+        batched._process_stream_items(frame)
+    warned = [r for r in caplog.records if "no stream buffer" in r.getMessage()]
+    caplog.clear()
+    one_by_one = worker()
+    for row in rows(frame):
+        one_by_one._process_message_list([WorkerMessage(
+            message_type=WorkerMessageType.INPUT_SIGNALS, body=row_input_signals(frame, row),
+        )])
+    assert _state(batched) == _state(one_by_one)
+    reads, acked, registered, _ = _state(batched)
+    assert reads == [(2, EDGE, [6])]
+    assert acked == [[1, 2], [4]]
+    assert registered == {2: [6], 3: []}
+    assert len(warned) == (0 if failed else 1)

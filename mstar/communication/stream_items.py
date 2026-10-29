@@ -119,11 +119,18 @@ def rows(frame: StreamItems) -> Iterator[StreamRow]:
         start += count
 
 
-def row_infos(frame: StreamItems, row: StreamRow) -> list[TensorPointerInfo]:
-    """The row's tensor descriptors, as INPUT_SIGNALS carried them."""
+def frame_dtypes(frame: StreamItems) -> list:
+    """The frame's dtypes, by ``dtype_idx``: once per frame, for ``row_infos``."""
+    return [_dtype_from_name(n) for n in frame.dtype_names]
+
+
+def row_infos(frame: StreamItems, row: StreamRow, dtypes: list | None = None) -> list[TensorPointerInfo]:
+    """The row's tensor descriptors, as INPUT_SIGNALS carried them
+    (``dtypes`` from ``frame_dtypes``, or computed here)."""
     out = []
     names = frame.names
-    dtypes = [_dtype_from_name(n) for n in frame.dtype_names]
+    if dtypes is None:
+        dtypes = frame_dtypes(frame)
     dim_at = row.dim_start
     walk = frame.walk_idx[row.index]
     for k in range(row.start, row.start + row.count):

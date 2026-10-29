@@ -999,10 +999,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         pass
 
     # Small items of one shape, dtype and segment (a step's streamed tokens)
-    # are gathered on the host into one buffer, copied once and split on the
-    # device: one copy call and one split instead of a copy and a view per item.
-    _GATHER_ITEM_BYTES = 4096
-    _GATHER_BYTES = 1 << 20
+    # are gathered on the host into one pinned buffer, copied once and split
+    # on the device: one copy call instead of a copy per item (~7 us each).
+    # Measured on an H200 host, reading k items of n bytes: the gather wins
+    # from k=2 up to n=16 KB and breaks even at 64 KB. Up to 512 B an index
+    # of 8-byte words is fastest; above it, one slice copy per item.
+    _GATHER_ITEM_BYTES = 16384
+    _GATHER_WORDS_BYTES = 512
 
     def _read_many_from_arena(self, infos: list[TensorPointerInfo]) -> list[torch.Tensor]:
         out: list[torch.Tensor | None] = [None] * len(infos)
@@ -1013,17 +1016,33 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     key = (info.shm_segment, info.nbytes, info.dtype, tuple(info.dims))
                     groups.setdefault(key, []).append(k)
             for (segment, nbytes, dtype, dims), ks in groups.items():
-                if len(ks) < 2 or len(ks) * nbytes > self._GATHER_BYTES:
+                if len(ks) < 2:
                     continue
-                seg = np.frombuffer(self._peer_view(segment), dtype=np.uint8)
-                starts = np.fromiter(
-                    (infos[k].shm_offset + infos[k].offset for k in ks), dtype=np.int64, count=len(ks),
-                )
-                gathered = torch.from_numpy(seg[(starts[:, None] + np.arange(nbytes)).ravel()])
-                rows = gathered.to(self.device, non_blocking=True).view(dtype).reshape(len(ks), *dims)
+                starts = [infos[k].shm_offset + infos[k].offset for k in ks]
+                # pinned, so the copy is a true async DMA; the caching host
+                # allocator holds the block until the copy is done
+                host = torch.empty(len(ks) * nbytes, dtype=torch.uint8, pin_memory=True)
+                self._gather(self._peer_view(segment), starts, nbytes, host.numpy())
+                rows = host.to(self.device, non_blocking=True).view(dtype).reshape(len(ks), *dims)
                 for k, t in zip(ks, rows.unbind(0), strict=True):
                     out[k] = t
         return [t if t is not None else self._read_from_arena(i) for t, i in zip(out, infos, strict=True)]
+
+    @classmethod
+    def _gather(cls, view, starts: list[int], nbytes: int, dst: np.ndarray) -> None:
+        """``nbytes`` from each of ``starts`` in ``view``, back to back into ``dst``."""
+        if (
+            nbytes <= cls._GATHER_WORDS_BYTES and nbytes % 8 == 0 and len(view) % 8 == 0
+            and all(s % 8 == 0 for s in starts)
+        ):
+            words = np.frombuffer(view, dtype=np.int64)
+            w = nbytes // 8
+            at = np.asarray(starts, dtype=np.int64) // 8
+            np.take(words, (at[:, None] + np.arange(w)).ravel(), out=dst.view(np.int64))
+            return
+        seg = np.frombuffer(view, dtype=np.uint8)
+        for i, s in enumerate(starts):
+            dst[i * nbytes:(i + 1) * nbytes] = seg[s:s + nbytes]
 
     def _read_from_arena(self, info: TensorPointerInfo) -> torch.Tensor:
         if info.nbytes == 0:

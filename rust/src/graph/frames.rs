@@ -476,7 +476,7 @@ impl StreamItems {
             first.source_session_id, first.source_entity, first.source_node_name,
             first.source_tp_size, first.source_tp_rank,
         );
-        if *self.shared.get_or_insert(shared) != shared {
+        if self.shared.is_some_and(|s| s != shared) {
             return false;
         }
         let walk = first.source_graph_walk;
@@ -486,6 +486,9 @@ impl StreamItems {
         }) {
             return false;
         }
+        // only once the row is taken, as the Python builder: a refused first
+        // row mustn't fix the frame's fields for the rows after it
+        self.shared = Some(shared);
         self.request_ids.push(request_id.to_string());
         let sig = self.name_idx(signal);
         self.signal_idx.push(sig);
@@ -724,6 +727,28 @@ mod tests {
             assert_eq!(entries[0].0.as_str(), Some("a"));
             assert_eq!(entries[1].1.as_i64(), Some(7));
         }
+    }
+
+    /// As Python's `StreamItemsBuilder.try_add`: a refused row leaves the
+    /// frame as it was, so it doesn't decide which rows come after it.
+    #[test]
+    fn a_refused_first_row_does_not_fix_the_frames_fields() {
+        let mut bk = StrToId::default();
+        let info = |bk: &mut StrToId, entity: &str, walk: &str| TensorPointerInfo {
+            dims: vec![1], dtype: bk.intern("int64"), nbytes: 8, address: 0, stride: vec![1],
+            uuid: 1, source_session_id: bk.intern("h:1"), source_entity: bk.intern(entity),
+            offset: 0, source_tp_size: 1, source_tp_rank: 0, shm_segment: None, shm_offset: 0,
+            source_node_name: Some(bk.intern("LLM")), source_graph_walk: Some(bk.intern(walk)),
+        };
+        // two walks in one row: refused
+        let mixed = [info(&mut bk, "w0", "a"), info(&mut bk, "w0", "b")];
+        let other = [info(&mut bk, "w1", "a")];
+        let first = [info(&mut bk, "w0", "a")];
+        let mut frame = StreamItems::new("p");
+        assert!(!frame.try_add(&bk, "r1", "s", "n", &mixed));
+        assert!(frame.is_empty());
+        assert!(frame.try_add(&bk, "r2", "s", "n", &other));
+        assert!(!frame.try_add(&bk, "r3", "s", "n", &first));
     }
 
     /// A nested counted map must not disturb its parent's count.

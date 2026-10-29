@@ -1581,6 +1581,10 @@ class PythonGraphRuntime(GraphRuntime):
             info = self._request_info.get(rid)
 
             for worker_id, edges in routing.to_workers.items():
+                # A sharded edge carries a CLONE of the store's descriptor, cloned
+                # during routing -- before staging stamped the arena placement onto
+                # the store's copy. Refresh it here, where the edge leaves the process.
+                self._tensor_manager.refresh_shm_placement(edges)
                 self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
 
             if routing.persist and info is not None:
@@ -1699,10 +1703,7 @@ class PythonGraphRuntime(GraphRuntime):
         self, rid: int, worker_id: str, edges: list[GraphEdge],
         fwd_info: CurrentForwardPassInfo | None, partition: str,
     ):
-        # A sharded edge carries a CLONE of the store's descriptor, cloned
-        # during routing -- before staging stamped the arena placement onto the
-        # store's copy. Refresh it here, where the edge leaves the process.
-        self._tensor_manager.refresh_shm_placement(edges)
+        # the caller refreshed the edges' arena placement
         self._communicator.send(worker_id, WorkerMessage(
             message_type=WorkerMessageType.INPUT_SIGNALS,
             body=InputSignals(

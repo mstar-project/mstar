@@ -23,7 +23,7 @@ from torch.distributed import ReduceOp
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
-from mstar.communication.stream_items import row_infos, row_input_signals
+from mstar.communication.stream_items import frame_dtypes, row_infos, row_input_signals
 from mstar.communication.stream_items import rows as stream_rows
 from mstar.communication.tensors import (
     LocalTransferEngine,
@@ -1208,14 +1208,7 @@ class Worker:
             if edge.is_streaming and edge.tensor_info:
                 (streaming_with_tensors if edge.name in buffers else unbuffered).append(edge)
         if unbuffered:
-            # Nothing here will consume it: ack it unread so the producer frees
-            # it. Expected when the request's ingest failed on this worker.
-            if request_id not in self.scheduler.failed_rids:
-                logger.warning(
-                    "Worker %s: no stream buffer for %s of request %s; dropping it",
-                    self.worker_id, [edge.name for edge in unbuffered], body.request_id,
-                )
-            self.tensor_manager.ack_unread_tensors(unbuffered)
+            self._ack_unbuffered(request_id, body.request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another
@@ -1285,6 +1278,7 @@ class Worker:
         row is what one INPUT_SIGNALS of a single streamed edge did, and the
         frame's reads start in one call."""
         reads: list[tuple[int, list[GraphEdge]]] = []
+        dtypes = frame_dtypes(frame)
         for row in stream_rows(frame):
             rid = self._rid(row.request_id)
             if rid is None or rid not in self.request_state.per_request_info:
@@ -1297,15 +1291,30 @@ class Worker:
                 continue
             if row.request_id in self._draining_rids:
                 continue  # as _process_new_inputs: no new reads
-            stream_buf = self.request_state.per_request_info[rid].stream_buffers[row.signal]
+            edge = GraphEdge(
+                next_node=row.next_node, name=row.signal,
+                tensor_info=row_infos(frame, row, dtypes), is_streaming=True,
+            )
+            stream_buf = self.request_state.per_request_info[rid].stream_buffers.get(row.signal)
+            if stream_buf is None:
+                self._ack_unbuffered(rid, row.request_id, [edge])
+                continue
             for uuid in frame.uuids[row.start:row.start + row.count]:
                 stream_buf.pre_read_register(uuid)
-            reads.append((rid, [GraphEdge(
-                next_node=row.next_node, name=row.signal,
-                tensor_info=row_infos(frame, row), is_streaming=True,
-            )]))
+            reads.append((rid, [edge]))
         if reads:
             self.wakeup_event.register_futures(self.tensor_manager.start_read_tensors_multi(reads))
+
+    def _ack_unbuffered(self, rid: int, request_id: str, edges: list[GraphEdge]) -> None:
+        """Streamed edges of a known request with no stream buffer here:
+        nothing will consume them, so ack them unread for the producer to
+        free. Expected when the request's ingest failed on this worker."""
+        if rid not in self.scheduler.failed_rids:
+            logger.warning(
+                "Worker %s: no stream buffer for %s of request %s; dropping it",
+                self.worker_id, [edge.name for edge in edges], request_id,
+            )
+        self.tensor_manager.ack_unread_tensors(edges)
 
     def _unpersist_tensors(self, body: UnpersistTensors):
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
