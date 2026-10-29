@@ -170,7 +170,7 @@ def _spec(k: int, rows: int, width: int):
     """The speculative resource with a verify plan over fake attention and KV
     buffers: a block table of distinct pages per row."""
     spec = SpecDecodeResource(device=DEV, num_draft_tokens=k, max_requests=rows, page_size=PAGE,
-                              kv_key="kv", attn_key="attn", stop_token_ids=(7,))
+                              kv_key="kv", attn_key="attn", stop_token_ids=(7,), sampling=True)
     for r in range(rows):
         spec.ingest_request(r)
     t = k + 1
@@ -195,13 +195,13 @@ def _spec(k: int, rows: int, width: int):
     return spec
 
 
-def _verify_step(spec, logits_rows, vocab, k):
+def _verify_step(spec, logits_rows, vocab, k, sample=False):
     """Every device operation of a verify step and its draft passes, as the
     forward issues them, with stand-ins for the layers."""
     ids, positions = spec.verify_inputs()
     # a target that predicts each token's successor
     logits = logits_rows.scatter(1, ((ids + 1) % vocab)[:, None], 1.0)
-    out = spec.accept(logits)
+    out = spec.accept(logits, sample=sample)
     drafted = out.target.reshape(-1)
     for j in range(k):
         spec.begin_draft_pass(j)
@@ -271,3 +271,35 @@ def test_a_captured_step_follows_the_registers():
             assert int(plan.write_pages[r * t + n]) == page
             assert int(plan.write_offsets[r * t + n]) == pos % PAGE
             assert int(plan.kv_lens[r]) == base[r] + t + (k - 1)
+
+
+def test_a_captured_sampled_step_draws_fresh_tokens_each_replay():
+    """The sampled verification (sort, filters, Gumbel noise) captures, draws
+    anew on every replay, and keeps greedy rows on the argmax."""
+    k, rows, vocab = 2, 2, 64
+    spec = _spec(k, rows, width=24)
+    t = k + 1
+    regs = slice(1, rows + 1)
+    # row 0 samples flat logits; row 1 is greedy
+    spec._temperature[regs] = torch.tensor([1.0, 0.0], device=DEV)
+    spec._top_p[regs], spec._top_k[regs] = 1.0, 0
+    flat = torch.zeros(rows * t, vocab, device=DEV)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        _verify_step(spec, flat, vocab, k, sample=True)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = _verify_step(spec, flat, vocab, k, sample=True)
+    drawn = set()
+    for _ in range(20):
+        spec._seq_len[regs] = 50
+        spec._num_acc[regs] = 1
+        spec._tokens[regs] = torch.tensor([[5, 6, 7], [1, 2, 3]], device=DEV)
+        graph.replay()
+        torch.cuda.synchronize()
+        drawn.add(int(out.target[0, 0]))
+        # the greedy row's target is each token's successor, so it accepts all three
+        assert out.target[1].tolist() == [2, 3, 4] and int(out.accepted[1]) == 3
+    assert len(drawn) > 5, drawn
