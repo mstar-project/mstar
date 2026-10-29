@@ -38,6 +38,9 @@ def make_test_api_server(**overrides) -> APIServer:
     # no LoRA block: no adapters to digest, as APIServer.__init__ leaves it
     server.lora_adapter_digests = {}
     server.lora_admin = LoraAdmin(None, server.served_models, None, lambda message: None)
+    server.client_streams = frozenset()
+    server.takes_stream_input = False
+    server._model_config = None   # max_call_input_bytes reads it on first use
     server.preprocess_worker = None
     server.communicator = None
     server._msg_thread = None

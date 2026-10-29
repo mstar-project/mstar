@@ -77,12 +77,15 @@ def _manager(tmp_path, entity_id):
 
 def _worker(tmp_path):
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
     w._last_active = {}
     w._innermost_loop_by_node = {}
     w._graph_runtime = _AccumulatingRuntime()
+    w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = _manager(tmp_path, "worker_0")
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},

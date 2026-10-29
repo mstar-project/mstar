@@ -635,7 +635,7 @@ class _LoopWorker:
         ))
         if self.runtime == "rust":
             plan = rt._rust.take_send_plan(out.completion_id)
-            return node, any(r == rid and wgs for r, wgs, _ in plan.completed)
+            return node, any(r == rid and wgs for r, wgs, *_ in plan.completed)
         done = bool(rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids)
         rt.send_outputs(SendInput(
             completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
@@ -800,9 +800,43 @@ def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size))
 
 
+def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
+    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
+    return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
+
+
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
     return _bare(WhisperModel, config=WhisperModelConfig())
+
+
+def _canary(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary.canary_model import CanaryModel
+    from mstar.model.canary.config import CanaryModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    config = CanaryModelConfig(encoder=FastConformerConfig())
+    return _bare(CanaryModel, config=config)
+
+
+def _canary_qwen(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.canary_qwen.config import CanaryQwenModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    return _bare(CanaryQwenModel, config=CanaryQwenModelConfig(
+        encoder=FastConformerConfig(), llm=Qwen3LMConfig(), llm_repo="Qwen/Qwen3-1.7B",
+    ))
+
+
+def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.fastconformer import FastConformerConfig
+    from mstar.model.components.transducer import TransducerConfig
+    from mstar.model.parakeet.config import ParakeetModelConfig
+    from mstar.model.parakeet.parakeet_model import ParakeetModel
+    # Nemotron ASR conditions the transducer on a language prompt
+    transducer = TransducerConfig(num_prompts=128 if name == "nemotron_asr" else 0)
+    return _bare(ParakeetModel, config=ParakeetModelConfig(name, FastConformerConfig(), transducer))
 
 
 def _default(name, model_kwargs, tmp_path, monkeypatch):
@@ -811,6 +845,8 @@ def _default(name, model_kwargs, tmp_path, monkeypatch):
 
 _FACTORIES = {
     "BagelModel": _bagel,
+    "CanaryModel": _canary,
+    "CanaryQwenModel": _canary_qwen,
     "ChatterboxModel": _chatterbox,
     "CommandAPlusModel": _command_a_plus,
     "Cosmos3Model": _cosmos3,
@@ -821,9 +857,11 @@ _FACTORIES = {
     "KokoroModel": _kokoro,
     "LTX25Model": _ltx2_5,
     "OrpheusModel": _orpheus,
+    "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
+    "Qwen3ASRModel": _qwen3_asr,
     "WhisperModel": _whisper,
     # constructed directly: NemotronDuplexModel, OmniVoiceModel, Pi05Model,
     # VJepa2Model, VJepa2ACModel, Wan22Model, WaypointModel

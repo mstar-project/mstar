@@ -1,8 +1,9 @@
 [package]
 name = "mstar-rust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
+publish = false
 
 [lib]
 name = "mstar_rust"
@@ -21,7 +22,7 @@ rmp-serde = "1.3"
 rustc-hash = "2"
 thiserror = "2"
 zmq = "0.10"
-pyo3 = { version = "0.23" }
+pyo3 = { version = "0.26", optional = true }
 rmpv = "1.3.1"
 # Direct msgpack writing. rmpv builds a Value tree first, which allocates a
 # String for every map KEY -- ~13 per tensor descriptor -- and then copies the
@@ -30,12 +31,15 @@ rmpv = "1.3.1"
 rmp = "0.8"
 
 [features]
-# On for the cdylib: a Python extension resolves the CPython symbols at import
-# time and must NOT link libpython. Off for `cargo test`, whose binary is an
-# executable and therefore has to link it -- hence
-# `cargo test --no-default-features`.
+# `python`: the PyO3 bindings and the modules built on them (graph runtime,
+# tensor bookkeeping). `extension-module` adds the cdylib's rule that a Python
+# extension resolves the CPython symbols at import time and must NOT link
+# libpython. `cargo test` builds an executable, which has to link it -- hence
+# `cargo test --no-default-features --features python`. rust/server takes
+# neither, so it links no Python at all.
 default = ["extension-module"]
-extension-module = ["pyo3/extension-module"]
+python = ["dep:pyo3"]
+extension-module = ["python", "pyo3/extension-module"]
 
 [profile.release]
 opt-level = 3

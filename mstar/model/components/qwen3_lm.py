@@ -29,6 +29,54 @@ from mstar.model.components.distributed import (
 from mstar.model.components.norm import RMSNorm
 
 
+class Qwen3Attention(ParallelAttention):
+    """``ParallelAttention`` with Qwen3's per-head q/k RMSNorm, its 1D RoPE and
+    the step's KV write in one Triton kernel (``qk_norm_rope_kv_write``). At
+    decode width a step is a few small kernels per layer, and the separate
+    norm, RoPE and KV-write kernels were a sizeable share of it. Falls back to
+    the unfused path off CUDA or without planned positions."""
+
+    _fuse_qk = False
+
+    def bind_resources(self, resources: dict) -> None:
+        super().bind_resources(resources)
+        # the kernel is plain non-interleaved RoPE over the whole head dim;
+        # anything else the position resource would apply stays unfused
+        self._rope_theta = self.pos.fusable_rope_theta(self.head_dim)
+        self._fuse_qk = (
+            self._rope_theta is not None and self.q_norm is not None and self.rope_scale == 1.0
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        pos_ids = self.pos.pos_ids(self.attend.label) if self._fuse_qk else None
+        if pos_ids is None or not hidden_states.is_cuda:
+            return super().forward(hidden_states)
+        num_tokens = hidden_states.shape[0]
+        q, k, v = self._project_qkv(hidden_states)
+        attn_output = self._norm_rope_attend(q, k, v, pos_ids)
+        attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
+        return self.o_proj(attn_output)
+
+    @torch.compiler.disable
+    def _norm_rope_attend(self, q, k, v, pos_ids) -> torch.Tensor:
+        """q/k norm and RoPE, the step's KV write and attention. For a backend
+        that reads K/V from the paged cache, the write rides in the norm/RoPE
+        kernel (``qk_norm_rope_kv_write``) rather than a launch of its own."""
+        from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
+
+        eps = (float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon), self._rope_theta)
+        attend = self.attend
+        if not attend.attn.requires_kv_write:
+            qk_norm_rope_inplace(q, k, self.q_norm.weight, self.k_norm.weight, pos_ids, *eps)
+            return attend(q, k, v)
+        layer, page_idx, slot_idx, n = attend.kv.write_target()
+        qk_norm_rope_kv_write(
+            q, k, v, self.q_norm.weight, self.k_norm.weight, pos_ids,
+            layer, page_idx, slot_idx, min(n, q.shape[0]), *eps,
+        )
+        return attend.attn.run(q, kv_cache_layer=attend.kv.layer_view())
+
+
 @dataclass
 class Qwen3LMConfig:
     hidden_size: int = 2048
@@ -71,7 +119,7 @@ class Qwen3DenseLM(nn.Module):
         )
         self.layers = nn.ModuleList([
             DecoderLayer(
-                self_attn=ParallelAttention(
+                self_attn=Qwen3Attention(
                     comm_group=comm_group,
                     hidden_size=config.num_attention_heads * config.head_dim,
                     num_heads=config.num_attention_heads,
@@ -138,10 +186,22 @@ class Qwen3DenseLM(nn.Module):
         """
         hidden_states = input_embeds
         self.layers[0].self_attn.attend.bind_step(label)
+        # Each residual add is deferred into the next norm: one fused add+norm
+        # kernel (in place) per norm instead of an add and a norm, 56 fewer
+        # launches a decode step on a 28-layer model.
+        residual = None
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states=hidden_states)
-        return self.norm(hidden_states)
+            if residual is None:
+                residual = hidden_states
+                h = layer.input_layernorm(hidden_states)
+            else:
+                h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
+            h = layer.self_attn(h)
+            h, residual = layer.post_attention_layernorm.forward_residual(h, residual)
+            hidden_states = layer.mlp(h)
+        normed, _ = self.norm.forward_residual(hidden_states, residual)
+        return normed
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
