@@ -18,13 +18,23 @@ rendered prompt ever does.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import NamedTuple
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.keys import MIXED
+
+if TYPE_CHECKING:
+    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+    from mstar.graph.base import TensorPointerInfo
+    from mstar.model.base import ForwardPassArgs
+
 TEXT = "text"
+VIDEO = "video"
 
 
 @dataclass(frozen=True)
@@ -266,3 +276,336 @@ def check_plan(plan: list[PromptPart], spans: list[MediaSpan], n_text: int) -> N
             f"multimodal placement mismatch: planned {planned_text} text spans, "
             f"prompt has {n_text}"
         )
+
+
+def as_uint8_chw(image) -> torch.Tensor:
+    """``(3, H, W)`` uint8 RGB on the CPU from what the data worker sends: a
+    ``(C, H, W)`` tensor, float in [0, 1] (rounded to the nearest level) or
+    uint8; or a PIL image or ``(H, W[, C])`` numpy array. A tensor's layout is
+    taken as given, not guessed from its shape. Alpha is dropped, gray
+    repeated."""
+    if not torch.is_tensor(image):
+        import numpy as np
+
+        if not isinstance(image, np.ndarray):  # a PIL image
+            image = np.asarray(image.convert("RGB"))
+        image = torch.from_numpy(np.ascontiguousarray(image))
+        if image.dim() == 2:
+            image = image[..., None]
+        image = image.permute(2, 0, 1)
+    if image.dtype.is_floating_point:
+        image = (image * 255.0).round().clamp(0, 255).to(torch.uint8)
+    image = image.cpu()
+    if image.shape[0] == 1:
+        image = image.expand(3, -1, -1)
+    return image[:3].contiguous()
+
+
+class MediaPads(NamedTuple):
+    """A prompt with each media placeholder expanded to its tokens, and where
+    each expanded run sits. The lists run in prompt order, one entry a run."""
+
+    ids: torch.Tensor
+    # the run's pad id, and its index among that pad's runs
+    pad: list[int]
+    index: list[int]
+    # the run's first pad position in ``ids``, and its length
+    offset: list[int]
+    tokens: list[int]
+
+
+def expand_media_pads(
+    ids: torch.Tensor,
+    counts: Mapping[int, Sequence[int]],
+    sentinels: Mapping[int, tuple[int, int]] | None = None,
+) -> MediaPads:
+    """Expand the nth occurrence of each pad id in ``ids`` to ``counts[pad][n]``
+    pads, wrapped in ``sentinels[pad]`` when given (a template that writes a
+    bare pad, as the processor's ``replace_*_token`` then wraps it).
+
+    Raises ``ValueError`` when a pad occurs other than once per count: user
+    text that spells a placeholder token, or a layout naming an attachment
+    the request did not carry. ``ids`` are host ids, straight from the
+    tokenizer.
+    """
+    sentinels = sentinels or {}
+    # a loop over the placeholders, not the tokens: a text-only prompt has none
+    hits = torch.isin(ids, ids.new_tensor(list(counts))).nonzero().flatten() if counts else ids.new_empty(0)
+    seen = dict.fromkeys(counts, 0)
+    pieces: list[torch.Tensor] = []
+    layout = MediaPads(ids, [], [], [], [])
+    cursor = size = 0
+    for i, token in zip(hits.tolist(), ids[hits].tolist(), strict=True):
+        n = seen[token]
+        if n >= len(counts[token]):
+            raise ValueError(
+                f"the prompt holds more placeholders {token} than the "
+                f"{len(counts[token])} attachments it has tokens for"
+            )
+        seen[token] = n + 1
+        pieces.append(ids[cursor:i])
+        size += i - cursor
+        start, end = sentinels.get(token, (None, None))
+        if start is not None:
+            pieces.append(ids.new_tensor([start]))
+            size += 1
+        tokens = int(counts[token][n])
+        layout.pad.append(token)
+        layout.index.append(n)
+        layout.offset.append(size)
+        layout.tokens.append(tokens)
+        pieces.append(ids.new_full((tokens,), token))
+        size += tokens
+        if end is not None:
+            pieces.append(ids.new_tensor([end]))
+            size += 1
+        cursor = i + 1
+    short = {pad: (seen[pad], len(c)) for pad, c in counts.items() if seen[pad] != len(c)}
+    if short:
+        raise ValueError(f"placeholder counts in the prompt (found, expected) per pad id: {short}")
+    if not pieces:
+        return layout
+    return layout._replace(ids=torch.cat([*pieces, ids[cursor:]]))
+
+
+# ---------------------------------------------------------------------------
+# The VLM walk set: `prefill_text` for a text-only prompt; for a prompt with
+# media, one walk that runs the encoders of the media it holds, then the LLM
+# over the whole prompt as one row; then a `decode` loop. The LLM splices
+# each encoder's output in at its pads inside its forward (see
+# `SampledTokenDecoder`).
+# ---------------------------------------------------------------------------
+
+# the step metadata key of a media walk's layout (`media_layout`)
+MEDIA_LAYOUT = "media_layout"
+
+
+@dataclass(frozen=True)
+class MediaEncoder:
+    """An encoder node of the media walks, as data.
+
+    ``name`` names the walks (``prefill_vision``, ``prefill_vision_audio``);
+    ``node`` reads ``inputs`` and sends the LLM ``output``, one row per pad
+    of ``pad_ids`` in the prompt, in prompt order.
+    """
+
+    name: str
+    node: str
+    inputs: tuple[str, ...]
+    output: str
+    pad_ids: tuple[int, ...]
+
+    def __post_init__(self):
+        if not self.pad_ids:
+            # the splice would have no pad to fill
+            raise ValueError(f"media encoder {self.node!r} names no pad ids")
+
+
+def vision_encoder(pad_ids: tuple[int, ...]) -> MediaEncoder:
+    """The ``vision_encoder`` node every VLM here declares."""
+    return MediaEncoder("vision", "vision_encoder", ("pixel_values",), "vision_embeds", pad_ids)
+
+
+def media_walk_name(encoders: Sequence[MediaEncoder]) -> str:
+    return "prefill_" + "_".join(e.name for e in encoders)
+
+
+def media_walk_names(encoders: Sequence[MediaEncoder]) -> list[str]:
+    """One walk per non-empty subset of ``encoders``, in declaration order."""
+    return [
+        media_walk_name([e for i, e in enumerate(encoders) if mask >> i & 1])
+        for mask in range(1, 1 << len(encoders))
+    ]
+
+
+def media_layout(
+    pads: MediaPads,
+    output_of: Mapping[int, str],
+    grids: Mapping[int, Sequence[Sequence[int]]] | None = None,
+) -> dict[str, list]:
+    """A media walk's ``MEDIA_LAYOUT`` step metadata, columnar: each run's
+    ``offset`` and ``tokens``, the encoder ``output`` it is read from, and
+    its patch ``grid`` (``[]`` for media without one). Plain lists: it rides
+    the step's control message, so every node of the walk reads it on the
+    host (`media_grids`)."""
+    grids = grids or {}
+    return {
+        "offset": list(pads.offset),
+        "tokens": list(pads.tokens),
+        "output": [output_of[p] for p in pads.pad],
+        "grid": [
+            [int(v) for v in grids[p][i]] if p in grids else []
+            for p, i in zip(pads.pad, pads.index, strict=True)
+        ],
+    }
+
+
+def media_grids(layout: Mapping, output: str) -> list[tuple[int, int, int]]:
+    """The patch grid of each run a ``MEDIA_LAYOUT`` fills from encoder output
+    ``output``, in prompt order."""
+    return [
+        tuple(grid) for grid, out in zip(layout.get("grid", ()), layout.get("output", ()), strict=True)
+        if out == output
+    ]
+
+
+def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[MediaEncoder]:
+    """The encoders a prompt's ``MEDIA_LAYOUT`` runs, in declaration order:
+    those whose output fills one of its runs. Both the prefill walk and
+    the KV layout read this, so they name the same walk."""
+    outputs = set(layout.get("output", ()))
+    return [e for e in encoders if e.output in outputs]
+
+
+def media_walks(
+    max_iters: int, encoders: Sequence[MediaEncoder] = (),
+) -> dict[str, GraphSection]:
+    """``prefill_text``, one media walk per subset of ``encoders``, and
+    ``decode``, over the ``LLM`` node and the encoders. ``max_iters`` bounds
+    the decode loop; it is a safety bound, not the per-request budget."""
+
+    def emit_first_token() -> GraphEdge:
+        return GraphEdge(
+            next_node=EMIT_TO_CLIENT, name="new_token", persist=True, output_modality="text",
+        )
+
+    walks: dict[str, GraphSection] = {
+        "prefill_text": GraphNode(name="LLM", input_names=["text_inputs"], outputs=[emit_first_token()]),
+    }
+    for mask in range(1, 1 << len(encoders)):
+        present = [e for i, e in enumerate(encoders) if mask >> i & 1]
+        nodes = [
+            GraphNode(
+                name=e.node, input_names=list(e.inputs),
+                outputs=[GraphEdge(next_node="LLM", name=e.output)],
+            )
+            for e in present
+        ]
+        walks[media_walk_name(present)] = Sequential([
+            nodes[0] if len(nodes) == 1 else Parallel(nodes),
+            GraphNode(
+                name="LLM",
+                input_names=["text_inputs", *(e.output for e in present)],
+                outputs=[emit_first_token()],
+            ),
+        ])
+    walks["decode"] = Loop(
+        name="decode_loop",
+        section=GraphNode(
+            name="LLM",
+            input_names=["text_inputs"],
+            outputs=[
+                GraphEdge(next_node="LLM", name="text_inputs"),
+                GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
+            ],
+        ),
+        max_iters=max_iters,
+        outputs=[],
+    )
+    return walks
+
+
+def text_combined_walks() -> dict[str, dict[str, set[str]]]:
+    """Text prefill and decode rows of the ``LLM`` node share a step."""
+    return {"LLM": {MIXED: {"prefill_text", "decode"}}}
+
+
+@dataclass(frozen=True)
+class PrefillStep:
+    walk: str
+    # (node, input name) -> the tensors that input carries
+    input_tensors: dict[tuple[str, str], list[TensorPointerInfo]]
+    # merged into the walk's step metadata
+    metadata: dict = field(default_factory=dict)
+
+
+def media_prefill_step(
+    signals: dict[str, list[TensorPointerInfo]],
+    encoders: Sequence[MediaEncoder],
+    layout: dict | None = None,
+    *,
+    model_name: str,
+) -> PrefillStep:
+    """The one prefill walk a request runs over its whole prompt
+    (``text_inputs``, one tensor): with media in its ``layout``, the walk over
+    the encoders it runs (`media_encoders`); without, ``prefill_text``."""
+    texts = signals.get("text_inputs", [])
+    if not texts:
+        # the conductor answers this with a 400
+        raise ValueError(
+            f"{model_name} has nothing to prefill: the request carries no "
+            f"{sorted(signals) or 'inputs'}. An empty prompt cannot be served."
+        )
+    if len(texts) != 1:
+        # the model's intake renders one prompt; the conductor answers this with a 400
+        raise ValueError(f"{model_name} got a prompt as {len(texts)} text tensors, not the one whole prompt")
+    present = media_encoders(encoders, layout or {})
+    if not present:
+        sent = sorted(name for e in encoders for name in e.inputs if signals.get(name))
+        if sent:
+            # a text prefill would drop them
+            raise ValueError(f"{model_name} got {sent} with no media layout to place them by")
+        return PrefillStep("prefill_text", {("LLM", "text_inputs"): texts})
+    inputs = {("LLM", "text_inputs"): texts}
+    for e in present:
+        for name in e.inputs:
+            inputs[(e.node, name)] = signals.get(name, [])
+    return PrefillStep(media_walk_name(present), inputs, {MEDIA_LAYOUT: layout or {}})
+
+
+def walk_input_edges(step: PrefillStep) -> list[GraphEdge]:
+    """One edge per (node, input) the step's walk reads."""
+    edges = []
+    for (node, name), tensors in step.input_tensors.items():
+        edge = GraphEdge(next_node=node, name=name)
+        edge.tensor_info = list(tensors)
+        edges.append(edge)
+    return edges
+
+
+def _prefill_args(
+    metadata: CurrentForwardConductorMetadata, inputs: list[GraphEdge], step_metadata: dict,
+) -> ForwardPassArgs:
+    from mstar.model.base import ForwardPassArgs
+
+    return ForwardPassArgs(
+        full_metadata=metadata,
+        inputs=inputs,
+        unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
+        step_metadata={"is_prefill": metadata.is_prefill, **step_metadata},
+    )
+
+
+def initial_prefill_args(
+    step: PrefillStep, input_modalities: list[str], output_modalities: list[str],
+) -> ForwardPassArgs:
+    """The prefill walk; `next_prefill_args` takes it from there."""
+    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=input_modalities,
+        output_modalities=output_modalities,
+        graph_walk=step.walk,
+        is_prefill=True,
+    )
+    return _prefill_args(metadata, walk_input_edges(step), step.metadata)
+
+
+def next_prefill_args(
+    metadata: CurrentForwardConductorMetadata,
+    persist_signals: dict[str, list[TensorPointerInfo]],
+) -> ForwardPassArgs:
+    """After the prefill, loop in decode until the decoder's stop check ends it."""
+    from mstar.model.base import ForwardPassArgs
+
+    if metadata.is_prefill:
+        metadata.is_prefill = False
+        metadata.graph_walk = "decode"
+        edge = GraphEdge(next_node="LLM", name="text_inputs")
+        edge.tensor_info = persist_signals.get("new_token", [])
+        return _prefill_args(metadata, [edge], {})
+    # reaching here again after decode stopped means the request is finished
+    metadata.kwargs["decode_finished"] = True
+    return ForwardPassArgs(
+        full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True,
+    )

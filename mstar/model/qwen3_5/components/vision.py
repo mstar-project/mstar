@@ -14,7 +14,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
+from mstar.model.components.vit import (
+    AxialVisionRope,
+    RaggedVisionAttention,
+    bilinear_table_taps,
+)
+from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
 
 # ----------------------------------------------------------------------------
 # Grid helpers
@@ -36,8 +41,15 @@ def vision_position_ids(
 
     Block-major, so the rotary sees the order the merger will fold.
     """
-    out = []
+    # a video's frames come as one-frame grids of one size: build each run once
+    runs: list[list[int]] = []
     for t, h, w in grid:
+        if runs and runs[-1][1:] == [h, w]:
+            runs[-1][0] += t
+        else:
+            runs.append([t, h, w])
+    out = []
+    for t, h, w in runs:
         hpos, wpos = torch.meshgrid(
             torch.arange(h, device=device),
             torch.arange(w, device=device),
@@ -53,21 +65,14 @@ def vision_position_ids(
     return torch.cat(out, dim=0)
 
 
-def _axis_taps_weights(
-    index: torch.Tensor, size: torch.Tensor, side: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Bilinear taps into a ``side``-long table, for positions on an axis of
-    length ``size``. ``align_corners=True`` and border padding, matching the
-    ``F.interpolate`` call upstream reproduces."""
+def _align_corners_src(index: torch.Tensor, size: torch.Tensor, side: int) -> torch.Tensor:
+    """Where positions on an axis of length ``size`` sample a ``side``-long
+    table: ``align_corners=True``, matching the ``F.interpolate`` call
+    upstream reproduces (with border padding)."""
     index = index.to(torch.float32)
     # closed form of `linspace(0, side - 1, size)[index]`; clamp avoids a
     # divide-by-zero at size == 1, where index is 0 anyway
-    src = index * (side - 1) / torch.clamp(size - 1, min=1)
-    floor = torch.floor(src)
-    offsets = torch.arange(0, 2, device=index.device)
-    taps = (floor.long()[:, None] + offsets).clamp(0, side - 1)
-    distance = (src[:, None] - floor[:, None] - offsets).abs()
-    return taps, (1 - distance).clamp(min=0)
+    return index * (side - 1) / torch.clamp(size - 1, min=1)
 
 
 def vision_interpolation(
@@ -107,48 +112,15 @@ def vision_interpolation(
     row = block_row * merge + in_row
     col = block_col * merge + in_col
 
-    h_taps, h_w = _axis_taps_weights(row, heights, side)
-    w_taps, w_w = _axis_taps_weights(col, widths, side)
-    indices = (h_taps[:, :, None] * side + w_taps[:, None, :]).reshape(-1, 4)
-    weights = (h_w[:, :, None] * w_w[:, None, :]).reshape(-1, 4)
-    return indices, weights
+    return bilinear_table_taps(
+        _align_corners_src(row, heights, side), _align_corners_src(col, widths, side), side,
+        zero_pad=False,
+    )
 
 
 # ----------------------------------------------------------------------------
 # Modules
 # ----------------------------------------------------------------------------
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
-class VisionRotaryEmbedding(nn.Module):
-    """Axial 2D rope: the same frequencies drive the H and W axes, and the two
-    halves are concatenated to cover the whole head — no partial rotation."""
-
-    def __init__(self, config: Qwen3_5VisionConfig):
-        super().__init__()
-        spatial_dim = config.head_dim // 2
-        inv_freq = 1.0 / (
-            config.rope_theta
-            ** (torch.arange(0, spatial_dim, 2, dtype=torch.float) / spatial_dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    @torch.no_grad()
-    def forward(
-        self, position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # position_ids: [N, 2] -> freqs [N, 2, dim/4]
-        freqs = position_ids[..., None].float() * self.inv_freq.float()
-        return self._recompose(freqs.cos()), self._recompose(freqs.sin())
-
-    @staticmethod
-    def _recompose(freq: torch.Tensor) -> torch.Tensor:
-        freq_hw = torch.cat([freq[:, 0], freq[:, 1]], dim=-1)
-        return torch.cat([freq_hw, freq_hw], dim=-1)
 
 
 class VisionPatchEmbed(nn.Module):
@@ -209,7 +181,7 @@ class VisionMLP(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
-class VisionAttention(nn.Module):
+class VisionAttention(RaggedVisionAttention):
     """Full attention within each frame, over packed patches.
 
     The ragged attention resource plans the per-frame layout, so this forward
@@ -219,47 +191,17 @@ class VisionAttention(nn.Module):
     """
 
     def __init__(self, config: Qwen3_5VisionConfig):
-        super().__init__()
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
+        super().__init__(config.hidden_size, config.num_heads)
         self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=True)
-        self.proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.ragged_attn = None
 
-    def bind_resources(self, resources: dict) -> None:
-        """See ``NodeSubmodule.bind_node_resources``. ``.get``: a deployment
-        that never builds the vision node binds nothing here."""
-        self.ragged_attn = resources.get(VISION_ATTN)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.ragged_attn is None:
-            raise RuntimeError(
-                "Qwen3.5's vision tower has no ragged attention resource; "
-                f"declare a RaggedAttentionSpec under {VISION_ATTN!r} for the "
-                "vision_encoder node"
-            )
-        seq_len = hidden_states.shape[0]
+    def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # [tokens, heads, head_dim]: the ragged kernel's layout, no transposes
-        q, k, v = (
+        return (
             self.qkv(hidden_states)
-            .reshape(seq_len, 3, self.num_heads, -1)
+            .reshape(hidden_states.shape[0], 3, self.num_heads, -1)
             .permute(1, 0, 2, 3)
             .unbind(0)
         )
-        # rope in fp32, as upstream does, then back
-        dtype = q.dtype
-        c, s = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-        qf, kf = q.float(), k.float()
-        q = ((qf * c) + (_rotate_half(qf) * s)).to(dtype)
-        k = ((kf * c) + (_rotate_half(kf) * s)).to(dtype)
-
-        out = self.ragged_attn.run(q, k, v)
-        return self.proj(out.reshape(seq_len, -1).contiguous())
 
 
 class VisionBlock(nn.Module):
@@ -296,7 +238,7 @@ class Qwen3_5VisionModel(nn.Module):
         self.pos_embed = nn.Embedding(
             config.num_position_embeddings, config.hidden_size,
         )
-        self.rotary_pos_emb = VisionRotaryEmbedding(config)
+        self.rotary_pos_emb = AxialVisionRope(config.head_dim, config.rope_theta)
         self.blocks = nn.ModuleList(
             VisionBlock(config) for _ in range(config.depth)
         )
@@ -326,6 +268,7 @@ class Qwen3_5VisionModel(nn.Module):
         indices: torch.Tensor,
         weights: torch.Tensor,
         position_ids: torch.Tensor,
+        **_: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Patch embed plus the resampled position table, and the rope for
         the blocks: everything before the block loop, per patch."""
@@ -340,8 +283,8 @@ class Qwen3_5VisionModel(nn.Module):
         pos = (self.pos_embed(indices) * weights[:, :, None]).sum(1)
         hidden = hidden + pos.to(hidden.dtype)
 
-        cos, sin = self.rotary_pos_emb(position_ids)
-        return hidden, cos.to(hidden.dtype), sin.to(hidden.dtype)
+        cos, sin = self.rotary_pos_emb(position_ids, hidden.dtype)
+        return hidden, cos, sin
 
     def encode(
         self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
@@ -351,3 +294,8 @@ class Qwen3_5VisionModel(nn.Module):
         for block in self.blocks:
             hidden = block(hidden, cos, sin)
         return hidden
+
+    def project(self, hidden: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
+        """The patch merger: one LLM-width token per ``spatial_merge_size ** 2``
+        block of patches."""
+        return self.merger(hidden)

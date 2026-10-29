@@ -339,8 +339,9 @@ is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts
 length of a request that asks for none until it fits. With every loop at 0 iterations, the
 same sum is the prompt a request reserves when its pool admits it.
 
-``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
-text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
+``prompt_spans(plan, texts, text_walk, item_spans)`` builds the spans of a prompt whose
+text and attachments, in ``prefill_plan`` order, are each written by their own walk, as
+BAGEL lays out its prompt:
 
 .. code-block:: python
 
@@ -567,10 +568,12 @@ The spec types are:
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
        kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
        MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-       Whisper and Qwen3-ASR declare ``False``. ``FLASHINFER_MLA`` is
+       Whisper and Qwen3-ASR declare ``False``. ``sm_scale`` (default
+       ``1/sqrt(head_dim)``) sets the softmax scale; FlashInfer and ``FLASHINFER_MLA``
+       read it, and the other backends refuse it. ``FLASHINFER_MLA`` is
        Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
-       the softmax scale of the model's original qk head dim, which the other backends
-       refuse. Its ``run`` takes the absorbed query (``[tokens, heads, kv_lora_rank]``)
+       the softmax scale of the model's original qk head dim. Its ``run`` takes the
+       absorbed query (``[tokens, heads, kv_lora_rank]``)
        with the rope part as ``q_pe``, and returns the output in the latent space, so
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
@@ -1610,9 +1613,13 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   ``(shape: PiecewiseCaptureShape) -> dict[str, Tensor]``. It returns the persistent
   buffers that the captured region reads. The runner owns these buffers. Before each
   replay, it copies your real tensors into them by name. ``shape`` provides ``bs``,
-  ``seq_lens`` and ``total_tokens`` for the bucket being built. Allocate the hidden-state
-  buffer with dtype ``autocast_dtype``, so that the copy before replay does not convert
-  dtypes.
+  ``seq_lens`` and ``total_tokens`` for the bucket being built. Allocate each buffer in the
+  dtype of the tensor you pass for it, which for a hidden state is usually
+  ``autocast_dtype``. The copy before replay casts a value into a wider dtype of its kind
+  (int32 token ids into an int64 buffer, a bf16 table into an fp32 one). A value the
+  buffer may round (a narrower dtype, such as an fp32 hidden state into a bf16 buffer, or
+  an integer into a floating-point or complex buffer) is refused with a ``ValueError``
+  naming the buffer.
 - ``forward_kwargs`` holds static keyword arguments that are passed to ``capture_fn`` on
   every call, for example a layer count or an ``is_causal`` flag.
 - ``declare_step`` has signature
@@ -2327,6 +2334,113 @@ On the API side ``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py
 ``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes
 ``width``/``height``, ``seed`` and other knobs pass through); register it under the
 model's registry key. The SDK exposes ``generate_image`` and ``edit_image``.
+
+Worked example: a vision-language model on the VLM scaffold
+-----------------------------------------------------------
+
+A decoder LLM with a ViT in front of it (Qwen3.5, Muse Glimmer) shares one graph and
+two node shapes, so M* ships them as a scaffold; a model adds its components, its
+resource declarations and a few overrides. The older span-split path, a walk per text
+span and attachment (``prefill_plan``, ``find_media_spans``, ``split_around_spans``,
+``prompt_spans``; BAGEL and Qwen3-Omni), is legacy: a new model builds on this scaffold.
+BAGEL stays on it because a whole-prompt row would lose what its spans carry: an image to
+generate from is written twice, as VAE latents and as ViT patches, by walks of their own,
+its classifier-free-guidance branches open KV labels over different subsets of the
+prompt's spans, and its leading text span is keyed for prefix reuse. Moving Qwen3-Omni
+and BAGEL onto the scaffold is tracked as a follow-up.
+
+Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder`` list::
+
+    prefill_text   : LLM(text_inputs)                        a text-only prompt
+    prefill_vision : vision_encoder(pixel_values)            each run's grid off MEDIA_LAYOUT
+                     -> LLM(text_inputs, vision_embeds)      the whole prompt, one row
+    prefill_<a>_<b>: Parallel(encoder a, encoder b) -> LLM   one walk per subset of encoders
+    decode         : Loop("decode_loop", LLM)
+    mixed          : prefill_text and decode rows in one step (a combined walk)
+
+The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_decoder.py``),
+which declares the walks (``media_walks(max_iters, encoders)`` and
+``text_combined_walks()``), runs the one prefill walk ``media_prefill_step`` picks
+through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, and owns
+media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, which is
+also the request's output budget), the KV label and its one-span layout (``kv_labels``,
+``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
+the request's ``SAMPLING_KEYS`` over ``sampling_defaults``, which ``__init__`` reads
+from the checkpoint's ``generation_config.json``), the LLM's ``SamplerSpec``
+(``_sampler_spec``, whose min-p filter is on only where the checkpoint defaults
+``min_p``, so a request's ``min_p > 0`` is otherwise refused at admission), sharding, the
+submodule cache and where the files come from. A model sets ``NAME`` and
+``METADATA_FILES`` and writes ``__init__`` (setting
+``config``, ``tokenizer`` and ``media``), its resources (the sampler from
+``_sampler_spec``; ``MIXED_SPLIT`` is the attention
+resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``. ``media`` holds a ``MediaIntake`` per attachment modality: its
+``MediaEncoder`` (modalities may share one), its placeholder ``pad`` id, the sentinels
+a template leaves to its processor, how many placeholders an attachment fills
+(``runs``, one by default; a Qwen3.5 video fills one per temporal group), and
+``prepare``, which turns an attachment into the encoder's input tensors and each
+placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and tokenizes the
+whole prompt once. ``intake`` then refuses a prompt whose placeholders don't match its
+attachments, prepares each attachment in prompt order, expands each placeholder to one
+pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
+layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length,
+advance)``. The layout's runs say which encoders the prompt runs (``media_encoders``), for
+the prefill schedule's walk and the KV layout's alike.
+``advance``, how far the prompt moves the position counter, defaults to the prompt's
+length; under Qwen-style MRoPE it is the positions' extent instead, an image spanning
+``max(h', w')`` positions rather than its tokens, which Qwen3.5 computes from the
+runs' grids in its own ``process_prompt`` over ``intake``. The encoders' inputs are
+lists in prompt order, as their outputs fill the pads. Each run's patch grid (the
+``grids`` of its ``PreparedMedia``) rides ``MEDIA_LAYOUT`` rather than a tensor, so a
+tower's grid maths in ``prepare_inputs`` reads host values (``PackedBlockLoopEncoder.grids``)
+and never syncs on the device.
+
+The ``LLM`` node subclasses ``SampledTokenDecoder``
+(``mstar/model/components/sampled_token_decoder.py``), which owns the capture configs
+(decode, packed text prefill, mixed, and one packed capture every media walk replays,
+which also caps their batches), device loop-back of the sampled token, the splice of
+the encoders' outputs into the prompt's embeddings inside the forward
+(``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
+sampler and the position resource, the forward through the sampler and both stop
+checks, ``TokenStepNode``'s (EOS, or the request's token count, where the loop's cap
+also ends it) on decode rows only. A media row's tensor holds exactly the pads in its
+ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
+sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
+writes:
+
+.. code-block:: python
+
+    class LLMSubmodule(SampledTokenDecoder):
+        ATTN_KEY = ATTN_FULL  # the attention resource that picks each prefill row's last token
+
+        def layer_steps(self):  # this step's work on the layers' resources
+            return {KV_CACHE: KVStep(), ATTN_FULL: AttentionStep(causal=True)}
+
+        # optional, for positions the resource cannot place (MRoPE):
+        def prompt_positions(self, fwd_info, layout, num_tokens): ...  # -> (custom_pos_ids, advance)
+        def decoder_kwargs(self, graph_walk, engine_inputs, num_tokens, **tensors): ...
+
+Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
+(the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
+``Qwen3_5ForCausalLM`` does (``Qwen3DenseLM`` has the first three). The sampler and
+position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``.
+``MSTAR_DECODE_BUCKETS`` sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS``
+caps a mixed step's prompt rows, and ``CAPTURE_COMPILE_MODE`` names the captures'
+``compile_mode``.
+
+The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
+(``mstar/model/components/block_loop_encoder.py``): one prompt per step, every image
+packed into one call, and the tower's block loop replayed as a piecewise region per
+patch bucket (``BLOCK_LOOP_PATCH_BUCKETS``). Its ``prepare_inputs`` returns the
+tower's tensors in ``tensor_inputs`` and, in ``resource_step_info``, each of
+``SEGMENT_LABELS``' attending spans (frames, windows) over the same patches. The tower
+provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`` and
+``project(encoded, **tensors)``. A prompt whose spans under some label exceed the
+ragged resource's ``max_segments_per_request`` takes no lease and runs eagerly.
+A tower builds on the pieces in ``mstar/model/components/vit.py``:
+``bilinear_table_taps`` (the learned position table resampled onto a patch grid),
+``AxialVisionRope`` and ``RaggedVisionAttention`` (attention over the packed patches
+through the ragged resource, rope in fp32), which a tower subclasses with its q/k/v
+projections.
 
 Advanced: async partitions and streaming
 ----------------------------------------

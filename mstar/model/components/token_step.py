@@ -60,9 +60,12 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        ignore_eos = request_info.resource_configs[self.SAMPLER].ignore_eos
         decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
-        return (not ignore_eos and token in self.stop_token_ids) or decoded >= request_info.max_tokens
+        # the set test first: a stop id is rare, and the config read behind it
+        # goes through the wrapper
+        return (
+            token in self.stop_token_ids and not request_info.resource_configs[self.SAMPLER].ignore_eos
+        ) or decoded >= request_info.max_tokens
 
     def check_stop(
         self,

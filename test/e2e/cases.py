@@ -256,6 +256,8 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ModelSpec("qwen3_5_2b", "configs/qwen3_5_2b.yaml", lm_cases(), "llm", peak_vram_gb=16.4),
     ModelSpec("qwen3_5_4b", "configs/qwen3_5_4b.yaml", lm_cases(), "llm", peak_vram_gb=30.1),
     ModelSpec("qwen3_5_9b", "configs/qwen3_5_9b.yaml", lm_cases(), "llm", peak_vram_gb=39.6),
+    # ~60 GB of bf16 weights: one 141 GB GPU; peak VRAM not yet measured on an H200
+    ModelSpec("muse_glimmer", "configs/muse_glimmer.yaml", lm_cases(), "llm"),
     ModelSpec("bagel", "configs/bagel_single_gpu.yaml", (
         Case("text_to_text", "chat", chat(lambda: TWO_PLUS_TWO), ANSWER_4),
         Case("image_to_text", "chat", chat(vision_prompt), ANSWER_RED),

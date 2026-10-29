@@ -26,12 +26,12 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.norm import rms_norm_no_weight
 from mstar.model.ltx2_5.components.layers import (
     Attend,
     GatedAttention,
     GeluFeedForward,
     RotaryTable,
-    rms_norm_no_weight,
     split_rope_table,
 )
 from mstar.model.ltx2_5.config import LTX2TransformerConfig
