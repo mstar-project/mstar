@@ -1,7 +1,8 @@
 model: "glm52"
-# glm52_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-78 draft module (greedy
-# requests only). A verify step takes its rejected rows back from the KV cache (the latents
-# and, on the same pages, the index keys) before the next step plans, and every verify row and
+# glm52_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-78 draft module (a repetition
+# penalty or min_tokens is refused per request). The engine takes a verify step's rejected rows
+# back from the KV cache (the latents and, on the same pages, the index keys) before the next
+# step plans, and every verify row and
 # the draft module's own indexer select their top-2048 tokens like the trunk's. MTP's prefill
 # over DSA runs eager.
 #

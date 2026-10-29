@@ -10,7 +10,7 @@ from mstar.engine.resources.attn.ragged.base import (
 )
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
-from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, KDAPlan, SpecBlocks
+from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, KDAPlan, VerifyBlocks
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
 
@@ -134,14 +134,15 @@ class LinearAttnCallable:
 class _KDALayerBlocks(NamedTuple):
     conv: torch.Tensor
     state: torch.Tensor
-    spec: SpecBlocks | None  # the speculative blocks, on a pool that keeps them
+    verify: VerifyBlocks | None  # the verify blocks, on a pool that keeps them
 
 
 class KDACallable:
     """:class:`LinearAttnCallable` for Kimi delta attention: the layer hands over
     its projections and ``KDAParams``, and this resolves the layer's conv and state
-    blocks and, for a verify step, its speculative blocks, so neither the layer
-    nor the manager holds the pool. ``set_prefix_len`` settles a verify step.
+    blocks and, for a verify step, its verify blocks, so neither the layer nor
+    the manager holds the pool. The pool settles a verify step
+    (``RecurrentStatePool.settle_verify``, run by the draft-verify resource).
 
     Same cursor protocol (``bind_step`` once per stack, ``set_layer_idx`` per KDA
     layer, counting KDA layers only); a ``layer_idx`` argument supersedes the
@@ -195,26 +196,11 @@ class KDACallable:
         if blocks is None:
             blocks = self._blocks[layer] = _KDALayerBlocks(
                 self.pool.block("conv", layer), self.pool.block("state", layer),
-                SpecBlocks.of(self.pool, layer) if self.attn.speculative_tokens else None,
+                VerifyBlocks.of(self.pool, layer) if self.attn.max_drafts else None,
             )
         return self.attn.run(
-            qkv, g, beta, blocks.conv, blocks.state, params, gate=gate, spec=blocks.spec,
+            qkv, g, beta, blocks.conv, blocks.state, params, gate=gate, verify_blocks=blocks.verify,
         )
-
-    @torch.compiler.disable
-    def set_prefix_len(self, accepted: torch.Tensor) -> None:
-        """After a verify step, ``accepted [rows]`` each row's accepted drafts: its
-        first ``accepted + 1`` tokens (the drafts and the token after them) are the
-        prefix the next step replays, from the side this step wrote. Device ops at
-        the plan's slot ids, so a captured step records them; padding rows write
-        the sink. Every layer shares the count and the side."""
-        plan = self.current_plan()
-        rows = plan.num_rows
-        slots = plan.slot_ids[:rows].long()
-        count = (accepted[:rows] + 1).to(torch.int32).unsqueeze(1)
-        prefix_len, side = self.pool.block("spec_len"), self.pool.block("spec_side")
-        prefix_len.index_copy_(0, slots, count)
-        side.index_copy_(0, slots, 1 - side.index_select(0, slots))
 
 
 class RaggedAttentionCallable:

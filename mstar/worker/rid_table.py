@@ -11,7 +11,8 @@ harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 MicroScheduler.{failed_rids, admit_errors, held_until, backlog} (purged by
 clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
-streaming_buffers}, the engine's and tensor manager's per-request state, and
+streaming_buffers}, the engine's and tensor manager's per-request state (among
+the resources, DraftVerifyResource's pending verdicts and emitted counts), and
 WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a

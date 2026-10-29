@@ -79,11 +79,6 @@ class Glm5NextMLAAttention(MLAAttention):
         super().__init__(config, comm_group, layer_idx, kv_key=KV_CACHE, attn_key=ATTN,
                          pos_key=None, kv_label=LABEL, cache_layer=kv_plane)
         self.kv_plane = kv_plane
-        if config.mtp_num_draft_tokens > 0:
-            # With MTP the rows a query must not see (rejected drafts left as holes, or a sparse
-            # plan's padding) carry a very negative rope slot: a query rope part of ones adds 0
-            # to a real key (its slot is 0).
-            self.kpe_query_fill = 1.0
         # Every full-attention layer (the MTP layer included) ships its own
         # full indexer; config.indexer_types is the source of truth.
         self.indexer = Glm5NextIndexer(config)

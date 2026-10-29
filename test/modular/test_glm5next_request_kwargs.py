@@ -27,10 +27,11 @@ def test_a_null_kwarg_is_unset(kwargs):
     assert out.new_input_tensors["text_inputs"][0].tolist() == [72, 105]
 
 
-def test_a_null_temperature_under_mtp_is_greedy():
+def test_a_null_temperature_under_mtp_is_the_default():
+    # MTP samples at a temperature (rejection sampling), so it takes the model's default
     m = _model(mtp_num_draft_tokens=3)
     assert m.process_prompt("Hi", ["text"], ["text"], temperature=None).new_input_tensors["text_inputs"][0].numel() == 2
-    assert m.get_request_resource_configs({}, {"temperature": None})[SAMPLER].temperature == 0
+    assert m.get_request_resource_configs({}, {"temperature": None})[SAMPLER].temperature == m.config.temperature
 
 
 @pytest.mark.parametrize("kwargs", [

@@ -95,17 +95,28 @@ def test_a_request_without_max_tokens_runs_to_the_window():
     assert _intake(m, {}) == 8192
 
 
-@pytest.mark.parametrize("kwargs", [{"temperature": 0.7}, {"repetition_penalty": 1.1}])
-def test_mtp_refuses_sampling_it_cannot_serve_in_process_prompt(kwargs):
-    with pytest.raises(ValueError, match="greedy only"):
-        _model(mtp_num_draft_tokens=2).process_prompt("Hi", ["text"], ["text"], **kwargs)
-    # without MTP it samples
-    out = _model().process_prompt("Hi", ["text"], ["text"], **kwargs)
-    assert out.new_input_tensors["text_inputs"][0].numel() == 2
+@pytest.mark.parametrize("kwargs", [{"repetition_penalty": 1.1}, {"temperature": 0.7, "repetition_penalty": 1.1}])
+def test_mtp_refuses_a_penalty_as_a_400(kwargs):
+    """The MTP sampler verifies drafts, which can't apply a repetition penalty: the
+    conductor's validation refuses it; without MTP it samples."""
+    for k, refused in ((2, True), (0, False)):
+        m = _model(mtp_num_draft_tokens=k)
+        spec = next(s for s in m.get_node_resources() if s.resource_key == SAMPLER_RESOURCE)
+        config = m.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
+        if refused:
+            with pytest.raises(ValueError, match="can't apply"):
+                config.validate(spec)
+        else:
+            config.validate(spec)
 
 
-@pytest.mark.parametrize("kwargs", [{}, {"temperature": 0}, {"temperature": None}])
-def test_mtp_serves_greedy(kwargs):
+@pytest.mark.parametrize("kwargs", [{}, {"temperature": 0}, {"temperature": None}, {"temperature": 0.7}])
+def test_mtp_serves_greedy_and_sampled_requests(kwargs):
+    """A request takes the temperature it asks for, or the config's, with MTP as without."""
     m = _model(mtp_num_draft_tokens=2)
+    spec = next(s for s in m.get_node_resources() if s.resource_key == SAMPLER_RESOURCE)
     assert m.process_prompt("Hi", ["text"], ["text"], **kwargs).new_input_tensors["text_inputs"][0].numel() == 2
-    assert m.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE].temperature == 0
+    config = m.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
+    asked = kwargs.get("temperature")
+    assert config.temperature == (m.config.temperature if asked is None else asked)
+    config.validate(spec)

@@ -1,6 +1,7 @@
 """GLM-5.3-Flash lays out its one paged label, so the preprocess worker and the conductor hold
 each request to the cache rows its prompt leaves (``docs/adding_models.rst``, Paged KV layouts).
-Under MTP every verify step keeps its whole block, so a decode step counts k + 1 rows."""
+Under MTP a decode step keeps a row per token it emits, and the verify rows it writes ahead of
+the engine's trim are the layout's lookahead (2k + 1)."""
 
 from __future__ import annotations
 
@@ -74,13 +75,14 @@ def test_every_paged_label_is_declared_at_load(k):
 
 
 @_K
-def test_a_decode_step_grows_the_label_by_its_block(k):
+def test_a_decode_step_grows_the_label_by_a_row_per_token(k):
     model = _model(mtp_num_draft_tokens=k)
 
     layout = model.process_prompt("hello", ["text"], ["text"]).metadata["kv_layout"][KV_CACHE]["main"]
 
     assert [(span.walk, span.length) for span in layout.spans] == [("prefill", PROMPT)]
-    assert layout.growth == (("decode_loop", k + 1),)
+    assert layout.growth == (("decode_loop", 1),)
+    assert layout.lookahead == (2 * k + 1 if k else 0) == model.mtp_kv_lookahead
 
 
 def test_a_request_decodes_one_step_fewer_than_its_max_tokens(tmp_path, monkeypatch):
@@ -96,12 +98,12 @@ def test_a_request_decodes_one_step_fewer_than_its_max_tokens(tmp_path, monkeypa
 @_K
 def test_a_request_that_asks_no_length_fills_the_cache_rows(tmp_path, monkeypatch, k):
     model = _model(mtp_num_draft_tokens=k)
-    rows, block = model.config.kv_rows, k + 1
+    rows, ahead = model.config.kv_rows, model.mtp_kv_lookahead
 
     new_request = _dispatched(_conduct(model, _preprocess(model, {}), tmp_path, monkeypatch))
 
     cap = new_request.loop_caps["decode_loop"]
-    assert PROMPT + block * cap <= rows < PROMPT + block * (cap + 1)
+    assert PROMPT + cap + ahead <= rows < PROMPT + cap + 1 + ahead
     assert cap <= model.max_decode_steps()
     assert new_request.request_info.max_tokens == cap + 1
 
@@ -110,8 +112,9 @@ def test_a_request_that_asks_no_length_fills_the_cache_rows(tmp_path, monkeypatc
 @pytest.mark.parametrize("past", [0, 1])
 def test_max_tokens_past_the_rows_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past, k):
     model = _model(mtp_num_draft_tokens=k)
-    # the prompt's rows and a block per decode step fill the cache; the last token is never stored
-    fits = (model.config.kv_rows - PROMPT) // (k + 1) + 1
+    # the prompt's rows, a row per decode step and the verify rows written ahead fill the
+    # cache; the last token is never stored
+    fits = model.config.kv_rows - PROMPT - model.mtp_kv_lookahead + 1
 
     sent = _conduct(model, _preprocess(model, {"max_output_tokens": fits + past}), tmp_path, monkeypatch)
 

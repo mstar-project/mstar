@@ -47,6 +47,14 @@ class LinearAttnManager(AttentionResource):
 
         # also checks the pool's shapes: `from_blocks` raises on another family's
         geometry = DeltaNetGeometry.from_blocks(pool_config.blocks)
+        max_drafts = DeltaNetGeometry.max_drafts_of(pool_config.blocks)
+        if max_drafts:
+            if variant is not LinearAttnVariant.KDA:
+                # GDN settles a verify step in its own resource and keeps nothing in the pool
+                raise ValueError(
+                    f"the pool keeps verify blocks, which only KDA replays; {variant.value} runs "
+                    "verify steps without them: build its blocks with to_blocks() alone"
+                )
         if variant is LinearAttnVariant.KDA:
             if backend is LinearAttnBackend.FLASHINFER:
                 # the config's default, which is GDN's; KDA has no FlashInfer path
@@ -66,7 +74,7 @@ class LinearAttnManager(AttentionResource):
                 num_layers=pool_config.num_layers,
                 state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
                 device=info.device,
-                speculative_tokens=DeltaNetGeometry.speculative_tokens_of(pool_config.blocks),
+                max_drafts=max_drafts,
             )
 
         if backend is not LinearAttnBackend.FLASHINFER:

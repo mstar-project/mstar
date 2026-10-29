@@ -111,17 +111,18 @@ def test_gather_and_scatter_take_no_layer_for_a_per_slot_block():
     pool.commit(step, ctx)
 
 
-def test_speculative_delta_net_blocks_shard_with_the_heads():
+def test_verify_delta_net_blocks_shard_with_the_heads():
     geometry = DeltaNetGeometry(
         num_k_heads=4, num_v_heads=4, head_k_dim=8, head_v_dim=8, conv_kernel_size=4,
     )
     assert set(geometry.to_blocks()) == {"state", "conv"}
-    config = RecurrentStateConfig(num_layers=2, blocks=geometry.to_blocks(speculative_tokens=3))
+    config = RecurrentStateConfig(num_layers=2, blocks=geometry.to_blocks(max_drafts=3))
     config.shard(2)
     shapes = {name: block.shape for name, block in config.blocks.items()}
-    assert shapes["spec_prefix"] == (2, 4, 48) and shapes["spec_conv"] == (2, 48, 3)
-    assert shapes["spec_g"] == (2, 4, 2, 8) and shapes["spec_beta"] == (2, 4, 2)
-    assert shapes["spec_len"] == shapes["spec_side"] == (1,)
-    assert not config.blocks["spec_len"].per_layer
-    assert DeltaNetGeometry.speculative_tokens_of(config.blocks) == 3
+    assert shapes["dv_prefix"] == (2, 4, 48) and shapes["dv_conv"] == (2, 48, 3)
+    assert shapes["dv_g"] == (2, 4, 2, 8) and shapes["dv_beta"] == (2, 4, 2)
+    assert shapes["dv_len"] == shapes["dv_side"] == (1,)
+    assert "dv_qkv" not in shapes
+    assert not config.blocks["dv_len"].per_layer
+    assert DeltaNetGeometry.max_drafts_of(config.blocks) == 3
     assert DeltaNetGeometry.from_blocks(config.blocks).num_v_heads == 2

@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from mstar.engine.resources.linear_attn.kda import KDAPlan, SpecBlocks
+from mstar.engine.resources.linear_attn.kda import KDAPlan, VerifyBlocks
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig
@@ -35,18 +35,18 @@ def _layer(cfg, device, dtype, seed=0):
 
 
 def _pool(layer, slots, k, device, conv_dtype):
-    """One layer's pool with speculative blocks, its state and conv tails random."""
+    """One layer's pool with verify blocks, its state and conv tails random."""
     geometry = DeltaNetGeometry(
         num_k_heads=layer.num_heads, num_v_heads=layer.num_heads, head_k_dim=layer.head_dim,
         head_v_dim=layer.head_dim, conv_kernel_size=4,
     )
     pool = RecurrentStatePool(torch.device(device), RecurrentStateConfig(
         num_layers=1, max_slots=slots,
-        blocks=geometry.to_blocks(conv_dtype=conv_dtype, speculative_tokens=k),
+        blocks=geometry.to_blocks(conv_dtype=conv_dtype, max_drafts=k),
     ))
     pool.block("state", 0).copy_(torch.randn(pool.block("state", 0).shape) * 0.1)
     pool.block("conv", 0).copy_(torch.randn(pool.block("conv", 0).shape) * 0.5)
-    pool.block("spec_side").random_(0, 2)  # the side a slot starts on does not matter
+    pool.block("dv_side").random_(0, 2)  # the side a slot starts on does not matter
     return pool
 
 
@@ -69,14 +69,14 @@ def _verify(bundle, layer, x, pool, plan):
     p, h, d = layer.qkv_dim, layer.num_heads, layer.head_dim
     return bundle.run_verify(
         proj[:, :3 * p], proj[:, 3 * p + h:3 * p + h + d], proj[:, 3 * p:3 * p + h], plan,
-        pool.block("conv", 0), pool.block("state", 0), SpecBlocks.of(pool, 0), layer.params(),
+        pool.block("conv", 0), pool.block("state", 0), VerifyBlocks.of(pool, 0), layer.params(),
         gate=proj[:, 3 * p + h + d:3 * p + h + 2 * d],
     )
 
 
 def _after_verdict(pool, slots, accepted):
-    """``KDACallable.set_prefix_len``: the accepted tokens and the token after them."""
-    spec = SpecBlocks.of(pool, 0)
+    """``RecurrentStatePool.settle_verify``: the accepted tokens and the token after them."""
+    spec = VerifyBlocks.of(pool, 0)
     spec.prefix_len[slots, 0] = (accepted + 1).to(torch.int32)
     spec.side[slots, 0] = 1 - spec.side[slots, 0]
 
@@ -88,7 +88,7 @@ def test_reference_matches_sequential_decode_over_accepted_tokens(block):
     so far; the pool's state and the cached conv window lag one step behind it."""
     layer = _layer(KDAConfig(hidden_size=64, num_heads=4, head_dim=32), "cpu", torch.float64)
     pool = _pool(layer, 6, 3, "cpu", torch.float64)
-    spec = SpecBlocks.of(pool, 0)
+    spec = VerifyBlocks.of(pool, 0)
     slots = torch.tensor([4, 1, 2])
     true_rec = [pool.block("state", 0)[s].transpose(-1, -2).clone()[None] for s in slots.tolist()]
     true_conv = [pool.block("conv", 0)[s].clone()[None] for s in slots.tolist()]
@@ -118,7 +118,7 @@ def test_reference_matches_sequential_decode_over_accepted_tokens(block):
 def test_padding_rows_on_the_sink_clamp_a_garbage_count():
     layer = _layer(KDAConfig(hidden_size=64, num_heads=4, head_dim=32), "cpu", torch.float64, seed=2)
     pool = _pool(layer, 4, 1, "cpu", torch.float64)
-    SpecBlocks.of(pool, 0).prefix_len[SINK_SLOT] = 1_000_000
+    VerifyBlocks.of(pool, 0).prefix_len[SINK_SLOT] = 1_000_000
     x = torch.randn(2 * 2, layer.hidden_size, dtype=torch.float64)
     out = _verify(TorchKDAKernels(), layer, x, pool, _plan(torch.tensor([3, SINK_SLOT]), 2))
     assert torch.isfinite(out).all()
@@ -145,8 +145,8 @@ def test_kernel_matches_reference(block, batch):
         torch.testing.assert_close(out, out_ref, rtol=2e-2, atol=2e-2, msg=f"step {step}")
         # the kernel sums the state in 32-column tiles, torch whole: fp32 order alone moves
         # single elements by ~1e-3; the cached inputs and windows are exact
-        for name, tol in (("state", 5e-3), ("conv", 0), ("spec_prefix", 0), ("spec_g", 0),
-                          ("spec_beta", 0), ("spec_conv", 0)):
+        for name, tol in (("state", 5e-3), ("conv", 0), ("dv_prefix", 0), ("dv_g", 0),
+                          ("dv_beta", 0), ("dv_conv", 0)):
             torch.testing.assert_close(ker._blocks[name], ref._blocks[name], rtol=tol, atol=tol,
                                        msg=f"{name} step {step}")
         accepted = torch.randint(0, block, (batch,), device="cuda", generator=gen)

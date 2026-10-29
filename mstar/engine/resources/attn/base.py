@@ -17,7 +17,7 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
 )
-from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
+from mstar.engine.resources.base import AttentionResource, EngineResourceInfo, RewindKind
 from mstar.engine.resources.kv.config import KVConfig, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 
@@ -44,6 +44,8 @@ def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBack
 
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
+    # planned from the KV resource each step
+    rewind_kind = RewindKind.NONE
 
     # Remains abstract except for build; will build based
     # on the attention backend
