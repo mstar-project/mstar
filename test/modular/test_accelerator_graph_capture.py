@@ -604,3 +604,45 @@ def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [1.0] * 4
+
+
+@pytest.mark.parametrize("dynamic, graphs", [(False, 6), (True, 2)])
+def test_compile_dynamic_compiles_one_graph_for_every_bucket(monkeypatch, dynamic, graphs):
+    """A ``compile_dynamic`` config's buckets share one compiled graph (size 1
+    gets its own), compiled under the platform's overrides for any count;
+    otherwise every bucket compiles, under its own count's overrides."""
+    from torch._dynamo.testing import CompileCounter
+
+    from mstar.engine import accelerator_graph_runner as agr
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+    from mstar.model.submodule_base import NodeInputs
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    real_compile = torch.compile
+    # the counting backend takes neither a mode nor inductor options
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: real_compile(
+        fn, backend=counter, fullgraph=kw["fullgraph"], dynamic=kw["dynamic"]))
+    overrides = []
+    monkeypatch.setattr(agr, "with_inductor_overrides",
+                        lambda fn, num_tokens=None, rows=None: overrides.append((num_tokens, rows)) or fn)
+
+    def encode(graph_walk, engine_inputs, feats):
+        return torch.nn.functional.gelu(feats @ feats.transpose(1, 2)).sum(-1)
+
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._submodule = SimpleNamespace(forward_batched=encode)
+    runner._compiled_forwards = {}
+    config = BatchedAcceleratorGraphConfig(
+        "encode", single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1), compile_dynamic=dynamic,
+    )
+    sizes = [32, 16, 8, 4, 2, 1]
+    for bs in sizes:  # largest first, as the runner captures
+        static = {"feats": torch.randn(bs, 15, 8)}
+        if dynamic:
+            agr.mark_bucket_dims_dynamic(static, {(0, "feats"): 0}, config_idx=0, num_tokens=bs)
+        spec = SimpleNamespace(config=config, config_idx=0, num_tokens=bs, bs=bs)
+        runner._forward_for(spec)(graph_walk="encode", engine_inputs=None, **static)
+    torch._dynamo.reset()
+    assert counter.frame_count == graphs
+    assert overrides == ([(None, None)] * len(sizes) if dynamic else [(bs, bs) for bs in sizes])
