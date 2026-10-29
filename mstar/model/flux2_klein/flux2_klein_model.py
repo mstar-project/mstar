@@ -44,6 +44,7 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.components.diffusion.attention import uses_ragged_attention
 from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 from mstar.model.components.diffusion.image_io import encode_image
 from mstar.model.components.diffusion.lora import LoraSpec
@@ -78,8 +79,6 @@ ENCODE_IMAGE_WALK = "encode_image"
 IMAGE_GEN_WALK = "image_gen"
 IMAGE_EDIT_WALK = "image_edit"
 
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
-
 
 class Flux2KleinModel(Model):
     """FLUX.2 [klein] (4B by default; the 9B checkpoint loads through the same class)."""
@@ -89,7 +88,7 @@ class Flux2KleinModel(Model):
         model_path_hf: str = FLUX2_KLEIN_4B,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
+        attention_backend: str = "auto",
         compile: bool = True,
         compile_eager_rounding: bool = True,
         compile_exact_ops: bool | list[str] = False,
@@ -104,8 +103,8 @@ class Flux2KleinModel(Model):
         lora: list | None = None,
         **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        # the DiT's attention: the engine's ragged resource (the platform's kernel), or torch's SDPA inline
+        self.use_ragged_attention = uses_ragged_attention(attention_backend)
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Dummy mode: get_submodule returns None for every node, so the engine runs
@@ -169,8 +168,8 @@ class Flux2KleinModel(Model):
     # ------------------------------------------------------------ structure
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The dit's joint attention through the engine's ragged (cacheless) resource,
-        when the FlashInfer backend is selected; nothing else here keeps state."""
-        if self.attention_backend != "flashinfer":
+        unless the deployment keeps SDPA; nothing else here keeps state."""
+        if not self.use_ragged_attention:
             return []
         tcfg = self.config.transformer
         return [
@@ -490,7 +489,7 @@ class Flux2KleinModel(Model):
                 apply_transformer_loras(transformer, self.loras)
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
-                attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
+                attn_resource_key=DIT_ATTN if self.use_ragged_attention else None,
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,
