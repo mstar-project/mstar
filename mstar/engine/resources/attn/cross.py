@@ -4,12 +4,12 @@ from typing import Any, NamedTuple
 
 import torch
 
+from mstar.engine.resources.attn.backends import flashinfer_kwargs
 from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
     WorkspacePool,
-    flashinfer_kwargs,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
