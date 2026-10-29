@@ -1413,8 +1413,7 @@ class MicroScheduler:
 
     def room_for_continuing(
         self, target: tuple[str, str],
-        request_state: RequestStateManager | None = None,
-        continuing: Sequence[int] = (),
+        request_state: RequestStateManager, continuing: Sequence[int],
     ) -> int | None:
         """How many of a speculation chain's ``continuing`` rids fit in
         ``target``'s step: what its backlog leaves (see
@@ -1429,7 +1428,7 @@ class MicroScheduler:
         never take it.
         """
         room = self._room_beside_backlog(target)
-        if not room or request_state is None or len(continuing) < room:
+        if not room or len(continuing) < room:
             return room  # uncapped, already given to the backlog, or short of the cap
         if len(request_state.per_request_info) <= len(continuing):
             return room  # the chain holds every request here; nothing can be waiting

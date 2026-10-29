@@ -659,21 +659,21 @@ def test_room_for_continuing_reserves_the_backlog_first():
     sched = _scheduler(_Engine(max_bs=16))
     sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(16)])
 
-    assert sched.room_for_continuing((NODE, WALK)) == 0
+    assert sched.room_for_continuing((NODE, WALK), _Manager([]), ()) == 0
 
 
 def test_room_for_continuing_splits_a_partial_backlog():
     sched = _scheduler(_Engine(max_bs=16))
     sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(6)])
 
-    assert sched.room_for_continuing((NODE, WALK)) == 10
+    assert sched.room_for_continuing((NODE, WALK), _Manager([]), ()) == 10
 
 
 def test_room_for_continuing_is_unbounded_without_a_cap():
     sched = _scheduler(_Engine(max_bs=None))
     sched.backlog[(NODE, WALK)] = _batch(["b0"])
 
-    assert sched.room_for_continuing((NODE, WALK)) is None
+    assert sched.room_for_continuing((NODE, WALK), _Manager([]), ()) is None
 
 
 def _room(sched, manager, continuing):
@@ -859,7 +859,7 @@ def test_the_reserved_room_is_exactly_what_the_backlog_then_fills():
     backlogged = [f"b{i}" for i in range(16)]
     sched.backlog[(NODE, WALK)] = _batch(backlogged)
 
-    keep = sched.room_for_continuing((NODE, WALK))
+    keep = sched.room_for_continuing((NODE, WALK), _Manager([]), ())
     batch = _next_batch(sched,
         _Manager([]), target=(NODE, WALK), pre_existing_batch_size=keep,
     )
@@ -1710,7 +1710,7 @@ def test_a_full_merge_leaves_every_row_queued():
     assert merged is None
     assert not sched.backlog
     assert set(manager.queues["wg0"].get_ready_node_names()) == {"p0", "d9"}
-    assert sched.room_for_continuing((NODE, WALK)) == 8
+    assert sched.room_for_continuing((NODE, WALK), manager, ()) == 8
 
 
 def test_a_relabelled_step_routes_with_its_own_walks_outputs():
@@ -1773,7 +1773,7 @@ def test_a_full_mixing_merge_parks_another_walks_rows():
     assert merged is None
     assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
     assert set(manager.queues["wg0"].get_ready_node_names()) == {"d9"}
-    assert sched.room_for_continuing((NODE, WALK)) == 7
+    assert sched.room_for_continuing((NODE, WALK), manager, ()) == 7
 
 
 def test_a_mixing_yield_away_skips_the_whole_combined_walk():
