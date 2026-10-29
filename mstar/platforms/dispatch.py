@@ -49,6 +49,10 @@ class PlatformDispatch:
             impl = self._resolve()
         return impl(*args, **kwargs)
 
+    def resolve(self) -> Callable[..., Any]:
+        """The implementation, picked (running its factory) if no call has yet."""
+        return self._impl or self._resolve()
+
     def _resolve(self) -> Callable[..., Any]:
         with self._lock:
             if self._impl is None:
