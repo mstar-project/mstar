@@ -47,6 +47,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
@@ -110,6 +111,23 @@ class HiggsAudioModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
+
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """Per-request adapters on the LLM: every linear of the Qwen3 stack and the text
+        head (one row per request: the last token's), placed as the weight loader places
+        the checkpoint's own tensors. The embedding takes none: ``prefill_text`` embeds in
+        ``prepare_inputs``, outside the step. Adapters saved on a ``Qwen3ForCausalLM``
+        layout (``model.layers.*``) are read as the flat checkpoint's."""
+        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
+
+        root = meta_root(lambda group: HiggsAudioLLM(self.config, comm_group=group))
+        return [module_lora_spec(
+            root, resource_key=LORA_RESOURCE_KEY, nodes={"LLM"}, root_path="model",
+            adapter_roots=[("model.", "")],
+            rows={"lm_head": PER_SEGMENT},
+        )]
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """LLM paged KV + attention/positions/sampler. audio_encoder is
@@ -520,27 +538,11 @@ class HiggsAudioModel(Model):
             audio_tower=audio_tower, projector=projector, config=self.config,
         )
 
-    @staticmethod
-    def _llm_remap(name: str) -> str | None:
-        # Generation-only components (audio codec embeddings, audio LM
-        # head) and the encoder/projector are not part of the LLM.
-        if name.startswith((
-            "audio_tower.", "audio_encoder_proj.",
-            "audio_codebook_embeddings.",
-        )):
-            return None
-        if name == "audio_decoder_proj.text_lm_head.weight":
-            return "lm_head.weight"
-        if name.startswith("audio_decoder_proj."):
-            return None
-        return name
-
     def _create_llm_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule:
         from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
-        from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
 
         with torch.device("meta"):
@@ -552,11 +554,7 @@ class HiggsAudioModel(Model):
         llm.to_empty(device=device)
 
         weights = iter_safetensors_shards(self.local_dir, device=device)
-        load_hf_weights(
-            llm, weights,
-            stacked_params=LLAMA_STACKED_PARAMS,
-            name_remapper=self._llm_remap,
-        )
+        llm.checkpoint_rules().load(llm, weights)
         llm.eval()
 
         from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule

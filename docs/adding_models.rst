@@ -966,7 +966,7 @@ model declares which linears adapters may touch; it never indexes the pool itsel
 
 A model declares LoRA from its own modules: the shared linears add the delta
 themselves once bound, and ``module_lora_spec`` builds the spec by walking each node's
-weights root. For an autoregressive LLM node such as Orpheus's:
+weights root. Orpheus is the reference (``OrpheusModel.get_lora_specs``):
 
 .. code-block:: python
 

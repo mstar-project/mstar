@@ -57,6 +57,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
@@ -300,6 +301,27 @@ class ChatterboxModel(Model):
         tokens = t3.cond_len + self.config.max_text_tokens + bos + limit
         streams = 1 if self.config.is_turbo else 2
         return streams * -(-tokens // page_size)
+
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """Per-request adapters on T3: every linear of its Llama backbone and the speech
+        head (one row per segment: each stream's last token). Under classifier-free
+        guidance a request's cond and uncond rows both run its adapter, as one model
+        would. The conditioning encoder takes none: it runs in ``prepare_inputs``.
+
+        Turbo serves none: its GPT-2 checkpoint fuses q, k and v into one ``c_attn``
+        tensor in Conv1D layout, which an adapter cannot be placed on per slice."""
+        if self.config.t3.backbone.is_gpt2:
+            return []
+        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+        from mstar.model.chatterbox.components.t3 import T3Model
+        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+
+        root = meta_root(lambda group: T3Model(self.config.t3, comm_group=group))
+        return [module_lora_spec(
+            root, resource_key=LORA_RESOURCE_KEY, nodes={T3_NODE}, root_path="model",
+            rows={"speech_head": PER_SEGMENT},
+            exclude={"cond_enc": "the conditioning encoder runs in prepare_inputs, outside the planned step"},
+        )]
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         t3 = self.config.t3
