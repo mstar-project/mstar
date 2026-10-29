@@ -86,6 +86,12 @@ def _file_state(path: str) -> tuple[int, int, int]:
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
+def _prefix_cache(model_kwargs: dict) -> bool:
+    """A client's prefix_cache: unset or None is on, otherwise its truth."""
+    value = model_kwargs.get("prefix_cache")
+    return value is None or bool(value)
+
+
 class _FileChangedError(Exception):
     """A file was rewritten between its load and its hash."""
 
@@ -715,8 +721,7 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            # read as KVReqConfig.prefix_cache is: unset or None is on, otherwise its truth
-            if model_kwargs.get("prefix_cache") is None or model_kwargs["prefix_cache"]:
+            if _prefix_cache(model_kwargs):
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
                 ))
@@ -741,6 +746,8 @@ class PreprocessWorkerThread:
             self._ended_streams[input.request_id] = set(input.ends)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
+        # always set, as KVReqConfig.prefix_cache reads only its truth
+        conductor_kwargs["prefix_cache"] = _prefix_cache(model_kwargs)
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(

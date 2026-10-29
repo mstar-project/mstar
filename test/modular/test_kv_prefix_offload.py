@@ -105,7 +105,7 @@ def _keys(tokens: list[int]) -> list[bytes]:
 def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
     whole = len(tokens) // PAGE_SIZE
     kv.ingest_request(rid, KVReqConfig(
-        prefix_keys={"main": _keys(tokens)},
+        prefix_cache=True, prefix_keys={"main": _keys(tokens)},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
         kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
     ))

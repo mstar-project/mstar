@@ -82,7 +82,7 @@ def _manager(max_num_pages: int = 64, cpu_offload_pages: int = 0) -> KVManager:
 def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
     whole = len(tokens) // PAGE_SIZE
     kv.ingest_request(rid, KVReqConfig(
-        prefix_keys={"main": chain([
+        prefix_cache=True, prefix_keys={"main": chain([
             tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)
         ])},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},

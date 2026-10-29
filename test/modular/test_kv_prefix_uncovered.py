@@ -89,7 +89,7 @@ def _ingest(kv: KVManager, rid: str, prompt: list[int] = PROMPT, decode: int = 0
     whole = len(prompt) // PAGE_SIZE
     spans = (PrefixSpan(len(prompt), len(prompt), WALK),) + ((PrefixSpan(image, 1, WALK),) if image else ())
     kv.ingest_request(rid, KVReqConfig(
-        prefix_keys={"main": chain([
+        prefix_cache=True, prefix_keys={"main": chain([
             prompt[at:at + PAGE_SIZE] for at in range(0, len(prompt), PAGE_SIZE)
         ])},
         prefix_tail={"main": prompt[whole * PAGE_SIZE:]},
@@ -319,7 +319,7 @@ def _first_write(walk: str) -> KVManager:
     kv.enable_prefix_cache(ROOT, WALKS)
     prompt = list(range(40))
     kv.ingest_request("r0", KVReqConfig(
-        prefix_keys={"main": chain([prompt[:16], prompt[16:32], prompt[32:]])},
+        prefix_cache=True, prefix_keys={"main": chain([prompt[:16], prompt[16:32], prompt[32:]])},
         prefix_tail={"main": prompt[32:]},
         kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(prompt), len(prompt), walk),), keyed_spans=1)},
     ))

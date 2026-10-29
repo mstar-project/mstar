@@ -114,7 +114,9 @@ def _seed(kv: KVManager, tokens: list[int]) -> list[bytes]:
     a later request can then match.
     """
     keys = _keys(tokens)
-    kv.ingest_request("seed", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(len(tokens))))
+    kv.ingest_request("seed", KVReqConfig(
+        prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(len(tokens)),
+    ))
     _grow(kv, "seed", len(tokens))
     pages = kv._streams["seed"]["main"].page_indices
     parent = None
@@ -130,7 +132,7 @@ def _seed(kv: KVManager, tokens: list[int]) -> list[bytes]:
 def test_a_second_request_with_the_same_prompt_matches_what_the_first_wrote():
     kv = _manager()
     keys = _seed(kv, list(range(100)))
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(100)))
 
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
 
@@ -143,7 +145,9 @@ def test_a_prompt_that_diverges_matches_only_what_they_share():
     _seed(kv, list(range(100)))
     diverged = list(range(48)) + [999] * 52
 
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys(diverged)}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(
+        prefix_cache=True, prefix_keys={"main": _keys(diverged)}, kv_layout=_layout(100),
+    ))
 
     assert kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens == 48, (
         "the match ran past the page where the two prompts stop agreeing"
@@ -154,7 +158,7 @@ def test_a_prompt_that_diverges_matches_only_what_they_share():
 def test_a_page_aligned_prompt_loses_its_last_page():
     kv = _manager()
     keys = _seed(kv, list(range(96)))
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(96)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(96)))
 
     assert kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=96)).tokens == 80, (
         "a full match would leave the request with no token to sample"
@@ -165,7 +169,9 @@ def test_a_page_aligned_prompt_loses_its_last_page():
 def test_a_request_that_matches_nothing_gets_no_lease():
     kv = _manager()
     _seed(kv, list(range(100)))
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys([7] * 100)}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(
+        prefix_cache=True, prefix_keys={"main": _keys([7] * 100)}, kv_layout=_layout(100),
+    ))
 
     assert kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)) is None, (
         "a prompt sharing no page with anything indexed was answered a length"
@@ -182,7 +188,7 @@ def test_a_request_that_matches_nothing_gets_no_lease():
 def test_a_refused_admit_answers_the_same_and_holds_one_lease():
     kv = _manager(max_num_pages=16)
     keys = _seed(kv, list(range(100)))
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(100)))
     first = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
     held = list(kv._streams["r1"]["main"].lease)
     owners = [kv._arena.num_owners[page] for page in held]
@@ -209,7 +215,7 @@ def test_a_refused_admit_answers_the_same_and_holds_one_lease():
 def test_remove_gives_back_a_lease_admit_never_took():
     kv = _manager()
     keys = _seed(kv, list(range(100)))
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(100)))
     kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100))
     leased = list(kv._streams["r1"]["main"].lease)
     owners = [kv._arena.num_owners[page] for page in leased]
@@ -225,7 +231,7 @@ def test_remove_gives_back_a_lease_admit_never_took():
 def test_a_reset_gives_back_a_lease_admit_never_took():
     kv = _manager()
     keys = _seed(kv, list(range(100)))
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(100)))
     kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100))
 
     kv.reset_request("r1")
@@ -242,7 +248,7 @@ def test_a_reset_gives_back_a_lease_admit_never_took():
 def test_admit_takes_the_lease_over_and_commit_clears_it():
     kv = _manager()
     keys = _seed(kv, list(range(100)))
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(100)))
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
     leased = list(kv._streams["r1"]["main"].lease)
 
@@ -267,7 +273,7 @@ def _converted_by_a_refused_admit(kv: KVManager) -> list[int]:
     """
     keys = _seed(kv, list(range(100)))
     kv.remove_request("seed")
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(100)))
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
     leased = list(kv._streams["r1"]["main"].lease)
     kv.ingest_request("hog", KVReqConfig())
@@ -334,7 +340,9 @@ def _refused_then_cached(kv: KVManager, prompt: list[int]) -> list[int]:
     and refuses r2's; before the batch comes round again, another request fills
     and indexes the prompt r1 is waiting on.
     """
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys(prompt)}, kv_layout=_layout(len(prompt))))
+    kv.ingest_request("r1", KVReqConfig(
+        prefix_cache=True, prefix_keys={"main": _keys(prompt)}, kv_layout=_layout(len(prompt)),
+    ))
     kv.ingest_request("r2", KVReqConfig())
     step = KVStep(segments=(
         Segment("r1", "main", len(prompt)), Segment("r2", "main", 2 * len(prompt)),
@@ -395,7 +403,7 @@ def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
     kv = _manager()
     keys = _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(
-        prefix_keys={"main": keys},
+        prefix_cache=True, prefix_keys={"main": keys},
         kv_layout={**_layout(100), "cfg_text": StreamLayout(spans=(PrefixSpan(100, 100, WALK),))},
     ))
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
@@ -436,7 +444,7 @@ def test_a_lease_is_cut_to_the_smallest_answer_and_the_rest_given_back():
     kv = _manager()
     keys = _seed(kv, list(range(100)))
     kv.remove_request("seed")
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(100)))
     runner = StepRunner(
         {"kv": kv, "other": _Holding(PAGE_SIZE)},
         node_resources={NODE: ["kv", "other"]},
@@ -487,7 +495,7 @@ def test_a_probe_hashes_the_prompt_with_the_lock_down(monkeypatch):
     kv = _manager()
     keys = _seed(kv, list(range(100)))
     kv.remove_request("seed")
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(100)))
     _assert_hashed_with_the_lock_down(kv, monkeypatch)
 
     assert kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)), "the probe matched nothing"
@@ -524,7 +532,7 @@ def test_a_probe_raced_by_a_remove_raises_nothing(monkeypatch):
     kv = _manager()
     keys = _seed(kv, list(range(64)))
     kv.remove_request("seed")
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(64)))
+    kv.ingest_request("r0", KVReqConfig(prefix_cache=True, prefix_keys={"main": keys}, kv_layout=_layout(64)))
     _removed_in_the_window(kv, monkeypatch, "r0")
 
     try:
@@ -545,7 +553,7 @@ def test_a_chain_extension_raced_by_a_remove_raises_nothing(monkeypatch):
     kv = _manager()
     tokens = list(range(40))
     kv.ingest_request("r0", KVReqConfig(
-        prefix_keys={"main": _keys(tokens)},
+        prefix_cache=True, prefix_keys={"main": _keys(tokens)},
         prefix_tail={"main": tokens[32:]},
         prefix_decode={"main": "text_inputs"},
         kv_layout=_layout(len(tokens)),

@@ -84,11 +84,11 @@ def _manager(prefix_cache: bool = True, walks=None) -> KVManager:
 
 def _ingest(kv: KVManager, rid: str, tokens: list[int], keyed: bool = True, decode: int = 0) -> None:
     if not keyed:
-        kv.ingest_request(rid, KVReqConfig())
+        kv.ingest_request(rid, KVReqConfig(prefix_cache=True))
         return
     whole = len(tokens) // PAGE_SIZE
     kv.ingest_request(rid, KVReqConfig(
-        prefix_keys={"main": chain([
+        prefix_cache=True, prefix_keys={"main": chain([
             tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)
         ])},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
@@ -274,4 +274,14 @@ def test_an_undeclared_node_never_warns(caplog):
 
     assert _warnings(caplog) == [], (
         "a node the model never declared was warned about keys it was never owed"
+    )
+
+
+def test_a_request_ingested_with_no_config_keeps_the_cache_on():
+    kv = _manager()
+
+    kv.ingest_request("pad", None)
+
+    assert kv._overrides["pad"].prefix_cache is True, (
+        "a request the data worker never saw, a capture padding row say, lost the cache it had"
     )

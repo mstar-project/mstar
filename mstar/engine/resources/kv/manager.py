@@ -1472,7 +1472,8 @@ class KVManager(AttentionResource):
             # the handle comes back while steps under its old name still wait
             self.flush_chain_backlog()
         if overrides is None:
-            overrides = KVReqConfig()
+            # a request the data worker never saw (a capture padding row, say) is cached as before
+            overrides = KVReqConfig(prefix_cache=True)
         # guards `_streams`/`_overrides` against a concurrent admit/plan/commit
         # or reset/remove on another thread (see `_lock`)
         with self._lock:

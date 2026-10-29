@@ -346,13 +346,29 @@ def test_a_request_can_turn_the_cache_off_for_itself():
 
 
 def test_a_request_that_says_nothing_is_still_cached():
+    worker = _worker(_Model(), _deployment())
+
+    for said in ({}, {"prefix_cache": None}):
+        kwargs = _run(worker, said)
+        assert kwargs["prefix_cache"] is True and "prefix_keys" in kwargs, (
+            f"a request that sent {said} was opted out of the cache"
+        )
+
+
+def test_a_config_handed_no_prefix_cache_is_not_cached():
     cfg = KVReqConfig()
 
     cfg.apply_conductor_config(seed=1, prefix_keys={"main": [b"k"]})
 
-    assert cfg.prefix_cache is True, (
-        "a request that never mentioned the cache was opted out of it"
+    assert cfg.prefix_cache is False, (
+        "the worker sets prefix_cache on every request it sends; a config without it was cached anyway"
     )
+
+
+def test_a_truthy_prefix_cache_opens_a_config():
+    cfg = _handed_over({"prefix_cache": 1, "prefix_keys": {"kv": {"main": [b"k"]}}})
+
+    assert cfg.prefix_cache is True, "a truthy prefix_cache did not open the request's cache"
 
 
 # ── a config for every resource that declared a stream ──────────────────
