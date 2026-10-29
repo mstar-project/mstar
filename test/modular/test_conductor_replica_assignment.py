@@ -323,6 +323,9 @@ def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors():
         get_max_output_tokens=lambda **kw: 8,
         get_loop_caps=lambda **kw: {},
         get_request_resource_configs=lambda **kw: {},
+        # what ingest reads for the partitions a keyed node streams into
+        kv_labels=_Model().kv_labels,
+        get_graph_walk_graphs=lambda: {},
     )
     conductor._status_interval_s = None
     conductor._loop_max_iters = {}
