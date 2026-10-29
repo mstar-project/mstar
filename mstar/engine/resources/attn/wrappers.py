@@ -282,11 +282,14 @@ class FlashInferPrefillWrapper:
                     kv_lens, paged_kv_indices,
                 )
             )
-            self._plan_staged(
-                qo_indptr, paged_kv_indptr, self._pinned["indices"][:n],
-                paged_kv_last_page_len, kv_lens, causal, dtype, window_left,
-            )
-            self._pinned_done.record()
+            try:
+                self._plan_staged(
+                    qo_indptr, paged_kv_indptr, self._pinned["indices"][:n],
+                    paged_kv_last_page_len, kv_lens, causal, dtype, window_left,
+                )
+            finally:
+                # also on a raise: copies already issued still read the pinned buffers
+                self._pinned_done.record()
             return
         self.dtype = dtype
         self.attn_wrapper.plan(
@@ -844,21 +847,24 @@ class FlashInferMixedWrapper:
         h["qo"][:] = qo
 
         t = self._host
-        self._idx64.copy_(self._host64, non_blocking=True)
-        self._qo_indptr_buf.copy_(t["qo"], non_blocking=True)
-        self._num_rows = rows
-        self._decode.plan(
-            paged_kv_indptr=t["d_indptr"],
-            paged_kv_indices=t["d_indices"][:n_dec],
-            paged_kv_last_page_len=t["d_last"],
-            kv_lens=self._d_lens,
-            dtype=dtype, window_left=window_left,
-        )
-        self._prefill._plan_staged(
-            t["p_qo"], t["p_kvp"], t["p_idx"][:n_pre], t["p_last"], self._p_lens,
-            causal, dtype, window_left,
-        )
-        self._done.record()
+        try:
+            self._idx64.copy_(self._host64, non_blocking=True)
+            self._qo_indptr_buf.copy_(t["qo"], non_blocking=True)
+            self._num_rows = rows
+            self._decode.plan(
+                paged_kv_indptr=t["d_indptr"],
+                paged_kv_indices=t["d_indices"][:n_dec],
+                paged_kv_last_page_len=t["d_last"],
+                kv_lens=self._d_lens,
+                dtype=dtype, window_left=window_left,
+            )
+            self._prefill._plan_staged(
+                t["p_qo"], t["p_kvp"], t["p_idx"][:n_pre], t["p_last"], self._p_lens,
+                causal, dtype, window_left,
+            )
+        finally:
+            # also on a raise: copies already issued still read the pinned buffers
+            self._done.record()
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
