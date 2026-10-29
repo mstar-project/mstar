@@ -464,6 +464,12 @@ class Worker:
     # postprocess.
     chunk_loops: ChunkLoops = ChunkLoops()
 
+    # Set in __init__; a bare instance runs no lockstep-parallel node and has
+    # TP async scheduling off.
+    parallel_nodes: frozenset[str] | set[str] = frozenset()
+    tp_async_sched: bool = False
+    tp_async_nodes: frozenset[str] | None = None
+
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
     _metrics: WorkerMetrics | None = None
@@ -5468,6 +5474,12 @@ class Worker:
                     in_flight = self._held_beside(CHAIN_LANE)
                     if spec_pending is not None:
                         in_flight.update(spec_pending.batch.request_to_worker_graph)
+                    if spec_pending is not None and spec_pending.node_name in self.parallel_nodes:
+                        # The launch wait above may have expired, and no page may move
+                        # between a lockstep step's broadcast and its admit. The next
+                        # pass opens on this same wait.
+                        self._await_admit_settled(spec_pending)
+                        laps.skip()
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     laps.lap("post_removes")
