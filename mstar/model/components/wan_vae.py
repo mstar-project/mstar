@@ -122,6 +122,13 @@ def is_channels_last(vae: nn.Module) -> bool:
     return isinstance(getattr(vae, "post_quant_conv", None), ChannelsLastCausalConv3d)
 
 
+def decode_prefers_channels_last() -> bool:
+    """Whether a compiled decode should run channels-last on this platform. cuDNN's
+    conv3d kernels run in it; MIOpen's channels-last conv3d is the slow one, about 2x
+    NCDHW for the same bf16 decode on an MI300X, so ROCm keeps the default layout."""
+    return not current_platform.is_rocm()
+
+
 class FeatCache(list):
     """A decoder feature cache that a compiled call writes as compact copies.
 
