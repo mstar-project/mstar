@@ -1,10 +1,14 @@
 """Wan22Model: Wan2.2-TI2V-5B text/image-to-video generation.
 
-Architecture (4 nodes, no engine resources — nothing here is cached):
+Architecture (4 nodes; nothing here is cached across steps):
     text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
     vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
     dit          - dense 5B video DiT; CFG as one batch-2 forward,
-                   UniPC (bh2, order 2, flow prediction) run inline
+                   UniPC (bh2, order 2, flow prediction) run inline; its
+                   attention runs on the engine's ragged (cacheless)
+                   attention resources, one for the self-attention over each
+                   guidance branch's video tokens and one for the
+                   cross-attention over the text
     vae_decoder  - Wan2.2-VAE latent -> pixel decode
 
 Graph walks (4):
@@ -39,7 +43,12 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources import (
+    NodeResourceSpec,
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
+    RaggedCrossAttentionSpec,
+)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -50,8 +59,9 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.diffusion.attention import uses_ragged_attention
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import DIT_ATTN, DIT_XATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
@@ -89,6 +99,7 @@ class Wan22Model(Model):
         skip_weight_loading: bool = False,
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
+        attention_backend: str = "auto",
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -104,6 +115,9 @@ class Wan22Model(Model):
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
+        # the DiT's attention: the engine's ragged resources (the platform's kernel), or torch's SDPA inline
+        self.use_ragged_attention = uses_ragged_attention(attention_backend)
+        self.attention_backend = attention_backend
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
@@ -123,15 +137,33 @@ class Wan22Model(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No engine-built resources: every node here is stateless.
+        """The dit's attention through the engine's ragged (cacheless) resources,
+        unless the deployment keeps SDPA; nothing else here keeps state.
 
         Nothing in this model reads K/V back across steps. The text encoder
         and both VAE passes are one-shot forwards, and the DiT recomputes
-        its self-attention over the whole latent grid every denoise step —
-        the only state that crosses a step is the UniPC solver's, which
-        rides the loop-back edges as ordinary tensors rather than a cache.
+        its attention over the whole latent grid every denoise step — the
+        only state that crosses a step is the UniPC solver's, which rides
+        the loop-back edges as ordinary tensors rather than a cache.
         """
-        return []
+        if not self.use_ragged_attention:
+            return []
+
+        def attention_config() -> RaggedAttentionConfig:
+            return RaggedAttentionConfig(
+                num_qo_heads=self.config.num_attention_heads,
+                num_kv_heads=self.config.num_attention_heads,
+                head_dim=self.config.attention_head_dim,
+                # a request's two guidance branches are two segments of one step
+                max_segments_per_request=2,
+                # the DiT's activation dtype: there is no KV cache to inherit one from
+                dtype=torch.bfloat16,
+            )
+
+        return [
+            RaggedAttentionSpec(resource_key=DIT_ATTN, nodes={"dit"}, config=attention_config()),
+            RaggedCrossAttentionSpec(resource_key=DIT_XATTN, nodes={"dit"}, config=attention_config()),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
@@ -731,7 +763,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config)
+            return Wan22DitSubmodule(transformer, self.config, use_ragged_attention=self.use_ragged_attention)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 
