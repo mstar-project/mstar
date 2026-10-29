@@ -192,41 +192,48 @@ struct ChunkIt {
 // row's squares from the residual itself (the per-tile partial sums need the whole tile).
 constexpr int kSplitK = 8;
 
-__device__ __forceinline__ bool split_k(const Params& P, const Phase& d) {
-  return (P.sync_mode & kSplitK) != 0 && (d.kind == OPROJ || d.kind == DOWN);
+// S: the kernel instance with the split (a template argument, so the default instance pays nothing for it)
+template <bool S>
+__device__ __forceinline__ bool split_k(const Phase& d) {
+  return S && (d.kind == OPROJ || d.kind == DOWN);
 }
 
 // tasks a GEMM phase is cut into, and the chunks of each
-__device__ __forceinline__ int phase_tasks(const Params& P, const Phase& d) {
-  return split_k(P, d) ? (int)(d.n_tasks * d.chunks) : (int)d.n_tasks;
+template <bool S>
+__device__ __forceinline__ int phase_tasks(const Phase& d) {
+  return split_k<S>(d) ? (int)(d.n_tasks * d.chunks) : (int)d.n_tasks;
 }
 
-__device__ __forceinline__ int task_chunks(const Params& P, const Phase& d) {
-  return split_k(P, d) ? 1 : (int)d.chunks;
+template <bool S>
+__device__ __forceinline__ int task_chunks(const Phase& d) {
+  return split_k<S>(d) ? 1 : (int)d.chunks;
 }
 
 // output tile and K chunk of a task's c-th chunk
-__device__ __forceinline__ int2 tile_chunk(const Params& P, const Phase& d, int task, int c) {
-  if (split_k(P, d)) return make_int2(task % (int)d.n_tasks, task / (int)d.n_tasks);
+template <bool S>
+__device__ __forceinline__ int2 tile_chunk(const Phase& d, int task, int c) {
+  if (split_k<S>(d)) return make_int2(task % (int)d.n_tasks, task / (int)d.n_tasks);
   return make_int2(task, c);
 }
 
 // First chunk at or after phase `ph` (`tile` holds the task index).
+template <bool S>
 __device__ ChunkIt first_chunk_from(const Params& P, const Group& G, int ph) {
   for (; ph < P.n_phases && ph < P.stop_after; ++ph) {
     const Phase d = load_phase(P, ph);
-    if (is_gemm(d.kind) && G.member < phase_tasks(P, d) - d.task_begin) {
+    if (is_gemm(d.kind) && G.member < phase_tasks<S>(d) - d.task_begin) {
       return {ph, (int)d.task_begin + G.member, 0, true};
     }
   }
   return {0, 0, 0, false};
 }
 
+template <bool S>
 __device__ ChunkIt advance(const Params& P, const Group& G, ChunkIt it) {
   const Phase d = load_phase(P, it.ph);
-  if (it.chunk + 1 < task_chunks(P, d)) return {it.ph, it.tile, it.chunk + 1, true};
-  if (it.tile + G.members < phase_tasks(P, d)) return {it.ph, it.tile + G.members, 0, true};
-  return first_chunk_from(P, G, it.ph + 1);
+  if (it.chunk + 1 < task_chunks<S>(d)) return {it.ph, it.tile, it.chunk + 1, true};
+  if (it.tile + G.members < phase_tasks<S>(d)) return {it.ph, it.tile + G.members, 0, true};
+  return first_chunk_from<S>(P, G, it.ph + 1);
 }
 
 // Weights of one chunk for this lane: 64 consecutive K elements of one of the tile's 16 rows.
@@ -244,10 +251,11 @@ __device__ __forceinline__ const uint4* chunk_src(const Phase& d, int tile, int 
   return reinterpret_cast<const uint4*>(w + (int64_t)(n0 + (lane & 15)) * d.ldw + k0 + 256 * wave + 64 * (lane >> 4));
 }
 
+template <bool S>
 __device__ __forceinline__ void load_chunk(uint4 (&wb)[8], const Params& P, const ChunkIt& it) {
   if (!it.valid) return;
   const Phase d = load_phase(P, it.ph);
-  const int2 tc = tile_chunk(P, d, it.tile, it.chunk);
+  const int2 tc = tile_chunk<S>(d, it.tile, it.chunk);
   const uint4* src = chunk_src(d, tc.x, tc.y);
 #pragma unroll
   for (int i = 0; i < 8; ++i) wb[i] = src[i];
@@ -255,6 +263,7 @@ __device__ __forceinline__ void load_chunk(uint4 (&wb)[8], const Params& P, cons
 
 // A operand of a K = 1024 GEMM from the fp32 residual: bf16(h * rsqrt(ss / 1024 + eps) * norm_w), for this
 // lane's row (lane % 16) and its 64 K elements; zeros past the group's rows.
+template <bool S>
 __device__ void load_a_normed(uint4 (&ab)[8], const Params& P, const Group& G, const Phase& d, float* scratch) {
   const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
   const int m = lane & 15;
@@ -262,23 +271,22 @@ __device__ void load_a_normed(uint4 (&ab)[8], const Params& P, const Group& G, c
   const bool live = m < G.nrows;
   const int row = G.row0 + (live ? m : 0);
   const float4* hp = reinterpret_cast<const float4*>(P.h + (int64_t)row * kHidden + kb);
-  float4 x[16];
-#pragma unroll
-  for (int i = 0; i < 16; ++i) x[i] = live ? hp[i] : make_float4(0.f, 0.f, 0.f, 0.f);
   float rs;
-  if ((P.sync_mode & kSplitK) != 0) {
+  if (S) {
     // the row's sum of squares from the residual: this lane's 64 elements, the wave's four lanes with this row,
-    // then the four waves
+    // then the four waves (the elements are read again below, from L1)
     float sq = 0.f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) sq += x[i].x * x[i].x + x[i].y * x[i].y + x[i].z * x[i].z + x[i].w * x[i].w;
+    for (int i = 0; i < 16; ++i) {
+      const float4 x = live ? hp[i] : make_float4(0.f, 0.f, 0.f, 0.f);
+      sq += x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
+    }
     sq += __shfl_xor(sq, 16, 64);
     sq += __shfl_xor(sq, 32, 64);
     __syncthreads();
     if (lane < 16) scratch[wave * 16 + lane] = sq;
     __syncthreads();
-    const float total = scratch[m] + scratch[16 + m] + scratch[32 + m] + scratch[48 + m];
-    rs = rsqrtf(total * (1.f / kHidden) + P.eps);
+    rs = rsqrtf((scratch[m] + scratch[16 + m] + scratch[32 + m] + scratch[48 + m]) * (1.f / kHidden) + P.eps);
   } else {
     rs = live ? rsqrtf(P.ss[d.ss_in * P.bs + row] * (1.f / kHidden) + P.eps) : 0.f;
   }
@@ -290,7 +298,7 @@ __device__ void load_a_normed(uint4 (&ab)[8], const Params& P, const Group& G, c
   const uint4* wp = reinterpret_cast<const uint4*>(reinterpret_cast<const bf16_t*>(d.norm_w) + kb);
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    const float4 x0 = x[2 * i], x1 = x[2 * i + 1];
+    const float4 x0 = hp[2 * i], x1 = hp[2 * i + 1];
     const uint4 w = wp[i];
     ab[i].x = pack2(x0.x * rs * bf2f(w.x & 0xffffu), x0.y * rs * bf2f(w.x >> 16));
     ab[i].y = pack2(x0.z * rs * bf2f(w.y & 0xffffu), x0.w * rs * bf2f(w.y >> 16));
@@ -409,6 +417,7 @@ __device__ __forceinline__ void acquire(const Params& P) {
 
 // The hierarchical barrier (kSyncHier), for a group whose members span 8 / groups XCDs. Workgroup i is on XCD
 // i % 8, so a group's members on one XCD are those with the same i % 8; the lowest of them leads the XCD.
+template <bool S>
 __device__ bool hier_barrier(const Params& P, const Group& G, unsigned epoch, uint4 (&wnext)[8], const ChunkIt& next,
                              bool prefetch, int* ok_flag) {
   const int xcds = 8 / P.groups;                // XCDs a group spans
@@ -420,7 +429,7 @@ __device__ bool hier_barrier(const Params& P, const Group& G, unsigned epoch, ui
   if (threadIdx.x == 0) {
     __hip_atomic_fetch_add(xcounter, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
   }
-  if (prefetch) load_chunk(wnext, P, next);
+  if (prefetch) load_chunk<S>(wnext, P, next);
   const uint64_t t0 = now();
   if (threadIdx.x == 0) {
     bool ok;
@@ -448,12 +457,13 @@ __device__ bool hier_barrier(const Params& P, const Group& G, unsigned epoch, ui
   return *ok_flag != 0;
 }
 
+template <bool S>
 __device__ bool group_barrier(const Params& P, const Group& G, unsigned epoch, uint4 (&wnext)[8],
                               const ChunkIt& next, bool prefetch, int* ok_flag) {
   wait_stores();
   __syncthreads();
   if ((P.sync_mode & kSyncHier) != 0 && P.scope == AGENT && P.groups < 8) {
-    return hier_barrier(P, G, epoch, wnext, next, prefetch, ok_flag);
+    return hier_barrier<S>(P, G, epoch, wnext, next, prefetch, ok_flag);
   }
   const bool gather = (P.sync_mode & kSyncGather) != 0;
   if (threadIdx.x == 0) {
@@ -465,7 +475,7 @@ __device__ bool group_barrier(const Params& P, const Group& G, unsigned epoch, u
       __hip_atomic_fetch_add(G.sync, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
     }
   }
-  if (prefetch) load_chunk(wnext, P, next);
+  if (prefetch) load_chunk<S>(wnext, P, next);
   const uint64_t t0 = now();
   if (gather && G.member == 0) {
     if (threadIdx.x < 64) {
@@ -506,17 +516,18 @@ struct Regs {
   bool requested;  // wnext holds (or has been asked for) the chunk `it` names
 };
 
+template <bool S>
 __device__ void gemm_phase(const Params& P, const Group& G, int ph_idx, const Phase& d, ChunkIt& it, Regs& R,
                            f32x4* red) {
   const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
   const bool shared_a = d.kind == QKV || d.kind == GATEUP || d.kind == LMHEAD;  // one A for the whole phase
   if (!(it.valid && it.ph == ph_idx)) return;
-  if (shared_a) load_a_normed(R.a, P, G, d, reinterpret_cast<float*>(red));
-  const bool atomic_residual = split_k(P, d);
-  const int nch = task_chunks(P, d);
+  if (shared_a) load_a_normed<S>(R.a, P, G, d, reinterpret_cast<float*>(red));
+  const bool atomic_residual = split_k<S>(d);
+  const int nch = task_chunks<S>(d);
   while (it.valid && it.ph == ph_idx) {
     const int task = it.tile;
-    const int tile = tile_chunk(P, d, task, 0).x;
+    const int tile = tile_chunk<S>(d, task, 0).x;
     f32x4 acc0 = {0.f, 0.f, 0.f, 0.f}, acc1 = {0.f, 0.f, 0.f, 0.f};
     for (int c = 0; c < nch; ++c) {
       // this chunk's activations are requested before waiting for its weights (R.wnext, requested a chunk
@@ -524,14 +535,14 @@ __device__ void gemm_phase(const Params& P, const Group& G, int ph_idx, const Ph
       if (!shared_a) {
         const bf16_t* a = d.kind == OPROJ ? P.attn : P.act;
         load_a_bf16(R.a, G, a, d.kind == OPROJ ? kQHeads * kHeadDim : kInter,
-                    tile_chunk(P, d, task, c).y * kChunkK);
+                    tile_chunk<S>(d, task, c).y * kChunkK);
       }
 #pragma unroll
       for (int i = 0; i < 8; ++i) R.wcur[i] = R.wnext[i];
-      it = advance(P, G, it);
+      it = advance<S>(P, G, it);
       R.requested = false;
       if (it.valid && it.ph == ph_idx) {
-        load_chunk(R.wnext, P, it);
+        load_chunk<S>(R.wnext, P, it);
         R.requested = true;
       }
       if (d.kind == GATEUP && c == 1) {
@@ -773,6 +784,7 @@ __device__ void row_phase(const Params& P, const Group& G, const Phase& d, uint6
   }
 }
 
+template <bool S>
 __global__ void __launch_bounds__(kThreads, 2) depth_step_kernel(Params P) {
   __shared__ f32x4 red[4 * 64];
   __shared__ uint64_t keys[kVocab];
@@ -797,15 +809,15 @@ __global__ void __launch_bounds__(kThreads, 2) depth_step_kernel(Params P) {
   }
 
   Regs R;
-  ChunkIt it = first_chunk_from(P, G, 0);
-  load_chunk(R.wnext, P, it);
+  ChunkIt it = first_chunk_from<S>(P, G, 0);
+  load_chunk<S>(R.wnext, P, it);
   R.requested = true;
   unsigned epoch = 0;
   const int n = P.n_phases < P.stop_after ? P.n_phases : P.stop_after;
   for (int ph = 0; ph < n; ++ph) {
     const Phase d = load_phase(P, ph);
     if (is_gemm(d.kind)) {
-      gemm_phase(P, G, ph, d, it, R, red);
+      gemm_phase<S>(P, G, ph, d, it, R, red);
     } else if (d.kind == ATTN) {
       attn_phase(P, G, d);
     } else {
@@ -816,7 +828,7 @@ __global__ void __launch_bounds__(kThreads, 2) depth_step_kernel(Params P) {
     if (prefetch) R.requested = true;
     const bool tracer = P.trace != nullptr && G.g == 0 && G.member == 0 && threadIdx.x == 0;
     if (tracer) P.trace[2 * ph] = now();
-    if (!group_barrier(P, G, ++epoch, R.wnext, it, prefetch, &ok_flag)) return;
+    if (!group_barrier<S>(P, G, ++epoch, R.wnext, it, prefetch, &ok_flag)) return;
     if (tracer) P.trace[2 * ph + 1] = now();
     if (G.g == 0 && G.member == 0 && threadIdx.x == 0) P.ctl[2] = (unsigned)(ph + 1);
   }
@@ -880,7 +892,13 @@ void depth_step(const at::Tensor& program, const at::Tensor& rope, const at::Ten
   P.eps = (float)eps;
   P.attn_scale = 1.f / sqrtf((float)kHeadDim);
   P.seed = (uint64_t)seed;
-  hipLaunchKernelGGL(depth_step_kernel, dim3(grid), dim3(kThreads), 0, at::cuda::getCurrentCUDAStream().stream(), P);
+  if ((sync_mode & kSplitK) != 0) {
+    hipLaunchKernelGGL(depth_step_kernel<true>, dim3(grid), dim3(kThreads), 0, at::cuda::getCurrentCUDAStream().stream(),
+                       P);
+  } else {
+    hipLaunchKernelGGL(depth_step_kernel<false>, dim3(grid), dim3(kThreads), 0, at::cuda::getCurrentCUDAStream().stream(),
+                       P);
+  }
   hipError_t e = hipGetLastError();
   TORCH_CHECK(e == hipSuccess, "depth_step launch: ", hipGetErrorString(e));
 }
