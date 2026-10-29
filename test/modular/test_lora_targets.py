@@ -14,6 +14,7 @@ import re
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -468,35 +469,46 @@ def _with(module: nn.Module, change: Callable[[nn.Module], object]) -> nn.Module
     return module
 
 
-REFUSED = {
-    "moe_experts": (lambda: _with(nn.Module(), lambda m: m.register_parameter(
-        "gate_up_proj", nn.Parameter(torch.empty(4, 16, HIDDEN)))), "not a LoRA-capable linear"),
-    "nn_embedding": (lambda: nn.Embedding(32, HIDDEN), "nn.Embedding"),
-    "token_embedding_not_served": (lambda: VocabParallelEmbedding(32, HIDDEN), "a token embedding"),
-    "subclass_forward": (lambda: _OwnForward(HIDDEN, HIDDEN), "a forward of its own"),
-    "instance_forward": (lambda: _with(nn.Linear(HIDDEN, HIDDEN), lambda m: setattr(m, "forward", lambda x: x)),
-                         "replaced on the instance"),
-    "forward_hooks": (lambda: _with(nn.Linear(HIDDEN, HIDDEN), lambda m: m.register_forward_hook(lambda *a: None)),
-                      "forward hooks"),
-    "depthwise_conv": (lambda: nn.Conv1d(HIDDEN, HIDDEN, 3, groups=HIDDEN), "groups 8"),
-    # a plain linear its parent declares it runs itself (``_ReadsBad``)
-    "read_outside_forward": (lambda: nn.Linear(HIDDEN, HIDDEN), "never its own forward"),
-}
+class Refused(NamedTuple):
+    """A module the walk refuses as ``layers.0.bad`` under ``parent``, and the reason."""
+
+    make: Callable[[], nn.Module]
+    reason: str
+    parent: Callable[[], nn.Module] = nn.Module
 
 
 class _ReadsBad(nn.Module):  # reads ``bad``'s weight itself (folded at load, or F.linear over it)
     lora_unservable = {"bad": "run through its weight, never its own forward"}
 
 
-@pytest.mark.parametrize("name", sorted(REFUSED))
-def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name, tmp_path):
-    make, reason = REFUSED[name]
+REFUSED = {
+    "moe_experts": Refused(lambda: _with(nn.Module(), lambda m: m.register_parameter(
+        "gate_up_proj", nn.Parameter(torch.empty(4, 16, HIDDEN)))), "not a LoRA-capable linear"),
+    "nn_embedding": Refused(lambda: nn.Embedding(32, HIDDEN), "nn.Embedding"),
+    "token_embedding_not_served": Refused(lambda: VocabParallelEmbedding(32, HIDDEN), "a token embedding"),
+    "subclass_forward": Refused(lambda: _OwnForward(HIDDEN, HIDDEN), "a forward of its own"),
+    "instance_forward": Refused(lambda: _with(nn.Linear(HIDDEN, HIDDEN), lambda m: setattr(m, "forward", lambda x: x)),
+                                "replaced on the instance"),
+    "forward_hooks": Refused(
+        lambda: _with(nn.Linear(HIDDEN, HIDDEN), lambda m: m.register_forward_hook(lambda *a: None)), "forward hooks"),
+    "depthwise_conv": Refused(lambda: nn.Conv1d(HIDDEN, HIDDEN, 3, groups=HIDDEN), "groups 8"),
+    "read_outside_forward": Refused(lambda: nn.Linear(HIDDEN, HIDDEN), "never its own forward", _ReadsBad),
+}
+
+
+def _refusing_root(case: Refused) -> nn.Module:
     with torch.device("meta"):
         root = nn.Module()
-        root.layers = nn.ModuleList([_ReadsBad() if name == "read_outside_forward" else nn.Module()])
+        root.layers = nn.ModuleList([case.parent()])
         root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
-        root.layers[0].bad = make()
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+        root.layers[0].bad = case.make()
+    return root
+
+
+@pytest.mark.parametrize("name", sorted(REFUSED))
+def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name, tmp_path):
+    reason = REFUSED[name].reason
+    spec = module_lora_spec(_refusing_root(REFUSED[name]), resource_key="lora", nodes={"N"}, root_path="")
     assert set(spec.targets) == {"fc"} and reason in spec.module_map.unservable["layers.0.bad"]
     path = write_peft(tmp_path / "a.safetensors", {
         "layers.0.fc": (rand(2, HIDDEN, seed=1), rand(HIDDEN, 2, seed=2)),
@@ -507,6 +519,17 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
     assert info.unmapped == ("layers.0.bad",)
     with pytest.raises(ValueError, match=re.escape(reason)):
         spec.check_adapter("a", info)
+
+
+def test_a_module_declaring_a_child_it_does_not_have_unservable_is_refused():
+    """A typo or a later rename would otherwise drop the refusal, and the adapter would
+    validate and do nothing."""
+    class _ReadsGone(nn.Module):
+        lora_unservable = {"gone": "run through its weight, never its own forward"}
+
+    with pytest.raises(ValueError, match="_ReadsGone.lora_unservable names 'gone'"):
+        module_lora_spec(_refusing_root(Refused(lambda: nn.Linear(HIDDEN, HIDDEN), "", _ReadsGone)),
+                         resource_key="lora", nodes={"N"}, root_path="")
 
 
 # --- the checkpoint: keys, scaling, header refusals ----------------------------------------
