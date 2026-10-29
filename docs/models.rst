@@ -61,6 +61,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
        encoder + Nemotron-H hybrid Mamba-2/attention backbone + EarTTS talker +
        RVQ codec; user speech in, agent text and 22.05 kHz speech out.
+   * - ``glm52``
+     - ``zai-org/GLM-5.2-FP8``
+     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -104,7 +107,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - V-JEPA 2 video encoder + masked predictor.
    * - ``vjepa2_ac``
      - ``vjepa2-ac-vitg``
-     - V-JEPA 2-AC encoder + action-conditioned predictor.
+     - V-JEPA 2-AC encoder + action-conditioned predictor. Video frames take the official
+       repo's central square crop, not the HF processor's resize and crop.
    * - ``whisper_large_v3_turbo``
      - ``openai/whisper-large-v3-turbo``
      - Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
@@ -143,6 +147,16 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - English speech recognition by an LLM: Canary's FastConformer encoder projected into
        Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The
        OpenAI ``prompt`` is ignored. No timestamps.
+   * - ``parakeet``
+     - ``nvidia/parakeet-tdt-0.6b-v3``
+     - FastConformer + token-and-duration transducer, 25 European languages, language detected
+       from the speech. Clips up to 10 min; longer uploads are windowed. No timestamps.
+   * - ``nemotron_asr``
+     - ``nvidia/nemotron-3.5-asr-streaming-0.6b``
+     - Cache-aware streaming FastConformer + RNN-T with a language prompt (``language``: a locale
+       such as ``en-US``, a bare code, or ``auto``); served over whole clips, with the streaming
+       model's chunked attention at its widest lookahead (``lookahead`` in the YAML's
+       ``model_kwargs``). Clips up to 10 min; longer uploads are windowed. No timestamps.
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
@@ -156,7 +170,16 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
-       rows for up to the 4,077-frame maximum. Needs ``flash-attn``; one rollout per GPU.
+       rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
+       through the engine's ragged attention resource, its blocks are compiled (Inductor's
+       deterministic mode), the condition encode runs channels-last, and the VAE decode is
+       channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).
+       ``model_kwargs: {reference_numerics: true}`` runs the reference's numerics instead
+       (FlashAttention-2, needs ``flash-attn``; an eager DiT; the fp32 contiguous encode and
+       decode), with which a rollout is bit-identical to the reference's.
+       ``lingbot_world_1_3b_fast.yaml`` compiles the DiT with autotuned kernels
+       (``dit_compile_autotune``): ~5% faster, but the rollout for a seed then differs from one
+       server process to the next.
        The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
        before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (``Robbyant/lingbot-world``).
    * - ``flux2_klein``
@@ -248,8 +271,8 @@ Omnilingual ASR notes
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
 
-FastConformer ASR (``canary``, ``canary_qwen``) notes
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
   torchcodec, which needs FFmpeg.
@@ -257,17 +280,27 @@ FastConformer ASR (``canary``, ``canary_qwen``) notes
 - Request fields, the same on ``/v1/audio/transcriptions`` and in ``/generate``'s
   ``model_kwargs``:
 
-  - ``canary``: ``language`` (the speech's, default ``en``; one of bg, hr, cs, da, nl, en,
-    et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk),
+  - ``parakeet``: detects the language from the speech. ``language`` may name one of the 25
+    it knows (bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro,
+    sk, sl, es, sv, ru, uk) and is then ignored; any other is refused.
+  - ``nemotron_asr``: ``language`` is its prompt: a locale from the checkpoint's
+    ``processor_config.json`` (such as ``en-US``), a bare code, or ``auto`` (the default).
+  - ``canary``: ``language`` (the speech's, default ``en``; one of Parakeet's 25),
     ``target_language`` (a translation to or from English; the OpenAI route also takes
     ``task="translate"``) and ``punctuation`` (default on).
   - ``canary_qwen``: English only (checked on the OpenAI route). ``instruction``
     replaces the trained one, "Transcribe the following:"; ``/generate``'s text is unused.
 
-- A request holds up to 40.96 s. ``/v1/audio/transcriptions`` cuts longer uploads (up to
-  30 min) into windows at quiet moments and joins their text. Neither model emits
-  timestamps.
-- Their YAMLs size the KV caches for ``max_concurrent_requests`` (64),
+- A request holds up to 610 s on Parakeet and Nemotron, and 40.96 s on Canary and
+  Canary-Qwen. ``/v1/audio/transcriptions`` cuts longer uploads (up to 30 min) into windows
+  at quiet moments and joins their text. None of the four emits timestamps.
+- Parakeet and Nemotron hold no cache. Each clip's decoder state (the LSTM's, and the
+  cursor) sits in a recurrent state slot from its first decode iteration until the request
+  is torn down; the YAMLs size ``resources.transducer_state.max_slots`` (129) for
+  ``max_concurrent_requests`` (128) and the sink slot, and startup refuses a cap the pool
+  can't hold. A decode iteration is 64 greedy steps, and its tokens stream out as it ends. ``compile_step: false`` in
+  their ``model_kwargs`` decodes with eager kernels instead of the compiled step.
+- Canary's and Canary-Qwen's YAMLs size the KV caches for ``max_concurrent_requests`` (64),
   and startup refuses a cap the caches can't hold.
 - Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
   smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
@@ -503,8 +536,9 @@ Qwen3-TTS notes
   overlap, which raised c=32 throughput by about a fifth on an H100.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
-  deployment YAML halves its GPU time when throughput matters more than
-  bit-exactness (the Talker is bf16 either way).
+  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
+  B300 that is slower, not faster: cuDNN's heuristics run several of its
+  convs on a kernel without tensor cores, so measure before switching.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 
@@ -896,11 +930,21 @@ Cosmos3 environment requirements
   (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
-  one matching your environment. When it is not importable, the engine logs a
-  warning at startup and automatically falls back to the paged ``flashinfer``
-  backend — serving still works, only the bs=1 dense fast path is lost.
-  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects
-  the paged backend explicitly.
+  one matching your environment. It ships kernels for sm_80 and sm_90a only.
+  Where it is not importable or has no kernel for the GPU (Blackwell), the
+  same dense pass runs on FlashInfer's ragged prefill, whose ``auto`` kernel on
+  a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
+  against 6.3 ms for the paged prefill. ``resources: attn_gen:
+  flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``); the
+  server checks it at startup with a tiny plan and run, and a backend this GPU or
+  FlashInfer build cannot run (a typo, ``fa3`` on Blackwell, ``cutlass`` on
+  Hopper) stops it with a ``ValueError`` naming the backend.
+  Without a usable FlashInfer either, the engine logs a warning and switches to
+  the paged backend, but that is FlashInfer too (the default backend on every
+  platform for now), so it cannot run there either: the dense pass needs
+  fa3-fwd (AITER on ROCm) or FlashInfer.
+  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects the
+  paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
@@ -963,6 +1007,32 @@ so an image or clip produced alongside other requests differs from its solo
 result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
 request at a time when outputs must be bitwise repeatable.
 
+The denoise step is compiled (``compile_denoise``) in Inductor's deterministic
+mode by default (``denoise_compile_mode: deterministic``, the engine's compile
+mode of that name): kernel configs are picked by rule, so a seed gives the same
+video from every server process. ``default`` is torch.compile's own defaults,
+and ``level`` takes the ``mstar serve -O`` level's options (``-O2``:
+max-autotune).
+
+Video clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
+one decoder call per latent, channels-last, in the decode dtype (bf16 with
+cuDNN >= 9.16, otherwise fp32; see above), on the decoder-only copy of the VAE
+the channels-last decoders on a GPU share. The first two calls (the clip-start latent and the one after it)
+run eager; every later call is compiled in Inductor's deterministic mode. An
+image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
+is faster for a single frame. False decodes everything with the compiled stock
+``vae.decode`` on the shared instance.
+
+Two or more requests at the same denoise step run one cross-request forward
+(``max_gen_batch_size``, default 8) for video, image and sound; the action step
+runs eager. With ``compile_denoise_batched`` (default on) its layer stack is
+compiled with the same mode, once, while the server starts, with the packed
+length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
+per-request patchify, rotary tables and unpatchify around it run eager. At
+832x480x121 one request's guidance pair is 24k tokens, which already fills the
+GPU's GEMM and attention throughput, so a batch of N costs about N single
+steps: batching keeps requests in step rather than adding throughput.
+
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``
@@ -993,7 +1063,10 @@ own ``window_decoder`` partition; a request opts in per call:
    * - ``window_mode``
      - — (``chained`` with ``stream_video``)
      - ``chained``: every window is a full bidirectional denoise conditioned on
-       the previous window's tail (``overlap_frames`` pinned clean). ``kv``
+       the previous window's tail (``overlap_frames`` pinned clean: the last
+       frames are decoded and encoded again as a clip of their own, the
+       video-to-video conditioning layout, so the window's first latent frame
+       is a single-frame one as in training). ``kv``
        (experimental, see below): the finished window's clean K/V is committed
        to the cache and later windows attend to it block-causally; no overlap,
        and frames older than ``context_frames`` behind the frontier are
@@ -1004,8 +1077,9 @@ own ``window_decoder`` partition; a request opts in per call:
      - Pixel frames per window (quantized to latent frames).
    * - ``overlap_frames``
      - 32 on Edge, 8 elsewhere
-     - ``chained`` only: frames re-pinned from the previous window (at least two
-       latent frames).
+     - ``chained`` only: frames re-pinned from the previous window, as k = 1 +
+       (overlap_frames - 1) // 4 latent frames (at least two), which pin
+       1 + 4(k - 1) frames: 5 and 29 at the defaults.
    * - ``context_frames``
      - 61
      - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.

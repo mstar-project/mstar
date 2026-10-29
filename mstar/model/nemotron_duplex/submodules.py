@@ -51,7 +51,7 @@ from mstar.engine.resources.kv.bounded import BoundedKVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStep
 from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec, CodecStreamAudio, CodecStreamState
-from mstar.model.nemotron_duplex.components.conformer import ConformerStreamer, StreamState, device_counts
+from mstar.model.nemotron_duplex.components.conformer import ConformerStreamer, StreamState
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
     CODEC_STATE,
@@ -78,6 +78,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -656,9 +657,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         moved = list(chunks)
         if host:
             flat = torch.cat([chunks[i].reshape(-1) for i in host])
-            if device.type == "cuda":
-                flat = flat.pin_memory()
-            parts = flat.to(device, non_blocking=True).split([chunks[i].numel() for i in host])
+            parts = to_device_nonblocking(flat, device).split([chunks[i].numel() for i in host])
             for i, part in zip(host, parts, strict=True):
                 moved[i] = part
         return moved
@@ -742,7 +741,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
 
     def _eager_layers(self, enc, kv, pool, device) -> list[torch.Tensor]:
         """The layer stack eagerly over ``enc``, on this step's plans: each call's new frames."""
-        y = self.streamer.layers(enc.x, kv, pool, device_counts(enc.n, device))
+        y = self.streamer.layers(enc.x, kv, pool, to_device_nonblocking(enc.n, device, dtype=torch.long))
         return [row[:n] for row, n in zip(y, enc.n, strict=True)]
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:

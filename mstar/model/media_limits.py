@@ -9,25 +9,26 @@ The pixel and audio caps hold for a whole request: while the data worker loads
 a request's files inside :class:`RequestMediaBudget`, every check also counts
 against what the request's earlier files used.
 """
+import functools
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 import torch
 
+from mstar.utils.cpus import usable_cpus
 
+
+@functools.cache
 def video_decode_threads() -> int:
     """FFmpeg threads for one video decode. torchcodec decodes single-threaded
     by default, which dominates a long clip's request latency; frame threading
-    is bit-identical. Bounded by the API server's preprocessing pool (torch's
-    intra-op threads, which ``preprocess_torch_threads`` sets), by this
-    process's CPU affinity (its cpuset; a CFS CPU quota is not read), and by 8,
-    so concurrent decodes don't oversubscribe."""
-    try:
-        cpus = len(os.sched_getaffinity(0))
-    except AttributeError:  # no affinity mask to read (macOS)
-        cpus = os.cpu_count() or 1
-    return max(1, min(8, cpus, torch.get_num_threads()))
+    is bit-identical. Bounded by the CPUs this process may use (its affinity and
+    cgroup quota) and by 8, so concurrent decodes don't oversubscribe. Not tied
+    to torch's intra-op pool: FFmpeg's threads are its own, and that pool is
+    kept small for fork-join ops a decode doesn't run. Read once per process,
+    as ``image_io.PNG_WORKERS`` is."""
+    return min(8, usable_cpus())
 
 
 # PIL's DecompressionBombWarning threshold (about 9459 x 9459 RGB)

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import collections
+import contextlib
 import itertools
 import json
 import logging
@@ -18,13 +19,15 @@ from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import msgpack
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
@@ -44,6 +47,7 @@ from mstar.api_server.request_types import (
     PreprocessInput,
     ResultChunk,
 )
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.model.multimodal import PromptPart
@@ -62,6 +66,7 @@ from mstar.utils import profiler
 from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
+from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
@@ -334,6 +339,18 @@ def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
     }) + "\n"
 
 
+async def _disconnected(raw_request: Request) -> None:
+    """Return once the client has gone; the body is already read."""
+    while (await raw_request.receive())["type"] != "http.disconnect":
+        pass
+
+
+async def _empty_stream():
+    """The body for a client that left before its first chunk."""
+    return
+    yield
+
+
 def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
     """Serialize one result chunk as a header line plus its untouched payload.
 
@@ -589,6 +606,16 @@ class APIServer:
     # Submitting a request
     # ----------------------------------------------------------
 
+    def _report_ignored_params(self, model_kwargs: dict) -> None:
+        """Log the keys the model does not read; the request is served regardless."""
+        model = getattr(self, "model", None)
+        declared = model.request_kwargs() if model is not None else None
+        if declared is None:
+            return
+        ignored = sorted(set(model_kwargs) - declared - set(model.ENGINE_KWARGS) - set(model.LENGTH_KWARGS))
+        if ignored:
+            logger.warning("Ignoring model_kwargs this model does not read: %s", ignored)
+
     def submit_request(
         self,
         *,
@@ -644,6 +671,10 @@ class APIServer:
                 f"Output modality {names} requires streaming=True; raw frame "
                 "chunks cannot be returned as an aggregated response."
             )
+        # here, before anything is queued: null is unset, types and ranges are
+        # checked once for every endpoint, and an over-wide seed cannot be packed
+        model_kwargs = normalize_generation_kwargs(model_kwargs)
+        self._report_ignored_params(model_kwargs)
 
         if file_streams:
             try:
@@ -1287,7 +1318,7 @@ class APIServer:
             if not finished:
                 self.abort_submission(key, outcome="timeout" if timed_out else "abort")
 
-    def async_stream_results(self, request_id: str, binary: bool = False):
+    def async_stream_results(self, request_id: str, binary: bool = False, chunks=None):
         """Yield the serialized body of ``/generate`` one piece at a time.
 
         ``binary`` selects the length-framed form negotiated through ``Accept``.
@@ -1298,11 +1329,57 @@ class APIServer:
         than an ``async def`` delegating to it: the branch is per-request, not
         per-chunk, and this keeps both bodies flat. It also binds the
         submission now, before Starlette starts iterating the body.
+
+        ``chunks`` is the request's ``ResultChunk`` iterator when the caller has
+        already read from it (``open_result_stream``); None opens a fresh one.
         """
-        chunks = self.iter_result_chunks(request_id)
+        chunks = chunks if chunks is not None else self.iter_result_chunks(request_id)
         if binary:
             return self._stream_binary(chunks)
         return self._stream_ndjson(chunks)
+
+    async def open_result_stream(
+        self, request_id: str, raw_request: Request | None = None, *, batches: bool = False,
+    ):
+        """The request's result iterator, after its first item has arrived.
+
+        A request the engine refuses raises ``HTTPException`` with its status
+        here, before the caller commits a 200; otherwise the iterator replays
+        the first item. ``batches`` selects ``iter_result_chunk_batches``. A
+        client that disconnects first is aborted and gets an empty iterator.
+        """
+        items = (self.iter_result_chunk_batches if batches else self.iter_result_chunks)(request_id)
+        first_read = asyncio.ensure_future(anext(items, None))
+        gone = asyncio.ensure_future(_disconnected(raw_request)) if raw_request is not None else None
+        try:
+            await asyncio.wait({first_read, gone} - {None}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # a pending receive() would take the disconnect StreamingResponse listens for
+            for task in (gone, first_read):
+                if task is not None and not task.done():
+                    # cancelling the read unwinds the iterator, which aborts the request
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+        if first_read.cancelled():
+            return _empty_stream()
+        first = first_read.result()
+        head = first[0] if batches and first else first
+        if head is not None and head.modality == "error":
+            # read to the end, so the finished request is not aborted
+            async for _ in items:
+                pass
+            raise HTTPException(
+                status_code=int((head.metadata or {}).get("status", 500)),
+                detail=bytes(head.data).decode("utf-8", "replace"),
+            )
+
+        async def replay():
+            if first is not None:
+                yield first
+            async for item in items:
+                yield item
+        return replay()
 
     async def _stream_ndjson(self, chunks):
         async for chunk in chunks:
@@ -1495,6 +1572,20 @@ class APIServer:
         else:
             self.abort_submission(key)
 
+    def release_submission(self, key: str | None) -> None:
+        """:meth:`release_request` for one submission, by its key
+        (:meth:`submission_key`); a newer submission under the id is untouched."""
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            finished = req is not None and req.event.is_set()
+            if finished:
+                self.pending_requests.pop(key)
+                self._retire(key)
+        if finished:
+            self._record_end(req, "abort")
+        else:
+            self.abort_submission(key)
+
     # ----------------------------------------------------------
     # Cleanup
     # ----------------------------------------------------------
@@ -1620,17 +1711,23 @@ class WarmupRequest:
         )
 
 
-def _data_parallel_replicas(config: dict) -> int:
-    """The most replicas any node group serves (its ranks over its tp x sp
-    instance size): how many copies of a request it takes to reach them all."""
-    replicas = 1
-    for group in config.get("node_groups") or []:
-        instance = int(group.get("tp_size", 1)) * int(group.get("sp_size", 1))
-        replicas = max(replicas, len(group.get("ranks") or []) // max(instance, 1))
-    return replicas
+class DataParallelReplicas(NamedTuple):
+    """The most and fewest replicas any worker graph is served by. ``most`` is
+    how many copies of a request it takes for the conductor's placement to
+    reach them all."""
+
+    most: int
+    fewest: int
 
 
-def _run_warmup_requests(server: APIServer, specs: list, copies: int = 1) -> None:
+def _data_parallel_replicas(model, config_path: str) -> DataParallelReplicas:
+    counts = [len(wg.replica_ranks) for wg in model.get_worker_graphs(config_path)]
+    return DataParallelReplicas(most=max(counts), fewest=min(counts))
+
+
+def _run_warmup_requests(
+    server: APIServer, specs: list, replicas: DataParallelReplicas = DataParallelReplicas(1, 1),
+) -> None:
     """Run the deployment's ``warmup_requests`` once the workers are ready and
     before the server binds, so the first client does not pay what a first
     request of a shape costs (torch.compile of a denoise step, a cold
@@ -1638,15 +1735,17 @@ def _run_warmup_requests(server: APIServer, specs: list, copies: int = 1) -> Non
     warmup that is malformed or fails is logged and skipped; it must not keep
     the server from coming up.
 
-    Each spec runs as ``copies`` x its ``concurrency`` concurrent requests,
-    once per value when ``concurrency`` is a list: ``copies`` warms every
+    Each spec runs as ``replicas.most`` x its ``concurrency`` concurrent
+    requests, once per value when ``concurrency`` is a list: the copies warm every
     replica of a data-parallel deployment, since the conductor sends
     concurrent requests to different replicas (the least-loaded one each), and
     ``concurrency`` lets them batch, for a step that compiles per batch size;
-    both are best effort, as the scheduler decides what shares a step. Past
-    one copy, they run with ``prefix_cache=False`` unless the spec sets it, so no
-    predicted hit (``routing_weights.prefix``) gathers them on one replica; the
-    cost is that they leave a prefill from cached pages unwarmed.
+    both are best effort, as the scheduler decides what shares a step. When
+    some worker graph has fewer replicas than that, each spec first runs once
+    alone, since that graph would batch the copies and miss its one-request
+    shape. Past one copy, they run with ``prefix_cache=False`` unless the spec
+    sets it, so no predicted hit (``routing_weights.prefix``) gathers them on
+    one replica; the cost is that they leave a prefill from cached pages unwarmed.
     """
     if not isinstance(specs, list):
         logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)
@@ -1671,12 +1770,26 @@ def _run_warmup_requests(server: APIServer, specs: list, copies: int = 1) -> Non
         except Exception as exc:  # noqa: BLE001 — a repeat too large to build, say
             logger.warning("warmup_requests[%d] skipped: %s", index, exc)
             continue
-        if copies > 1:
+        if replicas.fewest < replicas.most:
+            t0 = time.perf_counter()
+            try:
+                asyncio.run(_one(request, f"warmup-{index}.solo"))
+            except Exception as exc:  # noqa: BLE001 — the batched levels still run
+                logger.warning(
+                    "warmup request %d/%d failed after %.1f s alone: %s",
+                    index + 1, len(specs), time.perf_counter() - t0, getattr(exc, "detail", exc),
+                )
+            else:
+                logger.info(
+                    "warmup request %d/%d (%s) done in %.1f s alone",
+                    index + 1, len(specs), ",".join(request.output_modalities), time.perf_counter() - t0,
+                )
+        if replicas.most > 1:
             request = replace(request, model_kwargs={"prefix_cache": False, **(request.model_kwargs or {})})
         for level, concurrency in enumerate(request.concurrency):
             t0 = time.perf_counter()
             try:
-                asyncio.run(_all(request, f"warmup-{index}.{level}", copies * concurrency))
+                asyncio.run(_all(request, f"warmup-{index}.{level}", replicas.most * concurrency))
             except Exception as exc:  # noqa: BLE001 — a cold server is better than none
                 logger.warning(
                     "warmup request %d/%d failed after %.1f s at concurrency %d: %s",
@@ -1720,6 +1833,20 @@ app.add_middleware(
     metrics=lambda: getattr(api_server, "metrics", None),
     routes=lambda: (*app.router.routes, *openai_router.routes),
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(request: Request, exc: RequestValidationError):
+    """A body that fails its schema is a 400 like every other refused input,
+    in the envelope of the route family it was sent to."""
+    if request.url.path.startswith("/v1/"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "message": str(exc.errors()), "type": "invalid_request_error", "code": 400,
+            }},
+        )
+    return JSONResponse(status_code=400, content={"detail": jsonable_encoder(exc.errors())})
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2068,7 +2195,9 @@ async def generate_ws(websocket: WebSocket):
                 text, _ = client_error_text(
                     exc, f"generate/ws request {request_id} failed", log=logger, type_name=False,
                 )
-                payload = {"request_id": request_id, "error": text}
+                # the status /generate would have answered with
+                status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
+                payload = {"request_id": request_id, "error": text, "status": status}
             try:
                 await send(payload, binary)
             except Exception:  # noqa: BLE001
@@ -2181,7 +2310,7 @@ async def generate_ws(websocket: WebSocket):
             try:
                 check_request_id(request_id)
             except ValueError as exc:
-                reply({"request_id": request_id, "error": str(exc)}, binary)
+                reply({"request_id": request_id, "error": str(exc), "status": 400}, binary)
                 continue
             if _ws_is_append(message):
                 if request_id not in live:
@@ -2351,24 +2480,33 @@ async def generate(
 
     try:
         await api_server.wait_for_request_id(request_id)
-        request_id = api_server.submit_request(
-            text=text,
-            file_paths=file_paths or None,
-            input_modalities=in_mods,
-            output_modalities=out_mods,
-            model_kwargs=parsed_kwargs,
-            prompt_parts=parts or None,
-            streaming=streaming,
-            request_id=request_id,
-        )
+        try:
+            request_id = api_server.submit_request(
+                text=text,
+                file_paths=file_paths or None,
+                input_modalities=in_mods,
+                output_modalities=out_mods,
+                model_kwargs=parsed_kwargs,
+                prompt_parts=parts or None,
+                streaming=streaming,
+                request_id=request_id,
+            )
+        except json.JSONDecodeError:
+            raise   # a downstream parse failure, not a bad request (a 500 below)
+        except ValueError as e:   # submit_request's refusals are the client's fault
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
         if streaming:
             # Substring match, not RFC 7231 q-value parsing: the value is a
             # private vendor type that appears in no other media range, and a
             # client that does not ask for it keeps the historical NDJSON body.
             binary = BINARY_STREAM_MEDIA_TYPE in request.headers.get("accept", "")
-            return StreamingResponse(
-                api_server.async_stream_results(request_id, binary=binary),
+            key = api_server.submission_key(request_id)
+            # wait for the first chunk: a refused request gets its real status, not a 200
+            chunks = await api_server.open_result_stream(request_id, request)
+            return ReleasingStreamingResponse(
+                api_server.async_stream_results(request_id, binary=binary, chunks=chunks),
+                release=lambda: api_server.release_submission(key),
                 media_type=BINARY_STREAM_MEDIA_TYPE if binary else NDJSON_STREAM_MEDIA_TYPE,
                 headers={"Cache-Control": "no-cache", "Vary": "Accept"},
             )
@@ -2427,6 +2565,21 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
+def default_preprocess_threads(cpus: int | None = None) -> int:
+    """Intra-op threads for the API server when neither the config nor the model sets them.
+
+    Torch's default is one per host core, which inside a container can be several
+    times the CPUs the cgroup quota lets run; a fork-join op then waits for its
+    parked threads. A quarter of the usable CPUs, at most 4: the process shares
+    them with the engine workers, and its per-request ops are a few MB.
+    """
+    if cpus is None:
+        from mstar.utils.cpus import usable_cpus
+
+        cpus = usable_cpus()
+    return max(1, min(4, cpus // 4))
+
+
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
@@ -2440,13 +2593,17 @@ def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
 def _set_preprocess_threads(model, config: dict) -> None:
     """Size torch's intra-op pool for this process's media preprocessing.
 
-    ``config.yaml``'s ``preprocess_torch_threads`` wins, else the model's
-    ``PREPROCESS_TORCH_THREADS``; None keeps torch's default. Affects only this
-    process: the conductor and workers are spawned fresh.
+    ``config.yaml``'s ``preprocess_torch_threads`` wins (``null`` keeps torch's
+    default), else the model's ``PREPROCESS_TORCH_THREADS``, else
+    :func:`default_preprocess_threads`. Affects only this process: the conductor
+    and workers are spawned fresh.
     """
-    threads = config.get("preprocess_torch_threads", model.PREPROCESS_TORCH_THREADS)
-    if threads is None:
-        return
+    if "preprocess_torch_threads" in config:
+        threads = config["preprocess_torch_threads"]
+        if threads is None:
+            return
+    else:
+        threads = model.PREPROCESS_TORCH_THREADS or default_preprocess_threads()
     import torch
 
     torch.set_num_threads(int(threads))
@@ -2543,7 +2700,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--rust-frontend-bin", type=str, default=None,
         help="Path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
-             "$PATH, then rust/server/target/release)",
+             "the environment's scripts dir, $PATH, then "
+             "rust/server/target/release)",
     )
     args = parser.parse_args(argv)
     if args.enable_metrics and MISSING_DEPENDENCY is not None:
@@ -2634,12 +2792,12 @@ def main(argv: list[str] | None = None):
         # client never sees the first request of a shape.
         warmups = config.get("warmup_requests") or []
         if warmups:
-            copies = _data_parallel_replicas(config)
+            replicas = _data_parallel_replicas(model, args.config)
             logger.info(
-                "Running %d warmup request(s) before binding, %d at a time (one per replica)",
-                len(warmups), copies,
+                "Running %d warmup request(s) before binding, %s%d copies at a time (one per replica)",
+                len(warmups), "each once alone, then " if replicas.fewest < replicas.most else "", replicas.most,
             )
-            _run_warmup_requests(api_server, warmups, copies)
+            _run_warmup_requests(api_server, warmups, replicas)
         if args.enable_metrics:
             api_server.enable_metrics()
         if args.rust_frontend:

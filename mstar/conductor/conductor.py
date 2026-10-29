@@ -69,6 +69,7 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 from mstar.validation import validate_deployment
+from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +496,10 @@ class Conductor:
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
+        logger.info(
+            "Compile caches: Inductor %s, Triton %s",
+            os.environ.get("TORCHINDUCTOR_CACHE_DIR"), os.environ.get("TRITON_CACHE_DIR"),
+        )
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
@@ -567,6 +572,13 @@ class Conductor:
             for walk in wg.graph_walks
         }
         self.default_sharding_config.assert_streams_keep_tp_size(sorted(stream_edges))
+
+        topology = model.get_partition_topology()
+        self.producer_triggered_partitions: set[str] = (
+            topology.producer_triggered_partitions() if topology else set()
+        )
+        if topology:
+            topology.check_walk_driving_connections()
 
         for group in self.default_sharding_config.groups:
             group_graph_walks = group.graph_walks or graph_walks
@@ -655,6 +667,13 @@ class Conductor:
             specs = {s.resource_key: s for s in built}
             self._resource_specs_cache = specs
         return specs
+
+    def _streamed_partitions(self) -> frozenset[str]:
+        streamed = getattr(self, "_streamed_partitions_cache", None)
+        if streamed is None:
+            streamed = streamed_partitions(list(self._resource_specs().values()), self.model)
+            self._streamed_partitions_cache = streamed
+        return streamed
 
     def _fit_loop_caps(self, model_kwargs: dict, configs: dict, cap: int) -> tuple[int, dict[str, int]]:
         """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
@@ -935,7 +954,7 @@ class Conductor:
             # tp*sp instance runs the request together, so its TP all-reduce
             # and SP all-to-all collectives stay in sync. Picking a single TP
             # row here would desync the SP all-to-all across rows.
-            result[wg_id] = [f"worker_{r}" for r in wg.replica_instances[replica_idx]]
+            result[wg_id] = [f"worker_{r}" for r in wg.replica_ranks[replica_idx]]
         return result
 
     def _build_request_sharding_config(
@@ -1296,6 +1315,8 @@ class Conductor:
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        if not all(partition_states[name].is_done for name in self._streamed_partitions()):
+            prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
         refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, resource_configs)
         for key, cfg in resource_configs.items():
@@ -1815,6 +1836,19 @@ class Conductor:
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
                     conn.consumed_count = max(conn.consumed_count, consumed)
 
+        # The stream moves a producer-triggered partition's walk on the
+        # worker; follow it so the completion check and the model's state
+        # machine see the walk this pass actually ran.
+        if (
+            partition_name in self.producer_triggered_partitions
+            and body.graph_walk
+            and body.graph_walk != pstate.metadata.graph_walk
+        ):
+            pstate.metadata.graph_walk = body.graph_walk
+            self._set_partition_worker_graph_ids(
+                body.request_id, partition_name, body.graph_walk,
+            )
+
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
             count = pstate.wg_rank_completions.get(wg_id, 0) + 1
@@ -1898,6 +1932,11 @@ class Conductor:
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
+                    # A finished consumer takes no more input; told its
+                    # producer is done, a continue_after_done stream would
+                    # keep feeding it empty chunks
+                    if request_data.partition_states[conn.to_partition].is_done:
+                        continue
                     if conn.to_partition not in consumers:
                         consumers.add(conn.to_partition)
                         self._send_producer_done(request_id, conn.from_partition, conn.to_partition)

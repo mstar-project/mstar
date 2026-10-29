@@ -1,4 +1,5 @@
 import socket
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -44,6 +45,15 @@ def rendezvous_store(init_method: str, rank: int, world_size: int, timeout: time
     )
 
 
+@torch.compiler.disable
+def _all_to_all_single(
+    group: dist.ProcessGroup, send: torch.Tensor, recv: torch.Tensor,
+    recv_splits: list[int] | None = None, send_splits: list[int] | None = None,
+) -> torch.Tensor:
+    dist.all_to_all_single(recv, send, recv_splits, send_splits, group=group)
+    return recv
+
+
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
 
@@ -65,8 +75,9 @@ class CommGroup:
         self.group_members = group_members
         self.world_size = len(group_members)
         self.device_group = None
-        # gloo twin of ``device_group``, for object collectives (workspace
-        # rendezvous) that should not go through NCCL
+        # host channel of ``device_group``, for rank votes (``agree``) and
+        # object collectives (workspace rendezvous) that should not go through
+        # NCCL: a gloo twin, or on XPU the mixed group's gloo side
         self.cpu_group = None
         self.initialized = False
         # see ``init_allreduce_fusion``
@@ -81,6 +92,20 @@ class CommGroup:
         ``AllReduce.new``). Collective across the group — every member calls
         this from ``init_dist`` at the same point."""
         self._all_reduce = AllReduce.new(self, mode, max_kb)
+
+    def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
+        """Reduce each of ``values`` over the group's ranks with ``op``: ``MIN`` ANDs
+        flags, ``MAX`` takes the largest. Collective: every member calls it at the
+        same point. Over ``cpu_group``, so the answer costs no device sync."""
+        if self.world_size == 1 or not values:
+            return list(values)
+        if self.cpu_group is None:
+            raise ValueError(
+                f"agree over ranks {self.group_members} before init_dist set up their cpu_group"
+            )
+        t = torch.tensor(values, dtype=torch.int64)
+        dist.all_reduce(t, op=op, group=self.cpu_group)
+        return t.tolist()
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -143,7 +168,7 @@ class CommGroup:
         from mstar.distributed.ar_fusion import create_workspace
 
         self._ar_fusion_ws = create_workspace(
-            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
+            self, max_tokens, hidden, dtype,
         )
         self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
         return self._ar_fusion_ws is not None
@@ -210,12 +235,12 @@ class CommGroup:
 
     def all_to_all(
         self,
-        input_: torch.Tensor,
+        input_: torch.Tensor | Sequence[torch.Tensor],
         scatter_dim: int,
         gather_dim: int,
         scatter_sizes: list[int] | None = None,
         gather_sizes: list[int] | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Redistribute ``input_`` across the group: split it into
         ``world_size`` pieces along ``scatter_dim`` (piece i goes to rank i)
         and concatenate the pieces received from every rank along
@@ -230,34 +255,80 @@ class CommGroup:
         uneven split / gather (e.g. a sequence length not divisible by the
         group size); when ``None`` the respective dimension is split evenly
         (and ``scatter_dim`` must then be divisible by ``world_size``).
+
+        ``input_`` may be several tensors that differ only in the extent of
+        ``scatter_dim``, split evenly (q, k and v with their own head counts):
+        they go in one exchange and come back as a tuple. Each exchange is one
+        ``all_to_all_single`` over a buffer packed in a single copy, which
+        replays from a CUDA graph. The collective is hidden from torch.compile,
+        so a compiled caller breaks around this call; tracing it as a
+        functional collective instead gave an illegal memory access in
+        Cosmos3's batched capture.
         """
+        tensors = (input_,) if isinstance(input_, torch.Tensor) else tuple(input_)
         if self.world_size == 1:
-            return input_
+            return input_ if isinstance(input_, torch.Tensor) else tensors
         world_size = self.world_size
-        if scatter_sizes is None:
-            assert input_.size(scatter_dim) % world_size == 0, (
-                f"all_to_all: scatter_dim {scatter_dim} size "
-                f"{input_.size(scatter_dim)} not divisible by world_size "
-                f"{world_size}; pass scatter_sizes for an uneven split"
+        # positive dims: unflatten below adds a dim, which would shift a negative one
+        scatter_dim %= tensors[0].dim()
+        gather_dim %= tensors[0].dim()
+        if scatter_sizes is not None and len(set(scatter_sizes)) > 1:
+            assert len(tensors) == 1, "all_to_all: several tensors need an even scatter"
+            out = self._all_to_all_uneven_scatter(tensors[0], scatter_dim, gather_dim, scatter_sizes, gather_sizes)
+            return out if isinstance(input_, torch.Tensor) else (out,)
+        # per tensor [.., N, ..] -> [P, .., N/P, ..]; rank r's block of the send buffer holds
+        # its piece of each tensor one after another, so each tensor unpacks contiguous
+        blocks = [x.unflatten(scatter_dim, (world_size, -1)).movedim(scatter_dim, 0) for x in tensors]
+        numels = [blk[0].numel() for blk in blocks]
+        send = blocks[0].new_empty(world_size, sum(numels))
+        for blk, piece in zip(blocks, send.split(numels, dim=1), strict=True):
+            piece.view(blk.shape).copy_(blk)
+        if gather_sizes is None or len(set(gather_sizes)) == 1:
+            # the block received from rank r has this rank's own block's layout
+            recv = _all_to_all_single(self.device_group, send, torch.empty_like(send))
+            outs = [
+                piece.view(blk.shape).movedim(0, gather_dim).flatten(gather_dim, gather_dim + 1)
+                for blk, piece in zip(blocks, recv.split(numels, dim=1), strict=True)
+            ]
+        else:
+            # rank r's block: each tensor's piece with the gathered dim at rank r's extent
+            shapes = [
+                [blk.shape[1:gather_dim + 1] + (n,) + blk.shape[gather_dim + 2:] for blk in blocks]
+                for n in gather_sizes
+            ]
+            rank_numels = [[int(torch.Size(shape).numel()) for shape in row] for row in shapes]
+            recv = _all_to_all_single(
+                self.device_group, send.flatten(), send.new_empty(sum(map(sum, rank_numels))),
+                [sum(row) for row in rank_numels], [sum(numels)] * world_size,
             )
-            chunk = input_.size(scatter_dim) // world_size
-            scatter_sizes = [chunk] * world_size
-        send = [
-            t.contiguous()
-            for t in torch.split(input_, scatter_sizes, dim=scatter_dim)
-        ]
+            per_rank = [
+                [piece.view(shape) for piece, shape in zip(block.split(row), shape_row, strict=True)]
+                for block, row, shape_row in zip(recv.split([sum(row) for row in rank_numels]), rank_numels, shapes,
+                                                 strict=True)
+            ]
+            outs = [torch.cat([pieces[i] for pieces in per_rank], dim=gather_dim) for i in range(len(tensors))]
+        return outs[0] if isinstance(input_, torch.Tensor) else tuple(outs)
+
+    def _all_to_all_uneven_scatter(
+        self, input_: torch.Tensor, scatter_dim: int, gather_dim: int,
+        scatter_sizes: list[int], gather_sizes: list[int] | None,
+    ) -> torch.Tensor:
+        chunks = input_.split(scatter_sizes, dim=scatter_dim)
+        send = torch.cat([chunk.contiguous().flatten() for chunk in chunks])
+        mine = list(chunks[self.rank].shape)
         if gather_sizes is None:
-            gather_sizes = [send[self.rank].size(gather_dim)] * world_size
-        base_shape = list(send[self.rank].shape)
-        recv = []
-        for r in range(world_size):
-            shape = list(base_shape)
-            shape[gather_dim] = gather_sizes[r]
-            recv.append(
-                torch.empty(shape, dtype=input_.dtype, device=input_.device)
-            )
-        dist.all_to_all(recv, send, group=self.device_group)
-        return torch.cat(recv, dim=gather_dim).contiguous()
+            gather_sizes = [mine[gather_dim]] * self.world_size
+        shapes = [mine[:gather_dim] + [n] + mine[gather_dim + 1:] for n in gather_sizes]
+        numels = [int(torch.Size(shape).numel()) for shape in shapes]
+        recv = _all_to_all_single(
+            self.device_group, send, input_.new_empty(sum(numels)),
+            numels, [chunk.numel() for chunk in chunks],
+        )
+        pieces = [
+            piece.view(shape)
+            for piece, shape in zip(recv.split(numels), shapes, strict=True)
+        ]
+        return torch.cat(pieces, dim=gather_dim)
 
 
 @dataclass
@@ -294,6 +365,12 @@ class JointGroups:
         sp_src, tp_src = divmod(src, self.tp_group.world_size)
         tensor = self.tp_group.broadcast(tensor, tp_src)
         return self.sp_group.broadcast(tensor, sp_src)
+
+    def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
+        """``CommGroup.agree`` over the whole TP x SP block."""
+        for group in (self.tp_group, self.sp_group):
+            values = group.agree(values, op)
+        return values
 
 
 
@@ -411,22 +488,35 @@ class WorkerParallelGroups:
         # iterates it identically; ``new_group`` is collective and
         # tag-ordered (see the field comment). A tuple shared by a TP and
         # an SP group (degenerate meshes) maps to one subgroup.
-        rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        #
+        # The gloo twins are members only. With the default group bound to a
+        # device, a non-member's subgroup creation joins an ncclCommSplit
+        # that members never call for a gloo group, and blocks forever. But
+        # torch names a members-only group after its ranks and the number of
+        # groups this process has made so far, and a non-member makes none.
+        # So a rank outside the tuple makes a gloo group of just itself, which
+        # keeps that count equal on every rank and the members agreeing on the
+        # name (and the store prefix their rendezvous uses). A 2x2 TP x SP
+        # mesh hung at startup without it. The device subgroups go after,
+        # since they're only registered on their members and would skew it.
         rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        for rank_tuple in self.world_parallel_groups:
+            if device.type == "xpu":
+                continue  # the device group doubles as the cpu group below
+            member = self.global_rank in rank_tuple
+            cpu_pg = dist.new_group(
+                ranks=list(rank_tuple) if member else [self.global_rank],
+                backend="gloo", use_local_synchronization=True, **timeout_kwargs,
+            )
+            if member:
+                rank_tuple_to_cpu_pg[rank_tuple] = cpu_pg
+        rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(
                 ranks=list(rank_tuple), **timeout_kwargs
             )
             if device.type == "xpu":
                 rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
-            else:
-                # Members only: with the default group bound to a device, a
-                # non-member's subgroup creation joins an ncclCommSplit that
-                # members never call for a gloo group, and blocks forever.
-                rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                    ranks=list(rank_tuple), backend="gloo",
-                    use_local_synchronization=True, **timeout_kwargs,
-                )
 
         seen: set[int] = set()
         for comm_group in (
@@ -573,7 +663,7 @@ class GlobalParallelConfig:
             for node in wg.section.get_nodes():
                 node_to_parallel_shapes.setdefault(node, set()).add(shape)
                 node_to_instance_groups.setdefault(node, set()).update(
-                    wg.replica_instances
+                    tuple(group) for group in wg.replica_ranks
                 )
         frozen_parallel_shapes = {
             node: frozenset(shapes)

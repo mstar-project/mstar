@@ -8,13 +8,14 @@ patchified 2x2 into ``[B, 4C, H/2, W/2]`` and packed to tokens ``[B, (H/2)(W/2),
 from __future__ import annotations
 
 import io
-import os
 import struct
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
+
+from mstar.utils.cpus import usable_cpus
 
 
 def patchify_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -80,7 +81,7 @@ def pixels_to_uint8(image: torch.Tensor) -> torch.Tensor:
     return (image * 255).round().to(torch.uint8)
 
 
-PNG_WORKERS = min(8, os.cpu_count() or 1)
+PNG_WORKERS = min(8, usable_cpus())
 
 
 def uint8_to_png(

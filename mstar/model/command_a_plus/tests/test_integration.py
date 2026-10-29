@@ -28,7 +28,7 @@ from mstar.model.command_a_plus.config import (
     SAMPLER,
     CommandAPlusConfig,
 )
-from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
+from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule, CommandAPlusVisionSubmodule
 from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
 from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
 from mstar.model.multimodal import PromptPart
@@ -43,6 +43,23 @@ def info(walk="prefill", max_tokens=6, ignore_eos=False, index=0):
         resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": index} if walk == "decode" else {},
     )
+
+
+def engine_postprocess(submodule, request_id, request_info, outputs):
+    """``postprocess`` as ``Engine._postprocess_batch`` runs it, the engine's own
+    tail included (it drops the closing token of a reply that ended at prefill)."""
+    from mstar.engine.engine import Engine
+    from mstar.model.submodule_base import BatchedModelOutput
+
+    failures = {}
+    batch = SimpleNamespace(
+        node_name="llm", request_ids=[request_id], inputs=[None],
+        per_request_info_wrapped={request_id: request_info}, failed_requests=failures,
+        register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk=request_info.graph_walk),
+    )
+    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=submodule, piecewise_runners={})})
+    Engine._postprocess_batch(engine, batch, BatchedModelOutput(per_rid_outputs={request_id: outputs}))
+    assert not failures, failures
 
 
 class ToyLM(nn.Module):
@@ -105,13 +122,11 @@ class NodeTests(unittest.TestCase):
                 self.assertEqual(self.node.check_stop("a", info(ignore_eos=ignore_eos), prefill), set())
                 request = info("decode", ignore_eos=ignore_eos)
                 decode = {"new_token": [torch.tensor([7])]}
-                self.node.postprocess("a", request, decode)
+                engine_postprocess(self.node, "a", request, decode)
                 self.assertEqual("new_token" not in decode, ends)
                 self.assertEqual(self.node.check_stop("a", request, decode), {"decode_loop"} if ends else set())
-        self.assertEqual(self.node._ended_at_prefill, set())
-        self.node.check_stop("a", info(), {"new_token": [torch.tensor([3])]})
-        self.node.cleanup_request("a")
-        self.assertEqual(self.node._ended_at_prefill, set())
+                self.node.cleanup_request("a")
+                self.assertNotIn("a", self.node.request_states)
 
     def test_decode_stop_counts_prefill_token_and_respects_ignore_eos(self):
         for token, maximum, index, ignore_eos, stops in (
@@ -256,6 +271,26 @@ class ModelIntegrationTests(unittest.TestCase):
         with torch.inference_mode():
             outputs = node.forward("prefill_image", None, **node.preprocess("prefill_image", None, [inputs]))
         self.assertEqual(tuple(outputs["image_embeds"][0].shape), (3 * 4, self.model.config.hidden_size))
+
+    def test_vision_node_batches_requests_and_hands_each_its_own_embeddings(self):
+        from mstar.model.command_a_plus.tests.test_vision import tiny_encoder
+
+        torch.manual_seed(0)
+        node = CommandAPlusVisionSubmodule(tiny_encoder()).eval()
+        node.TILES_PER_CALL = 2  # a chunk straddles the two requests
+        tiles = {"b": torch.rand(3, 3, 32, 32), "a": torch.rand(1, 3, 32, 32)}
+        inputs = [node.prepare_inputs("prefill_image", info("prefill_image"), {"pixel_values": [t]})
+                  for t in tiles.values()]
+        engine = ModelInputsFromEngine(list(tiles), {})
+        self.assertTrue(node.can_batch(None, inputs))
+        with torch.inference_mode():
+            batched = node.forward_batched("prefill_image", engine, **node.preprocess("prefill_image", engine, inputs))
+            alone = [node.forward("prefill_image", None, **node.preprocess("prefill_image", None, [inp]))
+                     for inp in inputs]
+        self.assertEqual(list(batched), ["b", "a"])
+        for rid, single in zip(tiles, alone, strict=True):
+            self.assertEqual(len(batched[rid]["image_embeds"][0]), len(tiles[rid]) * 4)
+            torch.testing.assert_close(batched[rid]["image_embeds"][0], single["image_embeds"][0])
 
     def test_load_dtype_and_reject_sequence_parallelism(self):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")

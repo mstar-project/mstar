@@ -28,7 +28,7 @@ import triton
 import triton.language as tl
 
 from mstar.utils.device import DeviceCapability
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import PinnedStager, to_device_nonblocking
 from mstar.utils.knobs import sampler_slots
 
 if TYPE_CHECKING:
@@ -2530,11 +2530,7 @@ class SamplerBuffers:
         every row is kept."""
         if keep is None or all(keep):
             return None
-        # fresh pinned tensor: the host allocator holds it until the copy lands
-        device = self._slot_idx_gpu.device
-        return torch.tensor(
-            keep, dtype=torch.bool, pin_memory=DeviceCapability.of(device).pin_memory,
-        ).to(device, non_blocking=True)
+        return to_device_nonblocking(keep, self._slot_idx_gpu.device, dtype=torch.bool)
 
     def scatter_offset(
         self, cg_slot: int = 0, keep: torch.Tensor | None = None,

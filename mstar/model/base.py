@@ -208,7 +208,7 @@ class WorkerGraph:
     # columns (sequence-parallel comm groups: Ulysses all-to-all);
     # ``_instance_ranks`` are the whole instances (every rank of an instance runs
     # a request together; empty without TP/SP, so the data-parallel replicas the
-    # conductor routes to are ``replica_instances``). With
+    # conductor routes to are ``replica_ranks``). With
     # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
     # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
     # __post_init__ to the instance size (tp*sp) so the conductor — which models
@@ -256,9 +256,10 @@ class WorkerGraph:
             self.tp_size = inst
 
     @property
-    def replica_instances(self) -> tuple[tuple[int, ...], ...]:
-        """The data-parallel replicas: each lockstep instance's ranks, or one rank each."""
-        return tuple(map(tuple, self._instance_ranks)) or tuple((rank,) for rank in self.ranks)
+    def replica_ranks(self) -> list[list[int]]:
+        """The ranks of each data-parallel replica: the lockstep instances, or
+        one rank apiece without TP/SP. The conductor routes a request to one."""
+        return self._instance_ranks or [[r] for r in self.ranks]
 
 
 def _combine_sections_sequential_or_parallel(
@@ -451,11 +452,14 @@ class Model(ABC):
     # Request keys that set an output length. A request that sets one is refused when it
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
+    # Request keys the conductor reads for every model, never logged as ignored.
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache")
 
     # Intra-op threads for the API server's preprocessing of this model's
-    # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
-    # default of one per core; ``preprocess_torch_threads`` in the model's
-    # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
+    # inputs (``load_image``, ``process_prompt``, ...). None takes a default
+    # sized from the CPUs the process may use; ``preprocess_torch_threads`` in
+    # the model's config.yaml overrides either. See
+    # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
 
     def _get_worker_graphs_for_graph_walk(
@@ -806,6 +810,10 @@ class Model(ABC):
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
 
+        An image or video artifact encodes on the API server's pool, beside the
+        data worker's inline calls for the request's other outputs, so an
+        override must not keep state across calls.
+
         Modality to expected encoding type:
         - text: utf-8
         - image: png
@@ -862,8 +870,8 @@ class Model(ABC):
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an
         OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key named in the ``X-MStar-Ignored-Params`` response header.
-        None (the default) declares nothing, so nothing is reported.
+        and the key logged as ignored. None (the default) declares nothing, so
+        nothing is logged.
         """
         return None
 

@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, ".")
 
 from mstar.api_server import entrypoint
+from mstar.graph.base import GraphEdge, GraphNode, Sequential
 
 
 class _FakeServer:
@@ -125,6 +126,10 @@ def test_a_failing_warmup_is_logged_and_skipped(caplog) -> None:
     # not a list at all: nothing runs, one warning
     entrypoint._run_warmup_requests(fake, {"text": "x"})
     assert fake.collected == ["warmup-0.0.0", "warmup-2.0.0"]
+    # a failing solo does not keep the copies from running
+    fake = _FakeServer(fail_on="warmup-0.solo")
+    entrypoint._run_warmup_requests(fake, [{"text": "x"}], entrypoint.DataParallelReplicas(2, 1))
+    assert fake.collected == ["warmup-0.solo", "warmup-0.0.0", "warmup-0.0.1"]
 
 
 def test_hf_file_references_resolve_from_the_cache(monkeypatch) -> None:
@@ -152,29 +157,87 @@ def test_hf_file_references_resolve_from_the_cache(monkeypatch) -> None:
     assert len(fake.submitted) == 1
 
 
-def test_warmup_reaches_every_data_parallel_replica() -> None:
+def test_warmup_reaches_every_data_parallel_replica(tmp_path) -> None:
     """One concurrent copy of each warmup per replica, so the conductor's
-    least-loaded placement warms every replica, not a random one."""
-    config = {"node_groups": [
-        {"node_names": ["dit", "vae_decoder"], "ranks": [0, 1]},
+    least-loaded placement warms every replica, not a random one. Replicas are
+    counted from the model's worker graphs, the ones the conductor picks from:
+    the most and the fewest any of them is served by."""
+    from test_startup_graph_validation import _config, _llm, _ToyModel
+
+    def walks():
+        encoder = GraphNode(name="text_encoder", input_names=["x"], outputs=[GraphEdge(next_node="llm", name="x")])
+        return {"gen": Sequential([encoder, _llm()])}
+
+    model = _ToyModel(walks, tp_enabled_nodes={"llm"})
+
+    def replicas(node_groups):
+        return entrypoint._data_parallel_replicas(model, _config(tmp_path, node_groups))
+
+    assert replicas([
+        {"node_names": ["llm"], "ranks": [0, 1]},
         {"node_names": ["text_encoder"], "ranks": [0]},
-    ]}
-    assert entrypoint._data_parallel_replicas(config) == 2
+    ]) == (2, 1)
+    assert replicas([
+        {"node_names": ["llm"], "ranks": [0, 1]},
+        {"node_names": ["text_encoder"], "ranks": [0, 1]},
+    ]) == (2, 2)
     # a lockstep instance is one replica
-    assert entrypoint._data_parallel_replicas({"node_groups": [{"ranks": [0, 1], "sp_size": 2}]}) == 1
-    assert entrypoint._data_parallel_replicas({"node_groups": [{"ranks": [0, 1, 2, 3], "tp_size": 2}]}) == 2
+    assert replicas([
+        {"node_names": ["llm"], "ranks": [0, 1], "tp_size": 2},
+        {"node_names": ["text_encoder"], "ranks": [0]},
+    ]) == (1, 1)
+    assert replicas([
+        {"node_names": ["llm"], "ranks": [0, 1, 2, 3], "tp_size": 2},
+        {"node_names": ["text_encoder"], "ranks": [0]},
+    ]) == (2, 1)
+    # a node group no walk places is never routed to, so it adds no copies
+    assert replicas([
+        {"node_names": ["llm", "text_encoder"], "ranks": [0]},
+        {"node_names": ["unused"], "ranks": [1, 2, 3]},
+    ]) == (1, 1)
     fake = _FakeServer()
-    entrypoint._run_warmup_requests(fake, [{"text": "a"}, {"text": "b"}], copies=2)
+    entrypoint._run_warmup_requests(fake, [{"text": "a"}, {"text": "b"}], entrypoint.DataParallelReplicas(2, 2))
     assert [s["request_id"] for s in fake.submitted] == ["warmup-0.0.0", "warmup-0.0.1", "warmup-1.0.0", "warmup-1.0.1"]
     # off the prefix cache, so a prefix weight above load's cannot put the copies on one replica
     assert all(s["model_kwargs"] == {"prefix_cache": False} for s in fake.submitted)
+
+
+def test_replicated_warmup_runs_one_request_alone_first() -> None:
+    """When replicas are uneven, each entry first runs one request to its end
+    alone: a worker graph with fewer replicas than the copies (one DiT beside a
+    replicated VAE) would otherwise get every copy together and only compile
+    the batched shape. Evenly replicated, every graph already sees one copy."""
+    events = []
+
+    class _OrderedServer(_FakeServer):
+        def submit_request(self, **kwargs):
+            events.append(("submit", kwargs["request_id"]))
+            return super().submit_request(**kwargs)
+
+        async def collect_results(self, request_id, raw_request=None):
+            events.append(("done", request_id))
+            return await super().collect_results(request_id, raw_request)
+
+    specs = [{"text": "a", "concurrency": [1, 2]}, {"text": "b"}]
+    entrypoint._run_warmup_requests(_OrderedServer(), specs, entrypoint.DataParallelReplicas(2, 1))
+    assert events[:2] == [("submit", "warmup-0.solo"), ("done", "warmup-0.solo")]
+    assert [rid for kind, rid in events if kind == "submit"] == [
+        "warmup-0.solo", "warmup-0.0.0", "warmup-0.0.1", *(f"warmup-0.1.{c}" for c in range(4)),
+        "warmup-1.solo", "warmup-1.0.0", "warmup-1.0.1",
+    ]
+    solo_1 = events.index(("submit", "warmup-1.solo"))
+    assert events[solo_1 + 1] == ("done", "warmup-1.solo")
+    # every graph has as many replicas as copies: nothing extra
+    events.clear()
+    entrypoint._run_warmup_requests(_OrderedServer(), specs, entrypoint.DataParallelReplicas(2, 2))
+    assert not any(rid.endswith(".solo") for _, rid in events)
 
 
 def test_concurrency_runs_copies_together_for_batched_shapes() -> None:
     """``concurrency: N`` submits N copies at once (times the replica count), so
     a step compiled per batch size sees that batch before the bind."""
     fake = _FakeServer()
-    entrypoint._run_warmup_requests(fake, [{"text": "a", "concurrency": 3}], copies=2)
+    entrypoint._run_warmup_requests(fake, [{"text": "a", "concurrency": 3}], entrypoint.DataParallelReplicas(2, 2))
     assert [s["request_id"] for s in fake.submitted] == [f"warmup-0.0.{c}" for c in range(6)]
     # a list runs one warmup per batch size, in order, each under its own ids
     fake = _FakeServer()

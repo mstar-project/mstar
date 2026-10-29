@@ -216,7 +216,7 @@ def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
     """Whether every request runs all of these worker graphs on the same
     workers: the conductor picks one replica for every node_group on the same
     lockstep instances (``ReplicaRouter``), so they share those instances."""
-    return len({wg.replica_instances for wg in wgs}) == 1
+    return len({tuple(map(tuple, wg.replica_ranks)) for wg in wgs}) == 1
 
 
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:

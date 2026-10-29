@@ -316,11 +316,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        comes from the extension, or give ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
        long prompts take (a long-context prefill). Each entry is sent as many
-       times at once as the most data-parallel replicas any node group serves (its
-       ranks over ``tp_size`` x ``sp_size``), so every replica warms. A node group
-       with fewer replicas, such as one DiT instance beside a replicated VAE, gets
-       those copies together and may batch them, so its one-request shape can stay
-       cold. ``concurrency: N`` submits N copies per replica at once, so they can batch, for a step that
+       times at once as the most data-parallel replicas any of the model's worker
+       graphs is served by (the replicas the conductor picks from; a node group no
+       walk places adds none), so every replica warms. Past one copy, each run of
+       the entry starts with one request alone, so a node group with fewer replicas, such as one DiT
+       instance beside a replicated VAE, also warms its one-request shape before
+       the copies reach it together. ``concurrency: N`` submits N copies per replica at once, so they can batch, for a step that
        compiles per batch size (whether they share a step is the scheduler's
        call); a list (``concurrency: [1, 2, 4]``) runs the entry once per size, in
        order. A malformed or failing warmup is logged and skipped.
@@ -575,6 +576,43 @@ Pi0.5 DROID variant fixes the action horizon:
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`.
 
+Restarts and the compile cache
+------------------------------
+
+On a first start Inductor compiles every capture bucket (tuning it at ``-O1`` and
+``-O2``), and FlashInfer JIT-builds its kernels. Both cache the results, and a
+start that finds them skips that work. Qwen3.5-0.8B on an H200 took 320 s to start with an
+empty cache at the default ``-O1`` (1,294 s at ``-O2``); a warm start skips Inductor's
+compile and tuning. torch's default cache in ``/tmp`` already survives a process restart on
+the same host; M*'s default keeps it across a new container or a reboot that clears ``/tmp``.
+
+To keep it, persist these (all under ``~/.cache`` by default):
+
+- ``$XDG_CACHE_HOME/mstar/torchinductor``: Inductor's compiled graphs and autotune picks
+  (``TORCHINDUCTOR_CACHE_DIR``), and in its ``triton`` subdirectory Triton's compiled kernels,
+  Inductor's and others' alike (``TRITON_CACHE_DIR``)
+- ``~/.cache/flashinfer``: FlashInfer's JIT builds (it follows ``FLASHINFER_WORKSPACE_BASE``,
+  default home, not ``$XDG_CACHE_HOME``)
+- ``$HF_HOME``: the weights (``$XDG_CACHE_HOME/huggingface`` by default)
+
+``$XDG_CACHE_HOME`` defaults to ``~/.cache``. M* sets both variables unless you export them,
+and ``TRITON_CACHE_DIR`` follows an exported ``TORCHINDUCTOR_CACHE_DIR``.
+
+In a container, mount these from a volume rather than only ``~/.cache/huggingface``.
+Inductor keys compiled graphs and ``-O1``'s picks on the torch build. On CUDA and ROCm,
+compiled graphs (and ``-O2``'s GEMM timings) also key on the Triton build, the device (its
+name on CUDA, its gfx arch on ROCm) and the CUDA or HIP version; on XPU, on none of those.
+``-O1``'s picks key on the kernel source, which names the compute capability and SM count but
+not the GPU model, so give each GPU model (or each ROCm card sharing an arch) its own cache
+if one home serves several. Neither key covers the ``ptxas`` that built a kernel or the driver: after changing
+either, delete the cache or set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value.
+
+The default trades torch's node-local ``/tmp`` for home. Nothing prunes the cache, and every
+upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which costs only the
+next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
+concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
+path and copy a warm cache in at job start.
+
 .. _tensor-transport:
 
 Tensor transport
@@ -794,8 +832,10 @@ or ``increase()``.
 - ``mstar_prefix_cache_query_tokens_total{model_name, component}``,
   ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
   tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
-  tokens found there. Only models that key their prompts for prefix reuse (BAGEL and
-  Orpheus) count, and above one rank only with ``prefix_cache_tp`` set.
+  tokens found there. Only models that key their prompts for prefix reuse (BAGEL,
+  Orpheus, Qwen3.5 and Qwen3-Omni's Thinker) count, and above one rank only with
+  ``prefix_cache_tp`` set. Qwen3.5's hit counts the KV cache's tokens before its
+  recurrent pool cuts the hit to a snapshot.
 - ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
   step on the node is ready (its inputs arrived) and not running: waiting for room in a
   step or for the worker to pick the node.

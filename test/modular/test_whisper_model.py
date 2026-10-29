@@ -25,7 +25,13 @@ from mstar.model.components.audio_features import (  # noqa: E402
     sinusoid_positions,
 )
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, HostRows, ModelInputsFromEngine, NodeInputs, TokenStop  # noqa: E402
+from mstar.model.submodule_base import (  # noqa: E402
+    ARNodeInputs,
+    HostRows,
+    ModelInputsFromEngine,
+    NodeInputs,
+    TokenStop,
+)
 from mstar.model.whisper.components.decoder import WhisperDecoderModel  # noqa: E402
 from mstar.model.whisper.components.encoder import WhisperEncoderModel  # noqa: E402
 from mstar.model.whisper.config import (  # noqa: E402

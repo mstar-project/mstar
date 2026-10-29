@@ -78,7 +78,7 @@ class _CudaTensor:
 def _one_process(monkeypatch):
     monkeypatch.setattr(ar, "SYMM_BACKENDS", _fakes(_FakeSymm))
     # one process: every rank is this one
-    monkeypatch.setattr(ar, "_all_ranks_agree", lambda flag, cpu_group: flag)
+    monkeypatch.setattr(CommGroup, "agree", lambda self, values, op=None: list(values))
     _FakeSymm.instances.clear()
 
 
@@ -139,7 +139,7 @@ def test_setup_failure_falls_back_to_nccl_with_warning(monkeypatch, fake_cuda, c
 def test_a_peer_that_failed_takes_every_rank_to_nccl(monkeypatch, fake_cuda, caplog):
     """One rank on NCCL while its peers wait in the symmetric kernel for its signal
     deadlocked the first all-reduce."""
-    monkeypatch.setattr(ar, "_all_ranks_agree", lambda flag, cpu_group: False)
+    monkeypatch.setattr(CommGroup, "agree", lambda self, values, op=None: [0] * len(values))
     with caplog.at_level(logging.WARNING, logger=ar.__name__):
         backend = AllReduce.new(_group(), "symm_multimem")
     assert type(backend) is AllReduce
@@ -561,9 +561,9 @@ def flashinfer(monkeypatch, fake_cuda):
 
     built, routed = [], []
 
-    def create_workspace(rank, world_size, cpu_group, max_tokens, hidden, dtype):
+    def create_workspace(group, max_tokens, hidden, dtype):
         nbytes = max_tokens * hidden * dtype.itemsize
-        built.append((cpu_group, nbytes))
+        built.append((group.cpu_group, nbytes))
         ar_fusion._WORKSPACES.append(_Workspace(nbytes))
         return len(ar_fusion._WORKSPACES) - 1
 

@@ -219,7 +219,7 @@ class Wav2Vec2CTC(nn.Module):
         frame_lens = [t] * n if seq_lens is None else self.frame_lengths(seq_lens)
         frame_mask = None
         if any(f < t for f in frame_lens):
-            lens = to_device_nonblocking(torch.tensor(frame_lens), x.device)
+            lens = to_device_nonblocking(frame_lens, x.device)
             frame_mask = torch.arange(t, device=x.device)[None, :] < lens[:, None]
         x = front.model_dim_proj(front.post_extract_layer_norm(x))
         x = front.pos_encoder(x, frame_mask)

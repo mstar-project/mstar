@@ -34,13 +34,18 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
 )
 
 
 class CommandAPlusVisionSubmodule(NodeSubmodule):
-    """Turns a request's image tiles into the embeddings for its ``<|IMG_PATCH|>`` tokens."""
+    """Turns each request's image tiles into the embeddings for its ``<|IMG_PATCH|>`` tokens."""
 
     disable_torch_compile = True
+
+    # On GB200 a tile costs ~1.3 ms from 64 tiles up and ~26 MiB of activations,
+    # so larger calls only grow the peak; a step's tile count is otherwise unbounded.
+    TILES_PER_CALL = 64
 
     def __init__(self, encoder: CommandAPlusVisionEncoder):
         super().__init__()
@@ -50,8 +55,26 @@ class CommandAPlusVisionSubmodule(NodeSubmodule):
         tiles = torch.cat(inputs["pixel_values"]).to(self.get_device())
         return NodeInputs(tensor_inputs={"pixel_values": tiles})
 
+    def preprocess(self, graph_walk, engine_inputs, inputs) -> dict[str, Any]:
+        tiles = [inp.tensor_inputs["pixel_values"] for inp in inputs]
+        return {"pixel_values": torch.cat(tiles), "tile_counts": [len(t) for t in tiles]}
+
     def forward(self, graph_walk, engine_inputs, pixel_values, **kwargs) -> NameToTensorList:
         return {"image_embeds": [self.encoder(pixel_values)]}
+
+    def can_batch(self, batch, model_inputs) -> bool:
+        return True
+
+    def forward_batched(
+        self, graph_walk, engine_inputs, pixel_values, tile_counts, **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        tokens = self.encoder.config.tokens_per_tile
+        embeds = torch.cat([self.encoder(chunk) for chunk in pixel_values.split(self.TILES_PER_CALL)])
+        embeds = embeds.split([n * tokens for n in tile_counts])
+        return {
+            rid: {"image_embeds": [e]}
+            for rid, e in zip(engine_inputs.request_ids, embeds, strict=True)
+        }
 
 
 class CommandAPlusLLMSubmodule(ARNodeSubmodule):
@@ -66,7 +89,10 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
         self.language_model = language_model
         self.config = config
         self.image_token_id = image_token_id
-        self._ended_at_prefill: set[str] = set()
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token", stop_ids=frozenset({config.eos_token_id}),
+            sampler=SAMPLER, prefill_walks=frozenset(PREFILL_WALKS),
+        )
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -185,30 +211,3 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
                 outputs["decode_input"] = outputs["new_token"]
             return
         outputs["text_inputs"] = outputs["new_token"]
-        if request_id in self._ended_at_prefill:
-            # The reply ended on its first token; this step only stops the loop.
-            del outputs["new_token"]
-
-    def check_stop(self, request_id, request_info, outputs) -> set[str]:
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        if request_info.graph_walk in PREFILL_WALKS:
-            if (request_info.max_tokens > 1 and not ignore_eos
-                    and outputs["new_token"][0].item() == self.config.eos_token_id):
-                self._ended_at_prefill.add(request_id)
-            return set()
-        if request_id in self._ended_at_prefill:
-            self._ended_at_prefill.discard(request_id)
-            return {"decode_loop"}
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        # The loop index is zero-based; include the prefill token and the
-        # token produced by this decode iteration.
-        generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        if (not ignore_eos and token == self.config.eos_token_id) or generated >= request_info.max_tokens:
-            return {"decode_loop"}
-        return set()
-
-    def cleanup_request(self, request_id: str):
-        self._ended_at_prefill.discard(request_id)
-        super().cleanup_request(request_id)

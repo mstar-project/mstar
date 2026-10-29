@@ -122,7 +122,7 @@ class ReplicaRouter:
         self._weights = RoutingWeights(**{name: float(w) for name, w in (weights or {}).items()})
         units: dict[tuple[Instance, ...], list] = {}
         for wg in worker_graphs:
-            units.setdefault(wg.replica_instances, []).append(wg)
+            units.setdefault(tuple(map(tuple, wg.replica_ranks)), []).append(wg)
         # the KV declarations a mirror reads: keyed_labels as the engine reads them, and
         # names_checkpoint in place of the engine's checkpoint_path() is not None
         keyed = {
