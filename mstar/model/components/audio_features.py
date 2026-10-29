@@ -252,6 +252,7 @@ class NemoLogMel:
         reflects ``n_fft/2`` samples past the stream's first, so it needs more
         than that. At the stream's end, every frame of the clip. ``reflect_edges``
         streams only."""
+        assert self.reflect_edges
         if num_samples <= self.n_fft // 2:
             return 0
         if final:
