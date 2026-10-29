@@ -249,11 +249,12 @@ class KernelOp:
         return ran
 
     def config(self, shape: Mapping[str, int] | None = None, device=None) -> Mapping[str, Any] | None:
-        """This device's tuned config for ``shape``'s class (``mstar.kernels.configs``)."""
+        """This device's tuned config for ``shape``, or for its class
+        (``mstar.kernels.configs``)."""
         facts = current_platform.device_facts(device)
         config = configs.load_config(self.name, facts.arch, facts.product)
         shape_class = self.shapes.shape_class(shape) if self.shapes is not None and shape is not None else None
-        return configs.select(config, shape_class)
+        return configs.select(config, shape_class, shape)
 
     def describe(self, probe: bool = False) -> dict[str, Any]:
         """What a listing shows. With ``probe``, also which implementation runs
