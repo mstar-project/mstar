@@ -12,6 +12,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.sampler.unfiltered import UNFILTERED_SAMPLING, filters_nothing
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
     GenerationHistory,
@@ -93,6 +94,16 @@ class SamplerResource(Resource):
         # recomputed per step: `admit` is on the per-step path and this only
         # moves on ingest/remove.
         self._penalty_rids: set[str] = set()
+        # Resident requests the unfiltered draw cannot serve (a filter, a
+        # penalty or a history), held for the same reason.
+        self._filtered_rids: set[str] = set()
+        # (walk, unfiltered) -> batch sizes the runners kept, so a batch only
+        # takes the unfiltered capture where the walk has it at the size the
+        # batch pads to (the same on every rank: see `buckets_captured`)
+        self._captured: dict[tuple[str, bool], set[int]] = {}
+        self._unfiltered_pad: dict[tuple[str, int], bool] = {}
+        # whether this step replays a bucket captured with `sample_unfiltered`
+        self._unfiltered_step = False
         self._device = device
         self._comm_group = comm_group
         self._cg_buffers: SamplerBuffers | None = None
@@ -215,6 +226,8 @@ class SamplerResource(Resource):
         # after the refusals, so a refused request leaves no stale entry
         if resolved.presence_penalty != 1.0:
             self._penalty_rids.add(rid)
+        if not filters_nothing(resolved):
+            self._filtered_rids.add(rid)
         if self._history is not None:
             self._history.register(rid)
         if self._cg_buffers is not None:
@@ -290,6 +303,7 @@ class SamplerResource(Resource):
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
         self._penalty_rids.discard(rid)
+        self._filtered_rids.discard(rid)
         self._cached_prefix.pop(rid, None)
         if self._history is not None:
             self._history.unregister(rid)
@@ -359,6 +373,7 @@ class SamplerResource(Resource):
         if not ctx.is_preplan:
             self._kept_rids = step.kept_rids
             self._step_rids = tuple(ctx.padded_request_ids)
+            self._plan_variant(ctx)
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -422,6 +437,38 @@ class SamplerResource(Resource):
             self._gather_dynamic(ctx, lease)
             self._cg_sampler = sampler
             self._step_slot = (cg_slot, padded_bs)
+
+    def _plan_variant(self, ctx: StepContext) -> None:
+        """Whether this step runs the unfiltered draw: the bucket it replays,
+        or is captured for, says so."""
+        lease = ctx.slot_lease
+        self._unfiltered_step = lease is not None and lease.bucket.cg_key_info == UNFILTERED_SAMPLING
+        if self._unfiltered_step:
+            # the unfiltered draw reads no seen-token mask, and every row in it
+            # is at penalty 1.0, so the masks may stay stale (`_penalty_live`)
+            self._penalty_needed_this_step = False
+
+    def buckets_captured(self, buckets) -> None:
+        for bucket in buckets:
+            key = (bucket.graph_walk, bucket.cg_key_info == UNFILTERED_SAMPLING)
+            self._captured.setdefault(key, set()).add(bucket.bs)
+        self._unfiltered_pad.clear()
+
+    def unfiltered_key(self, graph_walk: str, request_ids) -> str | None:
+        """``UNFILTERED_SAMPLING`` when no row of this batch filters,
+        penalises or reads a history, and ``graph_walk`` captured the
+        unfiltered draw at the size the batch pads to; None otherwise, the
+        walk's ordinary capture. For a submodule's ``cg_key_info``."""
+        if self._filtered_rids and not self._filtered_rids.isdisjoint(request_ids):
+            return None
+        n = len(request_ids)
+        ok = self._unfiltered_pad.get((graph_walk, n))
+        if ok is None:
+            plain = self._captured.get((graph_walk, False), ())
+            pad = min((bs for bs in plain if bs >= n), default=None)
+            ok = pad is not None and pad in self._captured.get((graph_walk, True), ())
+            self._unfiltered_pad[(graph_walk, n)] = ok
+        return UNFILTERED_SAMPLING if ok else None
 
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
         """Gather the per-step RNG offset + seen-token mask (and the
@@ -491,6 +538,8 @@ class SamplerResource(Resource):
         eager step the real batch.
         """
         request_ids = self._planned_rows(logits.shape[0])
+        if self._cg_sampler is not None and self._unfiltered_step:
+            return self._cg_sampler.sample_unfiltered(logits)
         if self._cg_sampler is not None:
             # The capability flag, not the liveness one. Under a replay this
             # argument is inert (the kernel variant was baked at capture), and
