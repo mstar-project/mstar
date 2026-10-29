@@ -193,7 +193,7 @@ def run(
     bench = bench or Bench(device, rotate_bytes=2 * facts.mall_bytes if facts.mall_bytes else None)
     seeds = {}
     if store is not None:
-        for family in ("triton", "hip"):
+        for family in ("triton", "triton_fma", "triton_dot", "hip"):
             seeds[family] = store.seeds(facts, spec.name, family)
     cands = [c for c in spec.candidates(facts, budget=budget, seeds=seeds)
              if families is None or c.family in families]
