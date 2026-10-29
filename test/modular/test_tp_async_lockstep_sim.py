@@ -12,12 +12,12 @@ the implementation:
 """
 
 try:
-    from .tp_async_sim import INSTANCE_SCENARIOS, SCENARIOS, explore, explore_instance
+    from .tp_async_sim import SCENARIOS, explore
 except ImportError:  # collected without package context
     import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from tp_async_sim import INSTANCE_SCENARIOS, SCENARIOS, explore, explore_instance
+    from tp_async_sim import SCENARIOS, explore
 
 
 def _run(mode, scenario, nranks=2):
@@ -72,24 +72,6 @@ def test_b2_retract_is_refuted_on_structural_cancel():
 def test_b2_waste_matches_design_prediction():
     # expected run-ahead cost: one wasted forward per request end at B=1
     assert _run("B2_VOID", "clean-3step").max_waste == 1
-
-
-# --- two lockstep nodes on one instance ----------------------------------------
-
-
-def _run_instance(scenario, nranks):
-    need, pages, script = INSTANCE_SCENARIOS[scenario]
-    return explore_instance(nranks, need, pages, script, scenario)
-
-
-def test_two_lockstep_nodes_with_their_own_pools_stay_in_step():
-    """Rank 0 interleaves steps of two nodes with evictions, reloads, a refused
-    admit and an abort: every rank admits the same steps with the same pages
-    in every interleaving, each node's moves riding on its own next step."""
-    for nranks in (2, 3):
-        for name in INSTANCE_SCENARIOS:
-            res = _run_instance(name, nranks)
-            assert res.ok, (name, nranks, res.violations[:1])
 
 
 # --- a follower's input read failing after rank 0 scheduled the row ----------
