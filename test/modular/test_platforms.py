@@ -374,3 +374,109 @@ def test_env_defaults_are_strings_or_callables(platform):
     """What ``apply_process_env_defaults`` knows how to apply."""
     for key, value in platform.process_env_defaults().items():
         assert isinstance(key, str) and (isinstance(value, str) or callable(value)), key
+
+def _fake_runtime(api: str, register_rc: int = 0, unregister_rc: int = 0):
+    """libcudart / libamdhip64 as far as ``HostRegistrar`` uses it: the three
+    functions, returning scripted codes and recording each call."""
+    calls = []
+
+    def register(ptr, nbytes, flags):
+        calls.append(("register", ptr, nbytes, flags))
+        return register_rc
+
+    def unregister(ptr):
+        calls.append(("unregister", ptr))
+        return unregister_rc
+
+    def get_last_error():
+        calls.append(("get_last_error",))
+        return 0
+
+    lib = SimpleNamespace(**{
+        f"{api}HostRegister": register,
+        f"{api}HostUnregister": unregister,
+        f"{api}GetLastError": get_last_error,
+    })
+    return lib, calls
+
+
+@pytest.mark.parametrize("platform", [CpuPlatform(), XpuPlatform()])
+def test_only_gpu_platforms_page_lock_host_memory(platform):
+    assert not platform.host_register(1 << 20, 4096)
+    assert not platform.host_unregister(1 << 20)
+
+
+@pytest.mark.parametrize("api", ["cuda", "hip"])
+@pytest.mark.parametrize(
+    ("rc", "registered", "error_read"),
+    [(0, True, False), (712, True, True), (1, False, True)],
+)
+def test_host_register_accepts_a_range_already_registered(api, rc, registered, error_read):
+    """712 is the already-registered code of both runtimes. Any nonzero code
+    is read back, or the thread's next kernel launch would raise it."""
+    from mstar.platforms.host_memory import HostRegistrar
+
+    lib, calls = _fake_runtime(api, register_rc=rc)
+    registrar = HostRegistrar(api, lambda: lib)
+    assert registrar.register(0x1000, 4096) is registered
+    assert calls[0] == ("register", 0x1000, 4096, 0)
+    assert (("get_last_error",) in calls) is error_read
+
+
+def test_host_unregister_of_a_range_never_registered_fails_and_clears_the_error():
+    from mstar.platforms.host_memory import HostRegistrar
+
+    lib, calls = _fake_runtime("hip", unregister_rc=713)
+    assert not HostRegistrar("hip", lambda: lib).unregister(0x1000)
+    assert calls == [("unregister", 0x1000), ("get_last_error",)]
+
+
+def test_a_runtime_that_cannot_load_is_reported_once(caplog):
+    from mstar.platforms.host_memory import HostRegistrar
+
+    loads = []
+
+    def load():
+        loads.append(1)
+        raise OSError("not here")
+
+    registrar = HostRegistrar("hip", load)
+    with caplog.at_level("WARNING", logger="mstar.platforms.host_memory"):
+        assert not registrar.register(0x1000, 4096)
+        assert not registrar.register(0x2000, 4096)
+        assert not registrar.unregister(0x1000)
+    assert len(loads) == 1
+    assert [r.getMessage() for r in caplog.records if "cannot load" in r.getMessage()] == [
+        "cannot load the hip runtime to page-lock host memory (not here); copies through such memory stay pageable"
+    ]
+
+
+def test_rocm_binds_only_the_hip_runtime_torch_already_loaded(monkeypatch):
+    """Loading a second HIP runtime (the system ROCm's) would register memory
+    with a runtime torch's copies never consult."""
+    from mstar.platforms import host_memory
+
+    opened = []
+
+    def cdll(name, mode=0):
+        opened.append((name, mode))
+        raise OSError(f"{name}: not loaded")
+
+    monkeypatch.setattr(torch.version, "hip", "7.2.53211")
+    monkeypatch.setattr(host_memory.ctypes, "CDLL", cdll)
+    with pytest.raises(OSError, match="is loaded in this process"):
+        host_memory._load_amdhip()
+    assert [name for name, _ in opened] == ["libamdhip64.so", "libamdhip64.so.7"]
+    assert all(mode & os.RTLD_NOLOAD for _, mode in opened)
+
+
+@pytest.mark.parametrize(("platform", "registrar"), [(RocmPlatform(), "HIP_HOST"), (CudaPlatform(), "CUDA_HOST")])
+def test_each_gpu_platform_registers_through_its_own_runtime(monkeypatch, platform, registrar):
+    from mstar.platforms import host_memory
+
+    api = "hip" if registrar == "HIP_HOST" else "cuda"
+    lib, calls = _fake_runtime(api)
+    monkeypatch.setattr(host_memory, registrar, host_memory.HostRegistrar(api, lambda: lib))
+    assert platform.host_register(0x1000, 8192)
+    assert platform.host_unregister(0x1000)
+    assert calls == [("register", 0x1000, 8192, 0), ("unregister", 0x1000)]

@@ -1026,7 +1026,7 @@ def test_close_during_a_segment_registration_still_unregisters_it(
 def test_no_host_registration_outlives_a_dropped_arena(tmp_path):
     import gc
 
-    from mstar.communication.arena import _cudart
+    from mstar.platforms import current_platform
 
     os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
     os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
@@ -1037,10 +1037,8 @@ def test_no_host_registration_outlives_a_dropped_arena(tmp_path):
     (ptr,) = m._own_pinned
     del m
     gc.collect()
-    lib = _cudart()
-    rc = lib.cudaHostUnregister(ptr)  # 0 if the registration was left behind
-    lib.cudaGetLastError()
-    assert rc != 0
+    # succeeds only if the registration was left behind
+    assert not current_platform.host_unregister(ptr)
 
 
 def _bigger_than_dev_shm() -> int:
@@ -1265,3 +1263,25 @@ def test_a_failed_pin_leaves_cuda_usable():
 
     assert not arena._pin(4096, 4096)  # not a mapping of this process
     assert (torch.ones(4, device="cuda") + 1).sum().item() == 8
+
+
+def test_segments_are_pinned_through_the_platform(monkeypatch):
+    """hipHostRegister on ROCm, cudaHostRegister on CUDA: the arena only asks."""
+    from mstar.communication import arena as arena_mod
+
+    calls = []
+
+    class _Platform:
+        def host_register(self, ptr, nbytes):
+            calls.append(("register", ptr, nbytes))
+            return True
+
+        def host_unregister(self, ptr):
+            calls.append(("unregister", ptr))
+            return True
+
+    monkeypatch.setattr(arena_mod, "current_platform", _Platform())
+    monkeypatch.setattr(arena_mod.torch.cuda, "is_available", lambda: True)
+    assert arena_mod._pin(0x1000, 4096)
+    assert arena_mod._unpin(0x1000)
+    assert calls == [("register", 0x1000, 4096), ("unregister", 0x1000)]

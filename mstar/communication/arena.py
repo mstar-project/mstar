@@ -8,9 +8,10 @@ copy stream; the ``(segment, offset)`` rides the existing descriptors.
 Consumer: ``start_read_tensors`` maps the named segment once, reads
 zero-copy, H2D-copies on the copy stream; the producer reclaims on ACK,
 gated by a CUDA-event future so an edge is never ACKed before its copies
-land. Segments are mapped once and never move, so the one-time
-``cudaHostRegister`` per segment (within ``MSTAR_SHM_ARENA_PIN_MAX_MB``)
-holds for its lifetime and keeps the side-stream copies truly async.
+land. Segments are mapped once and never move, so the one-time host
+registration per segment (``Platform.host_register``, within
+``MSTAR_SHM_ARENA_PIN_MAX_MB``) holds for its lifetime and keeps the
+side-stream copies truly async.
 
 Capacity degrades in layers: grow by segments up to
 ``MSTAR_SHM_ARENA_MAX_SEGMENTS`` (or until /dev/shm cannot back another
@@ -59,12 +60,11 @@ from mstar.communication.tensors import (
     _serialize_tensor,
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.platforms import current_platform
 from mstar.utils.containers import ParallelList
 from mstar.utils.step_threads import unpin_thread
 
 logger = logging.getLogger(__name__)
-
-_CUDA_HOST_ALREADY_REGISTERED = 712
 
 
 class _Placements(NamedTuple):
@@ -118,32 +118,6 @@ class _CudaEventFuture:
         self._event.synchronize()
 
 
-_CUDART = None
-
-
-def _cudart():
-    """libcudart via ctypes: unlike the torch binding, a ctypes call
-    RELEASES the GIL, so registering a 256 MiB segment (tens of ms) on the
-    send path cannot stall the process's other Python threads (serve loop,
-    stream relays, the wake watcher). Loaded by the soname of torch's CUDA
-    major, which reaches the copy torch already loaded even where it is not
-    on the loader path (a pip install of torch)."""
-    global _CUDART
-    if _CUDART is None:
-        import ctypes
-
-        if not torch.version.cuda:
-            raise OSError("torch is not built with CUDA")
-        lib = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
-        lib.cudaHostRegister.argtypes = [
-            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
-        lib.cudaHostRegister.restype = ctypes.c_int
-        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
-        lib.cudaHostUnregister.restype = ctypes.c_int
-        _CUDART = lib
-    return _CUDART
-
-
 def _unlink_paths(paths: list) -> None:
     """Exit-time segment unlink (weakref.finalize target — must not
     reference the manager). Workers exit with the manager still alive, so
@@ -158,60 +132,39 @@ def _unlink_paths(paths: list) -> None:
 
 
 def _unpin(ptr: int) -> bool:
-    """cudaHostUnregister a previously pinned mapping (GIL released via
-    ctypes). Returns success."""
+    """Unregister a previously pinned mapping. Returns success."""
     if not torch.cuda.is_available():
         return False
-    try:
-        lib = _cudart()
-    except OSError:
-        return False
-    rc = lib.cudaHostUnregister(ptr)
-    if rc != 0:
-        # Left set, the thread's next torch kernel launch raises it.
-        lib.cudaGetLastError()
-    return rc == 0
+    return current_platform.host_unregister(ptr)
 
 
 def _unpin_live(own_pinned: list, peers: dict) -> None:
     """Unregister every pinned own and peer segment (weakref.finalize
     target -- must not reference the manager). Runs before the arena
     objects unmap: a mapping torn down while still registered leaves the
-    registration behind, and a later mapping at the same address then gets
-    ``cudaHostRegister`` rc 712."""
+    registration behind, and a later mapping at the same address is then
+    refused as already registered."""
     for ptr in own_pinned:
         if not _unpin(ptr):
-            logger.warning("ARENA: cudaHostUnregister failed for own "
+            logger.warning("ARENA: host unregister failed for own "
                            "segment %#x", ptr)
     own_pinned.clear()
     for name, (arena, view, pinned) in list(peers.items()):
         if pinned:
             if not _unpin(arena.ptr_len()[0]):
-                logger.warning("ARENA: cudaHostUnregister failed for peer "
+                logger.warning("ARENA: host unregister failed for peer "
                                "%s", name)
             peers[name] = (arena, view, 0)
 
 
 def _pin(ptr: int, nbytes: int) -> bool:
-    """cudaHostRegister a mapped segment (idempotent). Returns success.
-    GIL released for the duration (see ``_cudart``)."""
+    """Page-lock a mapped segment (idempotent). Returns success; the platform
+    logs why not. The GIL is released for the duration, so registering a
+    256 MiB segment on the send path does not stall the process's other
+    Python threads (serve loop, stream relays, the wake watcher)."""
     if not torch.cuda.is_available():
         return False
-    try:
-        lib = _cudart()
-    except OSError as e:
-        logger.warning("ARENA: cannot load libcudart (%s); copies fall back "
-                       "to pageable bandwidth", e)
-        return False
-    rc = lib.cudaHostRegister(ptr, nbytes, 0)
-    if rc != 0:
-        # Set by an already-registered range (accepted below) too.
-        lib.cudaGetLastError()
-    ok = rc in (0, _CUDA_HOST_ALREADY_REGISTERED)
-    if not ok:
-        logger.warning("cudaHostRegister(%#x, %d) failed rc=%d — copies fall "
-                       "back to pageable bandwidth", ptr, nbytes, rc)
-    return ok
+    return current_platform.host_register(ptr, nbytes)
 
 
 class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
@@ -596,13 +549,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 arena, view, pinned = self._peer_segments[name]
                 if pinned:
                     # Unregister BEFORE unmapping: tearing down a mapping
-                    # CUDA still holds registered leaves a dangling pinned
-                    # range. On failure keep the entry (retry next sweep)
+                    # the runtime still holds registered leaves a dangling
+                    # pinned range. On failure keep the entry (retry next sweep)
                     # so accounting stays truthful.
                     ptr, _len = arena.ptr_len()
                     if not _unpin(ptr):
                         logger.warning(
-                            "ARENA: cudaHostUnregister failed for dead peer "
+                            "ARENA: host unregister failed for dead peer "
                             "%s; keeping mapping until it succeeds", name)
                         continue
                     self._pinned_bytes -= pinned
