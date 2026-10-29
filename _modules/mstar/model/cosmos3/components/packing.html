@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 28, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 29, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -1502,9 +1502,8 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_gen_band</span><span class="p">(</span><span class="n">position_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">und_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""The generation band's position ids as their own tensor. A slice of</span>
-<span class="sd">    ``position_ids`` has the prompt length in its stride, which the compiled</span>
-<span class="sd">    denoise step guards on, so every new prompt length would recompile it."""</span>
+<span class="w">    </span><span class="sd">"""The generation band's position ids as their own tensor; the DiT</span>
+<span class="sd">    submodule builds the band's rotary table from them."""</span>
     <span class="k">return</span> <span class="n">position_ids</span><span class="p">[:,</span> <span class="n">und_len</span><span class="p">:]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
 
 
@@ -1648,7 +1647,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 28, 2026.
+  Last updated on Oct 29, 2026.
   <br/>
 </p>
   </div>

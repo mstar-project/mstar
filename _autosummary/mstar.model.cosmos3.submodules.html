@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 28, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 29, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -1077,14 +1077,14 @@ returns True.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.forward_captured">
-<span class="sig-name descname"><span class="pre">forward_captured</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latents</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vision_timesteps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position_ids_cond</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position_ids_uncond</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noisy_token_mask</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3DiTSubmodule.forward_captured"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.forward_captured" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">forward_captured</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latents</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vision_timesteps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cos_cond</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sin_cond</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cos_uncond</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sin_uncond</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noisy_token_mask</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3DiTSubmodule.forward_captured"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.forward_captured" title="Link to this definition">#</a></dt>
 <dd><p>Velocity-only denoise forward captured into a CUDA graph: both guidance
 branches in one pass (the combined plan), no scheduler step. The token
-layout is baked per resolution; the latents, timestep and rotary positions
-are static-buffer inputs stacked on a leading batch dim. A single request
-keeps the two-branch path; a concurrent batch runs the per-request denoise
-(the same compute as the eager cross-request forward), one transformer pass
-over the whole batch.</p>
+layout is baked per resolution; the latents, timestep and each branch’s
+rotary cos and sin are static-buffer inputs stacked on a leading batch
+dim. A single request keeps the two-branch path; a concurrent batch
+runs the per-request denoise (the same compute as the eager
+cross-request forward), one transformer pass over the whole batch.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>engine_inputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p>
@@ -1112,7 +1112,7 @@ over the whole batch.</p>
 resolution. Requests at other resolutions, or without guidance, fall back
 to the eager path. The per-resolution token layout is prompt-independent,
 so bake it once here and key it by latent shape; the per-prompt rotary
-positions, the latents and the timestep flow in as static-buffer inputs.</p>
+tables, the latents and the timestep flow in as static-buffer inputs.</p>
 <p>Set <code class="docutils literal notranslate"><span class="pre">COSMOS3_DISABLE_CUDA_GRAPH=1</span></code> to skip capture and run the denoise
 loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
 Set <code class="docutils literal notranslate"><span class="pre">COSMOS3_GEN_CAPTURE_RES</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">&quot;192x320,480x832&quot;</span></code>, height x
@@ -1942,7 +1942,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 28, 2026.
+  Last updated on Oct 29, 2026.
   <br/>
 </p>
   </div>
