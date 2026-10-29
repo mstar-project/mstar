@@ -132,6 +132,8 @@ class _Node:
         self.overrides = model.get_request_resource_configs(
             {}, model_kwargs={"temperature": 0.0, "ignore_eos": True},
         )
+        # a request's own resource configs (a sampled one's seed), else ``overrides``
+        self.request_configs: dict[str, dict] = {}
         self.cg = None
         if capture:
             self.cg = AcceleratorGraphRunner(
@@ -145,7 +147,7 @@ class _Node:
     def info(self, rid: str) -> CurrentForwardPassInfo:
         return CurrentForwardPassInfo(
             request_id=rid, graph_walk="prefill", fwd_index=0, random_seed=0,
-            max_tokens=MAX_TOKENS, resource_configs=self.overrides,
+            max_tokens=MAX_TOKENS, resource_configs=self.request_configs.get(rid, self.overrides),
         )
 
     def step(self, walk: str, batch: dict[str, tuple[CurrentForwardPassInfo, torch.Tensor]]):
@@ -197,7 +199,7 @@ class _Node:
         """Each prompt prefilled on its own, then decoded as one batch."""
         infos = {rid: self.info(rid) for rid in self.prompts}
         for rid in self.prompts:
-            self.runner.ingest_request(rid, self.overrides)
+            self.runner.ingest_request(rid, self.request_configs.get(rid, self.overrides))
         streams: dict[str, list[int]] = {rid: [] for rid in self.prompts}
         texts = {}
         for rid, prompt in self.prompts.items():

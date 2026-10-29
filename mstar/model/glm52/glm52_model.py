@@ -263,8 +263,9 @@ class Glm52Model(Model):
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,
                 vocab_size=self.config.vocab_size,
-                # MTP verifies greedily: the sampler refuses a request it would answer apart
+                # MTP's drafts are verified by the sampler, by rejection sampling at a temperature
                 draft_verify=self.config.mtp_num_draft_tokens > 0,
+                enable_sampled_verify=self.config.mtp_num_draft_tokens > 0,
             ),
         ]
         if self.config.mtp_num_draft_tokens > 0:
@@ -477,12 +478,6 @@ class Glm52Model(Model):
         for k, cast in (("top_k", int), ("min_p", float)):
             if model_kwargs.get(k) is not None:
                 params[k] = cast(model_kwargs[k])
-        if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP is greedy-only, so greedy is the declared default on MTP
-            # configs: a bare request serves instead of inheriting the config
-            # temperature and being refused by prepare_inputs. An explicit
-            # temperature > 0 still refuses.
-            params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 
     def context_limit(self) -> int:

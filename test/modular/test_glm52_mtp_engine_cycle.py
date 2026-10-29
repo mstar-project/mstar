@@ -453,17 +453,21 @@ def test_batch_of_two_matches_single_streams():
         assert torch.equal(got, singles[rid]), f"{rid}: {got.tolist()} vs {singles[rid].tolist()}"
 
 
-def test_non_greedy_request_is_refused_under_mtp():
-    """The sampler of an MTP node is declared to verify drafts, so the conductor refuses a
-    sampled request as a 400; a request that names no temperature gets 0."""
+def test_mtp_serves_sampled_requests_and_refuses_a_penalty():
+    """The sampler of an MTP node verifies drafts by rejection sampling, so a request at a
+    temperature serves, and one that names none takes the config's, as without MTP. A
+    repetition penalty or min_tokens is still refused (a 400 at the conductor)."""
     model = Glm52Model(model_path_hf="", tokenizer_mode="byte", config_variant="reduced")
     model.config.mtp_num_draft_tokens = 2
     spec = next(s for s in model.get_node_resources() if s.resource_key == SAMPLER_RESOURCE)
-    assert spec.draft_verify
-    for bad in ({"temperature": 0.7}, {"temperature": 0.0, "repetition_penalty": 1.2}):
-        with pytest.raises(ValueError, match="greedy-only"):
+    assert spec.draft_verify and spec.enable_sampled_verify
+    for bad in ({"temperature": 0.7, "repetition_penalty": 1.2}, {"temperature": 0.7, "min_tokens": 3}):
+        with pytest.raises(ValueError, match="can't apply"):
             SamplingReqConfig(**bad).validate(spec)
-    model.get_request_resource_configs({}, model_kwargs={})[SAMPLER_RESOURCE].validate(spec)
+    SamplingReqConfig(temperature=0.7, top_p=0.9, top_k=20).validate(spec)
+    bare = model.get_request_resource_configs({}, model_kwargs={})[SAMPLER_RESOURCE]
+    assert bare.temperature == model.config.temperature
+    bare.validate(spec)
 
 
 def test_declare_step_shapes():
