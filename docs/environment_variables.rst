@@ -434,7 +434,12 @@ Worker scheduling
        completes. Removes the per-step serial build/plan from the group's
        critical path. Voids (allocation failure, per-rid failure, a
        continuing request without loop-back output) are derived by each
-       rank from replicated state, never signalled. A comma-separated
+       rank, never signalled, from N's verdict as the ranks agree on it in
+       one host-side vote per step (``Worker._agree_on_step``): a request
+       that failed after the forward on one rank fails on every rank, and a
+       step that raised, was admitted, or ran different rows on some ranks
+       only stops every worker of the instance with the reason rather than
+       leave them waiting in a collective. A comma-separated
        list of node names (``thinker,talker``) enables it for those
        parallel nodes only. ``0`` (or ``false``): the serial path — leader schedules
        after N, followers rebuild after the broadcast. Set it identically

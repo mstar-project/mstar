@@ -16,7 +16,9 @@ it takes N+1. The order matters as well: the free list hands pages back out in t
 they were freed, so another order gives a follower other page ids than rank 0's.
 
 Drives ``Worker.run`` over stubs. The GPU thread is a stub that holds N+1's admit back until
-a request is torn down, or a while.
+a request is torn down, or a while. Every test runs twice: as the harness has always run, and
+with the node lockstep under ``MSTAR_TP_ASYNC_SCHED``, where each step also ends in the ranks'
+vote on its verdict (over a one-rank group here).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
@@ -43,6 +46,14 @@ HANDLES = {"gone": 1, "kept": 2, "also": 3, "idle": 4}
 STEP_N = [HANDLES[rid] for rid in ("gone", "kept", "also")]
 # how long the GPU thread holds N+1's admit back for a teardown that would jump it
 HOLD_S = 0.25
+# Under the TP async switch: set per test by ``_switch`` below, read by ``_rank``. Other modules
+# that build on ``_rank`` get the harness as it has always run.
+TP_ASYNC = False
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["harness", "tp-async-vote"])
+def _switch(request, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "TP_ASYNC", request.param)
 
 
 class _Stop(BaseException):
@@ -158,7 +169,10 @@ def _rank(
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.parallel_groups = SimpleNamespace(
         barrier_all=lambda: None, restore_default_timeout=lambda: None,
+        get_joint_group_for_node=lambda node: JointGroups(CommGroup.trivial(), CommGroup.trivial()),
     )
+    if TP_ASYNC:
+        w.parallel_nodes, w.tp_async_sched = {NODE}, True
     w.wakeup_event = SimpleNamespace(register_future=lambda future: None)
 
     def _broadcast(node_batch, **kwargs):
