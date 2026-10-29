@@ -1,0 +1,131 @@
+{
+ "arch": "gfx942",
+ "classes": {
+  "decode": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 0
+  },
+  "prefill": {
+   "elems_per_thread": 4,
+   "impl": "triton",
+   "rows_per_program": 2,
+   "waves_per_eu": 0
+  }
+ },
+ "kernel": "fused_add_rms_norm",
+ "product": "mi325x",
+ "provenance": {
+  "harness": "benchmark.kernels.search --spec fused_add_rms_norm, one MI325X VF GPU, one run per cell",
+  "job": "45",
+  "kernel": "row loop (one row of the tile at a time)",
+  "margin": 0.02,
+  "sha": "e82e18819",
+  "stack": "torch-2.12.1_rocm7.2-hip-7.2.53211-triton-3.7.1"
+ },
+ "shapes": {
+  "hidden1024-rows1": {
+   "elems_per_thread": 2,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 0
+  },
+  "hidden1024-rows128": {
+   "elems_per_thread": 2,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 1
+  },
+  "hidden1024-rows16": {
+   "elems_per_thread": 2,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 2
+  },
+  "hidden1024-rows4": {
+   "elems_per_thread": 2,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 2
+  },
+  "hidden1024-rows512": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 1
+  },
+  "hidden1024-rows64": {
+   "elems_per_thread": 2,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 2
+  },
+  "hidden2048-rows1": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 2
+  },
+  "hidden2048-rows128": {
+   "elems_per_thread": 4,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 1
+  },
+  "hidden2048-rows16": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 4
+  },
+  "hidden2048-rows2048": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 2,
+   "waves_per_eu": 4
+  },
+  "hidden2048-rows4": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 4
+  },
+  "hidden2048-rows512": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 2
+  },
+  "hidden2048-rows64": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 4
+  },
+  "hidden4096-rows1": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 1
+  },
+  "hidden4096-rows2048": {
+   "elems_per_thread": 16,
+   "impl": "triton",
+   "rows_per_program": 4,
+   "waves_per_eu": 2
+  },
+  "hidden4096-rows4": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 1
+  },
+  "hidden4096-rows512": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 4
+  }
+ }
+}
