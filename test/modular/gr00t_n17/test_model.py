@@ -143,14 +143,17 @@ _VIDEO_KEYS = {
     "oxe": ["video.image_0", "video.image_1", "video.image_2"],
     "franka": ["video.front", "video.wrist"],
 }
-_MAX_VIEWS = 3
+_MAX_FRAMES = 3 * 2  # the widest embodiment's views x the stub's two timesteps
 
 
 class _Processor:
-    """Only the fields ``max_views`` and ``__init__``'s embodiment check read."""
+    """Only the fields the frame bounds and ``__init__``'s embodiment check read."""
 
-    def __init__(self, video_keys: dict[str, list[str]], embodiment_ids: dict[str, int] | None = None):
+    def __init__(self, video_keys: dict[str, list[str]], embodiment_ids: dict[str, int] | None = None,
+                 video_steps: dict[str, int] | None = None):
         self.video_keys = video_keys
+        # two timesteps per view, as every embodiment in the checkpoint has
+        self.video_steps = {tag: 2 for tag in video_keys} if video_steps is None else video_steps
         # the tiny config has 4 embodiments; both ends of the range are used
         self.embodiment_ids = {"gr1": 0, "oxe": 1, "franka": 3} if embodiment_ids is None else embodiment_ids
 
@@ -764,7 +767,7 @@ def test_the_vision_bound_is_the_only_one_that_is_not_one_per_request():
     specs = _specs(_model())
 
     assert {key: spec.config.max_segments_per_request for key, spec in specs.items()} == {
-        VISION_ATTN: _MAX_VIEWS, LLM_ATTN: 1, BRIDGE_ATTN: 1, DT_ATTN: 1, DT_XATTN: 1,
+        VISION_ATTN: _MAX_FRAMES, LLM_ATTN: 1, BRIDGE_ATTN: 1, DT_ATTN: 1, DT_XATTN: 1,
     }
     # the count that makes 1 look wrong
     assert len(DT_XATTN_PAIRS) == 2
@@ -794,26 +797,28 @@ def test_causality_is_declared_on_the_step_and_not_on_the_resource():
 
 
 # ----------------------------------------------------------------------------
-# `max_views`, which is a property of the checkpoint
+# The ViT's segment bound, a property of the checkpoint
 # ----------------------------------------------------------------------------
 
 
-_VIEW_CASES = {
-    "three embodiments, the widest in the middle": (_VIDEO_KEYS, 3),
-    "one embodiment, one view": ({"gr1": ["video.ego_view"]}, 1),
-    "five views": ({"rig": list("abcde"), "gr1": ["x"]}, 5),
+# per-tag views and timesteps -> a request's most frames
+_FRAME_CASES = {
+    "three embodiments, the widest in the middle, two steps": (_VIDEO_KEYS, None, 3 * 2),
+    "one view, one step": ({"gr1": ["video.ego_view"]}, {"gr1": 1}, 1),
+    # the most any one tag carries, not the widest tag's views times the longest tag's steps
+    "the widest tag is not the longest": ({"rig": list("abcde"), "gr1": ["x"]}, {"rig": 1, "gr1": 4}, 5 * 1),
 }
 
 
-@pytest.mark.parametrize("video_keys, expected", list(_VIEW_CASES.values()), ids=list(_VIEW_CASES))
-def test_max_views_is_the_widest_embodiments_video_keys(video_keys, expected):
-    """Sizes the ViT's segment bound; an under-count plans fewer spans than the forward
-    attends, and a ragged kernel reading the declared length gives a wrong answer, not a
-    crash. Read off the processor's per-tag video keys (``Gr00tN17Preprocessor.video_keys``)."""
-    model = _model(video_keys=video_keys)
+@pytest.mark.parametrize("video_keys, steps, frames", list(_FRAME_CASES.values()), ids=list(_FRAME_CASES))
+def test_the_vit_segment_bound_is_a_requests_most_frames(video_keys, steps, frames):
+    """``vision_encoder`` declares one segment per frame, views x timesteps; a bound of views
+    alone (3 for DROID's 4 frames) would size a captured wrapper's plan too small."""
+    model = _model()
+    model.processor = _Processor(video_keys, video_steps=steps)
 
-    assert model.max_views == expected
-    assert _specs(model)[VISION_ATTN].config.max_segments_per_request == expected
+    assert _specs(model)[VISION_ATTN].config.max_segments_per_request == frames
+    assert model.max_input_files() == {"image": frames}
 
 
 # ----------------------------------------------------------------------------
@@ -1588,9 +1593,8 @@ def test_the_model_constructs_from_its_two_checkpoints():
     assert isinstance(model.processor, Gr00tN17Preprocessor)
     assert model.processor.max_state_dim == model.config.max_state_dim
     assert model.processor.max_action_horizon == model.config.action_horizon
-    # 3: the widest embodiment in this checkpoint, off the processor's video keys
-    assert model.max_views == 3
-    assert _specs(model)[VISION_ATTN].config.max_segments_per_request == 3
+    # 3 views x 2 timesteps: the widest embodiment in this checkpoint, off the processor
+    assert _specs(model)[VISION_ATTN].config.max_segments_per_request == 6
     # a frozenset, as `Model.request_kwargs` declares; no `video`: frames travel the media path
     assert model.request_kwargs() == frozenset({"embodiment_tag", "state", "walk"})
     # `walk` stays on the control wire: the conductor chooses the schedule with it
