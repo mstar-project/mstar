@@ -1,4 +1,3 @@
-# Needs upstream PR #705 to start: without it, a mesh with two axes hangs creating its gloo groups.
 model: "wan22"
 
 # See wan22_cfg_parallel_2gpu.yaml. On four GPUs the dit splits both ways: one
