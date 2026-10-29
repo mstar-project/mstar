@@ -67,6 +67,11 @@ class AcceleratorGraphConfig(ABC):
         # which can pick the wrong dim when an unrelated axis happens to
         # match the bucket's token count.
         input_seq_dims: dict[str, int] | None = None,
+        # Compile one graph whose bucket-varying dims are dynamic, rather than
+        # one per bucket (size 1 still gets its own). For forwards whose
+        # kernels gain little from a fixed size, e.g. an encoder over
+        # fixed-size windows; each bucket is still captured on its own.
+        compile_dynamic: bool = False,
     ):
         self.capture_graph_walk = capture_graph_walk
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
@@ -83,6 +88,7 @@ class AcceleratorGraphConfig(ABC):
         # scales by this. Subclasses that support it set it.
         self.total_tokens_multiplier = 1
         self.input_seq_dims = input_seq_dims
+        self.compile_dynamic = compile_dynamic
 
     @abstractmethod
     def get_config_type(self) -> AcceleratorGraphConfigType:
@@ -111,6 +117,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         total_tokens_multiplier: int = 1,
         compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
+        compile_dynamic: bool = False,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -122,6 +129,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
+            compile_dynamic=compile_dynamic,
         )
         self.single_request_inputs = single_request_inputs
         # ``single_request_inputs.input_seq_len`` is also read per-label by the
