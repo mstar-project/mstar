@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 
 import torch
 
+from mstar.platforms.facts import DeviceFacts, device_facts
 from mstar.platforms.ptxas import blackwell_ptxas_env
 
 
@@ -48,6 +49,13 @@ class Platform:
         """An NVIDIA GPU of at least ``major.minor``; never true off NVIDIA."""
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
+
+    def device_facts(self, device=None) -> DeviceFacts:
+        """The GPU's architecture, product, compute units, caches and peak
+        bandwidth and throughput, for kernel heuristics and the kernel harness
+        (see ``mstar.platforms.facts``); never for model code. Unknown fields
+        are None."""
+        return device_facts(self, device)
 
     def inductor_overrides(
         self, num_tokens: int | None = None, rows: int | None = None,
