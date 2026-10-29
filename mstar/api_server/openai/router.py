@@ -117,35 +117,28 @@ async def list_models():
     return JSONResponse(ModelList(data=cards).model_dump(exclude_none=True))
 
 
-async def _lora_admin_call(call):
-    """A ``LoraAdmin`` call's answer, or its failure as an OpenAI error envelope: an
-    HTTPException's own status and detail, a ValueError's 400, and for anything else a
-    500 that is logged but does not quote the exception, which may name server paths."""
+async def _lora_admin_call(call, route: str):
+    """A ``LoraAdmin`` call's answer, or its failure as an OpenAI error envelope
+    (:func:`_exception_error`)."""
     api = _api()
     if api is None:
         return _error(503, "Server not ready")
     try:
         return PlainTextResponse(await call(api.lora_admin))
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
-        status = getattr(e, "status_code", None)
-        if status is not None:
-            return _error(status, str(getattr(e, "detail", e)))
-        if isinstance(e, (ValueError, TypeError)):
-            return _error(400, str(e))
-        logger.exception("LoRA adapter request failed")
-        return _error(500, "the LoRA adapter request failed (the server log has the details)")
+        return _exception_error(e, route)
 
 
 @router.post("/v1/load_lora_adapter")
 async def load_lora_adapter(request: LoadLoraAdapterRequest):
     return await _lora_admin_call(
-        lambda admin: admin.load(request.lora_name, request.lora_path),
+        lambda admin: admin.load(request.lora_name, request.lora_path), "/v1/load_lora_adapter",
     )
 
 
 @router.post("/v1/unload_lora_adapter")
 async def unload_lora_adapter(request: UnloadLoraAdapterRequest):
-    return await _lora_admin_call(lambda admin: admin.unload(request.lora_name))
+    return await _lora_admin_call(lambda admin: admin.unload(request.lora_name), "/v1/unload_lora_adapter")
 
 
 @router.post("/v1/chat/completions")
