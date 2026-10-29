@@ -9,10 +9,10 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
+from mstar.model.components.distributed import ParallelKimiDeltaAttention
+from mstar.model.components.kda import KDAConfig, KimiDeltaAttention
 from mstar.model.glm5_next.config import KDA_STATE, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
-from mstar.model.glm5_next.kda import Glm5NextKdaConfig, Glm5NextLinearAttention
 from mstar.model.glm5_next.weight_loader import build_glm5_next_read_plan
 
 TP = 2
@@ -30,13 +30,13 @@ class _FakeGroup:
         return x
 
 
-def _cfg() -> Glm5NextKdaConfig:
-    return Glm5NextKdaConfig(hidden_size=32, linear_num_heads=4, linear_head_dim=8)
+def _cfg() -> KDAConfig:
+    return KDAConfig(hidden_size=32, num_heads=4, head_dim=8)
 
 
-def _full_layer(seed: int) -> Glm5NextLinearAttention:
+def _full_layer(seed: int) -> KimiDeltaAttention:
     torch.manual_seed(seed)
-    layer = Glm5NextLinearAttention(_cfg(), dtype=torch.float32)
+    layer = KimiDeltaAttention(_cfg(), dtype=torch.float32)
     for p in layer.parameters():
         torch.nn.init.normal_(p, std=0.3)
     return layer
@@ -44,7 +44,7 @@ def _full_layer(seed: int) -> Glm5NextLinearAttention:
 
 # checkpoint-shaped tensors of the full layer, keyed like the loader sees
 # them after remapping (conv split back into its q|k|v thirds)
-def _checkpoint(full: Glm5NextLinearAttention) -> dict[str, tuple[torch.Tensor, str | None]]:
+def _checkpoint(full: KimiDeltaAttention) -> dict[str, tuple[torch.Tensor, str | None]]:
     q = full.qkv_dim
     w = full.conv1d.weight.detach()
     return {
@@ -66,7 +66,7 @@ def _checkpoint(full: Glm5NextLinearAttention) -> dict[str, tuple[torch.Tensor, 
     }
 
 
-def _slice_for_rank(name: str, tensor: torch.Tensor, rank: int, full: Glm5NextLinearAttention) -> torch.Tensor:
+def _slice_for_rank(name: str, tensor: torch.Tensor, rank: int, full: KimiDeltaAttention) -> torch.Tensor:
     """What the read plan hands rank ``rank``: the head block of a sharded
     tensor, the whole tensor otherwise."""
     qkv = full.qkv_dim // TP
@@ -82,7 +82,7 @@ def _slice_for_rank(name: str, tensor: torch.Tensor, rank: int, full: Glm5NextLi
     return tensor
 
 
-def _load(layer: Glm5NextKdaAttention, ckpt, rank: int, full, presliced: bool) -> None:
+def _load(layer: ParallelKimiDeltaAttention, ckpt, rank: int, full, presliced: bool) -> None:
     params = dict(layer.named_parameters())
     for name, (tensor, shard_id) in ckpt.items():
         base = name.split("/")[0]
@@ -96,10 +96,10 @@ def _load(layer: Glm5NextKdaAttention, ckpt, rank: int, full, presliced: bool) -
             param.data.copy_(tensor)
 
 
-def _ranks(full, presliced: bool) -> list[Glm5NextKdaAttention]:
+def _ranks(full, presliced: bool) -> list[ParallelKimiDeltaAttention]:
     ranks = []
     for r in range(TP):
-        layer = Glm5NextKdaAttention(_cfg(), comm_group=_FakeGroup(r, TP), dtype=torch.float32)
+        layer = ParallelKimiDeltaAttention(_cfg(), comm_group=_FakeGroup(r, TP), dtype=torch.float32)
         _load(layer, _checkpoint(full), r, full, presliced)
         ranks.append(layer)
     return ranks
@@ -138,23 +138,24 @@ def test_sharded_ranks_reproduce_the_full_layer(presliced):
 
 
 def test_every_output_path_is_reduced_across_tp():
-    # o_proj is row-parallel with no reduce of its own, so each public path that
-    # ends in it must be wrapped by the TP subclass, or TP>1 serves partial sums.
+    # o_proj is row-parallel with no reduce of its own, so each path that ends in it
+    # (the dense reference's, and the resource path's _project_out) must be wrapped by
+    # the TP subclass, or TP>1 serves partial sums.
     ends_in_o_proj = {
-        name for name, fn in vars(Glm5NextLinearAttention).items()
-        if callable(fn) and not name.startswith("_")
+        name for name, fn in vars(KimiDeltaAttention).items()
+        if callable(fn) and name != "_finalize"
         and any(s in inspect.getsource(fn) for s in ("self.o_proj(", "self._finalize("))
     }
-    assert {"prefill", "decode_step"} <= ends_in_o_proj
-    assert ends_in_o_proj <= set(vars(Glm5NextKdaAttention))
-    # the paged path is the subclass's own, and reduces on both of its branches
-    source = inspect.getsource(Glm5NextKdaAttention.forward_paged)
+    assert {"prefill", "decode_step", "_project_out"} <= ends_in_o_proj
+    assert ends_in_o_proj <= set(vars(ParallelKimiDeltaAttention))
+    # the resource path reduces on both of its branches
+    source = inspect.getsource(ParallelKimiDeltaAttention._project_out)
     assert source.count("all_reduce(") == 2
 
 
 def test_loaders_refuse_a_wrong_width():
     full = _full_layer(2)
-    layer = Glm5NextKdaAttention(_cfg(), comm_group=_FakeGroup(0, TP), dtype=torch.float32)
+    layer = ParallelKimiDeltaAttention(_cfg(), comm_group=_FakeGroup(0, TP), dtype=torch.float32)
     bad = torch.zeros(full.qkv_dim + 1, full.hidden_size)
     with pytest.raises(ValueError, match="rows"):
         layer.q_proj.weight.weight_loader(layer.q_proj.weight, bad)
@@ -174,7 +175,7 @@ def test_pool_blocks_shard_the_same_axes():
     state, conv = pool.blocks["state"].shape, pool.blocks["conv"].shape
     assert state == (full_state[0] // TP, *full_state[1:])
     assert conv == (full_conv[0] // TP, full_conv[1])
-    layer = Glm5NextKdaAttention(model.config, comm_group=_FakeGroup(0, TP), dtype=torch.float32)
+    layer = ParallelKimiDeltaAttention(model.config.kda_config(), comm_group=_FakeGroup(0, TP), dtype=torch.float32)
     assert conv[0] == layer.conv_dim
     assert state == (layer.num_heads, layer.head_dim, layer.head_dim)
 

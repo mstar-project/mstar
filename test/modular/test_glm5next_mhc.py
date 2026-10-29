@@ -9,10 +9,7 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from mstar.model.glm5_next.kda import (
-    Glm5NextForgetGate,
-    Glm5NextKdaConfig,
-)
+from mstar.model.components.kda import KDAConfig, KDAForgetGate
 from mstar.model.glm5_next.mhc import (
     Glm5NextHyperConnection,
     Glm5NextHyperHead,
@@ -225,8 +222,8 @@ def test_dtype_stability_no_silent_fp64():
     torch.manual_seed(4)
     d = 32
     hc = Glm5NextHyperConnection(hidden_size=d, hc_mult=4).to(torch.bfloat16)
-    gate = Glm5NextForgetGate(
-        Glm5NextKdaConfig(hidden_size=d, linear_num_heads=2, linear_head_dim=8),
+    gate = KDAForgetGate(
+        KDAConfig(hidden_size=d, num_heads=2, head_dim=8),
         dtype=torch.bfloat16)
     # Checkpoint dtypes: projections bf16, dt_bias / A_log strict fp32.
     assert gate.f_a_proj.weight.dtype == torch.bfloat16
@@ -262,8 +259,8 @@ def test_dtype_stability_no_silent_fp64():
 def test_forget_gate_matches_independent_reference():
     torch.manual_seed(5)
     b, s, hidden, heads, head_dim = 2, 3, 16, 2, 4
-    cfg = Glm5NextKdaConfig(
-        hidden_size=hidden, linear_num_heads=heads, linear_head_dim=head_dim)
+    cfg = KDAConfig(
+        hidden_size=hidden, num_heads=heads, head_dim=head_dim)
     x = torch.randn(b, s, hidden)
     w_a = torch.randn(head_dim, hidden) * 0.5
     w_b = torch.randn(heads * head_dim, head_dim) * 0.5
@@ -282,7 +279,7 @@ def test_forget_gate_matches_independent_reference():
     ).reshape(b, s, heads, head_dim)
     decay_np = np.exp(a_log.numpy().astype(f64))[None, None, :, None]
 
-    gate = Glm5NextForgetGate(cfg, dtype=torch.float32)
+    gate = KDAForgetGate(cfg, dtype=torch.float32)
     with torch.no_grad():
         gate.f_a_proj.weight.copy_(w_a)
         gate.f_b_proj.weight.copy_(w_b)
@@ -302,7 +299,7 @@ def test_forget_gate_matches_independent_reference():
     # checkpoint: the one live implementation refuses it loudly instead of
     # shipping a second, untested math path.
     with pytest.raises(ValueError, match="softplus"):
-        Glm5NextForgetGate(
-            Glm5NextKdaConfig(
-                hidden_size=hidden, linear_num_heads=heads,
-                linear_head_dim=head_dim, gate_lower_bound=None))
+        KDAForgetGate(
+            KDAConfig(
+                hidden_size=hidden, num_heads=heads,
+                head_dim=head_dim, gate_lower_bound=None))
