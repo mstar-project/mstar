@@ -1969,6 +1969,12 @@ class Worker:
         final_stream_rids, stream_partition_done_rids = self._settle_final_streams(
             node_name, final_edges or {},
         )
+        if request_walks:
+            # Every path to a step comes through here, a TP follower's too, so
+            # each rank orders the leader's rows alike.
+            request_ids = self.engine_manager.get_engine(node_name).order_split_rows(
+                node_name, graph_walk, request_ids, request_walks,
+            )
         return ExecutingBatch(
             node_name=node_name,
             per_request_info=per_request_info,

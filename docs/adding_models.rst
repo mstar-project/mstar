@@ -1426,7 +1426,10 @@ can key on. A step of one walk keeps that walk's cap. A step that mixes walks ta
 combined walk's ``max_batch_size`` when it has one, else the smallest cap of the walks it
 holds, so a small prefill cap never limits a decode-only step.
 ``max_rows_in_combined(self, graph_walk)`` also bounds how many rows of one walk a mixed
-step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``).
+step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``). A resource
+that runs a combined walk on such split kernels declares it with a ``CombinedSplit``; the
+engine then orders that walk's steps with the ``prefill_walks`` rows last, so the kernels
+read the decode rows as the step's first tokens, in place.
 
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
