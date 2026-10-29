@@ -135,14 +135,15 @@ def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
 
 
 @triton.jit
-def _rms_norm_rope(
+def rms_norm_rope(
     x_first, x_second, w_ptr, pos, eps, rope_theta,
     D: tl.constexpr,
     HALF_D: tl.constexpr,
 ):
     """One head, given as its two halves in fp32: RMSNorm by the weight at
     ``w_ptr``, then rotate-half RoPE at position ``pos`` over the full head
-    dim. Returns the two rotated halves."""
+    dim. Returns the two rotated halves. Shared by the kernels here and the
+    code predictors' (``model/components/code_predictor_kernels.py``)."""
     offs_half = tl.arange(0, HALF_D)
     sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
     inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
@@ -175,7 +176,7 @@ def _qk_norm_rope_kernel(
     x_second = tl.load(base + (offs_half + HALF_D) * sx_d).to(tl.float32)
 
     pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    out_first, out_second = _rms_norm_rope(
+    out_first, out_second = rms_norm_rope(
         x_first, x_second, W_norm_ptr, pos, eps, rope_theta, D, HALF_D,
     )
 
@@ -235,7 +236,7 @@ def _qk_pair_norm_rope_kernel(
     x_first = tl.load(base + offs_half).to(tl.float32)
     x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
     pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    out_first, out_second = _rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
+    out_first, out_second = rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
     tl.store(base + offs_half, out_first.to(Q_ptr.dtype.element_ty))
     tl.store(base + offs_half + HALF_D, out_second.to(Q_ptr.dtype.element_ty))
 
@@ -309,7 +310,7 @@ def _qk_norm_rope_kv_kernel(
     x_first = tl.load(base + offs_half).to(tl.float32)
     x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
     pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    out_first, out_second = _rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
+    out_first, out_second = rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
 
     if pid_h < H_Q:
         tl.store(base + offs_half, out_first.to(Q_ptr.dtype.element_ty))
