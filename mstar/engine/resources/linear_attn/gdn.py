@@ -22,6 +22,7 @@ from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
     GDNMixedWrapper,
     GDNPrefillWrapper,
+    GDNVerifyWrapper,
     GDNWrapper,
     PrefillStagers,
 )
@@ -60,6 +61,7 @@ class GDNManager(LinearAttnManager):
         self.state_dtype = state_dtype
         self._device = device
         self._pool_key = config.recurrent_state
+        self._spec_key = config.spec_decode
         self._has_sink = has_sink
         # chosen once, by `LinearAttnManager.build`; every wrapper runs these
         self._kernels = kernels
@@ -87,7 +89,10 @@ class GDNManager(LinearAttnManager):
         self._cached_plan_output: dict[str, GDNWrapper] | None = None
 
     def depends_on(self) -> set[str]:
-        # the pool plans first; its addressing arrives via `ctx.plan_results`
+        # the pool plans first; its addressing arrives via `ctx.plan_results`,
+        # and a speculative step's start slots via the speculative resource's
+        if self._spec_key is not None:
+            return {self._pool_key, self._spec_key}
         return {self._pool_key}
 
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
@@ -115,9 +120,13 @@ class GDNManager(LinearAttnManager):
             return self._current
 
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
+        verify = self._verify_plan(ctx)
 
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
+            if verify is not None:
+                self._current[label] = self._build_verify(label, addressing[label], verify, ctx)
+                continue
             self._current[label] = self._build_plan(
                 label, segments, addressing[label], ctx
             )
@@ -138,6 +147,46 @@ class GDNManager(LinearAttnManager):
         for seg in segments:
             out.setdefault(seg.label, []).append(seg)
         return out
+
+    def _verify_plan(self, ctx: StepContext):
+        """The speculative resource's plan, if this step verifies drafts."""
+        if self._spec_key is None:
+            return None
+        from mstar.engine.resources.spec_decode.config import SpecPhase
+
+        plan = ctx.plan_results.get(self._spec_key)
+        if plan is None or plan.phase is not SpecPhase.VERIFY:
+            return None
+        return plan
+
+    def _build_verify(
+        self, label: str, addressing: RecurrentAddressing, verify, ctx: StepContext,
+    ) -> GDNWrapper:
+        groups = addressing.host_slot_groups
+        if groups is None:
+            raise RuntimeError(
+                "a speculative verify step needs the pool's slot groups; declare "
+                "the pool with RecurrentStateConfig.spec_tokens"
+            )
+        lease = ctx.slot_lease
+        if lease is None:
+            key, store, bs = (label, "verify"), self._eager_wrappers, None
+        else:
+            key, store = CGSlotKey(lease.bucket, lease.slot, label), self._cg_wrappers
+            bs = max(self._cg_max_bs, lease.bucket.bs)
+        wrapper = store.get(key)
+        if wrapper is None:
+            wrapper = store[key] = GDNVerifyWrapper(
+                device=self._device,
+                pad_slot_id=PAD_SLOT_ID,
+                tokens_per_row=len(groups[0]) if groups else 1,
+                bs=bs,
+                accelerator_graph=lease is not None,
+                null_slot_id=SINK_SLOT if self._has_sink else NO_SLOT,
+                kernels=self._kernels,
+            )
+        wrapper.plan(groups[: addressing.num_rows], verify.num_accepted)
+        return wrapper
 
     def _get_wrapper(
         self, label: str, is_decode: bool, lease: SlotLease | None = None,
