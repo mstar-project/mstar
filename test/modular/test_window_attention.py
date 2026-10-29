@@ -66,6 +66,26 @@ def test_whisper_encoder_attention_matches_sdpa():
 def test_gpu_matches_float32_reference():
     q, k, v = (_bshd(2, 1500, 20, 64, seed=i).cuda() for i in range(3))
     want = _reference(q, k, v)
-    got = wa.window_attention(q.bfloat16(), k.bfloat16(), v.bfloat16())
+    got = wa.window_attention_kernel()(q.bfloat16(), k.bfloat16(), v.bfloat16())
     assert got.shape == want.shape
     torch.testing.assert_close(got.float(), want, rtol=2e-2, atol=2e-2)
+
+
+def test_whisper_encoder_layer_traces_as_one_graph():
+    """The layer binds its kernels when built, so dynamo never meets the
+    dispatch's first pick (a lock it can't trace, a graph break mid-encoder)."""
+    from torch._dynamo.testing import CompileCounter
+
+    from mstar.model.whisper.components.encoder import WhisperEncoderLayer
+    from mstar.model.whisper.config import WhisperModelConfig
+    from mstar.platforms.dispatch import PlatformDispatch
+
+    PlatformDispatch.reset_all()
+    layer = WhisperEncoderLayer(WhisperModelConfig(d_model=32, encoder_attention_heads=4, encoder_ffn_dim=64)).eval()
+    with torch.no_grad():
+        for p in layer.parameters():
+            p.normal_(0, 0.2)
+        counter = CompileCounter()
+        torch._dynamo.reset()
+        torch.compile(layer, backend=counter, fullgraph=True)(torch.randn(2, 7, 32))
+    assert counter.frame_count == 1
