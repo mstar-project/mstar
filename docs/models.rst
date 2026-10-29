@@ -1993,7 +1993,9 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    from 23.9 to 22.6 dB. Both stay far closer to the reference than another seed is
    (normalized distance median 0.09 and 0.10, where 0 is a kernel change and 1 another seed),
    but klein-9B falls under the ROCm floor of 3 dB below the reference's own kernel spread, so
-   it stays opt-in, a quality trade to make per deployment.
+   it stays opt-in, a quality trade to make per deployment. Z-Image-Turbo's longer sampler
+   carries the error further (two of 40 images half-way or more to another seed), so ``fp8``
+   is not recommended there.
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one
