@@ -106,7 +106,7 @@ Communication
      - Size of each arena segment. The arena grows segment by segment;
        existing segments never move (registrations stay valid). A
        segment's /dev/shm pages are committed when it is created (pinned
-       segments always were, by ``cudaHostRegister``), so the whole
+       segments always were, by host registration), so the whole
        segment counts against /dev/shm, as do spill files, which land in
        /dev/shm by default. A segment /dev/shm cannot hold counts as arena
        full (sends spill, see ``MSTAR_SHM_ARENA_SPILL``).
@@ -137,9 +137,12 @@ Communication
        (a worker cannot receive ACKs while it waits).
    * - ``MSTAR_SHM_ARENA_PIN``
      - ``1``
-     - ``cudaHostRegister`` each mapped segment (both sides) so D2H/H2D
-       copies through the side streams run at page-locked bandwidth and
-       stay asynchronous. ``0`` disables (pageable copies).
+     - Page-lock each mapped segment (both sides) through
+       ``Platform.host_register``, ``cudaHostRegister`` on CUDA and
+       ``hipHostRegister`` on ROCm, so D2H/H2D copies through the side
+       streams run at page-locked bandwidth and stay asynchronous. Read by
+       ``ArenaShmCommunicationManager.__init__``. ``0`` disables (pageable
+       copies).
    * - ``MSTAR_SHM_ARENA_PIN_MAX_MB``
      - ``4096``
      - Budget for TOTAL pinned host memory PER PROCESS, distinct from the
