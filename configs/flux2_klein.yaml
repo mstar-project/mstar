@@ -22,11 +22,12 @@ model_kwargs:
   # is bit-exact with the eager one (the activations add nothing but graph breaks); every served image is then
   # >= 53 dB from the eager path on all 100 protocol prompts (the compiled VAE) — [norms] 0.371 s at B=1 vs 0.356 plain and 0.383 with the activations too; 0.461 without compile
   # On AMD GPUs this is not applied (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M kernel choice
-  # keeps the output off the reference bit for bit either way.
+  # keeps the output off the reference bit for bit either way. MI325X: 0.406 -> 0.384 s at B=1, 2.97 -> 3.32 images/s at c=16.
   compile_exact_ops: [norms]
   accelerator_graph: true
   # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles
-  # per batch size inside its first requests and decodes on the eager VAE. Edits keep the one bucket.
+  # per batch size inside its first requests and decodes on the eager VAE. Edits keep the one bucket. MI325X: the
+  # first 1344x768 request takes 0.4-0.7 s instead of 1.4-1.7 (86 s on a cold server); warm startup 63 -> 72-84 s.
   capture_sizes: [[1024, 1024], [768, 1344]]
   capture_edit_sizes: [[1024, 1024]]
   # every batch size up to max_batch_size: a lockstep group of 5-7 requests would otherwise be padded into the 8-graph
