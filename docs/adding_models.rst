@@ -1040,8 +1040,9 @@ placed exactly as weights are.
   a delta called outside a step would add another step's adapters to these rows. The
   engine brackets every planned step's ``preprocess`` and forward, and every capture, in
   ``StepRunner.compute_scope`` (``Resource.enter_compute`` / ``exit_compute``); an
-  engine-built pool refuses a delta called outside one, including from
-  ``warmup_compiles``, which runs outside any step. A piecewise region that runs
+  engine-built pool refuses a delta called outside one when run eagerly.
+  ``warmup_compiles`` runs outside any step, so a node serving adapters runs no adapted
+  linear there. A piecewise region that runs
   adapted modules declares their rows in its own step, or its capture is refused.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
