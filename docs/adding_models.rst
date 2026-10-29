@@ -505,8 +505,10 @@ Snapshots stay off without ``prefix_slots``, and also above one rank, without a 
 cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
 off or can't open at the pool's world size; in those cases the pool allocates no snapshot
 slots. Neither does a pool whose cache the engine keeps shut for another reason, such as a
-model that names no checkpoint and sets no salt. Every cache on the node of a pool without
-snapshots stays shut, and the engine logs which pool kept it shut.
+model that names no checkpoint and sets no salt, or a resource over the pool that can't
+write its snapshots, as AITER's GDN kernels on AMD GPUs can't (they keep no state
+checkpoints; ``NodeResourceSpec.restore_refusal`` says so). Every cache on the node of a
+pool without snapshots stays shut, and the engine logs which pool kept it shut.
 ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py`` is that rule over the
 specs. The engine evaluates it once, before it builds any resource, and opens exactly the
 caches it returns of those it holds; the conductor's routing and the API server's prompt
