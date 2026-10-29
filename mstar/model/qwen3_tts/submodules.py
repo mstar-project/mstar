@@ -144,10 +144,11 @@ class TalkerSubmodule(ARNodeSubmodule):
     # for this path. The whole decode forward (CodePredictor loop included) is
     # still CUDA-graph captured.
     disable_torch_compile = True
-    # The largest decode bucket is also the cap on rows per Talker step: a
-    # step costs nearly the same at 64 rows as at 32 (it is launch-bound), so
-    # with 32 as the top, 64 streams ran as two alternating batches of 32.
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64]
+    # The largest decode bucket is also the cap on rows per Talker step. Near
+    # capacity more streams are live than a step takes, and the rest wait in
+    # turn until their playback stalls, so the cap bounds how many streams one
+    # instance keeps in real time.
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128]
     MAX_BATCH_SIZE = DECODE_CAPTURE_BATCH_SIZES[-1]
     # Prefill prompts are short (a sentence plus the ChatML frame, an optional
     # instruction and speaker slot): a few token buckets cover them, and the
@@ -158,7 +159,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     # which keeps it in the captured token buckets. Its captures run to the
     # decode cap: one below it would split the batch.
     MIXED_MAX_PREFILL_ROWS = 4
-    MIXED_CAPTURE_BATCH_SIZES = [8, 16, 32, 48, 64]
+    MIXED_CAPTURE_BATCH_SIZES = [8, 16, 32, 48, 64, 96, 128]
     MIXED_TOKEN_BUCKETS = [128, 256, 512, 1024]
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS = CHATML_ASSISTANT_PREFIX_TOKEN_IDS
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
