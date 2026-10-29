@@ -1,0 +1,19 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+# qwen3omni_2gpu.yaml with Code2Wav on its own worker on the Talker's GPU
+# (rank_devices), so Talker steps no longer take turns with Code2Wav steps on
+# one worker loop. Same KV pools.
+resources:
+  thinker_kv:
+    max_num_pages: 1024
+    cpu_offload_pages: 1024
+node_groups:
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [1]
+  - node_names: [Thinker]
+    ranks: [1]
+  - node_names: [Talker]
+    ranks: [0]
+  - node_names: [Code2Wav]
+    ranks: [2]
+rank_devices: {2: 0}
