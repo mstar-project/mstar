@@ -532,6 +532,23 @@ def test_a_module_declaring_a_child_it_does_not_have_unservable_is_refused():
                          resource_key="lora", nodes={"N"}, root_path="")
 
 
+@pytest.mark.parametrize("absorb", [False, True])
+def test_absorbed_mla_refuses_the_projections_it_folds_at_load(absorb):
+    from mstar.model.components.mla import MLAAttention
+    from mstar.model.glm52.config import Glm52ModelConfig
+
+    cfg = Glm52ModelConfig.reduced()
+    cfg.mla_absorb = absorb
+    with torch.device("meta"):
+        root = nn.Module()
+        root.layers = nn.ModuleList([MLAAttention(cfg, kv_key="kv", attn_key="attn", pos_key="pos")])
+    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+    folded = {"q_a_proj", "kv_a_proj_with_mqa", "kv_b_proj"}
+    assert set(spec.targets) == {"q_b_proj", "o_proj"} | (set() if absorb else folded)
+    refused = {p.removeprefix("layers.0.") for p, r in spec.module_map.unservable.items() if "mla_absorb" in r}
+    assert refused == (folded if absorb else set())
+
+
 # --- the checkpoint: keys, scaling, header refusals ----------------------------------------
 
 @pytest.mark.parametrize("key,want", [
