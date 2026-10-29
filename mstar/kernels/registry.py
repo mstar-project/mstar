@@ -151,6 +151,12 @@ class KernelOp:
     def op(self) -> torch._ops.OpOverloadPacket:
         return getattr(getattr(torch.ops, NAMESPACE), self.name)
 
+    @property
+    def dispatch(self) -> PlatformDispatch:
+        """What accelerator tensors reach: the implementation for this process's
+        platform and architecture, called with the op's arguments."""
+        return self._dispatch
+
     def __call__(self, *args, **kwargs):
         return self.op(*args, **kwargs)
 
