@@ -27,7 +27,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Web
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
@@ -47,6 +47,7 @@ from mstar.api_server.request_types import (
     PreprocessInput,
     ResultChunk,
 )
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.model.multimodal import PromptPart
@@ -1572,6 +1573,20 @@ class APIServer:
         else:
             self.abort_submission(key)
 
+    def release_submission(self, key: str | None) -> None:
+        """:meth:`release_request` for one submission, by its key
+        (:meth:`submission_key`); a newer submission under the id is untouched."""
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            finished = req is not None and req.event.is_set()
+            if finished:
+                self.pending_requests.pop(key)
+                self._retire(key)
+        if finished:
+            self._record_end(req, "abort")
+        else:
+            self.abort_submission(key)
+
     # ----------------------------------------------------------
     # Cleanup
     # ----------------------------------------------------------
@@ -2420,10 +2435,12 @@ async def generate(
             # private vendor type that appears in no other media range, and a
             # client that does not ask for it keeps the historical NDJSON body.
             binary = BINARY_STREAM_MEDIA_TYPE in request.headers.get("accept", "")
+            key = api_server.submission_key(request_id)
             # wait for the first chunk: a refused request gets its real status, not a 200
             chunks = await api_server.open_result_stream(request_id, request)
-            return StreamingResponse(
+            return ReleasingStreamingResponse(
                 api_server.async_stream_results(request_id, binary=binary, chunks=chunks),
+                release=lambda: api_server.release_submission(key),
                 media_type=BINARY_STREAM_MEDIA_TYPE if binary else NDJSON_STREAM_MEDIA_TYPE,
                 headers={"Cache-Control": "no-cache", "Vary": "Accept"},
             )

@@ -83,15 +83,18 @@ def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: boo
     """Wrap a compiled callable so ``emulate_precision_casts`` is in effect for the
     traces it builds, and only for those. This works with torch.compile's lazy
     compilation, and post-torch 2.12 per-thread config behavior, without introducing
-    a global config change. ``deterministic`` also builds them in Inductor's
-    deterministic mode, where this torch has it: no on-device benchmarking that
-    changes numerics, so every process compiles the same kernels.
+    a global config change. ``deterministic`` also builds them with the engine's
+    deterministic compile option (``accelerator_graph_runner.
+    deterministic_inductor_options``): no on-device benchmarking that changes
+    numerics, so every process compiles the same kernels.
     """
     import torch._inductor.config as inductor_config
 
     options = {"emulate_precision_casts": eager_rounding}
-    if deterministic and hasattr(inductor_config, "deterministic"):
-        options["deterministic"] = True
+    if deterministic:
+        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+
+        options.update(deterministic_inductor_options())
 
     def forward(*args, **kwargs):
         with inductor_config.patch(**options):
