@@ -23,6 +23,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
+from mstar.model.components.depth_decoder import DepthDecoder
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
@@ -173,11 +174,7 @@ class Qwen3TTSTalkerModel(nn.Module):
 # ---------------------------------------------------------------------------
 # CodePredictor: autoregression across codec groups within one frame
 # ---------------------------------------------------------------------------
-# Qwen3-Omni has the same high-level residual-code loop, but currently uses a
-# different attention primitive, checkpoint/config namespace, sampling policy,
-# and CUDA-graph capture path.  Sharing the loop before the auxiliary-sampler
-# work tracked in #199 would couple two independently validated model ports;
-# factor the common implementation after that engine interface is available.
+# The group loop is DepthDecoder's, shared with Qwen3-Omni's code predictor.
 
 
 class Qwen3TTSCodePredictorLayer(nn.Module):
@@ -223,13 +220,13 @@ class Qwen3TTSCodePredictorInnerModel(nn.Module):
         ])
 
 
-class Qwen3TTSCodePredictor(nn.Module):
+class Qwen3TTSCodePredictor(DepthDecoder):
     """Five-layer decoder that predicts codec groups 1 through 15.
 
-    ``forward_depth_unrolled`` performs one position on the group-depth axis.
-    Callers first write the Talker hidden state at position 0, then repeatedly
-    feed the preceding codec embedding at positions 1-15. Keeping this as
-    tensor-only code allows the complete depth loop to be CUDA-graph captured.
+    ``DepthDecoder.run_depth_loop`` walks the groups: position 0 holds the
+    Talker hidden state, position g the embedding of group g's code. On
+    platforms without the fused depth kernels it runs ``forward_depth_unrolled``,
+    one position through every layer, per group.
 
     Every depth input arrives in the Talker width and passes through
     ``small_to_mtp_projection`` (a biased linear layer on the 1.7B
@@ -264,6 +261,11 @@ class Qwen3TTSCodePredictor(nn.Module):
             ),
             persistent=False,
         )
+
+    @property
+    def input_projection(self) -> nn.Module | None:
+        projection = self.small_to_mtp_projection
+        return None if isinstance(projection, nn.Identity) else projection
 
     def consolidate_stacked_weights(self) -> None:
         """Pack the 15 loaded LM heads into graph-friendly contiguous storage."""
