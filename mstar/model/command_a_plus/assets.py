@@ -7,7 +7,7 @@ CHECKPOINT_REVISION = "5fb6fde5fd12ff89356aae552e11883bc49f069b"
 METADATA_FILES = (
     "config.json", "tokenizer.json", "tokenizer_config.json",
     "special_tokens_map.json", "chat_template.jinja", "generation_config.json",
-    "model.safetensors.index.json",
+    "preprocessor_config.json", "model.safetensors.index.json",
 )
 
 

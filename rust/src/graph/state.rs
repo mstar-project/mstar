@@ -162,6 +162,8 @@ pub struct Completed {
     /// takes a reference on each. Apply before `freed`, which can name the
     /// same tensor.
     pub taken: Vec<u64>,
+    /// Finished-loop cache holds to exchange for routed readers AFTER fanout.
+    pub transferred: Vec<u64>,
 }
 
 /// Python's `SpeculativeNodeInfo`.
@@ -189,6 +191,7 @@ pub struct RequestState {
     /// `Loop._uncache_outputs`, `Loop._uncache_accumulated_outputs`).
     refs_taken: Vec<u64>,
     refs_released: Vec<u64>,
+    refs_transferred: Vec<u64>,
 }
 
 impl RequestState {
@@ -204,7 +207,7 @@ impl RequestState {
             nodes, loops, ready: vec![0; w], ready_streaming: vec![0; w],
             root_completed: 0, is_done: false, num_times_run: 0,
             spec_dirty: Vec::new(), refs_taken: Vec::new(),
-            refs_released: Vec::new(), graph,
+            refs_released: Vec::new(), refs_transferred: Vec::new(), graph,
         };
         s.seed_streaming_ready();
         s
@@ -537,6 +540,7 @@ impl RequestState {
             filtered,
             freed,
             taken: std::mem::take(&mut self.refs_taken),
+            transferred: std::mem::take(&mut self.refs_transferred),
         }
     }
 
@@ -632,6 +636,11 @@ impl RequestState {
             let st = &mut self.loops[lid as usize];
             (std::mem::take(&mut st.cached), std::mem::take(&mut st.accum))
         };
+        // Keep the holds alive through fanout/persist marking. Nested loops
+        // can transfer the same UUID more than once; preserve multiplicity.
+        for (_, tensors) in cached.iter().chain(accum.iter()) {
+            self.refs_transferred.extend(tensors.iter().map(|t| t.uuid));
+        }
         let own_edges_from = out.len();
         for o in &lspec.outputs {
             let t = cached.iter().find(|(n, _)| *n == o.name)
@@ -780,6 +789,16 @@ impl RequestState {
 
     pub fn loop_indices(&self) -> Vec<u32> {
         self.loops.iter().map(|l| l.curr_iter).collect()
+    }
+
+    /// Python's `WorkerGraphIO.is_idle`: no input held, nothing in flight, no
+    /// loop mid-run -- what `reset` leaves behind.
+    pub fn is_idle(&self) -> bool {
+        self.root_completed == 0
+            && self.nodes.iter().all(|n| {
+                n.cur.mask == 0 && n.next.mask == 0 && n.spec.mask == 0 && !n.in_flight
+            })
+            && self.loops.iter().all(|l| l.curr_iter == 0 && l.ext_inputs.is_empty())
     }
 
     // -- speculation ---------------------------------------------------------
@@ -958,6 +977,7 @@ mod tests {
                 // Advancing un-caches the regular output only; the
                 // accumulated one is held across iterations.
                 assert_eq!(done.freed, vec![new_tok], "iteration {i}");
+                assert!(done.transferred.is_empty());
                 assert_eq!(st.loop_iter(0), i as u32 + 1);
                 let names: Vec<Sym> = done.edges.iter().map(|e| e.name).collect();
                 assert_eq!(names, vec![tok, it.get("frame").unwrap(), h]);
@@ -972,6 +992,7 @@ mod tests {
                 // Finishing hands the caches to the loop's output edges: no
                 // release, and the loop-back edge is dropped.
                 assert!(done.freed.is_empty());
+                assert_eq!(done.transferred, vec![30, 11, 21, 31]);
                 assert_eq!(done.filtered, vec![(tok, dec)]);
                 assert!(done.edges.iter().all(|e| !matches!(e.dest, Dest::Local(_))));
                 let out: Vec<(Dest, Vec<u64>)> = done.edges.iter()
