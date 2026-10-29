@@ -41,6 +41,9 @@ def _entrypoint_prefix(monkeypatch, tmp_path, *argv) -> str:
         def __init__(self, **kwargs):
             pass
 
+        def max_input_files(self):
+            return {}
+
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("model: fake\n")
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)

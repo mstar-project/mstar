@@ -155,6 +155,7 @@ class PreprocessWorker:
         enable_prof: bool=False,
         model_config: dict | None = None,
         enable_nvtx: bool=False,
+        cpus: list[int] | None = None,
     ):
         check_media_limits()
         self.request_input_queue = queue.Queue()
@@ -218,6 +219,7 @@ class PreprocessWorker:
                 worker_metrics_requested=self.worker_metrics_requested,
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
+                cpus=cpus,
             )
         )
         self.thread.start()
@@ -475,7 +477,11 @@ class PreprocessWorkerThread:
         wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
+        cpus: list[int] | None = None,
     ):
+        # the preprocessing pool's CPUs (see entrypoint._preprocess_split); None
+        # runs where the process does
+        self.cpus = cpus
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -1304,6 +1310,11 @@ class PreprocessWorkerThread:
         return lambda: wait(idle_ms)
 
     def run(self):
+        # Before this thread's first torch op: torch's intra-op team is created
+        # by its master thread there, and its threads inherit the master's CPUs.
+        cpus = getattr(self, "cpus", None)
+        if cpus:
+            os.sched_setaffinity(0, cpus)
         # A thread told to stop before it starts (teardown tests build one with
         # only its queues) has nothing to warm up.
         if not self.stop_event.is_set():

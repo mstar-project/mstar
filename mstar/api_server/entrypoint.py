@@ -116,9 +116,15 @@ def _conductor_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    engine_cpus: list[int] | None = None,
 ):
     """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
-    turns on the conductor's status message (metrics on)."""
+    turns on the conductor's status message (metrics on). ``engine_cpus``, when
+    set, is what the conductor and the workers it spawns run on: the CPUs the
+    API server's preprocessing pool leaves (see `_preprocess_split`)."""
+    if engine_cpus:
+        # before any thread starts: every later thread and worker inherits it
+        os.sched_setaffinity(0, engine_cpus)
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -362,6 +368,7 @@ class APIServer:
         log_stats_file: str | None = None,
         enable_nvtx: bool = False,
         model_config: dict | None = None,
+        preprocess_cpus: list[int] | None = None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -399,6 +406,7 @@ class APIServer:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
             enable_nvtx=self.enable_nvtx,
+            cpus=preprocess_cpus,
         )
 
         self._init_request_state()
@@ -1960,14 +1968,41 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
-def _set_preprocess_threads(model, config: dict) -> None:
+def _preprocess_split(config: dict) -> tuple[list[int], list[int]] | None:
+    """``config.yaml``'s ``preprocess_cpus: N``: the API server's preprocessing
+    pool on the last N CPUs of the process's affinity, and the rest, which the
+    conductor and the engine workers run on; None (the default) for no split.
+
+    Off by default: with the pool sized below, pinning it measured no
+    consistent gain for Whisper large-v3 on a B300 (2 of 8 CPUs, or 1 of 4).
+    """
+    from mstar.utils.cpus import preprocess_cpu_split
+
+    pool = config.get("preprocess_cpus")
+    return preprocess_cpu_split(int(pool)) if pool else None
+
+
+def _set_preprocess_threads(model, config: dict, pool: list[int] | None = None) -> None:
     """Size torch's intra-op pool for this process's media preprocessing.
 
     ``config.yaml``'s ``preprocess_torch_threads`` wins, else the model's
-    ``PREPROCESS_TORCH_THREADS``; None keeps torch's default. Affects only this
-    process: the conductor and workers are spawned fresh.
+    ``PREPROCESS_TORCH_THREADS``, else one thread per CPU of the preprocessing
+    ``pool``. A model that takes audio otherwise gets a quarter of the CPUs the
+    quota lets the process keep busy, at most 4: its mel extraction is a burst
+    of small torch ops per clip, and a pool of a thread per core shares those
+    cores with the engine worker's busy threads, so each op waits on whichever
+    of its threads is descheduled (with 3 of 8 cores busy a clip takes 91 ms on
+    8 threads, 9 on 2) and requests queue behind it. None keeps torch's
+    default. Affects only this process: the conductor and workers are spawned
+    fresh.
     """
     threads = config.get("preprocess_torch_threads", model.PREPROCESS_TORCH_THREADS)
+    if threads is None and pool:
+        threads = len(pool)
+    if threads is None and "audio" in model.max_input_files():
+        from mstar.utils.cpus import usable_cpus
+
+        threads = max(1, min(4, usable_cpus() // 4))
     if threads is None:
         return
     import torch
@@ -2084,7 +2119,13 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    _set_preprocess_threads(model, config)
+    split = _preprocess_split(config)
+    pool_cpus, engine_cpus = split if split is not None else (None, None)
+    if split is not None:
+        logger.info(
+            "Preprocessing on CPUs %s; the conductor and workers on %s", pool_cpus, engine_cpus,
+        )
+    _set_preprocess_threads(model, config, pool_cpus)
 
     global api_server
     log_stats = args.log_stats or args.log_stats_file is not None
@@ -2100,6 +2141,7 @@ def main(argv: list[str] | None = None):
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
         enable_nvtx=args.enable_nvtx,
+        preprocess_cpus=pool_cpus,
     )
 
     from mstar.api_server.openai.adapters import get_adapter
@@ -2123,7 +2165,10 @@ def main(argv: list[str] | None = None):
             args.tcp_transfer_device
         ),
         # The API server drops these until enable_metrics(), after the warmups.
-        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None},
+        kwargs={
+            "status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None,
+            "engine_cpus": engine_cpus,
+        },
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)

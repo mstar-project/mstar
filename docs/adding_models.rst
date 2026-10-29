@@ -1661,6 +1661,25 @@ default:
 The setting applies only to the API server process. The conductor and workers keep
 torch's default.
 
+A model that takes audio, and sets neither, gets a quarter of the CPUs the cgroup quota lets
+the process keep busy, at most 4 (``mstar.utils.cpus.usable_cpus``). Its mel extraction is
+a burst of small torch ops per clip, and a pool of a thread per core shares those cores
+with the engine worker's busy threads, so each op waits on a descheduled thread and
+requests queue behind it. For Whisper large-v3 on 8 CPUs, the queue at 32 concurrent
+requests went from about 0.5 s to 40 ms.
+
+``preprocess_cpus: N`` also splits the CPUs. The API server pins its data worker thread,
+which runs the preprocessing and whose intra-op team inherits the pin, to the last ``N``
+CPUs of the process's affinity. Torch's pool takes that many threads, and the conductor
+and the engine workers run on the rest. There is no split when the engine would keep
+fewer than three CPUs. It is off by default, because it measured no consistent gain over
+the thread count alone for Whisper:
+
+.. code-block:: yaml
+
+   model: "whisper_large"
+   preprocess_cpus: 2
+
 .. _tensor-parallelism:
 
 Tensor parallelism (sharding)
