@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import torch
+
+from mstar.platforms.facts import DeviceFacts, device_facts
+from mstar.platforms.ptxas import blackwell_ptxas_env
 
 
 class Platform:
@@ -47,6 +50,13 @@ class Platform:
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
 
+    def device_facts(self, device=None) -> DeviceFacts:
+        """The GPU's architecture, product, compute units, caches and peak
+        bandwidth and throughput, for kernel heuristics and the kernel harness
+        (see ``mstar.platforms.facts``); never for model code. Unknown fields
+        are None."""
+        return device_facts(self, device)
+
     def inductor_overrides(
         self, num_tokens: int | None = None, rows: int | None = None,
     ) -> dict[str, object]:
@@ -60,10 +70,15 @@ class Platform:
         """
         return {}
 
-    def process_env_defaults(self) -> dict[str, str]:
+    def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         """Environment variables for settings a runtime or library reads once
         at init. Workers apply them with ``os.environ.setdefault`` before their
         first device call, so a value the user exported wins.
+
+        A callable adds to the user's value instead: it gets the current value
+        (None when unset) and returns the one to set. The conductor applies the
+        defaults and each worker again, so it must return a value that already
+        has its addition unchanged.
         """
         return {}
 
@@ -101,6 +116,10 @@ class CudaPlatform(Platform):
 
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
+
+    def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
+        # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
+        return {"NCCL_GRAPH_REGISTER": "0", **blackwell_ptxas_env()}
 
 
 class RocmPlatform(Platform):
