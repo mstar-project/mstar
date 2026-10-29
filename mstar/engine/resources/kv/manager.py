@@ -1912,6 +1912,7 @@ class KVManager(AttentionResource):
 
             page_size = self.config.page_size
             sink = step.sink
+            adjust = step.commit_adjust
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
@@ -1920,6 +1921,8 @@ class KVManager(AttentionResource):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
+                if adjust:
+                    seq_len += max(adjust.get((segment.request_id, segment.label), 0), 0)
                 # the common decode row: its pages already cover the token it
                 # appends, so there is nothing to acquire and nothing to record
                 if (
@@ -2206,6 +2209,7 @@ class KVManager(AttentionResource):
                 if eager_write and ctx.is_preplan and plan_state.token_to_page.is_cuda:
                     plan_state.ready = torch.cuda.Event()
                     plan_state.ready.record()
+            indptrs.write_state = plan_state
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
             else:
@@ -2731,11 +2735,13 @@ class KVManager(AttentionResource):
                 # another batch that is as big (surely sharing rows) or that
                 # names a cached row: the cache no longer describes the streams
                 self._plan_epoch += 1
-        if not step.commit:
+        if not step.commit or step.commit_adjust:
             self._plan_epoch += 1
         rows = self._readonly_rows
         if rows is not None and any(seg.span and seg.request_id in rows for seg in step.segments):
             self._readonly_epoch += 1
+
+        adjust = step.commit_adjust
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
@@ -2786,6 +2792,14 @@ class KVManager(AttentionResource):
                             self._assert_layout(segment, stream, touched, ctx, policy)
                     if index_on and stream.chain is not None:
                         self._index_filled_pages(segment, stream, ctx, touched)
+                    if adjust:
+                        # after the layout and index saw the span; pages are a
+                        # high-water mark, so a tail given back keeps them
+                        stream.stored_len = max(
+                            stream.stored_len
+                            + adjust.get((segment.request_id, segment.label), 0),
+                            0,
+                        )
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1

@@ -533,6 +533,12 @@ class KVStep(ResourceStep):
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.
     retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
+    # (request_id, label) -> tokens this commit adds beyond the segment's span:
+    # positive reserves room past it (admit sizes the pages for it too),
+    # negative gives back tokens an earlier commit over-counted. Speculative
+    # decoding commits the most a verify step could keep and settles the
+    # difference here once the host has learned it.
+    commit_adjust: Mapping[tuple[str, str], int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, kw_only=True)
