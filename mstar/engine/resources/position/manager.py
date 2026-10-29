@@ -210,13 +210,6 @@ class RopeManager(PositionManager):
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
 
-    def correct_len(self, rid: str, label: str, delta: int) -> None:
-        """Move a stream's position by ``delta``, beside ``KVManager.correct_len``: a speculative
-        verify step advances by its whole block, and its rejected tail is taken back from both
-        once the acceptance is known."""
-        counters = self._counters.setdefault(rid, {})
-        counters[label] = max(0, counters.get(label, 0) + delta)
-
     @property
     def rewind_kind(self) -> RewindKind | None:
         # a block scheme moves by a fixed step per block, not per token

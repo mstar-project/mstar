@@ -97,7 +97,10 @@ def test_glm52_graph_walks_are_one_node():
 
 
 def _specs(config):
-    kv, attn, pos, sampler = _make_model(config).get_node_resources()
+    kv, attn, pos, sampler, *extra = _make_model(config).get_node_resources()
+    # under MTP the draft-verify resource, and the sampler declared to verify
+    assert [spec.resource_key for spec in extra] == (["draft_verify"] if config.mtp_num_draft_tokens else [])
+    assert sampler.draft_verify == (config.mtp_num_draft_tokens > 0)
     assert isinstance(kv, KVSpec) and kv.resource_key == KV_RESOURCE
     assert isinstance(sampler, SamplerSpec) and sampler.resource_key == SAMPLER_RESOURCE
     assert attn.resource_key == ATTN_RESOURCE

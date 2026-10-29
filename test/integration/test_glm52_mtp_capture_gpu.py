@@ -6,6 +6,8 @@ import torch
 from test_glm52_capture_gpu import PROMPTS, _load, _Node
 
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+from mstar.engine.resources import DRAFT_VERIFY
+from mstar.model.glm52.config import SAMPLER_RESOURCE
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 
 pytestmark = pytest.mark.skipif(
@@ -16,8 +18,8 @@ MAX_TOKENS = 12
 
 
 class _MtpNode(_Node):
-    """``_Node`` plus the engine's host cut of a verify step (``unpack_packed_outputs``), and
-    streams that take every token a step emits."""
+    """``_Node`` plus the engine's cut of a verify step's tokens and its stop
+    (``Engine._emit_verified``), and streams that take every token a step emits."""
 
     def __init__(self, *args, seed_oracle: dict[str, list[int]] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -32,12 +34,18 @@ class _MtpNode(_Node):
 
     def step(self, walk, batch):
         outs = super().step(walk, batch)
-        unpacked = self.sub.unpack_packed_outputs(
-            static_output={}, request_ids=list(batch), real_seq_lens=[], inputs=[],
-            per_request_info={rid: info for rid, (info, _) in batch.items()},
-        )
-        for rid, rid_out in unpacked.items():
-            outs[rid].update(rid_out)
+        policy = self.sub.get_draft_policy(walk)
+        self.stops = set()
+        if policy is not None:
+            rids = list(batch)
+            infos = [info for info, _ in batch.values()]
+            rows = self.resources[DRAFT_VERIFY].emitted_rows(
+                rids, [info.max_tokens for info in infos],
+                [info.resource_configs[SAMPLER_RESOURCE].ignore_eos for info in infos], policy,
+            )
+            for rid, tokens in zip(rids, torch.from_numpy(rows.tokens).split(rows.counts.tolist()), strict=True):
+                outs[rid]["new_token"] = [tokens]
+            self.stops = {rid for rid, done in zip(rids, rows.done.tolist(), strict=True) if done}
         return outs
 
     def generate(self) -> dict[str, list[int]]:
@@ -69,7 +77,7 @@ class _MtpNode(_Node):
                 self.sub.postprocess(rid, infos[rid], out)
                 streams[rid] += out["new_token"][0].tolist()
                 texts[rid] = out["text_inputs"][0].clone()
-                if self.sub.check_stop(rid, infos[rid], out):
+                if rid in self.stops:
                     live.remove(rid)
         return streams
 
@@ -109,7 +117,7 @@ def test_captured_mtp_matches_eager_and_plain_decode(tmp_path, monkeypatch, eage
         if capture:
             assert node.cg.any_graphs and node.cg.dropped_buckets == []
         streams[capture] = node.generate()
-        accepted = submodule._mtp_stat_emitted - submodule._mtp_stat_steps
+        accepted = node.resources[DRAFT_VERIFY].drafts_accepted
         node.close()
         if oracle:
             assert accepted > 0, "the seed oracle's d1 never got accepted"

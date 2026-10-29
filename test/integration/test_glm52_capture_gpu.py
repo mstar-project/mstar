@@ -19,6 +19,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.draft_verify.resource import DraftVerifyResource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.glm52._testing import per_request_outputs
 from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
@@ -124,6 +125,10 @@ class _Node:
         }
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.bind_node_resources(self.resources)
+        for resource in self.resources.values():
+            # the engine binds a draft-verify resource to its sampler at load
+            if isinstance(resource, DraftVerifyResource):
+                resource.bind_sampler(self.resources[resource.sampler_key])
         self.overrides = model.get_request_resource_configs(
             {}, model_kwargs={"temperature": 0.0, "ignore_eos": True},
         )

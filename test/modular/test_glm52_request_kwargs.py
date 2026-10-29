@@ -96,12 +96,18 @@ def test_a_request_without_max_tokens_runs_to_the_window():
 
 
 @pytest.mark.parametrize("kwargs", [{"temperature": 0.7}, {"repetition_penalty": 1.1}])
-def test_mtp_refuses_sampling_it_cannot_serve_in_process_prompt(kwargs):
-    with pytest.raises(ValueError, match="greedy only"):
-        _model(mtp_num_draft_tokens=2).process_prompt("Hi", ["text"], ["text"], **kwargs)
-    # without MTP it samples
-    out = _model().process_prompt("Hi", ["text"], ["text"], **kwargs)
-    assert out.new_input_tensors["text_inputs"][0].numel() == 2
+def test_mtp_refuses_sampling_it_cannot_serve_as_a_400(kwargs):
+    """The MTP sampler is declared to verify drafts, so the conductor's validation refuses
+    sampling a greedy verify can't serve; without MTP it samples."""
+    for k, refused in ((2, True), (0, False)):
+        m = _model(mtp_num_draft_tokens=k)
+        spec = next(s for s in m.get_node_resources() if s.resource_key == SAMPLER_RESOURCE)
+        config = m.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
+        if refused:
+            with pytest.raises(ValueError, match="greedy-only"):
+                config.validate(spec)
+        else:
+            config.validate(spec)
 
 
 @pytest.mark.parametrize("kwargs", [{}, {"temperature": 0}, {"temperature": None}])

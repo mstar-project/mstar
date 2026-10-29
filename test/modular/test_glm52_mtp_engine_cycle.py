@@ -34,8 +34,12 @@ def _force_cpu_flashinfer(monkeypatch):
 
 
 from request_walks import run_walks  # noqa: E402
+from test_glm52_kv_layout import _conduct, _dispatched  # noqa: E402
+from test_kv_layout_intake import _preprocess  # noqa: E402
 
-from mstar.engine.resources import AllocationFailed, StepContext  # noqa: E402
+from mstar.engine.resources import DRAFT_VERIFY, AllocationFailed, SamplingReqConfig, StepContext  # noqa: E402
+from mstar.engine.resources.kv import manager as kv_manager_mod  # noqa: E402
+from mstar.engine.resources.kv.config import KVReqConfig  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
     build_cpu_resources,
     install_cpu_rope,
@@ -79,8 +83,9 @@ def _fwd_info(rid, max_tokens: int, ignore_eos: bool, wire: str | None = None) -
 
 
 class _Driver:
-    """The engine's per-step cycle for one node, over real resources: declare, admit,
-    plan, preprocess, forward, commit, the host's cut of packed outputs, postprocess."""
+    """The engine's per-step cycle for one node, over real resources: declare, admit (whose
+    runner rewinds the last verify step first), plan, preprocess, forward, commit, the
+    engine's cut of a verify step's tokens (``Engine._emit_verified``), postprocess."""
 
     def __init__(self, sub: Glm52LLMSubmodule, cfg: Glm52ModelConfig, rids: list[str], **pool):
         self.sub = sub
@@ -114,16 +119,38 @@ class _Driver:
         raw = self.sub.forward_batched(walk, engine_inputs, **kw)
         self.runner.commit(step)
         outs = per_request_outputs(raw, rids)
-        unpacked = self.sub.unpack_packed_outputs(
-            static_output=raw, request_ids=rids,
-            real_seq_lens=[inp.input_seq_len for inp in inputs], inputs=inputs,
-            per_request_info=infos,
-        )
-        for rid, rid_out in unpacked.items():
-            outs[rid].update(rid_out)
+        policy = self.sub.get_draft_policy(walk)
+        if policy is not None:
+            rows = self.resources[DRAFT_VERIFY].emitted_rows(
+                rids, [info.max_tokens for info in infos.values()],
+                [info.resource_configs[SAMPLER_RESOURCE].ignore_eos for info in infos.values()], policy,
+            )
+            for rid, tokens, done in zip(
+                rids, torch.from_numpy(rows.tokens).split(rows.counts.tolist()), rows.done.tolist(), strict=True,
+            ):
+                outs[rid]["new_token"] = [tokens]
+                outs[rid][_VERIFY_STOP] = done
         for rid, (info, _) in batch.items():
             self.sub.postprocess(rid, info, outs[rid])
         return outs
+
+    def check_stop(self, rid, info, out) -> set[str]:
+        """A verify step's stop is the engine's, from its cut; any other step's, the submodule's."""
+        if _VERIFY_STOP in out:
+            return {"decode_loop"} if out[_VERIFY_STOP] else set()
+        return self.sub.check_stop(rid, info, out)
+
+
+# the stop the engine settles with a verify step's tokens, carried on its outputs here
+_VERIFY_STOP = "verify_stop"
+
+
+def _rewind_now(driver: _Driver, rids) -> None:
+    """What the next step's admit does first: take back the last verdicts' rejected rows."""
+    verdicts = driver.resources[DRAFT_VERIFY].settle(rids)
+    if verdicts is not None:
+        for key in (KV_RESOURCE, POS_RESOURCE):
+            driver.resources[key].rewind(verdicts)
 
 
 def _drive(driver: _Driver, prompt: torch.Tensor, info, max_steps=64) -> torch.Tensor:
@@ -133,7 +160,7 @@ def _drive(driver: _Driver, prompt: torch.Tensor, info, max_steps=64) -> torch.T
     def step(walk, inputs, iteration):
         info.dynamic_loop_iter_counts = {"decode_loop": iteration} if walk == "decode" else {}
         out = driver.step(walk, {rid: (info, inputs["text_inputs"][0])})[rid]
-        return out, driver.sub.check_stop(rid, info, out)
+        return out, driver.check_stop(rid, info, out)
 
     model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
     return torch.tensor(run_walks(model, step, prompt, info.max_tokens, max_steps))
@@ -209,7 +236,8 @@ def _oracle(sub: Glm52LLMSubmodule, reference: dict, wrong_every: int):
     def decode(engine_inputs, *args):
         rids = list(engine_inputs.request_ids)
         # tokens emitted before this step: its first draft is the one at that position
-        where.update(rids=rids, row=0, done={rid: sub._mtp_emitted[rid] for rid in rids})
+        emitted = engine_inputs.resources[DRAFT_VERIFY]._emitted
+        where.update(rids=rids, row=0, done={rid: emitted[rid] or 1 for rid in rids})
         return real_decode(engine_inputs, *args)
 
     def draft(h_head, prev):
@@ -239,9 +267,11 @@ def test_mtp_keys_request_state_by_handle():
     streams = []
     for wire in (None, "req-a"):
         sub = Glm52LLMSubmodule(model, cfg)
-        streams.append(_drive(_Driver(sub, cfg, [7]), prompt, _fwd_info(7, 14, True, wire)))
+        driver = _Driver(sub, cfg, [7])
+        streams.append(_drive(driver, prompt, _fwd_info(7, 14, True, wire)))
+        driver.runner.remove_request(7)
         sub.cleanup_request(7)
-        assert not sub._mtp_max_tokens and not sub._mtp_ignore_eos
+        assert 7 not in sub._mtp_slot and 7 not in driver.resources[DRAFT_VERIFY]._emitted
     assert torch.equal(streams[0], streams[1])
 
 
@@ -317,9 +347,9 @@ def test_mtp_eos_truncation_matches_baseline():
 
 @pytest.mark.parametrize("wrong_every", [None, 0], ids=["mtp", "oracle"])
 def test_kv_length_tracks_the_verified_stream(wrong_every):
-    """Every step commits its whole block; the next declare takes back the rows the verdict
-    rejected, from the KV length and the position alike, so each step starts from the prompt
-    plus the emitted tokens but the last."""
+    """Every step commits its whole block; the next step's admit takes back the rows the
+    verdict rejected, from the KV length and the position alike, so each step starts from
+    the prompt plus the emitted tokens but the last."""
     k = 2
     (base, _), _ = _run_pair(k=k, max_tokens=20, ignore_eos=True, mla_absorb=True)
     cfg = _cfg(k, True)
@@ -339,38 +369,49 @@ def test_kv_length_tracks_the_verified_stream(wrong_every):
     out = driver.step("prefill", {"r0": (info, prompt)})["r0"]
     total = prompt.numel() + 1
     assert length() == prompt.numel()
+    dv = driver.resources[DRAFT_VERIFY]
     for _ in range(4):
         inputs = [sub.prepare_inputs("decode", info, {"text_inputs": out["text_inputs"]})]
-        sub.declare_step("decode", ["r0"], inputs)  # the trim; idempotent at the real declare
+        step = sub.declare_step("decode", ["r0"], inputs)
+        step.set_ctx(StepContext(request_ids=("r0",), graph_walk="decode", slot=0, capture=False))
+        # the rewind lands as the step admits, before it reserves; given back here, and the
+        # real step's admit finds nothing more to take
+        assert driver.runner.admit(step).ok
+        driver.runner.rollback_admit(step)
         assert length() == total - 1
+        before = dv.drafts_accepted
         out = driver.step("decode", {"r0": (info, out["text_inputs"][0])})["r0"]
-        _, _, accepted = sub._mtp_verdict["r0"]
+        accepted = dv.drafts_accepted - before
         assert out["new_token"][0].numel() == accepted + 1
         assert length() == total - 1 + k + 1
         assert out["text_inputs"][0].numel() == 1
         total += accepted + 1
 
 
-def test_every_rank_keeps_rank_0s_verdict(monkeypatch):
-    """The verdict is broadcast from rank 0 before anything reads it: here rank 0 accepted no
-    draft where this rank's oracle drafts were all right, and the step still trims, emits
-    and seeds by rank 0's, so the stream stays the plain one, a token a step."""
+def test_every_rank_keeps_rank_0s_verdict():
+    """The sampler's verify broadcasts the verdict from rank 0 before anything reads it: here
+    rank 0 accepted no draft where this rank's oracle drafts were all right, and the step
+    still rewinds, emits and seeds by rank 0's, so the stream stays the plain one, a token a
+    step."""
     k = 2
     (base, _), _ = _run_pair(k=k, max_tokens=12, ignore_eos=True, mla_absorb=True)
     calls = []
 
-    def rank0(self, verdict):
-        calls.append(verdict.shape)
-        verdict = verdict.clone()
-        verdict[:, k + 1] = 0
-        return verdict
+    class Rank0:
+        world_size = 2
 
-    monkeypatch.setattr(Glm52LLMSubmodule, "_broadcast", rank0)
+        def broadcast(self, verdict, src=0):
+            calls.append(tuple(verdict.shape))
+            verdict = verdict.clone()
+            verdict[:, k + 1] = 0
+            return verdict
+
     cfg = _cfg(k, True)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     _oracle(sub, {"r0": base.tolist()}, 0)
-    spec = _drive(_Driver(sub, cfg, ["r0"]), torch.arange(5, dtype=torch.long) + 3,
-                  _fwd_info("r0", 12, True))
+    driver = _Driver(sub, cfg, ["r0"])
+    driver.resources[SAMPLER_RESOURCE]._comm_group = Rank0()
+    spec = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", 12, True))
     assert torch.equal(spec, base)
     # one token from the prefill, then one per verify step
     assert calls == [(1, k + 2)] * (base.numel() - 1)
@@ -395,7 +436,7 @@ def test_batch_of_two_matches_single_streams():
     for rid, prompt in prompts.items():
         out = driver.step("prefill", {rid: (infos[rid], prompt)})[rid]
         emitted[rid].append(out["new_token"][0])
-        assert not sub.check_stop(rid, infos[rid], out)
+        assert not driver.check_stop(rid, infos[rid], out)
         texts[rid] = out["text_inputs"][0]
     live = set(prompts)
     for _ in range(20):
@@ -405,7 +446,7 @@ def test_batch_of_two_matches_single_streams():
         for rid in sorted(live):
             emitted[rid].append(outs[rid]["new_token"][0])
             texts[rid] = outs[rid]["text_inputs"][0]
-            if sub.check_stop(rid, infos[rid], outs[rid]):
+            if driver.check_stop(rid, infos[rid], outs[rid]):
                 live.discard(rid)
     for rid in prompts:
         got = torch.cat(emitted[rid])
@@ -413,12 +454,16 @@ def test_batch_of_two_matches_single_streams():
 
 
 def test_non_greedy_request_is_refused_under_mtp():
-    cfg = _cfg(2, True)
-    sub = Glm52LLMSubmodule(_model(cfg), cfg)
-    info = _fwd_info("r0", 8, True)
-    info.resource_configs[SAMPLER_RESOURCE].temperature = 0.7
-    with pytest.raises(RuntimeError, match="greedy-only"):
-        sub.prepare_inputs("prefill", info, {"text_inputs": [torch.tensor([1, 2, 3])]})
+    """The sampler of an MTP node is declared to verify drafts, so the conductor refuses a
+    sampled request as a 400; a request that names no temperature gets 0."""
+    model = Glm52Model(model_path_hf="", tokenizer_mode="byte", config_variant="reduced")
+    model.config.mtp_num_draft_tokens = 2
+    spec = next(s for s in model.get_node_resources() if s.resource_key == SAMPLER_RESOURCE)
+    assert spec.draft_verify
+    for bad in ({"temperature": 0.7}, {"temperature": 0.0, "repetition_penalty": 1.2}):
+        with pytest.raises(ValueError, match="greedy-only"):
+            SamplingReqConfig(**bad).validate(spec)
+    model.get_request_resource_configs({}, model_kwargs={})[SAMPLER_RESOURCE].validate(spec)
 
 
 def test_declare_step_shapes():
@@ -436,11 +481,12 @@ def test_declare_step_shapes():
     step = sub.declare_step("prefill", ["r0"], inputs)
     assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
     assert step.segments[0].span == 3
-    # one id in, the block of k+1 rows planned; the verify and drafts are argmaxes
+    # one id in, the block of k+1 rows planned; the verify is the draft-verify resource's
     inputs = [sub.prepare_inputs("decode", _fwd_info("r0", 8, True),
                                  {"text_inputs": [torch.tensor([4])]})]
     step = sub.declare_step("decode", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "pos"}
+    # with_draft_verify adds the sampler's step, which a greedy verify's sampler skips
+    assert set(step.keys()) == {"kv", "attn", "pos", "sampler", DRAFT_VERIFY}
     assert step.segments[0].span == 3
 
 
@@ -454,68 +500,112 @@ def test_seed_slots_are_reused():
     _drive(driver, prompt, _fwd_info("a", 6, True))
     assert sub._mtp_slot["a"] != 0 and len(sub._mtp_free_slots) == free - 1
     sub.cleanup_request("a")
-    assert len(sub._mtp_free_slots) == free and not sub._mtp_pending
+    assert len(sub._mtp_free_slots) == free
 
 
-# ── the context limit ────────────────────────────────────────────────────
+# ── the KV layout and the context limit ─────────────────────────────────
 
 
-def _window_cfg(k: int, limit: int) -> Glm52ModelConfig:
-    """Reduced config whose context limit (index_topk, DSA off) is ``limit``
-    rows: two CPU pages of 8, so a row past the limit needs a third page."""
-    cfg = _cfg(k, mla_absorb=True)
-    cfg.index_topk = limit
-    return cfg
+def _in_worker_order(driver: _Driver, info, prompt: torch.Tensor) -> tuple[list[int], int]:
+    """The request as the async worker runs it: step N+1 is launched before check_stop(N),
+    though never past the loop's cap, so a stop on max_tokens before the cap runs one more
+    verify step. Returns the tokens sent and the furthest KV length any step wrote."""
+    rid, kv = info.rid_handle, driver.resources[KV_RESOURCE]
+    cap = max(1, info.max_tokens - 1)
+    furthest = 0
+
+    def step(walk, text):
+        nonlocal furthest
+        out = driver.step(walk, {rid: (info, text)})[rid]
+        furthest = max(furthest, kv._streams[rid]["main"].stored_len)
+        return out
+
+    out = step("prefill", prompt)
+    sent = out["new_token"][0].tolist()
+    assert not driver.check_stop(rid, info, out)  # it counts the prefill's token
+    cur, iteration = step("decode", out["text_inputs"][0]), 0
+    while True:
+        nxt = step("decode", cur["text_inputs"][0]) if iteration + 1 < cap else None
+        sent += cur["new_token"][0].tolist()
+        if driver.check_stop(rid, info, cur) or nxt is None:
+            return sent, furthest
+        cur, iteration = nxt, iteration + 1
 
 
-def _window_stream(model, cfg, mode_k: int, prompt_len: int, max_tokens: int):
-    """One arm at the window: the stream, the capped budget (None: uncapped), and the KV
-    stream's final length and page high-water mark."""
-    k = cfg.mtp_num_draft_tokens
-    cfg.mtp_num_draft_tokens = mode_k
-    try:
-        sub = Glm52LLMSubmodule(model, cfg)
-        driver = _Driver(sub, cfg, ["r0"])
-        prompt = torch.arange(prompt_len, dtype=torch.long) + 3
-        stream = _drive(driver, prompt, _fwd_info("r0", max_tokens, True))
-        kv = driver.resources[KV_RESOURCE]
-        pages = len(kv._streams["r0"]["main"].page_indices)
-        budget = sub.request_state("r0").get("token_budget")
-        return stream, budget, kv._streams["r0"]["main"].stored_len, pages
-    finally:
-        cfg.mtp_num_draft_tokens = k
+def _laid_out(driver: _Driver, k: int, rid, prompt_len: int, max_tokens: int) -> None:
+    """Ingest ``rid`` with GLM-5.2's own layout for a prompt of ``prompt_len``, at the caps
+    of ``max_tokens``."""
+    model = Glm52Model(model_path_hf="", tokenizer_mode="byte", config_variant="reduced",
+                       mtp_num_draft_tokens=k)
+    out = model.process_prompt("x" * prompt_len, ["text"], ["text"])
+    config = KVReqConfig()
+    config.apply_conductor_config(
+        kv_layout={label: layout.row() for label, layout in out.metadata["kv_layout"][KV_RESOURCE].items()},
+        loop_caps=model.get_loop_caps(max_output_tokens=max_tokens),
+    )
+    driver.runner.ingest_request(rid, {KV_RESOURCE: config})
+
+
+@pytest.mark.parametrize("debug", [False, True], ids=["always_on", "debug_asserts"])
+def test_mtp_requests_hold_their_layout_in_the_workers_order(debug, monkeypatch, caplog):
+    """GLM-5.2's layout covers every slot and page an MTP request takes: a verify step
+    writes k rows past what it emits, its trim keeps accepted drafts past max_tokens, and
+    the step launched before check_stop sees a stop on max_tokens lands a whole block on
+    top. Some request here writes all 2k + 1 of the lookahead."""
+    monkeypatch.setattr(kv_manager_mod, "_DEBUG_ASSERTS", debug)
+    k = 3
+    (base, _), _ = _run_pair(k=k, max_tokens=40, ignore_eos=True, mla_absorb=True)
+    cfg = _cfg(k, True)
+    model = _model(cfg)
+    prompt = torch.arange(5, dtype=torch.long) + 3
+    furthest = 0
+    with caplog.at_level(logging.ERROR, logger=kv_manager_mod.__name__):
+        for wrong_every in (0, 3, 5):
+            for max_tokens in range(4, 13):
+                sub = Glm52LLMSubmodule(model, cfg)
+                _oracle(sub, {"r0": base.tolist()}, wrong_every)
+                driver = _Driver(sub, cfg, [])
+                _laid_out(driver, k, "r0", prompt.numel(), max_tokens)
+                sent, written = _in_worker_order(driver, _fwd_info("r0", max_tokens, True), prompt)
+                assert sent == base.tolist()[:max_tokens], (wrong_every, max_tokens)
+                stream = driver.resources[KV_RESOURCE]._streams["r0"]["main"]
+                assert len(stream.page_indices) <= stream.footprint, (wrong_every, max_tokens)
+                furthest = max(furthest, written - (prompt.numel() + max_tokens - 1))
+    assert not _errors(caplog), _errors(caplog)
+    assert furthest == cfg.mtp_kv_lookahead == 2 * k + 1
 
 
 @pytest.mark.parametrize("k", [2, 3])
-def test_stream_stops_cleanly_at_the_context_limit(k):
-    """A request sized to the window, the most the conductor admits (limit - prompt + 1
-    tokens: the last is never stored), fills it exactly without MTP. Under MTP the
-    prefill's preprocess caps its budget two blocks short of that (every step writes a
-    whole block, and the next may run before the stop lands), so the trunk guard never
-    fires and no step writes past the limit (no third KV page)."""
-    limit, prompt_len = 24, 5
-    fits = limit - prompt_len + 1
-    cfg = _window_cfg(k, limit)
-    model = _model(cfg)
-    baseline, budget, stored, pages = _window_stream(model, cfg, 0, prompt_len, fits)
-    assert budget is None, "without MTP the conductor sizes the request; nothing caps it"
-    assert baseline.numel() == fits
-    assert stored == limit and pages == limit // 8
-    stream, budget, stored, pages = _window_stream(model, cfg, k, prompt_len, fits)
-    assert budget == limit - prompt_len - 2 * (k + 1)
-    assert torch.equal(stream, baseline[:budget]), (stream.tolist(), baseline.tolist())
-    assert stored <= limit and pages <= limit // 8, (stored, pages)
+def test_a_request_the_conductor_fits_stops_inside_the_window(k, tmp_path, monkeypatch):
+    """The conductor gives a request that names no length the window less its prompt and
+    the layout's lookahead. Run in the worker's order with every draft accepted, no step
+    writes past the limit, so preprocess's guard never fires, and the stream is the plain
+    one. GLM-5.2 itself no longer cuts the budget."""
+    limit = 24  # the context limit (index_topk, DSA off): three CPU pages of 8
+    glm = Glm52Model(model_path_hf="", tokenizer_mode="byte", config_variant="reduced", mtp_num_draft_tokens=k)
+    glm.config.index_topk = limit
+    kwargs = _preprocess(glm, {})
+    prompt_len = len("hello")  # _preprocess's prompt, a token per byte
+    new_request = _dispatched(_conduct(glm, kwargs, tmp_path, monkeypatch))
+    max_tokens = new_request.request_info.max_tokens
+    assert max_tokens == limit - prompt_len - (2 * k + 1) + 1
 
-
-def test_budget_within_the_window_is_untouched():
-    cfg = _window_cfg(2, 64)
+    cfg = _cfg(k, True)
+    cfg.index_topk = limit
     model = _model(cfg)
+    prompt = torch.arange(prompt_len, dtype=torch.long) + 3
+    cfg.mtp_num_draft_tokens = 0
+    plain = _drive(_Driver(Glm52LLMSubmodule(model, cfg), cfg, ["r0"]), prompt, _fwd_info("r0", max_tokens + k, True))
+    cfg.mtp_num_draft_tokens = k
     sub = Glm52LLMSubmodule(model, cfg)
-    driver = _Driver(sub, cfg, ["r0"])
-    prompt = torch.arange(5, dtype=torch.long) + 3
-    stream = _drive(driver, prompt, _fwd_info("r0", 9, True))
-    assert sub.request_state("r0")["token_budget"] == 9
-    assert stream.numel() == 9
+    _oracle(sub, {"r0": plain.tolist()}, 0)
+    driver = _Driver(sub, cfg, [])
+    driver.runner.ingest_request("r0", {KV_RESOURCE: new_request.request_info.resource_configs[KV_RESOURCE]})
+
+    sent, furthest = _in_worker_order(driver, _fwd_info("r0", max_tokens, True), prompt)
+
+    assert sent == plain.tolist()[:max_tokens]
+    assert furthest <= limit and len(driver.resources[KV_RESOURCE]._streams["r0"]["main"].page_indices) <= limit // 8
 
 
 # ── KV exhaustion ────────────────────────────────────────────────────────
@@ -579,15 +669,14 @@ def test_exhaustion_refuses_the_step_and_the_pool_recovers():
     for rid, prompt in prompts.items():
         out = driver.step("prefill", {rid: (infos[rid], prompt)})[rid]
         emitted[rid].append(out["new_token"][0])
-        assert not sub.check_stop(rid, infos[rid], out)
+        assert not driver.check_stop(rid, infos[rid], out)
         texts[rid] = out["text_inputs"][0]
     live, refused = set(prompts), 0
     for _ in range(64):
         if not live:
             break
-        # the last verdict's trim lands at declare, refused or not, and only once
-        for rid in live:
-            sub._apply_verdict(rid)
+        # the last verdict's rewind lands as the step admits, refused or not, and only once
+        _rewind_now(driver, sorted(live))
         before = {rid: kv._streams[rid]["main"].stored_len for rid in live}
         outs = driver.step("decode", {rid: (infos[rid], texts[rid]) for rid in sorted(live)},
                            refusable=True)
@@ -602,7 +691,7 @@ def test_exhaustion_refuses_the_step_and_the_pool_recovers():
         for rid in sorted(live):
             emitted[rid].append(outs[rid]["new_token"][0])
             texts[rid] = outs[rid]["text_inputs"][0]
-            if sub.check_stop(rid, infos[rid], outs[rid]):
+            if driver.check_stop(rid, infos[rid], outs[rid]):
                 live.discard(rid)
                 remove(rid)
     assert refused == 1
@@ -626,12 +715,12 @@ def test_stop_counts_what_the_checked_steps_delivered():
         info = _fwd_info(7, budget, True)
         out = driver.step("prefill", {7: (info, torch.arange(5, dtype=torch.long) + 3)})[7]
         delivered = out["new_token"][0].numel()
-        assert not sub.check_stop(7, info, out)
+        assert not driver.check_stop(7, info, out)
         cur = driver.step("decode", {7: (info, out["text_inputs"][0])})[7]
         for _ in range(40):
             nxt = driver.step("decode", {7: (info, cur["text_inputs"][0])})[7]
             delivered += cur["new_token"][0].numel()
-            if sub.check_stop(7, info, cur):
+            if driver.check_stop(7, info, cur):
                 break
             cur = nxt
         assert delivered == budget, (budget, delivered)

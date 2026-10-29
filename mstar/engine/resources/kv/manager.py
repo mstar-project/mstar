@@ -2988,28 +2988,6 @@ class KVManager(AttentionResource):
         stream.chain = None
         return True
 
-    def correct_len(self, rid: str, label: str, delta: int) -> None:
-        """Move a stream's stored length by ``delta`` tokens, pages kept: a
-        speculative verify step commits its whole block and its rejected tail
-        is taken back here once the acceptance is known. The generation moves
-        so an offload claimed against the old length fails its guard."""
-        with self._lock:
-            stream = self._streams.get(rid, {}).get(label)
-            if stream is None:
-                raise KeyError(f"KV {self.name}: no stream {label!r} for request {rid}")
-            # an admitted step's addressing was planned from the old length
-            assert not stream.step_in_flight, (
-                f"KV {self.name}: correct_len on {rid}/{label} between admit and commit"
-            )
-            if delta == 0:
-                return
-            stream.stored_len = max(0, stream.stored_len + delta)
-            stream.generation += 1
-            if delta < 0:
-                self._drop_sealed_tail(rid, label, stream)
-            if _DEBUG_ASSERTS:
-                self.assert_pages_conserved()
-
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams
         retention = step.retention
