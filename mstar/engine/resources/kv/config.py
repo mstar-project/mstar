@@ -422,6 +422,10 @@ class KVSpec(NodeResourceSpec):
     leader: str | None = None
 
     @property
+    def journals_resident_moves(self) -> bool:
+        return True
+
+    @property
     def resource_class(self) -> "type[Resource]":
         if isinstance(self.config, RingKVConfig):
             from mstar.engine.resources.kv.ring.manager import RingKVManager

@@ -57,6 +57,13 @@ class NodeResourceSpec(ABC):
         return False
 
     @property
+    def journals_resident_moves(self) -> bool:
+        """Under TP, rank 0 moves this resource's state outside a step (a host
+        offload or reload) and the followers replay the move with the next step
+        of the node it was journaled under, so lockstep nodes must not share it."""
+        return False
+
+    @property
     @abstractmethod
     def resource_class(self) -> "type[Resource]":
         """What builds this spec. Imported inside the property, so declaring a

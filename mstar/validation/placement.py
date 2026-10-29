@@ -6,7 +6,6 @@ from typing import Any
 
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
-from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -407,7 +406,7 @@ def _worker_parallelism(
                 node for node in local
                 if per_worker[wid].get_instance_world_size_for_node(node) > 1
             )
-            if isinstance(spec, KVSpec) and len(lockstep) > 1:
+            if spec.journals_resident_moves and len(lockstep) > 1:
                 yield (
                     f"KV resource {spec.resource_key} is shared by lockstep-parallel nodes "
                     f"{lockstep} on {wid}. Rank 0 replicates the page moves it makes on a pool "
