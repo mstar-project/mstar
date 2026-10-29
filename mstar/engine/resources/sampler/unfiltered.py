@@ -7,9 +7,9 @@ rejection sampler reads them back, which is most of what the full sampler costs
 a decode step. A row at temperature 0 takes the argmax of its logits, the first
 index among equal maxima, the token the full sampler's greedy rows get.
 
-The noise is Philox keyed on the row's seed, counted by (vocab index, the row's
-offset), and a draw advances the offset by one as the full sampler's draws do,
-so a request moving between the two paths never reuses a step's numbers.
+The noise is Philox keyed on the row's seed, counted by (vocab index / 4, the
+row's offset), and a draw advances the offset by one as the full sampler's draws
+do, so a request moving between the two paths never reuses a step's numbers.
 
 ``mstar::sample_unfiltered`` also does the step's bookkeeping around the draw,
 so a captured step adds no kernels for it: given a slot index (in-graph
@@ -57,13 +57,17 @@ def _block_for(batch: int, vocab: int) -> int:
 
 
 @triton.jit
-def _gumbel(seed, offs, off):
-    """Standard Gumbel noise for vocab indices ``offs`` at row offset ``off``."""
-    c0 = offs.to(tl.uint32)
+def _gumbel(seed, start, off, BLOCK: tl.constexpr):
+    """Standard Gumbel noise for vocab indices ``start + [0, BLOCK)`` at row
+    offset ``off``. One Philox call gives four words, so index ``i`` takes word
+    ``i % 4`` of counter ``i // 4``: a quarter of the integer work."""
+    c0 = (start // 4 + tl.arange(0, BLOCK // 4)).to(tl.uint32)
     zero = c0 * 0
     lo = zero + (off & 0xFFFFFFFF).to(tl.uint32)
     hi = zero + ((off >> 32) & 0xFFFFFFFF).to(tl.uint32)
-    r, _, _, _ = tl.philox(seed, c0, lo, hi, zero)
+    r0, r1, r2, r3 = tl.philox(seed, c0, lo, hi, zero)
+    # [i, j, k] holds word 2j + k of counter i, so the flat order is the vocab order
+    r = tl.reshape(tl.join(tl.join(r0, r2), tl.join(r1, r3)), [BLOCK])
     # 24 bits, centred, so u is never 0 or 1
     u = ((r >> 8).to(tl.float32) + 0.5) * (1.0 / 16777216.0)
     return -tl.log(-tl.log(u))
@@ -88,7 +92,7 @@ def _partials_kernel(
             off = tl.load(offset_master_ptr + tl.load(slot_ptr + row))
         else:
             off = tl.load(offset_ptr + row)
-        score = x * (1.0 / temp) + _gumbel(tl.load(seed_ptr + row), offs, off)
+        score = x * (1.0 / temp) + _gumbel(tl.load(seed_ptr + row), split * BLOCK, off, BLOCK)
         score = tl.where(mask, score, -float("inf"))
     else:
         score = x
@@ -197,9 +201,11 @@ def philox4x32(seed: int, c0, c1, c2, c3, rounds: int = 10):
 
 
 def gumbel_reference(seed: int, offset: int, vocab: int, device=None) -> torch.Tensor:
-    c0 = torch.arange(vocab, dtype=torch.int64, device=device)
+    """The kernel's noise for one row: word ``i % 4`` of Philox counter ``i // 4``."""
+    c0 = torch.arange(-(-vocab // 4), dtype=torch.int64, device=device)
     zero = torch.zeros_like(c0)
-    r, _, _, _ = philox4x32(seed & (2**64 - 1), c0, zero + (offset & _MASK32), zero + ((offset >> 32) & _MASK32), zero)
+    words = philox4x32(seed & (2**64 - 1), c0, zero + (offset & _MASK32), zero + ((offset >> 32) & _MASK32), zero)
+    r = torch.stack(words, dim=1).reshape(-1)[:vocab]
     u = ((r >> 8).to(torch.float32) + 0.5) * (1.0 / 16777216.0)
     return -torch.log(-torch.log(u))
 
