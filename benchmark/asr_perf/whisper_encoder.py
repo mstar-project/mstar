@@ -113,6 +113,8 @@ def profile_replays(g, reps: int) -> dict:
         "families_ms": {f: round(ms, 4) for f, (ms, _) in sorted(fams.items(), key=lambda kv: -kv[1][0])},
         "families_n": {f: n for f, (_, n) in fams.items()},
         "top": [{"ms": round(ms, 4), "n": n // reps, "name": name[:140]} for name, (ms, n) in top],
+        "kernels": [{"ms": round(ms, 4), "n": n // reps, "family": family(name), "name": name[:200]}
+                    for name, (ms, n) in sorted(per_kernel.items(), key=lambda kv: -kv[1][0])],
     }
 
 
@@ -161,7 +163,9 @@ def main() -> int:
             cell["parity"] = errs
         if a.profile:
             cell["profile"] = profile_replays(g, 5)
-        print(json.dumps(cell), flush=True)
+        print(json.dumps({k: v for k, v in cell.items() if k != "profile"} | (
+            {"profile": {k: v for k, v in cell["profile"].items() if k != "kernels"}} if "profile" in cell else {})),
+            flush=True)
         result["cells"].append(cell)
         del g, out
         torch.cuda.empty_cache()
