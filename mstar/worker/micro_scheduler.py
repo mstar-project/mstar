@@ -278,10 +278,11 @@ class MicroScheduler:
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
 
         self.node_and_walk_to_last_batch_num = {}
-        # rid -> the step it last ran in (`note_ran`). Rows competing for a
-        # capped step go longest-waiting first, so a looping node at its cap
-        # serves its rows in turn.
-        self.last_ran: dict[int, int] = {}
+        # scheduling key -> rid -> the step it last ran in under that key
+        # (`note_ran`). Rows competing for a capped step go longest-waiting
+        # first, so a looping node at its cap serves its rows in turn. Kept
+        # per key: a row that runs another node meanwhile has still waited here.
+        self.last_ran: dict[tuple[str, str], dict[int, int]] = {}
         self._steps_run = 0
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
@@ -369,14 +370,21 @@ class MicroScheduler:
         )
 
     def note_ran(self, batch: ScheduledBatch) -> None:
-        """Stamp ``batch``'s rows with this step; every submitted step calls it."""
+        """Stamp ``batch``'s rows with this step under its scheduling key;
+        every submitted step calls it."""
         self._steps_run += 1
-        self.last_ran.update(dict.fromkeys(batch.request_to_worker_graph, self._steps_run))
+        key = self._key(batch.node_name, batch.graph_walk)
+        stamps = self.last_ran.get(key)
+        if stamps is None:
+            stamps = self.last_ran[key] = {}
+        stamps.update(dict.fromkeys(batch.request_to_worker_graph, self._steps_run))
 
-    def _waited_since(self, rid: int) -> int:
-        """Sort key, longest-waiting first: the step ``rid`` last ran in, 0
-        if it never ran here."""
-        return self.last_ran.get(rid, 0)
+    def _waited_since(self, key: tuple[str, str]) -> Callable[[int], int]:
+        """Sort key over rids competing for scheduling key ``key``,
+        longest-waiting first: the step a rid last ran in there, 0 if it
+        never did, so a row new to the key takes its first step ahead."""
+        stamps = self.last_ran.get(key, {})
+        return lambda rid: stamps.get(rid, 0)
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -961,7 +969,8 @@ class MicroScheduler:
             # Not every row fits: the ones that waited longest go first, and the
             # rest park in that order. The runtime's scan order (handles, which
             # are recycled) says nothing about how long a row has waited.
-            entries = sorted(entries, key=lambda e: self._waited_since(e.request_id))
+            waited = self._waited_since(node_walk)
+            entries = sorted(entries, key=lambda e: waited(e.request_id))
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
@@ -1426,7 +1435,7 @@ class MicroScheduler:
             return []
         partition = request_state.get_partition_for_node(target[0])
         ready = []
-        for rid in sorted(rids, key=self._waited_since):
+        for rid in sorted(rids, key=self._waited_since(self._key(*target))):
             fwd_info = request_state.get_fwd_info(rid, partition)
             if self._check_ready(target[0], rid, fwd_info, allow_reload=False):
                 ready.append(rid)
@@ -1590,7 +1599,8 @@ class MicroScheduler:
         self.read_failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
-        self.last_ran.pop(rid, None)
+        for stamps in self.last_ran.values():
+            stamps.pop(rid, None)
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)
 

@@ -748,6 +748,19 @@ def test_a_capped_step_takes_the_rows_that_waited_longest():
     assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r0", "r1"]
 
 
+def test_a_row_that_ran_another_node_keeps_its_place_at_a_capped_one():
+    """Stamps are per scheduling key: a request ready on two nodes of one
+    worker has still waited at the capped one while it ran the other."""
+    sched = _scheduler(_Engine(max_bs=1))
+    for rid in ["r0", "r1", "r2"]:  # r0 has waited longest here
+        sched.note_ran(_batch([rid]))
+    sched.note_ran(_batch(["r0"], node="talker", walk="stream"))
+
+    batch = _next_batch(sched, _Manager(["r0", "r1", "r2"]))
+
+    assert list(batch.request_to_worker_graph) == ["r0"]
+
+
 def test_rows_that_all_fit_keep_the_scan_order():
     sched = _scheduler(_Engine(max_bs=8))
     sched.note_ran(_batch(["r1"]))
@@ -759,13 +772,14 @@ def test_rows_that_all_fit_keep_the_scan_order():
 
 def test_clear_rid_forgets_when_the_rid_last_ran():
     """Handles are recycled: the next request given this one must not
-    inherit its place in line."""
+    inherit its place in line, at any node."""
     sched = _scheduler(_Engine(max_bs=1))
-    sched.note_ran(_batch(["r0"]))
+    sched.note_ran(_batch(["r0", "r1"]))
+    sched.note_ran(_batch(["r0"], node="talker", walk="stream"))
 
     sched.clear_rid("r0", "wire-r0")
 
-    assert "r0" not in sched.last_ran
+    assert sched.last_ran == {(NODE, WALK): {"r1": 1}, ("talker", "stream"): {}}
 
 
 def test_the_reserved_room_is_exactly_what_the_backlog_then_fills():

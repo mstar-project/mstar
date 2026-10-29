@@ -92,9 +92,13 @@ def _scheduler(runtime: _Runtime) -> tuple[MicroScheduler, SimpleNamespace]:
     return sched, state
 
 
-def _run(steps: dict[int, int], arrive_at: dict[int, int] | None = None) -> list[int]:
+def _run(
+    steps: dict[int, int], arrive_at: dict[int, int] | None = None,
+    elsewhere: ScheduledBatch | None = None,
+) -> list[int]:
     """The rid each step served. ``steps``: rid -> loop length; ``arrive_at``:
-    rid -> the step before which it turns ready (default 0)."""
+    rid -> the step before which it turns ready (default 0); ``elsewhere``: a
+    step of another node on the same worker, run after each of this one's."""
     runtime = _Runtime()
     sched, state = _scheduler(runtime)
     arrive_at = arrive_at or {}
@@ -124,6 +128,8 @@ def _run(steps: dict[int, int], arrive_at: dict[int, int] | None = None) -> list
             assert not any(left.values()), f"stalled with {left} left"
             break
         sched.note_ran(ScheduledBatch(NODE, WALK, request_to_worker_graph={nxt: 0}))
+        if elsewhere is not None:
+            sched.note_ran(elsewhere)
         left[nxt] -= 1
         order.append(nxt)
         running = nxt
@@ -159,6 +165,18 @@ def test_a_request_with_a_recycled_low_handle_does_not_jump_the_others():
     # the newcomer joins the rotation; nobody else is overtaken twice by it
     first = order.index(0)
     assert sorted(order[first - 3:first]) == [1, 2, 3]
+
+
+def test_a_request_that_also_runs_another_node_keeps_its_turn_here():
+    """Request 0 runs an uncapped node of the same worker after every step of
+    this one (a streaming thinker/talker pair, say). Its place in line here
+    counts only its steps here, so the other node's steps don't push it to
+    the back for as long as this node is oversubscribed."""
+    other = ScheduledBatch("talker", "stream", request_to_worker_graph={0: 0})
+
+    order = _run({rid: 6 for rid in range(3)}, elsewhere=other)
+
+    assert order == [0, 1, 2] * 6
 
 
 def test_a_lone_request_keeps_its_chain_without_a_scan():
