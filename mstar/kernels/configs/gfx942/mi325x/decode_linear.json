@@ -1,0 +1,91 @@
+{
+ "kernel": "decode_linear",
+ "arch": "gfx942",
+ "product": "mi325x",
+ "classes": {
+  "rows4-n12352-k4096": {
+   "impl": "hipblaslt",
+   "solution": 198480,
+   "us": 28.8,
+   "default_us": 31.41
+  },
+  "rows8-n12352-k4096": {
+   "impl": "hipblaslt",
+   "solution": 205516,
+   "us": 25.67,
+   "default_us": 37.4
+  },
+  "rows16-n12352-k4096": {
+   "impl": "hipblaslt",
+   "solution": 205516,
+   "us": 25.84,
+   "default_us": 38.34
+  },
+  "rows4-n10240-k4096": {
+   "impl": "hipblaslt",
+   "solution": 198175,
+   "us": 24.54,
+   "default_us": 27.81
+  },
+  "rows8-n10240-k4096": {
+   "impl": "hipblaslt",
+   "solution": 205516,
+   "us": 23.45,
+   "default_us": 28.27
+  },
+  "rows16-n10240-k4096": {
+   "impl": "hipblaslt",
+   "solution": 205516,
+   "us": 24.11,
+   "default_us": 27.35
+  },
+  "rows4-n24576-k4096": {
+   "impl": "hipblaslt",
+   "solution": 205557,
+   "us": 57.07,
+   "default_us": 67.9
+  },
+  "rows8-n24576-k4096": {
+   "impl": "hipblaslt",
+   "solution": 205483,
+   "us": 51.54,
+   "default_us": 70.85
+  },
+  "rows16-n24576-k4096": {
+   "impl": "hipblaslt",
+   "solution": 205483,
+   "us": 51.98,
+   "default_us": 68.32
+  },
+  "rows64-n24576-k4096": {
+   "impl": "hipblaslt",
+   "solution": 205483,
+   "us": 54.27,
+   "default_us": 68.52
+  },
+  "rows4-n4096-k12288": {
+   "impl": "hipblaslt",
+   "solution": 205536,
+   "us": 29.06,
+   "default_us": 30.98
+  },
+  "rows8-n4096-k12288": {
+   "impl": "hipblaslt",
+   "solution": 205481,
+   "us": 27.17,
+   "default_us": 31.58
+  },
+  "rows16-n4096-k12288": {
+   "impl": "hipblaslt",
+   "solution": 205481,
+   "us": 28.05,
+   "default_us": 31.3
+  }
+ },
+ "provenance": {
+  "stack": "torch-2.12.1_rocm7.2-hip-7.2.53211-triton-3.7.1",
+  "job": "gemm-98",
+  "source": "benchmark/kernels linear search, captured graphs, weights rotated past the MALL",
+  "min_gain": 0.05
+ }
+}
