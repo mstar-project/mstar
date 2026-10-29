@@ -1104,13 +1104,14 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
 def split_loop(request):
     """One loop whose body spans two worker graphs, as BAGEL's CFG-parallel
     denoise: ``step`` in one, ``combine`` here, and combine's output loops
-    back to step. ``step`` runs on a peer (over the wire) or in a sibling
-    worker graph on this worker. The runtime under test is this worker's."""
+    back to step. ``step`` enters the loop with an external ``cond`` and runs
+    on a peer (over the wire) or in a sibling worker graph on this worker.
+    The runtime under test is this worker's."""
     kind, step_workers = request.param
     loop = Loop(
         name="L", max_iters=3, outputs=[],
         section=Sequential(sections=[
-            GraphNode(name="step", input_names={"x"},
+            GraphNode(name="step", input_names={"cond", "x"},
                       outputs=[GraphEdge(name="v", next_node="combine")]),
             GraphNode(name="combine", input_names={"v"},
                       outputs=[GraphEdge(name="x", next_node="step")]),
@@ -1144,7 +1145,8 @@ def split_loop(request):
 
 def test_the_last_iteration_sends_no_loop_back_to_another_worker_graph(split_loop):
     """A finishing loop sends no loop-back to another worker graph, or step
-    runs one more iteration with its counter back at 0."""
+    runs one more iteration with its counter back at 0. Each branch runs the
+    loop's three iterations and both worker graphs end idle."""
     rt, book, step_workers = split_loop
     sibling = step_workers == [WORKER]
     rid = rt.add_request(
@@ -1153,39 +1155,41 @@ def test_the_last_iteration_sends_no_loop_back_to_another_worker_graph(split_loo
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], step_workers]),
         loop_caps={},
     )
-    held, sent = [], []
-    for k in range(3):
-        if k == 0 or not sibling:  # a sibling step feeds combine itself
-            rt.ingest_inputs_batch(_ingest_block([rid], [_spec("v", "combine")]))
-        rt.pop_rids("combine", WALK, [rid])
-        uuid = 10 + k
+    uuids = iter(range(10, 100))
+
+    def run(node, signal, wg_id):
+        rt.pop_rids(node, WALK, [rid])
+        uuid = next(uuids)
         book.put_tensor(uuid, _info(uuid))
         book.increment_ref(uuid, 1)  # the safety hold
         out = rt.complete_and_route_batch(RouteInput(
-            partition="default", graph_walk=WALK, node_name="combine",
-            output_signals=["x"], wg_ids=ParallelList([rid], [0]),
+            partition="default", graph_walk=WALK, node_name=node,
+            output_signals=[signal], wg_ids=ParallelList([rid], [wg_id]),
             tensors=[uuid], num_tensors=[1],
         ))
+        return uuid, out
+
+    if sibling:  # the loop is entered at step, as BAGEL's branches
+        rt.ingest_inputs_batch(_ingest_block(
+            [rid, rid], [_spec("cond", "step"), _spec("x", "step")]))
+    held, sent = [], []
+    for _ in range(3):
+        if sibling:
+            assert _ready(rt) == [("step", WALK, [rid])]
+            run("step", "v", 1)
+        else:  # the peer's step
+            rt.ingest_inputs_batch(_ingest_block([rid], [_spec("v", "combine")]))
+        uuid, out = run("combine", "x", 0)
         # A loop-back holds a reference for step's read.
         held.append(not _released(book, uuid))
-        if not sibling:
-            # Staged for the peer's read.
-            sent.append(uuid in out.register_uuids)
-            continue
-        # Ingested into the sibling graph, so step is ready.
-        sent.append(("step", WALK, [rid]) in _ready(rt))
-        if sent[-1]:
-            rt.pop_rids("step", WALK, [rid])
-            v = 20 + k
-            book.put_tensor(v, _info(v))
-            book.increment_ref(v, 1)
-            rt.complete_and_route_batch(RouteInput(
-                partition="default", graph_walk=WALK, node_name="step",
-                output_signals=["v"], wg_ids=ParallelList([rid], [1]),
-                tensors=[v], num_tensors=[1],
-            ))
+        # Staged for the peer's read, or ingested into the sibling graph.
+        sent.append(uuid in out.register_uuids if not sibling
+                    else ("step", WALK, [rid]) in _ready(rt))
     assert sent == [True, True, False]
     assert held == [True, True, False]
+    # No fourth step, and neither loop is left mid-run.
+    assert _ready(rt) == []
+    assert rt.is_partition_idle(rid, "default")
 
 
 # --- several requests in one batch --------------------------------------------
