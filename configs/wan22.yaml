@@ -14,13 +14,20 @@ max_seq_len: 512
 # any other shape runs the DiT eager. Requests above max_video_pixels
 # (height x width x num_frames, default 268435456) get a 400.
 #
+# The DiT's attention runs on the engine's ragged attention resources with the
+# platform's default kernel (attention_backend: auto; FlashInfer FA3 on an H100,
+# AITER's asm flash attention on MI300X/MI325X). attention_backend: sdpa keeps
+# torch's kernel inline, the reference pipeline's, for parity runs.
+#
 # Uncomment the lines you need (one model_kwargs block) to list more decode
-# sizes or DiT shapes, restore stock vae.decode everywhere, or raise the ceiling:
+# sizes or DiT shapes, restore stock vae.decode everywhere, raise the ceiling,
+# or switch the attention kernel:
 # model_kwargs:
 #   vae_decode_fast_sizes: ["1280x704", "832x480"]
 #   vae_decode_fast: false
 #   compile_dit_sizes: ["1280x704x81", "1280x704x121", "832x480x81"]
 #   max_video_pixels: 536870912
+#   attention_backend: sdpa
 
 # Wan2.2-TI2V-5B single-GPU colocated: all four nodes on rank 0.
 node_groups:

@@ -964,6 +964,12 @@ Text-to-video and image-to-video on **Wan2.2-TI2V-5B** — the dense 5B variant
 encoder and the Wan2.2-VAE, all four nodes stateless. The A14B (MoE dual-DiT)
 variants are **not** supported; ``wan22`` rejects any other variant explicitly.
 
+The DiT's attention — self-attention over each guidance branch's video tokens and
+cross-attention over the text — runs on the engine's ragged attention resources with
+the platform's default kernel (``model_kwargs.attention_backend: auto``: FlashInfer
+FA3 on an H100, AITER's asm flash attention on MI300X/MI325X); ``sdpa`` keeps torch's
+kernel inline, the reference pipeline's, for parity runs.
+
 Install and serve on one GPU:
 
 .. code-block:: bash
@@ -1098,7 +1104,9 @@ image-to-video and the duration head are not ported yet.
 
 Four nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
 DiT scaffold's denoise loop; video and audio latents carried in fp32; every attention
-through two ragged attention resources), ``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
+through the engine's ragged attention resources on the platform's default kernel,
+``attention_backend: auto``, or ``sdpa`` for parity runs), ``vae_decoder`` and
+``audio_decoder``. The walk follows the requested output
 modalities, so ``["video"]`` skips the audio decode (the model still denoises both).
 
 .. code-block:: bash
@@ -1164,9 +1172,14 @@ conditioning tokens, in order).
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``attention_backend``
-   ``sdpa`` (default) is the reference kernel, cuDNN on an H100 and measured as fast as
-   FlashInfer in the served path. ``flashinfer`` runs the DiT's joint attention on the
-   engine's ragged FlashInfer resource; both are CUDA-graph replayable.
+   ``auto`` (the shipped default) runs the DiT's joint attention on the engine's ragged
+   attention resource with the platform's default kernel: FlashInfer FA3 on an H100, where
+   it served as fast as SDPA (0.355 vs 0.349 s at B=1), and AITER's asm flash attention
+   on MI300X/MI325X, where torch's SDPA is AOTriton's Triton kernel and well short of it.
+   ``sdpa`` keeps torch's kernel inline, the reference pipelines' own, for parity runs.
+   Both are graph-replayable. ``resources: dit_attn: backend: flashinfer|aiter`` in the
+   YAML pins a kernel; ``flashinfer`` as the value of this knob is the earlier spelling
+   of ``auto`` and means the same.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.

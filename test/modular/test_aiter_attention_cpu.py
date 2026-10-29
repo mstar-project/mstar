@@ -259,7 +259,6 @@ def test_a_captured_ragged_step_pads_to_the_buckets_segments():
     assert plan.cu_seqlens_q.tolist() == [0, 30, 40, 40, 40]
     assert plan.cu_seqlens_k.tolist() == plan.cu_seqlens_q.tolist()
     assert (plan.max_seqlen_q, plan.num_segments, plan.num_tokens) == (64, 2, 40)
-    assert plan.out.shape == (64, 4, 72)
     assert m.num_segments("img") == 2
 
 
@@ -269,7 +268,7 @@ def test_an_eager_ragged_step_is_exact():
     m.plan(step, StepContext(request_ids=["a", "b"], graph_walk="w", slot=0, capture=False))
     plan = m._current_plans["img"]
     assert plan.cu_seqlens_q.tolist() == [0, 30, 40]
-    assert (plan.max_seqlen_q, plan.out) == (30, None)
+    assert plan.max_seqlen_q == 30
 
 
 def test_one_request_brings_several_segments_to_a_captured_step():
@@ -302,7 +301,7 @@ def test_one_request_brings_several_segments_to_a_captured_step():
 
 def test_ragged_output_stays_in_the_resources_dtype(monkeypatch):
     """Like FlashInfer's: whatever dtype q comes in, the output is the resource's."""
-    monkeypatch.setattr(rocm_ragged, "_varlen", lambda: lambda q, *args, out, **kwargs: out.copy_(q))
+    monkeypatch.setattr(rocm_ragged, "_varlen", lambda: lambda q, *args, **kwargs: q.clone())
     m = AiterRaggedManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
     m.plan(AttentionStep(segments=(Segment("a", "img", 3),), causal=False),
            StepContext(request_ids=["a"], graph_walk="w", slot=0, capture=False))
@@ -310,6 +309,27 @@ def test_ragged_output_stays_in_the_resources_dtype(monkeypatch):
     out = m.run(q, q, q, "img")
     assert out.dtype == torch.bfloat16
     assert torch.equal(out, q.to(torch.bfloat16))
+
+
+def test_a_captured_ragged_run_keeps_every_layers_output(monkeypatch):
+    """The kernel allocates each call's output (no shared buffer, no copy out of
+    it), so a layer's result survives the next layer's call under one plan."""
+    calls = []
+
+    def fake_varlen(q, k, v, cu_q, cu_k, max_q, max_k, **kwargs):
+        calls.append(kwargs)
+        return q * 2
+
+    monkeypatch.setattr(rocm_ragged, "_varlen", lambda: fake_varlen)
+    m = AiterRaggedManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
+    step = AttentionStep(segments=(Segment("a", "img", 30),), causal=False)
+    m.plan(step, StepContext(request_ids=["a"], graph_walk="w", slot=0, capture=False, slot_lease=lease(1, 64)))
+    q1, q2 = torch.randn(64, 4, 72, dtype=torch.bfloat16), torch.randn(64, 4, 72, dtype=torch.bfloat16)
+    first = m.run(q1, q1, q1, "img")
+    second = m.run(q2, q2, q2, "img")
+    assert torch.equal(first, q1 * 2) and torch.equal(second, q2 * 2)
+    assert all("out" not in kw for kw in calls), "the manager hands the kernel no output buffer"
+    assert calls[0]["causal"] is False and calls[0]["softmax_scale"] == 72 ** -0.5
 
 
 def test_ragged_cross_pairs_plan_their_own_key_layout():
