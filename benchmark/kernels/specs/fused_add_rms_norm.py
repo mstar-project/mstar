@@ -23,7 +23,7 @@ SHAPES = (
     shape_product(rows=(1, 4, 16, 64, 128, 512, 2048), hidden=(1024, 2048, 4096), gemma=(1,))
     + shape_product(rows=(1, 16, 128, 2048), hidden=(4096,), gemma=(0,))
 )
-TRITON_SPACE = {"elems_per_thread": (2, 4, 8, 16, 32), "rows_per_program": (1, 2, 4)}
+TRITON_SPACE = {"elems_per_thread": (2, 4, 8, 16, 32), "rows_per_program": (1, 2, 4, 8)}
 TRITON_AMD_SPACE = {**TRITON_SPACE, "waves_per_eu": (0, 1, 2, 4)}
 
 
