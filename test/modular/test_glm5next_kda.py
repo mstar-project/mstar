@@ -8,20 +8,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from mstar.model.glm5_next.kda import (
-    Glm5NextKdaConfig,
-    Glm5NextLinearAttention,
-)
+from mstar.model.components.kda import KDAConfig, KimiDeltaAttention
 
 OUT_ATOL = 1e-3  # bf16 outputs
 STATE_ATOL = 1e-5  # fp32 recurrent states
 
 
-def _build(seed: int) -> tuple[Glm5NextLinearAttention, Glm5NextKdaConfig]:
+def _build(seed: int) -> tuple[KimiDeltaAttention, KDAConfig]:
     """Reduced-geometry layer with small random weights, grad-free."""
     torch.manual_seed(seed)
-    cfg = Glm5NextKdaConfig.reduced()
-    layer = Glm5NextLinearAttention(cfg, dtype=torch.bfloat16)
+    cfg = KDAConfig(hidden_size=64, num_heads=4, head_dim=32)
+    layer = KimiDeltaAttention(cfg, dtype=torch.bfloat16)
     for lin in (
         layer.q_proj, layer.k_proj, layer.v_proj, layer.b_proj,
         layer.g_a_proj, layer.g_b_proj, layer.o_proj,
@@ -36,7 +33,7 @@ def _build(seed: int) -> tuple[Glm5NextLinearAttention, Glm5NextKdaConfig]:
     return layer, cfg
 
 
-def _input(cfg: Glm5NextKdaConfig, batch_size: int, seq_len: int) -> torch.Tensor:
+def _input(cfg: KDAConfig, batch_size: int, seq_len: int) -> torch.Tensor:
     return torch.randn(batch_size, seq_len, cfg.hidden_size, dtype=torch.bfloat16) * 0.1
 
 
@@ -70,10 +67,10 @@ def test_conv_state_stores_raw_projection_tail():
     mixed = torch.cat(
         [layer.q_proj(x), layer.k_proj(x), layer.v_proj(x)], dim=-1
     ).transpose(1, 2)
-    tail = cfg.linear_conv_kernel_size - 1
+    tail = cfg.conv_kernel_size - 1
     expected = F.pad(mixed, (tail, 0))[:, :, -tail:]
     assert torch.equal(cs, expected)
-    assert cs.shape == (batch_size, cfg.linear_conv_channels, tail)
+    assert cs.shape == (batch_size, cfg.conv_channels, tail)
     assert cs.is_contiguous()
 
     # L < kernel-1: the zero left-pad must show up in the stored tail.
@@ -143,7 +140,7 @@ def test_forget_gate_respects_lower_bound():
     x = _input(cfg, batch_size, seq_len) * 5.0
     g = layer.forget_gate(x)
     assert g.dtype == torch.float32
-    assert g.shape == (batch_size, seq_len, cfg.linear_num_heads, cfg.linear_head_dim)
+    assert g.shape == (batch_size, seq_len, cfg.num_heads, cfg.head_dim)
     assert (g > cfg.gate_lower_bound).all()
     assert (g < 0).all()
 
@@ -185,8 +182,8 @@ def test_left_padding_mask_is_inert():
 def test_shapes_and_dtypes_at_real_config_dims():
     """Full-size geometry (4096 hidden, 64x128 heads, 24576 conv channels)."""
     torch.manual_seed(6)
-    cfg = Glm5NextKdaConfig()
-    layer = Glm5NextLinearAttention(cfg, dtype=torch.bfloat16)
+    cfg = KDAConfig(hidden_size=4096, num_heads=64, head_dim=128)
+    layer = KimiDeltaAttention(cfg, dtype=torch.bfloat16)
     layer.requires_grad_(False)
     batch_size, seq_len = 1, 5
     x = torch.randn(batch_size, seq_len, cfg.hidden_size, dtype=torch.bfloat16) * 0.05

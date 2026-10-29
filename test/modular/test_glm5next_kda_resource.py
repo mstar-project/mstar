@@ -20,16 +20,16 @@ from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.step import Segment, StepContext
-from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
+from mstar.model.components.distributed import ParallelKimiDeltaAttention
 from mstar.model.glm5_next.config import KDA, KDA_STATE, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
 
 LAYER = 1  # the second KDA layer's blocks: a layer index that is not 0
 
 
-def _layer(seed: int) -> Glm5NextKdaAttention:
+def _layer(seed: int) -> ParallelKimiDeltaAttention:
     torch.manual_seed(seed)
-    layer = Glm5NextKdaAttention(Glm5NextModelConfig.reduced(), dtype=torch.float64)
+    layer = ParallelKimiDeltaAttention(Glm5NextModelConfig.reduced().kda_config(), dtype=torch.float64)
     with torch.no_grad():
         for name, p in layer.named_parameters():
             if "conv1d" in name:
@@ -95,13 +95,13 @@ def test_prefill_then_decode_matches_each_request_alone(lengths):
     tokens = [{rid: torch.randn(1, hidden, dtype=torch.float64) for rid in rids} for _ in range(3)]
 
     step = steps.open({rid: x.shape[0] for rid, x in prompts.items()}, "prefill")
-    got_prefill = layer.forward_paged(torch.cat(list(prompts.values())), LAYER)
+    got_prefill = layer(torch.cat(list(prompts.values())), LAYER)
     steps.close(*step)
     got_decode = []
     for tok in tokens:
         step = steps.open(dict.fromkeys(rids, 1), "decode")
         assert kda.current_plan().is_decode
-        got_decode.append(layer.forward_paged(torch.cat([tok[r] for r in rids]), LAYER))
+        got_decode.append(layer(torch.cat([tok[r] for r in rids]), LAYER))
         steps.close(*step)
 
     start = 0
@@ -133,14 +133,14 @@ def test_verify_blocks_decode_only_the_accepted_tokens():
     torch.manual_seed(5)
     prompt = torch.randn(6, layer.hidden_size, dtype=torch.float64)
     step = steps.open({"r": 6}, "prefill")
-    layer.forward_paged(prompt, LAYER)
+    layer(prompt, LAYER)
     steps.close(*step)
     _, rec, conv = layer.prefill(prompt.unsqueeze(0), *layer.init_state(1))
     for accepted in (1, 0, 2):
         block = torch.randn(3, layer.hidden_size, dtype=torch.float64)
         step = steps.open({"r": 3}, "decode", speculative=True)
         assert kda.current_plan().is_verify
-        got = layer.forward_paged(block, LAYER)
+        got = layer(block, LAYER)
         layer.mix.set_prefix_len(torch.tensor([accepted]))
         steps.close(*step)
         r, c = rec.clone(), conv.clone()
@@ -164,7 +164,7 @@ def test_a_resumed_prefill_continues_from_the_slot():
     outs = []
     for chunk in (x[:25], x[25:]):
         step = steps.open({"r": chunk.shape[0]}, "prefill")
-        outs.append(layer.forward_paged(chunk, LAYER))
+        outs.append(layer(chunk, LAYER))
         steps.close(*step)
     first, rec, conv = layer.prefill(x[:25].unsqueeze(0), *layer.init_state(1))
     second, _, _ = layer.prefill(x[25:].unsqueeze(0), rec, conv)
@@ -176,5 +176,5 @@ def test_bind_refuses_a_conv_state_in_another_dtype():
     model = Glm5NextModel("x", config_variant="reduced", kda_conv_dtype=torch.bfloat16)
     specs = {s.resource_key: s for s in model.get_node_resources()}
     pool = build_resource(specs[KDA_STATE], EngineResourceInfo(device=torch.device("cpu")))
-    with pytest.raises(RuntimeError, match="kda_conv_dtype"):
+    with pytest.raises(RuntimeError, match="KDA conv state is torch.bfloat16"):
         layer.bind_resources({KDA_STATE: pool, KDA: None})
