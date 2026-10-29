@@ -25,6 +25,7 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from mstar.engine.resources.kv.cache import KVCache, KVLayout
 from mstar.engine.resources.kv.page_copier import make_page_copier
+from mstar.utils.step_threads import unpin_thread
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import (
@@ -229,7 +230,10 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
 
     def _bind_device(self) -> None:
         """CUDA's current device is per-thread and defaults to 0; an unbound
-        pool thread has no context to open the peer's IPC handle against."""
+        pool thread has no context to open the peer's IPC handle against.
+        The pool starts under the worker's pinned main thread, so its threads
+        go back to the process mask first."""
+        unpin_thread()
         if self._device.type == "cuda":
             torch.cuda.set_device(self._device)
 
