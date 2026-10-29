@@ -564,7 +564,8 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, case):
         with torch.no_grad():
             return bound(x, weights, ids), plain(x, weights, ids)
 
-    fn = torch.compile(forward, mode="max-autotune-no-cudagraphs", fullgraph=True) if "compiled" in case else forward
+    # fullgraph=False, as the engine compiles: moe_align_block_size probes its JIT op on first use.
+    fn = torch.compile(forward, mode="max-autotune-no-cudagraphs", fullgraph=False) if "compiled" in case else forward
     graph, (out, base) = capture(fn)
     for mix in mixes:
         for rid, name, _ in mix:
