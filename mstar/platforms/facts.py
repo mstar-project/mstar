@@ -110,8 +110,8 @@ _PRODUCTS: tuple[_Product, ...] = (
 
 def normalize_product(name: str | None) -> str | None:
     """``"AMD Instinct MI300X"`` -> ``"mi300x"``, ``"NVIDIA H100 80GB HBM3"`` ->
-    ``"h100-80gb-hbm3"``. A virtual function's ``VF`` suffix is dropped: the
-    slice runs the same silicon."""
+    ``"h100-80gb-hbm3"``. A virtual function's ``VF`` suffix is dropped: a
+    partition of the GPU runs the same silicon."""
     if not name:
         return None
     product = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
