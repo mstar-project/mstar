@@ -1,8 +1,9 @@
 """CUDA MPS for a deployment that runs several workers on one GPU (``mps: true``).
 
-Without MPS, kernels from different processes on one GPU time-slice; under MPS they
-overlap. Each deployment runs its own control daemon in a private pipe directory, so
-only its workers become MPS clients and other processes on the GPU are unaffected.
+Without MPS, kernels from different processes on one NVIDIA GPU time-slice; under
+MPS they overlap. Each deployment runs its own control daemon in a private pipe
+directory, so only its workers become MPS clients and other processes on the GPU
+are unaffected. ``CudaPlatform.colocated_workers`` hands one to the conductor.
 """
 
 import logging
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import threading
 import time
+
+from mstar.platforms.interface import WorkerColocation
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,7 @@ os.execvp(sys.argv[2], sys.argv[2:])
 """
 
 
-class MpsDaemon:
+class MpsDaemon(WorkerColocation):
     """An ``nvidia-cuda-mps-control`` child of the conductor, and the environment
     its clients need."""
 
