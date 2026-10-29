@@ -1,7 +1,10 @@
 
 from collections.abc import KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+
+if TYPE_CHECKING:
+    from mstar.engine.rows import StepRows
 
 
 class Segment(NamedTuple):
@@ -83,6 +86,9 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # a persistent walk's rows for this step, in the order of `request_ids`;
+    # resources write their per-step changes here while they plan
+    rows: "StepRows | None" = None
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)

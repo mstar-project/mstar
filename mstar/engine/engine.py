@@ -46,6 +46,7 @@ from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     AdmitOutcome,
 )
+from mstar.engine.rows import NodeRows
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
@@ -509,6 +510,8 @@ class Engine:
         # that is not sharded is in neither: it owns its own eviction.
         self._tp_leader_nodes: set[str] = set()
         self._tp_follower_nodes: set[str] = set()
+        # node -> its walks that keep persistent rows (``mstar.engine.rows``)
+        self._rows: dict[str, NodeRows] = {}
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
@@ -699,6 +702,10 @@ class Engine:
                 node_name, submodule_mgmt
             )
 
+        # Row buffers too have the address the graphs record, so they are
+        # registered before any capture.
+        self._build_rows(ag_runners)
+
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
         # buffers an earlier node's graphs already recorded the address of.
@@ -753,6 +760,16 @@ class Engine:
             for bs, tokens in runner.dropped_shapes
         ])
 
+        for node_name, node_rows in self._rows.items():
+            for walk in node_rows.walks:
+                cap = self.get_max_batch_size(node_name, walk)
+                rows = node_rows.space(walk).max_rows
+                if cap is None or cap > rows:
+                    raise ValueError(
+                        f"{node_name}: walk {walk!r} may run steps of {cap} rows "
+                        f"but its persistent rows hold {rows}"
+                    )
+
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules()
@@ -762,6 +779,59 @@ class Engine:
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
+
+    def _build_rows(self, ag_runners: dict[str, AcceleratorGraphRunner]) -> None:
+        """Each node's persistent-row walks, sized to the most rows a step of
+        the walk may hold: the submodule's cap and the walk's capture configs."""
+        for node_name, submodule_mgmt in self._submodules.items():
+            walks = submodule_mgmt.submodule.persistent_row_walks()
+            if not walks:
+                continue
+            if node_name in self._tp_leader_nodes or node_name in self._tp_follower_nodes:
+                # every rank would have to agree on each step's row order
+                raise ValueError(
+                    f"{node_name}: persistent rows are not supported on a "
+                    "tensor- or sequence-parallel node yet"
+                )
+
+            def max_rows(walk, submodule=submodule_mgmt.submodule, runner=ag_runners[node_name]):
+                caps = [submodule.max_batch_size(walk), runner.max_batch_size_for(walk)]
+                caps = [cap for cap in caps if cap is not None]
+                return min(caps) if caps else None
+
+            self._rows[node_name] = NodeRows.build(
+                node_name, walks, max_rows, submodule_mgmt.resources, self._device,
+            )
+
+    def _enter_rows(self, batch: ExecutingBatch, preplan: bool = False) -> bool:
+        """Put a persistent walk's step in row order, proposing its rows; on
+        the gpu thread, check in the rows any other step of the node runs.
+        False for a pre-plan that has to wait for that check-in."""
+        node_rows = self._rows.get(batch.node_name)
+        if node_rows is None:
+            return True
+        ctx = batch.step_context
+        walk = ctx.graph_walk
+        if not node_rows.persistent(walk):
+            if preplan:
+                # the check-in lands in stream order on the gpu thread, and
+                # this step's plan reads what it writes back
+                return not node_rows.holds_any(batch.request_ids)
+            node_rows.check_in(batch.request_ids)
+            return True
+        rids = batch.request_ids
+        rows = ctx.rows
+        if rows is None or rows.stale or (
+            tuple(rows.order) != tuple(rids) and set(rows.order) != set(rids)
+        ):
+            rows = ctx.rows = node_rows.begin(walk, rids)
+        order = rows.order
+        if tuple(order) != tuple(rids):
+            if batch.inputs is not None:
+                at = {rid: i for i, rid in enumerate(rids)}
+                batch.inputs = [batch.inputs[at[rid]] for rid in order]
+            batch.request_ids = list(order)
+        return True
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],
@@ -1320,6 +1390,8 @@ class Engine:
                 node_name=batch.node_name,
             ):
                 laps = PhaseLaps("engine.exec.")
+                self._enter_rows(batch)
+                laps.lap("rows")
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
                 laps.lap("reserve_slot")
@@ -1331,6 +1403,11 @@ class Engine:
                     batch.rows_only = False
                     batch.loopback_rids = frozenset()
                 if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
+                    if batch.step_context.rows is not None:
+                        raise RuntimeError(
+                            f"{batch.node_name}: walk {batch.graph_walk!r} keeps "
+                            "persistent rows, so its steps must run batched"
+                        )
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
@@ -1348,6 +1425,7 @@ class Engine:
             if batch.preplanned_rids is not None and self._runner.staged:
                 self._runner.clear_preplan()
                 batch.preplanned_rids = None
+            batch.step_context.rows = None
             raise
         finally:
             batch.preplan_event = None
@@ -1392,6 +1470,8 @@ class Engine:
                 nvtx=self._enable_nvtx, step=batch.step
             )
             if not admit.ok:
+                # the retry proposes its rows afresh
+                batch.step_context.rows = None
                 return BatchedModelOutput(
                     per_rid_outputs={rid: {} for rid in batch.request_ids}
                 )
@@ -1732,6 +1812,17 @@ class Engine:
             phase_end("engine.preprocess", t0)
             if nvtx:
                 range_pop()
+
+        rows = ctx.rows
+        if rows is not None:
+            t0 = phase_start()
+            # after every resource planned, so one upload carries all their
+            # writes; committed before the launch releases the main thread,
+            # which may then remove a request this step checked in
+            rows.stage()
+            self._rows[batch.node_name].commit(ctx.graph_walk, rows)
+            rows.apply()
+            phase_end("engine.rows", t0)
 
         if self._enable_profile and batch.exec_timings.fwd_start is None:
             batch.exec_timings.fwd_start = time.perf_counter()
@@ -2488,6 +2579,9 @@ class Engine:
     ) -> bool:
 
         laps = PhaseLaps("engine.pre_plan.")
+        if not self._enter_rows(batch, preplan=True):
+            return False
+        laps.lap("rows")
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
         inputs = (
@@ -2544,9 +2638,11 @@ class Engine:
 
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
         """Whether the staged plan no longer describes this batch."""
-        return (
-            batch.preplanned_rids is not None
-            and batch.preplanned_rids != tuple(batch.request_ids)
+        if batch.preplanned_rids is None:
+            return False
+        rows = batch.step_context.rows
+        return batch.preplanned_rids != tuple(batch.request_ids) or (
+            rows is not None and rows.stale
         )
 
     def reset_pre_plan_for_batch(self, batch: ExecutingBatch | None = None) -> None:
@@ -2566,6 +2662,8 @@ class Engine:
                 batch.discarded_preplan_event = batch.preplan_event
             batch.preplan_event = None
             batch.preplanned_rids = None
+            # proposed against the rows the pre-plan saw; exec proposes afresh
+            batch.step_context.rows = None
             # The step was declared over the rows the pre-plan saw: template
             # rows for an unprepared batch, or a request set that has since
             # lost rows to prepare_inputs (preplan_is_stale). Either way exec
@@ -2608,6 +2706,11 @@ class Engine:
             # Rank 0 decides what this instance evicts, and its decision arrives
             # as a resident-set delta. TP followers can deadlock if they are not
             # given a single source of truth for eviction.
+            return 0
+        node_rows = self._rows.get(node_name)
+        if node_rows is not None and node_rows.holds_any((request_id,)):
+            # its state is in a row its walk's next step reads; a request
+            # that sits that step out is checked in, and evictable after
             return 0
         freed = sum(
             resource.offload(request_id)
@@ -2842,6 +2945,8 @@ class Engine:
         a KV cache whose pages reach the free list or are left to the prefix
         index alone. An offloaded request, or one that never ran, frees none."""
         self._loopback_steps.pop(request_id, None)
+        for node_rows in self._rows.values():
+            node_rows.forget(request_id)
         freed = {
             key for key, resource in self._resources.items()
             if resource.reclaimable(request_id)

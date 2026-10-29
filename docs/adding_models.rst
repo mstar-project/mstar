@@ -1798,6 +1798,50 @@ embedding and the RoPE gathers left eager because they are data-dependent indexi
 
 .. _config-yaml:
 
+Persistent rows (keeping per-row state on the device across steps)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A decode loop's per-row state (lengths, page tables, positions, sampler
+settings) is mostly the same from one step to the next. A walk listed in
+``NodeSubmodule.persistent_row_walks()`` keeps each request in a fixed row
+of device buffers across steps (``mstar/engine/rows/``). Each step then
+uploads only what changed: the rows that joined or left, and single elements
+such as an appended page. A step with no changes uploads nothing.
+
+The engine runs such a step in row order, so ``request_ids`` is a
+permutation of what the worker scheduled. It proposes the step's rows before
+planning (``ctx.rows``), uploads them after every resource has planned,
+commits them before the launch, and applies them on the step's stream. A
+step of another walk that runs a request holding a row first checks that
+request in. A removed request's row leaves at its walk's next step.
+
+Every resource of the node takes part through ``Resource.row_state(space,
+node_name, graph_walk)``, called once at startup before capture:
+
+- It registers its buffers with ``space.buffer(name, shape, dtype, pad,
+  mirrored)``. A mirrored buffer keeps a host copy that is the truth for the
+  rows it holds; an unmirrored one is device-only state, checked out of a
+  store the resource owns.
+- It returns a ``RowState``:
+
+  - ``check_out`` writes joining rows (``write``, or ``copy_in`` from a
+    store).
+  - ``check_in`` reads leaving rows back: ``copy_out`` to a store, and host
+    state from the mirror in an ``on_commit`` hook, so that a proposal that
+    never commits changes nothing.
+  - ``released`` frees what was kept for a request removed while it held a
+    row.
+
+  The base ``RowState()`` is for a resource that keeps nothing per row.
+- While planning, it writes the step's changes through ``ctx.rows``:
+  ``write_at`` for single elements, ``advance`` for what the forward adds to
+  every active row.
+
+The engine refuses the walk at startup if any resource returns None (the
+default), if the walk has no batch cap to size the rows, or if the node is
+tensor- or sequence-parallel. A request holding a row can't be offloaded
+until it sits out a step of its walk.
+
 Step 6 — Write a config YAML
 ----------------------------
 

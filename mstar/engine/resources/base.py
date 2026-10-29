@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         PiecewiseAcceleratorGraphConfig,
     )
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.engine.rows import RowSpace, RowState
 
 
 @dataclass(frozen=True)
@@ -392,6 +393,16 @@ class Resource(ABC):
 
     def clear_preplan(self):
         return
+
+    # Persistent rows
+
+    def row_state(self, space: RowSpace, node_name: str, graph_walk: str) -> RowState | None:
+        """This resource's per-row state on a walk that keeps persistent rows
+        (``NodeSubmodule.persistent_row_walks``), its buffers registered on
+        ``space``; called once at startup, before capture. ``RowState()`` for
+        a resource that keeps nothing per row. None, the default, means it
+        can't, and the engine refuses the walk at startup."""
+        return None
 
     # Eviction
     #

@@ -339,7 +339,7 @@ def _engine_manager(**pools: KVManager) -> SimpleNamespace:
     """The worker's engine manager over the real ``Engine.remove_request``,
     with these KV pools as the engine's resources."""
     engine = SimpleNamespace(
-        _loopback_steps={}, _resources=pools, _submodules={},
+        _loopback_steps={}, _resources=pools, _submodules={}, _rows={},
         _runner=SimpleNamespace(
             remove_request=lambda rid: [pool.remove_request(rid) for pool in pools.values()],
         ),
