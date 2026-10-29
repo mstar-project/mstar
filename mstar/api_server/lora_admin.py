@@ -89,8 +89,9 @@ class LoraAdmin:
                 digest = await asyncio.to_thread(check_adapter_file, self._spec, name, path)
             except Exception as exc:  # noqa: BLE001 - any unreadable or unfit file is the client's
                 # the client sees why the adapter was refused, never what the server's
-                # files hold or whether a path exists
-                logger.warning("LoRA adapter %s at %s refused: %s", name, path, exc)
+                # files hold or whether a path exists; the route logs it with the cause and,
+                # as a note (not in the client's text), the file
+                exc.add_note(f"adapter file: {path}")
                 raise ValueError(f"LoRA adapter '{name}': {describe_load_error(exc)}") from exc
             await self._request(
                 LoadLoraAdapter(

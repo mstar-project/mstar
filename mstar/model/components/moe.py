@@ -510,6 +510,70 @@ class FusedExperts(nn.Module, LoraCapable):
         )
 
 
+# GLM-5.2 still uses these three - port it onto `FusedExperts` and delete them
+def _dispatch(
+    hidden_states: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    num_experts: int,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    skip_invalid: bool = False,
+) -> torch.Tensor:
+    """Pick fused-Triton if available, otherwise the naive loop."""
+    if _HAS_FUSED and hidden_states.is_cuda:
+        return _fused_experts(
+            hidden_states, gate_up_proj, down_proj,
+            routing_weights, selected_experts, skip_invalid=skip_invalid,
+        )
+    return dispatch_experts_fused(
+        hidden_states, gate_up_proj, down_proj,
+        num_experts, selected_experts, routing_weights, skip_invalid=skip_invalid,
+    )
+
+
+def _gate_up_weight_loader(
+    tp_rank: int, tp_size: int, full_inter: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: int | str | None = None,
+):
+    """Load one expert's gate_proj or up_proj into the fused gate_up_proj param.
+
+    ``loaded_shard_id`` is ``"gate:N"`` or ``"up:N"`` where N is the
+    expert index.  ``loaded_weight`` shape is ``(inter, hidden)`` — a
+    single expert's projection.  The TP rank's slice is taken and copied
+    into the correct position in ``param`` which has shape
+    ``(E, 2*shard_inter, hidden)``.
+    """
+    assert loaded_shard_id is not None
+    kind, expert_str = loaded_shard_id.split(":")
+    expert_idx = int(expert_str)
+    shard_inter = divide(full_inter, tp_size)
+    start = tp_rank * shard_inter
+    tp_slice = loaded_weight[start:start + shard_inter, :]
+    if kind == "gate":
+        param.data[expert_idx, :shard_inter, :] = tp_slice
+    else:
+        param.data[expert_idx, shard_inter:, :] = tp_slice
+
+
+def _down_proj_weight_loader(
+    tp_rank: int, tp_size: int, full_inter: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: int | str | None = None,
+):
+    """Load one expert's down_proj into the fused down_proj param.
+
+    ``loaded_shard_id`` is ``"down:N"``.  ``loaded_weight`` shape is
+    ``(hidden, inter)``.  The TP rank's column slice is taken.
+    """
+    assert loaded_shard_id is not None
+    expert_idx = int(loaded_shard_id.split(":")[1])
+    shard_inter = divide(full_inter, tp_size)
+    start = tp_rank * shard_inter
+    param.data[expert_idx, :, :] = loaded_weight[:, start:start + shard_inter]
+
+
 def _gate_up_fp8_weight_loader(
     tp_rank: int, tp_size: int, full_inter: int, row_unit: int,
     param: nn.Parameter, loaded_weight: torch.Tensor,
