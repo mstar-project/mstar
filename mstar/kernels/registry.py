@@ -248,11 +248,25 @@ class KernelOp:
         return ran
 
     def config(self, shape: Mapping[str, int] | None = None, device=None) -> Mapping[str, Any] | None:
-        """This device's tuned config for ``shape``'s class (``mstar.kernels.configs``)."""
+        """This device's tuned config for ``shape``, or for its class
+        (``mstar.kernels.configs``)."""
         facts = current_platform.device_facts(device)
         config = configs.load_config(self.name, facts.arch, facts.product)
         shape_class = self.shapes.shape_class(shape) if self.shapes is not None and shape is not None else None
-        return configs.select(config, shape_class)
+        return configs.select(config, shape_class, shape)
+
+    def selection(self) -> str:
+        """What this process runs, in a few words: the implementation's key and
+        what it says it chose (an implementation can carry a
+        ``kernel_selection`` string). Runs the factory."""
+        reason = self.unavailable_reason()
+        key = self.implementation_key()
+        if key is None or key == "reference":
+            return f"reference ({reason})" if reason else "reference"
+        if reason is not None:
+            return f"{key} unavailable ({reason})" + ("; runs the reference" if self.fallback_to_reference else "")
+        detail = getattr(self.implementation(), "kernel_selection", None)
+        return f"{key}: {detail}" if detail else key
 
     def describe(self, probe: bool = False) -> dict[str, Any]:
         """What a listing shows. With ``probe``, also which implementation runs
@@ -295,3 +309,11 @@ def load_all() -> list[KernelOp]:
     for module in DECLARING_MODULES:
         importlib.import_module(module)
     return ops()
+
+
+def warm_all() -> dict[str, str]:
+    """Resolve every op's implementation for this process's platform, so its
+    imports and JIT builds happen now rather than in a captured step, and say
+    what each runs (``KernelOp.selection``). Runs no kernel: the shapes a model
+    uses compile in the eager forwards the engine runs before each capture."""
+    return {op.qualname: op.selection() for op in load_all()}
