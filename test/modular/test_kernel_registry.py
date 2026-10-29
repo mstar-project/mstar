@@ -380,3 +380,34 @@ def test_rms_norm_is_one_node_under_dynamo():
     x = torch.randn(5, 64)
     compiled = torch.compile(fn, backend="eager", fullgraph=True)
     torch.testing.assert_close(compiled(x), fn(x))
+
+
+def test_selection_names_what_runs_and_why_not(declare, on_platform):
+    on_platform(RocmPlatform())
+    plain = declare(impls={"rocm": _Impl("fork")})
+    assert plain.selection() == "rocm"
+
+    def tuned():
+        impl = _Impl("tuned")()
+        impl.kernel_selection = "triton for decode"
+        return impl
+
+    assert declare(impls={"rocm": tuned}).selection() == "rocm: triton for decode"
+    broken = declare(impls={"rocm": _Impl("x", error=ImportError("no aiter"))})
+    assert broken.selection() == "rocm unavailable (ImportError: no aiter)"
+    fallback = declare(impls={"rocm": _Impl("x", error=ImportError("no aiter"))}, fallback_to_reference=True)
+    assert fallback.selection().endswith("; runs the reference")
+    assert declare(impls={"cuda": _Impl("nv")}, fallback_to_reference=True).selection().startswith("reference")
+
+
+def test_warm_all_resolves_every_op_once(declare, on_platform, monkeypatch):
+    on_platform(RocmPlatform())
+    factory = _Impl("fork")
+    op = declare(impls={"rocm": factory})
+    monkeypatch.setattr(registry, "DECLARING_MODULES", ())
+    monkeypatch.setattr(registry, "_OPS", {op.name: op})
+    lines = registry.warm_all()
+    assert lines[op.qualname] == "rocm"
+    assert factory.calls == 1
+    registry.warm_all()
+    assert factory.calls == 1, "a resolved implementation is kept"
