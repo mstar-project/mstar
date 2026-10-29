@@ -154,6 +154,28 @@ def test_only_matching_linears_whose_shapes_fit_are_swapped():
     assert type(net.proj_out) is nn.Linear
 
 
+def test_patterns_match_segment_by_segment_with_index_ranges():
+    from mstar.model.components.fp8_linear import matches
+
+    assert matches("single_blocks.3.out", "single_blocks.0-3.*")
+    assert not matches("single_blocks.4.out", "single_blocks.0-3.*")
+    assert matches("single_blocks.22.qkv_mlp", "single_blocks.20-23.qkv_mlp")
+    assert matches("double_blocks.1.img_ff.linear_in", "double_blocks.*.img_ff.linear_*")
+    assert not matches("double_blocks.1.img_ff.linear_in", "double_blocks.*")  # * stays in one segment
+    assert not matches("single_blocks.x.out", "single_blocks.0-3.out")
+
+
+def test_keep_leaves_the_named_linears_in_bf16(monkeypatch):
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: _Rocm("gfx942"))
+    monkeypatch.setattr(fp8_linear, "fp8_unavailable_reason", lambda: None)
+    net = _Net()
+    replaced = apply_linear_dtype(net, "fp8", ("blocks.*.qkv", "blocks.*.out"), "net", keep=("blocks.1-1.*",))
+    assert replaced == ["blocks.0.qkv", "blocks.0.out"]
+    assert isinstance(net.blocks[1].qkv, FusedColumnLinear) and type(net.blocks[1].out) is nn.Linear
+    with pytest.raises(ValueError, match="name none of its fp8-eligible linears"):
+        apply_linear_dtype(_Net(), "fp8", ("blocks.*.qkv",), "net", keep=("blocks.*.mod",))
+
+
 def test_linear_dtype_bf16_keeps_the_weights_and_unknown_values_fail():
     net = _Net()
     assert apply_linear_dtype(net, "bf16", ("blocks.*.qkv",), "net") == []
@@ -219,7 +241,7 @@ def test_each_dit_declares_its_token_stream_linears(build):
     patterns = type(dit).FP8_LINEARS
     names = {name for name, _ in dit.named_modules()}
     for pattern in patterns:
-        assert any(fp8_linear.fnmatch.fnmatchcase(name, pattern) for name in names), pattern
+        assert any(fp8_linear.matches(name, pattern) for name in names), pattern
     replaced = quantize_linears(dit, patterns, torch.float8_e4m3fnuz)
     assert len(replaced) == expected
     for name in replaced:
@@ -234,6 +256,8 @@ def test_the_models_take_linear_dtype():
 
     assert Flux2KleinModel(model_path_hf="x").linear_dtype == "bf16"
     assert ZImageModel(model_path_hf="x", linear_dtype="fp8").linear_dtype == "fp8"
+    keep = Flux2KleinModel(model_path_hf="x", fp8_keep_bf16=["single_blocks.0-1.*"]).fp8_keep_bf16
+    assert keep == ["single_blocks.0-1.*"]
     with pytest.raises(ValueError, match="linear_dtype"):
         Flux2KleinModel(model_path_hf="x", linear_dtype="fp16")
 
