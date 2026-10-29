@@ -74,11 +74,13 @@ VISION_ENCODER, LLM, STATE_ENCODER, VL_BRIDGE, DENOISE_STEP = (
 # because `max_iters` still stops the loop. z_image and ltx2_5 both name theirs.
 DENOISE_LOOP = "denoise_loop"
 
-# Pillow's names for the formats that return the pixels they were given. WebP is
-# here because *lossless* WebP measures bit-identical to PNG through the image
-# path; Pillow reports one format for both WebP modes, so a lossy WebP gets in --
-# the one hole this list cannot close, and the reason the error says what it does.
-_LOSSLESS_IMAGE_FORMATS = frozenset({"PNG", "BMP", "TIFF", "PPM", "WEBP"})
+# Pillow's names for the formats that return the pixels they were given, among those
+# the engine's reader decodes (`media_limits.IMAGE_FORMATS`; it refuses BMP, TIFF and
+# PPM before this check runs). WebP is here because *lossless* WebP measures
+# bit-identical to PNG through the image path; Pillow reports one format for both
+# WebP modes, so a lossy WebP gets in -- the one hole this list cannot close, and the
+# reason the error says what it does.
+_LOSSLESS_IMAGE_FORMATS = frozenset({"PNG", "WEBP"})
 
 
 def _entry(value: np.ndarray) -> dict:

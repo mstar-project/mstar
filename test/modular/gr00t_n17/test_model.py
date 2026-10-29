@@ -1342,6 +1342,38 @@ def test_only_a_state_of_one_request_and_the_configured_history_is_served(lead, 
             serve()
 
 
+# Pillow's format name and save options for each frame format the API accepts
+_LOSSLESS = {"PNG": {}, "WEBP": {"lossless": True}}
+
+
+@pytest.mark.parametrize("fmt", list(_LOSSLESS), ids=str.lower)
+def test_a_lossless_frame_loads_as_its_exact_pixels_in_uint8_hwc(tmp_path, fmt):
+    """The reference's transform takes uint8 HWC; the base loader's float CHW in [0, 1] would
+    be rescaled again by the HF processor into a black image, with no error."""
+    from PIL import Image
+
+    pixels = np.random.default_rng(0).integers(0, 256, (6, 10, 3), dtype=np.uint8)
+    path = tmp_path / f"frame.{fmt.lower()}"
+    Image.fromarray(pixels).save(path, format=fmt, **_LOSSLESS[fmt])
+    frame = _model().load_image(str(path), "cpu").data
+
+    assert frame.dtype == torch.uint8 and tuple(frame.shape) == (6, 10, 3)
+    assert np.array_equal(frame.numpy(), pixels)
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "GIF", "BMP", "TIFF"], ids=str.lower)
+def test_any_other_frame_format_is_refused_before_it_is_decoded(tmp_path, fmt):
+    """A JPEG passes every count, dtype and shape check and still moves the pixels 167x
+    further than a lossless frame: the actions look fine and the robot moves wrong. GIF is
+    a 256-colour palette; BMP and TIFF the engine's reader does not decode."""
+    from PIL import Image
+
+    path = tmp_path / f"frame.{fmt.lower()}"
+    Image.fromarray(np.zeros((6, 10, 3), np.uint8)).save(path, format=fmt)
+    with pytest.raises(ValueError, match="lossless|not in a format"):
+        _model().load_image(str(path), "cpu")
+
+
 # each JSON type a client field can arrive as
 _JSON_TYPES = {"an object": {"a": 1}, "a list": [1.0], "a number": 3, "a string": "x", "null": None}
 
