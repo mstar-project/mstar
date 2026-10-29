@@ -80,6 +80,13 @@ class Platform:
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
 
+    def fp8_dtype(self, device=None) -> torch.dtype | None:
+        """The e4m3 format this GPU's matrix units multiply natively, or None
+        where there is no fp8 GEMM. AMD's gfx942 (MI300X/MI325X) takes the FNUZ
+        variant (largest finite 240), gfx950 and NVIDIA the OCP one (448), so
+        fp8 code takes the dtype from here and never from a constant."""
+        return None
+
     def device_facts(self, device=None) -> DeviceFacts:
         """The GPU's architecture, product, compute units, caches and peak
         bandwidth and throughput, for kernel heuristics and the kernel harness
@@ -153,6 +160,10 @@ class CudaPlatform(Platform):
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
 
+    def fp8_dtype(self, device=None) -> torch.dtype | None:
+        # Ada (sm_89) and newer
+        return torch.float8_e4m3fn if self.has_cuda_capability(8, 9, device) else None
+
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
         return {"NCCL_GRAPH_REGISTER": "0", **blackwell_ptxas_env()}
@@ -174,6 +185,11 @@ class RocmPlatform(Platform):
     def arch(self, device=None) -> str:
         # "gfx942:sramecc+:xnack-": what follows the colon are target features
         return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+
+    FP8_DTYPES = {"gfx942": torch.float8_e4m3fnuz, "gfx950": torch.float8_e4m3fn}
+
+    def fp8_dtype(self, device=None) -> torch.dtype | None:
+        return self.FP8_DTYPES.get(self.arch(device))
 
     # captured buckets up to this many tokens autotune GEMMs over ATen (hipBLASLt) only
     ATEN_GEMM_MAX_TOKENS = 32
