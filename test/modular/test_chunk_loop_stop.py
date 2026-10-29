@@ -131,7 +131,7 @@ def _wrapped_walk(chunkable: bool, policy=None):
     if not chunkable:
         return node
     return _wrap_node_in_loop(
-        node, NODE, "prefill", chunk_loop_name(NODE, "prefill"),
+        node, NODE, "prefill",
         policy or ChunkingPolicy(walks=("prefill",), chunkable=True, max_chunks=8),
     )
 

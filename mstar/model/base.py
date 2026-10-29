@@ -34,11 +34,12 @@ from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.submodule_base import (
     ChunkingPolicy,
     chunk_loop_name,
+    chunk_tick_name,
 )
 
 
 def _wrap_node_in_loop(
-    section: GraphSection, node_name: str, graph_walk: str, loop_name: str,
+    section: GraphSection, node_name: str, graph_walk: str,
     policy: "ChunkingPolicy",
 ) -> GraphSection:
     """``section`` with ``node_name`` wrapped in the Loop its chunks run as.
@@ -67,10 +68,10 @@ def _wrap_node_in_loop(
             ticks.append(GraphEdge(next_node=EMPTY_DESTINATION, name=edge.name))
             dest = gathered if edge.name in policy.accumulated_outputs else final
             dest.append(edge)
-        tick = f"{loop_name}.next_chunk"
+        tick = chunk_tick_name(node_name, graph_walk)
         ticks.append(GraphEdge(next_node=node_name, name=tick))
         return Loop(
-            name=loop_name,
+            name=chunk_loop_name(node_name, graph_walk),
             section=replace(
                 section, outputs=ticks,
                 input_names=set(section.input_names) | {tick},
@@ -81,11 +82,11 @@ def _wrap_node_in_loop(
         )
     if isinstance(section, Sequential):
         return Sequential([
-            _wrap_node_in_loop(s, node_name, graph_walk, loop_name, policy) for s in section.sections
+            _wrap_node_in_loop(s, node_name, graph_walk, policy) for s in section.sections
         ])
     if isinstance(section, Parallel):
         return Parallel([
-            _wrap_node_in_loop(s, node_name, graph_walk, loop_name, policy) for s in section.sections
+            _wrap_node_in_loop(s, node_name, graph_walk, policy) for s in section.sections
         ])
     if isinstance(section, Loop):
         # A chunkable node inside an existing Loop nests one loop in another,
@@ -797,9 +798,7 @@ class Model(ABC):
                     section = walk_graphs.get(walk)
                     if section is None:
                         continue
-                    walk_graphs[walk] = _wrap_node_in_loop(
-                        section, node, walk, chunk_loop_name(node, walk), policy,
-                    )
+                    walk_graphs[walk] = _wrap_node_in_loop(section, node, walk, policy)
         return walk_graphs
 
     @abstractmethod

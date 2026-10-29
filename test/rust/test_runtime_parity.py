@@ -2362,14 +2362,14 @@ CHUNK_WALK = "prefill_text"
 
 def _wrapped_chunk_walk(max_chunks=8):
     from mstar.model.base import _wrap_node_in_loop
-    from mstar.model.submodule_base import ChunkingPolicy, chunk_loop_name
+    from mstar.model.submodule_base import ChunkingPolicy
 
     node = GraphNode(
         name="llm", input_names={"text_inputs"},
         outputs=[GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT, persist=True)],
     )
     return _wrap_node_in_loop(
-        node, "llm", CHUNK_WALK, chunk_loop_name("llm", CHUNK_WALK),
+        node, "llm", CHUNK_WALK,
         ChunkingPolicy(
             walks=(CHUNK_WALK,), chunkable=True, max_chunks=max_chunks,
         ),
