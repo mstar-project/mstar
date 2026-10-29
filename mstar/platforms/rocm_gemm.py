@@ -142,30 +142,25 @@ def _decode_kernel(op: KernelOp, silu_mul: bool, rows: int, n: int, k: int, dtyp
     return functools.partial(kernel, knobs=knobs)
 
 
-def _tuned_decode_gemv():
-    chosen: dict[tuple, object] = {}
+def _tuned(name: str, silu_mul: bool):
+    """A factory for ``name``'s implementation: each shape's kernel, picked
+    from the config on the shape's first call."""
 
-    def run(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-        key = (x.shape[0], weight.shape[0], x.shape[1], x.dtype)
-        kernel = chosen.get(key)
-        if kernel is None:
-            kernel = chosen[key] = _decode_kernel(DECODE_GEMV, False, *key)
-        return kernel(x, weight, bias)
+    def factory():
+        op = DECODE_GEMV_SILU_MUL if silu_mul else DECODE_GEMV
+        chosen: dict[tuple, object] = {}
 
-    return run
+        def run(x: torch.Tensor, weight: torch.Tensor, *bias) -> torch.Tensor:
+            key = (x.shape[0], weight.shape[0], x.shape[1], x.dtype)
+            kernel = chosen.get(key)
+            if kernel is None:
+                kernel = chosen[key] = _decode_kernel(op, silu_mul, *key)
+            return kernel(x, weight, *bias)
 
+        return run
 
-def _tuned_decode_gemv_silu_mul():
-    chosen: dict[tuple, object] = {}
-
-    def run(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        key = (x.shape[0], weight.shape[0], x.shape[1], x.dtype)
-        kernel = chosen.get(key)
-        if kernel is None:
-            kernel = chosen[key] = _decode_kernel(DECODE_GEMV_SILU_MUL, True, *key)
-        return kernel(x, weight)
-
-    return run
+    factory.__name__ = f"_tuned_{name}"
+    return factory
 
 
 def _silu_mul_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -187,7 +182,7 @@ DECODE_GEMV = KernelOp(
     "(Tensor x, Tensor weight, Tensor? bias) -> Tensor",
     fake=_skinny_gemm_fake,
     reference=_skinny_gemm_reference,
-    impls={f"rocm:{arch}": _tuned_decode_gemv for arch in ("gfx942", "gfx950")},
+    impls={f"rocm:{arch}": _tuned("decode_gemv", False) for arch in ("gfx942", "gfx950")},
     shapes=ShapePolicy(
         dims=("rows", "n", "k"),
         key=_gemm_shape,
@@ -209,7 +204,7 @@ DECODE_GEMV_SILU_MUL = KernelOp(
     "(Tensor x, Tensor weight) -> Tensor",
     fake=_silu_mul_fake,
     reference=_silu_mul_reference,
-    impls={f"rocm:{arch}": _tuned_decode_gemv_silu_mul for arch in ("gfx942", "gfx950")},
+    impls={f"rocm:{arch}": _tuned("decode_gemv_silu_mul", True) for arch in ("gfx942", "gfx950")},
     shapes=ShapePolicy(
         dims=("rows", "n", "k"),
         key=lambda x, weight: {"rows": x.shape[0], "n": weight.shape[0], "k": x.shape[1]},
