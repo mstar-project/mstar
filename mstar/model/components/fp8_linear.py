@@ -35,6 +35,17 @@ LINEAR_DTYPES = ("bf16", "fp8")
 # hipBLASLt's fp8 kernels need both GEMM dimensions of the weight in multiples of 16
 _ALIGN = 16
 
+# An uncompiled forward (a Wan2.2 size outside compile_dit_sizes, say) would otherwise quantise in
+# five eager kernels per linear, which cost more than the fp8 GEMM saves; this runs it as one.
+_quantize_rows_fused = torch.compile(quantize_rows, dynamic=True)
+
+
+def _quantize_tokens(x: torch.Tensor, fp8_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch.compiler.is_compiling() or x.device.type == "cpu":
+        # traced into the caller's graph, where it fuses with whatever produced x
+        return quantize_rows(x, fp8_dtype)
+    return _quantize_rows_fused(x, fp8_dtype)
+
 
 class Fp8Linear(nn.Module):
     """``x @ W.T (+ b)`` with ``W`` stored as e4m3 rows times fp32 per-row scales.
@@ -56,7 +67,7 @@ class Fp8Linear(nn.Module):
         return cls(weight, scale.T.contiguous(), bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xq, x_scale = quantize_rows(x.reshape(-1, self.in_features), self.weight.dtype)
+        xq, x_scale = _quantize_tokens(x.reshape(-1, self.in_features), self.weight.dtype)
         out = FP8_ROWWISE_MM(xq, x_scale, self.weight, self.weight_scale, self.bias, x.dtype)
         return out.reshape(*x.shape[:-1], self.out_features)
 
