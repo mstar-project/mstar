@@ -10,9 +10,14 @@ without ``transformers`` in the serving path. It runs wherever the waveform
 is, on the CPU of the API-server data worker or on the GPU inside an
 encoder's forward (every op is fixed-shape for a fixed clip length, so it
 captures into a CUDA graph).
+
+NVIDIA's FastConformer models (Canary, Parakeet, Nemotron ASR) take NeMo's
+recipe instead, ``NemoLogMel``: preemphasis, natural log, and per-bin
+standardization over the clip.
 """
 from __future__ import annotations
 
+import functools
 import math
 
 import numpy as np
@@ -20,6 +25,8 @@ import torch
 from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
+from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
+from mstar.utils.h2d import to_device_nonblocking
 
 
 def _hertz_to_mel(freq: np.ndarray | float) -> np.ndarray | float:
@@ -143,29 +150,209 @@ class LogMelSpectrogram(nn.Module):
         )
 
 
-def load_audio_file(path: str, sample_rate: int = 16_000) -> torch.Tensor:
+def librosa_mel_filters(sampling_rate: int, n_fft: int, num_mel_bins: int) -> np.ndarray:
+    """``librosa.filters.mel(norm="slaney")`` as float32 ``(n_mels, 1 + n_fft // 2)``,
+    with librosa's own arithmetic and its float32 rounding of each row before
+    the area normalization, so NeMo-trained encoders see their exact filters."""
+    f_sp = 200.0 / 3
+    min_log_hz, min_log_mel, logstep = 1000.0, 1000.0 / (200.0 / 3), np.log(6.4) / 27.0
+
+    def hz_to_mel(f: float) -> float:
+        return min_log_mel + np.log(f / min_log_hz) / logstep if f >= min_log_hz else f / f_sp
+
+    mels = np.linspace(hz_to_mel(0.0), hz_to_mel(sampling_rate / 2.0), num_mel_bins + 2)
+    mel_f = f_sp * mels
+    log_t = mels >= min_log_mel
+    mel_f[log_t] = min_log_hz * np.exp(logstep * (mels[log_t] - min_log_mel))
+    fftfreqs = np.fft.rfftfreq(n=n_fft, d=1.0 / sampling_rate)
+    fdiff = np.diff(mel_f)
+    ramps = np.subtract.outer(mel_f, fftfreqs)
+    weights = np.zeros((num_mel_bins, 1 + n_fft // 2), dtype=np.float32)
+    for i in range(num_mel_bins):
+        weights[i] = np.maximum(0, np.minimum(-ramps[i] / fdiff[i], ramps[i + 2] / fdiff[i + 1]))
+    weights *= (2.0 / (mel_f[2:num_mel_bins + 2] - mel_f[:num_mel_bins]))[:, None]
+    return weights
+
+
+class NemoLogMel:
+    """FastConformer front end (Canary, Parakeet, Nemotron ASR): ``(samples,)``
+    at 16 kHz -> ``(samples // hop, n_mels)``.
+
+    Preemphasis, a power spectrum from a 25 ms symmetric Hann window zero-padded
+    to ``n_fft``, Slaney mel, natural log with a 2^-24 floor, then (offline
+    checkpoints) per-bin standardization over the clip. Matches HF's
+    ``ParakeetFeatureExtractor`` for one clip; the STFT's last frame is
+    padding there and is dropped here.
+
+    A plain object rather than a module, so an engine casting its node to
+    bf16 leaves the filters and window in fp32.
+    """
+
+    def __init__(
+        self,
+        num_mel_bins: int = 128,
+        sampling_rate: int = 16_000,
+        n_fft: int = 512,
+        win_length: int = 400,
+        hop_length: int = 160,
+        preemphasis: float = 0.97,
+        normalize: bool = True,
+        device: torch.device | str = "cpu",
+        mel_filters: torch.Tensor | None = None,
+        window: torch.Tensor | None = None,
+    ):
+        """``mel_filters`` / ``window`` override the computed ones, for a
+        checkpoint that ships its own (rounded) copies."""
+        self.n_fft, self.win_length, self.hop_length = n_fft, win_length, hop_length
+        self.preemphasis = preemphasis
+        self.normalize = normalize
+        if mel_filters is None:
+            mel_filters = torch.from_numpy(librosa_mel_filters(sampling_rate, n_fft, num_mel_bins))
+        if window is None:
+            window = torch.hann_window(win_length, periodic=False)
+        self.mel_filters = mel_filters.reshape(num_mel_bins, n_fft // 2 + 1).to(device=device, dtype=torch.float32)
+        self.window = window.to(device=device, dtype=torch.float32)
+
+    def num_frames(self, num_samples: int) -> int:
+        return num_samples // self.hop_length
+
+    def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
+        return self.batch([waveform])[0]
+
+    def batch(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
+        """``__call__`` for several clips in one pass and one host-to-device
+        copy: each clip gets what it gets alone. A clip is preemphasized, then
+        zero past its end, which is what the STFT pads a lone clip with; and
+        standardized over its own frames."""
+        lengths = [w.numel() for w in waveforms]
+        frames = [self.num_frames(n) for n in lengths]
+        if min(frames) < 2:
+            n = lengths[frames.index(min(frames))]
+            raise ValueError(f"audio of {n} samples is shorter than two {self.hop_length}-sample frames")
+        device = self.window.device
+        source = waveforms[0].device
+        # host clips are padded straight into pinned memory: one copy to the device
+        pin = source.type == "cpu" and device.type == "cuda"
+        x = torch.zeros(len(waveforms), max(lengths), dtype=torch.float32, device=source, pin_memory=pin)
+        for row, w in enumerate(waveforms):
+            x[row, :lengths[row]] = w.reshape(-1)
+        x = to_device_nonblocking(x, device)
+        n_samples = to_device_nonblocking(torch.tensor(lengths), device)
+        if self.preemphasis:
+            x = torch.cat([x[:, :1], x[:, 1:] - self.preemphasis * x[:, :-1]], dim=1)
+            x = x * (torch.arange(x.shape[1], device=device) < n_samples[:, None])
+        stft = torch.stft(
+            x, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
+            window=self.window, return_complex=True, pad_mode="constant",
+        )
+        # sqrt then square, as the reference does: it rounds differently
+        power = torch.view_as_real(stft).pow(2).sum(-1).sqrt().pow(2)
+        # full fp32, as the reference: the process default is TF32
+        with fp32_precision_scope(Fp32Precision(matmul="highest", cudnn_allow_tf32=None)):
+            mel =torch.log(self.mel_filters @ power + 2.0 ** -24)[:, :, :max(frames)]
+        if self.normalize:
+            # the mean taken as an offset from the first frame: the plain mean up
+            # to rounding, and exact for a constant bin, so digital silence stays
+            # zero where the reference's rounding amplifies it into noise
+            n = to_device_nonblocking(torch.tensor(frames), device)[:, None, None]
+            valid = torch.arange(mel.shape[2], device=device) < n
+            ref = mel[:, :, :1]
+            mean = ref + ((mel - ref) * valid).sum(dim=2, keepdim=True) / n
+            std = (((mel - mean) * valid).pow(2).sum(dim=2, keepdim=True) / (n - 1)).sqrt()
+            mel = (mel - mean) / (std + 1e-5)
+        return [mel[row, :, :f].T for row, f in enumerate(frames)]
+
+
+@functools.cache
+def _ffmpeg_decoder_loads() -> bool:
+    """Whether torchcodec, and the FFmpeg libraries it loads, work here."""
+    try:
+        from torchcodec.decoders import AudioDecoder  # noqa: F401
+    except Exception:  # noqa: BLE001 -- ImportError, or RuntimeError without FFmpeg
+        return False
+    return True
+
+
+def load_audio_file(path: str, sample_rate: int = 16_000, max_seconds: float | None = None) -> torch.Tensor:
     """Decode an audio file to a float32 mono waveform at ``sample_rate``.
 
     libsndfile (``soundfile``) first — it needs no FFmpeg and covers WAV,
     FLAC, OGG and MP3 — then torchcodec for anything else (M4A, WebM, ...).
-    Resampling goes through torchaudio. Audio longer than
-    ``media_io.MAX_AUDIO_SECONDS`` is refused while it decodes.
+    Resampling goes through torchaudio. Audio longer than ``max_seconds``
+    (default ``media_io.MAX_AUDIO_SECONDS``) is refused while it decodes.
     """
+    from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+
+    if max_seconds is None:
+        max_seconds = MAX_AUDIO_SECONDS
+    return _resample(*_decode(path, sample_rate, max_seconds), sample_rate)
+
+
+def _decode(path: str, sample_rate: int, max_seconds: float) -> tuple[torch.Tensor, int]:
+    """The waveform and its rate: libsndfile at the file's own rate, else
+    FFmpeg, which decodes straight to ``sample_rate``."""
     from mstar.api_server.media_io import AudioRefusedError, decode_torchcodec_capped, read_soundfile_capped
 
     try:
-        audio, sr = read_soundfile_capped(path)
-        waveform = torch.from_numpy(audio)
+        audio, sr = read_soundfile_capped(path, max_seconds)
     except AudioRefusedError:
         raise
     except Exception:  # noqa: BLE001 — not a libsndfile container; try FFmpeg
-        return decode_torchcodec_capped(path, sample_rate).to(torch.float32)
-    check_resample_rate(sr, sample_rate)
-    if sr != sample_rate:
+        return decode_torchcodec_capped(path, sample_rate, max_seconds).to(torch.float32), sample_rate
+    return torch.from_numpy(audio), sr
+
+
+def _resample(waveform: torch.Tensor, rate: int, sample_rate: int) -> torch.Tensor:
+    check_resample_rate(rate, sample_rate)
+    if rate != sample_rate:
         import torchaudio
 
-        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
+        waveform = torchaudio.functional.resample(waveform, rate, sample_rate)
     return waveform.contiguous()
+
+
+def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.Tensor:
+    """:func:`load_audio_file` for request uploads, refused past the model's
+    ``max_seconds`` as it decodes, so a small file whose header understates
+    its length cannot expand past it. An undecodable file is the client's
+    error, so it surfaces as ``ValueError`` (HTTP 400). A missing decoder or
+    memory, and anything after the decode, is the server's, and stays as it is."""
+    try:
+        # decoded at its own rate, so a resampling failure isn't blamed on the file
+        waveform, rate = _decode(path, sample_rate, max_seconds)
+    except (ImportError, MemoryError, ValueError):
+        raise
+    except Exception as exc:  # noqa: BLE001 -- libsndfile and FFmpeg both refused it
+        if not _ffmpeg_decoder_loads():
+            raise
+        # FFmpeg's message (paths, internals) stays out of the response
+        raise ValueError("could not decode the audio upload") from exc
+    return _resample(waveform, rate, sample_rate)
+
+
+SAMPLE_RATE = 16_000
+# the mel hop of every FastConformer checkpoint, 10 ms
+HOP_LENGTH = 160
+
+
+def clip_samples(tensors: dict | None, max_seconds: float, model: str) -> torch.Tensor:
+    """A request's one audio input as float32 samples at :data:`SAMPLE_RATE`;
+    ValueError unless there is exactly one, at most ``max_seconds`` long and
+    at least two mel frames."""
+    audio = (tensors or {}).get("audio_inputs", [])
+    if len(audio) != 1:
+        raise ValueError(f"{model} expects exactly one audio input per request; got {len(audio)}")
+    samples = audio[0].reshape(-1).to(torch.float32)
+    seconds = samples.shape[0] / SAMPLE_RATE
+    if seconds > max_seconds:
+        # the loader stops a second past the limit, so the length may be clipped
+        raise ValueError(
+            f"audio is longer than {max_seconds:.0f} s; {model} takes up to {max_seconds:.0f} s per "
+            "request (the transcription endpoint splits longer uploads)"
+        )
+    if samples.shape[0] < 2 * HOP_LENGTH:
+        raise ValueError("audio is shorter than 20 ms")
+    return samples
 
 
 def sinusoid_positions(length: int, channels: int, max_timescale: float = 10_000.0) -> torch.Tensor:

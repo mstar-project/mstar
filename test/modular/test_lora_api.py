@@ -23,6 +23,7 @@ import torch
 pytest.importorskip("fastapi")
 pytest.importorskip("safetensors")
 from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
@@ -35,7 +36,7 @@ except ImportError:  # collected without package context
     from test_lora_tp_lockstep import _Barrier
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
-from mstar.api_server.entrypoint import APIServer, resolve_lora_spec  # noqa: E402
+from mstar.api_server.entrypoint import APIServer, request_validation_error, resolve_lora_spec  # noqa: E402
 from mstar.api_server.lora_admin import LoraAdmin  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult, RequestFailed  # noqa: E402
@@ -136,6 +137,8 @@ def _client(monkeypatch, config, adapter=None):
     if adapter is not None:
         monkeypatch.setattr(router_module, "get_adapter", lambda name: adapter)
     app = FastAPI()
+    # the real server's envelope for a body that fails its schema
+    app.add_exception_handler(RequestValidationError, request_validation_error)
     app.include_router(router_module.router)
     return TestClient(app), stub
 
@@ -282,12 +285,13 @@ _ENDPOINTS = (("/v1/load_lora_adapter", {"lora_name": "a", "lora_path": "/p"}),
 @pytest.mark.parametrize("error,status,message", [
     (None, 200, None),
     (ValueError("why"), 400, "why"),
+    (ValueError("bad /srv/x/adapter.safetensors"), 400, "bad adapter.safetensors"),
     (HTTPException(status_code=409, detail="why"), 409, "why"),
-    (RuntimeError("/srv/secret"), 500, "the LoRA adapter request failed (the server log has the details)"),
+    (RuntimeError("/srv/secret"), 500, "internal error (error id"),
 ])
 def test_the_lora_endpoints(monkeypatch, error, status, message):
-    """vLLM's bodies; a ValueError is a 400 with its message, anything else a 500 that
-    does not quote the exception."""
+    """vLLM's bodies; errors take every route's envelope: a ValueError is a 400 with
+    server paths cut to base names, anything else a 500 naming only an error id."""
     client, stub = _client(monkeypatch, LORA_CONFIG)
     stub.lora_admin = _Admin(error)
     for (path, body), verb in zip(_ENDPOINTS, ("added", "removed"), strict=True):
@@ -295,13 +299,14 @@ def test_the_lora_endpoints(monkeypatch, error, status, message):
         if error is None:
             assert r.status_code == 200 and r.text == f"Success: LoRA adapter 'a' {verb} successfully."
         else:
-            assert r.status_code == status and r.json()["error"] == {
-                "message": message, "code": status,
-                "type": "invalid_request_error" if status < 500 else "server_error",
-            }
-    # a missing field is FastAPI's 422 and never reaches the admin
-    assert client.post("/v1/load_lora_adapter", json={"lora_name": "b"}).status_code == 422
-    assert client.post("/v1/unload_lora_adapter", json={}).status_code == 422
+            got = r.json()["error"]
+            assert r.status_code == status and got["code"] == status
+            assert got["type"] == ("invalid_request_error" if status < 500 else "server_error")
+            assert got["message"].startswith(message) and "/srv" not in got["message"]
+    # a missing field is a 400 and never reaches the admin
+    for path, body in (("/v1/load_lora_adapter", {"lora_name": "b"}), ("/v1/unload_lora_adapter", {})):
+        r = client.post(path, json=body)
+        assert r.status_code == 400 and r.json()["error"]["code"] == 400
     assert stub.lora_admin.calls == [("load", "a", "/p"), ("unload", "a")]
 
 
@@ -405,7 +410,9 @@ def test_a_request_on_an_adapter_being_loaded_or_unloaded_is_refused(paths):
     conductor._reject_request = lambda rid, error, status: rejected.append((rid, status))
 
     def admit(rid, adapter):
-        conductor._admit_request(SimpleNamespace(request_id=rid, model_kwargs={LORA_ADAPTER_KWARG: adapter}))
+        conductor._admit_request(SimpleNamespace(
+            request_id=rid, model_kwargs={LORA_ADAPTER_KWARG: adapter}, client_input=None,
+        ))
 
     ops.load(LoadLoraAdapter(op_id="l", lora_name="a1", lora_path=paths["a1"], lora_digest="ab" * 32))
     admit("on_a1", "a1")

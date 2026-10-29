@@ -53,7 +53,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     )
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: [],
-        add_request=lambda rid, cfg: (_ for _ in ()).throw(RuntimeError("over capacity")),
+        add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
     )
     w.request_state = SimpleNamespace(add_request=lambda rid, info: None)
     w.tensor_manager = SimpleNamespace(
@@ -70,6 +70,6 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     )
     Worker._add_new_request(w, body)
     assert registered == [5] and len(failed) == 1 and list(failed[0]) == [5]
-    assert "over capacity" in failed[0][5]
+    assert failed[0][5].startswith("Error in worker: internal error (error id ")
     # messages parked before the NEW still go through (a parked REMOVE among them)
     assert processed == ["parked"] and "wire" not in w._unprocessed_messages

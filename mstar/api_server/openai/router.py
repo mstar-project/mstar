@@ -11,7 +11,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Request, WebSocket
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from mstar.api_server.body_limit import max_body_bytes
 from mstar.api_server.openai import (
@@ -35,6 +35,7 @@ from mstar.api_server.openai.protocol import (
     UnloadLoraAdapterRequest,
     VideoGenerationRequest,
 )
+from mstar.utils.client_errors import client_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,26 @@ def _error(status: int, message: str, type_: str | None = None) -> JSONResponse:
         status_code=status,
         content={"error": {"message": message, "type": type_ or error_type(status), "code": status}},
     )
+
+
+def _exception_error(e: Exception, route: str) -> JSONResponse:
+    """The error envelope for an exception a route's handler raised.
+
+    An ``HTTPException`` was raised on purpose and keeps its status and
+    detail. Anything else goes through :func:`client_error_text`: a
+    ``ValueError`` or ``TypeError`` is the request's fault, a 400 with server
+    paths cut to base names, and any other error is a 500 that shows the
+    client only an error id, with the full error logged under it. An
+    exception class that names its own ``status_code`` (``AudioTooLongError``
+    is a 413) keeps that status.
+    """
+    status, detail = getattr(e, "status_code", None), getattr(e, "detail", None)
+    if isinstance(status, int) and detail is not None:
+        return _error(status, str(detail))
+    text, _ = client_error_text(e, f"{route} request failed", log=logger, type_name=False)
+    if not isinstance(status, int):
+        status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+    return _error(status, text)
 
 
 def _resolve(require: str):
@@ -96,35 +117,28 @@ async def list_models():
     return JSONResponse(ModelList(data=cards).model_dump(exclude_none=True))
 
 
-async def _lora_admin_call(call):
-    """A ``LoraAdmin`` call's answer, or its failure as an OpenAI error envelope: an
-    HTTPException's own status and detail, a ValueError's 400, and for anything else a
-    500 that is logged but does not quote the exception, which may name server paths."""
+async def _lora_admin_call(call, route: str):
+    """A ``LoraAdmin`` call's answer, or its failure as an OpenAI error envelope
+    (:func:`_exception_error`)."""
     api = _api()
     if api is None:
         return _error(503, "Server not ready")
     try:
         return PlainTextResponse(await call(api.lora_admin))
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
-        status = getattr(e, "status_code", None)
-        if status is not None:
-            return _error(status, str(getattr(e, "detail", e)))
-        if isinstance(e, (ValueError, TypeError)):
-            return _error(400, str(e))
-        logger.exception("LoRA adapter request failed")
-        return _error(500, "the LoRA adapter request failed (the server log has the details)")
+        return _exception_error(e, route)
 
 
 @router.post("/v1/load_lora_adapter")
 async def load_lora_adapter(request: LoadLoraAdapterRequest):
     return await _lora_admin_call(
-        lambda admin: admin.load(request.lora_name, request.lora_path),
+        lambda admin: admin.load(request.lora_name, request.lora_path), "/v1/load_lora_adapter",
     )
 
 
 @router.post("/v1/unload_lora_adapter")
 async def unload_lora_adapter(request: UnloadLoraAdapterRequest):
-    return await _lora_admin_call(lambda admin: admin.unload(request.lora_name))
+    return await _lora_admin_call(lambda admin: admin.unload(request.lora_name), "/v1/unload_lora_adapter")
 
 
 @router.post("/v1/chat/completions")
@@ -135,12 +149,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     try:
         result = await serving_chat.create_chat_completion(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
+        return _exception_error(e, "/v1/chat/completions")
     if request.stream:
-        return StreamingResponse(
-            result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
-        )
+        return result  # serving_chat builds the streaming response
     return JSONResponse(result)
 
 
@@ -152,7 +163,7 @@ async def audio_speech(request: SpeechRequest, raw_request: Request):
     try:
         return await serving_speech.create_speech(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)))
+        return _exception_error(e, "/v1/audio/speech")
 
 
 @router.post("/v1/audio/transcriptions")
@@ -194,8 +205,7 @@ async def audio_transcriptions(request: Request):
             getattr(upload, "filename", None), raw_request=request,
         )
     except Exception as e:  # noqa: BLE001
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
+        return _exception_error(e, "/v1/audio/transcriptions")
 
 
 @router.websocket("/v1/realtime")
@@ -235,9 +245,7 @@ async def images_generations(request: ImageGenerationRequest, raw_request: Reque
     try:
         result = await serving_images.create_images(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        # a malformed request (adapter / model validation) is the client's error, not the server's
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
+        return _exception_error(e, "/v1/images/generations")
     return JSONResponse(result)
 
 
@@ -249,14 +257,9 @@ async def videos_generations(request: VideoGenerationRequest, raw_request: Reque
     try:
         result = await serving_videos.create_videos(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
+        return _exception_error(e, "/v1/videos/generations")
     if (request.model_extra or {}).get("stream_video"):
-        # A windowed request delivering each window as it lands: NDJSON lines
-        # (see serving_videos._stream_ndjson) instead of one JSON body.
-        return StreamingResponse(
-            result, media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"}
-        )
+        return result  # serving_videos builds the streaming response
     return JSONResponse(result)
 
 
@@ -300,6 +303,5 @@ async def images_edits(request: Request):
             raw_request=request,
         )
     except Exception as e:  # noqa: BLE001
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
+        return _exception_error(e, "/v1/images/edits")
     return JSONResponse(result)

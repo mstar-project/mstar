@@ -10,6 +10,7 @@ import collections
 import ctypes
 import itertools
 import json
+import re
 import threading
 import time
 from concurrent.futures import Future
@@ -217,7 +218,10 @@ def test_the_worker_fails_a_request_once_when_its_input_read_fails(tmp_path):
     (sent,) = w.sent
     assert sent[1].message_type == ConductorMessageType.FAIL_REQUESTS
     assert list(sent[1].body.errors) == ["r1"]
-    assert "input tensor read failed: RuntimeError: Mooncake read failed" in sent[1].body.errors["r1"]
+    assert re.fullmatch(
+        r"Error in worker: input tensor read failed: internal error \(error id [0-9a-f]{12}\)",
+        sent[1].body.errors["r1"],
+    )
     assert w.scheduler.failed_rids == {"r1"}
 
 
@@ -237,10 +241,15 @@ def test_the_data_worker_answers_a_failed_output_read_in_its_slot(tmp_path, capl
         assert wt._process_read_tensors() is True
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert [r.exc_info for r in errors] == [None, None]
-    assert "output tensor read failed for request r1: RuntimeError" in errors[1].getMessage()
+    logged = re.fullmatch(
+        r"output tensor read failed for request r1 \[error id ([0-9a-f]{12})\]: "
+        r"RuntimeError: Mooncake read failed.*", errors[1].getMessage(),
+    )
+    assert logged
     chunks = [wt.out_queue.get_nowait(), wt.out_queue.get_nowait()]
     assert [c.modality for c in chunks] == ["error", "text"]
-    assert b"output tensor read failed: RuntimeError: Mooncake read failed" in chunks[0].data
+    # the client gets the id the log line carries, not the read's error text
+    assert chunks[0].data == f"output tensor read failed: internal error (error id {logged[1]})".encode()
     assert chunks[0].metadata["status"] == 500
     assert wt.out_queue.empty()
     assert wt.request_output_state["r1"].order == {}

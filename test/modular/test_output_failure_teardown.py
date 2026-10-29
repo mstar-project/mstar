@@ -26,6 +26,7 @@ from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _requ
 from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import InlineToken, PreprocessWorkerThread, RequestOutputState
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
+from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests, ReadsDone
 
 # ── the data worker ─────────────────────────────────────────────────────────
@@ -43,6 +44,13 @@ class _Socket:
 
     def send(self, entity, msg):
         self.sent.append((entity, msg))
+
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
 
     def to_conductor(self):
         return [(m.message_type, m.body.request_id) for e, m in self.sent if e == "conductor"]
@@ -82,6 +90,9 @@ class _Model:
     def __init__(self, postprocess_raises=False, prompt_raises=False):
         self.postprocess_raises = postprocess_raises
         self.prompt_raises = prompt_raises
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
     def process_prompt(self, *args, **kwargs):
         if self.prompt_raises:
