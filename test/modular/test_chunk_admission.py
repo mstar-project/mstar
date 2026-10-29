@@ -23,8 +23,12 @@ from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    ALL_SET,
+    NONE_SET,
     AllocationFailed,
+    PerReqSetting,
     Segment,
+    SettingValue,
     StepContext,
     SubmoduleStep,
 )
@@ -66,7 +70,7 @@ def _kv(pages: int) -> KVManager:
     )
 
 
-def _ctx(*rids, after=None, reserve_ahead=True) -> StepContext:
+def _ctx(*rids, after=None, reserve_ahead=ALL_SET) -> StepContext:
     ctx = StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False)
     ctx.chunk_tokens_after = after or {}
     ctx.reserve_whole_prefill = reserve_ahead
@@ -92,9 +96,23 @@ def test_the_manager_reserves_ahead_only_when_the_step_says_so():
     kv = _kv(pages=32)
     kv.ingest_request(1, None)
 
-    assert kv.admit(_step(r1=PAGE), _ctx(1, after={1: 4 * PAGE}, reserve_ahead=False)).ok
+    assert kv.admit(_step(r1=PAGE), _ctx(1, after={1: 4 * PAGE}, reserve_ahead=NONE_SET)).ok
 
     assert len(kv._streams[1]["main"].page_indices) == 1
+
+
+def test_a_partial_setting_reserves_ahead_for_its_rows_alone():
+    kv = _kv(pages=32)
+    kv.ingest_request(1, None)
+    kv.ingest_request(2, None)
+    partial = PerReqSetting(SettingValue.PARTIAL, frozenset({1}))
+
+    assert kv.admit(
+        _step(r1=PAGE, r2=PAGE), _ctx(1, 2, after={1: 4 * PAGE, 2: 4 * PAGE}, reserve_ahead=partial),
+    ).ok
+
+    assert len(kv._streams[1]["main"].page_indices) == 5
+    assert len(kv._streams[2]["main"].page_indices) == 1
 
 
 def test_a_later_chunk_takes_no_more_pages():
@@ -137,10 +155,15 @@ def test_a_refused_reservation_unwinds_with_the_step():
 
 
 class _Sub:
-    def __init__(self, reserve_whole_prefill=True):
+    def __init__(self, reserve_whole_prefill=True, other_reserves=True):
         self.policy = ChunkingPolicy(
             walks=("prefill",), chunkable=True, max_batch_tokens=8,
             reserve_whole_prefill=reserve_whole_prefill,
+        )
+        # a second chunked walk, for a step that mixes the two
+        self.other = ChunkingPolicy(
+            walks=("other",), chunkable=True, max_batch_tokens=8,
+            reserve_whole_prefill=other_reserves,
         )
 
     def declare_step(self, **kwargs):
@@ -156,27 +179,36 @@ class _Runner:
         return ADMIT_OK
 
 
-def _declare(sub: "_Sub"):
+def _declare(sub: "_Sub", other_walk_row: bool = False):
     """``_declare_and_admit`` over one non-final chunk, one final one and one
-    unchunked row; returns the ctx the runner was admitted with."""
+    unchunked row, plus a non-final chunk of walk ``other`` if asked; returns
+    the ctx the runner was admitted with."""
     eng = Engine.__new__(Engine)
     eng._runner = _Runner()
     eng._submodules = {"LLM": SimpleNamespace(piecewise_runners={}, submodule=sub)}
     eng._chunking = ChunkingManagement(eng._submodules)
-    eng._chunking.set_policies({("LLM", "prefill"): sub.policy})
-    ctx = StepContext(request_ids=(1, 2, 3), graph_walk="prefill", slot=0, capture=False)
-    batch = SimpleNamespace(
-        node_name="LLM", graph_walk="prefill", per_request_info={},
-        chunk_ranges={1: (0, 4, 10), 2: (4, 10, 10)}, step_context=ctx,
+    eng._chunking.set_policies({("LLM", "prefill"): sub.policy, ("LLM", "other"): sub.other})
+    rids = [1, 2, 3, 4] if other_walk_row else [1, 2, 3]
+    ctx = StepContext(
+        request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False,
+        request_walks={4: "other"} if other_walk_row else {},
     )
+    chunk_ranges = {1: (0, 4, 10), 2: (4, 10, 10)}
     inputs = [
         ARNodeInputs(input_seq_len=4, chunk_start=0, chunk_total=10),   # more to come
         ARNodeInputs(input_seq_len=6, chunk_start=4, chunk_total=10),   # its last chunk
         ARNodeInputs(input_seq_len=1),                                  # not chunked
     ]
+    if other_walk_row:
+        chunk_ranges[4] = (0, 4, 10)
+        inputs.append(ARNodeInputs(input_seq_len=4, chunk_start=0, chunk_total=10))
+    batch = SimpleNamespace(
+        node_name="LLM", graph_walk="prefill", per_request_info={},
+        chunk_ranges=chunk_ranges, step_context=ctx,
+    )
 
     outcome, _ = eng._declare_and_admit(
-        batch, rids=[1, 2, 3], inputs=inputs, submodule=sub, nvtx=False, ctx=ctx,
+        batch, rids=rids, inputs=inputs, submodule=sub, nvtx=False, ctx=ctx,
     )
 
     assert outcome.ok
@@ -186,7 +218,7 @@ def _declare(sub: "_Sub"):
 def test_the_engine_reports_only_non_final_chunks():
     ctx = _declare(_Sub())
     assert ctx.chunk_tokens_after == {1: 6}
-    assert ctx.reserve_whole_prefill
+    assert ctx.reserve_whole_prefill == ALL_SET
 
 
 def test_a_walk_that_reserves_per_chunk_still_reports_what_is_left():
@@ -194,4 +226,12 @@ def test_a_walk_that_reserves_per_chunk_still_reports_what_is_left():
     tokens a step runs, so the counts stand but no resource reserves by them."""
     ctx = _declare(_Sub(reserve_whole_prefill=False))
     assert ctx.chunk_tokens_after == {1: 6}
-    assert not ctx.reserve_whole_prefill
+    assert ctx.reserve_whole_prefill == NONE_SET
+
+
+def test_a_step_mixing_the_two_kinds_of_walk_names_the_rows_that_reserve():
+    """Each row reserves as its own walk says, rather than one answer for the
+    step overriding one of them."""
+    ctx = _declare(_Sub(other_reserves=False), other_walk_row=True)
+    assert ctx.chunk_tokens_after == {1: 6, 4: 6}
+    assert ctx.reserve_whole_prefill == PerReqSetting(SettingValue.PARTIAL, frozenset({1}))

@@ -44,6 +44,7 @@ from mstar.engine.resources.step import (
     ADMIT_OK,
     FULL_ADMIT_NOT_READY,
     AdmitOutcome,
+    PerReqSetting,
 )
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
@@ -1642,12 +1643,11 @@ class Engine:
                 for rid, inp in zip(rids, inputs, strict=True)
                 if not inp.is_final_chunk
             }
-            # all, not per row: one answer for the step keeps a resource from
-            # having to reserve two ways within a single sweep, and no model
-            # mixes the two walks today
-            ctx.reserve_whole_prefill = all(
-                self._chunking.policy(batch.node_name, walk_of(rid)).reserve_whole_prefill
-                for rid in ctx.chunk_tokens_after
+            ctx.reserve_whole_prefill = PerReqSetting.over(
+                ctx.chunk_tokens_after,
+                lambda rid: self._chunking.policy(
+                    batch.node_name, walk_of(rid),
+                ).reserve_whole_prefill,
             )
         # admit reads the step's ctx, so bind it before the sweep rather than
         # in `_drive_step`

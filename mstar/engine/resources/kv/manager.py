@@ -54,6 +54,7 @@ from mstar.engine.resources.step import (
     AllocationFailed,
     RequestOffloading,
     Segment,
+    SettingValue,
     StepContext,
 )
 from mstar.utils.client_errors import client_error_text
@@ -1792,9 +1793,11 @@ class KVManager(AttentionResource):
 
             page_size = self.config.page_size
             sink = step.sink
-            # the counts are in tokens; the flag is the walk's say that its KV
+            # the counts are in tokens; the setting names the rows whose KV
             # grows by them, so they are a span this label can reserve
-            ahead = ctx.chunk_tokens_after if ctx.reserve_whole_prefill else None
+            reserve_ahead = ctx.reserve_whole_prefill
+            ahead = ctx.chunk_tokens_after \
+                if reserve_ahead.value is not SettingValue.UNSET else None
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
@@ -1803,7 +1806,7 @@ class KVManager(AttentionResource):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
-                if ahead:
+                if ahead and reserve_ahead.holds_for(segment.request_id):
                     # a chunked row reserves the rest of its walk up front
                     seq_len += ahead.get(segment.request_id, 0)
                 # the common decode row: its pages already cover the token it
