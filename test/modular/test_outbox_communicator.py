@@ -232,7 +232,8 @@ def _factory(monkeypatch, choice, *, has_try_send):
     if has_try_send:
         _Zmq.try_send = lambda self, peer_id, data: True
     version = communicator.EXPECTED_MSTAR_RUST_VERSION if has_try_send else "0.1.0"
-    monkeypatch.setitem(sys.modules, "mstar_rust", SimpleNamespace(ZmqCommunicator=_Zmq, __version__=version))
+    monkeypatch.setitem(sys.modules, "mstar_rust", SimpleNamespace(
+        ZmqCommunicator=_Zmq, __version__=version, __file__="mstar_rust.so"))
     monkeypatch.setattr(rust_communicator, "RustZMQCommunicator", lambda *args, **kwargs: "rust")
     monkeypatch.setattr(communicator, "ZMQCommunicator", lambda *args, **kwargs: "pyzmq")
     monkeypatch.setenv("MSTAR_RUST_ZMQ", choice)

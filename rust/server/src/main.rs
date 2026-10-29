@@ -62,15 +62,19 @@ use protocol::{
     VideoGenerationRequest,
 };
 use serving::{
-    collect, now, result_stream, rid, try_result_stream, AppState, Out, DUPLICATE_ID_GRACE,
+    collect, now, result_stream, rid, try_result_stream, AppState, Out, OutStream, DUPLICATE_ID_GRACE,
 };
 use utf8::Utf8Stream;
 
 #[tokio::main]
 async fn main() {
-    let model_name = std::env::args()
-        .nth(1)
-        .expect("usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]");
+    const USAGE: &str =
+        "usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]";
+    let model_name = std::env::args().nth(1).expect(USAGE);
+    if model_name == "-h" || model_name == "--help" {
+        println!("{USAGE}");
+        return;
+    }
     let port: u16 = std::env::args()
         .nth(2)
         .and_then(|p| p.parse().ok())
@@ -328,12 +332,11 @@ fn detail_error(status: u16, message: &str) -> Response {
     (code, Json(json!({"detail": message}))).into_response()
 }
 
-/// Turn a `Json` extractor rejection into FastAPI + pydantic's `422` +
-/// `{"detail": [{"loc", "msg", "type"}]}` shape, instead of axum's default
-/// `400` + `text/plain`, so a malformed/invalid body looks the same as the
-/// Python frontend's validation error. Handlers take
+/// Turn a `Json` extractor rejection into the Python frontend's answer to a
+/// schema-invalid body: `400` in the OpenAI envelope, like every other refused
+/// input (axum's default is `400` + `text/plain`). Handlers take
 /// `Result<Json<T>, JsonRejection>` and route the error through here.
-fn json_422(rej: JsonRejection) -> Response {
+fn json_400(rej: JsonRejection) -> Response {
     if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
         let mb = body_limit_mb();
         return error(
@@ -342,15 +345,7 @@ fn json_422(rej: JsonRejection) -> Response {
             "invalid_request_error",
         );
     }
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(json!({"detail": [{
-            "loc": ["body"],
-            "msg": rej.body_text(),
-            "type": "value_error",
-        }]})),
-    )
-        .into_response()
+    error(400, &rej.body_text(), "invalid_request_error")
 }
 
 /// Parse a form-field boolean the way FastAPI's `bool = Form(...)` does (pydantic
@@ -493,7 +488,7 @@ async fn chat_completions(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Chat) {
         Ok(a) => a,
@@ -514,7 +509,11 @@ async fn chat_completions(
     let request_id = rid("chatcmpl");
 
     if req.stream.unwrap_or(false) {
-        return chat_sse(st, args, request_id).into_response();
+        let base = match open_stream(result_stream(&st, &args, &request_id, true)).await {
+            Ok(base) => base,
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
+        };
+        return chat_sse(st, base, request_id).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(build_chat_response(
@@ -525,22 +524,30 @@ async fn chat_completions(
     }
 }
 
+/// `base` once its first item is in, replayed; a refusal is `Err` before any 200 is sent.
+/// A client that leaves meanwhile drops this future, and the stream's guard aborts.
+async fn open_stream(mut base: OutStream) -> Result<OutStream, (u16, String)> {
+    match base.next().await {
+        Some(Out::Error { status, message }) => Err((status, message)),
+        first => Ok(Box::pin(futures::stream::iter(first).chain(base))),
+    }
+}
+
 /// SSE `chat.completion.chunk`s: per-chunk deltas, finish, `[DONE]`. The role
 /// rides on the first delta (the finish one when there is none), as in
 /// `serving_chat.py`: clients time the first token from the first chunk.
 fn chat_sse(
     st: AppState,
-    args: SubmitArgs,
+    base: OutStream,
     request_id: String,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let base = result_stream(&st, &args, &request_id, true);
     let payloads = chat_sse_payloads(base, request_id, now(), st.model_name.clone());
     Sse::new(payloads.map(|s| Ok(Event::default().data(s)))).keep_alive(KeepAlive::default())
 }
 
 /// The `data:` payloads of [`chat_sse`], in order.
 fn chat_sse_payloads(
-    base: serving::OutStream,
+    base: OutStream,
     request_id: String,
     created: i64,
     model: String,
@@ -687,7 +694,7 @@ async fn audio_speech(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Speech) {
         Ok(a) => a,
@@ -716,23 +723,26 @@ async fn audio_speech(
     }
 
     if req.stream.unwrap_or(false) {
-        // Open-ended WAV: streaming header, then PCM16 frames as they arrive.
-        // A backend error ends the byte stream (the connection closes
-        // mid-WAV, matching mstar's generator exception).
-        let header = media::wav_stream_header(st.sample_rate, 1);
-        let base = result_stream(&st, &args, &request_id, true);
-        let audio_only = base.filter_map(|item| async move {
+        let base = match open_stream(result_stream(&st, &args, &request_id, true)).await {
+            Ok(base) => base,
+            Err((status, message)) => return error(status, &message, error_type(status)),
+        };
+        // Open-ended WAV (a streaming header, then PCM16 frames), or bare PCM.
+        // A later error aborts the body: the status is already sent, and a
+        // cleanly ended stream would pass for a complete answer.
+        let audio = base.filter_map(|item| async move {
             match item {
                 Out::Chunk(c) if c.modality == "audio" && !c.data.is_empty() => {
-                    Some(Ok::<Bytes, Infallible>(Bytes::from(c.data)))
+                    Some(Ok(Bytes::from(c.data)))
                 }
-                _ => None,
+                Out::Chunk(_) => None,
+                Out::Error { message, .. } => Some(Err(std::io::Error::other(message))),
             }
         });
-        let body = futures::stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(header)) })
-            .chain(audio_only);
+        let header = (fmt == "wav").then(|| Ok(Bytes::from(media::wav_stream_header(st.sample_rate, 1))));
+        let body = futures::stream::iter(header).chain(audio);
         return Response::builder()
-            .header("content-type", "audio/wav")
+            .header("content-type", if fmt == "wav" { "audio/wav" } else { "audio/pcm" })
             .header("cache-control", "no-cache")
             .body(Body::from_stream(body))
             .unwrap();
@@ -763,7 +773,7 @@ async fn images_generations(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Images) {
         Ok(a) => a,
@@ -785,7 +795,7 @@ async fn images_generations(
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
         if let (Some(s), true) = (seed, i > 0) {
-            args.model_kwargs.insert("seed".to_string(), Value::from(s + i));
+            args.model_kwargs.insert("seed".to_string(), Value::from(s.wrapping_add(i)));
         }
         let st = st.clone();
         async move {
@@ -834,7 +844,7 @@ async fn videos_generations(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Videos) {
         Ok(a) => a,
@@ -859,7 +869,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     };
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
-    let known = ["image", "prompt", "model", "n", "size", "response_format"];
+    // `size` is kept: the adapter maps "WxH" onto the model's width / height
+    let known = ["image", "prompt", "model", "n", "response_format"];
     let mut image_bytes: Option<Vec<u8>> = None;
     let mut image_filename: Option<String> = None;
     let mut prompt = String::new();
@@ -1242,11 +1253,16 @@ async fn generate_finish(
             Ok(base) => base,
             Err((status, message)) => return detail_error(status, &message),
         };
+        let base = match open_stream(base).await {
+            Ok(base) => base,
+            Err((status, message)) => return detail_error(status, &message),
+        };
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
-                Out::Error { message, .. } => {
-                    let mut s = json!({"error": message}).to_string();
+                // after the 200 is committed the status travels in-band
+                Out::Error { status, message } => {
+                    let mut s = json!({"error": message, "status": status}).to_string();
                     s.push('\n');
                     s.into_bytes()
                 }
@@ -1508,8 +1524,9 @@ mod tests {
                 output_modalities: outputs.iter().map(|m| m.to_string()).collect(),
                 ..SubmitArgs::default()
             };
-            let (status, _, data) =
-                body(chat_sse(state(None), args, "r".into()).into_response()).await;
+            let st = state(None);
+            let base = result_stream(&st, &args, "r", true);
+            let (status, _, data) = body(chat_sse(st, base, "r".into()).into_response()).await;
             assert_eq!(status, StatusCode::OK);
             let text = String::from_utf8(data).unwrap();
             let events: Vec<&str> = text

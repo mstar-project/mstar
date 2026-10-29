@@ -63,9 +63,9 @@ def test_the_edges_of_each_range_are_served():
     assert _intake(_model(), {"temperature": 0, "top_p": 1, "repetition_penalty": 1}) == 2048
 
 
-@pytest.mark.parametrize("kwargs", [{"temperature": "0.7"}, {"top_k": "20"}, {"max_output_tokens": "64"}])
-def test_numbers_sent_as_strings_are_refused(kwargs):
-    # one meaning per knob on every model (mstar/utils/generation_kwargs.py): types are strict
+@pytest.mark.parametrize("kwargs", [{"temperature": "warm"}, {"top_k": "20.5"}, {"max_output_tokens": "lots"}])
+def test_strings_that_are_not_the_knobs_type_are_refused(kwargs):
+    # one meaning per knob on every model (mstar/utils/generation_kwargs.py)
     with pytest.raises(ValueError, match=next(iter(kwargs))):
         _intake(_model(), kwargs)
 

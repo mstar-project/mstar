@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=78.1.1", "wheel"]
+requires = ["setuptools>=78.1.1", "setuptools-rust>=1.11", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -19,6 +19,8 @@ keywords = ["inference", "multimodal", "llm", "serving", "engine"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Environment :: GPU :: NVIDIA CUDA",
@@ -172,8 +174,8 @@ cosmos3 = [
     # diffusers 0.39; serving itself uses AutoencoderKLWan and the scheduler.
     "diffusers>=0.39",
     # bs=1 dense attention fast path. The wheel is ABI-tied to the torch/CUDA
-    # build; on a mismatch the engine logs a warning and falls back to the
-    # paged flashinfer backend. See docs/models.rst.
+    # build; on a mismatch the engine runs the dense pass on FlashInfer's
+    # ragged prefill instead. See docs/models.rst.
     "fa3-fwd",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
@@ -327,11 +329,13 @@ lingbot_world = [
     # UMT5 and the Wan2.1 VAE load through transformers / diffusers (see [wan22]);
     # scipy resamples the camera trajectory (Slerp) as the reference does;
     # ftfy and regex clean the prompt as the reference's T5 tokenizer does.
-    # flash-attn (FA2 varlen, what the reference attends with) is installed
+    # The engine's ragged attention runs on FlashInfer; flash-attn (FA2 varlen,
+    # what the reference attends with under reference_numerics) is installed
     # separately, see docs/installation.rst.
     "accelerate",
     "diffusers>=0.39",
     "einops",
+    "flashinfer-python>=0.6.14",
     "ftfy",
     "huggingface-hub",
     "regex",

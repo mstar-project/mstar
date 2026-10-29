@@ -52,6 +52,11 @@ class NodeResourceSpec(ABC):
         return set()
 
     @property
+    def writes_prefix_snapshots(self) -> bool:
+        """Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them."""
+        return False
+
+    @property
     @abstractmethod
     def resource_class(self) -> "type[Resource]":
         """What builds this spec. Imported inside the property, so declaring a
