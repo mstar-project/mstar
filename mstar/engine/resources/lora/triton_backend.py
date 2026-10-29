@@ -21,7 +21,7 @@ the slot's own rank.
 
 These are the CUDA kernels of the ``mstar::lora_shrink`` / ``mstar::lora_expand_`` /
 ``mstar::lora_apply_`` custom ops (``ops.py``), so ``torch.compile`` treats each as one
-opaque node.
+opaque node; an experts target's grouped GEMMs run as ``mstar::lora_experts_apply_``.
 """
 
 from __future__ import annotations
@@ -323,24 +323,43 @@ class TritonLoraBackend(LoraOpsBackend):
             return
         if y.shape[0] == 0:
             return
-        config = _experts_config(ids, a.shape[0])
-        assert config["BLOCK_SIZE_M"] == alignment.block_m
-        sorted_ids, expert_ids, num_post_padded, _ = alignment
-        compute_type = tl_compute_type(x.dtype)
-        launch = dict(
-            topk_ids=ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
-            num_tokens_post_padded=num_post_padded, config=config, compute_type=compute_type,
+        sorted_ids, expert_ids, num_post_padded, block_m = alignment
+        lora_experts_apply_(x, y, a, b, ids, row_weight, sorted_ids, expert_ids, num_post_padded,
+                            top_k, list(out_slices), block_m)
+
+
+# One opaque node for torch.compile, as the dense ops are - traced as raw Triton launches into
+# column views of ``y``, compiled output differed from eager and graph capture crashed.
+@torch.library.custom_op("mstar::lora_experts_apply_", mutates_args={"y"}, device_types="cuda")
+def lora_experts_apply_(
+    x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor, ids: torch.Tensor,
+    row_weight: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor,
+    num_post_padded: torch.Tensor, top_k: int, out_slices: list[int], block_m: int,
+) -> None:
+    """The experts targets' shrink and per-slice expands (``TritonLoraBackend.apply_experts_``)."""
+    config = _experts_config(ids, a.shape[0])
+    assert config["BLOCK_SIZE_M"] == block_m
+    compute_type = tl_compute_type(x.dtype)
+    launch = dict(
+        topk_ids=ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
+        num_tokens_post_padded=num_post_padded, config=config, compute_type=compute_type,
+    )
+    max_rank = b.shape[-1]
+    h = x.new_empty(y.shape[0], a.shape[1])
+    invoke_fused_moe_kernel(x, a, h, row_weight, mul_routed_weight=False, top_k=top_k, **launch)
+    offset = 0
+    for i, width in enumerate(out_slices):
+        invoke_fused_moe_kernel(
+            h[:, i * max_rank:(i + 1) * max_rank], b[:, offset:offset + width], y[:, offset:offset + width],
+            row_weight, mul_routed_weight=True, top_k=1, accumulate=True, **launch,
         )
-        max_rank = b.shape[-1]
-        h = x.new_empty(y.shape[0], a.shape[1])
-        invoke_fused_moe_kernel(x, a, h, row_weight, mul_routed_weight=False, top_k=top_k, **launch)
-        offset = 0
-        for i, width in enumerate(out_slices):
-            invoke_fused_moe_kernel(
-                h[:, i * max_rank:(i + 1) * max_rank], b[:, offset:offset + width], y[:, offset:offset + width],
-                row_weight, mul_routed_weight=True, top_k=1, accumulate=True, **launch,
-            )
-            offset += width
+        offset += width
+
+
+@lora_experts_apply_.register_fake
+def _lora_experts_apply_fake(x, y, a, b, ids, row_weight, sorted_ids, expert_ids, num_post_padded, top_k,
+                             out_slices, block_m):
+    return None
 
 
 def _experts_config(ids: torch.Tensor, num_ids: int) -> dict:

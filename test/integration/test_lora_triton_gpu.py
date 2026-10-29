@@ -517,13 +517,13 @@ def routed(tokens, g):
     return x, weights, ids
 
 
-@pytest.mark.parametrize("captured", [False, True])
-def test_bound_experts_match_each_rows_merged_adapter(tmp_path, captured):
+@pytest.mark.parametrize("case", ["eager", "captured", "captured-compiled"])
+def test_bound_experts_match_each_rows_merged_adapter(tmp_path, case):
     """A bound ``FusedExperts`` through ``fused_experts(lora=)`` (gate/up delta before the SwiGLU,
     routing-weighted down delta before the top-k sum), two adapters and base rows in one batch,
     against each row's adapter merged into its experts in fp32: eagerly, and inside one captured
-    graph replayed for other adapter mixes. Base rows (and bucket padding) are bitwise the unbound
-    layer's."""
+    graph replayed for other adapter mixes (``captured-compiled`` captures the Inductor-compiled
+    forward, as the runner does). Base rows (and bucket padding) are bitwise the unbound layer's."""
     paths, refs = {}, {}
     for name, seed in (("e1", 1), ("e2", 2)):
         paths[name] = str(tmp_path / f"{name}.safetensors")
@@ -543,7 +543,7 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, captured):
             at += n
 
     mixes = [[("m0", "e1", 9), ("m1", None, 1), ("m2", "e2", 20)], [("m3", "e2", 5), ("m4", None, 30)]]
-    if not captured:
+    if case == "eager":
         for mix in mixes:
             step, ctx = eager_step(pool, mix)
             x, weights, ids = routed(sum(n for *_, n in mix), g)
@@ -564,7 +564,8 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, captured):
         with torch.no_grad():
             return bound(x, weights, ids), plain(x, weights, ids)
 
-    graph, (out, base) = capture(forward)
+    fn = torch.compile(forward, mode="max-autotune-no-cudagraphs", fullgraph=True) if "compiled" in case else forward
+    graph, (out, base) = capture(fn)
     for mix in mixes:
         for rid, name, _ in mix:
             pool.ingest_request(rid, None if name is None else LoraReqConfig(adapter=name))
