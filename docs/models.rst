@@ -373,7 +373,10 @@ via ``extra_body``.
 With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
 YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
 token's raw log-prob in its chunk's ``metadata`` (``{"logprob": ...}``); top
-alternatives and OpenAI's ``logprobs`` are not supported yet.
+alternatives and OpenAI's ``logprobs`` are not supported yet. On any deployment,
+``"return_token_ids": true`` adds each text chunk's sampled ids
+(``{"token_ids": [...]}``), stop tokens included, so a trainer need not
+re-tokenize the text.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
