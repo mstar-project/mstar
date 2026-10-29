@@ -200,6 +200,13 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         tp_env={"GLOO_SOCKET_IFNAME": "lo"}, model_kwargs={"moe_backend": "aiter"}, follows="mstar",
         recipe="as the mstar arm, with model_kwargs moe_backend: aiter (AITER's fused MoE for the Thinker and "
                "Talker experts; mstar's tuned Triton MoE tables don't apply)"),
+    # The DiT blocks' linears as fp8 GEMMs (mstar/model/components/fp8_linear.py), right after the mstar arm on the
+    # same GPUs.
+    Arm("mstar-fp8", "mstar", ("image", "video"), client="ours_openai", env={"MSTAR_SHM_ARENA": "1"},
+        rows=("flux2_klein", "flux2_klein_9b", "z_image_turbo", "wan22"), model_kwargs={"linear_dtype": "fp8"},
+        follows="mstar",
+        recipe="as the mstar arm, with model_kwargs linear_dtype: fp8 (per-channel e4m3 weights, per-token "
+               "activations, hipBLASLt fp8 GEMMs; text encoder and VAE in bf16)"),
     # The same arms on the base tree (--tree base=PATH), back to back with the head's on each row, so the head's
     # change is measured in the same session. Each serves its own tree's configs.
     Arm("mstar-base", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai", tree="base",
