@@ -174,22 +174,22 @@ class CommGroup:
         if self.world_size == 1:
             return False
         if self._ar_fusion_ws is not None:
-            if (self._ar_fusion_hidden, self._ar_fusion_dtype) == (hidden, dtype):
-                return True
-            logger.warning(
-                "all-reduce fusion is set up for hidden %d %s on TP ranks %s; inputs of "
-                "hidden %d %s take NCCL all-reduce + separate norm",
-                self._ar_fusion_hidden, self._ar_fusion_dtype, self.group_members, hidden, dtype,
-            )
-            return False
+            same = (self._ar_fusion_hidden, self._ar_fusion_dtype) == (hidden, dtype)
+            if not same or max_tokens > self._ar_fusion_max_tokens:
+                logger.warning(
+                    "all-reduce fusion is set up for up to %d x %d %s on TP ranks %s; other "
+                    "inputs (here up to %d x %d %s) take NCCL all-reduce + separate norm",
+                    self._ar_fusion_max_tokens, self._ar_fusion_hidden, self._ar_fusion_dtype,
+                    self.group_members, max_tokens, hidden, dtype,
+                )
+            return same
         from mstar.distributed.ar_fusion import create_workspace
 
-        self._ar_fusion_ws = create_workspace(
-            self, max_tokens, hidden, dtype,
-        )
-        self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
-        self._ar_fusion_hidden, self._ar_fusion_dtype = hidden, dtype
-        return self._ar_fusion_ws is not None
+        ws = create_workspace(self, max_tokens, hidden, dtype)
+        if ws is not None:
+            self._ar_fusion_ws, self._ar_fusion_max_tokens = ws, max_tokens
+            self._ar_fusion_hidden, self._ar_fusion_dtype = hidden, dtype
+        return ws is not None
 
     def allreduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
