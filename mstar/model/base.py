@@ -488,8 +488,9 @@ class Model(ABC):
     # Request keys that set an output length. A request that sets one is refused when it
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
-    # Request keys the conductor reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache")
+    # Request keys the conductor reads for every model, never logged as ignored
+    # (``lora_adapter`` is ``LORA_ADAPTER_KWARG``).
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "lora_adapter")
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
