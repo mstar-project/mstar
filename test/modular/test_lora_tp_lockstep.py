@@ -328,8 +328,8 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
     assert not errors and v1 == v2 == "ok"
     for pool in ranks:
         pool.remove_request("h")
-    gate, read = threading.Event(), follower.store._read
-    follower.store._read = lambda name, path: (name != "a2" or gate.wait(10)) and read(name, path)
+    gate, read = threading.Event(), follower.store.read
+    follower.store.read = lambda name, path, digest: (name != "a2" or gate.wait(10)) and read(name, path, digest)
     for pool in ranks:
         ingest(pool, "rA", "a2")
         ingest(pool, "rB", "a3")
@@ -373,13 +373,13 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
     pool = LoraAdapterPool.build(make_spec(lora_paths, max_slots=2, cpu_capacity=1),
                                  EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
     if rank == 1:
-        read = pool.store._read
+        read = pool.store.read
 
-        def flaky(name, path):
+        def flaky(name, path, digest):
             if name == "a2":
                 raise OSError("read error on rank 1 only")
-            return read(name, path)
-        pool.store._read = flaky
+            return read(name, path, digest)
+        pool.store.read = flaky
     for rid, adapter in (("ok", "a1"), ("bad", "a2")):
         ingest(pool, rid, adapter)
     result = {"agree": [_verdict(pool.admit(step([rid]), ctx([rid]))) for rid in ("ok", "bad")],

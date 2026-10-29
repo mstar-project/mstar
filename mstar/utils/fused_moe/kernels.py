@@ -73,6 +73,7 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     even_Ks: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
 ):
     """Compute one ``[BLOCK_SIZE_M, BLOCK_SIZE_N]`` tile of the MoE output.
 
@@ -87,6 +88,9 @@ def fused_moe_kernel(
     holds the permuted slot indices (< ``num_valid_tokens`` for real
     tokens, >= for padding) and ``expert_ids`` maps each ``BLOCK_SIZE_M``
     block to the expert index.
+
+    ``ACCUMULATE`` adds the tile into ``C`` instead of overwriting it (a
+    LoRA delta onto a base GEMM's output).
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -138,11 +142,12 @@ def fused_moe_kernel(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
-    accumulator = accumulator.to(compute_type)
-
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    if ACCUMULATE:
+        accumulator += tl.load(c_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+    accumulator = accumulator.to(compute_type)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -284,6 +289,7 @@ def invoke_fused_moe_kernel(
     top_k: int,
     config: Dict[str, Any],
     compute_type: tl.dtype,
+    accumulate: bool = False,
 ) -> None:
     """Launch :func:`fused_moe_kernel` with the right grid size.
 
@@ -311,6 +317,8 @@ def invoke_fused_moe_kernel(
         Tile sizes; output of :func:`get_default_config`.
     compute_type : triton.language.dtype
         Dtype for the accumulator store.
+    accumulate : bool
+        Add into ``C`` rather than overwrite it.
     """
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -349,6 +357,7 @@ def invoke_fused_moe_kernel(
         top_k=top_k,
         compute_type=compute_type,
         even_Ks=even_Ks,
+        ACCUMULATE=accumulate,
         **config,
     )
 

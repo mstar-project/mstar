@@ -65,7 +65,9 @@ def test_custom_ops_pass_opcheck():
     token_slots = torch.tensor([2, 0, 1, 3, 2, 2, 1], dtype=torch.int32)
     order = torch.cat([torch.argsort(token_slots, stable=True).to(torch.int32), torch.zeros(3, dtype=torch.int32)])
     indptr = torch.cat([torch.zeros(1, dtype=torch.int32), torch.bincount(token_slots, minlength=4).cumsum(0)])
-    common = (order, indptr.to(torch.int32), ranks)
+    # a capture bucket's tail tokens are on the zero adapter
+    token_slot = torch.cat([token_slots, torch.zeros(3, dtype=torch.int32)])
+    common = (order, indptr.to(torch.int32), token_slot, ranks)
     g = torch.Generator().manual_seed(1)
     a, b = torch.randn(4, 3 * 4, 12, generator=g, dtype=F64), torch.randn(4, 14, 4, generator=g, dtype=F64)
     x, y = torch.randn(10, 12, generator=g, dtype=F64), torch.randn(10, 14, generator=g, dtype=F64)

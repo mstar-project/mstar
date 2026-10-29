@@ -147,13 +147,16 @@ class CommandAPlusAttention(ParallelAttention):
 class CommandAPlusDecoderLayer(nn.Module):
     """Parallel residual block: x + Attention(LN(x)) + MoE(LN(x))."""
 
-    # once fused (``fuse_weights``, on CUDA) ``fused_branches`` runs these as slices of its GEMMs
+    # once fused (``fuse_weights``, on CUDA) ``fused_branches`` runs these through their weights
     lora_unservable = dict.fromkeys(
         ("self_attn.qkv_proj", "self_attn.o_proj",
          "mlp.shared_experts.gate_up_proj", "mlp.shared_experts.down_proj"),
         "fused into the decoder layer's GEMMs at load on CUDA (fuse_weights); refused on every "
         "device so the spec does not depend on it",
-    )
+    ) | {
+        "mlp.experts": "run by the decoder layer's fused path on CUDA (fused_branches calls the "
+        "MoE kernel on their weights); refused on every device so the spec does not depend on it",
+    }
 
     def __init__(
         self,

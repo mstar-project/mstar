@@ -9,7 +9,7 @@ handle only the gate_up GEMM, SwiGLU, down GEMM, and weighted sum over top-k.
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 import triton.language as tl
@@ -24,6 +24,9 @@ from mstar.utils.fused_moe.kernels import (
     moe_sum_reduce_triton,
 )
 from mstar.utils.quant_fp8 import FP8_DTYPE, per_token_group_quant_fp8
+
+if TYPE_CHECKING:
+    from mstar.model.components.moe import ExpertsLora
 
 
 class MoeAlignment(NamedTuple):
@@ -41,7 +44,8 @@ def moe_block_m(num_tokens: int, w1: torch.Tensor, top_k: int) -> int:
     return get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k)[0]["BLOCK_SIZE_M"]
 
 
-def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
+def tl_compute_type(dtype: torch.dtype) -> tl.dtype:
+    """The Triton dtype the fused-MoE kernel stores its output in, for inputs in ``dtype``."""
     if dtype == torch.bfloat16:
         return tl.bfloat16
     if dtype == torch.float16:
@@ -59,6 +63,7 @@ def fused_experts(
     reduce_results: bool = True,
     skip_invalid: bool = False,
     alignment: MoeAlignment | None = None,
+    lora: "ExpertsLora | None" = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -94,6 +99,10 @@ def fused_experts(
     alignment : MoeAlignment, optional
         Precomputed alignment of ``topk_ids``. Its ``block_m`` must be
         :func:`moe_block_m` for this shape. Computed here when omitted.
+    lora : ExpertsLora, optional
+        Per-request LoRA deltas on the experts, added to the gate+up GEMM's
+        output before the activation and to the down GEMM's (weighted)
+        output before the top-k sum. None when the layer has none bound.
 
     Returns
     -------
@@ -121,7 +130,7 @@ def fused_experts(
     topk_weights = topk_weights.contiguous()
 
     config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
-    compute_type = _tl_compute_type(hidden_states.dtype)
+    compute_type = tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
     block_m = config["BLOCK_SIZE_M"]
@@ -164,6 +173,8 @@ def fused_experts(
         config=config,
         compute_type=compute_type,
     )
+    if lora is not None:
+        lora.gate_up_(hidden_states, cache1)
 
     # 4. SwiGLU: cache2[slot] = silu(gate) * up
     act_and_mul_triton(cache1, cache2, activation=activation)
@@ -185,6 +196,8 @@ def fused_experts(
         config=down_config,
         compute_type=compute_type,
     )
+    if lora is not None:
+        lora.down_(cache2, cache3.view(m_topk, hidden), topk_weights)
 
     # 6. Sum over the top-k slots -> (tokens, hidden).
     if not reduce_results:
@@ -340,7 +353,7 @@ def _fused_experts_fp8_impl(
         # launches read the same alignment, so it must match across them.
         config.update(BLOCK_SIZE_N=128, GROUP_SIZE_M=32, num_warps=4, num_stages=3)
         config_down = dict(config)
-    compute_type = _tl_compute_type(hidden_states.dtype)
+    compute_type = tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)

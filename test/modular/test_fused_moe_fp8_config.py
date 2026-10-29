@@ -185,7 +185,7 @@ def fp8_fakes(monkeypatch):
     monkeypatch.setattr(runner, "invoke_fused_moe_kernel_fp8_w8a8", fake_gemm)
     monkeypatch.setattr(runner, "act_and_mul_triton", fake_act)
     monkeypatch.setattr(runner, "moe_sum_reduce_triton", fake_reduce)
-    monkeypatch.setattr(runner, "_tl_compute_type", lambda dtype: f"tl:{dtype}")
+    monkeypatch.setattr(runner, "tl_compute_type", lambda dtype: f"tl:{dtype}")
     return launches, quants, reduces
 
 
@@ -292,6 +292,6 @@ def test_bf16_fused_experts_signature_unchanged():
     params = list(inspect.signature(runner.fused_experts).parameters)
     assert params == [
         "hidden_states", "w1", "w2", "topk_weights", "topk_ids", "activation", "reduce_results", "skip_invalid",
-        "alignment",
+        "alignment", "lora",
     ]
     assert list(inspect.signature(get_default_config).parameters) == ["M", "E", "N", "K", "top_k"]

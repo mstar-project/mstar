@@ -5,12 +5,17 @@ and captured paths address slots the same way. Shapes, per layer of one target:
 
 * ``x [T, in]``, ``y [T, out]`` (written in place), ``h [T, slices * R]``
 * ``a [slots, slices * R, in]``, ``b [slots, out, R]``, ``ranks`` / ``scalings`` ``[slots]``
+  (slot 0, the zero adapter, has rank 0)
 
 ``out_slices`` are this rank's widths of a fused projection's outputs (``(q, k, v)``); slice
 ``i`` reads ``h[:, i*R:(i+1)*R]`` and writes its own columns of ``y``.
 
 An embedding target's shrink is a gather instead (``gather_shrink``): its input is a token
 id, ``in`` is the vocabulary, and ``x @ A^T`` of the id's one-hot is A's column for it.
+
+An experts target (``apply_experts_``) holds one A and B per (slot, expert), addressed per
+output row by a combined id ``(slot - 1) * experts + expert``; the zero adapter's are not
+stored, and any id past them is a row that gets nothing.
 """
 
 from __future__ import annotations
@@ -47,7 +52,7 @@ class LoraBackend(ABC):
     ) -> torch.Tensor:
         """``h[t] = a[slot(t)][:, ids[t]]``, the shrink of a token's one-hot; an id outside
         ``[0, in)`` (e.g. an image position's ``-1``) contributes nothing."""
-        return gather_shrink_reference(ids, a, addressing.token_order, addressing.slot_indptr, ranks)
+        return gather_shrink_reference(ids, a, addressing.token_slot, ranks)
 
     def apply_(
         self, x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
@@ -83,59 +88,81 @@ class LoraBackend(ABC):
         h = self.shrink(x, a, addressing, ranks, len(out_slices))
         self.expand_fused(h, b, addressing, ranks, scalings, y, out_slices)
 
+    def align_experts(self, ids: torch.Tensor, num_ids: int):
+        """What ``apply_experts_`` reads to group the rows of ``ids`` (``[tokens, top_k]``
+        combined ids, ``num_ids`` meaning none) by id, shared by every call over them;
+        None where the backend groups nothing (this reference)."""
+        return None
 
-def _token_slots(token_order: torch.Tensor, slot_indptr: torch.Tensor, tokens: int):
-    """``(slot of each token, whether it has one)`` from the slot-grouped layout.
+    def apply_experts_(
+        self, x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+        ids: torch.Tensor, row_weight: torch.Tensor, top_k: int, out_slices: tuple[int, ...],
+        alignment=None,
+    ) -> None:
+        """``y[m, slice i] += row_weight[m] * (x[m // top_k] @ a[id, slice i]^T) @ b[id,
+        slice i]^T`` for each row ``m`` of ``y``, ``id = ids.flatten()[m]``; a row whose id
+        is past ``a``'s (``a.shape[0]``) gets nothing. ``a [ids, slices * R, in]``, ``b [ids,
+        out, R]``; ``alignment`` is ``align_experts``' for ``ids``.
 
-    A token outside every slot's range (a capture bucket's tail) gets slot 0.
-    """
-    slots = slot_indptr.shape[0] - 1
-    pos = torch.arange(tokens, device=token_order.device)
-    # the slot owning sorted position p: how many slots end at or before it
-    owner = torch.searchsorted(slot_indptr[1:].contiguous(), pos.to(slot_indptr.dtype), right=True)
-    live = owner < slots
-    # scatter into a spare last entry for the dead positions, so they write nothing real
-    index = torch.where(live, token_order.long(), tokens)
-    token_slot = torch.zeros(tokens + 1, dtype=torch.long, device=token_order.device)
-    token_slot.scatter_(0, index, torch.where(live, owner, 0))
-    has = torch.zeros(tokens + 1, dtype=torch.bool, device=token_order.device)
-    has.scatter_(0, index, live)
-    return token_slot[:tokens], has[:tokens]
+        This reference gathers each row's factors, ``_EXPERT_ROWS`` rows at a time so the
+        gathered copies stay bounded: fine on a CPU, at a dense LoRA's work per row."""
+        del alignment
+        num_ids, max_rank = a.shape[0], b.shape[-1]
+        ids, row_weight = ids.reshape(-1), row_weight.reshape(-1)
+        acc = torch.promote_types(x.dtype, torch.float32)
+        for start in range(0, y.shape[0], _EXPERT_ROWS):
+            stop = min(start + _EXPERT_ROWS, y.shape[0])
+            chunk = ids[start:stop]
+            keep = chunk < num_ids
+            idx = torch.where(keep, chunk, 0).long()
+            src = x[torch.arange(start, stop, device=x.device) // top_k].to(acc)
+            h = torch.einsum("mk,mrk->mr", src, a[idx].to(acc))
+            weight = torch.where(keep, row_weight[start:stop].to(acc), 0.0)[:, None]
+            offset = 0
+            for i, width in enumerate(out_slices):
+                h_i = h[:, i * max_rank:(i + 1) * max_rank]
+                delta = torch.einsum("mr,mor->mo", h_i, b[idx, offset:offset + width].to(acc))
+                # a select, not a multiply: a captured bucket's tail rows may hold anything
+                y[start:stop, offset:offset + width] += torch.where(keep[:, None], weight * delta, 0.0).to(y.dtype)
+                offset += width
+
+
+# rows of an experts target the torch reference gathers factors for at once
+_EXPERT_ROWS = 64
 
 
 def shrink_reference(
-    x: torch.Tensor, a: torch.Tensor, token_order: torch.Tensor,
-    slot_indptr: torch.Tensor, ranks: torch.Tensor, num_slices: int,
+    x: torch.Tensor, a: torch.Tensor, token_slot: torch.Tensor, ranks: torch.Tensor, num_slices: int,
 ) -> torch.Tensor:
     """``h [T, slices * R]`` for ``x [T, in]`` against ``a [slots, slices * R, in]``, every
-    token against every slot and then its own selected: no host sync and no data-dependent
-    shape, so it compiles and captures, at ``slots`` times a dense LoRA's work. Zeros where
-    the expand does not read (dead tokens, columns past a slot's rank)."""
+    token against every slot and then its own (``token_slot [T]``) selected: no host sync
+    and no data-dependent shape, so it compiles and captures, at ``slots`` times a dense
+    LoRA's work. Zeros where the expand does not read (the zero adapter's rows, columns
+    past a slot's rank)."""
     tokens = x.shape[0]
     slots, width, k = a.shape
     max_rank = width // num_slices
-    token_slot, live = _token_slots(token_order, slot_indptr, tokens)
+    token_slot = token_slot.long()
     h_all = (x @ a.reshape(slots * width, k).t()).view(tokens, slots, width)
     h = h_all.gather(1, token_slot.view(tokens, 1, 1).expand(tokens, 1, width)).squeeze(1)
     rank = ranks.long()[token_slot]
     col = torch.arange(width, device=x.device) % max_rank
-    keep = live[:, None] & (col[None, :] < rank[:, None])
+    keep = col[None, :] < rank[:, None]
     # a select, not a multiply: a captured bucket's tail tokens may hold anything, inf included
     return torch.where(keep, h, torch.zeros((), dtype=h.dtype, device=h.device))
 
 
 def expand_reference_(
-    y: torch.Tensor, h: torch.Tensor, b: torch.Tensor, token_order: torch.Tensor,
-    slot_indptr: torch.Tensor, ranks: torch.Tensor, scalings: torch.Tensor,
-    out_slices: list[int],
+    y: torch.Tensor, h: torch.Tensor, b: torch.Tensor, token_slot: torch.Tensor,
+    ranks: torch.Tensor, scalings: torch.Tensor, out_slices: list[int],
 ) -> None:
     """``y[:, slice] += scaling * h[:, slice ranks] @ b[slot, slice]^T`` in place, as
     ``shrink_reference`` computes it."""
     tokens = y.shape[0]
     slots, _, max_rank = b.shape
-    token_slot, live = _token_slots(token_order, slot_indptr, tokens)
+    token_slot = token_slot.long()
     rank = ranks.long()[token_slot]
-    live = live & (rank > 0)
+    live = rank > 0
     k = torch.arange(max_rank, device=y.device)
     # accumulate in at least fp32, as the kernels do
     acc = torch.promote_types(h.dtype, torch.float32)
@@ -156,15 +183,14 @@ def expand_reference_(
 
 
 def gather_shrink_reference(
-    ids: torch.Tensor, a: torch.Tensor, token_order: torch.Tensor,
-    slot_indptr: torch.Tensor, ranks: torch.Tensor,
+    ids: torch.Tensor, a: torch.Tensor, token_slot: torch.Tensor, ranks: torch.Tensor,
 ) -> torch.Tensor:
     """Plain torch for ``gather_shrink``: fixed shapes and no host sync, so it compiles
     and captures on any device."""
     vocab = a.shape[2]
     ids = ids.long()
-    slots, has = _token_slots(token_order, slot_indptr, ids.shape[0])
-    live = has & (ids >= 0) & (ids < vocab) & (ranks[slots] > 0)
+    slots = token_slot.long()
+    live = (ids >= 0) & (ids < vocab) & (ranks[slots] > 0)
     h = a[slots, :, ids.clamp(0, vocab - 1)]  # [T, slices * R]
     return torch.where(live[:, None], h, torch.zeros((), dtype=h.dtype, device=h.device))
 
@@ -175,12 +201,10 @@ class TorchLoraBackend(LoraBackend):
     GPU kernel. Fine for a reference and for small pools."""
 
     def shrink(self, x, a, addressing, ranks, num_slices=1):
-        return shrink_reference(x, a, addressing.token_order, addressing.slot_indptr, ranks, num_slices)
+        return shrink_reference(x, a, addressing.token_slot, ranks, num_slices)
 
     def expand_fused(self, h, b, addressing, ranks, scalings, y, out_slices):
-        expand_reference_(
-            y, h, b, addressing.token_order, addressing.slot_indptr, ranks, scalings, list(out_slices),
-        )
+        expand_reference_(y, h, b, addressing.token_slot, ranks, scalings, list(out_slices))
 
 
 def make_backend(kind: str, device: torch.device) -> LoraBackend:

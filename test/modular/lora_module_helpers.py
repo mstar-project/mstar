@@ -21,10 +21,11 @@ from safetensors.torch import save_file
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.lora import LoraReqConfig, LoraSpec
-from mstar.engine.resources.lora.checkpoint import read_lora_file
+from mstar.engine.resources.lora import AdapterInfo, LoraReqConfig, LoraSpec
+from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file
 from mstar.engine.resources.lora.identity import adapter_digest
 from mstar.engine.resources.lora.pool import LoraAdapterPool
+from mstar.engine.resources.lora.store import classify_adapter
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from mstar.model.submodule_base import ARNodeInputs, declared_step
@@ -123,6 +124,22 @@ def pin_digests(spec: LoraSpec) -> LoraSpec:
         for name, path in spec.adapters.items()
     }
     return spec
+
+
+def header_info(spec: LoraSpec, items) -> AdapterInfo:
+    """``classify_adapter`` on the ``(checkpoint key, shape)`` pairs a safetensors header
+    lists: what ``check_adapter_file`` refuses, for adapters too large to write out (a
+    released model size) or a refusal checked without writing a file."""
+    shapes: dict[str, dict[str, tuple[int, ...]]] = {}
+    for key, shape in items:
+        # a key no plain LoRA has (DoRA, modules_to_save, ...) raises a refusal, named
+        module, kind = parse_lora_key(normalize_lora_key(key))
+        if kind != "alpha":
+            shapes.setdefault(module, {})[kind] = tuple(shape)
+    for module, ab in shapes.items():
+        if set(ab) != {"A", "B"}:  # as read_lora_file refuses it
+            raise ValueError(f"LoRA module {module!r} is missing lora_{'B' if 'A' in ab else 'A'}")
+    return classify_adapter(spec, shapes)
 
 
 def serve(spec: LoraSpec, adapters: dict[str, str], max_rank: int = 4, **kw) -> LoraSpec:
@@ -341,7 +358,7 @@ def bind_under(module: nn.Module, prefix: str, lora_pool: LoraAdapterPool, check
             continue
         target = make_lora_capable(module.get_submodule(path[len(prefix):]))
         if check:
-            _check(target, spec.targets[ref.target], lora_pool.targets[ref.target], path, spec.resource_key)
+            _check(target, None, spec.targets[ref.target], lora_pool.targets[ref.target], path, spec.resource_key)
         target.lora_delta = lora_pool.layer_delta(ref.target, ref.layer)
         bound += 1
     return bound
@@ -527,7 +544,7 @@ class Stack:
     # the node's forward, per request: (its hidden rows, its head rows)
     run: Callable[[nn.Module, list[torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]
     declare: Callable[[nn.Module, list[str], list[torch.Tensor]], object]
-    inputs: Callable[[object, int, int], torch.Tensor]         # (config, tokens, seed) -> a row
+    inputs: Callable[[object, int, int], torch.Tensor]         # (config, n, seed) -> a row whose length scales with n
     # (the model at its released config, (config, TP group) -> the root its LoRA binds in)
     released: Callable[[], tuple[object, Callable]] | None = None
     worlds: tuple[int, ...] = (1, 2, 4)
@@ -535,6 +552,8 @@ class Stack:
     # the layouts the adapters' files name their modules in
     a1_rename: Callable[[str], str] = lambda m: m
     a2_rename: Callable[[str], str] = lambda m: m
+    # the YAML's `targets:` (every target the spec declares), for opt-in ones (experts)
+    opt_in: bool = False
 
 
 def model_object(cls, config, **attrs):
@@ -654,26 +673,42 @@ def _higgs():
 
 
 def _omni():
-    """Layer 0 is MoE (its routed experts take no delta), layer 1 a dense MLP."""
+    """Layers 0 and 2 are MoE, their routed experts adapted (opted in by the YAML's
+    ``targets:``), layer 1 a dense MLP. A row is ``per_token`` tokens per unit of the
+    ``n`` it is asked for, so at ``test_lora_models.ROWS``' sizes one expert gathers
+    more rows than the torch reference's 64-row chunk."""
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
     from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig, ThinkerTextConfig
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
 
+    moe = (0, 2)
+    per_token = 16
+    projs = (("gate_proj", (8, 16)), ("up_proj", (8, 16)), ("down_proj", (16, 8)))
+
     def weights(c):
         tc = c.thinker_text
         out = llama_weights(tc, "model.", "lm_head", qk_norm=True)
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            del out[f"model.layers.0.mlp.{proj}.weight"]
-        out["model.layers.0.mlp.gate.weight"] = rand(tc.num_experts, tc.hidden_size, seed=900)
-        for e in range(tc.num_experts):
-            for proj, shape in (("gate_proj", (8, 16)), ("up_proj", (8, 16)), ("down_proj", (16, 8))):
-                out[f"model.layers.0.mlp.experts.{e}.{proj}.weight"] = rand(*shape, seed=901 + e, scale=0.2)
+        for layer in moe:
+            for proj, _ in projs:
+                del out[f"model.layers.{layer}.mlp.{proj}.weight"]
+            seed = 900 + 100 * layer
+            out[f"model.layers.{layer}.mlp.gate.weight"] = rand(tc.num_experts, tc.hidden_size, seed=seed)
+            for e in range(tc.num_experts):
+                for i, (proj, shape) in enumerate(projs):
+                    out[f"model.layers.{layer}.mlp.experts.{e}.{proj}.weight"] = rand(
+                        *shape, seed=seed + 1 + 3 * e + i, scale=0.2)
         return out
 
     def adapted(c):
-        return {m: s for m, s in llama_layers(c.thinker_text, "model.").items()
-                if "self_attn" in m or not m.startswith("model.layers.0.")}
+        tc = c.thinker_text
+        experts = {
+            f"model.layers.{layer}.mlp.experts.{e}.{proj}": shape
+            for layer in moe for e in range(tc.num_experts) for proj, shape in projs
+        }
+        return {**{m: s for m, s in llama_layers(tc, "model.").items()
+                   if "self_attn" in m or not m.startswith(tuple(f"model.layers.{n}." for n in moe))},
+                **experts}
 
     # the released Qwen3-Omni-30B-A3B Thinker's text config
     full = Qwen3OmniModelConfig(thinker_text=ThinkerTextConfig(
@@ -683,7 +718,7 @@ def _omni():
     ))
     return Stack(
         config=lambda: Qwen3OmniModelConfig(thinker_text=ThinkerTextConfig(
-            vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+            vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=3,
             num_attention_heads=4, num_key_value_heads=2, head_dim=4, num_experts=4,
             num_experts_per_tok=2, moe_intermediate_size=8,
             mlp_only_layers=[1],
@@ -695,13 +730,16 @@ def _omni():
             name_remapper=Qwen3OmniModel._thinker_remap), c),
         weights=weights,
         a1=lambda c: {**adapted(c), "lm_head": (c.thinker_text.vocab_size, c.thinker_text.hidden_size)},
-        a2=lambda c: _subset(adapted(c), "v_proj", "o_proj", "up_proj"),
+        a2=lambda c: _subset(adapted(c), "v_proj", "o_proj", "1.mlp.up_proj", "experts.1.up_proj",
+                             "experts.3.down_proj"),
         run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.embed_tokens(ids),
                      lambda s, x: s.model(input_embeds=x, label="main")[0], lambda s, x: s.model.lm_head(x)),
-        declare=_declare("prefill_text"), inputs=_tokens(lambda c: c.thinker_text.vocab_size),
+        declare=_declare("prefill_text"),
+        inputs=lambda c, n, seed: _tokens(lambda c: c.thinker_text.vocab_size)(c, per_token * n, seed),
         released=lambda: (model_object(Qwen3OmniModel, full),
                           lambda c, g: Qwen3OmniThinkerModel(c, comm_group=g)),
         a1_rename=lambda m: f"thinker.{m}",  # the full model's checkpoint naming
+        opt_in=True,
     )
 
 

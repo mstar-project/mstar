@@ -30,7 +30,6 @@ from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig, LoraSpec  # noqa: E402
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key  # noqa: E402
 from mstar.engine.resources.lora.serving import lora_spec  # noqa: E402
-from mstar.engine.resources.lora.store import inspect_keys  # noqa: E402
 from mstar.engine.resources.spec import instance_key  # noqa: E402
 from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, Segment, SlotLease, StepContext  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
@@ -53,7 +52,19 @@ _SETUP = threading.Lock()
 
 
 def _bound(module) -> bool:
-    return getattr(module, "lora_delta", None) is not None or getattr(module, "lora_deferred", None) is not None
+    return (getattr(module, "lora_delta", None) is not None or getattr(module, "lora_deferred", None) is not None
+            or bool(getattr(module, "lora_params", None)))
+
+
+def _declared(spec) -> list[str]:
+    """Every target the spec declares, the opt-in (experts) ones included."""
+    return sorted({**spec.targets, **spec.dropped_targets})
+
+
+def _bound_modules(spec) -> int:
+    """The modules a spec's bindings name (an experts module has one per parameter)."""
+    return len({path.removesuffix(f".{ref.param}") if ref.param else path
+                for path, ref in spec.module_map.bindings.items()})
 
 
 def _unbound(stack, c, weights):
@@ -68,7 +79,8 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
     c = stack.config()
     p1, r1 = H.make_adapter(tmp_path / "a1.safetensors", stack.a1(c), 4, 8.0, 100, stack.embedding, stack.a1_rename)
     p2, r2 = H.make_adapter(tmp_path / "a2.safetensors", stack.a2(c), 2, None, 200, rename=stack.a2_rename)
-    spec = H.serve(stack.lora_spec(c), {"a1": p1, "a2": p2})
+    spec = stack.lora_spec(c)
+    spec = H.serve(spec, {"a1": p1, "a2": p2}, **({"targets": _declared(spec)} if stack.opt_in else {}))
     base = stack.weights(c)
     rows = [stack.inputs(c, n, i) for i, (_, _, n) in enumerate(ROWS)]
     rids = [rid for rid, _, _ in ROWS]
@@ -78,7 +90,7 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
             sub = stack.build(c, group, base)
             lora_pool = H.pool(spec, rank, world)
             sub.bind_node_resources({spec.resource_key: lora_pool})
-            assert sum(map(_bound, sub.modules())) == len(spec.module_map.bindings)
+            assert sum(map(_bound, sub.modules())) == _bound_modules(spec)
             H.admit_declared(lora_pool, stack.declare(sub, rids, rows), ROWS)
         with torch.no_grad(), H.compute(lora_pool):
             return stack.run(sub, rows)
@@ -150,8 +162,9 @@ def test_every_placed_module_binds_at_the_released_size(name, size, world):
             with torch.device("meta"):
                 root = build(group if tp else CommGroup.trivial())
             for path, ref in spec.module_map.part(node).bindings.items():
-                target = spec.targets[ref.target]
-                _check(make_lora_capable(root.get_submodule(path)), target, target.shard(world if tp else 1),
+                target = {**spec.targets, **spec.dropped_targets}[ref.target]
+                module = root.get_submodule(path if ref.param is None else path.removesuffix(f".{ref.param}"))
+                _check(make_lora_capable(module), ref.param, target, target.shard(world if tp else 1),
                        path, spec.resource_key)
             if isinstance(root, Qwen3_5ForCausalLM):
                 # the delta-net's slices are this rank's [q|k|v|z|a+pad|b]
@@ -159,28 +172,108 @@ def test_every_placed_module_binds_at_the_released_size(name, size, world):
                 assert spec.targets["in_proj_fused"].shard(world).out_slices == (q, k, v, z, a + pad, b)
 
 
+def test_expert_lora_refuses_expert_parallelism_and_more_ids_than_the_align_op_groups():
+    """Startup refusals, each saying why: experts split by EP (rank 1 of 2 holds half), at
+    deployment validation and at bind, and more slots than the fused-MoE align op groups
+    at the released 128 experts, on the spec as the YAML sizes it."""
+    from mstar.model.components import MoeParallelConfig
+    from mstar.model.components.lora.modules import bind_module_lora
+    from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
+    from mstar.validation.resources import _expert_lora_split_by_ep
+
+    stack = H.STACKS["qwen3_omni_thinker"]()
+    c = stack.config()
+    spec = stack.lora_spec(c)
+    spec = H.serve(spec, {}, targets=_declared(spec))
+    group = CommGroup(my_global_rank=1, my_group_rank=1, group_members=[0, 1])
+    holder = torch.nn.Module()
+    with torch.device("meta"):
+        holder.model = Qwen3OmniThinkerModel(c, comm_group=group, moe_parallel=MoeParallelConfig(parallel="ep"))
+    with pytest.raises(ValueError, match=r"holds experts 2\.\.3 of 4 .*expert parallelism"):
+        bind_module_lora(holder, {spec.resource_key: H.pool(spec, rank=1, world=2)})
+    ep = {"node_names": sorted(spec.nodes), "tp_size": 2, "ep_config": {"parallel": "ep"}}
+    (problem,) = _expert_lora_split_by_ep([spec], {"node_groups": [ep]})
+    assert "split by expert parallelism" in problem
+    assert not list(_expert_lora_split_by_ep([spec], {"node_groups": [{**ep, "ep_config": None}]}))
+
+    released = _released("qwen3_omni_thinker")[0]
+    with pytest.raises(ValueError, match="serve at most 7 slots"):
+        released.apply_yaml_overrides(max_slots=8, targets=["qkv_proj", "experts_down_proj"])
+    assert "experts_down_proj" not in released.targets and released.max_slots != 8
+
+
+def test_the_api_server_keeps_the_experts_targets_the_yaml_names_and_refuses_them_unnamed(tmp_path):
+    """Experts targets are opt-in, resolved once from the declaration: named, they survive
+    the API server's resolve and any later override that names no targets, and a later
+    list restores what an earlier one left out; unnamed, an adapter on them fails the
+    deployment saying where to name them, a hint an adapter on a left-out linear does not
+    get."""
+    from mstar.engine.resources.lora.serving import resolve_lora_adapters
+    from mstar.model.base import declared_resources
+
+    stack = H.STACKS["qwen3_omni_thinker"]()
+    c = stack.config()
+    path, _ = H.make_adapter(tmp_path / "a1.safetensors", stack.a1(c), 4, 8.0, 100, stack.embedding,
+                             stack.a1_rename)
+    model = SimpleNamespace(get_node_resources=lambda: [stack.lora_spec(c)])
+    declared = stack.lora_spec(c)
+    assert {"experts_gate_up_proj", "experts_down_proj"} == set(declared.dropped_targets)
+    named = _declared(declared)
+    config = {"resources": {"lora": {"adapters": {"a1": path}, "targets": named}}}
+    spec = lora_spec(declared_resources(model, config))
+    resolve_lora_adapters(spec, config)
+    assert sorted(spec.targets) == named
+    spec.apply_yaml_overrides(max_slots=3)
+    assert sorted(spec.targets) == named
+    spec.apply_yaml_overrides(targets=["qkv_proj"])
+    spec.apply_yaml_overrides(targets=named)
+    assert sorted(spec.targets) == named
+    config = {"resources": {"lora": {"adapters": {"a1": path}, "targets": [t for t in named if t != "o_proj"]}}}
+    with pytest.raises(ValueError, match=r"\['o_proj'\] are left out") as refused:
+        resolve_lora_adapters(lora_spec(declared_resources(model, config)), config)
+    assert "experts target" not in str(refused.value)
+    config = {"resources": {"lora": {"adapters": {"a1": path}}}}
+    spec = lora_spec(declared_resources(model, config))
+    assert not {"experts_gate_up_proj", "experts_down_proj"} & set(spec.targets)
+    with pytest.raises(ValueError, match="served only when that list names it"):
+        resolve_lora_adapters(spec, config)
+
+
 # --- adapters on the Hub ---------------------------------------------------------------------------
 
 # headers (key -> shape) read off the Hub, a few per key layout and size; `refused` is a
 # substring of the refusal an adapter must get, `served_without` what it is refused for
 HUB = {m: json.loads((FIXTURES / f"{m}_lora_hub_keys.json").read_text())["adapters"] for m in ("qwen3_5", "orpheus")}
-HUB["qwen3_omni_thinker"] = {"moe-experts": {  # packed tensors, run by the fused kernel
-    "refused": "experts.*not a LoRA-capable linear",
-    "keys": {
-        "base_model.model.thinker.model.layers.1.self_attn.q_proj.lora_A.weight": [2, 2048],
-        "base_model.model.thinker.model.layers.1.self_attn.q_proj.lora_B.weight": [4096, 2],
-        "base_model.model.thinker.model.layers.0.mlp.experts.1.gate_proj.lora_A.weight": [2, 2048],
-        "base_model.model.thinker.model.layers.0.mlp.experts.1.gate_proj.lora_B.weight": [768, 2],
+_OMNI_EXPERTS = {
+    "base_model.model.thinker.model.layers.1.self_attn.q_proj.lora_A.weight": [2, 2048],
+    "base_model.model.thinker.model.layers.1.self_attn.q_proj.lora_B.weight": [4096, 2],
+    "base_model.model.thinker.model.layers.0.mlp.experts.1.gate_proj.lora_A.weight": [2, 2048],
+    "base_model.model.thinker.model.layers.0.mlp.experts.1.gate_proj.lora_B.weight": [768, 2],
+}
+HUB["qwen3_omni_thinker"] = {
+    # the experts targets are opt-in: served only where the YAML's `targets:` names them
+    "moe-experts": {"refused": "served only when that list names it", "keys": _OMNI_EXPERTS},
+    "moe-experts-named": {"targets": ["qkv_proj", "experts_gate_up_proj"], "keys": _OMNI_EXPERTS},
+    # PEFT's `target_parameters` on the stacked experts: one A and B for the container
+    "moe-experts-fused-3d": {"refused": "fused 3-D expert adapters are not read yet", "keys": {
+        "base_model.model.thinker.model.layers.0.mlp.experts.lora_A.weight": [256, 2048],
+        "base_model.model.thinker.model.layers.0.mlp.experts.lora_B.weight": [1536, 256],
+    }},
+    "moe-router": {
+        "refused": "TopKRouter holds weight matrices", "targets": ["qkv_proj", "experts_gate_up_proj"],
+        "keys": {**_OMNI_EXPERTS,
+                 "base_model.model.thinker.model.layers.0.mlp.gate.lora_A.weight": [2, 2048],
+                 "base_model.model.thinker.model.layers.0.mlp.gate.lora_B.weight": [128, 2]},
     },
-}}
+}
 
 
-def _validate(model: str, size: str | None, repo: str, keys: dict) -> LoraSpec:
-    """What registering an adapter checks (``check_adapter_file``), from its header."""
+def _validate(model: str, size: str | None, repo: str, keys: dict, targets: list[str] | None = None) -> LoraSpec:
+    """What registering an adapter checks (``check_adapter_file``), from the shapes its header lists."""
     spec = (_released(model, size)[0] if size != "tiny"
             else H.STACKS[model]().lora_spec(H.tiny()))
-    spec.apply_yaml_overrides(max_rank=512)
-    spec.check_adapter(repo, inspect_keys(spec, sorted(keys.items())))
+    spec.apply_yaml_overrides(max_rank=512, targets=targets)
+    spec.check_adapter(repo, H.header_info(spec, sorted(keys.items())))
     return spec
 
 
@@ -190,11 +283,11 @@ def test_hub_adapter_is_served_or_refused_by_name(model, repo):
     keys = entry["keys"]
     if "refused" in entry:
         with pytest.raises(ValueError, match=entry["refused"]):
-            _validate(model, entry.get("size"), repo, keys)
+            _validate(model, entry.get("size"), repo, keys, entry.get("targets"))
         if "served_without" not in entry:
             return
         keys = {k: v for k, v in keys.items() if entry["served_without"] not in k}
-    spec = _validate(model, entry.get("size"), repo, keys)
+    spec = _validate(model, entry.get("size"), repo, keys, entry.get("targets"))
     # no module is silently dropped: each is placed on one of the model's targets
     for module in {parse_lora_key(normalize_lora_key(k))[0] for k in keys}:
         ref = spec.module_map(module)
@@ -206,7 +299,7 @@ def test_hub_adapter_is_served_or_refused_by_name(model, repo):
     ("orpheus", "Tachyeon/orpheus-3b-sft-lora", "tiny"),
 ])
 def test_control_an_adapter_checked_against_another_size_is_refused(model, repo, other):
-    """Mechanism off for the header's shape check: refused, not loaded until a request fails."""
+    """Mechanism off for the adapter check's shape check: refused, not loaded until a request fails."""
     layer0 = {k: v for k, v in HUB[model][repo]["keys"].items() if ".layers.0." in k}
     with pytest.raises(ValueError, match="does not fit"):
         _validate(model, other, repo, layer0)
