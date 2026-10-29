@@ -165,6 +165,14 @@ class ZImageDiT(nn.Module):
     mask, and the rotary tables for the unified sequence — all per-shape derived state.
     """
 
+    # The linears over the image and main token streams, which ``linear_dtype: fp8`` runs as fp8
+    # GEMMs; the caption refiner (a few dozen tokens), modulation, embedding and output projections
+    # keep the checkpoint's weights.
+    FP8_LINEARS = tuple(
+        f"{blocks}.*.{linear}" for blocks in ("noise_refiner", "layers")
+        for linear in ("attn.qkv", "attn.out", "ff.w13", "ff.w2")
+    )
+
     def __init__(self, config: ZImageTransformerConfig):
         super().__init__()
         self.config = config

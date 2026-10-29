@@ -32,6 +32,7 @@ from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.components.diffusion.attention import uses_ragged_attention
 from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 from mstar.model.components.diffusion.image_io import encode_image
+from mstar.model.components.fp8_linear import apply_linear_dtype, check_linear_dtype
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, Z_IMAGE_TURBO, ZImageConfig, resolve_snapshot_dir
 from mstar.model.z_image.submodules import (
@@ -69,6 +70,7 @@ class ZImageModel(Model):
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
         async_scheduling: bool = True,
+        linear_dtype: str = "bf16",
         **kwargs,
     ):
         # the DiT's attention: the engine's ragged resource (the platform's kernel), or torch's SDPA inline
@@ -92,6 +94,8 @@ class ZImageModel(Model):
         self.vae_compile = bool(vae_compile)
         # speculative scheduling of the image nodes, on by default (see Flux2KleinModel.async_scheduling)
         self.async_scheduling = bool(async_scheduling)
+        # fp8: the DiT blocks' linears (ZImageDiT.FP8_LINEARS) run as fp8 GEMMs where the GPU has them
+        self.linear_dtype = check_linear_dtype(linear_dtype)
         self._snapshot = None
         self._config: ZImageConfig | None = None
         self.tokenizer = None
@@ -308,8 +312,10 @@ class ZImageModel(Model):
                 decode_batch_sizes=[s for s in VAE_DECODE_BATCH_SIZES if s <= self.max_batch_size],  # see klein
             )
         if node_name == "dit":
+            transformer = build_transformer(self.config, self.snapshot, device)
+            apply_linear_dtype(transformer, self.linear_dtype, transformer.FP8_LINEARS, "Z-Image transformer")
             return ZImageDenoiseSubmodule(
-                build_transformer(self.config, self.snapshot, device), self.config, loop_name=DENOISE_LOOP,
+                transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.use_ragged_attention else None,
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
