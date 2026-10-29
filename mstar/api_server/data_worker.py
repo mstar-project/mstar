@@ -748,6 +748,7 @@ class PreprocessWorkerThread:
                 prompt_parts=input.prompt_parts,
                 **model_kwargs,
             )
+            profiler.hop_stamp(input.request_id, "dw.prompt")
             if isinstance(prompt_tensors, ProcessPromptOutput):
                 model_kwargs.update(prompt_tensors.metadata)
                 prompt_tensors = prompt_tensors.new_input_tensors
