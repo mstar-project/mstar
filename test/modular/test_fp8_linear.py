@@ -222,3 +222,67 @@ def test_the_models_take_linear_dtype():
     assert ZImageModel(model_path_hf="x", linear_dtype="fp8").linear_dtype == "fp8"
     with pytest.raises(ValueError, match="linear_dtype"):
         Flux2KleinModel(model_path_hf="x", linear_dtype="fp16")
+
+
+# --- on a GPU with fp8 GEMMs -----------------------------------------------------------------------------------------
+
+
+def _gpu_fp8_dtype():
+    if not torch.cuda.is_available():
+        return None
+    return platforms.current_platform.fp8_dtype()
+
+
+gpu = pytest.mark.skipif(_gpu_fp8_dtype() is None, reason="needs a GPU with fp8 GEMMs")
+
+
+@gpu
+def test_a_compiled_fp8_linear_replays_in_a_graph():
+    torch.manual_seed(0)
+    linear = nn.Linear(1024, 3072, bias=True, device="cuda", dtype=torch.bfloat16)
+    quantized = Fp8Linear.from_linear(linear, _gpu_fp8_dtype())
+    x = torch.randn(2, 300, 1024, device="cuda", dtype=torch.bfloat16)
+    eager = quantized(x)
+    assert _rel(eager, F.linear(x, linear.weight, linear.bias)) < 0.05
+    compiled = torch.compile(quantized, fullgraph=True, dynamic=False)
+    out = compiled(x)
+    # inductor's fused quantisation may round a scale differently from eager's; nothing more
+    assert _rel(out, eager) < 1e-2
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        compiled(x)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = compiled(x)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, out)
+
+
+@gpu
+def test_a_compiled_fp8_flux_dit_tracks_the_bf16_one():
+    import copy
+
+    from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+    from mstar.model.flux2_klein.components.transformer import Flux2DiT
+    from mstar.model.flux2_klein.config import Flux2TransformerConfig
+
+    config = Flux2TransformerConfig(
+        in_channels=64, out_channels=64, num_layers=1, num_single_layers=2, attention_head_dim=64,
+        num_attention_heads=4, joint_attention_dim=256, timestep_guidance_channels=256, axes_dims_rope=(16, 16, 16, 16),
+    )
+    torch.manual_seed(0)
+    dit = Flux2DiT(config).to("cuda", torch.bfloat16)
+    for p in dit.parameters():
+        nn.init.normal_(p, std=0.05)
+    fp8 = copy.deepcopy(dit)
+    assert len(quantize_linears(fp8, Flux2DiT.FP8_LINEARS, _gpu_fp8_dtype())) == 12
+    compile_transformer_forward(fp8, exact_ops=["norms"])
+    img = torch.randn(1, 256, 64, device="cuda", dtype=torch.bfloat16)
+    txt = torch.randn(1, 32, 256, device="cuda", dtype=torch.bfloat16)
+    t = torch.tensor([0.7], device="cuda", dtype=torch.bfloat16)
+    rope = (torch.ones(288, 64, device="cuda"), torch.zeros(288, 64, device="cuda"))
+    with torch.no_grad():
+        assert _rel(fp8(img, txt, t, rope), dit(img, txt, t, rope)) < 0.08
