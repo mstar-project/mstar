@@ -340,6 +340,10 @@ class Glm5NextModelConfig:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
 
     @property
+    def softmax_scale(self) -> float:
+        return self.qk_head_dim ** -0.5
+
+    @property
     def mla_cache_kpe(self) -> int:
         """Rope-slot width of the MLA latent cache. NoPE needs none; MTP keeps
         a 64-wide slot to mask rows a query must not see: rejected draft rows, or
@@ -430,6 +434,21 @@ class Glm5NextModelConfig:
         raise ValueError(
             f"qk_head_dim={self.qk_head_dim} exceeds the largest FlashInfer "
             "SM90 head_dim (256); the naive-MLA pad mitigation cannot cover it."
+        )
+
+    def kda_config(self):
+        """The KDA layers' ``KDAConfig``, all heads (the layer divides them by TP)."""
+        # imported here: the layer's module pulls in the engine, which this config (and the
+        # weight loader that imports it) must import without
+        from mstar.model.components.kda import KDAConfig
+
+        return KDAConfig(
+            hidden_size=self.hidden_size,
+            num_heads=self.linear_num_heads,
+            head_dim=self.linear_head_dim,
+            conv_kernel_size=self.linear_conv_kernel_size,
+            gate_lower_bound=self.gate_lower_bound,
+            rms_norm_eps=self.rms_norm_eps,
         )
 
     @property

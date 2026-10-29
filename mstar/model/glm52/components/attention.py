@@ -181,14 +181,13 @@ class Glm52MLAAttention(MLAAttention):
         slots: torch.Tensor,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        kv_c: torch.Tensor,
-        k_pe: torch.Tensor,
+        latent: torch.Tensor,
         dsa_selection: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write the step's latents at the plan's slots, then attend each row over its own
         selected slots (prefill rows too: each sees its causal top-k)."""
         dsa_ctx = self._dsa_ctx()
         layer_idx = self.cache_layer_idx
-        self._kv.write_kv(torch.cat([kv_c, k_pe], dim=-1).squeeze(1), None, layer_idx=layer_idx)
+        self._kv.write_kv(latent, None, layer_idx=layer_idx)
         return paged.sparse_attend(
             q_nope, q_pe, self._kv.layer_view(layer_idx), slots, dsa_ctx, self.softmax_scale)
