@@ -1684,7 +1684,7 @@ class LLMSubmodule(ARNodeSubmodule):
             # conductor says whether a stop there ends the request: not for an
             # earlier prefill's throwaway token, nor for a think-then-image
             # request, whose image_gen only the conductor's transition can start.
-            ends = request_info.step_metadata["prefill_stop_ends"]
+            ends = request_info.step_metadata.get("prefill_stop_ends", False)
             return {END_PARTITION} if hit_eos and ends else set()
         if hit_eos or request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens:
             return {"decode_loop"}

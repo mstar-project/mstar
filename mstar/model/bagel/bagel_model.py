@@ -1330,6 +1330,16 @@ class BagelModel(Model):
             "image_preprocess": full_metadata.kwargs["image_preprocess"],
         }
 
+    @staticmethod
+    def _prefill_token_metadata(sample_prefill_token: bool, target_output: str) -> dict:
+        """Whether this pass samples the reply's first token, and whether a stop
+        there ends the request: only for a text reply, which has no walk after
+        decode."""
+        return {
+            "sample_prefill_token": sample_prefill_token,
+            "prefill_stop_ends": sample_prefill_token and target_output == "text",
+        }
+
     def _get_fwd_pass_inputs(
         self,
         metadata: CurrentForwardConductorMetadata,
@@ -1461,9 +1471,7 @@ class BagelModel(Model):
         step_metadata =  self._get_step_metadata(full_metadata)
 
         sample_prefill_token = (think_mode or target_output != "image") and len(schedule) == 1
-        step_metadata["sample_prefill_token"] = sample_prefill_token
-        # a text reply has no walk after decode, so a stop at its first token ends it
-        step_metadata["prefill_stop_ends"] = sample_prefill_token and target_output == "text"
+        step_metadata.update(self._prefill_token_metadata(sample_prefill_token, target_output))
 
         inputs = self._get_fwd_pass_inputs(
             full_metadata, input_signals
@@ -1545,9 +1553,8 @@ class BagelModel(Model):
             request_done = True
 
         step_metadata =  self._get_step_metadata(metadata)
-        step_metadata["sample_prefill_token"] = sample_prefill_token
-        step_metadata["prefill_stop_ends"] = (
-            sample_prefill_token and metadata.kwargs["target_output"] == "text"
+        step_metadata.update(
+            self._prefill_token_metadata(sample_prefill_token, metadata.kwargs["target_output"])
         )
         inputs = self._get_fwd_pass_inputs(
             metadata, persist_signals
