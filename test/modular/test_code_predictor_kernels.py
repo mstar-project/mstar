@@ -135,6 +135,20 @@ def test_cp_linear_matches_the_unfused_ops(rows):
     close(cp_linear(out, folded, norm_eps=1e-6, partials=partials, n_part=h // STREAM_TILE), on @ folded.float().t())
 
 
+def test_cp_linear_norm_from_x_holds_with_more_programs_than_sms():
+    """The row norm ``cp_linear`` takes from x stays right when its launch has
+    more programs than the GPU has SMs (two per SM here), run after run."""
+    from mstar.model.components.code_predictor_kernels import cp_linear
+
+    torch.manual_seed(5)
+    n = 64 * torch.cuda.get_device_properties(0).multi_processor_count  # 32-wide tiles: 2 programs an SM
+    x = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, 1024, device="cuda", dtype=torch.bfloat16) * 0.03
+    want = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)) @ w.float().t()
+    for _ in range(5):
+        got = cp_linear(x, w, norm_eps=1e-6).float()
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2 * want.abs().max().item())
+
 def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
 

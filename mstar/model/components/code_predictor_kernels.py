@@ -331,9 +331,16 @@ def _cp_linear_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     ss = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    if NORM == 1 and not GEMV:
+        # its own pass over X: summed in the pipelined loop below, from the
+        # tile that also feeds tl.dot, they came out wrong, nondeterministically,
+        # once a launch had more programs than the GPU has SMs
+        for k0 in range(0, K, BLOCK_K):
+            xs = tl.load(X + rm[:, None] * s_x + (k0 + rk)[None, :], mask=rows, other=0.0).to(tl.float32)
+            ss += tl.sum(xs * xs, 1)
     for k0 in range(0, K, BLOCK_K):
         x = tl.load(X + rm[:, None] * s_x + (k0 + rk)[None, :], mask=rows, other=0.0)
-        if NORM == 1:
+        if NORM == 1 and GEMV:
             xf = x.to(tl.float32)
             ss += tl.sum(xf * xf, 1)
         w = tl.load(W + rn[:, None] * s_w + (k0 + rk)[None, :])
