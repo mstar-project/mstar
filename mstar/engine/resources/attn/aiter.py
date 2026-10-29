@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey
-from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
+from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.attn.cross import CrossAttentionManager
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
@@ -85,6 +85,44 @@ def nan_safe_page_size(page_size: int) -> bool:
     the tail of a row's last page reaches P·V (0 * NaN = NaN).
     """
     return not (page_size <= 64 and page_size & (page_size - 1) == 0)
+
+
+def rocm_paged_backend(page_size: int | None) -> AttnBackend:
+    """``AUTO`` on ROCm: AITER's unified attention, unless AITER reads page
+    tails unmasked at this page size and AMD's FlashInfer build (which masks
+    them) is installed."""
+    aiter_reason = aiter_paged_unavailable_reason()
+    flashinfer_reason = flashinfer_rocm_unavailable_reason()
+    tails_safe = page_size is None or nan_safe_page_size(page_size)
+    if aiter_reason is None and (tails_safe or flashinfer_reason is not None):
+        return AttnBackend.AITER
+    if flashinfer_reason is None:
+        return AttnBackend.FLASHINFER
+    raise RuntimeError(
+        "No paged attention backend on this ROCm install: AITER's unified "
+        f"attention is not importable ({aiter_reason}), nor is AMD's FlashInfer "
+        f"build ({flashinfer_reason}). Install amd-aiter (AITER) or amd-flashinfer."
+    )
+
+
+def flashinfer_rocm_kwargs(kv_config: PagedKVConfig, backend: str) -> dict:
+    """``FlashInferManager``'s arguments on ROCm, where only AMD's FlashInfer
+    build runs. Its ``auto`` can't use an AITER kernel at page 128 (it falls
+    back to fa2 after a failed attempt, or gathers per token for prefill), so
+    ``auto`` is pinned to fa2. Decode skips tensor cores, the faster path on
+    ROCm, for the GQA groups that kernel dispatches."""
+    reason = flashinfer_rocm_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(
+            "attention backend 'flashinfer' on ROCm needs AMD's FlashInfer build "
+            f"(amd-flashinfer), which is not importable ({reason}); name backend "
+            "'aiter' or 'auto' instead"
+        )
+    group = kv_config.num_qo_heads // kv_config.num_kv_heads
+    return {
+        "backend": "fa2" if backend == "auto" else backend,
+        "decode_tensor_cores": group not in FLASHINFER_ROCM_DECODE_GROUPS,
+    }
 
 
 @functools.cache
@@ -709,3 +747,13 @@ class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor,
     ) -> torch.Tensor:
         return self._unified(q, self._current_plans[label], kv_cache_layer)
+
+
+def build_aiter_paged(spec, info, kv_config) -> AiterPagedAttentionManager:
+    """The ``aiter`` row of ``attn.backends``."""
+    return AiterPagedAttentionManager(
+        kv_cache=spec.config.kv_cache,
+        device=info.device,
+        dtype=info.kv_dtype,
+        kv_config=kv_config,
+    )
