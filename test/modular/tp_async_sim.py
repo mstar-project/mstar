@@ -36,6 +36,15 @@ Modes:
                 reconciled on arrival. Retract is safe here for the reason
                 B2_RETRACT is not: verdict(N) happens-before launch(S) on
                 every rank, so no rank can have run S when another voids it.
+                That holds only while every rank's verdict is the same: a
+                failure on one rank alone (``structural_on`` in a script) has
+                one rank drop S that the others run.
+  B2_AGREED   — the implemented protocol since the ranks vote on each step
+                (``Worker._agree_on_step``): B2_LOCAL, but every rank applies
+                N's verdict at one vote on N, a collective that completes once
+                every rank has completed N and the leader has built or declined
+                the spec from N, and the verdict is the instance's: structural
+                if it is on any rank.
 
 Follower behavior encodes a property of the graph layer: spec batches are
 buildable from replicated graph state alone (``speculative_signals``
@@ -60,6 +69,9 @@ STATE_CAP = 400_000
 # msg:   ("STEP", batch) | ("SPEC", batch) | ("COMMIT", seq) | ("CANCEL", seq)
 # rank:  {"fifo": tuple(msg), "q": tuple((batch, gated, void)),
 #         "exec": tuple(batch), "live": frozenset(batch), "voided": frozenset(seq)}
+# world: "votes": frozenset(step), the steps the ranks have voted on (B2_AGREED)
+
+LOCAL_VERDICT_MODES = ("B2_LOCAL", "B2_AGREED")
 
 
 def _new_rank():
@@ -69,12 +81,23 @@ def _new_rank():
     }
 
 
+def _structural(w, rank, step):
+    """Whether ``step`` failed structurally, as ``rank`` decides it: by its own
+    failure, or under B2_AGREED by the vote's, which is any rank's."""
+    ev = w["script"].get(step, {})
+    on = ev.get("structural_on", ())
+    if w["mode"] == "B2_AGREED":
+        return bool(ev.get("structural") or on)
+    return bool(ev.get("structural") or rank in on)
+
+
 def make_world(mode, nranks, comp0, script):
     w = {
         "mode": mode,
         "nranks": nranks,
         "script": script,
         "seq": 0,
+        "votes": frozenset(),
         "L": {
             "step": 0,
             "comp": tuple(comp0),
@@ -143,7 +166,7 @@ def _local_verdict_on_step(w, rank, step):
     same rule on every rank, nowhere else either); otherwise release its
     launch gate. Same information the leader uses in its post(step)."""
     rk = w["ranks"][rank]
-    structural = bool(w["script"].get(step, {}).get("structural"))
+    structural = _structural(w, rank, step)
     newq = []
     for (b, g, v) in rk["q"]:
         if b[0] == "spec" and b[1] == step + 1:
@@ -163,11 +186,14 @@ def _local_verdict_on_arrival(w, rank, spec):
     Otherwise build gated; ``_local_verdict_on_step`` will release it."""
     rk = w["ranks"][rank]
     parent = spec[1] - 1
-    done = any(b[1] == parent for b in rk["exec"])
+    if w["mode"] == "B2_AGREED":
+        done = parent in w["votes"]
+    else:
+        done = any(b[1] == parent for b in rk["exec"])
     if not done:
         _build(w, rank, spec, gated=True)
         return
-    if w["script"].get(parent, {}).get("structural"):
+    if _structural(w, rank, parent):
         return  # dropped on arrival, never enters the queue
     _build(w, rank, spec, gated=False)
 
@@ -188,15 +214,34 @@ def enabled_actions(w):
         q = w["ranks"][r]["q"]
         if q and not q[0][1]:
             acts.append(("gpu", r))
+    if w["mode"] == "B2_AGREED" and _next_vote(w) is not None:
+        acts.append(("vote",))
     if not L["done"]:
         # leader spec build for step+1, inside the open window
         if (w["mode"] != "SERIAL" and L["spec"] is None and not L["spec_closed"]
                 and L["comp"]):
             acts.append(("spec",))
-        # leader post-step once its own GPU finished the current batch
-        if L["cur"] is not None and L["cur"] in w["ranks"][0]["exec"]:
+        # leader post-step once its own GPU finished the current batch, and
+        # under B2_AGREED once it has voted on it
+        if L["cur"] is not None and L["cur"] in w["ranks"][0]["exec"] and (
+            w["mode"] != "B2_AGREED" or L["cur"][1] in w["votes"]
+        ):
             acts.append(("post",))
     return acts
+
+
+def _next_vote(w):
+    """B2_AGREED: the step the ranks vote on next, once the vote can complete:
+    the earliest step not voted on, when every rank has run it and the leader
+    has built or declined its spec from it (it does that before it awaits the
+    step, and it votes after)."""
+    L = w["L"]
+    step = L["step"]
+    if step in w["votes"] or not (L["spec_closed"] or not L["comp"]):
+        return None
+    if all(any(b[1] == step for b in rk["exec"]) for rk in w["ranks"]):
+        return step
+    return None
 
 
 def apply_action(w, act):
@@ -210,7 +255,16 @@ def apply_action(w, act):
         _do_spec(w)
     elif kind == "post":
         _do_post(w)
+    elif kind == "vote":
+        _do_vote(w)
     return w
+
+
+def _do_vote(w):
+    step = _next_vote(w)
+    w["votes"] = w["votes"] | {step}
+    for r in range(w["nranks"]):
+        _local_verdict_on_step(w, r, step)
 
 
 def _do_proc(w, r):
@@ -220,7 +274,7 @@ def _do_proc(w, r):
     if tag == "STEP":
         _build(w, r, msg[1], gated=False)
     elif tag == "SPEC":
-        if w["mode"] == "B2_LOCAL":
+        if w["mode"] in LOCAL_VERDICT_MODES:
             _local_verdict_on_arrival(w, r, msg[1])
         else:
             # Buildable now — placeholder inputs, no wait on local step-N
@@ -246,7 +300,8 @@ def _do_gpu(w, r):
     if w["mode"] == "B2_LOCAL" and r != 0:
         # A follower's "await(N)" is completing N: the moment it decides
         # about specs speculated from N. The leader decides at post(N) — it
-        # may still be BUILDING S when its GPU finishes N.
+        # may still be BUILDING S when its GPU finishes N. (B2_AGREED: at
+        # the vote, _do_vote.)
         _local_verdict_on_step(w, r, batch[1])
 
 
@@ -260,8 +315,9 @@ def _do_spec(w):
     b = ("spec", L["step"] + 1, L["comp"], w["seq"])
     _broadcast(w, ("SPEC", b))
     # B1: gated on Commit. B2_LOCAL: gated on the leader's OWN completion of
-    # step N (released/dropped in _local_verdict_on_step). B2_*: run-ahead.
-    _build(w, 0, b, gated=(w["mode"] in ("B1", "B2_LOCAL")))
+    # step N, B2_AGREED on its vote on N (released/dropped in
+    # _local_verdict_on_step). B2_*: run-ahead.
+    _build(w, 0, b, gated=(w["mode"] in ("B1", *LOCAL_VERDICT_MODES)))
     L["spec"] = b
 
 
@@ -270,7 +326,7 @@ def _do_post(w):
     mode = w["mode"]
     ev = w["script"].get(L["step"], {})
     stops = frozenset(ev.get("stop", ())) & set(L["comp"])
-    structural = bool(ev.get("structural"))
+    structural = _structural(w, 0, L["step"])
     new_comp = tuple(x for x in L["comp"] if x not in stops)
     new_comp = new_comp + tuple(ev.get("arrival", ()))
     S = L["spec"]
@@ -287,13 +343,15 @@ def _do_post(w):
 
     if S is None:
         _serial_next()
-    elif mode == "B2_LOCAL":
+    elif mode in LOCAL_VERDICT_MODES:
         # No message. The leader applies its own verdict for step N to the
         # S it built (gated on itself until now): structural → retract
         # locally and reschedule; else release and continue the chain.
         # Followers reach the identical verdict at their own completion of N
-        # (_local_verdict_on_step / _local_verdict_on_arrival).
-        _local_verdict_on_step(w, 0, L["step"])
+        # (_local_verdict_on_step / _local_verdict_on_arrival); under
+        # B2_AGREED every rank, the leader too, applied it at its vote.
+        if mode == "B2_LOCAL":
+            _local_verdict_on_step(w, 0, L["step"])
         if structural:
             _serial_next()
         else:
@@ -340,7 +398,7 @@ def _do_post(w):
 def world_key(w):
     L = w["L"]
     return (
-        w["seq"], L["step"], L["comp"], L["cur"], L["spec"], L["spec_closed"],
+        w["seq"], w["votes"], L["step"], L["comp"], L["cur"], L["spec"], L["spec_closed"],
         L["waste"], L["done"],
         tuple(
             (rk["fifo"], rk["q"], rk["exec"],
@@ -436,13 +494,27 @@ SCENARIOS = {
                      ("r1",)),
 }
 
-MODES = ("SERIAL", "B1", "B2_VOID", "B2_LOCAL", "B2_RETRACT")
+# A structural failure on one rank alone: a per-rid stage that raised on one
+# rank. Only the modes in which each rank applies a verdict see it; the others
+# signal the leader's and do not model a follower's own.
+PER_RANK_SCENARIOS = {
+    "follower-structural": (("r0", "r1"),
+                            {1: {"structural_on": {1}}, 2: {"stop": {"r0", "r1"}}}, ()),
+    "leader-structural": (("r0", "r1"),
+                          {1: {"structural_on": {0}}, 2: {"stop": {"r0", "r1"}}}, ()),
+}
+
+MODES = ("SERIAL", "B1", "B2_VOID", "B2_LOCAL", "B2_AGREED", "B2_RETRACT")
+PER_RANK_MODES = ("SERIAL", "B2_LOCAL", "B2_AGREED")
 
 
 def run_all(nranks=2):
     results = []
     for name, (comp0, script, must) in SCENARIOS.items():
         for mode in MODES:
+            results.append(explore(mode, nranks, comp0, script, name, must))
+    for name, (comp0, script, must) in PER_RANK_SCENARIOS.items():
+        for mode in PER_RANK_MODES:
             results.append(explore(mode, nranks, comp0, script, name, must))
     return results
 
