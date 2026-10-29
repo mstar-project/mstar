@@ -23,6 +23,7 @@ np = pytest.importorskip("numpy")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server.entrypoint import APIServer  # noqa: E402
 from mstar.api_server.openai import adapters  # noqa: E402
 from mstar.api_server.openai.speech_chunking import split_sentences  # noqa: E402
 
@@ -116,6 +117,8 @@ def _pcm(*vals):
 
 class _RecordingAPI:
     """Each submitted request returns PCM that encodes its submission index."""
+
+    open_result_stream = APIServer.open_result_stream
 
     def __init__(self):
         self.model_name = "orpheus"
@@ -303,9 +306,8 @@ def _stream(stub, num_chunks):
         from mstar.api_server.openai import serving_speech
 
         pending = [submit(0), submit(1)]
-        first_iter = stub.iter_result_chunks(pending[0])
-        first = await anext(first_iter)
-        return serving_speech._stream_pcm(stub, submit, num_chunks, pending, first_iter, first, 24000)
+        first_iter = await stub.open_result_stream(pending[0])
+        return serving_speech._stream_pcm(stub, submit, num_chunks, pending, first_iter, 24000)
 
     return ids, start
 
@@ -408,7 +410,8 @@ def test_a_client_seed_advances_per_chunk_and_wraps_at_int64():
 
     assert [_chunk_kwargs({"seed": 7}, i)["seed"] for i in range(3)] == [7, 8, 9]
     top = 2**63 - 1
-    assert [_chunk_kwargs({"seed": top}, i)["seed"] for i in range(3)] == [top, 0, 1]
+    # a signed int64 wrap, as the Rust frontend's
+    assert [_chunk_kwargs({"seed": top}, i)["seed"] for i in range(3)] == [top, -(2**63), 1 - 2**63]
     # the first piece keeps the client's value
     assert _chunk_kwargs({"seed": -5}, 0)["seed"] == -5
     assert "seed" not in _chunk_kwargs({"sentence_chunking": True}, 1)

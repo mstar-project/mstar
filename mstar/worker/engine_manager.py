@@ -3,76 +3,18 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources import (
-    NodeResourceSpec,
-    ResourceReqConfig,
-    apply_yaml_overrides,
-)
+from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
-from mstar.model.base import Model
+from mstar.model.base import Model, node_moe_parallel_configs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
-
-
-def _refuse_uncacheable_positions(
-    specs: list[NodeResourceSpec], model: Model,
-) -> None:
-    """Refuse a keyed cache whose positions are not sequential.
-
-    A cached page is reusable only at the positions it was written at, since its
-    K is stored already rotated.
-    """
-    declared = set(model.prefix_key_streams())
-    if not declared:
-        return
-    for spec in specs:
-        if not isinstance(spec, PositionSpec):
-            continue
-        cached = declared & spec.depends_on()
-        if cached and spec.config.scheme is not PosScheme.SEQUENTIAL:
-            raise ValueError(
-                f"resource {spec.resource_key!r} places positions by "
-                f"{spec.config.scheme.value}, but it sits over "
-                f"{sorted(cached)}, which the model keyed for prefix reuse; "
-                "either drop the stream or give the resource a sequential "
-                "scheme"
-            )
-
-
-def _refuse_unskippable_resources(
-    specs: list[NodeResourceSpec], model: Model,
-) -> None:
-    """Refuse a declared node carrying a resource that cannot skip a prefix.
-
-    A hit takes the front of a request away from every resource on the node,
-    not just the ones that answered the probe, so one that cannot account for
-    tokens it never saw would plan its step against a sequence that never ran.
-    """
-    declared = set(model.prefix_key_streams())
-    if not declared:
-        return
-    cached_nodes = {
-        node for spec in specs if spec.resource_key in declared
-        for node in spec.nodes
-    }
-    for spec in specs:
-        shared = spec.nodes & cached_nodes
-        if not shared or spec.resource_class.prefix_skip_safe:
-            continue
-        raise ValueError(
-            f"resource {spec.resource_key!r} cannot serve a request whose "
-            f"prefix came from the cache, but it sits on {sorted(shared)}, "
-            "which the model keyed for prefix reuse; either drop the stream "
-            "or give the resource the prefix hooks"
-        )
 
 
 def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
@@ -84,6 +26,30 @@ def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
                 f"{type(model).__name__}: {node!r} splits its combined walk "
                 f"{combined!r} by capture key"
             )
+
+
+def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
+    """A spanned output is cut after its step ends, but speculation hands a
+    step's outputs to the next step before then: no spanned output may feed a
+    node this worker speculates into (see ``NodeSubmodule.spanned_outputs``)."""
+    for walk, section in model.get_graph_walk_graphs().items():
+        nodes = section.get_nodes()
+        for name, node in nodes.items():
+            submodule = submodules.get(name)
+            if submodule is None or not node.enable_async_scheduling:
+                continue
+            spanned = submodule.spanned_outputs(walk)
+            for edge in node.outputs:
+                target = nodes.get(edge.next_node)
+                if (
+                    edge.name in spanned and edge.next_node in submodules
+                    and target is not None and target.enable_async_scheduling
+                ):
+                    raise ValueError(
+                        f"{type(model).__name__}: {name!r} spans {edge.name!r}, which "
+                        f"feeds {edge.next_node!r} on the same worker in walk {walk!r}; "
+                        "set enable_async_scheduling=False on one of them"
+                    )
 
 
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
@@ -119,63 +85,6 @@ def refuse_combined_walks_across_tp_groups(
             )
 
 
-def _refuse_unknown_walks(model: Model) -> None:
-    """Refuse a declared stream that names a walk the model never runs.
-
-    Only the named walks may file pages or be probed, so a name that matches
-    nothing leaves that cache empty for good, and nothing says why.
-    """
-    walks = set(model.get_graph_walk_graphs())
-    for key, by_label in model.prefix_key_streams().items():
-        for label, stream in by_label.items():
-            unknown = sorted(
-                {stream.walk, stream.decode_walk, *stream.layout_walks} - walks - {None}
-            )
-            if unknown:
-                raise ValueError(
-                    f"{type(model).__name__} keys {key!r}/{label!r} on "
-                    f"{unknown}, which it never runs; its walks are "
-                    f"{sorted(walks)}"
-                )
-
-
-def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> None:
-    """Refuse a stream with layout walks if the cache could not serve one of its
-    walks whole: a walk where a keyed node feeds another node, or where no
-    keyed node runs.
-
-    A walk the cache serves whole completes with no outputs, so a node that
-    reads them would get nothing. Only a stream with layout walks is checked,
-    because a stream with one span always runs its last token.
-    """
-    graphs = model.get_graph_walk_graphs()
-    by_key = {spec.resource_key: spec for spec in specs}
-    for key, by_label in model.prefix_key_streams().items():
-        for label, stream in by_label.items():
-            if not stream.layout_walks:
-                continue
-            keyed_nodes = by_key[key].nodes
-            for walk in (stream.walk, *stream.layout_walks):
-                nodes = graphs[walk].get_nodes()
-                ran = sorted(keyed_nodes & set(nodes))
-                if not ran:
-                    raise ValueError(
-                        f"{type(model).__name__} lays {key!r}/{label!r} out over "
-                        f"{walk!r}, where none of {sorted(keyed_nodes)} runs"
-                    )
-                for name in ran:
-                    fed = sorted(
-                        {edge.next_node for edge in nodes[name].outputs}
-                        - SPECIAL_DESTINATIONS
-                    )
-                    if fed:
-                        raise ValueError(
-                            f"{type(model).__name__} lays {key!r}/{label!r} out over "
-                            f"{walk!r}, where {name} feeds {fed}, which would get "
-                            "nothing from a walk the cache serves whole"
-                        )
-
-
 @dataclass
 class EngineManager:
     """Owns the worker's engine.
@@ -204,14 +113,11 @@ class EngineManager:
 
         The model supplies each node's submodule via ``get_submodule`` and its
         resources via ``get_node_resources``; the KV cache's shape rides on
-        the latter, so there is no separate cache config.
+        the latter, so there is no separate cache config. The conductor's
+        ``validate_deployment`` has already checked the specs and overrides.
         """
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, model_config)
-        _refuse_uncacheable_positions(specs, model)
-        _refuse_unskippable_resources(specs, model)
-        _refuse_unknown_walks(model)
-        _refuse_unservable_walks(specs, model)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
@@ -227,14 +133,19 @@ class EngineManager:
         # return — the latter doubles the load-time VRAM peak. The cast below
         # applies the same resolved dtype, so allocation and runtime agree.
         submodules: dict[str, torch.nn.Module] = {}
+        # Checked by the conductor's get_sharding_config before spawn.
+        moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
             # Sequence parallelism is opt-in per node; only forward the SP
             # group when this node actually participates in one, so models
             # that don't support SP keep their existing get_submodule call.
+            # Likewise ``moe_parallel``, only for a node group's ``ep_config``.
             extra = {}
             node_sp_group = parallel_groups.get_sp_config_for_node(name)
             if node_sp_group.world_size > 1:
                 extra["sp_group"] = node_sp_group
+            if name in moe_parallel:
+                extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
                 name, device,
                 tp_group=parallel_groups.get_tp_config_for_node(name),
@@ -251,6 +162,7 @@ class EngineManager:
             node_dtype = submodule.get_autocast_dtype() or autocast_dtype
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
+        _refuse_speculated_spans(submodules, model)
 
         engine = Engine(
             graph_runtime=graph_runtime,
@@ -288,13 +200,16 @@ class EngineManager:
     def add_request(
         self, request_id: str,
         resource_configs: dict[str, ResourceReqConfig] | None = None,
+        request_info: CurrentForwardPassInfo | None = None,
     ) -> None:
         """Open resource state for a request, on the per-resource configs the
-        conductor resolved for it (``Model.get_request_resource_configs``)."""
-        self.engine.add_request(request_id, resource_configs)
+        conductor resolved for it (``Model.get_request_resource_configs``),
+        and hand the submodules its ``request_info``."""
+        self.engine.add_request(request_id, resource_configs, request_info)
 
-    def remove_request(self, request_id: str) -> None:
-        self.engine.remove_request(request_id)
+    def remove_request(self, request_id: str) -> set[str]:
+        """Tear the request down; returns the resources it handed pages back to."""
+        return self.engine.remove_request(request_id)
 
     def evictable_nodes(self) -> list[str]:
         """Nodes whose state can be reclaimed. The worker keeps the per-request

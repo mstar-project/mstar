@@ -292,6 +292,7 @@ class RustGraphRuntime(GraphRuntime):
         self, request_id: str, partition: str, graph_walk: str,
         partition_worker_graph_ids: list[int],
         worker_graph_to_workers: ParallelList[int, list[str]],
+        loop_caps: dict[str, int],
     ) -> int:
         flat: list[str] = []
         counts: list[int] = []
@@ -306,6 +307,7 @@ class RustGraphRuntime(GraphRuntime):
             # is derived from.
             list(partition_worker_graph_ids),
             list(worker_graph_to_workers.keys), flat, counts,
+            list(loop_caps), list(loop_caps.values()),
         )
         # One NewRequest arrives PER PARTITION, all carrying the same map, so
         # the first one settles it.
@@ -335,6 +337,9 @@ class RustGraphRuntime(GraphRuntime):
 
     def set_walk(self, rid: int, partition: str, walk: str):
         self._rust.set_walk(rid, partition, walk)
+
+    def is_partition_idle(self, rid: int, partition: str) -> bool:
+        return self._rust.is_partition_idle(rid, partition)
 
     def set_in_flight(
         self, node: str, rids: list[int], wg_ids: list[int],
@@ -717,6 +722,7 @@ class RustGraphRuntime(GraphRuntime):
                     for value in input.resource_publish_info.values
                 ]
             ),
+            skip_rids=list(input.failed_rids),
         )
         if PHASE_PERIOD:
             _t1 = _time.perf_counter()

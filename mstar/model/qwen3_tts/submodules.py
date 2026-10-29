@@ -89,12 +89,30 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopCheck,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 from mstar.utils.h2d import PinnedStager
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
+
+
+def prefill_rows(prompt_layout: Sequence[int], language_id: int, speaker: bool) -> int:
+    """The rows `TalkerSubmodule._build_prefill` writes, where ``speaker`` is True when a
+    speaker tag or x-vector takes a row."""
+    instruct_len, text_len, stream_text, ref_text_len, ref_frames = prompt_layout
+    prefix = len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS)
+    # the role, then every codec tag but codec BOS
+    rows = instruct_len + prefix + (3 if language_id < 0 else 4) + int(speaker) + 1
+    if ref_frames:
+        # codec BOS and the reference frames. When the text isn't streamed, both transcripts and TTS EOS come first
+        text = ref_text_len - prefix - 2 + text_len + 1
+        return rows + 1 + ref_frames + (0 if stream_text else text)
+    # a streamed prompt adds its first text token over codec BOS. Any other adds its text and TTS EOS,
+    # then TTS PAD over codec BOS
+    return rows + (1 if stream_text else text_len + 2)
+
 
 # ===========================================================================
 # 1. TalkerSubmodule - autoregressive 12 Hz codec-frame generation
@@ -433,6 +451,10 @@ class TalkerSubmodule(ARNodeSubmodule):
                 speaker_embed=inputs["speaker_embed"][0] if "speaker_embed" in inputs else None,
                 ref_codes=inputs["ref_codes"][0] if "ref_codes" in inputs else None,
             )
+            speaker = int(step_metadata[SPEAKER_ID_KEY]) >= 0 or "speaker_embed" in inputs
+            assert input_embeds.shape[0] == prefill_rows(
+                step_metadata[PROMPT_LAYOUT_KEY], int(step_metadata[LANGUAGE_ID_KEY]), speaker,
+            ), f"the prefill built {input_embeds.shape[0]} rows, not the count `prefill_rows` lays out"
             state = self.request_state(fwd_info.rid_handle)
         elif graph_walk == "talker_decode":
             state = self.request_state(fwd_info.rid_handle)
@@ -767,11 +789,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
+    ) -> set[str] | StopCheck:
         """Stop the graph loop on codec EOS or the request frame limit.
 
         This callback runs off the GPU execution thread, so reading the sampled
         token with ``item`` is allowed here rather than in ``postprocess``.
+        An EOS frame stays out of the codec stream, ``ignore_eos`` or not: EOS
+        is loop control and not a codebook index, and only this host copy
+        tells it from audio.
         """
         if "layer0_codes" not in outputs:
             return set()
@@ -779,18 +804,16 @@ class TalkerSubmodule(ARNodeSubmodule):
         generated = int(
             self.request_state(request_id).get("generated_frames", 0)
         )
-        max_tokens = request_info.step_metadata.get(
-            "talker_max_tokens", request_info.max_tokens
-        )
+        max_tokens = request_info.max_tokens
         sampling_config = request_info.resource_configs.get(TALKER_SAMPLER)
         ignore_eos = bool(getattr(sampling_config, "ignore_eos", False))
-        reached_eos = (
-            not ignore_eos and token == self.talker_config.codec_eos_token_id
-        )
+        is_eos = token == self.talker_config.codec_eos_token_id
+        reached_eos = is_eos and not ignore_eos
+        stops = set()
         if reached_eos or generated >= max_tokens:
             logger.debug("talker %s: stop after %d frames (eos=%s)", request_id, generated, reached_eos)
-            return {"talker_decode_loop"}
-        return set()
+            stops = {"talker_decode_loop"}
+        return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Admit compatible prefill/decode requests to continuous batching.
@@ -1039,46 +1062,40 @@ class CodecSubmodule(ARNodeSubmodule):
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        """Remove EOS frames and pad one stream window to its capture bucket.
+        """Pad one stream window to its capture bucket.
 
         Input arrives as ``[frames, code_groups]``. The official decoder wants
         ``[quantizers, frames]``; every request is padded to the smallest
         captured window that fits so the ramp's windows and the terminal tail
-        all replay CUDA graphs.
+        all replay CUDA graphs. Every item is a frame: the Talker withholds
+        its EOS frame from the stream (``TalkerSubmodule.check_stop``).
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
         state = self.request_state(fwd_info.rid_handle)
-        codes = inputs["codec_tokens"][0].to(
-            device=self.get_device(), dtype=torch.long
-        )
+        received = inputs.get("codec_tokens")
+        if received:
+            codes = received[0].to(device=self.get_device(), dtype=torch.long)
+        else:
+            # a stream whose first frame was EOS ends with an empty chunk
+            codes = torch.zeros(0, self.config.num_code_groups, dtype=torch.long, device=self.get_device())
         if codes.ndim == 1:
             codes = codes.view(-1, self.config.num_code_groups)
         if codes.ndim != 2:
             raise ValueError(
                 f"Expected codec tokens with shape (frames, groups), got {codes.shape}"
             )
-        num_items = codes.shape[0]
-        # EOS belongs to Talker loop control and is not a valid codec codebook
-        # index for waveform reconstruction. It is only ever the last frame of
-        # a stream, so the leading context count is unaffected. A sync: which
-        # window holds that frame is not known on the host.
-        codes = codes[
-            codes[:, 0] != self.config.talker.codec_eos_token_id,
-            :self.config.codec.num_quantizers,
-        ]
+        codes = codes[:, :self.config.codec.num_quantizers]
         frames = codes.shape[0]
-        context = min(chunk.context_items if chunk is not None else 0, frames)
+        context = chunk.context_items if chunk is not None else 0
         # First window frame the conv stack decodes: the new frames' conv context.
         conv_start = context - min(context, self.conv_context) if self.split_decode else 0
-        # The bucket is chosen from the window's item count (EOS included) so
-        # that ``cg_key_info``, which only sees the stream chunk info, agrees.
-        bucket = self._bucket(max(chunk.num_items if chunk is not None else num_items, 1))
+        bucket = self._bucket(max(frames, 1))
         if frames < bucket:
             codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
         logger.debug(
-            "codec %s: window items=%d context=%d frames=%d bucket=%d final=%s",
-            fwd_info.request_id, num_items, context, frames, bucket, chunk is not None and chunk.is_final,
+            "codec %s: window context=%d frames=%d bucket=%d final=%s",
+            fwd_info.request_id, context, frames, bucket, chunk is not None and chunk.is_final,
         )
         state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream chunk info
         # The window's geometry rides with this pass: under speculative

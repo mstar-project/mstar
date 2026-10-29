@@ -687,3 +687,297 @@ def test_silero_splits_real_speech_into_its_turns(client_and_stub):  # noqa: F81
     for turn, clip_start in zip(turns, (1000, 2000 + clip_ms), strict=True):
         assert turn["start"] <= clip_start + 100 and turn["end"] >= clip_start + clip_ms - 100
     _assert_items_are_the_stream(turns, heard, stream, sr=24000)
+
+
+# ---------------------------------------------------------------- semantic_vad
+
+
+class _EndOfTurn:
+    """Fake end-of-turn model: always returns ``p``, and records each call."""
+
+    def __init__(self, p):
+        self.p, self.calls = p, []
+
+    def __call__(self, audio):
+        self.calls.append(audio.size)
+        return self.p
+
+
+def _semantic(monkeypatch, p):
+    eot = _EndOfTurn(p)
+    monkeypatch.setattr(realtime_vad, "smart_turn", lambda: eot)
+    return eot
+
+
+def _run_semantic(client, stream, eagerness="medium"):
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "turn_detection": {"type": "semantic_vad", "eagerness": eagerness}, "mstar": {"chunk_seconds": 300}}}))
+        session = json.loads(ws.receive_text())["session"]
+        _send(ws, stream, step=1600)
+        events = _barrier(ws)
+    return session, events
+
+
+def test_semantic_vad_commits_at_a_pause_the_model_calls_final(vad_client, monkeypatch):
+    """P(end of turn) 0.9 at the 300 ms pause ends the turn there, well
+    before server_vad's 500 ms window."""
+    client, stub = vad_client
+    heard = _step_samples(stub)
+    eot = _semantic(monkeypatch, 0.9)
+    stream = np.concatenate([_speech(10), _silence(40), _speech(5), _silence(20)])
+    session, events = _run_semantic(client, stream)
+    assert session["turn_detection"] == {"type": "semantic_vad", "eagerness": "medium",
+                                         "create_response": True, "interrupt_response": True}
+    turns = _turns(events)
+    # the pause reaches 300 ms on the 10th silent frame (320 ms); the next turn has 300 ms of prefix
+    assert [(t["start"], t["end"]) for t in turns] == [(0, 20 * 32), (50 * 32 - 300, 65 * 32)]
+    assert len(eot.calls) == 2 and eot.calls[0] == 20 * FRAME
+    _assert_items_are_the_stream(turns, heard, stream)
+
+
+def test_semantic_vad_keeps_listening_when_the_model_says_not_done(vad_client, monkeypatch):
+    """P 0.1 at a pause keeps the turn open: speech after it is the same
+    turn, and the silence limit (4 s at medium) ends it."""
+    client, stub = vad_client
+    heard = _step_samples(stub)
+    eot = _semantic(monkeypatch, 0.1)
+    stream = np.concatenate([_speech(10), _silence(20), _speech(10), _silence(130)])
+    _, events = _run_semantic(client, stream)
+    turns = _turns(events)
+    assert [(t["start"], t["end"]) for t in turns] == [(0, (10 + 20 + 10 + 125) * 32)]
+    assert len(eot.calls) == 2          # once per pause, not once per frame
+    _assert_items_are_the_stream(turns, heard, stream)
+
+
+class _FailingEndOfTurn(_EndOfTurn):
+    """Fake end-of-turn model that raises, as onnxruntime or the feature extractor can."""
+
+    def __call__(self, audio):
+        self.calls.append(audio.size)
+        raise RuntimeError("[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : /srv/models/smart-turn.onnx")
+
+
+def test_semantic_vad_survives_an_end_of_turn_model_error(vad_client, monkeypatch, caplog):
+    """The model raising at a pause is an error event, not a closed socket
+    (1011): the session goes on, its turns end at medium's 4 s silence
+    limit, the model is not asked again, and every sample is in exactly one
+    item. The event has an error id and no server path."""
+    client, stub = vad_client
+    heard = _step_samples(stub)
+    eot = _FailingEndOfTurn(0.9)
+    monkeypatch.setattr(realtime_vad, "smart_turn", lambda: eot)
+    stream = np.concatenate([_speech(10), _silence(130), _speech(10), _silence(130)])
+    with caplog.at_level("ERROR"):
+        _, events = _run_semantic(client, stream)
+    errors = [e for e in events if e["type"] == "error"]
+    assert len(errors) == 1, errors
+    error = errors[0]["error"]
+    assert error["type"] == "server_error" and error["code"] == "end_of_turn_failed"
+    assert "after 4 s of silence" in error["message"] and "/srv" not in error["message"]
+    error_id = error["message"].split("error id ")[1].split(")")[0]
+    assert error_id in caplog.text and "RUNTIME_EXCEPTION" in caplog.text
+    turns = _turns(events)
+    # the second turn's prefix is the 5 silent frames left after the first one ended
+    assert [(t["start"], t["end"]) for t in turns] == [(0, (10 + 125) * 32), ((10 + 125) * 32, (150 + 125) * 32)]
+    assert len(eot.calls) == 1
+    _assert_items_are_the_stream(turns, heard, stream)
+
+
+@pytest.mark.parametrize("eagerness,end_frames", [
+    ("high", 7),        # 0.6 >= 0.3: ends at the 200 ms pause (7 frames, 224 ms)
+    ("medium", 10),     # 0.6 >= 0.5: ends at the 300 ms pause (10 frames)
+    ("auto", 10),
+    ("low", 250),       # 0.6 < 0.7: no; the 8 s silence ends it (250 frames)
+])
+def test_semantic_vad_eagerness(vad_client, monkeypatch, eagerness, end_frames):
+    client, stub = vad_client
+    heard = _step_samples(stub)
+    _semantic(monkeypatch, 0.6)
+    stream = np.concatenate([_speech(10), _silence(260)])
+    _, events = _run_semantic(client, stream, eagerness)
+    turns = _turns(events)
+    assert [(t["start"], t["end"]) for t in turns] == [(0, (10 + end_frames) * 32)]
+    _assert_items_are_the_stream(turns, heard, stream)
+
+
+def test_semantic_history_holds_only_its_window_and_is_dropped_at_the_turn_end():
+    """The 8 s the model hears are copies, emptied when the turn ends or is
+    cleared, so one long append is not kept alive by its frames."""
+    seg = realtime_vad.TurnSegmenter(_EnergyVAD(), realtime_vad.SemanticVAD(), 300 * 16000,
+                                     end_of_turn=_EndOfTurn(0.1))
+    append = np.concatenate([_speech(400), _silence(10)]).astype(np.float32) / 32768
+    seg.feed(append)
+    assert seg.speaking and not any(np.shares_memory(piece, append) for piece in seg._recent)
+    assert sum(piece.size for piece in seg._recent) <= realtime_vad.SMART_TURN_SECONDS * 16000 + FRAME
+    seg.feed(np.zeros(130 * FRAME, dtype=np.float32))
+    assert not seg.speaking and not seg._recent
+    seg.feed(append)
+    seg.reset()
+    assert not seg._recent
+
+
+def _semantic_vad_is_refused_and_server_vad_still_works(vad_client, reason, hidden):
+    """semantic_vad is refused with an error event naming ``reason`` (and not
+    the server path ``hidden``); the session goes on, and server_vad chosen
+    next segments as usual."""
+    client, stub = vad_client
+    heard = _step_samples(stub)
+    stream = np.concatenate([_speech(10), _silence(20)])
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "turn_detection": {"type": "semantic_vad", "eagerness": "high"}, "mstar": {"chunk_seconds": 300}}}))
+        err = json.loads(ws.receive_text())
+        assert err["type"] == "error", err
+        message = err["error"]["message"]
+        assert "semantic_vad is unavailable" in message and reason in message and hidden not in message
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "turn_detection": {"type": "server_vad"}, "mstar": {"chunk_seconds": 300}}}))
+        updated = json.loads(ws.receive_text())
+        assert updated["session"]["turn_detection"]["type"] == "server_vad", updated
+        _send(ws, stream, step=1600)
+        events = _barrier(ws)
+    turns = _turns(events)
+    assert [(t["start"], t["end"]) for t in turns] == [(0, (10 + 16) * 32)]
+    _assert_items_are_the_stream(turns, heard, stream)
+
+
+def test_semantic_vad_without_smart_turn_weights_is_refused(vad_client, monkeypatch, tmp_path, _uncached_smart_turn):
+    monkeypatch.setenv("MSTAR_SMART_TURN_PATH", str(tmp_path / "missing.onnx"))
+    realtime_vad.smart_turn.cache_clear()
+    _semantic_vad_is_refused_and_server_vad_still_works(vad_client, "no Smart Turn weights", str(tmp_path))
+
+
+def test_semantic_vad_settings_are_validated(vad_client, monkeypatch):
+    client, _ = vad_client
+    _semantic(monkeypatch, 0.9)
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        for td, needle in (({"type": "semantic_vad", "eagerness": "eager"}, "eagerness must be one of"),
+                           ({"type": "semantic_vad", "silence_duration_ms": 500}, "silence_duration_ms' is not")):
+            ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"turn_detection": td}}))
+            assert needle in json.loads(ws.receive_text())["error"]["message"]
+
+
+def _smart_turn_available() -> bool:
+    import importlib.util
+
+    if importlib.util.find_spec("onnxruntime") is None or importlib.util.find_spec("transformers") is None:
+        return False
+    return realtime_vad.smart_turn_weights() is not None and realtime_vad.silero_weights() is not None
+
+
+@pytest.mark.skipif(not _smart_turn_available(), reason="no Smart Turn / Silero weights or onnxruntime")
+def test_smart_turn_ends_real_turns_sooner_than_the_silence_window(client_and_stub):  # noqa: F811
+    """Real Silero and Smart Turn on real speech at 24 kHz: the clip twice is
+    two turns, each ending at the first 300 ms pause after the clip rather
+    than after 500 ms of silence."""
+    realtime_vad.silero_factory.cache_clear()
+    realtime_vad.smart_turn.cache_clear()
+    client, stub = client_and_stub
+    heard = _step_samples(stub)
+    with wave.open(str(Path(__file__).parents[1] / "qwen3-omni" / "audio.wav"), "rb") as wf:
+        clip = np.frombuffer(wf.readframes(wf.getnframes()), dtype="<i2")
+    gap = np.zeros(24000, dtype="<i2")
+    stream = np.concatenate([gap, clip, gap, clip, gap])
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000},
+            "turn_detection": {"type": "semantic_vad"}, "mstar": {"chunk_seconds": 300}}}))
+        assert json.loads(ws.receive_text())["session"]["turn_detection"]["type"] == "semantic_vad"
+        _send(ws, stream, step=480)
+        events = _barrier(ws)
+    turns = _turns(events)
+    clip_ms = clip.size * 1000 // 24000
+    assert len(turns) == 2
+    for turn, clip_end in zip(turns, (1000 + clip_ms, 2000 + 2 * clip_ms), strict=True):
+        assert clip_end - 100 <= turn["end"] < clip_end + 500
+    _assert_items_are_the_stream(turns, heard, stream, sr=24000)
+
+
+def test_missing_smart_turn_is_a_warning_and_no_model(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("MSTAR_SMART_TURN_PATH", str(tmp_path / "missing.onnx"))
+    realtime_vad.smart_turn.cache_clear()
+    try:
+        with caplog.at_level("WARNING", logger=realtime_vad.__name__):
+            assert realtime_vad.smart_turn() is None
+        assert realtime_vad.smart_turn_problem() == "no Smart Turn weights on this server"
+    finally:
+        realtime_vad.smart_turn.cache_clear()
+    assert "semantic_vad is unavailable" in caplog.text
+
+
+def test_smart_turn_without_onnxruntime_names_the_package(monkeypatch, tmp_path, _uncached_smart_turn):
+    weights = tmp_path / "smart-turn-v3.2-cpu.onnx"
+    weights.write_bytes(b"onnx")
+    monkeypatch.setenv("MSTAR_SMART_TURN_PATH", str(weights))
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)
+    realtime_vad.smart_turn.cache_clear()
+    assert realtime_vad.smart_turn() is None
+    assert realtime_vad.smart_turn_problem() == "onnxruntime or transformers is not installed"
+
+
+def _fake_smart_turn_runtime(monkeypatch, tmp_path, session):
+    weights = tmp_path / "smart-turn-v3.2-cpu.onnx"
+    weights.write_bytes(b"onnx")
+    monkeypatch.setenv("MSTAR_SMART_TURN_PATH", str(weights))
+    ort = type(sys)("onnxruntime")
+    ort.SessionOptions = type("SessionOptions", (), {})
+    ort.InferenceSession = lambda *a, **k: session
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort)
+    realtime_vad.smart_turn.cache_clear()
+
+
+@pytest.fixture
+def _uncached_smart_turn():
+    yield
+    realtime_vad.smart_turn.cache_clear()
+
+
+_needs_transformers = pytest.mark.skipif(importlib.util.find_spec("transformers") is None,
+                                         reason="needs transformers (Whisper's feature extractor)")
+
+
+@_needs_transformers
+@pytest.mark.parametrize("session,needle", [
+    (_FakeSession(_SILERO_IN), "its inputs are"),     # MSTAR_SMART_TURN_PATH pointed at Silero
+    (_FakeSession([("input_features", _I)], out_shapes=((1, 1),)), "its inputs are"),
+    (_FakeSession([("input_features", _F)], out_shapes=((1,),)), "its outputs have shapes"),
+    (_FakeSession([("input_features", _F)], out_shapes=()), "its outputs have shapes"),
+])
+def test_a_smart_turn_file_with_other_inputs_or_outputs_is_no_model(
+        monkeypatch, tmp_path, caplog, _uncached_smart_turn, session, needle):
+    _fake_smart_turn_runtime(monkeypatch, tmp_path, session)
+    with caplog.at_level("WARNING", logger=realtime_vad.__name__):
+        assert realtime_vad.smart_turn() is None
+    assert "semantic_vad is unavailable" in caplog.text and needle in caplog.text
+    assert realtime_vad.smart_turn_problem() == "the Smart Turn file is not the expected model"
+
+
+@_needs_transformers
+def test_the_smart_turn_signature_is_accepted(monkeypatch, tmp_path, _uncached_smart_turn):
+    _fake_smart_turn_runtime(monkeypatch, tmp_path, _FakeSession([("input_features", _F)], out_shapes=((1, 1),)))
+    model = realtime_vad.smart_turn()
+    assert model is not None and model(np.zeros(16000, dtype=np.float32)) == 0.0
+
+
+@_needs_transformers
+def test_semantic_vad_with_a_wrong_smart_turn_file_is_refused(vad_client, monkeypatch, tmp_path, _uncached_smart_turn):
+    """Refused at the session update, instead of the first pause raising and
+    closing the socket."""
+    _fake_smart_turn_runtime(monkeypatch, tmp_path, _FakeSession(_SILERO_IN))
+    _semantic_vad_is_refused_and_server_vad_still_works(
+        vad_client, "the Smart Turn file is not the expected model", str(tmp_path))
+
+
+@pytest.mark.skipif(any(importlib.util.find_spec(m) is None for m in ("onnx", "onnxruntime", "transformers")),
+                    reason="needs onnx, onnxruntime and transformers")
+def test_a_real_onnx_file_with_silero_inputs_is_not_smart_turn(monkeypatch, tmp_path, _uncached_smart_turn):
+    path = tmp_path / "silero_shaped.onnx"
+    _tiny_onnx(path, [("input", "float"), ("state", "float"), ("sr", "int64")])
+    monkeypatch.setenv("MSTAR_SMART_TURN_PATH", str(path))
+    realtime_vad.smart_turn.cache_clear()
+    assert realtime_vad.smart_turn() is None

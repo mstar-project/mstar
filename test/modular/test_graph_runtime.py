@@ -26,6 +26,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     EdgeSpec,
     PendingLoopStop,
+    RequestWalks,
     RouteInput,
     SendInput,
     SpeculationPrepInput,
@@ -167,6 +168,7 @@ def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
         graph_walk=walk,
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers=ParallelList([wg_id], [[worker_id]]),
+        loop_caps={},
     )
     mgr.add_request(rid, fwd_info)
     return mgr, runtime, rid
@@ -523,6 +525,7 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         request_id="rid_b", partition="default", graph_walk="decode",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker0"]]),
+        loop_caps={},
     )
     mgr.add_request(rid_b, _fwd_info("decode"))
     for rid in (rid_a, rid_b):
@@ -716,6 +719,65 @@ def test_worker_graphs_done_carries_every_persisted_tensor_of_a_name():
         and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
     ]
     assert [i.uuid for i in wgd.body.persist_signals["token"]] == [-1, uuids[0]]
+
+
+def test_worker_graphs_done_names_each_rows_own_walk():
+    """A mixed step routes rows of two walks under one combined label. The
+    conductor follows a producer-triggered partition's walk off each
+    WORKER_GRAPHS_DONE, so it must name the row's own walk."""
+    import torch
+
+    def wg(wg_id, walk):
+        return WorkerGraph(
+            section=GraphNode(
+                name="only", input_names={"prompt"},
+                outputs=[GraphEdge(name="token", next_node=EMPTY_DESTINATION, persist=True)],
+            ),
+            graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
+        )
+    runtime = PythonGraphRuntime(
+        my_worker_id="worker0", my_worker_graphs=[wg(0, "prefill"), wg(1, "decode")],
+        all_wg_ids_to_graph_walks={0: {"prefill"}, 1: {"decode"}},
+        all_wg_ids_to_dyn_loops={0: set(), 1: set()},
+        all_wg_ids_to_nodes={0: {"only"}, 1: {"only"}},
+        node_to_partition={"only": "default"},
+        sharding_config=_sharding_config(), tensor_manager=StubTensorManager(),
+    )
+    comm = _RecordingCommunicator()
+    runtime._communicator = comm
+    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+    rids = [
+        runtime.add_request(
+            request_id=f"r_{walk}", partition="default", graph_walk=walk,
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers=ParallelList([0, 1], [["worker0"], ["worker0"]]),
+            loop_caps={},
+        )
+        for walk in ("prefill", "decode")
+    ]
+    for rid in rids:
+        _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="only")])
+    runtime.pop_walk_rids("only", RequestWalks(rids, ["prefill", "decode"], [0, 1]))
+    uuids = [_store_outputs(store, minter, rid, {"token": [torch.ones(2)]})["token"][0] for rid in rids]
+
+    out = runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="mixed", node_name="only",
+        output_signals=["token"], wg_ids=ParallelList(rids, [0, 1]),
+        tensors=uuids, num_tensors=[1, 1],
+        walks=["prefill", "decode"], rid_walk_idx=[0, 1],
+    ))
+    runtime.send_outputs(SendInput(
+        completion_id=out.completion_id,
+        per_request_info=ParallelList(rids, [_fwd_info("mixed"), _fwd_info("mixed")]),
+        new_token_counts=ParallelList(rids, [{}, {}]),
+    ))
+
+    done = {
+        m.body.request_id: (m.body.worker_graph_ids, m.body.graph_walk)
+        for e, m in comm.sent
+        if e == "conductor" and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
+    }
+    assert done == {"r_prefill": ([0], "prefill"), "r_decode": ([1], "decode")}
 
 
 def test_an_unread_loop_back_is_not_routed():
@@ -1011,6 +1073,7 @@ def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset()):
         request_id="r", partition="default", graph_walk="w",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+        loop_caps={},
     )
     tm.register_request(rid, runtime.get_sharding_config(rid))
     return tm, runtime, rid

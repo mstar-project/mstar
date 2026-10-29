@@ -213,7 +213,8 @@ class PythonGraphRuntime(GraphRuntime):
         partition: str,
         graph_walk: str,
         partition_worker_graph_ids: list[int],
-        worker_graph_to_workers: ParallelList[int, list[str]]
+        worker_graph_to_workers: ParallelList[int, list[str]],
+        loop_caps: dict[str, int],
     ) -> int:
         # The conductor sends one NewRequest PER PARTITION, so this runs
         # several times for one request; they all share the first's handle.
@@ -255,7 +256,7 @@ class PythonGraphRuntime(GraphRuntime):
 
         for graph_id in partition_worker_graph_ids:
             if graph_id in self._queues:
-                self._queues[graph_id].add_request(handle)
+                self._queues[graph_id].add_request(handle, loop_caps)
 
         self._request_info[handle].partition_info[partition] = GraphRuntimePartitionInfo(
             graph_walk=graph_walk,
@@ -331,6 +332,19 @@ class PythonGraphRuntime(GraphRuntime):
             wg_id for wg_id in request_info.worker_graph_ids
             if walk in self._all_wg_ids_to_graph_walks[wg_id]
         ]
+
+    def is_partition_idle(self, rid: int, partition: str) -> bool:
+        request_info = self._request_info.get(rid)
+        if request_info is None:
+            return False
+        part_info = request_info.partition_info.get(partition)
+        if part_info is None:
+            return False
+        for wg_id in part_info.graph_walk_worker_graph_ids:
+            wgio = self._queues[wg_id].per_request_queues.get(rid)
+            if wgio is not None and not wgio.is_idle():
+                return False
+        return True
 
     def set_in_flight(
         self, node: str, rids: list[int], wg_ids: list[int],
@@ -1373,7 +1387,7 @@ class PythonGraphRuntime(GraphRuntime):
             for edge in routing.persist:
                 for info in edge.tensor_info:
                     self._tensor_manager.set_persist(info.uuid, persist=True)
-            if owned:
+            if owned or completion.transferred_refs:
                 # persist is deliberately absent: those tensors are held alive
                 # by the persist marker, and counting them here would
                 # double-count a signal whose destination is EMPTY_DESTINATION
@@ -1385,7 +1399,9 @@ class PythonGraphRuntime(GraphRuntime):
                     + sum(routing.to_workers.values(), start=[])
                     + sum(routing.streaming_to_workers.values(), start=[])
                 )
-                self._tensor_manager.set_output_ref_counts(owned, routed_edges)
+                self._tensor_manager.set_output_ref_counts(
+                    owned, routed_edges, completion.transferred_refs,
+                )
 
             # What the caller has to stage for remote reads. Every tensor on
             # an outgoing edge, not just the ones this batch produced: a loop
@@ -1484,6 +1500,8 @@ class PythonGraphRuntime(GraphRuntime):
         sent_rids: list[int] = []
 
         for rid, routing in completion.routing.items():
+            if rid in input.failed_rids:
+                continue
             fwd_info = fwd_infos.get(rid)
             info = self._request_info.get(rid)
 
@@ -1538,10 +1556,12 @@ class PythonGraphRuntime(GraphRuntime):
 
             if routing.completed_worker_graph_ids and info is not None:
                 part = info.partition_info.get(partition)
+                # The rid's own walk: a mixed step's combined label is no
+                # walk of the graph's, nor one the conductor can follow.
+                rid_walk = completion.rid_walk.get(rid, completion.graph_walk)
                 node = self._queues[
                     self.get_worker_graph_id_for_node(
-                        completion.node_name,
-                        completion.rid_walk.get(rid, completion.graph_walk),
+                        completion.node_name, rid_walk,
                     )
                 ].per_request_queues.get(rid)
                 speculative = node is not None and node.get_node(
@@ -1549,6 +1569,7 @@ class PythonGraphRuntime(GraphRuntime):
                 )._in_flight
                 self._send_worker_graphs_done(
                     rid, routing, info, fwd_info, partition,
+                    graph_walk=rid_walk,
                     resource_publish_info=publications.get(rid, {}),
                     stream_tokens_consumed=consumed.get(rid, {}),
                     # A speculatively-scheduled node has not really finished
@@ -1585,6 +1606,7 @@ class PythonGraphRuntime(GraphRuntime):
         info: GraphRuntimeRequestInfo,
         fwd_info: CurrentForwardPassInfo | None,
         partition: str,
+        graph_walk: str,
         resource_publish_info: dict[str, PublishedInfo],
         stream_tokens_consumed: dict[str, int],
         partition_done: bool,
@@ -1628,6 +1650,7 @@ class PythonGraphRuntime(GraphRuntime):
                 resource_publish_info=resource_publish_info,
                 partition_name=partition,
                 partition_done=partition_done,
+                graph_walk=graph_walk,
                 stream_tokens_consumed=stream_tokens_consumed,
                 stream_items_sent=stream_items_sent,
                 graph_timings=graph_timings,

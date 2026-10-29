@@ -646,9 +646,9 @@ def test_anchor_encode_matches_full() -> None:
         print("  (skipped anchor-encode parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
     device = base["device"]
-    # [C, H, W] in [0, 1] on the 8-bit grid, like load_image: the aspect-crop
-    # conditioning recipe (Edge) rounds to 8 bits, the stretch/action path does
-    # not, so an off-grid image would reach the two encodes as different pixels.
+    # [C, H, W] in [0, 1] on the 8-bit grid, like load_image: the i2v
+    # conditioning recipe rounds to 8 bits, the action path does not, so an
+    # off-grid image would reach the two encodes as different pixels.
     img = torch.randint(0, 256, (3, H, W), device=device).float() / 255.0
     md = {"height": H, "width": W, "num_frames": VIDEO_FRAMES, "has_image_condition": True}
     anchor = _encode_cond(base["model"], md, {"image_inputs": [img]}, "prefill_cond")

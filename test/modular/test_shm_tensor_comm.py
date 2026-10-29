@@ -1,5 +1,6 @@
 """Unit tests for SharedMemoryCommunicationManager and tensor serialization."""
 
+import ctypes
 import errno
 import logging
 import os
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import mstar.communication.tensors as tensors_mod
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     MooncakeCommunicationManager,
@@ -18,7 +20,7 @@ from mstar.communication.tensors import (
     _serialize_tensor,
     create_tensor_communication_manager,
 )
-from mstar.distributed.base import ShardingConfig
+from mstar.distributed.base import NodeAndGraphWalk, ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.utils.containers import ParallelList
@@ -487,6 +489,27 @@ def test_ack_unread_tensors_lets_producer_reclaim_buffer():
         assert not os.path.isfile(shm_path)  # reclaimed -> no leak
 
 
+def test_a_worker_acks_unread_tensors_under_the_wire_id():
+    """A worker installs a handle-to-string ``rid_to_str``, and a removed
+    request has no handle, so the unread ack must carry the wire id as is."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        producer = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        edges, uuid = _produce_registered_output(producer, "req1")
+
+        consumer = _make_manager(tmpdir, entity_id="worker_1")
+
+        def _released(handle):
+            raise KeyError(f"no live request has handle {handle}")
+
+        consumer.rid_to_str = _released
+        consumer.ack_unread_tensors("req1", edges)
+
+        [(entity_id, msg)] = consumer.communicator.sent
+        assert entity_id == "worker_0"
+        assert msg.body.request_id == "req1"
+        assert msg.body.successful_tensors == {uuid: 1}
+
+
 # ---------------------------------------------------------------------------
 # Teardown: cleanup_request (soft) vs force_cleanup_request (hard) + drain gate
 # ---------------------------------------------------------------------------
@@ -618,6 +641,256 @@ def test_a_read_that_finishes_early_waits_for_the_ones_started_before_it():
         assert [e.name for e in ready["req1"]] == ["token_0", "token_1"], (
             "the request's reads came out out of order"
         )
+
+
+# ---------------------------------------------------------------------------
+# Two slices of one producer tensor on one consumer
+# ---------------------------------------------------------------------------
+
+def _two_slice_config(shard_dim: int = 0) -> ShardingConfig:
+    """``x`` is sharded on dim 0 from a TP=1 producer into a TP=2 node ``a``
+    and a TP=4 group of ``b`` and ``c``, each with its rank 0 on worker_1. So
+    worker_1 receives two slices of one producer uuid, rows [0, 2) for ``a``
+    and row 0 for ``b`` and ``c``."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes=["src"], tp_size=1, graph_walks=["w"], _tp_rank=0),
+            ShardingGroup(nodes=["a"], tp_size=2, graph_walks=["w"]),
+            ShardingGroup(nodes=["b", "c"], tp_size=4, graph_walks=["w"]),
+        ],
+        tp_enabled_nodes={"src", "a", "b", "c"},
+        shard_dim={"x": shard_dim},
+    )
+    tp4 = [f"worker_{i}" for i in range(1, 5)]
+    cfg.setup({
+        NodeAndGraphWalk("src", "w"): ["worker_0"],
+        NodeAndGraphWalk("a", "w"): ["worker_1", "worker_2"],
+        NodeAndGraphWalk("b", "w"): tp4,
+        NodeAndGraphWalk("c", "w"): tp4,
+    })
+    return cfg
+
+
+class _InProcessTransferEngine:
+    """Mooncake's engine for two managers in one process: a read is a memcpy
+    from the producer's address, which is what an RDMA or TCP read does."""
+
+    def initialize(self, *args):
+        return 0
+
+    def get_rpc_port(self):
+        return 0
+
+    def register_memory(self, ptr, nbytes):
+        return 0
+
+    def unregister_memory(self, ptr):
+        return 0
+
+    def batch_transfer_sync_read(self, session_id, local_ptrs, remote_ptrs, lengths):
+        for dst, src, n in zip(local_ptrs, remote_ptrs, lengths, strict=True):
+            ctypes.memmove(dst, src, n)
+        return 0
+
+    def batch_transfer_async_read(self, session_id, local_ptrs, remote_ptrs, lengths):
+        self.batch_transfer_sync_read(session_id, local_ptrs, remote_ptrs, lengths)
+        return 1  # any nonzero batch id; every batch is done once submitted
+
+    def transfer_check_status(self, batch_id):
+        return 1  # COMPLETED
+
+
+def _transport(protocol, entity_id, shm_dir):
+    if protocol == CommProtocol.SHM:
+        return SharedMemoryCommunicationManager(
+            my_entity_id=entity_id, hostname="localhost", device="cpu",
+            communicator=MockCommunicator(), shm_dir=shm_dir,
+        )
+    return MooncakeCommunicationManager(
+        my_entity_id=entity_id, hostname="localhost", device="cpu",
+        communicator=MockCommunicator(), protocol=protocol,
+    )
+
+
+@pytest.mark.parametrize("shape", [
+    pytest.param((4, 3), id="rows"),
+    # Zero-byte rows: every slice is offset 0, nbytes 0, so only its dims tell
+    # ``a``'s [2, 0] from ``b``'s [1, 0].
+    pytest.param((4, 0), id="empty-rows"),
+])
+@pytest.mark.parametrize("protocol", [
+    pytest.param(CommProtocol.SHM, id="file"),
+    pytest.param(CommProtocol.TCP, id="mooncake"),
+])
+def test_two_slices_of_one_tensor_on_one_worker_do_not_alias(
+    tmp_path, monkeypatch, protocol, shape,
+):
+    """Every slice of a producer tensor carries the producer's uuid, so a
+    receive cache keyed by the uuid alone handed ``b`` the rows stored for
+    ``a``. A repeated slice (``c``) still reuses the first read of it."""
+    monkeypatch.setattr(tensors_mod, "TransferEngine", _InProcessTransferEngine)
+    prod = _transport(protocol, "worker_0", str(tmp_path))
+    cons = _transport(protocol, "worker_1", str(tmp_path))
+    cfg = _two_slice_config()
+    for mgr in (prod, cons):
+        mgr.register_request("req1", cfg)
+
+    x = torch.arange(float(shape[0] * shape[1])).reshape(shape)
+    (info,) = prod.store_and_return_tensor_info(
+        "req1", {"x": [x]}, node_name="src", graph_walk="w",
+    )["x"]
+    edges = [
+        cfg.fanout_graph_edges(
+            GraphEdge(name="x", next_node=node, tensor_info=[info]),
+            source_node="src", source_graph_walk="w", dest_graph_walk="w",
+        )["worker_1"]
+        for node in ("a", "b", "c")
+    ]
+    prod.increment_ref(info.uuid, n=len(edges))
+    prod.register_for_send("req1", [info])
+
+    for fut in cons.start_read_tensors("req1", edges, graph_walk="w") or []:
+        fut.result()
+    ready = cons.get_ready_tensors(graph_walk="w")["req1"]
+    got = {e.next_node: cons.get_tensor(e.tensor_info[0].uuid) for e in ready}
+    assert torch.equal(got["a"], x[:2])
+    assert torch.equal(got["b"], x[:1]), "b got the slice stored for a"
+    assert torch.equal(got["c"], x[:1])
+    assert ready[1].tensor_info[0].uuid == ready[2].tensor_info[0].uuid
+
+    # The producer still hears about its own uuid, once per edge.
+    assert [msg.body.successful_tensors for _, msg in cons.communicator.sent] == [
+        {info.uuid: 3}
+    ]
+    # Each consuming node releases its input: nothing is freed early or left.
+    for edge in ready:
+        assert cons.tensor_store.check_uuid_presence(edge.tensor_info[0].uuid)
+        cons.dereference(edge.tensor_info[0].uuid)
+    assert cons.tensor_store.get_all_uuids("req1") == []
+
+
+@pytest.mark.parametrize("shard_dim", [0, 1])
+@pytest.mark.parametrize("protocol", [
+    pytest.param(CommProtocol.SHM, id="file"),
+    pytest.param(CommProtocol.TCP, id="mooncake"),
+])
+def test_an_edge_mixing_a_reused_and_a_new_slice_is_read_in_full(
+    tmp_path, monkeypatch, protocol, shard_dim,
+):
+    """``x`` holds a tensor with rows and one with none on the shard dim. On
+    worker_1 the empty one's slice is the same for ``a`` and ``b``, so ``b``
+    reuses it while its other slice is new: that edge holds a reused and a
+    new tensor. The new one still drops its transit ref and gets its layout
+    back."""
+    monkeypatch.setattr(tensors_mod, "TransferEngine", _InProcessTransferEngine)
+    prod = _transport(protocol, "worker_0", str(tmp_path))
+    cons = _transport(protocol, "worker_1", str(tmp_path))
+    cfg = _two_slice_config(shard_dim)
+    for mgr in (prod, cons):
+        mgr.register_request("req1", cfg)
+
+    full = torch.arange(12.0).reshape(4, 3)
+    empty = torch.zeros(0, 3)
+    if shard_dim == 1:
+        full, empty = full.T.contiguous(), empty.T.contiguous()
+    infos = prod.store_and_return_tensor_info(
+        "req1", {"x": [full, empty]}, node_name="src", graph_walk="w",
+    )["x"]
+    edges = [
+        cfg.fanout_graph_edges(
+            GraphEdge(name="x", next_node=node, tensor_info=infos),
+            source_node="src", source_graph_walk="w", dest_graph_walk="w",
+        )["worker_1"]
+        for node in ("a", "b")
+    ]
+    for info in infos:
+        prod.increment_ref(info.uuid, n=len(edges))
+    prod.register_for_send("req1", infos)
+
+    for fut in cons.start_read_tensors("req1", edges, graph_walk="w") or []:
+        fut.result()
+    ready = cons.get_ready_tensors(graph_walk="w")["req1"]
+    got = {e.next_node: [cons.get_tensor(i.uuid) for i in e.tensor_info] for e in ready}
+    rows = (slice(None), slice(0, 2)) if shard_dim else (slice(0, 2),)
+    row = (slice(None), slice(0, 1)) if shard_dim else (slice(0, 1),)
+    assert torch.equal(got["a"][0], full[rows])
+    assert torch.equal(got["b"][0], full[row]), "b's new slice lost its layout"
+    assert got["a"][1].shape == got["b"][1].shape == empty.shape
+    assert [msg.body.successful_tensors for _, msg in cons.communicator.sent] == [
+        {infos[0].uuid: 2, infos[1].uuid: 2}
+    ]
+    for edge in ready:
+        for info in edge.tensor_info:
+            cons.dereference(info.uuid)
+    assert cons.tensor_store.get_all_uuids("req1") == [], "a slice kept its transit ref"
+
+
+@pytest.mark.parametrize("protocol", [
+    pytest.param(CommProtocol.SHM, id="file"),
+    pytest.param(CommProtocol.TCP, id="mooncake"),
+])
+def test_a_slice_does_not_join_another_nodes_gather(tmp_path, monkeypatch, protocol):
+    """``x`` goes from a TP=2 producer to ``g`` (TP=1, gathers both ranks'
+    shards) and to ``s`` (TP=4, takes a slice of rank 0's), both on
+    worker_1. ``s``'s slice arrives while ``g``'s gather waits for rank 1,
+    and must not be counted as one of ``g``'s shards."""
+    monkeypatch.setattr(tensors_mod, "TransferEngine", _InProcessTransferEngine)
+
+    def config(src_rank=None):
+        cfg = ShardingConfig(
+            groups=[
+                ShardingGroup(nodes=["src"], tp_size=2, graph_walks=["w"], _tp_rank=src_rank),
+                ShardingGroup(nodes=["g"], tp_size=1, graph_walks=["w"]),
+                ShardingGroup(nodes=["s"], tp_size=4, graph_walks=["w"]),
+            ],
+            tp_enabled_nodes={"src", "g", "s"},
+            shard_dim={"x": 0},
+        )
+        cfg.setup({
+            NodeAndGraphWalk("src", "w"): ["worker_0", "worker_5"],
+            NodeAndGraphWalk("g", "w"): ["worker_1"],
+            NodeAndGraphWalk("s", "w"): [f"worker_{i}" for i in range(1, 5)],
+        })
+        return cfg
+
+    cfg = config()
+    prods = [_transport(protocol, w, str(tmp_path)) for w in ("worker_0", "worker_5")]
+    cons = _transport(protocol, "worker_1", str(tmp_path))
+    for rank, prod in enumerate(prods):
+        prod.register_request("req1", config(rank))
+    cons.register_request("req1", cfg)
+
+    x = torch.arange(12.0).reshape(4, 3)
+    infos = []
+    for rank, prod in enumerate(prods):
+        (info,) = prod.store_and_return_tensor_info(
+            "req1", {"x": [x[2 * rank:2 * rank + 2].clone()]},
+            node_name="src", graph_walk="w",
+        )["x"]
+        infos.append(info)
+
+    def edge(node, rank):
+        return cfg.fanout_graph_edges(
+            GraphEdge(name="x", next_node=node, tensor_info=[infos[rank]]),
+            source_node="src", source_graph_walk="w", dest_graph_walk="w",
+            source_tp_rank=rank,
+        )["worker_1"]
+
+    order = [edge("g", 0), edge("s", 0), edge("g", 1)]
+    prods[0].increment_ref(infos[0].uuid, n=2)
+    prods[1].increment_ref(infos[1].uuid, n=1)
+    for prod, info in zip(prods, infos, strict=True):
+        prod.register_for_send("req1", [info])
+
+    for fut in cons.start_read_tensors("req1", order, graph_walk="w") or []:
+        fut.result()
+    ready = cons.get_ready_tensors(graph_walk="w")["req1"]
+    got = {e.next_node: cons.get_tensor(e.tensor_info[0].uuid) for e in ready}
+    assert torch.equal(got["s"], x[:1])
+    assert torch.equal(got["g"], x)
+    for e in ready:
+        cons.dereference(e.tensor_info[0].uuid)
+    assert cons.tensor_store.get_all_uuids("req1") == []
 
 
 # ---------------------------------------------------------------------------
@@ -884,6 +1157,33 @@ def test_host_copy_follows_a_renamed_output():
             cpu_tensors={7: {"new_token": [host]}},
         )
         assert mgr.tensor_store.get_cpu_tensor(stored.flat_uuids[0]) is host
+
+
+def test_a_tensor_sent_after_its_step_is_read_from_its_own_memory():
+    """A loop's accumulated output is stored on its own iteration and sent when
+    the loop ends. Its host copy is a view of a buffer every later step writes
+    over, so the worker drops host copies once a step's sends are done and the
+    late send reads each step's own tensor."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
+        reused = torch.empty(1, 4)  # the producer's host buffer, rewritten every step
+        infos = []
+        for step in range(3):
+            out = torch.full((1, 4), float(step))
+            reused.copy_(out)
+            infos += sender.store_and_return_tensor_info(
+                "req1", {"pred": [out]}, cpu_tensors={"pred": [reused]},
+            )["pred"]
+            sender.drop_host_copies()
+            assert sender.tensor_store.get_cpu_tensor(infos[-1].uuid) is None
+
+        edges = [GraphEdge(next_node="client", name="pred", tensor_info=infos)]
+        sender.register_for_send("req1", infos)
+        receiver.start_read_tensors("req1", edges, graph_walk="rollout")
+        receiver.get_ready_tensors(graph_walk="rollout")
+        got = [receiver.get_tensor(info.uuid) for info in infos]
+        assert [t.flatten().tolist() for t in got] == [[float(k)] * 4 for k in range(3)]
 
 
 def test_host_copies_not_kept_for_device_transports():

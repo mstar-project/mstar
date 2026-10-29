@@ -14,7 +14,7 @@ from collections.abc import Mapping
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.wrappers import (
@@ -24,7 +24,13 @@ from mstar.engine.resources.linear_attn.wrappers import (
     GDNWrapper,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
-from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing
+from mstar.engine.resources.recurrent.pool import (
+    NO_SLOT,
+    SINK_SLOT,
+    RecurrentAddressing,
+    RecurrentStatePool,
+    checkpoint_rows,
+)
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
@@ -79,7 +85,14 @@ class GDNManager(LinearAttnManager):
 
         # See `build_cuda_graph_buffers`.
         self._cg_max_bs = 0
+        self._cg_max_tokens = 0
         self._cg_wrappers: dict[CGSlotKey, GDNWrapper] = {}
+        # The prefills' state checkpoints, sized once to the largest bucket and
+        # shared: one forward runs at a time, and each graph holds the address.
+        # An eager step fits it (`RecurrentStatePool._checkpoint_every`), and
+        # without graphs it grows to the largest step.
+        self._checkpoints: torch.Tensor | None = None
+        self._pool: RecurrentStatePool | None = None
 
         # (label, is_decode) -> wrapper
         self._eager_wrappers: dict[tuple[str, bool], GDNWrapper] = {}
@@ -127,6 +140,9 @@ class GDNManager(LinearAttnManager):
     def depends_on(self) -> set[str]:
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
+
+    def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
+        self._pool = resources.get(self._pool_key)
 
     # Step lifecycle
 
@@ -251,19 +267,45 @@ class GDNManager(LinearAttnManager):
         is_decode = not ctx.force_prefill and bool(spans) and all(s == 1 for s in spans)
         walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
         split = self._splits.get(walk)
+        every = addressing.snapshot_every
+        walks = split.prefill_walks if split is not None else (walk,)
+        if every and self._pool.keyed_walks(label).isdisjoint(walks):
+            # a walk the KV cache doesn't key keeps no snapshots, so its graphs skip the checkpoints too
+            every = 0
+        assert every or not addressing.snapshots, (
+            f"gdn: a {walk!r} step keeps snapshots for {label!r}, which its KV cache doesn't key there"
+        )
+        checkpoints = None
+        if every and ctx.slot_lease is not None:
+            checkpoints = self._checkpoint_buffer(checkpoint_rows(self._cg_max_tokens, self._cg_max_bs, every))
+        elif every and addressing.snapshots:
+            checkpoints = self._checkpoint_buffer(sum(max(span, 1) // every for span in spans))
         if split is not None and addressing.host_slot_indices is not None:
             wrapper = self._get_wrapper(label, False, ctx.slot_lease, split=split)
             wrapper.plan(
                 spans, addressing.host_slot_indices[:num_rows],
                 addressing.host_has_state[:num_rows],
+                addressing.snapshots, every, checkpoints,
             )
             return wrapper
         wrapper = self._get_wrapper(label, is_decode, ctx.slot_lease)
         if is_decode:
             wrapper.plan(spans, slots)
         else:
-            wrapper.plan(spans, slots, addressing.has_state[:num_rows])
+            wrapper.plan(
+                spans, slots, addressing.has_state[:num_rows],
+                addressing.snapshots, every, checkpoints,
+            )
         return wrapper
+
+    def _checkpoint_buffer(self, rows: int) -> torch.Tensor:
+        if self._checkpoints is None or self._checkpoints.shape[0] < rows:
+            geometry = self.geometry
+            self._checkpoints = torch.empty(
+                (rows, geometry.num_v_heads, geometry.head_v_dim, geometry.head_k_dim),
+                dtype=torch.float32, device=self._device,
+            )
+        return self._checkpoints
 
     def current_plan(self, label: str | None = None) -> GDNWrapper:
         if label is None:
@@ -343,12 +385,14 @@ class GDNManager(LinearAttnManager):
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
-        del slots, max_seq_len
+        del slots
         # A floor under every capture wrapper's row count, so none reallocates
         # if a wider layout reaches it; announced before any bucket plans.
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
+        self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
 
     def cleanup(self):
         self._cg_wrappers.clear()
         self._eager_wrappers.clear()
         self._current.clear()
+        self._checkpoints = None

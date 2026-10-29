@@ -89,7 +89,7 @@ def test_a_page_its_request_still_owns_is_passed_over():
     page, = arena.acquire(1)
     index.insert(b"k", page)
 
-    freed = index.evict(1)
+    freed = len(index.evict(1))
 
     assert freed == 0, "a page a request still owns was counted as freed"
     assert arena.num_owners[page] == 2, "the index let go of a page it still names"
@@ -139,7 +139,7 @@ def test_eviction_after_a_hit_takes_the_cold_branch_and_stops_at_the_fork():
         "the branch this test warms was not the one the index walked"
     )
 
-    freed = index.evict(1)
+    freed = len(index.evict(1))
 
     assert freed == 1, "the eviction stopped before it had given a page back"
     assert index.lookup([b"A", b"B", b"D"]) == [pages["A"], pages["B"], pages["D"]], (
@@ -156,7 +156,7 @@ def test_eviction_walks_up_a_chain_once_it_is_childless():
     index = PrefixIndex(arena)
     pages = _chain(index, arena)
 
-    freed = index.evict(4)
+    freed = len(index.evict(4))
 
     assert freed == 4, f"a whole chain of 4 freed only {freed} pages"
     assert index.lookup([b"A"]) == [], "the root outlived every child"
@@ -168,7 +168,7 @@ def test_eviction_stops_when_no_leaf_is_left():
     index = PrefixIndex(arena)
     _chain(index, arena)
 
-    assert index.evict(99) == 4, "eviction claimed more pages than it held"
+    assert len(index.evict(99)) == 4, "eviction claimed more pages than it held"
     _assert_pages_partition(arena)
 
 
@@ -216,7 +216,7 @@ def test_children_churning_under_a_held_parent_leave_it_one_heap_entry():
         arena.release([child])
         index.lookup([b"parent", key])
 
-        assert index.evict(1) == 1, "the one child nobody holds was not given back"
+        assert len(index.evict(1)) == 1, "the one child nobody holds was not given back"
         _one_entry_per_indexed_page(index)
     _assert_pages_partition(arena)
 
