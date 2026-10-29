@@ -14,7 +14,8 @@ from mstar.model.submodule_base import ARNodeInputs
 
 
 def test_text_prefill_and_decode_share_the_mixed_walk():
-    assert Qwen3_5DenseModel.get_combined_graph_walks(None) == {
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    assert model.get_combined_graph_walks() == {
         "LLM": {LLM_MIXED: {"prefill_text", "decode"}},
     }
 
