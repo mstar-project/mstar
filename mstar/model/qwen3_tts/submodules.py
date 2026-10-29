@@ -55,6 +55,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.rows import RowWalk
 from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
 from mstar.model.qwen3_tts.components.conv_stack import causal_receptive_field_frames, conv_stack
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
@@ -831,6 +832,9 @@ class TalkerSubmodule(ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str) -> int:
         del graph_walk
         return self.MAX_BATCH_SIZE
+
+    def persistent_row_walks(self) -> Mapping[str, RowWalk]:
+        return {"talker_decode": RowWalk(labels={TALKER_KV: ("main",)})}
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1

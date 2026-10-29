@@ -23,7 +23,7 @@ from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.base import Resource  # noqa: E402
 from mstar.engine.resources.spec import NodeResourceSpec  # noqa: E402
 from mstar.engine.resources.step import ResourceStep, SubmoduleStep  # noqa: E402
-from mstar.engine.rows import RowState  # noqa: E402
+from mstar.engine.rows import RowState, RowWalk  # noqa: E402
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule  # noqa: E402
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
@@ -33,7 +33,7 @@ NODE, ROWS_WALK, OTHER_WALK, MAX_ROWS, HANDLES = "toy", "decode", "other", 8, 32
 class _CounterRows(RowState):
     def __init__(self, res: "_Counter", space):
         self.res = res
-        self.count = space.buffer("count", (), torch.int32)
+        self.count = space.buffer("count", (), torch.int32, step=1)
         self.acc = space.buffer("acc", (2,), torch.float32, mirrored=False)
         self.released_slots: list[int] = []
 
@@ -122,8 +122,7 @@ class _Counter(Resource):
         return rows
 
     def plan(self, step, ctx):
-        if ctx.rows is not None:
-            ctx.rows.advance(self.rows_by_walk[ctx.graph_walk].count, 1)
+        pass
 
     def commit(self, step, ctx):
         if ctx.rows is None:
@@ -146,7 +145,7 @@ class _Toy(NodeSubmodule):
         self.walks = frozenset(walks)
 
     def persistent_row_walks(self):
-        return self.walks
+        return {walk: RowWalk() for walk in self.walks}
 
     def max_batch_size(self, graph_walk):
         return self.cap
@@ -174,7 +173,6 @@ class _Toy(NodeSubmodule):
             rows = res.rows_by_walk[graph_walk]
             count = rows.count.rows(n).clone()
             acc = rows.acc.rows(n)[:, 0].clone()
-            rows.count.device[:n] += 1
             rows.acc.device[:n] += 1
         else:
             count = torch.tensor([res.count[rid] for rid in rids])
@@ -187,10 +185,10 @@ class _Toy(NodeSubmodule):
         }
 
 
-def _engine(device, sub=None, keeps_rows=True) -> Engine:
+def _engine(device, sub=None, keeps_rows=True, max_live=None) -> Engine:
     spec = _CounterSpec(resource_key="counter", nodes={NODE})
     spec.keeps_rows = keeps_rows
-    engine = Engine(None, autocast_dtype=None)
+    engine = Engine(None, autocast_dtype=None, max_concurrent_requests=max_live)
     engine.load_model(
         submodules={NODE: sub or _Toy()}, specs=[spec],
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
@@ -224,9 +222,10 @@ def _step(engine, walk, rids):
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("seed", range(4))
-def test_steps_read_each_request_s_own_state_across_walks_and_removals(device, seed):
+@pytest.mark.parametrize("max_live", [None, 16])
+def test_steps_read_each_request_s_own_state_across_walks_and_removals(device, seed, max_live):
     rng = random.Random(seed)
-    engine = _engine(device)
+    engine = _engine(device, max_live=max_live)
     space = engine._rows[NODE].space(ROWS_WALK)
     ran: dict[int, int] = {}  # rid -> steps it ran: its count and accumulator
     free = list(range(HANDLES))
@@ -254,6 +253,7 @@ def test_steps_read_each_request_s_own_state_across_walks_and_removals(device, s
         if walk == ROWS_WALK:
             # the step ran in row order, and the rows are its requests
             assert list(batch.request_ids) == list(space.batch.order)
+            assert space.batch.n_held <= (max_live or MAX_ROWS)
             space.check_mirrors()
         else:
             assert not any(space.holds(rid) for rid in rids)
@@ -319,13 +319,12 @@ def test_a_request_holding_a_row_is_evicted_with_the_state_its_row_held(device):
 
 @pytest.mark.parametrize("drop", [False, True])
 def test_a_pre_plan_leaves_the_batch_to_the_main_thread(drop):
-    """A pre-plan runs in row order but doesn't reorder the batch: the main
-    thread may be dropping rows from it meanwhile, and a write-back would
-    bring a dropped row back. Exec reorders it."""
+    """A pre-plan doesn't write the batch back: the main thread may be
+    dropping rows from it meanwhile, which then makes the pre-plan stale."""
     engine = _engine("cpu")
     for rid in (1, 2, 3):
         engine.add_request(rid)
-    _step(engine, ROWS_WALK, [1, 2])  # 1 and 2 hold the first rows
+    _step(engine, ROWS_WALK, [1, 2])
     batch = _batch(ROWS_WALK, [3, 2, 1])
     node_rows = engine._rows[NODE]
     begin = node_rows.begin
@@ -339,14 +338,10 @@ def test_a_pre_plan_leaves_the_batch_to_the_main_thread(drop):
     node_rows.begin = begin_while_the_main_thread_drops
     order = engine._enter_rows(batch, preplan=True)
     node_rows.begin = begin
-    assert list(order) == [1, 2, 3]
+    assert list(order) == [3, 2, 1]
     batch.preplanned_rids = tuple(order)  # as _pre_plan_for_batch records it
     assert list(batch.request_ids) == ([3, 1] if drop else [3, 2, 1])
     assert engine.preplan_is_stale(batch) == drop
-    if not drop:
-        engine.prepare_inputs(batch)
-        engine.exec_and_postprocess(batch)
-        assert list(batch.request_ids) == [1, 2, 3]
 
 
 class _Captured(_Toy):
@@ -386,37 +381,21 @@ def _pre_planned_step(engine, rids):
     return batch
 
 
-@pytest.mark.parametrize("both_passes", [False, True])
-def test_a_pre_planned_step_advances_its_rows_once(monkeypatch, both_passes):
-    """A step planned ahead is planned again at exec with the same rows: a
-    resource writing on both passes is refused rather than advancing twice."""
+def test_a_pre_planned_step_runs_on_its_rows(monkeypatch):
     monkeypatch.setattr(_Counter, "supports_preplan", True, raising=False)
-    plan = _Counter.plan
-
-    def plan_once(self, step, ctx):
-        # as KV does: a step planned ahead keeps its staged plan at exec
-        if not both_passes and not ctx.is_preplan and ctx.rows is getattr(self, "staged", None):
-            return
-        if ctx.is_preplan:
-            self.staged = ctx.rows
-        plan(self, step, ctx)
-
-    monkeypatch.setattr(_Counter, "plan", plan_once)
     engine = _engine("cpu")
     space = engine._rows[NODE].space(ROWS_WALK)
     for rid in (1, 2):
         engine.add_request(rid)
     _step(engine, ROWS_WALK, [1, 2])
-    batch = _pre_planned_step(engine, [1, 2])
+    batch = _pre_planned_step(engine, [2, 1])
     engine.prepare_inputs(batch)
     assert not engine.preplan_is_stale(batch)
-    if both_passes:
-        with pytest.raises(ValueError, match="advanced twice"):
-            engine.exec_and_postprocess(batch)
-        return
-    engine.exec_and_postprocess(batch)
+    out = engine.exec_and_postprocess(batch)
+    assert {rid: int(out.get(rid)["count"][0]) for rid in (1, 2)} == {1: 1, 2: 1}
     space.check_mirrors()
-    assert list(space.buffers[0].host[:2]) == [2, 2]
+    _, seen = _step(engine, ROWS_WALK, [1, 2])
+    assert seen == {1: (2, 2.0), 2: (2, 2.0)}
 
 
 @pytest.mark.parametrize("device", DEVICES)

@@ -13,6 +13,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.sampler.rows import SamplerRows
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
     GenerationHistory,
@@ -21,6 +22,7 @@ from mstar.engine.resources.sampler.utils import (
     SamplingConfig,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.rows import RowState
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
@@ -122,6 +124,12 @@ class SamplerResource(Resource):
         self._kept_rids: frozenset[int] | None = None
         # row indices for `overwrite_rows`, H2D from a ring of pinned buffers
         self._row_stager: PinnedStager | None = None
+        # walk -> its persistent rows (`row_state`); their copies hold the
+        # masters' addresses, so with any the masters never grow
+        self._rows: dict[str, SamplerRows] = {}
+        self._fixed_masters = False
+        # the rows and row count of the step planned last, if it ran on rows
+        self._row_step: tuple[SamplerRows, int] | None = None
 
     @property
     def _penalty_live(self) -> bool:
@@ -181,6 +189,7 @@ class SamplerResource(Resource):
             ) if self._device.type == "cuda" else {}),
             ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter(),
             loopback_state=self._loopback_state,
+            fixed_masters=self._fixed_masters,
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
@@ -335,6 +344,38 @@ class SamplerResource(Resource):
             "with the sampler's configs (a mid-request config update?)"
         )
 
+    def row_state(self, space, node_name: str, graph_walk: str) -> RowState | None:
+        # the generation history is per-step state these rows don't hold yet;
+        # the rows' sampler is the graph sampler
+        if self._history is not None or not self.can_capture():
+            return None
+        if graph_walk in self._rows:
+            raise ValueError(
+                f"{node_name}: walk {graph_walk!r} already keeps rows in this sampler"
+            )
+        if self._cg_buffers is not None and not self._cg_buffers.fixed_masters:
+            raise RuntimeError("persistent rows are built before the graph buffers")
+        self._fixed_masters = True
+        seen = None
+        if self._track_seen_tokens:
+            if self._vocab_size is None:
+                raise ValueError(f"{node_name}: a penalised sampler keeps rows only with a fixed vocab_size")
+            seen = (self._vocab_size, self._seen_mask)
+        rows = SamplerRows(space, self._row_buffers, self._loopback_state, seen)
+        self._rows[graph_walk] = rows
+        return rows
+
+    def _seen_mask(self, rid) -> torch.Tensor | None:
+        mask = self._sampler._seen_token_mask.get(rid)
+        return None if mask is None else mask._seen_token_mask
+
+    def _row_buffers(self) -> SamplerBuffers:
+        # rows are built before capture allocates the buffers; allocated here
+        # if no capture will
+        if self._cg_buffers is None:
+            self.build_accelerator_graph_buffers((), 1, 0)
+        return self._cg_buffers
+
     @property
     def supports_preplan(self):
         return True
@@ -363,6 +404,8 @@ class SamplerResource(Resource):
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
             self._kept_rids = step.kept_rids
+        if not ctx.is_preplan and self._penalty_live and ctx.graph_walk in self._rows:
+            self._check_rows_take_no_prompt(step, ctx)
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -389,6 +432,12 @@ class SamplerResource(Resource):
         # and the staged plan is dropped, exactly as `reset_pre_plan_for_batch`
         # would have done.
         laps.lap("penalty")
+        if not ctx.is_preplan:
+            self._row_step = None
+        rows = self._rows.get(ctx.graph_walk) if self._rows else None
+        if rows is not None:
+            self._plan_rows(step, ctx, rows)
+            return
         if self._preplanned and not ctx.is_preplan:
             if ctx.slot_lease is None or self._preplan_key != self._plan_key(ctx):
                 self.clear_preplan()
@@ -431,6 +480,35 @@ class SamplerResource(Resource):
             self._cg_sampler = sampler
             self._step_slot = (cg_slot, padded_bs)
 
+    def _check_rows_take_no_prompt(self, step: SamplerStep, ctx: StepContext) -> None:
+        # a held row's mask is the live one, so tokens added to the request's
+        # would be overwritten when the row leaves
+        if any(not ctx.is_padding_row(rid) for rid in step.prefill_tracked_tokens) or any(
+            rid in self._cached_prefix for rid in ctx.request_ids
+        ):
+            raise RuntimeError(
+                f"walk {ctx.graph_walk!r} keeps persistent rows, which hold the seen-token "
+                "mask; its steps can't add prompt tokens to penalise"
+            )
+
+    def _plan_rows(self, step: SamplerStep, ctx: StepContext, rows: SamplerRows):
+        """A step whose state is its rows: nothing to stage ahead, and at exec
+        only the new slots' resets, ahead of the rows' check-out copies."""
+        if ctx.is_preplan:
+            return
+        if step.kept_rids is not None:
+            raise RuntimeError(
+                f"walk {ctx.graph_walk!r} keeps persistent rows, whose sampler "
+                "advances every row; a step that drops draws can't run on them"
+            )
+        # staged for another step, which this one overtook
+        self.clear_preplan()
+        self._cg_buffers.sync_slots()
+        bs = len(ctx.padded_request_ids)
+        self._cg_sampler = rows.sampler_for(bs)
+        self._step_slot = None
+        self._row_step = (rows, bs)
+
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
         """Gather the per-step RNG offset + seen-token mask (and the
         generation history, if any) into this step's slot, inline so they
@@ -454,8 +532,9 @@ class SamplerResource(Resource):
             self._history.gather_step(ctx.request_ids, padded_bs)
 
     def commit(self, step: SamplerStep, ctx: StepContext):
-        # None on an eager step, which never gathered one
-        if self._cg_buffers is None or self._cg_sampler is None:
+        # None on an eager step, which never gathered one; a step on rows
+        # leaves its state in them
+        if self._cg_buffers is None or self._cg_sampler is None or self._row_step is not None:
             return
         kept = step.kept_rids
         keep = None if kept is None else [rid in kept for rid in ctx.request_ids]
@@ -557,6 +636,9 @@ class SamplerResource(Resource):
         bufs = self._cg_buffers
         if bufs is None:
             raise RuntimeError("device loop-back needs the sampler's slot masters")
+        if self._row_step is not None:
+            rows, bs = self._row_step
+            return rows.last_token.rows(bs)
         if self._cg_sampler is not None and self._step_slot is not None:
             cg_slot, padded_bs = self._step_slot
             return bufs.gather_last_tokens(cg_slot, padded_bs)
@@ -570,6 +652,9 @@ class SamplerResource(Resource):
         bufs = self._cg_buffers
         if bufs is None:
             raise RuntimeError("device loop-back needs the sampler's slot masters")
+        if self._row_step is not None:
+            rows, bs = self._row_step
+            return rows.loopback[name].rows(bs)
         if self._cg_sampler is not None and self._step_slot is not None:
             cg_slot, padded_bs = self._step_slot
             return bufs.gather_loopback(name, cg_slot, padded_bs)
@@ -585,7 +670,10 @@ class SamplerResource(Resource):
         bufs = self._cg_buffers
         if bufs is None:
             raise RuntimeError("device loop-back needs the sampler's slot masters")
-        if self._cg_sampler is not None and self._step_slot is not None:
+        if self._row_step is not None:
+            rows, bs = self._row_step
+            rows.loopback[name].rows(bs).copy_(values)
+        elif self._cg_sampler is not None and self._step_slot is not None:
             cg_slot, padded_bs = self._step_slot
             bufs.loopback[name].slot_view(cg_slot, padded_bs).copy_(values)
         else:

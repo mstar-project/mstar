@@ -1,5 +1,6 @@
 
 
+import functools
 import logging
 import os
 import threading
@@ -484,6 +485,7 @@ class Engine:
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
+        max_concurrent_requests: int | None = None,
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
@@ -494,6 +496,9 @@ class Engine:
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
         self._gpu_memory_fraction = gpu_memory_fraction
+        # the deployment's limit on live requests: a persistent walk keeps a
+        # resident row for each
+        self._max_concurrent_requests = max_concurrent_requests
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
@@ -789,7 +794,7 @@ class Engine:
             if not walks:
                 continue
             if node_name in self._tp_leader_nodes or node_name in self._tp_follower_nodes:
-                # every rank would have to agree on each step's row order
+                # every rank would have to agree on each step's slots and evictions
                 raise ValueError(
                     f"{node_name}: persistent rows are not supported on a "
                     "tensor- or sequence-parallel node yet"
@@ -816,18 +821,22 @@ class Engine:
                 caps = [cap for cap in caps if cap is not None]
                 return runner.padded_batch_size_for(walk, min(caps)) if caps else None
 
-            self._rows[node_name] = NodeRows.build(
+            node_rows = self._rows[node_name] = NodeRows.build(
                 node_name, walks, max_rows, submodule_mgmt.resources, self._device,
+                max_live=self._max_concurrent_requests,
             )
+            for walk in node_rows.walks:
+                ag_runners[node_name].add_forward_hooks(
+                    walk,
+                    functools.partial(node_rows.before_forward, walk),
+                    node_rows.space(walk).after_forward,
+                )
 
     def _enter_rows(self, batch: ExecutingBatch, preplan: bool = False) -> Sequence[int] | None:
-        """The step's rids in the order it runs: a persistent walk's in row
-        order, proposing its rows. On the gpu thread, put the batch in that
-        order and check in the rows any other step of the node runs. None for
-        a pre-plan that has to wait for that check-in.
-
-        A pre-plan leaves the batch as it is, since the main thread may still
-        be dropping rows from it; exec reorders it."""
+        """The step's rids, in the order it runs: a persistent walk's step is
+        proposed over its rows in the batch's order. On the gpu thread, check
+        in the rows any other step of the node runs. None for a pre-plan that
+        has to wait for that check-in."""
         node_rows = self._rows.get(batch.node_name)
         if node_rows is None:
             return batch.request_ids
@@ -848,19 +857,9 @@ class Engine:
         else:
             node_rows.check_in(rids, skip_walk=walk)
         rows = ctx.rows
-        if rows is None or rows.stale or (
-            tuple(rows.order) != tuple(rids) and set(rows.order) != set(rids)
-        ):
-            rows = ctx.rows = node_rows.begin(walk, rids)
-        order = rows.order
-        if preplan:
-            return order
-        if tuple(order) != tuple(rids):
-            if batch.inputs is not None:
-                at = {rid: i for i, rid in enumerate(rids)}
-                batch.inputs = [batch.inputs[at[rid]] for rid in order]
-            batch.request_ids = list(order)
-        return batch.request_ids
+        if rows is None or rows.stale or tuple(rows.order) != tuple(rids):
+            ctx.rows = node_rows.begin(walk, rids)
+        return rids
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],
@@ -1454,6 +1453,9 @@ class Engine:
             if batch.preplanned_rids is not None and self._runner.staged:
                 self._runner.clear_preplan()
                 batch.preplanned_rids = None
+            rows = batch.step_context.rows
+            if rows is not None and rows.committed:
+                rows.space.resync()
             batch.step_context.rows = None
             raise
         finally:
@@ -1814,6 +1816,19 @@ class Engine:
                 if nvtx:
                     range_pop()
 
+        rows = ctx.rows
+        if rows is not None:
+            t0 = phase_start()
+            # after every resource planned, so one upload carries all their
+            # writes; committed before the launch releases the main thread,
+            # which may then remove a request this step checked in; gathered
+            # before preprocess, which reads and overwrites the step's rows
+            rows.stage()
+            self._rows[batch.node_name].commit(ctx.graph_walk, rows)
+            rows.apply()
+            self._rows[batch.node_name].gather(ctx.graph_walk, len(ctx.padded_request_ids))
+            phase_end("engine.rows", t0)
+
         laps = PhaseLaps("engine.")
         engine_inputs = ModelInputsFromEngine(
             request_ids=rids,
@@ -1841,17 +1856,6 @@ class Engine:
             phase_end("engine.preprocess", t0)
             if nvtx:
                 range_pop()
-
-        rows = ctx.rows
-        if rows is not None:
-            t0 = phase_start()
-            # after every resource planned, so one upload carries all their
-            # writes; committed before the launch releases the main thread,
-            # which may then remove a request this step checked in
-            rows.stage()
-            self._rows[batch.node_name].commit(ctx.graph_walk, rows)
-            rows.apply()
-            phase_end("engine.rows", t0)
 
         if self._enable_profile and batch.exec_timings.fwd_start is None:
             batch.exec_timings.fwd_start = time.perf_counter()
@@ -1914,11 +1918,14 @@ class Engine:
         if release_event is not None:
             release_event.set()
         if running_batched:
-            return BatchedModelOutput.coerce(
-                submodule_mgmt.forward_batched(
-                    graph_walk, engine_inputs=engine_inputs, **preprocessed
-                )
+            rows = batch.step_context.rows
+            out = submodule_mgmt.forward_batched(
+                graph_walk, engine_inputs=engine_inputs, **preprocessed
             )
+            if rows is not None:
+                # what a captured step's graph does after its forward
+                self._rows[batch.node_name].after_forward(graph_walk)
+            return BatchedModelOutput.coerce(out)
         assert len(request_ids) == 1, (
             "the unbatched forward takes one request; batch of "
             f"{len(request_ids)} needs running_batched"
@@ -2673,10 +2680,9 @@ class Engine:
         if batch.preplanned_rids is None:
             return False
         rows = batch.step_context.rows
-        if rows is not None:
-            # planned in row order, which exec puts the batch in (_enter_rows)
-            return rows.stale or set(batch.preplanned_rids) != set(batch.request_ids)
-        return batch.preplanned_rids != tuple(batch.request_ids)
+        return batch.preplanned_rids != tuple(batch.request_ids) or (
+            rows is not None and rows.stale
+        )
 
     def reset_pre_plan_for_batch(self, batch: ExecutingBatch | None = None) -> None:
         """Drop planned-ahead state, e.g. when its batch never dispatched.

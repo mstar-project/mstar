@@ -2,12 +2,14 @@
 //! on the Python side).
 //!
 //! A step's rows change by many small byte copies: leaving rows read out to
-//! their stores, rows moved between slots, joining rows copied in, and host
-//! values written into rows. `RowStage` collects them as the resources
-//! register them and packs the segment tables and the payload into the
-//! step's pinned block, which one H2D and one copy kernel per phase then
-//! apply. `stage.py`'s `PyRowStage` is the Python version, segment for
-//! segment and byte for byte.
+//! their stores, rows moved between slots, joining rows copied in, host
+//! values written into rows, and the mirrored slab and the step header
+//! uploaded whole. `RowStage` collects them as the resources register them
+//! and packs the segment tables and the payload into the step's pinned
+//! block, which one H2D and one copy kernel per phase then apply.
+//! `rows_step_mirrors` adds each stepped mirror's step to the rows a forward
+//! ran. `stage.py`'s `PyRowStage` is the Python version, segment for segment
+//! and byte for byte.
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
@@ -97,6 +99,25 @@ impl RowStage {
         self.add_from_payload(at, dst, data.len() as i64);
     }
 
+    /// The step header (last phase): its row count, then each of `max_rows`
+    /// dense rows' slot to gather from (`pad` past the step's rows) and to
+    /// scatter to (`trash` past them), as int32 (`RowSpace._header_for`).
+    pub fn header(&mut self, idx: &[i64], max_rows: usize, pad: i32, trash: i32, dst: i64) -> Result<(), String> {
+        let n = idx.len();
+        if n > max_rows {
+            return Err(format!("{n} rows in a header of {max_rows}"));
+        }
+        let mut words = Vec::with_capacity(1 + 2 * max_rows);
+        words.push(n as i32);
+        for fill in [pad, trash] {
+            words.extend(idx.iter().map(|&s| s as i32));
+            words.extend(std::iter::repeat(fill).take(max_rows - n));
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        self.put(&bytes, dst);
+        Ok(())
+    }
+
     fn put_bytes(&mut self, data: &[u8]) -> usize {
         let at = self.payload.len();
         self.payload.extend_from_slice(data);
@@ -158,6 +179,46 @@ impl RowStage {
     }
 }
 
+/// Add each stepped mirror's step to the rows of `slots`, in the host slab.
+/// `desc` is four int64 per buffer: its byte offset in the slab, its element
+/// size (1, 2, 4 or 8), elements a row, and its step; every buffer has
+/// `n_slots` rows. Integer addition wraps, as numpy's does.
+pub fn step_mirrors(slab: &mut [u8], desc: &[i64], n_slots: i64, slots: &[i64]) -> Result<(), String> {
+    if desc.len() % 4 != 0 {
+        return Err("a stepped mirror is described by four numbers".into());
+    }
+    if let Some(&bad) = slots.iter().find(|&&s| s < 0 || s >= n_slots) {
+        return Err(format!("slot {bad} is outside the {n_slots} slots"));
+    }
+    for d in desc.chunks_exact(4) {
+        let (offset, size, elems, step) = (d[0], d[1], d[2], d[3]);
+        if offset < 0 || elems < 0 || offset + n_slots * elems * size > slab.len() as i64 {
+            return Err(format!("a stepped mirror at {offset} runs past the slab"));
+        }
+        for &slot in slots {
+            let row = (offset + slot * elems * size) as usize;
+            for e in 0..elems as usize {
+                let at = row + e * size as usize;
+                macro_rules! add {
+                    ($t:ty) => {{
+                        const N: usize = std::mem::size_of::<$t>();
+                        let cell: &mut [u8; N] = (&mut slab[at..at + N]).try_into().unwrap();
+                        *cell = <$t>::from_ne_bytes(*cell).wrapping_add(step as $t).to_ne_bytes();
+                    }};
+                }
+                match size {
+                    1 => add!(i8),
+                    2 => add!(i16),
+                    4 => add!(i32),
+                    8 => add!(i64),
+                    _ => return Err(format!("element size {size}: only integer rows step")),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // SAFETY (for the views below): C-contiguous buffers of the declared item
 // type, held by the caller for the call under the GIL.
 fn view<'a, T: pyo3::buffer::Element>(buf: &'a PyBuffer<T>, what: &str) -> PyResult<&'a [T]> {
@@ -217,6 +278,12 @@ impl PyRowStage {
         Ok(())
     }
 
+    fn header(&mut self, idx: PyBuffer<i64>, max_rows: usize, pad: i32, trash: i32, dst: i64) -> PyResult<()> {
+        self.inner
+            .header(view(&idx, "idx")?, max_rows, pad, trash, dst)
+            .map_err(PyValueError::new_err)
+    }
+
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -228,6 +295,13 @@ impl PyRowStage {
     fn pack(&self, out: PyBuffer<u8>, device_base: i64) -> PyResult<Vec<Placed>> {
         self.inner.pack(view_mut(&out, "out")?, device_base).map_err(PyValueError::new_err)
     }
+}
+
+/// `step_mirrors` for Python, on the slab in place.
+#[pyfunction]
+pub fn rows_step_mirrors(slab: PyBuffer<u8>, desc: PyBuffer<i64>, n_slots: i64, slots: PyBuffer<i64>) -> PyResult<()> {
+    step_mirrors(view_mut(&slab, "slab")?, view(&desc, "desc")?, n_slots, view(&slots, "slots")?)
+        .map_err(PyValueError::new_err)
 }
 
 #[cfg(test)]
@@ -283,10 +357,31 @@ mod tests {
     }
 
     #[test]
+    fn the_header_pads_with_the_pad_and_trash_slots() {
+        let mut st = RowStage::new(2).unwrap();
+        st.header(&[4, 1], 3, 9, 10, 0).unwrap();
+        let ints: Vec<i32> = st.payload[..28].chunks_exact(4).map(|c| i32::from_ne_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(ints, vec![2, 4, 1, 9, 4, 1, 10]);
+        assert!(st.header(&[1, 2, 3, 4], 3, 9, 10, 0).is_err());
+    }
+
+    #[test]
     fn a_short_block_is_refused() {
         let mut st = RowStage::new(1).unwrap();
         st.put(&[1; 40], 0);
         let mut out = vec![0u8; st.size() - 1];
         assert!(st.pack(&mut out, 0).is_err());
+    }
+
+    #[test]
+    fn stepping_adds_to_the_rows_of_each_stepped_mirror_only() {
+        // an int32 mirror of 4 slots x 2 elements at 0, an int64 one of 4 slots at 32
+        let mut slab = vec![0u8; 64];
+        step_mirrors(&mut slab, &[0, 4, 2, 1, 32, 8, 1, 3], 4, &[2, 0]).unwrap();
+        let a: Vec<i32> = slab[..32].chunks_exact(4).map(|c| i32::from_ne_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(a, vec![1, 1, 0, 0, 1, 1, 0, 0]);
+        assert_eq!(words(&slab[32..]), vec![3, 0, 3, 0]);
+        assert!(step_mirrors(&mut slab, &[0, 4, 2, 1], 4, &[4]).is_err());
+        assert!(step_mirrors(&mut slab, &[0, 4, 5, 1], 4, &[0]).is_err());
     }
 }

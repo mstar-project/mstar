@@ -1803,25 +1803,62 @@ Persistent rows (keeping per-row state on the device across steps)
 
 A decode loop's per-row state (lengths, page tables, positions, sampler
 settings) is mostly the same from one step to the next. A walk listed in
-``NodeSubmodule.persistent_row_walks()`` keeps each request in a fixed row
-of device buffers across steps (``mstar/engine/rows/``). Each step then
-uploads only what changed: the rows that joined or left, and single elements
-such as an appended page. A step with no changes uploads nothing.
+``NodeSubmodule.persistent_row_walks()`` keeps each request in a resident
+slot of device buffers across steps (``mstar/engine/rows/``). Every step of the
+walk computes one token a row. Its ``RowWalk`` names, by KV cache key, the
+stream labels the walk's steps extend by that token, since the rows are
+allocated at startup, before any step names its labels (a label a step only
+reads, such as an encoder context at span 0, is not named):
 
-The engine runs such a step in row order, so ``request_ids`` is a
-permutation of what the worker scheduled. It proposes the step's rows before
-planning (``ctx.rows``), uploads them after every resource has planned,
-commits them before the launch, and applies them on the step's stream. A
-step of another walk that runs a request holding a row first checks that
-request in. A removed request's row leaves at its walk's next step.
+.. code-block:: python
+
+   def persistent_row_walks(self):
+       return {DECODE_WALK: RowWalk(labels={KV_CACHE: ("main",)})}
+
+A request keeps its slot from its first step of the walk until it is
+removed, runs a step of another walk, or is evicted. The slots number
+``max(max_batch_size, max_concurrent_requests)`` (the serving config's
+``max_concurrent_requests``, when set). When a request joins with every slot
+taken, the row that ran least recently and isn't in the step is evicted
+(checked in), so without ``max_concurrent_requests``, a scheduler that
+rotates more live requests than a step runs keeps checking rows in and out.
+The captured graphs read a step's rows from a dense view, in step order and
+padded to the bucket: the engine gathers them from their slots once the
+step's rows are applied, before ``preprocess`` (which may read them, such as
+a loop-back token), and the step's graph scatters what the forward changed
+back after it.
+
+Each step then uploads only what changed: the rows that joined or left,
+single elements such as an appended page, and which slots it runs. A step
+that runs the same slots in the same order uploads nothing. Mirrored buffers
+share one slab, which a step that changes any of them uploads whole, in the
+same copy as the rest; the device applies it in one kernel (two when a
+leaving row's device state is read out). On the host, slot assignment and
+packing the step are each one call into the Rust extension
+(``rust/src/row_slots.rs``, ``rust/src/rows.rs``), with a Python version of
+each, slot for slot and byte for byte, for builds without it.
+
+The engine proposes the step's rows before planning (``ctx.rows``). Once
+every resource has planned, before ``preprocess`` (which may read them), it
+uploads, commits and applies them on the step's stream. A step of another
+walk that runs a request holding a row first checks that request in. A
+removed request's row leaves at its walk's next step.
 
 Every resource of the node takes part through ``Resource.row_state(space,
 node_name, graph_walk)``, called once at startup before capture:
 
 - It registers its buffers with ``space.buffer(name, shape, dtype, pad,
-  mirrored)``. A mirrored buffer keeps a host copy that is the truth for the
-  rows it holds; an unmirrored one is device-only state, checked out of a
-  store the resource owns.
+  mirrored, step)``. A mirrored buffer keeps a host copy that is the truth for
+  the rows it holds; an unmirrored one is device-only state, checked out of a
+  store the resource owns. The rows are allocated once every resource has
+  registered (``RowSpace.seal``), so a buffer's ``device`` tensor (the
+  dense view a forward reads, ``rows(n)`` for a step's ``n`` rows) exists from
+  then on and keeps its address. Joins, leaves and host writes address rows
+  by slot (``RowDiff.join_slots``, ``StepRows.slot_of``), and a mirror is
+  indexed by slot. A buffer with a ``step`` (a position, a
+  length) gains it on every active row with each forward of the walk: the
+  engine adds it on the device after the forward, inside the step's graph,
+  and on the mirror as the step commits, so a steady step uploads nothing.
 - It returns a ``RowState``:
 
   - ``check_out`` writes joining rows (``write``, or ``copy_in`` from a
@@ -1833,12 +1870,38 @@ node_name, graph_walk)``, called once at startup before capture:
     row.
 
   The base ``RowState()`` is for a resource that keeps nothing per row.
-- While planning, it writes the step's changes through ``ctx.rows``:
-  ``write_at`` for single elements, ``advance`` for what the forward adds to
-  every active row. A step planned ahead is planned again at exec with the
-  same ``ctx.rows``, so a resource that pre-plans writes on one of the two
-  passes (``ctx.is_preplan`` tells them apart); ``advance`` refuses a second
-  call for a buffer.
+- While planning, it writes the step's other changes through ``ctx.rows``
+  (``write_at`` for single elements). A step planned ahead is planned again
+  at exec with the same ``ctx.rows``, so a resource that pre-plans writes on
+  one of the two passes (``ctx.is_preplan`` tells them apart).
+- What a step's forward reads that it can build from the rows, it builds
+  inside the step's graph: a ``RowFills`` state's ``arm`` takes a fill while
+  the graph is captured, aimed at the buffers that graph reads, and the
+  capture records it ahead of the forward. A replay then rebuilds them from
+  the rows as they are, and the host only plans what it must.
+
+The sampler keeps each row's settings, RNG offset, last token and declared
+loop-back states in the rows (``mstar/engine/resources/sampler/rows.py``);
+it refuses rows while it tracks a seen-token mask or a generation history,
+and off a device with graph capture. The position resource keeps each row's
+next position on every declared label of its KV cache, mirrored and stepped
+by one token: the step's position ids are the rows
+(``mstar/engine/resources/position/rows.py``). A step of the walk takes no
+explicit ``pos_ids``, ``advance`` or label forks.
+
+The KV resource keeps each declared label's stored length (mirrored,
+stepped) and page list (device only) in the rows
+(``mstar/engine/resources/kv/rows.py``). The step's graph builds the write
+address of each row's token from them, and the FlashInfer attention
+resource's graph builds its paged arrays the same way, so the host runs only
+FlashInfer's planner, on lengths from the mirror. The host uploads a joining
+row, or a page a held row's stream gained. The streams remain the host
+truth, extended at each commit as for any step. A read-only step of the walk
+(every segment span 0) reuses its last plan while the rows are unchanged,
+and so does cross attention (``FlashInferCrossManager``): a held row's
+context can only change through a step of another walk, which checks the row
+in first. Such a walk's KV steps take no forks, sink rows, combined labels or
+eager writes, and its attention needs a plain decode wrapper.
 
 The engine refuses the walk at startup if any resource returns None (the
 default), if the walk has no batch cap to size the rows, if the node is

@@ -1,6 +1,7 @@
 """A step's stage packs the same block on both backends: the Rust
 ``RowStage`` and ``PyRowStage``, fed the same calls, give the same segment
-tables, payload and placement."""
+tables, payload and placement, and ``rows_step_mirrors`` steps the slab as
+the numpy version does."""
 import random
 
 import numpy as np
@@ -17,7 +18,7 @@ def _calls(rng: random.Random, phases: int):
     """A random step's registrations, as (method, args)."""
     calls = []
     for _ in range(rng.randint(0, 12)):
-        kind = rng.choice(["copy", "write", "write_at", "put"])
+        kind = rng.choice(["copy", "write", "write_at", "put", "header"])
         n = rng.randint(0, 5)
         slots = np.array(rng.sample(range(40), n), dtype=np.int64)
         rb = rng.choice([4, 8, 24, 64])
@@ -34,8 +35,10 @@ def _calls(rng: random.Random, phases: int):
             values = np.frombuffer(rng.randbytes(n * 4), dtype=np.uint8)
             offsets = np.array([4 * rng.randrange(rb // 4) for _ in range(n)], dtype=np.int64)
             calls.append(("write", (base, rb, slots, values, 4, offsets)))
-        else:
+        elif kind == "put":
             calls.append(("put", (np.frombuffer(rng.randbytes(rng.randint(1, 300)), dtype=np.uint8), base)))
+        else:
+            calls.append(("header", (slots, rng.randint(n, 8), 41, 42, base)))
     return calls
 
 
@@ -96,3 +99,20 @@ def test_both_copy_the_values_when_they_are_written():
 
     for make in (stage.PyRowStage, mstar_rust.RowStage):
         assert np.array_equal(block(make, reuse=True), block(make, reuse=False))
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_both_step_the_mirrors_alike(seed):
+    rng = random.Random(seed)
+    n_slots, desc, size = 14, [], 0
+    for _ in range(rng.randint(1, 5)):
+        itemsize, elems = rng.choice([1, 2, 4, 8]), rng.randint(1, 3)
+        desc.append((size, itemsize, elems, rng.randint(-3, 3)))
+        size += -(-n_slots * elems * itemsize // 16) * 16
+    desc = np.array(desc, dtype=np.int64)
+    slab = np.frombuffer(rng.randbytes(size), dtype=np.uint8).copy()
+    slots = np.array(rng.sample(range(n_slots), rng.randint(0, n_slots)), dtype=np.int64)
+    want, got = slab.copy(), slab.copy()
+    stage.py_step_mirrors(want, desc, n_slots, slots)
+    mstar_rust.rows_step_mirrors(got, desc, n_slots, slots)
+    np.testing.assert_array_equal(got, want)

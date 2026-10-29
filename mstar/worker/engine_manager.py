@@ -164,6 +164,7 @@ class EngineManager:
             enable_profile=enable_prof,
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
+            max_concurrent_requests=model_config.get("max_concurrent_requests"),
         )
         engine.load_model(
             submodules,

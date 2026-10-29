@@ -1,3 +1,4 @@
+import functools
 import itertools
 import logging
 import os
@@ -46,6 +47,7 @@ from mstar.engine.resources.kv.plan import (
     group_by_plan_label,
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
+from mstar.engine.resources.kv.rows import KVRows, decode_addressing
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -58,6 +60,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.engine.rows import RowState
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 
@@ -493,6 +496,13 @@ class _LabelRows:
             setattr(self, k, kw[k])
 
 
+class _RowsPlan(NamedTuple):
+    """A read-only step's plan over a persistent walk's rows, as committed."""
+    version: int  # the rows' ``PersistentBatch.version``
+    rids: frozenset  # its real rows
+    plan: "KVPlanOutputs"
+
+
 class _DecodePlanCache:
     """The last leased decode plan, as `_fast_decode_plan` continues it."""
 
@@ -671,6 +681,16 @@ class KVManager(AttentionResource):
         self._readonly_epoch = 0
         self._readonly_plan: tuple | None = None
         self._readonly_rows: frozenset | None = None
+        # The same on a persistent-row walk, keyed by the rows instead: a held
+        # row's streams change only through a step of another walk, which
+        # checks the row in first, so unchanged rows (rows version) are an
+        # unchanged plan. (walk, bucket, slot) -> _RowsPlan
+        self._rows_walks: set[str] = set()
+        self._rows_plans: dict[tuple, _RowsPlan] = {}
+        # walk -> its rows, for the labels its steps extend (`kv.rows`)
+        self._kv_rows: dict[str, KVRows] = {}
+        # bucket rows -> host qo_indptr of a step of one token a row
+        self._decode_qo: dict[int, torch.Tensor] = {}
         # (slot, label) -> the plan output whose state that slot's static
         # buffers hold, so a reused plan skips re-staging them
         self._staged_outputs: dict[tuple, KVPlanOutput] = {}
@@ -2491,14 +2511,26 @@ class KVManager(AttentionResource):
         """The last read-only step's plan, when this step is the same read-only
         step over untouched streams. Its views and indptrs are reused as they
         are, and a slot whose static buffers already hold it is not re-staged."""
-        cached = self._readonly_plan
-        if cached is None or not self._is_readonly(step, ctx) or cached[0] != self._readonly_key(step, ctx):
+        if not self._is_readonly(step, ctx):
             return None
-        res = cached[1]
         lease = ctx.slot_lease
-        if lease is not None and all(
-            self._staged_outputs.get((lease.slot, label)) is out for label, out in res.items()
-        ):
+        rows_key = self._rows_plan_key(ctx)
+        if rows_key is not None:
+            cached = self._rows_plans.get(rows_key)
+            diff = ctx.rows.diff
+            if cached is None or not diff.empty() or cached.version != diff.base_version:
+                return None
+            res = cached.plan
+            # only into the slot that still holds it: re-staging would read
+            # its `cpu_indptrs`, which a later plan may have rewritten
+            if not self._holds_staged(lease, res):
+                return None
+        else:
+            cached = self._readonly_plan
+            if cached is None or cached[0] != self._readonly_key(step, ctx):
+                return None
+            res = cached[1]
+        if lease is not None and self._holds_staged(lease, res):
             for label in res:
                 self._current_plan_states[label] = self._static_plan_state(
                     lease.slot, label, lease.bucket.num_tokens,
@@ -2507,6 +2539,117 @@ class KVManager(AttentionResource):
             self._setup_plan_states(res, ctx, lease)
         return res
 
+    def _plan_rows(self, step: KVStep, ctx: StepContext, kv_rows: KVRows) -> "KVPlanOutputs":
+        """A step of a persistent walk: its rows hold each stream's length and
+        pages on the device, where its graph builds the write addressing and
+        attention's arrays (`_arm_rows`). Here: the rows that joined or
+        gained a page, and the host arrays FlashInfer's planner reads."""
+        rows = ctx.rows
+        lease = ctx.slot_lease
+        if step.pre_forks or step.post_forks or step.sink or step.combined_labels or step.eager_write:
+            raise ValueError(
+                f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} takes "
+                "no forks, sink rows, combined labels or eager writes"
+            )
+        by_label = group_by_plan_label(step.segments, {})
+        if by_label.keys() != kv_rows.labels.keys():
+            raise ValueError(
+                f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} carries "
+                f"labels {sorted(by_label)}, but its rows hold {sorted(kv_rows.labels)} "
+                "(RowWalk.labels)"
+            )
+        order = rows.order
+        d = rows.diff
+        if d.join_rids:
+            kv_rows.write_joins(rows, self._streams)
+        if self._admit_reserved_pages:
+            joined = set(d.join_rids)
+            for (rid, label), new in self._admit_reserved_pages.items():
+                if rid in joined or label not in kv_rows.labels or ctx.is_padding_row(rid):
+                    continue
+                held = self._streams[rid][label].page_indices.n
+                kv_rows.write_pages(rows, label, rows.slot_of(rid), held - len(new), new)
+        page_size = kv_rows.page_size
+        plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
+        out = {}
+        for label, segments in by_label.items():
+            n = len(segments)
+            if any(seg.span != 1 for seg in segments) or [
+                seg.request_id for seg in segments[:len(order)]
+            ] != list(order):
+                raise ValueError(
+                    f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} must "
+                    "compute one token a row, in row order"
+                )
+            # padding rows past the active ones hold length 0 and sink pages
+            lens = kv_rows.lens_host(rows, label)[:n]
+            indptr = np.zeros(n + 1, np.int32)
+            np.cumsum(lens // page_size + 1, out=indptr[1:])
+            qo = self._decode_qo.get(n)
+            if qo is None:
+                qo = self._decode_qo[n] = torch.arange(n + 1, dtype=torch.int32)
+            out[label] = KVPlanOutput(
+                cpu_indptrs=PagedIndptrs(
+                    qo_indptr=qo, paged_kv_indptr=torch.from_numpy(indptr),
+                    paged_kv_indices=None, paged_kv_last_page_len=None,
+                    kv_lens=torch.from_numpy(lens + 1).as_subclass(HostLens),
+                ),
+                rows=segments,
+                view_builder=lambda segments=segments: self._sequence_views(segments, {}, ctx),
+                decode=True,
+                device_rows=kv_rows.device_rows(label),
+            )
+            # the graph writes it from the rows (`_arm_rows`), so it is no
+            # longer known zero, nor the staging of an earlier plan
+            state = self._static_plan_state(lease.slot, label, lease.bucket.num_tokens)
+            state.total_tokens = n
+            state.slot_buffer.zero_prefix = 0
+            self._staged_outputs.pop((lease.slot, label), None)
+            plan_states[label] = state
+        return KVPlanOutputs(out)
+
+    def _arm_rows(self, kv_rows: KVRows, res: "KVPlanOutputs", ctx: StepContext) -> None:
+        """While a persistent walk's graph is captured: have it write each
+        row's address from the rows before its forward."""
+        lease = ctx.slot_lease
+        for label, kv_out in res.items():
+            if label not in kv_rows.labels:
+                continue
+            state = self._static_plan_state(lease.slot, label, lease.bucket.num_tokens)
+            kv_rows.arm(lease, label, functools.partial(
+                decode_addressing, kv_rows.device_rows(label), len(kv_out.rows or kv_out.views),
+                state.token_to_page, state.token_to_cache,
+            ))
+            state.slot_buffer.zero_prefix = 0
+            self._staged_outputs.pop((lease.slot, label), None)
+            kv_out.device_rows = kv_rows.device_rows(label)
+
+    def _holds_staged(self, lease, res: "KVPlanOutputs") -> bool:
+        return all(self._staged_outputs.get((lease.slot, label)) is out for label, out in res.items())
+
+    def _rows_plan_key(self, ctx: StepContext) -> tuple | None:
+        """Where a read-only step of a persistent walk keeps its plan: per
+        slot, whose static buffers hold it and whose padding rows it names."""
+        lease = ctx.slot_lease
+        if ctx.rows is None or lease is None or ctx.graph_walk not in self._rows_walks:
+            return None
+        return ctx.graph_walk, lease.bucket, lease.slot
+
+    def _remember_rows_plan(
+        self, key: tuple, step: KVStep, ctx: StepContext, res: "KVPlanOutputs",
+    ) -> None:
+        rids = frozenset(
+            seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
+        )
+        space = ctx.rows.space
+        # at commit, the version those rows are; a step that never commits
+        # leaves no entry
+        ctx.rows.on_commit(
+            lambda _released: self._rows_plans.__setitem__(
+                key, _RowsPlan(space.batch.version, rids, res),
+            ),
+        )
+
     def _touch_plan_cache(self, rid: str | None = None) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
         commit: the plan caches no longer describe the streams if they hold
@@ -2514,6 +2657,9 @@ class KVManager(AttentionResource):
         rows = self._readonly_rows
         if rows is not None and (rid is None or rid in rows):
             self._readonly_epoch += 1
+        if self._rows_plans:
+            for key in [k for k, p in self._rows_plans.items() if rid is None or rid in p.rids]:
+                del self._rows_plans[key]
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
@@ -2856,6 +3002,16 @@ class KVManager(AttentionResource):
         if reused is not None:
             return reused
 
+        kv_rows = self._kv_rows.get(ctx.graph_walk) if ctx.slot_lease is not None else None
+        if kv_rows is not None and ctx.rows is not None and not ctx.capture:
+            res = self._plan_rows(step, ctx, kv_rows)
+            laps.lap("rows")
+            if ctx.is_preplan:
+                self._preplan_key = self._plan_key(step, ctx)
+                self._preplanned = True
+                self._cached_plan_output = res
+            return res
+
         # Forks run ahead of the views, which record length and generation;
         # staging only reads what the fork will land.
         if ctx.is_preplan:
@@ -2898,17 +3054,36 @@ class KVManager(AttentionResource):
             laps.lap("full")
         self._setup_plan_states(res, ctx, ctx.slot_lease, eager_write=step.eager_write)
         laps.lap("setup_states")
+        if kv_rows is not None and ctx.capture:
+            self._arm_rows(kv_rows, res, ctx)
         if self._is_readonly(step, ctx):
-            # the rows first: a touch from here on invalidates the entry
-            self._readonly_rows = frozenset(
-                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
-            )
-            self._readonly_plan = (self._readonly_key(step, ctx), res)
+            rows_key = self._rows_plan_key(ctx)
+            if rows_key is not None:
+                self._remember_rows_plan(rows_key, step, ctx, res)
+            else:
+                # the rows first: a touch from here on invalidates the entry
+                self._readonly_rows = frozenset(
+                    seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
+                )
+                self._readonly_plan = (self._readonly_key(step, ctx), res)
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
             self._cached_plan_output = res
         return res
+
+    def row_state(self, space, node_name: str, graph_walk: str) -> RowState:
+        # a read-only step's plan is kept by rows (`_rows_plans`); the labels
+        # the walk extends keep their lengths and pages in them (`kv.rows`)
+        self._rows_walks.add(graph_walk)
+        labels = space.labels.get(self.name)
+        if not labels:
+            return RowState()
+        page_size = self.kv_cache.page_size
+        state = self._kv_rows[graph_walk] = KVRows(
+            space, labels, max_pages=-(-self.config.max_seq_len // page_size) + 1, page_size=page_size,
+        )
+        return state
 
     @property
     def supports_preplan(self):

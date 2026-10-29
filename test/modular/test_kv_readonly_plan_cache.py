@@ -15,6 +15,7 @@ from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.engine.rows import RowSpace  # noqa: E402
 
 PAGE = 4
 
@@ -201,3 +202,76 @@ def test_an_offload_and_reload_of_a_real_row_plans_again():
     assert kv.reload("b")
     again = _read(kv, ("a", "b"))
     assert again is not first and _lengths(again)[:2] == [6, 9]
+
+
+# A persistent-row walk keys the reuse by its committed rows instead.
+
+def _rows_read(kv: KVManager, space: RowSpace, rids: tuple[int, ...], slot: int = 0, commit: bool = True):
+    """``_read`` as a step of the persistent walk ``decode``, in row order;
+    rows are keyed by worker handle, as the engine keys them."""
+    padded = rids + tuple(f"pad{i}" for i in range(2))
+    step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded))
+    bucket = BucketKey(graph_walk="decode", bs=len(padded), num_tokens=len(padded))
+    ctx = StepContext(
+        request_ids=rids, graph_walk="decode", slot=slot, capture=False,
+        slot_lease=SlotLease(slot=slot, bucket=bucket),
+    )
+    ctx.set_padded_rids(padded)
+    ctx.rows = space.propose(list(rids))
+    assert kv.admit(step, ctx).ok
+    res = kv.plan(step, ctx)
+    if commit:
+        ctx.rows.commit()
+    kv.commit(step, ctx)
+    return res
+
+
+@pytest.fixture
+def space(kv):
+    # handles 0 and 1 hold what the eager tests' a and b streams do
+    _write(kv, 0, 6)
+    _write(kv, 1, 9)
+    space = RowSpace(4, torch.device("cpu"))
+    kv.row_state(space, "decoder", "decode")
+    return space
+
+
+def test_unchanged_rows_reuse_their_slots_plan(kv, space):
+    first = [_rows_read(kv, space, (0, 1), slot=slot) for slot in (0, 1)]
+    # what defeats the segment-keyed reuse does not move the rows
+    kv._plan_epoch += 1
+    for slot in (0, 1):
+        assert _rows_read(kv, space, (0, 1), slot=slot) is first[slot]
+        assert kv._current_plan_states["main"] is kv._static_plan_state(slot, "main", 4)
+
+
+def test_rows_that_changed_plan_again(kv, space):
+    first = _rows_read(kv, space, (0, 1))
+    _write(kv, 2, 5)
+    assert _rows_read(kv, space, (0, 2)) is not first
+    # back to the first rows, at a later version
+    again = _rows_read(kv, space, (0, 1))
+    assert again is not first and _lengths(again)[:2] == [6, 9]
+
+
+def test_a_step_that_never_committed_leaves_no_plan(kv, space):
+    _rows_read(kv, space, (0, 1), commit=False)
+    first = _rows_read(kv, space, (0, 1))
+    assert _rows_read(kv, space, (0, 1)) is first
+
+
+def test_a_touch_of_a_held_rows_stream_plans_again(kv, space):
+    first = _rows_read(kv, space, (0, 1))
+    kv._touch_plan_cache(2)
+    assert _rows_read(kv, space, (0, 1)) is first
+    kv._touch_plan_cache(1)
+    assert _rows_read(kv, space, (0, 1)) is not first
+
+
+def test_a_slot_another_step_staged_plans_again(kv, space):
+    """Rather than staging the kept plan again, whose ``cpu_indptrs`` may
+    live in a ring a later plan rewrote."""
+    first = _rows_read(kv, space, (0, 1))
+    _read(kv, (0, 1), sink=frozenset({(1, "main")}))
+    again = _rows_read(kv, space, (0, 1))
+    assert again is not first and kv._staged_outputs[(0, "main")] is again["main"]
