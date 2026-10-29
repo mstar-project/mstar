@@ -329,5 +329,7 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::page_arena::PyPageArena>()?;
     m.add_class::<crate::page_arena::PyStreamPages>()?;
     m.add_class::<crate::rows::PyRowStage>()?;
+    m.add_class::<crate::row_slots::PyRowSlots>()?;
+    m.add_function(wrap_pyfunction!(crate::rows::rows_step_mirrors, m)?)?;
     Ok(())
 }
