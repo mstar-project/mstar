@@ -1337,6 +1337,61 @@ def test_only_a_state_of_one_request_and_the_configured_history_is_served(lead, 
             serve()
 
 
+# each JSON type a client field can arrive as
+_JSON_TYPES = {"an object": {"a": 1}, "a list": [1.0], "a number": 3, "a string": "x", "null": None}
+
+
+def _observation_model():
+    model = _model()
+    model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
+    frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
+    state = {"arm": np.zeros((1, 1, 2), np.float32), "grip": np.zeros((1, 1, 1), np.float32)}
+    return model, frames, state
+
+
+@pytest.mark.parametrize("field, value", [
+    *(("embodiment_tag", v) for k, v in _JSON_TYPES.items() if k != "a string"),
+    ("embodiment_tag", "not_a_robot"),
+    *(("state", v) for k, v in _JSON_TYPES.items() if k != "an object"),
+    *(("a state group", v) for v in _JSON_TYPES.values()),
+    # null is the key left out (upstream's `normalize_generation_kwargs` drops it): the full path
+    *(("walk", v) for k, v in _JSON_TYPES.items() if k != "null"),
+], ids=lambda x: x if isinstance(x, str) and " " in x or x in ("embodiment_tag", "state", "walk") else repr(x))
+def test_a_client_field_of_the_wrong_json_type_is_a_400_not_a_500(field, value):
+    """The data worker answers ``ValueError``/``TypeError`` with a 400 and anything else with a
+    500, so each field, sent as every JSON type but its own, must raise ``ValueError``."""
+    model, frames, state = _observation_model()
+    kwargs = {"embodiment_tag": "bot", "state": state}
+    if field == "walk":
+        with pytest.raises(ValueError):
+            model._walk_schedule({"walk": value})
+        return
+    if field == "a state group":
+        kwargs["state"] = {**state, "arm": value}
+    else:
+        kwargs[field] = value
+    with pytest.raises(ValueError):
+        model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": frames}, **kwargs)
+
+
+@pytest.mark.parametrize("value", [[[[0.0], [0.0, 1.0]]], [[["x", "y"]]]], ids=["ragged", "strings"])
+def test_a_state_group_that_is_not_a_numeric_array_is_named(value):
+    """numpy's own message ("setting an array element with a sequence") names no field."""
+    model, frames, state = _observation_model()
+    with pytest.raises(ValueError, match="'arm': 'not a numeric array'"):
+        model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": frames},
+                             embodiment_tag="bot", state={**state, "arm": value})
+
+
+@pytest.mark.parametrize("field", ["embodiment_tag", "state"])
+def test_a_missing_client_field_is_a_400_naming_it(field):
+    model, frames, state = _observation_model()
+    kwargs = {"embodiment_tag": "bot", "state": state}
+    del kwargs[field]
+    with pytest.raises(ValueError, match=f"needs (an )?`{field}`"):
+        model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": frames}, **kwargs)
+
+
 def test_postprocess_names_every_joint_group_the_way_the_reference_does():
     """One float32 entry per joint group, keyed as NVIDIA's policy keys it
     (``gr00t_policy.py:425-432``). Groups have different widths (9, 1, 7 on DROID), so a
