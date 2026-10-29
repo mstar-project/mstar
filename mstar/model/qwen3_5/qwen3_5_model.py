@@ -169,6 +169,9 @@ class Qwen3_5DenseModel(Model):
     PREPROCESS_TORCH_THREADS = 4
 
     _text_detokenizer: TextChunkDetokenizer | None = None
+    # drafts a speculative decode step verifies (see `__init__`); 0 decodes one
+    # token a step
+    num_draft_tokens: int = 0
 
     def __init__(
         self,
