@@ -63,9 +63,13 @@ Declaring an op
   has none) raises when the op is called there, naming the op, the platform
   and the cause; ``op.unavailable_reason()`` says the same at build time,
   which is where a resource should refuse a configuration it cannot serve.
-- Nothing is built inside a captured graph: the engine's warm-up iterations
-  run every op before capture, and ``op.warm(shapes)`` resolves and runs an op
-  on chosen shapes explicitly.
+- Nothing is built inside a captured graph. Before it captures anything the
+  engine resolves every op (``registry.warm_all()``: imports and JIT builds,
+  no kernel runs) and logs one line per op naming what runs
+  (``op.selection()``; an implementation may carry a ``kernel_selection``
+  string saying what it chose). The shapes a model uses then compile in the
+  eager forwards that precede each capture, and ``op.warm(shapes)`` resolves
+  and runs an op on chosen shapes explicitly.
 - Add the declaring module to ``DECLARING_MODULES`` in the registry; a CPU
   test fails on a module that declares an op without being listed.
 
@@ -112,10 +116,16 @@ Tuned configs
 
 ``op.config(shape)`` reads ``configs/<arch>/<product>/<name>.json`` if the
 product has one, else ``configs/<arch>/<name>.json``, and returns the entry
-for the shape's class (``ShapePolicy.classes``) or the file's ``default``.
+for the shape itself (the optional ``shapes`` table, keyed by
+``configs.shape_key``: dimensions in name order, ``hidden4096-rows1``), else
+for the shape's class (``ShapePolicy.classes``), else the file's ``default``.
 Products of one architecture share code objects, not timings. Configs are
-written by the harness (``ResultsStore.promote``), and only after a
-model-level A/B shows the change helps.
+written by the harness, and only after a model-level A/B shows the change
+helps: ``ResultsStore.promote`` writes one family's winning knobs per class,
+and ``ResultsStore.promote_best`` picks an implementation per shape across
+families (a kernel of this repo only where it beats the shipped one by a
+margin), optionally keeping each class's default so that shapes nobody
+searched run what they ran before.
 
 Measuring with the harness
 --------------------------
