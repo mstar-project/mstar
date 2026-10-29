@@ -1236,6 +1236,29 @@ is built with a ``comm_group`` and ``tp_world_size > 1``, the loader slices the 
 tensor along that parameter's shard dimension before copying it. For this reason, one
 ``load_weights`` path serves both single-GPU runs and tensor-parallel runs without change.
 
+**fp8 linears.** A compute-bound model can let a deployment run some of its linears as fp8
+GEMMs (``model_kwargs.linear_dtype: fp8``). The module declares which ones, as fnmatch
+patterns over module names, and ``get_submodule`` hands them to
+``mstar.model.components.fp8_linear.apply_linear_dtype`` after loading (and after any LoRA
+merge) and before compiling:
+
+.. code-block:: python
+
+   class MyDiT(nn.Module):
+       # the GEMMs over the token stream; small modulation/embedding/output projections stay
+       FP8_LINEARS = ("blocks.*.attn.qkv", "blocks.*.attn.out", "blocks.*.mlp.fc*")
+
+   transformer = build_transformer(...)
+   apply_linear_dtype(transformer, self.linear_dtype, transformer.FP8_LINEARS, "MyDiT")
+
+Each matching ``nn.Linear`` or ``FusedColumnLinear`` becomes an ``Fp8Linear``: weights in
+the GPU's e4m3 format (``current_platform.fp8_dtype()``: FNUZ on gfx942, OCP on gfx950 and
+NVIDIA sm_89+) with one scale per output channel, activations quantised per token in plain
+torch so the compiled forward fuses that into the producing norm, and the product on
+``mstar::fp8_rowwise_mm``. Where the platform has no fp8 GEMM the linears stay bf16 with a
+warning. The output moves by e4m3 rounding, so keep the default ``bf16`` unless the model's
+correctness family passes with fp8 on.
+
 .. _step-5:
 
 Step 5 — Continuous batching and CUDA graphs
