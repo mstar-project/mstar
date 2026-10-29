@@ -74,7 +74,7 @@ struct Params {
   bf16_t* kv;                 // [layers][bs][2][16][8][128]
   float* ss;                  // [slots][bs]
   unsigned* sync;             // [groups][64]
-  unsigned* ctl;              // [0] abort, [1] XCC mismatches, [2] phases completed by group 0's member 0
+  unsigned* ctl;              // [0] abort, [2] phases completed by group 0's member 0, [3] XCD rotations seen
   uint64_t* trace;            // [n_phases][2] or null: group 0 member 0's wall clock at each barrier's arrival and exit
   int n_phases, bs, groups, scope, sync_mode, stop_after, top_k;
   float top_p, inv_temperature, eps, attn_scale;
@@ -373,8 +373,9 @@ __device__ __forceinline__ void store_flag(unsigned* p, unsigned v, int scope) {
   if (scope == AGENT) {
     __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   } else {
+    // an exchange, not a store: the probe saw workgroup-scope flag stores never reach another CU of the XCD
     wait_stores();
-    __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    __hip_atomic_exchange(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
   }
 }
 
@@ -443,8 +444,7 @@ __device__ bool hier_barrier(const Params& P, const Group& G, unsigned epoch, ui
         }
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         if (ok) {
-          wait_stores();
-          __hip_atomic_store(xgo, epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+          store_flag(xgo, epoch, XCD);
         }
       }
     } else {
@@ -798,15 +798,10 @@ __global__ void __launch_bounds__(kThreads, 2) depth_step_kernel(Params P) {
   G.row0 = (G.g * P.bs) / P.groups;
   G.nrows = ((G.g + 1) * P.bs) / P.groups - G.row0;
   G.sync = P.sync + G.g * kSyncWords;
-  const bool placed = P.scope == XCD || (P.sync_mode & kSyncHier) != 0;
-  if (placed && (int)xcc_id() != (int)(blockIdx.x % 8)) {
-    // the XCD-local protocols rely on workgroup i running on XCD i % 8
-    if (threadIdx.x == 0) {
-      atomicAdd(P.ctl + 1, 1u);
-      __hip_atomic_store(P.ctl, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    }
-    return;
-  }
+  // The XCD-local protocols rely on workgroups i and i + 8 sharing an XCD. The dispatch is round-robin from a
+  // starting XCD that need not be 0 (workgroup i ran on XCD (i + 6) % 8 on an MI325X VF), so the rotation each
+  // workgroup sees is recorded as a bit of ctl[3]: one bit set means one rotation for the whole grid.
+  if (threadIdx.x == 0) atomicOr(P.ctl + 3, 1u << ((xcc_id() - blockIdx.x) & 7u));
 
   Regs R;
   ChunkIt it = first_chunk_from<S>(P, G, 0);

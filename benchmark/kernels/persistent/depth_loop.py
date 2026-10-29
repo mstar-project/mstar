@@ -407,20 +407,27 @@ def run(args) -> dict[str, Any]:
 
     # 2. parity, teacher-forced, against float64
     ref = sp.interpret(program, w, codebook, last_hidden, embed0, forced, kernel_rounding=False)
-    k = Kernel(program, w, codebook, bs, 8, ds.SCOPE_XCD, ds.default_grid(cus, 8), device, top_k, top_p, temperature)
     state = perop.PerOpState.allocate(OMNI, bs, device, top_k, top_p, temperature, seed=0)
     rope = sp.rope_table(OMNI, device)
+    clean: list[Kernel] = []
 
-    def stage_kernel_parity():
-        emb_sum = embed0.float().clone()
-        codes = forced.clone()
-        k.zero_state()
-        k.run(last_hidden, embed0, emb_sum, codes, forced=forced)
-        torch.cuda.synchronize()
-        out = group_errors(k.scratch.logits, ref["logits"])
-        out["emb_sum_rel"] = rel(emb_sum, ref["emb_sum"])
-        out["ctl"] = k.ctl()
-        return out
+    def kernel_parity(groups, scope):
+        kp = Kernel(program, w, codebook, bs, groups, scope, ds.default_grid(cus, groups), device, top_k, top_p,
+                    temperature)
+
+        def run_it():
+            emb_sum = embed0.float().clone()
+            codes = forced.clone()
+            kp.zero_state()
+            kp.run(last_hidden, embed0, emb_sum, codes, forced=forced)
+            torch.cuda.synchronize()
+            out = group_errors(kp.scratch.logits, ref["logits"])
+            out["emb_sum_rel"] = rel(emb_sum, ref["emb_sum"])
+            out["ctl"] = kp.ctl()
+            if out["ctl"][0] == 0:
+                clean.append(kp)
+            return out
+        return run_it
 
     def stage_per_op_parity():
         emb_sum_p = embed0.float().clone()
@@ -432,7 +439,10 @@ def run(args) -> dict[str, Any]:
         out["kernel_vs_per_op_rel_sum"] = sum(rel(k.scratch.logits[g], state.logits[g]) for g in range(15))
         return out
 
-    parity = {"kernel": guarded("kernel parity", stage_kernel_parity)}
+    parity = {"kernel": guarded("kernel parity", kernel_parity(8, ds.SCOPE_XCD)),
+              "kernel_g4_agent": guarded("kernel parity g4", kernel_parity(4, ds.SCOPE_AGENT))}
+    k = clean[0] if clean else Kernel(program, w, codebook, bs, 4, ds.SCOPE_AGENT, ds.default_grid(cus, 4), device,
+                                      top_k, top_p, temperature)
     parity["per_op"] = guarded("per-op parity", stage_per_op_parity)
     result["parity"] = parity
 
@@ -602,8 +612,8 @@ def table(r: dict[str, Any]) -> str:
     p = r["parity"]
     lines += ["", "## parity, teacher-forced, logits vs float64 (sum over the 15 groups of the relative L2 error)", "",
               "| path | rel sum | worst row rel | argmax agreement |", "|---|---|---|---|"]
-    for name in ("kernel", "per_op"):
-        e = p[name]
+    for name in ("kernel", "kernel_g4_agent", "per_op"):
+        e = p.get(name, {"error": "not run"})
         if "error" in e:
             lines.append(f"| {name} | {e['error']} | | |")
             continue
