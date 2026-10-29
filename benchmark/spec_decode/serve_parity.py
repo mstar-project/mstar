@@ -83,7 +83,7 @@ def save(args) -> int:
         # a smoke check of sampled decoding: it must answer, and answer differently each time
         try:
             texts = [one(args.url, args.tokenizer, pid, p, 64, args.timeout,
-                         {"temperature": 0.7, "top_p": 0.95})["text"] for _ in range(2)]
+                         {"temperature": 0.7})["text"] for _ in range(2)]
             sampled.append({"id": pid, "texts": texts, "distinct": texts[0] != texts[1]})
         except Exception as e:  # noqa: BLE001 - recorded, the greedy pass stands on its own
             sampled.append({"id": pid, "error": f"{type(e).__name__}: {e}"})
@@ -135,7 +135,7 @@ def main(argv=None) -> int:
     s.add_argument("--concurrency", type=int, default=1)
     s.add_argument("--timeout", type=float, default=600)
     s.add_argument("--sampled", type=int, default=0,
-                   help="also send this many prompts twice at temperature 0.7, top-p 0.95 (64 tokens)")
+                   help="also send this many prompts twice at temperature 0.7 (64 tokens)")
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")

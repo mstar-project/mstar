@@ -32,8 +32,8 @@ class SpecDecodeConfig:
     draft: DraftKind = DraftKind.MTP
     # requests this node can hold at once, each with one row of device registers
     max_requests: int = 256
-    # Whether verify steps can sample the target (temperature, top-k, top-p),
-    # not only take its argmax. A capability: the model captures a sampled
+    # Whether verify steps can sample the target at a request's temperature
+    # (no top-k or top-p cut), not only take its argmax. A capability: the model captures a sampled
     # decode variant beside the greedy one and routes a batch by its rows.
     sampling: bool = False
 
