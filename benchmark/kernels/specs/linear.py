@@ -117,6 +117,58 @@ def _tunableop():
     return linear
 
 
+# solutions chosen by `hipblaslt_best`, by (rows, n, k): (index, quick us, default us, solutions tried)
+HIPBLASLT_CHOICES: dict[tuple[int, int, int], tuple[int, float, float, int]] = {}
+
+
+def _quick_us(fn, x, weights, reps: int = 10) -> float:
+    """Median us of ``fn(x, w)`` over ``reps`` calls cycling ``weights`` (eager, events)."""
+    times = []
+    for i in range(reps + 2):
+        w = weights[i % len(weights)]
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn(x, w)
+        end.record()
+        end.synchronize()
+        if i >= 2:
+            times.append(start.elapsed_time(end) * 1e3)
+    return sorted(times)[len(times) // 2]
+
+
+def _hipblaslt_best():
+    """hipBLASLt at the fastest of all its solutions for a shape (AITER's ``hipb_findallsols``), picked on
+    the first call per shape by a quick eager timing over weight copies that outgrow the MALL; the
+    captured timings then run that solution. The choice is kept in ``HIPBLASLT_CHOICES``."""
+    import aiter
+
+    aiter.hipb_create_extension()
+    chosen: dict[tuple[int, int, int], int] = {}
+
+    def linear(x, w):
+        key = (x.shape[0], w.shape[0], w.shape[1])
+        if key not in chosen:
+            copies = max(1, min(8, -(-(600 << 20) // (w.numel() * w.element_size()))))
+            weights = [w] + [w.clone() for _ in range(copies - 1)]
+            sols = aiter.hipb_findallsols(x, w.t())
+            timed = []
+            for sol in sols:
+                try:
+                    timed.append((_quick_us(lambda a, b, sol=sol: aiter.hipb_mm(a, b.t(), sol), x, weights), sol))
+                except Exception:  # noqa: BLE001  a solution that cannot run this shape
+                    continue
+            best_us, best = min(timed)
+            default_us = _quick_us(F.linear, x, weights)
+            chosen[key] = best
+            HIPBLASLT_CHOICES[key] = (best, best_us, default_us, len(sols))
+            print(f"hipblaslt_best rows={key[0]} n={key[1]} k={key[2]}: solution {best} {best_us:.1f} us "
+                  f"(default {default_us:.1f} us, {len(sols)} solutions)", flush=True)
+            del weights
+        return aiter.hipb_mm(x, w.t(), chosen[key])
+
+    return linear
+
+
 def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> list[Candidate]:
     found = [Candidate("torch", {}, _torch)]
     if is_amd(facts):
@@ -125,6 +177,7 @@ def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> lis
         found += [Candidate("aiter_asm", {"tile": t, "split_k": k}, _aiter_asm(t, k))
                   for t in ASM_TILES for k in ASM_SPLITS if t != "auto" or k == 1]
         found.append(Candidate("tunableop", {}, _tunableop))
+        found.append(Candidate("hipblaslt_best", {}, _hipblaslt_best))
     return found
 
 
