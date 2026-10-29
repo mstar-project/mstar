@@ -52,6 +52,19 @@ def test_the_fp8_format_comes_from_the_architecture():
     assert CpuPlatform().fp8_dtype() is None
 
 
+def test_the_gemm_needs_hopper_on_nvidia(monkeypatch):
+    from mstar.kernels import fp8_gemm
+
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: _Cuda((8, 9)))
+    with pytest.raises(RuntimeError, match="sm_90 or newer"):
+        fp8_gemm._scaled_mm()
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: _Cuda((9, 0)))
+    assert callable(fp8_gemm._scaled_mm())
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: _Rocm("gfx90a"))
+    with pytest.raises(RuntimeError, match="no fp8 GEMM"):
+        fp8_gemm._scaled_mm()
+
+
 @pytest.mark.parametrize("fp8", FP8_DTYPES, ids=str)
 def test_quantize_rows_maps_each_rows_largest_value_to_the_format_max(fp8):
     torch.manual_seed(0)
