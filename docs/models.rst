@@ -403,10 +403,11 @@ Speculative decoding with the checkpoints' MTP head (AMD GPUs): serve
 drafts the next ``k``, in one captured graph, and streams the 1 to ``k + 1``
 tokens it accepts as one chunk. A request holds ``k + 1`` recurrent-state slots,
 so ``gdn_state.max_slots`` is ``1 + concurrency * (k + 1)`` (the configs: 64
-requests); the KV cache gains one layer for the head. Verification is greedy, so
-these deployments refuse ``temperature > 0`` and ``repetition_penalty``; they
-need AITER's attention (device-side KV lengths) and are checked on text
-prompts. See "Speculative decoding" in :doc:`adding_models` for the design.
+requests); the KV cache gains one layer for the head. The ``mtp3`` configs verify
+greedily and refuse ``temperature > 0``; the ``mtp2`` ones set ``spec_sampling:
+true`` and also sample at a request's temperature (a second decode capture), with
+``top_p`` 1 and ``top_k`` 0 only. Neither takes ``repetition_penalty``. They need
+AITER's attention (device-side KV lengths) and are checked on text prompts. See "Speculative decoding" in :doc:`adding_models` for the design.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
