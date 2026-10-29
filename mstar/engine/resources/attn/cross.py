@@ -5,11 +5,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import numpy as np
 import torch
 
+from mstar.engine.resources.attn.backends import flashinfer_kwargs
 from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
-    flashinfer_kwargs,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
