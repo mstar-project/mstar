@@ -175,7 +175,7 @@ class DSAManager(Resource):
     def build(cls, spec: DSASpec, info: EngineResourceInfo):
         # `dependency` hands back the SPEC; its `.config` is the KV config
         kv_spec = info.dependency(spec.config.kv_cache)
-        return cls(spec.config, page_size=kv_spec.config.page_size, device=info.device)
+        return cls(spec.config, page_size=kv_spec.config.tokens_per_page, device=info.device)
 
     def __init__(self, config: DSAConfig, page_size: int, device: torch.device):
         self.config = config

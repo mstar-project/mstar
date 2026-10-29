@@ -47,7 +47,7 @@ class _StubChains:
     """Keys each request's whole pages of ids, as the KV cache's chains do."""
 
     def __init__(self):
-        self.config = type("Config", (), {"page_size": PAGE})()
+        self.config = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4 * PAGE, page_size=PAGE)
         self.keys: dict[str, list[bytes]] = {}
 
     def add(self, rid: str, tokens: list[int]) -> None:

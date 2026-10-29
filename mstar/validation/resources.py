@@ -11,6 +11,7 @@ from mstar.engine.resources.runner import topo_sort
 from mstar.engine.resources.spec import (
     TOP_LEVEL_KV_CACHE,
     NodeResourceSpec,
+    derive_specs,
     spec_dependency_problems,
     unknown_overrides_message,
 )
@@ -73,6 +74,9 @@ def _apply_overrides(
             by_key[key].apply_yaml_overrides(**kwargs)
         except (TypeError, ValueError) as e:
             yield f"resources.{key}: {e}"
+    # after the overrides, so a page size from the YAML is checked against the pool's window
+    for key, message in derive_specs(by_key):
+        yield f"resources.{key}: {message}"
 
 
 def _uncacheable_positions(

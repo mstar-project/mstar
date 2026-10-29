@@ -164,7 +164,7 @@ class XPUPagedAttentionManager(AttentionManager):
                         for name, values in metadata.items()
                     },
                     max_q=max_q if max_q is not None else max((view.to_compute for view in views), default=0),
-                    max_k=self._kv_config.max_num_pages * self._kv_config.page_size,
+                    max_k=self._kv_config.max_num_pages * self._kv_config.tokens_per_page,
                     causal=causal,
                 )
             for name, values in metadata.items():

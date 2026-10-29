@@ -50,8 +50,6 @@ def _fa3_unavailable_reason(device: torch.device | None = None) -> str | None:
     imported (fa3-fwd, and AITER on ROCm), or fa3-fwd has none for its capability"""
     if _VARLEN_IMPORT_ERROR is not None:
         return _VARLEN_IMPORT_ERROR
-    if device is not None and torch.device(device).type != "cuda":
-        return None
     capability = current_platform.cuda_capability(device)
     if capability is not None and not _fa3_has_kernel(capability):
         return f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
@@ -305,7 +303,7 @@ class DenseAttentionManager(AttentionManager):
     def _build_plan(self, kv_out: KVPlanOutput, causal: bool, wrapper: PrefixedPrefillWrapper) -> DensePlan:
         """The per-segment gather layout plus the cumulative lengths one varlen
         kernel needs, in the packed order the KV plan defined."""
-        page_size = self._kv_config.page_size
+        page_size = self._kv_config.tokens_per_page
         segments: list[DenseSegment] = []
         cu_q = [0]
         cu_k = [0]

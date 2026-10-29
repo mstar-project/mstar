@@ -482,8 +482,8 @@ runs that partition is not cached either, since a hit would skip the rows the no
 streams for the tokens the cache holds. BAGEL
 keys an understanding prompt's text and images, and a generation's first span when it
 is text: an edit's images are resized before their walks see them, and a file's digest
-doesn't cover the resize. A label under a sliding window files pages only up to its
-protected prefix, which the window never releases.
+doesn't cover the resize. A label under a step's retention (``RetentionPolicy``) files
+pages only up to its protected prefix, which the retention never releases.
 
 .. _Step 2a — Declare your resources:
 
@@ -527,6 +527,9 @@ The spec types are:
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
        ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
+       A pool keeps only a window of the layers a windowed attention over it runs
+       (``AttentionConfig.sliding_window``, below); its ``page_size``, ``max_num_pages``
+       and ``cpu_offload_pages`` then work as described there.
        A spec whose nodes can run on several workers, as Bagel's LLM nodes do under CFG
        parallel, sets ``leader`` to the node whose pool admits each request. Left unset, each
        worker's pool admits requests on its own.
@@ -572,9 +575,34 @@ The spec types are:
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
        fallback, which cannot be captured in a CUDA graph.
-       ``sliding_window=N`` lets each query attend to the last ``N`` positions, its
-       own included. It needs the FlashInfer backend and causal attention, and the
-       pages behind the window stay allocated.
+       ``sliding_window=N`` lets each query attend to the last ``N`` positions, its own
+       included, and the cache keeps only about the last ``N`` tokens of this
+       attention's layers per request, returning the rest to the pool, so long requests
+       take far fewer pages. It needs the FlashInfer backend, causal attention, a paged
+       NHD cache and ``layers=(...)``, the KV layer indices this attention runs (the ones
+       ``set_layer_idx`` takes). The cache's other layers keep every token, and the
+       attentions over it that declare no window run them (Command A+); each attention
+       refuses a layer it doesn't run. The cache works this out from its attentions
+       before anything is built (``derive_kv_groups``); a window at least the cache's
+       ``max_seq_len`` keeps every token, so it needs no ``layers`` and costs nothing.
+       Startup refuses a window over another kind of cache, a window without ``layers``,
+       a layer declared twice, two different windows over one cache (one per cache for
+       now), a window over every layer of a cache, other layers that no attention
+       without a window reads, cross attention over such a cache, and a backend other
+       than FlashInfer; its kernel must be ``auto`` or ``fa2``, or ``fa3`` on SM90, and
+       from SM100 ``auto`` runs ``fa2``. The window's pages hold ``page_size × full
+       layers / sliding layers`` tokens, which must be whole. Left unset, the page
+       (``tokens_per_page``) is the smallest whole one whose pages of either group hold at least 64 tokens
+       (192 for 13 full and 39 sliding layers, 184 for 16 and 46); a ``page_size`` in the
+       YAML must be a multiple of ``sliding layers / gcd(full, sliding)``. A window is
+       kept in whole pages of its layers plus up to one more, so with few sliding layers
+       among many full ones (1984-token sliding pages at 31 full and 1 sliding) a short
+       window saves little. ``max_num_pages`` and ``cpu_offload_pages`` count pages of
+       every layer at the declared ``page_size``, or at 128 tokens when it is unset, so
+       the pool's bytes don't move with the derived page. Such a cache doesn't prefix
+       cache yet, so its ``prefix_cache`` goes off (logged at info). It doesn't fork,
+       serve a node on another instance (replicas of one node group are fine) or hand out
+       ``write_slots`` yet either; each of these is refused.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step
        declares ``DSAStep()``, and the resource takes each request's rows from the KV plan.

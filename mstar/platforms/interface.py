@@ -41,7 +41,7 @@ class Platform:
         return None
 
     def cuda_capability(self, device=None) -> tuple[int, int] | None:
-        """NVIDIA compute capability; None on any other platform."""
+        """NVIDIA compute capability; None on any other platform or for a non-CUDA device."""
         return None
 
     def has_cuda_capability(self, major: int, minor: int = 0, device=None) -> bool:
@@ -82,11 +82,14 @@ class CudaPlatform(Platform):
     def is_cuda(self) -> bool:
         return True
 
-    def arch(self, device=None) -> str:
-        major, minor = self.cuda_capability(device)
-        return f"sm_{major}{minor}"
+    def arch(self, device=None) -> str | None:
+        capability = self.cuda_capability(device)
+        return None if capability is None else f"sm_{capability[0]}{capability[1]}"
 
-    def cuda_capability(self, device=None) -> tuple[int, int]:
+    def cuda_capability(self, device=None) -> tuple[int, int] | None:
+        # a CPU device (tests that drive GPU resources with stand-ins) has none
+        if device is not None and torch.device(device).type != "cuda":
+            return None
         return torch.cuda.get_device_capability(device)
 
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
