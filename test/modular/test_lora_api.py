@@ -23,6 +23,7 @@ import torch
 pytest.importorskip("fastapi")
 pytest.importorskip("safetensors")
 from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
@@ -36,7 +37,7 @@ except ImportError:  # collected without package context
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
 from mstar.api_server.data_worker import adapter_prefix_roots  # noqa: E402
-from mstar.api_server.entrypoint import APIServer  # noqa: E402
+from mstar.api_server.entrypoint import APIServer, request_validation_error  # noqa: E402
 from mstar.api_server.lora_admin import LoraAdmin  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult, RequestFailed  # noqa: E402
@@ -130,6 +131,8 @@ def _client(monkeypatch, config, adapter=None):
     if adapter is not None:
         monkeypatch.setattr(router_module, "get_adapter", lambda name: adapter)
     app = FastAPI()
+    # the real server's envelope for a body that fails its schema
+    app.add_exception_handler(RequestValidationError, request_validation_error)
     app.include_router(router_module.router)
     return TestClient(app), stub
 
@@ -292,9 +295,10 @@ def test_the_lora_endpoints(monkeypatch, error, status, message):
             assert r.status_code == status and got["code"] == status
             assert got["type"] == ("invalid_request_error" if status < 500 else "server_error")
             assert got["message"].startswith(message) and "/srv" not in got["message"]
-    # a missing field never reaches the admin
-    client.post("/v1/load_lora_adapter", json={"lora_name": "b"})
-    client.post("/v1/unload_lora_adapter", json={})
+    # a missing field is a 400 and never reaches the admin
+    for path, body in (("/v1/load_lora_adapter", {"lora_name": "b"}), ("/v1/unload_lora_adapter", {})):
+        r = client.post(path, json=body)
+        assert r.status_code == 400 and r.json()["error"]["code"] == 400
     assert stub.lora_admin.calls == [("load", "a", "/p"), ("unload", "a")]
 
 
