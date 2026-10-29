@@ -18,6 +18,8 @@ pub mod graph;
 pub mod kv_plan;
 #[cfg(feature = "python")]
 pub mod page_arena;
+#[cfg(feature = "python")]
+pub mod rows;
 pub mod shm;
 #[cfg(feature = "python")]
 pub mod tensors;

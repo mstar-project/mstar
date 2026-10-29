@@ -20,10 +20,9 @@ import numpy as np
 import torch
 
 from mstar.engine.rows.batch import PersistentBatch, RowDiff
-from mstar.engine.rows.copy import SegmentTable, copy_segments
+from mstar.engine.rows.copy import copy_segments
+from mstar.engine.rows.stage import new_stage
 from mstar.utils.h2d import _H2D, _cuda_memcpy_async
-
-_ALIGN = 16
 
 
 class RowBuffer:
@@ -307,55 +306,44 @@ class RowSpace:
             and not step._copy_in and not step._copy_out
         ):
             return None
-        out = SegmentTable()       # phase 0: leaving rows to their stores
-        moves = SegmentTable()     # phase 1: rows past the end into holes
-        writes = SegmentTable()    # phase 2: joins, element writes, cleared tail
-        payload = _Payload()
+        # phase 0: leaving rows to their stores; 1: rows past the end into
+        # holes; 2: joins, element writes, the cleared tail and the row count
+        stage = new_stage(3)
         for buf, slots, dst, dst_rows in step._copy_out:
-            out.add_rows(buf._ptr, slots, dst.data_ptr(), dst_rows, buf.row_bytes)
+            rb = buf.row_bytes
+            stage.copy_rows(0, buf._ptr, rb, slots, dst.data_ptr(), rb, dst_rows, rb)
         for buf in self.buffers:
+            rb = buf.row_bytes
             if len(d.move_src):
-                moves.add_rows(buf._ptr, d.move_src, buf._ptr, d.move_dst, buf.row_bytes)
+                stage.copy_rows(1, buf._ptr, rb, d.move_src, buf._ptr, rb, d.move_dst, rb)
             if d.n_before > d.n_active:
-                at = payload.put(buf.pad_bytes)
-                writes.add_fill(at, buf._ptr, np.arange(d.n_active, d.n_before), buf.row_bytes)
+                cleared = np.arange(d.n_active, d.n_before, dtype=np.int64)
+                stage.write(buf._ptr, rb, cleared, np.tile(buf.pad_bytes, len(cleared)), rb)
         for buf, slots, src, src_rows in step._copy_in:
-            writes.add_rows(src.data_ptr(), src_rows, buf._ptr, slots, buf.row_bytes)
+            rb = buf.row_bytes
+            stage.copy_rows(2, src.data_ptr(), rb, src_rows, buf._ptr, rb, slots, rb)
         for buf, entries in step._rows.items():
             for slots, values in entries:
                 if values is None:
                     values = step._mirrors[buf][slots].reshape(len(slots), -1).view(np.uint8)
-                at = payload.put(np.ascontiguousarray(values).reshape(-1))
-                writes.add_payload_rows(at, buf._ptr, slots, buf.row_bytes)
+                stage.write(buf._ptr, buf.row_bytes, slots, np.ascontiguousarray(values).reshape(-1), buf.row_bytes)
         for buf, entries in step._elements.items():
             mirror = step._mirrors[buf].reshape(-1)
             item = mirror.itemsize
             for _, flat in entries:
-                at = payload.put(mirror[flat].view(np.uint8))
-                writes.add_payload_elements(at, buf._ptr, flat, item)
+                # each element its own one-element row of the flat buffer
+                stage.write(buf._ptr, item, flat, mirror[flat].view(np.uint8), item)
         if d.n_active != d.n_before:
             self._n_bytes.view(np.int32)[0] = d.n_active
-            at = payload.put(self._n_bytes)
-            writes.add_payload_rows(at, self.n_active.data_ptr(), np.zeros(1, np.int64), 4)
-        return self._upload([out, moves, writes], payload)
+            stage.put(self._n_bytes.copy(), self.n_active.data_ptr())
+        return self._upload(stage)
 
-    def _upload(self, phases: list[SegmentTable], payload: _Payload) -> _Block:
-        tables = [t.finish() for t in phases]
-        table_bytes = sum(t.nbytes for t, _ in tables)
-        total = _round(table_bytes) + payload.size
+    def _upload(self, stage) -> _Block:
+        """The stage's tables and payload to a device block, as one copy."""
+        total = stage.size()
         entry = self._take(total)
         base = entry.device.data_ptr()
-        payload_at = _round(table_bytes)
-        view = entry.view
-        placed, at = [], 0
-        for table, src_kinds in tables:
-            # payload-relative sources become device addresses in this block
-            rows = table.copy()
-            rows[src_kinds, 0] += base + payload_at
-            view[at:at + rows.nbytes] = rows.view(np.uint8).reshape(-1)
-            placed.append((at, len(rows), int(rows[:, 2].max()) if len(rows) else 0))
-            at += rows.nbytes
-        view[payload_at:payload_at + payload.size] = payload.bytes()
+        placed = stage.pack(entry.view, base)
         if self._memcpy is not None:
             stream = torch.cuda.current_stream(self.device)
             if entry.applied is not None:
@@ -415,29 +403,3 @@ class RowSpace:
             for buf, delta in step._advance:
                 buf.host[:n] += delta
             return released
-
-
-class _Payload:
-    """Host bytes a step uploads, each piece aligned."""
-
-    def __init__(self):
-        self._parts: list[np.ndarray] = []
-        self.size = 0
-
-    def put(self, data: np.ndarray) -> int:
-        at = self.size
-        self._parts.append(data)
-        pad = _round(data.nbytes) - data.nbytes
-        if pad:
-            self._parts.append(np.zeros(pad, dtype=np.uint8))
-        self.size += data.nbytes + pad
-        return at
-
-    def bytes(self) -> np.ndarray:
-        if not self._parts:
-            return np.zeros(0, dtype=np.uint8)
-        return np.concatenate([p.view(np.uint8).reshape(-1) for p in self._parts])
-
-
-def _round(n: int) -> int:
-    return -(-n // _ALIGN) * _ALIGN
