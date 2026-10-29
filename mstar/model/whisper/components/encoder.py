@@ -4,10 +4,10 @@ Two GELU convolutions (the second strided by 2) turn a ``(num_mel_bins,
 3000)`` log-mel window into 1500 frames, a fixed sinusoidal table is added,
 and a pre-norm transformer stack (bidirectional self-attention + GELU FFN)
 runs over them. Every window is ``max_source_positions`` tokens, so
-a batch is a dense ``[bs, 1500, d_model]`` tensor: attention is plain SDPA
-with no mask, no cache and no resource, and the whole forward is a fixed
-shape per batch size — which is what lets the submodule capture it as one
-CUDA graph per batch size.
+a batch is a dense ``[bs, 1500, d_model]`` tensor: attention is
+``window_attention`` (SDPA, or the platform's faster kernel) with no mask, no
+cache and no resource, and the whole forward is a fixed shape per batch size —
+which is what lets the submodule capture it as one CUDA graph per batch size.
 
 Parameter paths mirror HF's ``model.encoder.*`` so the checkpoint loads
 through ``load_hf_weights`` with ``WHISPER_STACKED_PARAMS`` (``q/k/v_proj``
@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.linear import FusedColumnLinear
+from mstar.model.components.window_attention import window_attention
 from mstar.model.whisper.config import WhisperModelConfig
 
 
@@ -41,12 +42,11 @@ class WhisperEncoderAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         bs, seq_len, d_model = hidden_states.shape
         q, k, v = self.qkv_proj(hidden_states).split(d_model, dim=-1)
-        q = q.view(bs, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bs, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bs, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # SDPA's default scale is head_dim ** -0.5, Whisper's own.
-        out = F.scaled_dot_product_attention(q, k, v)
-        out = out.transpose(1, 2).reshape(bs, seq_len, d_model)
+        q = q.view(bs, seq_len, self.num_heads, self.head_dim)
+        k = k.view(bs, seq_len, self.num_heads, self.head_dim)
+        v = v.view(bs, seq_len, self.num_heads, self.head_dim)
+        # scaled by head_dim ** -0.5, Whisper's own
+        out = window_attention(q, k, v).reshape(bs, seq_len, d_model)
         return self.out_proj(out)
 
 
