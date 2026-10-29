@@ -761,10 +761,15 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   fp32 and under bf16 autocast, save the last frame when the end of input
   reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends put
   the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
-  autocast. So live and one-shot text should agree token for token in fp32
-  (inferred from those frames, not measured on served text); under the served
-  bf16 a different chunking can flip a knife-edge frame such as the agent's
-  turn start.
+  autocast (the bf16 figure was measured on the duplex encoder the shared
+  FastConformer replaced, and not since). So live and one-shot text should
+  agree token for token in fp32 (inferred from those frames, not measured on
+  served text); under the served bf16 a different chunking can flip a
+  knife-edge frame such as the agent's turn start. On CUDA under bf16 the
+  shared blocks keep the residual in bf16 through all 24 layers, as the
+  offline FastConformer encoders do; the replaced encoder's carried it in
+  fp32 from the second layer on, so served bf16 frames differ slightly from
+  that encoder's (not yet measured on a GPU).
 - The encoder keeps each call's state in a slot per session of three
   resources: its attention keys and values in a bounded KV (``encoder_kv``),
   which keeps a call's last 70 frames per layer and runs the attention, each new
