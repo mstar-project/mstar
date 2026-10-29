@@ -1478,7 +1478,11 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    * On AMD GPUs the setting is not applied unless the deployment asks for it
      (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`). hipBLASLt picks
      GEMM kernels per M, so the eager norms do not make the output match the reference
-     there either, and the bar is the reference's own cross-seed spread.
+     there either, and the bar is the reference's own cross-seed spread. On MI325X the
+     compiled norms take klein-4B from 0.406 to 0.384 s at B=1 and 2.97 to 3.32 images/s
+     at concurrency 16, klein-9B from 0.709 to 0.660 s and 1.54 to 1.68 images/s, with
+     both models' images closer to the reference (24.2 and 26.8 dB median, floors 22.4
+     and 25.5).
 
 ``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
    The denoise step, Euler update included, is captured per listed ``[height, width]``
