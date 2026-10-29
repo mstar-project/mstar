@@ -553,6 +553,15 @@ Worker scheduling
        the position resource's planned positions instead of staging them.
        On by default on AMD GPUs (``RocmPlatform.knob_defaults``), where
        each launch beside a replayed graph costs about 5 us of GPU time.
+   * - ``MSTAR_DIT_EXACT_OPS``
+     - config's ``knobs: dit_exact_ops``, else ``1`` (``0`` on ROCm)
+     - Whether a compiled DiT transformer (FLUX.2 klein, Z-Image) keeps the
+       op classes its ``compile_exact_ops`` model setting lists on the eager
+       kernels. ``0`` compiles them with the rest, so inductor fuses each norm
+       with its modulation and residual. Off by default on AMD GPUs
+       (``RocmPlatform.knob_defaults``): the eager norms exist to match the
+       cuBLAS reference bit for bit, which hipBLASLt's per-M kernel choice
+       rules out there. Read by ``knobs.dit_exact_ops``.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``0`` (``1`` on ROCm)
      - The captured sampler gathers its RNG offsets from the slot masters

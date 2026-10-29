@@ -20,6 +20,7 @@ KNOBS: dict[str, str] = {
     "kv_plan_cache": "MSTAR_KV_PLAN_CACHE",
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
+    "dit_exact_ops": "MSTAR_DIT_EXACT_OPS",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -160,3 +161,12 @@ def gc_gen0_threshold() -> int:
     c=128 (8% shorter decode step) for at most that many young objects held
     between collections."""
     return max(0, int(_setting("gc_gen0_threshold", "0")))
+
+
+def dit_exact_ops() -> bool:
+    """``dit_exact_ops`` / ``MSTAR_DIT_EXACT_OPS`` (default on, off for AMD
+    GPUs): whether a compiled DiT transformer keeps the op classes its model
+    config lists under ``compile_exact_ops`` on the eager kernels. Off
+    compiles them with the rest, so inductor can fuse each norm with its
+    modulation and residual."""
+    return _setting("dit_exact_ops", "1") == "1"

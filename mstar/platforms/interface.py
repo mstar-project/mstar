@@ -178,7 +178,13 @@ class RocmPlatform(Platform):
         # time on MI300X. Building the rope tables and scattering the
         # sampler's rows inside the graph drops about ten a step (Qwen3.5
         # 2B/9B: +1-3% tok/s at c=1-4).
-        return {"ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1"}
+        #
+        # A DiT's eager norms (compile_exact_ops) exist to match cuBLAS/cuDNN
+        # reference output bit for bit. hipBLASLt picks GEMM kernels per M, so
+        # that match does not hold here and the bar is the reference's own
+        # cross-seed spread; the eager norms only cost fusion (one graph break
+        # each, 137 on FLUX.2 klein 9B).
+        return {"ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1", "dit_exact_ops": "0"}
 
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
