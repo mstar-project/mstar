@@ -31,15 +31,13 @@ class WorkerColocation:
 
 
 class HardwareQueueColocation(WorkerColocation):
-    """AMD GPUs: nothing to start. Each process submits to its own hardware
-    queues, and the GPU's scheduler runs kernels from different processes
-    concurrently, so two workers on one device already overlap."""
+    """AMD GPUs: nothing to start. Each process submits to hardware queues of
+    its own, which the GPU schedules without a daemon, so two workers on one
+    device can run their kernels side by side. Whether a given pair gains from
+    sharing is the deployment's A/B."""
 
     def start(self) -> None:
-        logger.info(
-            "mps: true on ROCm: nothing to start, the hardware scheduler runs "
-            "the workers' queues side by side"
-        )
+        logger.info("mps: true on ROCm: nothing to start, the GPU schedules the workers' queues itself")
 
 
 class Platform:
