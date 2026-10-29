@@ -252,6 +252,15 @@ class Glm52ModelConfig:
         limit = self.max_seq_len if self.dsa_long_context else self.index_topk
         return limit - 2 * (self.mtp_num_draft_tokens + 1)
 
+    @property
+    def mtp_kv_lookahead(self) -> int:
+        """The KV rows an MTP request writes past the tokens it keeps, its layout's lookahead:
+        the draft-verify policy's (``DraftPolicy.lookahead``, 2k + 1)."""
+        from mstar.engine.resources.draft_verify.config import DraftPolicy
+
+        k = self.mtp_num_draft_tokens
+        return DraftPolicy(max_drafts=k).lookahead if k else 0
+
     @classmethod
     def from_hf_config(cls, hf_config: dict) -> "Glm52ModelConfig":
         """Geometry from the checkpoint's config.json; serving knobs keep

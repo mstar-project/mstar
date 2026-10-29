@@ -55,7 +55,7 @@ class _Pool:
 class _Kda:
     """The KDA resource's ``run`` on a hand-built plan."""
 
-    speculative_tokens = 0
+    max_drafts = 0
 
     def __init__(self, plan, kernels):
         self.plan, self.kernels = plan, kernels
@@ -63,7 +63,7 @@ class _Kda:
     def current_plan(self, label=None):
         return self.plan
 
-    def run(self, qkv, g, beta, conv, state, params, gate=None, label=None, spec=None):
+    def run(self, qkv, g, beta, conv, state, params, gate=None, label=None, verify_blocks=None):
         return self.kernels.run_paged(qkv, g, beta, self.plan, conv, state, params, gate=gate)
 
 

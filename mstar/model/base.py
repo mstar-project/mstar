@@ -96,6 +96,9 @@ class LabelLayout(NamedTuple):
     ``(loop, slots)`` in ``growth`` writes ``slots`` per iteration of the named
     loop. ``scratch`` is the most one non-committing step writes past the
     committed length, and ``retention`` the policy the label's committing steps declare.
+    ``lookahead`` is the most slots a committing step writes past the tokens the request
+    keeps, before a trim takes them back, as a draft-verify step does with its rejected
+    drafts.
     """
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()
@@ -103,6 +106,7 @@ class LabelLayout(NamedTuple):
     retention: RetentionPolicy | None = None
     # how many leading spans the label's keys cover, by default every span before the first rows span
     keyed_spans: int | None = None
+    lookahead: int = 0
 
     def keyed_count(self) -> int:
         if self.keyed_spans is not None:
@@ -112,7 +116,14 @@ class LabelLayout(NamedTuple):
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
         ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
-        wire's msgpack path."""
+        wire's msgpack path. A lookahead goes last, and only when there is one, so every other
+        layout's row is unchanged."""
+        if not isinstance(self.lookahead, int) or self.lookahead < 0:
+            raise ValueError(f"a lookahead of {self.lookahead!r}")
+        if self.lookahead and self.retention is not None:
+            # retention releases at commit, before the trim, so it would count the rows the trim
+            # takes back and leave the window short by up to the lookahead
+            raise ValueError("a layout with both a lookahead and a retention policy")
         for span in self.spans:
             if span.kind not in ("ids", "digest", "rows"):
                 raise ValueError(f"a span of kind {span.kind!r}")
@@ -122,13 +133,16 @@ class LabelLayout(NamedTuple):
                     f"{type(span.advance).__name__} and {type(span.scratch).__name__}"
                 )
         retention = self.retention
-        return [
+        row = [
             [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
             self.keyed_count(),
         ]
+        if self.lookahead:
+            row.append(self.lookahead)
+        return row
 
 
 def prompt_spans(

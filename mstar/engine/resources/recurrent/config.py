@@ -17,6 +17,11 @@ from mstar.engine.resources.step import ResourceStep
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
+# The per-slot verify blocks every layer shares (``DeltaNetGeometry.to_blocks(max_drafts=k)``):
+# how many tokens of the last verify block the next step replays, and the side holding them.
+VERIFY_LEN = "dv_len"
+VERIFY_SIDE = "dv_side"
+
 
 @dataclass
 class RecurrentBlockConfig:
@@ -94,17 +99,19 @@ class DeltaNetGeometry(RecurrentGeometry):
         self,
         state_dtype: torch.dtype | None = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
-        speculative_tokens: int = 0,
+        max_drafts: int = 0,
     ) -> dict[str, RecurrentBlockConfig]:
         """Pool blocks for this geometry; head counts are pre-sharding.
 
-        With ``speculative_tokens = k > 0`` the pool also keeps what a verify
+        With ``max_drafts = k > 0`` the pool also keeps what a draft-verify
         step of ``k + 1`` tokens leaves for the next one, which learns how many
-        were accepted: the block's pre-conv inputs, raw forget gates and raw
-        betas, and the conv window before it, each on two sides (a step reads
-        one and writes the other); per slot, the accepted count (0 after a
-        prefill) and the side holding them. ``state`` then holds the state
-        before those accepted tokens.
+        were kept: the block's pre-conv inputs, its raw gates, and the conv
+        window before it, each on two sides (a step reads one and writes the
+        other); per slot, the kept count (0 after a prefill) and the side
+        holding them. ``state`` then holds the state before those tokens: a
+        checkpoint the next step replays them from, which is how a verify step
+        takes its rejected tokens back. They are Kimi delta attention's (a forget
+        gate per key channel); GDN settles a verify step without them.
         """
         blocks = {
             "state": RecurrentBlockConfig(
@@ -118,32 +125,32 @@ class DeltaNetGeometry(RecurrentGeometry):
                 shard_dims=(0,),
             ),
         }
-        if speculative_tokens > 0:
-            k1 = speculative_tokens + 1
-            blocks["spec_prefix"] = RecurrentBlockConfig(
+        if max_drafts > 0:
+            k1 = max_drafts + 1
+            blocks["dv_prefix"] = RecurrentBlockConfig(
                 shape=(2, k1, self.conv_dim), dtype=conv_dtype, shard_dims=(2,),
             )
-            blocks["spec_g"] = RecurrentBlockConfig(
+            blocks["dv_g"] = RecurrentBlockConfig(
                 shape=(2, k1, self.num_v_heads, self.head_k_dim), dtype=conv_dtype,
                 shard_dims=(2,),
             )
-            blocks["spec_beta"] = RecurrentBlockConfig(
+            blocks["dv_beta"] = RecurrentBlockConfig(
                 shape=(2, k1, self.num_v_heads), dtype=conv_dtype, shard_dims=(2,),
             )
-            blocks["spec_conv"] = RecurrentBlockConfig(
+            blocks["dv_conv"] = RecurrentBlockConfig(
                 shape=(2, self.conv_dim, self.conv_kernel_size - 1), dtype=conv_dtype,
                 shard_dims=(1,),
             )
-            for name in ("spec_len", "spec_side"):
+            for name in (VERIFY_LEN, VERIFY_SIDE):
                 blocks[name] = RecurrentBlockConfig(
                     shape=(1,), dtype=torch.int32, per_layer=False,
                 )
         return blocks
 
     @staticmethod
-    def speculative_tokens_of(blocks: dict[str, RecurrentBlockConfig]) -> int:
-        """The ``k`` of ``to_blocks(speculative_tokens=k)``, 0 without."""
-        prefix = blocks.get("spec_prefix")
+    def max_drafts_of(blocks: dict[str, RecurrentBlockConfig]) -> int:
+        """The ``k`` of ``to_blocks(max_drafts=k)``, 0 without."""
+        prefix = blocks.get("dv_prefix")
         return 0 if prefix is None else prefix.shape[1] - 1
 
     @classmethod

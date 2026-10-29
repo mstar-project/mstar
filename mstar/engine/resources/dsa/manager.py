@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import EngineResourceInfo, Resource, RewindKind
 from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec
 from mstar.engine.resources.dsa.paged import DSAContext, attn_lens
@@ -24,6 +24,10 @@ from mstar.utils.h2d import PinnedStager
 
 class DSAManager(Resource):
     """DSA for one node's MLA layers over their cache (``config.kv_cache``)."""
+
+    # Planned from the KV plan every step, and its index keys ride the KV pages, so the KV
+    # resource's rewind takes a verify step's rejected rows back here too (draft-verify).
+    rewind_kind = RewindKind.NONE
 
     @classmethod
     def build(cls, spec: DSASpec, info: EngineResourceInfo):

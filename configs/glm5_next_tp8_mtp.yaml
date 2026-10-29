@@ -18,8 +18,9 @@ model_kwargs:
   # "auto" takes the fused fp8 MoE kernel when one is available, which is
   # what lets decode capture; "reference" is an eager, uncapturable fallback.
   moe_quant_kernel: "auto"
-  # Drafts per step from the layer-45 MTP module. Greedy requests only: a
-  # temperature > 0 or a repetition penalty is refused.
+  # Drafts per step from the layer-45 MTP module, verified by the engine's
+  # draft-verify (rejection sampling at a temperature); a repetition penalty
+  # is refused.
   mtp_num_draft_tokens: 3
   # Capture the prefill per (rows, token bucket); an uncaptured shape runs
   # eager. Adds ~40 s of capture at startup.
@@ -30,13 +31,12 @@ model_kwargs:
 # Per-resource overrides, keyed by what get_node_resources declares.
 resources:
   kv_cache:
-    # The 11 MLA layers and the MTP layer are paged, one 576-wide latent
-    # (512 + the rope slot that masks rejected drafts) per token per layer:
-    # ~13.8 KB/token/rank. A request holds up to 4096 rows (2048 tokens plus
-    # the rejected drafts), so 2048 pages x 128 = 64 of them, plus the sink
-    # page, ~3.6 GB/rank. Sized to the slot pool below, which is the real
-    # concurrency limit.
-    max_num_pages: 2049
+    # The 11 MLA layers and the MTP layer are paged, one 512-wide latent per
+    # token per layer: ~12.3 KB/token/rank. A request holds up to 2048 rows (its
+    # tokens and the verify rows written ahead of the engine's trim), so 1024
+    # pages x 128 = 64 of them, plus the sink page, ~1.6 GB/rank. Sized to the
+    # slot pool below, which is the real concurrency limit.
+    max_num_pages: 1025
     page_size: 128
   kda_state:
     # One slot per in-flight request plus the pool's sink, head-sharded
