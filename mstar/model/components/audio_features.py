@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
+from typing import Any
 
 import numpy as np
 import torch
@@ -346,6 +347,31 @@ class NemoLogMel:
         # autocast is off (offline); under the engine's autocast it runs in its dtype
         with fp32_precision_scope(Fp32Precision(matmul="highest", cudnn_allow_tf32=None)):
             return torch.log(self.mel_filters @ power + 2.0 ** -24)
+
+
+# NeMo ``preprocessor`` settings ``NemoLogMel`` runs for every checkpoint
+NEMO_MEL_SETTINGS = dict(
+    window="hann", log=True, frame_splicing=1, mag_power=2.0, exact_pad=False,
+    log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
+)
+# NeMo's ``AudioToMelSpectrogramPreprocessor`` defaults for the checked settings
+# its configs usually leave out
+_NEMO_PREPROCESSOR_DEFAULTS = dict(
+    mag_power=2.0, exact_pad=False, log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
+    preemph=0.97, pad_to=16,
+)
+
+
+def check_nemo_preprocessor(preprocessor: dict[str, Any], **model_settings: Any) -> None:
+    """Refuse a NeMo ``preprocessor`` config whose settings differ from
+    ``NEMO_MEL_SETTINGS`` and the model's own, the only ones compared. A key it
+    leaves out reads as NeMo's default where ``_NEMO_PREPROCESSOR_DEFAULTS``
+    has one, and is refused otherwise."""
+    expected = {**NEMO_MEL_SETTINGS, **model_settings}
+    got = {k: preprocessor.get(k, _NEMO_PREPROCESSOR_DEFAULTS.get(k)) for k in expected}
+    unsupported = {k: v for k, v in got.items() if v != expected[k]}
+    if unsupported:
+        raise ValueError(f"unsupported NeMo preprocessor settings {unsupported}; expected {expected}")
 
 
 @functools.cache

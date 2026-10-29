@@ -591,20 +591,6 @@ class FastConformerEncoder(nn.Module):
         return loaded
 
 
-# NeMo ``preprocessor`` settings ``NemoLogMel`` runs for every checkpoint
-NEMO_MEL_SETTINGS = dict(window="hann", log=True, frame_splicing=1)
-
-
-def check_nemo_preprocessor(preprocessor: dict[str, Any], **model_settings: Any) -> None:
-    """Refuse a NeMo ``preprocessor`` config that ``NEMO_MEL_SETTINGS`` and the
-    model's own settings don't describe. A key it leaves out is refused too,
-    rather than read as NeMo's default."""
-    expected = {**NEMO_MEL_SETTINGS, **model_settings}
-    unsupported = {k: preprocessor.get(k) for k, v in expected.items() if preprocessor.get(k) != v}
-    if unsupported:
-        raise ValueError(f"unsupported NeMo preprocessor settings {unsupported}; expected {expected}")
-
-
 def load_nemo_perception(
     config: FastConformerConfig,
     out_dim: int,
