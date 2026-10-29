@@ -1122,13 +1122,18 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if not d.reads:
             return
         h2d = self._deferred_h2d
+        reads = list(d.reads)
         if d.infos:
+            t0 = time.perf_counter()
             ctx = (torch.cuda.stream(self._h2d_stream)
                    if self._h2d_stream is not None else _nullcontext())
             with ctx:
                 self._copy_runs(d)
             h2d = h2d or self.device != "cpu"
-        reads = list(d.reads)
+            # transfer metrics: each edge read takes an equal share
+            share = (time.perf_counter() - t0) / len(reads)
+            for fp in reads:
+                fp.rx_time = (fp.rx_time or 0.0) + share
         d.clear()
         self._deferred_h2d = False
         future = None
