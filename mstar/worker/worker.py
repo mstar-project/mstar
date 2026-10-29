@@ -386,8 +386,8 @@ class Worker:
     _lockstep_led: frozenset[str] = frozenset()
     _lockstep_unread: Mapping[int, set[str]] = MappingProxyType({})
 
-    # The CPUs of the main, GPU and plan threads (None: not pinned) and the
-    # process mask everything else keeps; see ``mstar.utils.cpus``.
+    # The CPUs the main, GPU and plan threads share (None: not pinned) and
+    # the process mask everything else keeps; see ``mstar.utils.cpus``.
     _step_cpus: cpus.StepCpus | None = None
     _process_cpus: frozenset[int] = frozenset()
 
@@ -2285,7 +2285,7 @@ class Worker:
         engine = self.engine_manager.get_engine(spec_node_batch.node_name)
         engine.reset_pre_plan_for_batch(spec_node_batch)
 
-    def _init_engine_thread(self, role: str = "gpu") -> None:
+    def _init_engine_thread(self) -> None:
         """Pin this executor thread to the worker's accelerator device.
 
         The CUDA current device is per-thread and defaults to 0. PyTorch
@@ -2297,12 +2297,12 @@ class Worker:
 
         It also applies mstar's dynamo config, because dynamo config is
         per-thread since torch 2.12 and this thread compiles, and moves the
-        thread (``role``: ``gpu`` or ``plan``) to its step CPU.
+        thread to the step CPUs.
         """
         if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
         apply_dynamo_config()
-        self._pin_step_thread(role)
+        self._pin_step_thread()
 
     def _plan_step_cpus(
         self, worker_ids: list[str], local_worker_devices: list[str] | None,
@@ -2328,15 +2328,14 @@ class Worker:
             logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, plan.why)
         else:
             logger.info(
-                "Worker %s: step threads on CPUs main %s, GPU %s, plan %s (%s; %s, worker %d of %d, mask %s)",
-                self.worker_id, *(cpus.format_cpu_list(c) for c in step[:3]), step.why,
+                "Worker %s: step threads (main, GPU, plan) on CPUs %s (%s; %s, worker %d of %d, mask %s)",
+                self.worker_id, cpus.format_cpu_list(step.cpus), step.why,
                 self.device, slot + 1, len(devices), cpus.format_cpu_list(plan.mask),
             )
 
-    def _pin_step_thread(self, role: str) -> None:
-        step = self._step_cpus
-        if step is not None:
-            pin_thread({"main": step.main, "gpu": step.gpu, "plan": step.plan}[role], self._process_cpus)
+    def _pin_step_thread(self) -> None:
+        if self._step_cpus is not None:
+            pin_thread(self._step_cpus.cpus, self._process_cpus)
 
     @contextmanager
     def _span(self, name: str, cpu: str | None = None):
@@ -4895,9 +4894,9 @@ class Worker:
         )
 
         # The main thread hands every step to the GPU and plan threads and
-        # back, so all three move to their step CPUs (each executor thread in
+        # back, so all three move to the step CPUs (each executor thread in
         # its initializer).
-        self._pin_step_thread("main")
+        self._pin_step_thread()
 
         # The async worker path needs decode submission to return quickly so
         # the main loop can overlap queue/tensor polling and post-processing
@@ -4905,7 +4904,7 @@ class Worker:
         # 1-worker GPU thread.
         gpu_executor = ThreadPool(
             max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}",
-            initializer=self._init_engine_thread, initargs=("gpu",),
+            initializer=self._init_engine_thread,
         )
         logger.info(
             "Worker %s: engine runs on dedicated GPU thread",
@@ -4930,7 +4929,7 @@ class Worker:
         if pre_plan_spec:
             plan_executor = ThreadPool(
                 max_workers=1, thread_name_prefix=f"mstar-plan-{self.worker_id}",
-                initializer=self._init_engine_thread, initargs=("plan",),
+                initializer=self._init_engine_thread,
             )
             logger.info(
                 "Worker %s: plan_executor enabled — speculative plan() "

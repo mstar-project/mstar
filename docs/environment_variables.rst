@@ -491,27 +491,46 @@ Worker scheduling
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
    * - ``MSTAR_STEP_THREAD_CORE``
-     - config's ``knobs: step_thread_core``, else ``auto``
-     - The CPU a worker's main, GPU and plan threads share. A step passes
-       between them several times, and a thread woken on another core waits
-       for it to leave a deep idle state; on one shared CPU it starts at once.
-       ``auto`` pins only when the process mask is narrower than the host,
-       i.e. the server runs under ``taskset`` or a cpuset (separate servers
-       on one bare host would otherwise all pick the same CPUs); it then
-       gives each worker of the deployment its own CPU: the first one local
-       to its GPU (sysfs ``local_cpulist``) that the process may run on and
-       no earlier worker took, else the first free CPU of the mask. When the
-       mask has fewer than one CPU per worker plus one, nothing is pinned.
-       ``off`` leaves the threads on the process mask; a number pins on any
-       mask: it is the first worker's CPU, and the next workers take the
-       allowed CPUs above it. The API
-       server's message thread and the Rust frontend's bridge, which every
-       step's tokens pass through next, share the last CPU of the mask, and
-       the workers leave that one out (unless ``off``, or the mask has fewer
-       than three CPUs). Everything else (intra-op pools, transport threads,
-       the API server's data worker) keeps the process mask, the pools a
-       pinned thread starts later included. Each worker and
-       the API server log their CPU and how it was chosen. Read by
+     - config's ``knobs: step_thread_core``, else ``off``
+     - Pin each worker's main, GPU and plan threads to one core's two
+       hardware threads, and the API server's message thread and Rust
+       frontend bridge to one CPU of another core. A step hands work between
+       the three worker threads several times and every step's tokens pass
+       from the message thread to the bridge; a thread woken on an idle core
+       waits for that core to leave its idle state. The gain needs deep idle
+       states. On a 2x B300 host (Xeon 6767P, ``intel_idle``, C6 at 170 µs)
+       a handoff to another core took 130-175 µs and 4-5 µs to a running
+       one; on an H100 cloud VM without deep C-states it took 22 µs and
+       11 µs, and pinning only cost throughput there. Turn it on (``auto``)
+       where ``/sys/devices/system/cpu/cpu*/cpuidle/state*/latency`` shows a
+       C6-class state of 100 µs or more and the server is host-bound (small
+       models, high concurrency); leave it off on a VM without deep idle
+       states. Measured off → ``auto`` (all three threads on one CPU in
+       parentheses). B300 host, server ``taskset`` to 8 cores and their
+       siblings: Qwen3.5-0.8B c=1 338 → 529 (566) tok/s, c=64 12247 → 18990
+       (17824); 2B c=1 318 → 586 (529); Qwen3-TTS 1.7B c=1 TTFA p50 23.5 →
+       23.6 (34.6) ms. H100 VM, 40-CPU ``taskset`` (from the #919 review):
+       0.8B c=1 525 → 434 (486) tok/s, c=64 14455 → 14040 (12800); Qwen3-TTS
+       c=1 TTFA mean 21.0 → 21.0 (25.6) ms. ``auto``
+       places by the GPU's rank among the host's GPUs on its NUMA node (sysfs
+       ``/sys/bus/pci/devices``: the PCI functions of the GPU's vendor and
+       class in address order, ``numa_node`` and ``local_cpulist``), so
+       servers on different GPUs take different CPUs without knowing about
+       each other: a worker the core at that rank from the bottom of the
+       node's cores in the process mask, the API server the core at its
+       first worker's GPU's rank from the top; further workers of one
+       deployment on one GPU step by the node's GPU count. A GPU whose node
+       has no CPU in the mask picks, by its rank among all the host's GPUs,
+       from the cores the node-local GPUs leave. If the mask is too small to
+       leave a CPU unpinned, nothing is pinned and a warning says why. A
+       number names the first worker's core (its hardware threads in the
+       mask); the next workers take the next cores up and the API server the
+       last core of the mask. A number outside the mask, or too near its top
+       for every worker, stops the server at startup. Threads and pools a
+       pinned thread starts keep the process mask (``mstar.utils.threads``),
+       and the API server's intra-op and encode pools are sized from the
+       CPUs the pins leave (``CpuPlan`` in ``mstar.utils.cpus``). Each worker
+       and the API server log their CPUs and why. Read by
        ``knobs.step_thread_core``; no effect where ``os.sched_setaffinity``
        is missing (macOS, Windows).
    * - ``MSTAR_DECODE_BUCKETS``

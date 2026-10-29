@@ -109,11 +109,9 @@ def usable_cpus() -> int:
 # ── the plan ────────────────────────────────────────────────────────────────
 
 class StepCpus(NamedTuple):
-    """The CPUs one worker's main, GPU and plan threads run on, and how they
-    were chosen (for the log)."""
-    main: frozenset[int]
-    gpu: frozenset[int]
-    plan: frozenset[int]
+    """The CPUs one worker's main, GPU and plan threads share (one core's
+    hardware threads in the mask), and how they were chosen, for the log."""
+    cpus: frozenset[int]
     why: str
 
 
@@ -133,7 +131,7 @@ class CpuPlan:
         cpus = set() if self.result is None else {self.result}
         for step in self.workers:
             if step is not None:
-                cpus |= step.main | step.gpu | step.plan
+                cpus |= step.cpus
         return frozenset(cpus)
 
     @property
@@ -239,11 +237,13 @@ def _cores(cpus: Collection[int], siblings: Callable[[int], frozenset[int]]) -> 
     return sorted(cores)
 
 
-def _step_cpus(anchor: int, core: tuple[int, ...], why: str) -> StepCpus:
-    """A worker's step threads, on the core holding ``anchor``: all three on
-    the one CPU."""
-    one = frozenset({anchor})
-    return StepCpus(one, one, one, why)
+def _step_cpus(core: tuple[int, ...], why: str) -> StepCpus:
+    """A worker's step threads on all of ``core``'s hardware threads in the
+    mask. On one CPU the three queue behind each other (a Qwen3-TTS worker's
+    main thread alone keeps about 0.6 of a CPU busy at c=1); on the core's two
+    hardware threads there is room, and a woken thread still finds the core
+    awake."""
+    return StepCpus(frozenset(core), why)
 
 
 # ── building it ─────────────────────────────────────────────────────────────
@@ -304,7 +304,7 @@ def _explicit(first: int, n: int, mask: frozenset[int], cores: list[tuple[int, .
             f"process mask {format_cpu_list(mask)} (the last, {result_core[0]}, is the API server's)"
         )
     why = f"step_thread_core {first}"
-    workers = [_step_cpus(first if k == 0 else core[0], core, why) for k, core in enumerate(above[:n])]
+    workers = [_step_cpus(core, why) for core in above[:n]]
     return workers, result_core[0], f"{why}; the API server on the last core of the mask"
 
 
@@ -358,7 +358,7 @@ def _auto(addresses, mask, cores, pci_root, siblings):
         if core is None:
             return f"{len(addresses)} worker(s) and the API server need more cores than the mask has"
         taken.add(core)
-        workers.append(_step_cpus(core[0], core, f"auto: {why_i}"))
+        workers.append(_step_cpus(core, f"auto: {why_i}"))
     return workers, result_core[0], f"auto: {why} (the first worker's device), from the top"
 
 

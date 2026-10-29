@@ -60,11 +60,12 @@ def _plan(setting, addresses, mask, root, usable=None):
 
 
 def _one(cpu) -> StepCpus:
-    return StepCpus(frozenset({cpu}), frozenset({cpu}), frozenset({cpu}), "")
+    return StepCpus(frozenset({cpu}), "")
 
 
 def _cpus(plan: CpuPlan) -> list[int | None]:
-    return [None if w is None else min(w.main) for w in plan.workers]
+    """Each worker's first step CPU (its core's first hardware thread)."""
+    return [None if w is None else min(w.cpus) for w in plan.workers]
 
 
 # ── where a GPU sits ────────────────────────────────────────────────────────
@@ -101,7 +102,8 @@ def test_auto_takes_the_cores_at_the_gpus_rank_on_its_node(tmp_path):
     plan = _plan("auto", ["0000:40:00.0"], HOST, root)
     # GPU 2 of 2 on node 0: the worker the second core from the bottom, the
     # API server the second from the top
-    assert plan.workers[0][:3] == _one(1)[:3] and plan.result == 30
+    # (both hardware threads of the worker's core, one CPU for the API server)
+    assert plan.workers[0].cpus == {1, 129} and plan.result == 30
     assert "GPU 2 of 2 on its NUMA node" in plan.workers[0].why
     plan = _plan("auto", ["0000:62:00.0"], HOST, root)
     assert _cpus(plan) == [32] and plan.result == 63
@@ -156,13 +158,14 @@ def test_auto_pins_nothing_when_the_mask_is_too_small(tmp_path):
     assert plan.pinned == frozenset() and "more cores than the mask has" in plan.why
 
 
-def test_siblings_share_a_core_and_stay_off_the_step_cpu(tmp_path):
+def test_a_worker_takes_both_hardware_threads_of_its_core(tmp_path):
     root = _sysfs(tmp_path)
     mask = parse_cpu_list("32-35,160-163")
     plan = _plan("auto", [None, None], mask, root)
-    # cores, not hardware threads: the second worker gets the next core
-    assert _cpus(plan) == [32, 33] and plan.result == 35
-    assert all(160 + i not in plan.pinned for i in range(4))
+    assert [w.cpus for w in plan.workers] == [{32, 160}, {33, 161}] and plan.result == 35
+    assert plan.pinned == {32, 33, 35, 160, 161} and plan.left == 3
+    # a mask with one hardware thread of the core: that one
+    assert [w.cpus for w in _plan("auto", [None], parse_cpu_list("32-35"), root).workers] == [{32}]
 
 
 # ── a CPU number, and off ───────────────────────────────────────────────────
@@ -172,7 +175,8 @@ def test_a_number_is_the_first_workers_cpu_and_the_api_takes_the_last_core(tmp_p
     mask = parse_cpu_list("32-39")
     plan = _plan(34, ["0000:40:00.0", "0000:40:00.0"], mask, root)
     assert _cpus(plan) == [34, 35] and plan.result == 39
-    assert _cpus(_plan(32, [None], HOST, root)) == [32]
+    # the number names a core: the worker takes its hardware threads in the mask
+    assert _plan(160, [None], HOST, root).workers[0].cpus == {32, 160}
 
 
 @pytest.mark.parametrize(("setting", "n", "message"), [
@@ -250,15 +254,16 @@ def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
     w = _bare_worker()
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
         w._plan_step_cpus(["worker_0", "worker_1", "worker_2"], ["cuda:0", "cuda:1", "cuda:2"])
-    assert w._step_cpus[:3] == _one(1)[:3] and w._process_cpus == HOST
-    assert cpus.plan().result == 31 and cpus.plan().left == 54 - 4
-    assert ("step threads on CPUs main 1, GPU 1, plan 1 (auto: GPU 2 of 2 on its NUMA node, over its allowed "
+    assert w._step_cpus.cpus == {1, 129} and w._process_cpus == HOST
+    # three workers' cores and the API server's CPU leave 54 - 7 for the pools
+    assert cpus.plan().result == 31 and cpus.plan().left == 54 - 7
+    assert ("step threads (main, GPU, plan) on CPUs 1,129 (auto: GPU 2 of 2 on its NUMA node, over its allowed "
             "CPUs 0-31,128-159; cuda:1, worker 2 of 3, mask 0-255)") in caplog.text
 
     # standalone (no conductor list): the only worker
     w = _bare_worker()
     w._plan_step_cpus(["worker_1"], None)
-    assert w._step_cpus[:3] == _one(1)[:3]
+    assert w._step_cpus.cpus == {1, 129}
 
     # a number the mask can't honour stops the worker
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "300")
@@ -270,7 +275,7 @@ def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
         w._plan_step_cpus(["worker_1"], None)
     assert w._step_cpus is None and "step threads not pinned (step_thread_core off)" in caplog.text
-    w._pin_step_thread("main")  # a no-op
+    w._pin_step_thread()  # a no-op
     cpus.install(None)
 
 
@@ -338,14 +343,14 @@ def _tids() -> set[int]:
     return set(map(int, os.listdir("/proc/self/task")))
 
 
-def _confined_to(cpu: int, besides: set[int]) -> list[int]:
+def _confined_to(cpus: int | frozenset[int], besides: set[int]) -> list[int]:
     """This process's threads, other than ``besides``, whose mask is just
-    ``cpu``. ``besides`` holds the threads a test started with: an earlier
+    ``cpus``. ``besides`` holds the threads a test started with: an earlier
     test's idle pool threads may still be on their way out."""
     stray = []
     for tid in map(int, os.listdir("/proc/self/task")):
         try:
-            if tid not in besides and os.sched_getaffinity(tid) == {cpu}:
+            if tid not in besides and os.sched_getaffinity(tid) == ({cpus} if isinstance(cpus, int) else cpus):
                 stray.append(tid)
         except OSError:  # exited meanwhile
             pass
@@ -453,8 +458,8 @@ class _StopLoopError(BaseException):
 
 
 @needs_affinity
-@pytest.mark.parametrize("split", ["one CPU", "plan on another"])
-def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intra_op_pool, split):
+@pytest.mark.parametrize("width", [1, 2])
+def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intra_op_pool, width):
     """The real ``Worker.run``, every collaborator stubbed: one scheduled step,
     then a speculated one the plan thread pre-plans. Each of the three threads
     reports its mask from inside its own work; a thread one of them starts
@@ -464,7 +469,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     from mstar.worker.worker import Speculation
 
     allowed, cpu = _two_cpus()
-    plan_cpu = cpu if split == "one CPU" else min(allowed)
+    step = frozenset({cpu, min(allowed)} if width == 2 else {cpu})
     before = _tids()
     monkeypatch.setenv("MSTAR_PRE_PLAN_SPEC", "1")
     monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
@@ -508,7 +513,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
         # it started now would sit on its CPU
         torch.ones(torch.get_num_threads() * 65536).sum()
         steps = before | {seen[n][0] for n in ("main", "gpu") if n in seen} | {threading.get_native_id()}
-        mask("plan", _confined_to(cpu, steps) + _confined_to(plan_cpu, steps))
+        mask("plan", _confined_to(step, steps))
         return True
 
     def build_speculation(pending, consecutive, fair):
@@ -534,7 +539,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     w.tp_async_sched, w.is_tp_follower = False, False
     w._in_flight_rids = set()
     w._metrics = None
-    w._step_cpus = StepCpus(frozenset({cpu}), frozenset({cpu}), frozenset({plan_cpu}), "test")
+    w._step_cpus = StepCpus(step, "test")
     w._process_cpus = allowed
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: None)
@@ -575,7 +580,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     main.start()
     main.join(60)
     assert not main.is_alive() and not errors, errors
-    assert {name: m for name, (_, m, _) in seen.items()} == {"main": {cpu}, "gpu": {cpu}, "plan": {plan_cpu}}
+    assert {name: m for name, (_, m, _) in seen.items()} == {"main": step, "gpu": step, "plan": step}
     assert len({tid for tid, _, _ in seen.values()}) == 3
     # no other thread of the process landed on a step CPU, the intra-op pool
     # the plan thread just used included (looked at while it was alive)

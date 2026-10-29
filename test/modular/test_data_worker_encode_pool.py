@@ -11,9 +11,9 @@ import pytest
 import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState
-from mstar.utils import cpus
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.streaming.topology import PartitionTopology
+from mstar.utils import cpus
 
 
 class _Model:
