@@ -1,62 +1,72 @@
-"""Large host copies split over a few threads of their own.
+"""Large host copies split over threads of their own.
 
 The API server sizes torch's intra-op pool for its small per-request ops
-(``entrypoint.default_preprocess_threads``: two threads on an 8-core pin), and
-one numpy memcpy runs on one core. A video output (121 frames at 832x480 is
-145 MB) copied either way takes two to three times as long as it does over
-the CPUs the process may use. numpy releases the GIL while it copies, so
-slices on a small pool run in parallel without resizing the intra-op pool.
+(``entrypoint.default_preprocess_threads``), and one numpy memcpy runs on one
+core. Most of a large copy into a fresh allocation is the destination's
+first-touch page faults, which a copy split into slices takes in parallel too.
+numpy releases the GIL while it copies, so slices on a pool of their own run in
+parallel without resizing the intra-op pool.
 """
 from __future__ import annotations
 
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import torch
 
-from mstar.utils.cpus import usable_cpus
+# The smallest slice worth a pool thread: below a few MB the handoff costs
+# about what the slice saves, so a 3 MB image stays one memcpy and a copy gets
+# one more slice per MIN_SLICE_BYTES, up to the copier's width.
+MIN_SLICE_BYTES = 4 << 20
 
-# Smaller copies stay one memcpy. Slicing pays off somewhere past a few MB:
-# a 3 MB image copies in ~0.7 ms on one core and ~1.7 ms in 8 slices, 40 MB
-# in ~16 ms and ~10 ms (B300 host, Xeon 6740E).
-PARALLEL_COPY_BYTES = 16 << 20
-MAX_COPY_WORKERS = 8
-
-_pool: ThreadPoolExecutor | None = None
-_workers = 0
-_pool_lock = threading.Lock()
+_TORCH_DTYPES: dict[np.dtype, torch.dtype] = {}
 
 
-def _copy_pool() -> tuple[ThreadPoolExecutor, int]:
-    global _pool, _workers
-    with _pool_lock:
-        if _pool is None:
-            _workers = max(1, min(MAX_COPY_WORKERS, usable_cpus()))
-            _pool = ThreadPoolExecutor(max_workers=_workers, thread_name_prefix="mstar-copy")
-        return _pool, _workers
+def _torch_dtype(dtype: np.dtype) -> torch.dtype:
+    if dtype not in _TORCH_DTYPES:
+        _TORCH_DTYPES[dtype] = torch.from_numpy(np.empty(0, dtype)).dtype
+    return _TORCH_DTYPES[dtype]
 
 
-def copy_into(dst: np.ndarray, src: np.ndarray) -> np.ndarray:
-    """``dst[...] = src``, in slices along the first axis on the copy pool once
-    ``dst`` is at least ``PARALLEL_COPY_BYTES``. Returns ``dst``.
+class HostCopier:
+    """Copies host arrays into fresh torch allocations, a large one in slices
+    along its first axis on ``workers`` threads.
 
-    Give it a destination torch allocated (``torch.empty(...).numpy()``), not
-    ``np.empty``: numpy madvises large arrays for huge pages, and under THP
-    ``defrag=madvise`` their first-touch faults can stall in compaction."""
-    if dst.shape != src.shape:
-        raise ValueError(f"copy_into: shape {src.shape} into {dst.shape}")
-    parts = 1
-    if dst.nbytes >= PARALLEL_COPY_BYTES and dst.ndim:
-        pool, workers = _copy_pool()
-        parts = min(workers, dst.shape[0])
-    if parts < 2:
-        np.copyto(dst, src)
+    The destination is torch's, never ``np.empty``: numpy madvises large arrays
+    for huge pages, and under THP ``defrag=madvise`` their first-touch faults
+    can stall in compaction."""
+
+    def __init__(self, workers: int, min_slice_bytes: int | None = None):
+        self.workers = max(1, workers)
+        self.min_slice_bytes = MIN_SLICE_BYTES if min_slice_bytes is None else max(1, min_slice_bytes)
+        self._pool = (
+            ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="mstar-copy")
+            if self.workers > 1 else None
+        )
+
+    def slices(self, src: np.ndarray) -> int:
+        if self._pool is None or not src.ndim:
+            return 1
+        return max(1, min(self.workers, src.shape[0], src.nbytes // self.min_slice_bytes))
+
+    def copy(self, src: np.ndarray) -> torch.Tensor:
+        """A contiguous torch copy of ``src`` (which may be strided)."""
+        # Allocated as bytes and viewed, which costs less than a typed,
+        # shaped allocation on the many small reads.
+        flat = torch.empty(src.nbytes, dtype=torch.uint8)
+        if src.ndim == 1 and src.dtype == np.uint8:
+            dst, out = flat, flat.numpy()
+        else:
+            dst = flat.view(_torch_dtype(src.dtype)).view(src.shape)
+            out = flat.numpy().view(src.dtype).reshape(src.shape)
+        if src.nbytes < 2 * self.min_slice_bytes or (parts := self.slices(src)) == 1:
+            np.copyto(out, src)
+            return dst
+        step = -(-src.shape[0] // parts)
+        futures = [
+            self._pool.submit(np.copyto, out[i:i + step], src[i:i + step])
+            for i in range(0, src.shape[0], step)
+        ]
+        for future in futures:
+            future.result()
         return dst
-    step = -(-dst.shape[0] // parts)
-    futures = [
-        pool.submit(np.copyto, dst[i:i + step], src[i:i + step])
-        for i in range(0, dst.shape[0], step)
-    ]
-    for future in futures:
-        future.result()
-    return dst

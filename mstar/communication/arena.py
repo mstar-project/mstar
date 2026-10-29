@@ -60,7 +60,7 @@ from mstar.communication.tensors import (
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.utils.containers import ParallelList
-from mstar.utils.host_copy import copy_into
+from mstar.utils.host_copy import HostCopier
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +233,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         communicator: BaseCommunicator,
         shm_dir: str | None = None,
         enable_prof: bool = False,
+        copy_workers: int = 1,
     ):
         super().__init__(
             my_entity_id=my_entity_id, hostname=hostname, device=device,
@@ -240,6 +241,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             enable_prof=enable_prof,
         )
         from mstar_rust import SegmentedShmArena, ShmArena
+
+        # A CPU consumer's reads (the API server's outputs) copy on these.
+        self._host_copier = HostCopier(copy_workers)
 
         self._ShmArena = ShmArena
         segment_mb = int(os.getenv("MSTAR_SHM_ARENA_SEGMENT_MB", "256"))
@@ -975,13 +979,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         start = info.shm_offset + info.offset  # offset = TP-shard read offset
         if self.device == "cpu":
             # A CPU consumer owns a copy past reclaim. clone() would split it
-            # over torch's intra-op pool, sized for small ops; copy_into is one
-            # memcpy for those and a few threads of its own for a video. The
-            # destination is torch's: numpy madvises large arrays for huge pages,
-            # and with THP defrag=madvise their faults can stall in compaction.
-            src = np.frombuffer(view, dtype=np.uint8, count=info.nbytes, offset=start)
-            flat = torch.empty(info.nbytes, dtype=torch.uint8)
-            copy_into(flat.numpy(), src)
+            # over torch's intra-op pool, sized for small ops; the copier keeps
+            # an image one memcpy and slices a video over threads of its own.
+            flat = self._host_copier.copy(
+                np.frombuffer(view, dtype=np.uint8, count=info.nbytes, offset=start))
             return flat.view(info.dtype).reshape(info.dims)
         flat = torch.frombuffer(
             view[start:start + info.nbytes], dtype=torch.uint8)
