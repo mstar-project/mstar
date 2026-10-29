@@ -4,7 +4,7 @@ The Talker is a smaller MoE transformer (1024 hidden, 20 layers) that runs
 in streaming mode alongside the Thinker.  Key differences from the Thinker:
 
 1. Standard 1-D RoPE (no 3-D MRoPE).
-2. All layers are MoE with a shared expert (``SparseMoeBlockWithSharedExpert``).
+2. All layers are MoE with a shared expert (``ParallelSparseMoeBlock`` with ``shared_expert``).
 3. No ``lm_head`` -- uses ``codec_head`` for codec token prediction.
 4. Has ``codec_embedding`` for layer-0 codec tokens.
 5. Has ``text_projection`` and ``hidden_projection`` MLPs that project
@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm
+from mstar.model.components import ParallelSparseMoeBlock, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
 from mstar.model.qwen3_omni.config import TALKER_ATTN, TALKER_KV, TALKER_POS, Qwen3OmniModelConfig, TalkerTextConfig
@@ -85,7 +85,7 @@ class Qwen3OmniTalkerLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
 
-        self.mlp = ParallelSparseMoeBlockWithSharedExpert(
+        self.mlp = ParallelSparseMoeBlock(
             hidden_size=hidden_size,
             moe_intermediate_size=config.moe_intermediate_size,
             num_experts=config.num_experts,

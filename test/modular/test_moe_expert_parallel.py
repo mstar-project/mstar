@@ -1,9 +1,9 @@
-"""Single-process parity tests for :class:`ExpertParallelSparseMoeBlock`.
+"""Single-process parity tests for an expert-parallel :class:`ParallelSparseMoeBlock`.
 
 EP output is a sum over expert shards, so each test builds all P rank
 blocks in one process with a fake ``CommGroup`` whose all-reduce is the
 identity, sums their outputs, and compares with an unsharded
-:class:`SparseMoeBlock`. The naive path runs on CPU; the fused Triton path
+TP1 :class:`ParallelSparseMoeBlock`. The naive path runs on CPU; the fused Triton path
 runs only when CUDA is available.
 """
 
@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlock, SparseMoeBlock
+from mstar.model.components import ParallelSparseMoeBlock
 
 HIDDEN, INTER, NUM_EXPERTS, TOP_K = 64, 32, 16, 4
 
@@ -100,7 +100,7 @@ def _load(block, ckpt):
 
 
 def _reference(ckpt, router, router_w, device, dtype):
-    ref = SparseMoeBlock(HIDDEN, NUM_EXPERTS, TOP_K, INTER, router=router)
+    ref = ParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, TOP_K, INTER, router=router)
     with torch.no_grad():
         ref.gate.weight.copy_(router_w)
         for e in range(NUM_EXPERTS):
@@ -113,9 +113,9 @@ def _ep_blocks(world_size, ckpt, router_factory, router_w, device, dtype, router
     blocks = []
     bus = {}
     for rank in range(world_size):
-        block = ExpertParallelSparseMoeBlock(
+        block = ParallelSparseMoeBlock(
             HIDDEN, NUM_EXPERTS, TOP_K, INTER,
-            router=router_factory(), comm_group=_FakeCommGroup(rank, world_size, bus),
+            router=router_factory(), comm_group=_FakeCommGroup(rank, world_size, bus), expert_parallel=True,
         )
         # The router is replicated on every rank, unless a test perturbs it.
         with torch.no_grad():
@@ -226,8 +226,8 @@ def test_ep_loader_keeps_only_local_experts(world_size):
     ckpt = _checkpoint()
     e_local = NUM_EXPERTS // world_size
     for rank in range(world_size):
-        block = ExpertParallelSparseMoeBlock(
-            HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size),
+        block = ParallelSparseMoeBlock(
+            HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size), expert_parallel=True,
         )
         assert block.experts.gate_up_proj.shape == (e_local, 2 * INTER, HIDDEN)
         assert block.experts.down_proj.shape == (e_local, HIDDEN, INTER)
@@ -248,9 +248,29 @@ def test_ep_loader_keeps_only_local_experts(world_size):
             torch.testing.assert_close(block.experts.down_proj[local], ckpt[f"down:{e}"])
 
 
+@pytest.mark.parametrize("shard_id, shape", [
+    (None, (INTER, HIDDEN)),
+    ("gate:-1", (INTER, HIDDEN)),
+    (f"up:{NUM_EXPERTS}", (INTER, HIDDEN)),
+    (f"down:{NUM_EXPERTS}", (HIDDEN, INTER)),
+    ("gate:0", (INTER + 1, HIDDEN)),
+    ("down:0", (HIDDEN, INTER - 1)),
+    ("down:0", (INTER, HIDDEN)),
+])
+def test_loader_rejects_a_bad_expert_weight(shard_id, shape):
+    """A missing id, another projection's id, an expert outside [0, num_experts) or a
+    wrong shape fails loudly."""
+    block = ParallelSparseMoeBlock(
+        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(0, 2), expert_parallel=True,
+    )
+    param = block.experts.down_proj if shape[0] == HIDDEN else block.experts.gate_up_proj
+    with pytest.raises(ValueError):
+        param.weight_loader(param, torch.zeros(shape), shard_id)
+
+
 def test_ep_loaders_survive_module_apply():
-    block = ExpertParallelSparseMoeBlock(
-        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(1, 2),
+    block = ParallelSparseMoeBlock(
+        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(1, 2), expert_parallel=True,
     ).to(torch.float64)
     ckpt = _checkpoint()
     _load(block, ckpt)
@@ -259,7 +279,7 @@ def test_ep_loaders_survive_module_apply():
 
 def test_ep_rejects_uneven_experts():
     with pytest.raises(AssertionError, match="not divisible"):
-        ExpertParallelSparseMoeBlock(HIDDEN, 10, TOP_K, INTER, comm_group=_FakeCommGroup(0, 4))
+        ParallelSparseMoeBlock(HIDDEN, 10, TOP_K, INTER, comm_group=_FakeCommGroup(0, 4), expert_parallel=True)
 
 
 def _routing(block, x):
@@ -272,8 +292,9 @@ def test_ep_expert_load_counts_every_expert(dev):
     """Rank 0 counts slots for all experts, including other ranks' ones."""
     device, dtype = dev
     router_w = torch.randn(NUM_EXPERTS, HIDDEN)
-    block = ExpertParallelSparseMoeBlock(
-        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(0, 2), track_expert_load=True,
+    block = ParallelSparseMoeBlock(
+        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(0, 2), expert_parallel=True,
+        track_expert_load=True,
     )
     with torch.no_grad():
         block.gate.weight.copy_(router_w)
@@ -292,7 +313,9 @@ def test_ep_expert_load_counts_every_expert(dev):
 
 def test_ep_expert_load_zeroed_after_to_empty():
     with torch.device("meta"):
-        block = ExpertParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, TOP_K, INTER, track_expert_load=True)
+        block = ParallelSparseMoeBlock(
+            HIDDEN, NUM_EXPERTS, TOP_K, INTER, expert_parallel=True, track_expert_load=True,
+        )
     block.to_empty(device="cpu")
     assert block.expert_load.dtype == torch.int64
     assert (block.expert_load == 0).all()
@@ -301,14 +324,16 @@ def test_ep_expert_load_zeroed_after_to_empty():
 
 
 def test_ep_expert_load_off_by_default():
-    block = ExpertParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, TOP_K, INTER)
+    block = ParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, TOP_K, INTER, expert_parallel=True)
     assert not hasattr(block, "expert_load")
 
 
-def _rank_blocks(cls, world_size, ckpt, router_w, device, dtype, **kwargs):
+def _rank_blocks(world_size, ckpt, router_w, device, dtype, **kwargs):
     blocks, bus = [], {}
     for rank in range(world_size):
-        block = cls(HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size, bus), **kwargs)
+        block = ParallelSparseMoeBlock(
+            HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size, bus), **kwargs,
+        )
         with torch.no_grad():
             block.gate.weight.copy_(router_w)
         block = block.to(device, dtype)
@@ -319,21 +344,23 @@ def _rank_blocks(cls, world_size, ckpt, router_w, device, dtype, **kwargs):
 
 _CPU, _CUDA = ("cpu", torch.float32), ("cuda", torch.bfloat16)
 _SCHEMES = [
-    pytest.param(ExpertParallelSparseMoeBlock, 1, _CPU, id="ep1-naive-cpu"),
-    pytest.param(ExpertParallelSparseMoeBlock, 4, _CPU, id="ep4-naive-cpu"),
-    pytest.param(ExpertParallelSparseMoeBlock, 4, _CUDA, id="ep4-fused-cuda", marks=_needs_cuda),
-    pytest.param(ParallelSparseMoeBlock, 1, _CPU, id="tp1-naive-cpu"),
-    pytest.param(ParallelSparseMoeBlock, 1, _CUDA, id="tp1-fused-cuda", marks=_needs_cuda),
-    # TP > 1 dispatches through the fused kernel only.
-    pytest.param(ParallelSparseMoeBlock, 4, _CUDA, id="tp4-fused-cuda", marks=_needs_cuda),
+    pytest.param(True, 1, _CPU, id="ep1-naive-cpu"),
+    pytest.param(True, 4, _CPU, id="ep4-naive-cpu"),
+    pytest.param(True, 4, _CUDA, id="ep4-fused-cuda", marks=_needs_cuda),
+    pytest.param(False, 1, _CPU, id="tp1-naive-cpu"),
+    pytest.param(False, 1, _CUDA, id="tp1-fused-cuda", marks=_needs_cuda),
+    pytest.param(False, 4, _CPU, id="tp4-naive-cpu"),
+    pytest.param(False, 4, _CUDA, id="tp4-fused-cuda", marks=_needs_cuda),
 ]
 
 
-@pytest.mark.parametrize("cls, world_size, dev", _SCHEMES)
-def test_padding_rows_skip_every_gemm(cls, world_size, dev):
+@pytest.mark.parametrize("expert_parallel, world_size, dev", _SCHEMES)
+def test_padding_rows_skip_every_gemm(expert_parallel, world_size, dev):
     """Masked rows contribute zero; real rows match the unmasked forward."""
     device, dtype = dev
-    blocks = _rank_blocks(cls, world_size, _checkpoint(), torch.randn(NUM_EXPERTS, HIDDEN), device, dtype)
+    blocks = _rank_blocks(
+        world_size, _checkpoint(), torch.randn(NUM_EXPERTS, HIDDEN), device, dtype, expert_parallel=expert_parallel,
+    )
     x = torch.randn(9, HIDDEN, device=device, dtype=dtype)
     num_real = 6
     valid = torch.arange(9, device=device) < torch.tensor([num_real], device=device)
@@ -347,7 +374,7 @@ def test_padding_rows_skip_every_gemm(cls, world_size, dev):
 def test_ep_expert_load_ignores_padding():
     router_w = torch.randn(NUM_EXPERTS, HIDDEN)
     (block,) = _rank_blocks(
-        ExpertParallelSparseMoeBlock, 1, _checkpoint(), router_w, "cpu", torch.float32, track_expert_load=True,
+        1, _checkpoint(), router_w, "cpu", torch.float32, expert_parallel=True, track_expert_load=True,
     )
     x = torch.randn(7, HIDDEN)
     valid = torch.tensor([True] * 4 + [False] * 3)

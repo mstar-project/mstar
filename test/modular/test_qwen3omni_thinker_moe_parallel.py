@@ -19,7 +19,6 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import CommGroup
 from mstar.model.base import Model, node_moe_parallel_configs
 from mstar.model.components import (
-    ExpertParallelSparseMoeBlock,
     MoeParallelConfig,
     ParallelSparseMoeBlock,
     instantiate_moe_block,
@@ -72,16 +71,19 @@ def test_from_yaml_rejects(section, match):
         MoeParallelConfig.from_yaml(section)
 
 
-@pytest.mark.parametrize("parallel, cls", [("tp", ParallelSparseMoeBlock), ("ep", ExpertParallelSparseMoeBlock)])
-def test_layer_picks_moe_block(parallel, cls):
+@pytest.mark.parametrize("parallel", ["tp", "ep"])
+def test_layer_picks_moe_block(parallel):
     moe = MoeParallelConfig.from_yaml({"parallel": parallel})
     with torch.device("meta"):
         layer = Qwen3OmniThinkerLayer(_config(), 0, comm_group=_group(1, 2), moe_parallel=moe)
-    assert type(layer.mlp) is cls
+    assert type(layer.mlp) is ParallelSparseMoeBlock
     if parallel == "ep":
         # Rank 1 of 2 owns experts 4..7 at full width.
-        assert layer.mlp.expert_start == NUM_EXPERTS // 2
+        assert layer.mlp.experts.expert_start == NUM_EXPERTS // 2
         assert layer.mlp.experts.down_proj.shape == (NUM_EXPERTS // 2, 64, 16)
+    else:
+        # Rank 1 of 2 holds the second half of every expert's intermediate.
+        assert layer.mlp.experts.down_proj.shape == (NUM_EXPERTS, 64, 8)
 
 
 @pytest.mark.parametrize("rank, tracked", [(0, True), (1, False)])
@@ -144,15 +146,16 @@ def test_load_log_discards_warmup(caplog):
     assert "per-rank slots [6, 2]" in record.getMessage()
 
 
-@pytest.mark.parametrize("parallel, cls", [("tp", ParallelSparseMoeBlock), ("ep", ExpertParallelSparseMoeBlock)])
-def test_instantiate_moe_block(parallel, cls):
+@pytest.mark.parametrize("parallel, local_experts", [("tp", NUM_EXPERTS), ("ep", NUM_EXPERTS // 2)])
+def test_instantiate_moe_block(parallel, local_experts):
     with torch.device("meta"):
         block = instantiate_moe_block(
             hidden_size=64, num_experts=NUM_EXPERTS, num_experts_per_tok=2,
             moe_intermediate_size=16, comm_group=_group(0, 2),
             moe_parallel=MoeParallelConfig(parallel=parallel),
         )
-    assert type(block) is cls
+    assert type(block) is ParallelSparseMoeBlock
+    assert block.experts.num_local_experts == local_experts
 
 
 def test_instantiate_moe_block_defaults_to_tp():

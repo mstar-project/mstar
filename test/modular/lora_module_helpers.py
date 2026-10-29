@@ -653,31 +653,27 @@ def _higgs():
     )
 
 
-def _omni(dense: bool):
-    """``dense``: every layer a dense MLP, so TP runs on a CPU (the sharded MoE dispatch
-    is a Triton kernel); else layer 0 is MoE and takes no delta."""
+def _omni():
+    """Layer 0 is MoE (its routed experts take no delta), layer 1 a dense MLP."""
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
     from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig, ThinkerTextConfig
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
 
-    moe_layers = () if dense else (0,)
-
     def weights(c):
         tc = c.thinker_text
         out = llama_weights(tc, "model.", "lm_head", qk_norm=True)
-        for layer in moe_layers:
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                del out[f"model.layers.{layer}.mlp.{proj}.weight"]
-            out[f"model.layers.{layer}.mlp.gate.weight"] = rand(tc.num_experts, tc.hidden_size, seed=900)
-            for e in range(tc.num_experts):
-                for proj, shape in (("gate_proj", (8, 16)), ("up_proj", (8, 16)), ("down_proj", (16, 8))):
-                    out[f"model.layers.{layer}.mlp.experts.{e}.{proj}.weight"] = rand(*shape, seed=901 + e, scale=0.2)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            del out[f"model.layers.0.mlp.{proj}.weight"]
+        out["model.layers.0.mlp.gate.weight"] = rand(tc.num_experts, tc.hidden_size, seed=900)
+        for e in range(tc.num_experts):
+            for proj, shape in (("gate_proj", (8, 16)), ("up_proj", (8, 16)), ("down_proj", (16, 8))):
+                out[f"model.layers.0.mlp.experts.{e}.{proj}.weight"] = rand(*shape, seed=901 + e, scale=0.2)
         return out
 
     def adapted(c):
         return {m: s for m, s in llama_layers(c.thinker_text, "model.").items()
-                if "self_attn" in m or int(m.split(".")[2]) not in moe_layers}
+                if "self_attn" in m or not m.startswith("model.layers.0.")}
 
     # the released Qwen3-Omni-30B-A3B Thinker's text config
     full = Qwen3OmniModelConfig(thinker_text=ThinkerTextConfig(
@@ -690,7 +686,7 @@ def _omni(dense: bool):
             vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
             num_attention_heads=4, num_key_value_heads=2, head_dim=4, num_experts=4,
             num_experts_per_tok=2, moe_intermediate_size=8,
-            mlp_only_layers=[i for i in range(2) if i not in moe_layers],
+            mlp_only_layers=[1],
         )),
         lora_spec=lambda c: _declared(model_object(Qwen3OmniModel, c)),
         build=lambda c, group, w: ThinkerSubmodule(_loaded(
@@ -703,9 +699,8 @@ def _omni(dense: bool):
         run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.embed_tokens(ids),
                      lambda s, x: s.model(input_embeds=x, label="main")[0], lambda s, x: s.model.lm_head(x)),
         declare=_declare("prefill_text"), inputs=_tokens(lambda c: c.thinker_text.vocab_size),
-        released=None if dense else lambda: (model_object(Qwen3OmniModel, full),
-                                             lambda c, g: Qwen3OmniThinkerModel(c, comm_group=g)),
-        worlds=(1, 2, 4) if dense else (1,),
+        released=lambda: (model_object(Qwen3OmniModel, full),
+                          lambda c, g: Qwen3OmniThinkerModel(c, comm_group=g)),
         a1_rename=lambda m: f"thinker.{m}",  # the full model's checkpoint naming
     )
 
@@ -858,8 +853,7 @@ def _qwen3_5():
 STACKS = {
     "orpheus": _orpheus,
     "higgs_audio": _higgs,
-    "qwen3_omni_thinker": lambda: _omni(dense=False),
-    "qwen3_omni_thinker_dense": lambda: _omni(dense=True),
+    "qwen3_omni_thinker": _omni,
     "qwen3_tts_talker": _qwen3_tts,
     "chatterbox_t3": _chatterbox_t3,
     "qwen3_5": _qwen3_5,
