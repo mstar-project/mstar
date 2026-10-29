@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import sys
 import threading
+from concurrent.futures import Future
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -362,3 +364,36 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     _run(w)
 
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
+
+
+@pytest.mark.parametrize("tp_seq, never_runs", [(5, False), (-1, False), (5, True)])
+def test_the_admit_fence_waits_out_a_lockstep_step(monkeypatch, tp_seq, never_runs):
+    """A teardown inside a lockstep step's admit splits the ranks, so the fence waits for
+    it past any number of warning intervals; any other step is given up on after one. A
+    step whose future completed without running (a GPU executor that failed to start)
+    never sets the event, and ends the wait too."""
+    monkeypatch.setattr(worker_mod, "_ADMIT_FENCE_TIMEOUT_S", 0.02)
+    admitted = threading.Event()
+    future = Future()
+    if never_runs:
+        future.set_exception(RuntimeError("the GPU executor failed to start"))
+    w = Worker.__new__(Worker)
+    w.worker_id = "rank0"
+    w._span = lambda name: nullcontext()
+    _, executing = _batch(tp_seq, [HANDLES["kept"]])
+    executing.launch_started_event = admitted
+    pending = SimpleNamespace(
+        tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, node_batch=executing, future=future,
+    )
+    timer = threading.Timer(0.3, admitted.set)
+    if not never_runs:
+        timer.start()
+    fence = threading.Thread(target=w._await_admit_settled, args=(pending,), daemon=True)
+    try:
+        fence.start()
+        fence.join(timeout=5)
+        returned_admitted = admitted.is_set()
+    finally:
+        timer.cancel()
+    assert not fence.is_alive()
+    assert returned_admitted == (tp_seq >= 0 and not never_runs)
