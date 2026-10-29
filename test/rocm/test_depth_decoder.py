@@ -261,10 +261,9 @@ def _loop(fn, cp, group0, last_hidden, codes, sum_dtype):
     from mstar.model.components.depth_decoder import DepthDecoder
 
     sampler = _Forced(codes)
-    kv = cp.depth_kv_cache(len(codes), 32)
     with torch.no_grad(), torch.autocast(DEV, dtype=torch.bfloat16):
         out_codes, embed_sum = getattr(DepthDecoder, fn)(cp, last_hidden.clone(), codes[:, 0].contiguous(), group0,
-                                                         sampler, kv, sum_dtype or group0.weight.dtype)
+                                                         sampler, 32, sum_dtype)
     assert torch.equal(out_codes, codes)
     return torch.stack(sampler.logits), embed_sum
 
@@ -311,11 +310,9 @@ def test_fused_loop_replays_from_a_captured_graph(build, rows):
     width = cp.input_projection.in_features if cp.input_projection is not None else group0.weight.shape[1]
     last_hidden = torch.randn(rows, width, device=DEV).to(torch.bfloat16)
     layer0 = torch.randint(0, group0.num_embeddings, (rows,), device=DEV)
-    kv = cp.depth_kv_cache(rows, 32)
-    sum_dtype = sum_dtype or group0.weight.dtype
 
     def run():
-        return DepthDecoder._fused_loop(cp, last_hidden, layer0, group0, lambda x: x.argmax(-1), kv, sum_dtype)
+        return DepthDecoder._fused_loop(cp, last_hidden, layer0, group0, lambda x: x.argmax(-1), 32, sum_dtype)
 
     with torch.no_grad(), torch.autocast(DEV, dtype=torch.bfloat16, cache_enabled=False):
         eager = [t.clone() for t in run()]

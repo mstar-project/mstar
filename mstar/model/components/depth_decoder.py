@@ -10,23 +10,24 @@ the backbone's decode graph.
 ``DepthDecoder`` runs that loop for a code predictor with the standard layer
 anatomy (``input_layernorm``, ``self_attn`` with ``qkv_proj``, ``q_norm``, ``k_norm``
 and ``o_proj``, ``post_attention_layernorm``, a gated ``mlp``). At decode batch sizes
-the loop is bound by its kernel count, so where the platform has the fused depth
-kernels (``mstar.platforms.depth_decoder_ops``) it runs as a fixed sequence of
-them, eagerly: per layer the QKV GEMM, one attention kernel that also normalizes,
-rotates and appends k and v, the output GEMM, a fused residual add and norm, the
-gate/up GEMM, the activation, the down GEMM. Elsewhere each model's own
-per-position forward, ``forward_depth_unrolled``, runs as before.
+the loop is bound by its kernel count, so on AMD GPUs, where the fused depth
+kernels (``mstar.platforms.depth_decoder_ops``) are validated, it runs as a fixed
+sequence of them, eagerly: per layer the QKV GEMM, one attention kernel that also
+normalizes, rotates and appends k and v, the output GEMM, a fused residual add and
+norm, the gate/up GEMM, the activation, the down GEMM. Elsewhere each model's own
+per-position forward, ``forward_depth_unrolled``, runs as before, until an A/B on
+that platform moves it.
 """
 
-from collections.abc import Callable
+import types
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.rms_norm import run_rms_norm
+from mstar.platforms import current_platform
 from mstar.platforms import depth_decoder_ops as ops
-from mstar.platforms.dispatch import PlatformDispatch
 
 
 class DepthDecoder(nn.Module):
@@ -36,6 +37,15 @@ class DepthDecoder(nn.Module):
     (the table of group g at ``g - 1``), the stacked LM heads ``lm_head_weight``
     (``[G - 1, vocab, hidden]``), ``input_projection`` (applied to every depth
     input, or None) and ``forward_depth_unrolled``, its per-position forward.
+
+    ``run_depth_loop(last_hidden, layer0_codes, group0_embedding, sample,
+    max_batch_size, sum_dtype=None)`` walks codec groups 1..G-1 for one frame per
+    row. ``last_hidden`` is the backbone's hidden state per row, ``layer0_codes`` the
+    group-0 codes it sampled, ``group0_embedding`` the backbone's codec table and
+    ``sample`` maps one group's logits to codes; the KV scratch is allocated once for
+    ``max_batch_size`` rows. Returns ``all_codes`` (``[rows, G]`` int64) and the sum
+    of the frame's G code embeddings, the next backbone step's input, in
+    ``sum_dtype`` (default: the embeddings' dtype).
     """
 
     def __init__(self) -> None:
@@ -45,6 +55,12 @@ class DepthDecoder(nn.Module):
         # address is what a captured decode graph reads and writes.
         self._depth_kv: torch.Tensor | None = None
         self._fusable: bool | None = None
+        # Bound per instance rather than dispatched inside a method: a compiled caller
+        # must reach the loop with no frame of its own in between, or dynamo compiles
+        # that frame around the sampler (a bound method, new on every call) and
+        # recompiles it every step, which fails graph capture.
+        loop = DepthDecoder._fused_loop if current_platform.is_rocm() else DepthDecoder._reference_loop
+        self.run_depth_loop = types.MethodType(loop, self)
 
     @property
     def input_projection(self) -> nn.Module | None:
@@ -54,10 +70,8 @@ class DepthDecoder(nn.Module):
     def num_code_groups(self) -> int:
         return len(self.model.codec_embedding) + 1
 
-    @torch.compiler.disable
     def depth_kv_cache(self, batch_size: int, max_batch_size: int) -> torch.Tensor:
-        """The KV scratch for ``batch_size`` rows, allocated once for ``max_batch_size``
-        (eagerly, so a compiled forward never owns it)."""
+        """The KV scratch for ``batch_size`` rows, allocated once for ``max_batch_size``."""
         if self._depth_kv is None:
             attn = self.model.layers[0].self_attn
             weight = attn.qkv_proj.weight
@@ -67,33 +81,14 @@ class DepthDecoder(nn.Module):
             )
         return self._depth_kv[:, :batch_size]
 
-    @torch.compiler.disable(recursive=False)
-    def run_depth_loop(
-        self,
-        last_hidden: torch.Tensor,
-        layer0_codes: torch.Tensor,
-        group0_embedding: nn.Embedding,
-        sample: Callable[[torch.Tensor], torch.Tensor],
-        kv_cache: torch.Tensor,
-        sum_dtype: torch.dtype | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Walk codec groups 1..G-1 for one frame per row.
-
-        ``last_hidden`` is the backbone's hidden state per row, ``layer0_codes`` the
-        group-0 codes it sampled and ``group0_embedding`` the backbone's codec table.
-        ``sample`` maps one group's logits to codes. Returns ``all_codes``
-        (``[rows, G]`` int64) and the sum of the frame's G code embeddings, the next
-        backbone step's input, in ``sum_dtype`` (default: the embeddings' dtype).
-        """
-        sum_dtype = sum_dtype or group0_embedding.weight.dtype
-        return _depth_loop(self, last_hidden, layer0_codes, group0_embedding, sample, kv_cache, sum_dtype)
-
     # ------------------------------------------------------------------
     # each model's own per-position forward
     # ------------------------------------------------------------------
 
-    def _reference_loop(self, last_hidden, layer0_codes, group0_embedding, sample, kv_cache, sum_dtype):
+    def _reference_loop(self, last_hidden, layer0_codes, group0_embedding, sample, max_batch_size, sum_dtype=None):
+        sum_dtype = sum_dtype or group0_embedding.weight.dtype
         rows = layer0_codes.shape[0]
+        kv_cache = self.depth_kv_cache(rows, max_batch_size)
         all_codes = torch.empty((rows, self.num_code_groups), dtype=torch.long, device=layer0_codes.device)
         all_codes[:, 0] = layer0_codes
         embed = group0_embedding(layer0_codes)
@@ -131,10 +126,12 @@ class DepthDecoder(nn.Module):
         return self._fusable
 
     @torch.compiler.disable
-    def _fused_loop(self, last_hidden, layer0_codes, group0_embedding, sample, kv_cache, sum_dtype):
+    def _fused_loop(self, last_hidden, layer0_codes, group0_embedding, sample, max_batch_size, sum_dtype=None):
         if not self._fused_loop_fits():
-            return self._reference_loop(last_hidden, layer0_codes, group0_embedding, sample, kv_cache, sum_dtype)
+            return self._reference_loop(last_hidden, layer0_codes, group0_embedding, sample, max_batch_size, sum_dtype)
+        sum_dtype = sum_dtype or group0_embedding.weight.dtype
         rows = layer0_codes.shape[0]
+        kv_cache = self.depth_kv_cache(rows, max_batch_size)
         table = group0_embedding.weight
         all_codes = torch.empty((rows, self.num_code_groups), dtype=torch.long, device=table.device)
         embed = torch.empty((rows, table.shape[1]), dtype=table.dtype, device=table.device)
@@ -189,9 +186,3 @@ def _add_norm(hidden: torch.Tensor, residual: torch.Tensor, norm: nn.Module) -> 
     """In place: ``residual += hidden``, then ``hidden = norm(residual)``."""
     torch.ops.mstar.fused_add_rms_norm(hidden, residual, norm.weight, norm.variance_epsilon, norm.gemma_mode)
 
-
-# The fused loop runs where its kernels are validated (AMD GPUs). Elsewhere every
-# model keeps its own per-position forward until an A/B on that platform moves it.
-_depth_loop = PlatformDispatch(
-    "depth_loop", rocm=lambda: DepthDecoder._fused_loop, default=lambda: DepthDecoder._reference_loop,
-)
