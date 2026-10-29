@@ -2240,3 +2240,50 @@ def test_removal_forgets_a_parked_request():
     sched.clear_rid("b", "b")
 
     assert not any(sched.parked.values()), "a recycled handle would start parked"
+
+
+def test_a_follower_runs_the_leaders_chunks():
+    """The leader alone cuts chunks; a follower takes them off the head, so
+    its chunk Loop ends on the same step as the leader's."""
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.register_tp_follow(ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1", "t2"],
+        chunk_starts=[4, -1, 6], chunk_ends=[8, -1, 10], chunk_totals=[10, -1, 10],
+    ))
+
+    batch = _next_batch(sched, _Manager(["t0", "t1", "t2"]))
+
+    assert batch.chunk_ranges == {"t0": (4, 8, 10), "t2": (6, 10, 10)}
+    assert batch.incomplete_node_rids == {"t0"}
+
+
+def test_a_follower_step_without_chunks_takes_no_ranges():
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.register_tp_follow(ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"]))
+
+    batch = _next_batch(sched, _Manager(["t0", "t1"]))
+
+    assert (batch.chunk_ranges, batch.incomplete_node_rids) == ({}, set())
+
+
+def test_a_follower_refuses_chunk_lists_that_do_not_match_its_rows():
+    """The ranks disagree on the step: it raises before any row is popped."""
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    head = ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"],
+        chunk_starts=[4], chunk_ends=[8], chunk_totals=[10],
+    )
+    sched.register_tp_follow(head)
+    manager = _Manager(["t0", "t1"])
+
+    with pytest.raises(ValueError):
+        _next_batch(sched, manager)
+
+    assert sched.peek_tp_follow() is head
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"t0", "t1"}

@@ -98,6 +98,8 @@ from mstar.worker.micro_scheduler import (
     MicroScheduler,
     MidPrefillRow,
     ScheduledBatch,
+    tp_chunk_ranges,
+    unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker_metrics import WorkerMetrics
@@ -2050,6 +2052,16 @@ class Worker:
                 node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
             )
             walks, walk_idx = rows.walks, rows.walk_idx
+        # the leader alone cuts chunks: a follower's own cut could differ
+        chunk_starts: list[int] = []
+        chunk_ends: list[int] = []
+        chunk_totals: list[int] = []
+        if node_batch.chunk_ranges:
+            for rid in node_batch.request_ids:
+                start, end, total = node_batch.chunk_ranges.get(rid, (-1, -1, -1))
+                chunk_starts.append(start)
+                chunk_ends.append(end)
+                chunk_totals.append(total)
         for worker in workers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
@@ -2067,6 +2079,9 @@ class Worker:
                         prefix_hits=prefix_hits,
                         page_trails=page_trails,
                         read_check=read_check,
+                        chunk_starts=chunk_starts,
+                        chunk_ends=chunk_ends,
+                        chunk_totals=chunk_totals,
                     )
                 )
             )
@@ -3377,6 +3392,8 @@ class Worker:
         batch_N = pending.batch
         # The leader names its rids by wire string; these are this rank's handles.
         head_rids = self.scheduler.tp_rids(head)
+        # before anything is popped: lists that do not match the rows raise
+        chunk_ranges = tp_chunk_ranges(head, head_rids)
         # rows whose input read failed here: built without, as on the serial path
         unread = self.scheduler.unread_rows(head, head_rids)
         head_walk_idx = dict(zip(head_rids, head.walk_idx, strict=True)) if head.walks else None
@@ -3384,7 +3401,12 @@ class Worker:
         # rows read here: prepped (continuing) or popped (fresh); every row,
         # unread ones included, runs the leader's continuation of N
         in_n = [r for r in head_rids if r in in_batch]
-        continuing = [r for r in in_n if r not in unread]
+        # N's rows mid-prefill loop back on nothing of N's: as on the leader,
+        # their next chunk is cut from the input held since their first. N's
+        # chunks came from the leader, so every rank splits these out alike.
+        held = batch_N.incomplete_node_rids
+        mid_prefill = {r for r in in_n if r in held} if held else set()
+        continuing = [r for r in in_n if r not in unread and r not in mid_prefill]
         fresh = [r for r in head_rids if r not in in_batch and r not in unread]
         if not in_n:
             return None
@@ -3485,6 +3507,9 @@ class Worker:
                 per_request_inputs[rid] = prep_inputs[rid]
             elif rid in unread:
                 per_request_inputs[rid] = {}
+            elif rid in mid_prefill:
+                new_request_to_worker_graph[rid] = in_batch[rid]
+                per_request_inputs[rid] = {}
             else:
                 new_request_to_worker_graph[rid] = fresh_wg[rid]
                 per_request_inputs[rid] = fresh_inputs[rid]
@@ -3514,11 +3539,17 @@ class Worker:
         speculation = self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
-            consumed_streaming_edges, in_n, fresh_final_edges,
+            consumed_streaming_edges,
+            [r for r in in_n if r not in mid_prefill] if mid_prefill else in_n,
+            fresh_final_edges,
             is_same_node=True, spec_id=prep.spec_id, tp_seq=head.spec_seq,
             request_walks=request_walks,
+            chunk_ranges=chunk_ranges,
+            incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
         )
-        if head.read_check and speculation is not None:
+        # N's rows, as on the leader: N's settle readies them, not a cleared speculation
+        speculation.continuing_rids.update(mid_prefill)
+        if head.read_check:
             speculation.node_batch.read_check_rids = tuple(head_rids)
         return speculation
 
