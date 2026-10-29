@@ -24,6 +24,7 @@ from typing import Any
 import torch
 
 from mstar.kernels.configs import CONFIG_ROOT, config_path
+from mstar.kernels.configs import shape_key as config_shape_key
 from mstar.platforms.facts import DeviceFacts
 
 DEFAULT_ROOT = Path(__file__).resolve().parent / "results"
@@ -122,6 +123,71 @@ class ResultsStore:
         config = {
             "kernel": kernel, "arch": facts.arch, "product": facts.product if per_product else None,
             "classes": classes, "provenance": {"stack": self.stack, "family": family, **(provenance or {})},
+        }
+        path = config_path(kernel, facts.arch, facts.product if per_product else None, root or CONFIG_ROOT)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, indent=1, sort_keys=True) + "\n")
+        return path
+
+
+    def promote_best(
+        self,
+        facts: DeviceFacts,
+        kernel: str,
+        impl_of: Callable[[str], tuple[str, Mapping[str, Any]] | None],
+        shape_class: Callable[[Mapping[str, int]], str | None],
+        tuned: str = "triton",
+        margin: float = 0.02,
+        dims: tuple[str, ...] | None = None,
+        root: Path | None = None,
+        per_product: bool = True,
+        provenance: Mapping[str, Any] | None = None,
+    ) -> Path:
+        """Write the implementation that serves each stored shape best as
+        ``kernel``'s config, for an op whose implementation is chosen per shape.
+
+        ``impl_of(family)`` names the implementation a candidate family stands
+        for and the knobs it adds (``("triton", {"use_dot": True})``), or None
+        for families that cannot ship (a torch expression). The ``tuned``
+        implementation replaces the fastest other one only where it is at least
+        ``margin`` faster. Each class gets the entry most of its shapes chose,
+        and a shape that chose otherwise its own entry. ``dims`` names the shape
+        dimensions the op's configs are keyed by (all of them by default).
+        """
+        chosen: dict[str, tuple[str, dict]] = {}
+        for record in self.records(facts, kernel):
+            timed: list[tuple[float, str, dict]] = []
+            for cand in record["candidates"].values():
+                mapped = impl_of(cand.get("family", ""))
+                if mapped is None or not _ok(cand):
+                    continue
+                impl, extra = mapped
+                knobs = {**cand.get("knobs", {}), **extra} if impl == tuned else {}
+                timed.append((cand["us"], impl, knobs))
+            if not timed:
+                continue
+            best_tuned = min((t for t in timed if t[1] == tuned), default=None)
+            best_other = min((t for t in timed if t[1] != tuned), default=None)
+            pick = best_other
+            if best_tuned is not None and (best_other is None or best_tuned[0] <= (1 - margin) * best_other[0]):
+                pick = best_tuned
+            shape = {k: v for k, v in record["shape"].items() if dims is None or k in dims}
+            chosen[json.dumps(shape)] = (shape_class(record["shape"]) or "default", {"impl": pick[1], **pick[2]})
+        if not chosen:
+            raise ValueError(f"no passing results for {kernel} on {facts.arch}/{facts.product}")
+        votes: dict[str, dict[str, int]] = {}
+        for klass, entry in chosen.values():
+            key = json.dumps(entry, sort_keys=True)
+            votes.setdefault(klass, {})[key] = votes.setdefault(klass, {}).get(key, 0) + 1
+        classes = {k: json.loads(max(v.items(), key=lambda item: item[1])[0]) for k, v in votes.items()}
+        shapes = {
+            config_shape_key(json.loads(shape)): entry
+            for shape, (klass, entry) in chosen.items() if entry != classes[klass]
+        }
+        config = {
+            "kernel": kernel, "arch": facts.arch, "product": facts.product if per_product else None,
+            "classes": classes, "shapes": shapes,
+            "provenance": {"stack": self.stack, "margin": margin, **(provenance or {})},
         }
         path = config_path(kernel, facts.arch, facts.product if per_product else None, root or CONFIG_ROOT)
         path.parent.mkdir(parents=True, exist_ok=True)
