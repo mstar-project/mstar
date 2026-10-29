@@ -6,6 +6,8 @@ from collections.abc import Mapping
 
 import torch
 
+from mstar.utils.cpu_list import parse_cpu_list
+
 
 class Platform:
     """One accelerator stack; ``current_platform`` is the one this process runs.
@@ -85,8 +87,25 @@ class Platform:
         """
         return {} if devices is None else {"CUDA_VISIBLE_DEVICES": devices}
 
+    def local_cpus(self, device_index: int) -> frozenset[int] | None:
+        """The CPUs on the device's NUMA node, as the host lists them; None
+        where the platform or the host doesn't say."""
+        return None
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
+
+
+def _pci_local_cpus(device_index: int) -> frozenset[int] | None:
+    """The device's ``local_cpulist`` in sysfs, found by the PCI address torch
+    reports. ROCm builds report it the same way, so this needs no NVML."""
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        bdf = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+        with open(f"/sys/bus/pci/devices/{bdf}/local_cpulist") as f:
+            return parse_cpu_list(f.read()) or None
+    except (AssertionError, AttributeError, OSError, RuntimeError, ValueError):
+        return None
 
 
 class CudaPlatform(Platform):
@@ -101,6 +120,9 @@ class CudaPlatform(Platform):
 
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
+
+    def local_cpus(self, device_index: int) -> frozenset[int] | None:
+        return _pci_local_cpus(device_index)
 
 
 class RocmPlatform(Platform):
@@ -176,6 +198,9 @@ class RocmPlatform(Platform):
                 "disagree and HIP uses the first. Unset one or pass --gpus"
             )
         return {}
+
+    def local_cpus(self, device_index: int) -> frozenset[int] | None:
+        return _pci_local_cpus(device_index)
 
 
 class XpuPlatform(Platform):

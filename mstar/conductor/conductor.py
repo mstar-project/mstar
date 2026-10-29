@@ -233,9 +233,11 @@ def _worker_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    local_worker_devices: list[str] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
-    picklability. ``status_interval_s`` turns on the worker's metrics."""
+    picklability. ``status_interval_s`` turns on the worker's metrics;
+    ``local_worker_devices`` is every worker's device, in ``worker_ids`` order."""
     # before anything in this process touches the device runtime
     apply_process_env_defaults()
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
@@ -287,6 +289,7 @@ def _worker_process_target(
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
             status_interval_s=status_interval_s,
+            local_worker_devices=local_worker_devices,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
@@ -735,6 +738,9 @@ class Conductor:
 
             _cuda_op_available()
         ctx = mp.get_context("spawn")
+        # every worker runs on this host; each picks its step-thread CPU knowing
+        # the others' devices (see mstar.utils.step_threads)
+        devices = [worker_device(self.device_type, rank, self.rank_devices) for rank in self._sorted_ranks]
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
@@ -755,6 +761,7 @@ class Conductor:
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
                     "device": worker_device(self.device_type, rank, self.rank_devices),
+                    "local_worker_devices": devices,
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
