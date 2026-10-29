@@ -8,6 +8,7 @@ import yaml
 from torch import nn
 
 from mstar.model.cosmos3 import constants as C
+from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer, Cosmos3RotaryEmbedding
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule, Cosmos3ReasonerSubmodule
 
@@ -19,11 +20,15 @@ GRAPH_CONFIGS = [
 
 
 class _FakeTransformer(nn.Module):
-    def __init__(self):
+    # declaring a video capture builds its statics, rotary table included
+    _rotary = Cosmos3OmniTransformer._rotary
+
+    def __init__(self, config):
         super().__init__()
         self.proj_in = nn.Linear(1, 1, bias=False)
         self.sp_group = SimpleNamespace(world_size=1)
         self.comm_group = SimpleNamespace(world_size=1)
+        self.rotary_emb = Cosmos3RotaryEmbedding(config.head_dim, config.rope_theta, config.rope_axes_dim)
 
     def text_forward(self, *args, **kwargs):
         raise AssertionError("declaring captures should not execute the model")
@@ -35,7 +40,7 @@ def _submodules(enabled):
         accelerator_graph=enabled, compile_denoise=False,
     )
     assert model.config.accelerator_graph is enabled
-    transformer = _FakeTransformer()
+    transformer = _FakeTransformer(model.config)
     return (
         Cosmos3DiTSubmodule(transformer, model.config),
         Cosmos3ReasonerSubmodule(transformer, model.config),
