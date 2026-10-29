@@ -478,8 +478,7 @@ def test_requests_hold_slot_groups_and_return_them():
 
 
 def _filtered(logits: torch.Tensor, temperature: float, top_p: float, top_k: int) -> torch.Tensor:
-    """The sampler's distribution: top-k, then top-p over the renormalised rest
-    (the verify step takes temperature only, so the tests leave both off)."""
+    """The sampler's distribution: top-k, then top-p over the renormalised rest."""
     probs = (logits.double() / temperature).softmax(-1)
     order = probs.argsort(descending=True)
     keep = torch.zeros_like(probs, dtype=torch.bool)
@@ -497,11 +496,30 @@ def _filtered(logits: torch.Tensor, temperature: float, top_p: float, top_k: int
     return probs / probs.sum()
 
 
-@pytest.mark.parametrize("params", [(1.0, 1.0, 0), (0.7, 1.0, 0), (1.3, 1.0, 0)])
-def test_sampled_verification_follows_the_target_distribution(params):
+def _reference_draw(logits, temperature, top_k, top_p, seed, offset):
+    """`draw_tokens` on CPU: each row's filtered distribution, drawn with a
+    generator seeded from its seed and offset (argmax at temperature 0)."""
+    out = torch.empty(logits.shape[0], dtype=torch.long)
+    for i in range(logits.shape[0]):
+        t = float(temperature[i])
+        if t == 0:
+            out[i] = logits[i].argmax()
+            continue
+        k = int(top_k[i])
+        probs = _filtered(logits[i], t, float(top_p[i]), k if k < logits.shape[1] else 0)
+        gen = torch.Generator().manual_seed(int(seed[i]) * 1_000_003 + int(offset[i]) * 7919 + i)
+        out[i] = torch.multinomial(probs.float(), 1, generator=gen)[0]
+    return out
+
+
+@pytest.mark.parametrize("params", [(1.0, 1.0, 0), (0.7, 0.9, 0), (1.3, 1.0, 5), (0.8, 0.6, 4)])
+def test_sampled_verification_follows_the_target_distribution(params, monkeypatch):
     """k = 1 against fixed logits: the first emitted token is a draw from the
     target's filtered distribution at position 0, whether or not the draft is
     accepted, and the token after an accepted draft one from position 1's."""
+    from mstar.engine.resources.spec_decode import resource as spec_mod
+
+    monkeypatch.setattr(spec_mod.sampling, "draw_tokens", _reference_draw)
     torch.manual_seed(0)
     temperature, top_p, top_k = params
     rows, vocab, draws = 400, 12, 30
@@ -522,6 +540,7 @@ def test_sampled_verification_follows_the_target_distribution(params):
     )
     regs = slice(1, rows + 1)
     spec._temperature[regs], spec._top_p[regs], spec._top_k[regs] = temperature, top_p, top_k
+    spec._seed[regs] = torch.arange(rows)
     spec._budget[regs] = 1 << 20
     logits = torch.randn(2, vocab) * 2
     p0, p1 = (_filtered(logits[i], temperature, top_p, top_k) for i in range(2))

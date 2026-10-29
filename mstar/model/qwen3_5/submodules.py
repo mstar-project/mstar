@@ -644,7 +644,9 @@ class LLMSubmodule(ARNodeSubmodule):
             if cfg is not None and cfg.ignore_eos:
                 ignore.add(rid)
             if cfg is not None and self.spec_sampling and cfg.temperature > 0:
-                sampling[rid] = (float(cfg.temperature), float(cfg.top_p), int(cfg.top_k or 0))
+                sampling[rid] = (
+                    float(cfg.temperature), float(cfg.top_p), int(cfg.top_k or 0), int(cfg.seed),
+                )
             if row.step_metadata.get("last_prefill", False) and spec.seed_lookahead:
                 adjust[(rid, "main")] = spec.seed_lookahead
         steps[KV_CACHE] = KVStep(commit_adjust=adjust)
