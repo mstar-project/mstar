@@ -520,8 +520,8 @@ def _encode_batch(enc, steps):
 
 
 def _stream(enc, wavs, sizes):
-    """Stream each call in its own chunk size, every call with audio left in
-    each step, then end them all; the frames each call got."""
+    """Run each stream in its own chunk size, every stream with audio left in
+    each step, then end them all; the frames each stream got."""
     got = {h: [] for h in wavs}
     pos = dict.fromkeys(wavs, 0)
     while any(pos[h] < wavs[h].numel() for h in wavs):
@@ -549,7 +549,7 @@ STEP, LAYERS = FastConformerStreamSubmodule.STEP_REGION, FastConformerStreamSubm
 def test_encoder_streams_the_offline_frames(n, end_rides_last_chunk):
     """Chunks of any size, smaller than a frame included, then the end of input,
     on an empty final chunk or on the last chunk of audio (as an upload's usually
-    is): the frames emitted in order are the offline encoding of the call, and
+    is): the frames emitted in order are the offline encoding of the stream, and
     the mel frames the offline featurizer's, the reflected right edge included
     (a length on the hop grid is the one whose last frame reads it), the newest
     of which the front end holds."""
@@ -572,8 +572,8 @@ def test_encoder_streams_the_offline_frames(n, end_rides_last_chunk):
         assert torch.allclose(held, mel[-held.shape[0]:], atol=1e-5), size
 
 
-def test_encoder_batches_calls_at_different_points():
-    """Calls in one step, each with its own chunking (one frame a step, several,
+def test_encoder_batches_streams_at_different_points():
+    """Streams in one step, each with its own chunking (one frame a step, several,
     or none), each get their own offline frames."""
     enc = _Encoder()
     wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000 * 3) * 0.1, 3: torch.randn(9000) * 0.1}
@@ -583,10 +583,10 @@ def test_encoder_batches_calls_at_different_points():
 
 
 def test_encoder_live_steps_replay_the_regions_with_padding_rows():
-    """Calls one frame of audio further on take the whole-step region; the
-    others in the same step (a call's first frames, one under a frame a step)
+    """Streams one frame of audio further on take the whole-step region; the
+    others in the same step (a stream's first frames, one under a frame a step)
     the eager front end and the blocks region, both in buckets wider than the
-    batch. Every call gets its offline frames: the padding rows, which address
+    batch. Every stream gets its offline frames: the padding rows, which address
     the pools' sinks, and the rows another path served leave them alone."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP, LAYERS)
@@ -598,9 +598,9 @@ def test_encoder_live_steps_replay_the_regions_with_padding_rows():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
-def test_encoder_layer_region_runs_only_the_calls_with_a_frame():
-    """Calls one frame on take the whole-step region; the blocks region then
-    runs only the other calls that got a frame, not every call of the step."""
+def test_encoder_layer_region_runs_only_the_streams_with_a_frame():
+    """Streams one frame on take the whole-step region; the blocks region then
+    runs only the other streams that got a frame, not every stream of the step."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP, LAYERS)
     layers = enc.regions[LAYERS]
@@ -609,7 +609,7 @@ def test_encoder_layer_region_runs_only_the_calls_with_a_frame():
     enc.step = lambda rids, inputs: rows.append(f"step of {len(rids)}") or step(rids, inputs)
     wavs = {1: torch.randn(16000) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(16000) * 0.1}
     got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640})
-    # once calls 1 and 2 are one frame on, the blocks region runs call 3 alone
+    # once streams 1 and 2 are one frame on, the blocks region runs stream 3 alone
     assert rows[4:10] == ["step of 3", 1, "step of 3", "step of 3", 1, "step of 3"], rows
     for h, wav in wavs.items():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
@@ -619,7 +619,7 @@ def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
     """The KV attends under a plan of exactly the rows it is given, padding
     included, with the eager path on this step's plan before a region plans its
     own (the pools' gather / scatter_ read the plan the pool holds when they
-    run). A call with a chunk over a second runs in a step of its own."""
+    run). A stream with a chunk over a second runs in a step of its own."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP, LAYERS)
     attend = enc.kv.attend
@@ -642,10 +642,10 @@ def _kv_spans(step) -> list[int]:
 
 
 def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
-    """When every call is one frame on and the whole-step region is captured
+    """When every stream is one frame on and the whole-step region is captured
     for the batch, the region's own step owns the resources: the node declares
     nothing, so no second plan is built and thrown away. Otherwise it declares
-    every call in each, and in the KV its new frames at its position."""
+    every stream in each, and in the KV its new frames at its position."""
     enc = _Encoder()
     wavs = {1: torch.randn(1280 * 6) * 0.1, 2: torch.randn(1280 * 6) * 0.1}
     for at in (0, 1280):
@@ -656,7 +656,7 @@ def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
     assert _kv_spans(step) == [1, 1]
     states = [enc.node.request_state(h).get(enc.node.STATE_KEY) for h in (1, 2)]
     assert [step.get(KV).positions[h].written for h in (1, 2)] == [st.frames for st in states]
-    # the call's own position, built when its frames last moved, not one per declaration
+    # the stream's own position, built when its frames last moved, not one per declaration
     assert all(step.get(KV).positions[h] is st.position for h, st in zip((1, 2), states, strict=True))
     enc.regions = _encoder_regions(enc, STEP)
     assert enc.declare([1, 2], nxt) is None
@@ -670,11 +670,11 @@ def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
     assert _kv_spans(step) == [mixed[0].kwargs["n"], 1]
 
 
-def test_encoder_a_step_mixes_a_steady_call_with_eager_chunks_past_the_window():
-    """One step holds a call one frame on, a call whose chunk adds more frames
+def test_encoder_a_step_mixes_a_steady_stream_with_eager_chunks_past_the_window():
+    """One step holds a stream one frame on, a stream whose chunk adds more frames
     than the attention window (the eager blocks, a step of T > 1 where each
-    frame sees only the window before it, which the call one frame on then
-    joins) and a call under a frame a step: each gets its offline frames."""
+    frame sees only the window before it, which the stream one frame on then
+    joins) and a stream under a frame a step: each gets its offline frames."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP, LAYERS)
     window = enc.node.encoder.config.left_context
@@ -695,10 +695,10 @@ def test_encoder_a_step_mixes_a_steady_call_with_eager_chunks_past_the_window():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
-def test_encoder_a_steady_call_joins_the_eager_layers_of_its_step():
-    """A call one frame on whose window has wrapped, in a step where another
-    call's chunk makes several frames: this step's KV plan, which the eager
-    blocks run on, writes both calls' frames, so the steady call can't also
+def test_encoder_a_steady_stream_joins_the_eager_layers_of_its_step():
+    """A stream one frame on whose window has wrapped, in a step where another
+    stream's chunk makes several frames: this step's KV plan, which the eager
+    blocks run on, writes both streams' frames, so the steady stream can't also
     take the whole-step region (whose write of its frame would follow one from
     padding into the ring entry the region reads)."""
     enc = _Encoder()
@@ -719,10 +719,10 @@ def test_encoder_a_steady_call_joins_the_eager_layers_of_its_step():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wavs[h]), atol=1e-5), h
 
 
-def test_encoder_runs_a_steady_call_eagerly_when_its_region_has_no_graph():
+def test_encoder_runs_a_steady_stream_eagerly_when_its_region_has_no_graph():
     """The whole-step region leases the batch's bucket, but replays only the
-    steady calls: when the runner dropped the capture for that sub-batch (here
-    one call's), they take the eager path, which this step's plans cover."""
+    steady streams: when the runner dropped the capture for that sub-batch (here
+    one stream's), they take the eager path, which this step's plans cover."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP, LAYERS)
     step_region = enc.regions[STEP]
@@ -732,7 +732,7 @@ def test_encoder_runs_a_steady_call_eagerly_when_its_region_has_no_graph():
     for at in (0, 1280, 2560):
         for h, frames in _encode_batch(enc, [(h, wavs[h][at:at + 1280], False) for h in (1, 2)]).items():
             got[h] += frames
-    # call 1 is one frame on (steady), call 2 appends half a frame
+    # stream 1 is one frame on (steady), stream 2 appends half a frame
     out = _encode_batch(enc, [(1, wavs[1][3840:5120], False), (2, wavs[2][3840:4480], False)])
     for h in (1, 2):
         got[h] += out[h]
@@ -744,8 +744,8 @@ def test_encoder_runs_a_steady_call_eagerly_when_its_region_has_no_graph():
 @pytest.mark.parametrize("b_end_rides", [False, True])
 @pytest.mark.parametrize("a_chunk", [1280, 9000])
 @pytest.mark.parametrize("b_len", [16000 * 2, 16000 * 2 + 640, 16000 * 2 + 777])
-def test_encoder_a_calls_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, b_end_rides):
-    """Call B ends in the same step as call A's longer chunk, A still mid-call:
+def test_encoder_a_streams_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, b_end_rides):
+    """Stream B ends in the same step as stream A's longer chunk, A still mid-stream:
     B's last frames, which read past its audio, are still its offline ones."""
     enc = _Encoder()
     starts = list(range(0, b_len, 1280))
@@ -764,10 +764,10 @@ def test_encoder_a_calls_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, 
 
 
 def test_encoder_keeps_a_chunk_over_a_second_out_of_a_batch():
-    """A pass pads every call to its longest chunk, so a step holding an upload
+    """A pass pads every stream to its longest chunk, so a step holding an upload
     or a large append is not batched: can_batch refuses it, by the chunk length
-    prepare_inputs reports, and the engine runs each call's step on its own.
-    Calls with a second or less share one pass. The frames are the offline
+    prepare_inputs reports, and the engine runs each stream's step on its own.
+    Streams with a second or less share one pass. The frames are the offline
     ones either way."""
     enc = _Encoder()
     fronts, front = [], enc.node._front
@@ -787,7 +787,7 @@ def test_encoder_keeps_a_chunk_over_a_second_out_of_a_batch():
     assert enc.node.can_batch(None, [prepared[1]])                       # alone, it is its own step
 
     out = _encode_batch(enc, [(h, w, True) for h, w in wav.items()])
-    assert sorted(fronts) == [[1280], [16000], [16001], [16000 * 5]]    # every call on its own
+    assert sorted(fronts) == [[1280], [16000], [16001], [16000 * 5]]    # every stream on its own
     for h, w in wav.items():
         assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
 
@@ -801,7 +801,7 @@ def test_encoder_keeps_a_chunk_over_a_second_out_of_a_batch():
 
 def test_encoder_takes_no_batch_wider_than_its_graphs():
     """Its graphs are piecewise regions, which the engine's batch cap does not
-    see: a wider step would run every call eagerly, so the node caps its batch
+    see: a wider step would run every stream eagerly, so the node caps its batch
     at its widest capture and the scheduler splits the rest."""
     from mstar.engine.engine import Engine
 
@@ -819,7 +819,7 @@ def test_encoder_refuses_what_it_cannot_stream(unsupported):
     """A right context, a per-clip normalization, the 2.5 featurizer (whose
     zero-padded edges a stream's front end does not cut) or a window longer
     than the samples the front end keeps are refused when the node is built,
-    not met as wrong frames mid-call."""
+    not met as wrong frames mid-stream."""
     with pytest.raises(ValueError, match=next(iter(unsupported))):
         _stream_node(**unsupported)
 
@@ -843,9 +843,9 @@ def test_encoder_steady_steps_match_offline_for_the_featurizer_they_get(n_fft):
 
 @pytest.mark.parametrize("n_fft", [512, 256])
 @pytest.mark.parametrize("n", [1580, 1728])
-def test_encoder_ends_a_call_with_its_last_frame_when_the_end_adds_no_mel_frame(n_fft, n):
+def test_encoder_ends_a_stream_with_its_last_frame_when_the_end_adds_no_mel_frame(n_fft, n):
     """With a half window under a hop, the end of input can make a last encoder
-    frame final without adding a mel frame: the call still gets it."""
+    frame final without adding a mel frame: the stream still gets it."""
     enc = _Encoder(n_fft=n_fft, win_length=n_fft)
     wav = torch.randn(n) * 0.1
     got = []
@@ -857,8 +857,8 @@ def test_encoder_ends_a_call_with_its_last_frame_when_the_end_adds_no_mel_frame(
     assert torch.allclose(torch.stack(got), want, atol=1e-5)
 
 
-def test_encoder_decides_a_calls_steadiness_once_per_step(monkeypatch):
-    """Whether a call takes the whole-step region is decided once, where its
+def test_encoder_decides_a_streams_steadiness_once_per_step(monkeypatch):
+    """Whether a stream takes the whole-step region is decided once, where its
     inputs are prepared; the declaration and the forward read that decision."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP)
@@ -876,7 +876,7 @@ def test_encoder_decides_a_calls_steadiness_once_per_step(monkeypatch):
 
 
 def test_encoder_moves_a_steps_chunks_to_the_device_in_one_copy():
-    """Each call's chunk arrives on the host; one copy per call would each be a
+    """Each stream's chunk arrives on the host; one copy per stream would each be a
     blocking transfer from pageable memory, so the step copies them as one."""
     from torch.profiler import ProfilerActivity, profile
 
@@ -889,9 +889,9 @@ def test_encoder_moves_a_steps_chunks_to_the_device_in_one_copy():
         ("meta", (1280,)), None, ("meta", (640,)), ("meta", (1280,))]
 
 
-def test_encoder_step_region_replays_three_calls_with_a_padding_row():
-    """Three calls one frame on replay the whole-step region in a bucket of
-    four: the padding row addresses both pools' sinks and the calls get their
+def test_encoder_step_region_replays_three_streams_with_a_padding_row():
+    """Three streams one frame on replay the whole-step region in a bucket of
+    four: the padding row addresses both pools' sinks and the streams get their
     offline frames."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP)
@@ -933,8 +933,8 @@ def test_encoder_waits_for_enough_audio_to_featurize():
 
 
 @pytest.mark.parametrize("n", [257, 1000, 1279, 1281])
-def test_encoder_a_short_call_gets_the_offline_frames(n):
-    """Offline encodes any call longer than n_fft/2 samples, under one frame too."""
+def test_encoder_a_short_stream_gets_the_offline_frames(n):
+    """Offline encodes any stream longer than n_fft/2 samples, under one frame too."""
     enc = _Encoder()
     wav = torch.randn(n) * 0.1
     want = enc.offline(wav)
@@ -948,9 +948,9 @@ def test_encoder_a_short_call_gets_the_offline_frames(n):
 
 
 @pytest.mark.parametrize("chunks", [[], [torch.zeros(256)], [torch.zeros(100), torch.zeros(156)]])
-def test_encoder_fails_a_call_that_ends_without_enough_audio(chunks):
+def test_encoder_fails_a_stream_that_ends_without_enough_audio(chunks):
     """No audio, or no more than n_fft/2 samples (which offline can't featurize):
-    the call fails rather than reply to nothing."""
+    the stream fails rather than reply to nothing."""
     enc = _Encoder()
     for chunk in chunks:
         enc.encode(1, chunk)
@@ -958,7 +958,7 @@ def test_encoder_fails_a_call_that_ends_without_enough_audio(chunks):
         enc.encode(1, None, final=True)
 
 
-def test_encoder_state_is_per_call_and_cleaned_up():
+def test_encoder_state_is_per_stream_and_cleaned_up():
     enc = _Encoder()
     free = enc.pool.num_free_slots
     enc.encode(1, torch.randn(4000) * 0.1)

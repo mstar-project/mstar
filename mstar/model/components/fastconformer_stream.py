@@ -260,7 +260,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         if is_final_stream_chunk and samples < shortest:
             # too short to featurize (offline can't either): fail rather than reply to nothing
             raise ValueError(
-                f"the call ended with {1000 * samples / rate:g} ms of audio; "
+                f"the stream ended with {1000 * samples / rate:g} ms of audio; "
                 f"it needs at least {1000 * shortest / rate:g} ms"
             )
         final = bool(is_final_stream_chunk)
