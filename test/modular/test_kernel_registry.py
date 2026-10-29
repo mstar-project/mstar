@@ -411,3 +411,19 @@ def test_warm_all_resolves_every_op_once(declare, on_platform, monkeypatch):
     assert factory.calls == 1
     registry.warm_all()
     assert factory.calls == 1, "a resolved implementation is kept"
+
+
+def test_a_shape_entry_wins_over_its_class(declare, on_platform, tmp_path, monkeypatch):
+    on_platform(_Mi325x())
+    op = declare(shapes=_policy())
+    monkeypatch.setattr(configs, "CONFIG_ROOT", tmp_path)
+    path = configs.config_path(op.name, "gfx942", "mi325x")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"classes": {"small": {"BLOCK": 64}}, "shapes": {"n4": {"BLOCK": 16}}}))
+    configs._read.cache_clear()
+    try:
+        assert op.config({"n": 4}) == {"BLOCK": 16}
+        assert op.config({"n": 8}) == {"BLOCK": 64}
+        assert configs.shape_key({"rows": 1, "n": 2, "k": 3}) == configs.shape_key({"k": 3, "rows": 1, "n": 2})
+    finally:
+        configs._read.cache_clear()
