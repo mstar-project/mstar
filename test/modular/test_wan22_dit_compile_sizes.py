@@ -222,19 +222,20 @@ def test_the_largest_side_the_mp4_encoder_takes_passes() -> None:
 
 
 def test_the_config_examples_uncomment_into_one_model_kwargs_block() -> None:
-    """configs/wan22.yaml documents its knobs as a commented ``model_kwargs``
-    example; with two such blocks, uncommenting both keeps only the second."""
+    """configs/wan22.yaml ships a ``model_kwargs`` block and documents the other knobs
+    as commented lines under it; uncommenting them keeps one valid block."""
     from pathlib import Path
 
     import yaml
 
     out, inside = [], False
     for line in (Path(__file__).resolve().parents[2] / "configs" / "wan22.yaml").read_text().splitlines():
-        inside = line == "# model_kwargs:" or (inside and line.startswith("#   "))
-        out.append(line[2:] if inside else line)
+        inside = line == "model_kwargs:" or (inside and line.startswith(("  ", "#")))
+        out.append(line[2:] if inside and line.startswith("#   ") else line)
     text = "\n".join(out)
     assert text.count("\nmodel_kwargs:") == 1
     kwargs = yaml.safe_load(text)["model_kwargs"]
     assert set(kwargs) == {"vae_decode_fast_sizes", "vae_decode_fast", "compile_dit_sizes", "max_video_pixels",
-                           "attention_backend"}
+                           "attention_backend", "dit_loop", "accelerator_graph", "capture_batch_sizes",
+                           "max_batch_size"}
     _model(**kwargs)
