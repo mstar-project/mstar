@@ -1,4 +1,5 @@
 import functools
+import itertools
 import logging
 import time
 from collections import Counter, defaultdict, deque
@@ -263,6 +264,8 @@ class ChunkProgress:
     cursor: ChunkCursor | None = None
     # a chunk scheduled speculatively, dropped if that speculation is
     cursor_spec: ChunkCursor | None = None
+    # when its first chunk was cut, for serving prompts in start order
+    started: int = 0
 
     def next_start(self) -> int:
         """Where a chunk scheduled now begins."""
@@ -327,6 +330,7 @@ class MicroScheduler:
         self.get_tensor: Callable[[int], Any] | None = None
         # (rid, node) -> progress, for rows mid-prefill
         self.chunk_progress: dict[tuple[int, str], ChunkProgress] = {}
+        self._chunk_starts = itertools.count()
         # (rid, node) -> cached prefix a measured, not yet chunked row starts past
         self.cached_prefix: dict[tuple[int, str], int] = {}
         # their non-final chunks' outputs, routed with the final chunk
@@ -1050,12 +1054,13 @@ class MicroScheduler:
         max_tokens = self.engine_manager.get_engine(node_walk[0]).get_max_batch_tokens(*node_walk)
         row_tokens: dict[int, int] = {}
         chunkable: set[int] = set()
+        started: dict[int, int] = {}
         backlogged = self.backlog.pop(node_walk, None)
         blocked = set()
         if backlogged is not None:
             waiting = self._waiting_rids(backlogged)
             if max_tokens is not None:
-                tokens, chunks = self._measure_rows(request_state, backlogged, waiting)
+                tokens, chunks = self._measure_rows(request_state, backlogged, started, waiting)
                 row_tokens.update(tokens)
                 chunkable |= chunks
             # bounded by what this step could take, so a long backlog is not
@@ -1076,10 +1081,12 @@ class MicroScheduler:
         # with no budget skips it: measuring a row costs an input-tensor build
         # and a cached-prefix probe, and a backlogged one pays it every pass
         if fresh and max_tokens is not None:
-            tokens, chunks = self._measure_rows(request_state, fresh)
+            tokens, chunks = self._measure_rows(request_state, fresh, started)
             row_tokens.update(tokens)
             chunkable |= chunks
-        continuing, starts = self._mid_prefill_rows(node_walk, mid_prefill, row_tokens, chunkable)
+        continuing, starts = self._mid_prefill_rows(
+            node_walk, mid_prefill, row_tokens, chunkable, started,
+        )
         if backlogged is None and not fresh and continuing is None:
             return None
         min_chunk = 1
@@ -1104,11 +1111,12 @@ class MicroScheduler:
             row_tokens=row_tokens,
             chunkable=chunkable,
             min_chunk_tokens=min_chunk,
+            start_order=started,
         ), starts, speculative)
 
     def _mid_prefill_rows(
         self, node_walk: tuple[str, str], rows: Collection[MidPrefillRow],
-        row_tokens: dict[int, int], chunkable: set[int],
+        row_tokens: dict[int, int], chunkable: set[int], started: dict[int, int],
     ) -> tuple[ScheduledBatch | None, dict[int, int]]:
         """``rows`` as a batch to build from, measured from where each next
         chunk starts; not popped, since their nodes are in flight. Returns the
@@ -1129,7 +1137,9 @@ class MicroScheduler:
         if node_walk in self._walks_of_key:
             batch.request_walks = {row.request_id: row.graph_walk for row in rows}
         for rid, start in starts.items():
-            row_tokens[rid] = self.chunk_progress[(rid, node)].total - start
+            progress = self.chunk_progress[(rid, node)]
+            row_tokens[rid] = progress.total - start
+            started[rid] = progress.started
             chunkable.add(rid)
         return batch, starts
 
@@ -1242,10 +1252,11 @@ class MicroScheduler:
 
     def _measure_rows(
         self, request_state: RequestStateManager, batch: ScheduledBatch,
-        skip: set[int] = frozenset(),
+        started: dict[int, int], skip: set[int] = frozenset(),
     ) -> tuple[dict[int, int], set[int]]:
         """For a node that reports row lengths: each row of ``batch``'s
-        remaining tokens, and the rows that may be chunked."""
+        remaining tokens, and the rows that may be chunked. Rows mid-prefill
+        go in ``started`` with their start order."""
         node = batch.node_name
         engine = self.engine_manager.get_engine(node)
         rids = [rid for rid in batch.request_to_worker_graph if rid not in skip]
@@ -1262,6 +1273,7 @@ class MicroScheduler:
             progress = self.chunk_progress.get((rid, node))
             if progress is not None:
                 tokens[rid] = progress.total - progress.done
+                started[rid] = progress.started
             else:
                 info = lens[rid]
                 if info is None:
@@ -1458,7 +1470,9 @@ class MicroScheduler:
                 cached = self.cached_prefix.pop(key, 0)
                 if rid not in chunk_tokens:
                     continue
-                progress = self.chunk_progress[key] = ChunkProgress(cached, cached + row_tokens[rid])
+                progress = self.chunk_progress[key] = ChunkProgress(
+                    cached, cached + row_tokens[rid], started=next(self._chunk_starts),
+                )
             start = mid_prefill_starts.get(rid, progress.next_start())
             total = progress.total
             end = start + chunk_tokens.get(rid, total - start)

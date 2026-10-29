@@ -95,6 +95,7 @@ from mstar.utils.profiler import (
     range_pop,
     range_push,
 )
+from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import (
     MicroScheduler,
@@ -631,6 +632,7 @@ class Worker:
             parallel_leader_nodes=self.parallel_leader_nodes,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
+            batch_builder_type=BatchBuilderType((model_config or {}).get("batch_builder", "fifo")),
         )
 
         # Request ids are strings on the wire and ints (handles) inside this

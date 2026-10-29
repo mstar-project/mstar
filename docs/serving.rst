@@ -296,6 +296,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        keeps to its own walk and yields to the others, and a step mixes walks only
        when the scheduler builds one fresh. Naming a node with no combined walk, or a
        walk outside its combined walks, fails loading.
+   * - ``batch_builder``
+     - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
+       budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:
+       a prompt mid-prefill takes the budget before a newer one, so it finishes first,
+       and prompts short enough for an equal share still go in whole. ``fair_share``
+       splits the budget max-min fair over every waiting prompt, so each advances every
+       step and all finish late together.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,

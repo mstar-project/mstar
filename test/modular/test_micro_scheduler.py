@@ -39,6 +39,7 @@ from mstar.worker.batch_builder import (
     BaseBatchBuilder,
     BatchBuildRequest,
     BatchBuildResult,
+    FairShareBatchBuilder,
     FIFOBatchBuilder,
 )
 from mstar.worker.micro_scheduler import ChunkCursor, MicroScheduler, MidPrefillRow, ScheduledBatch
@@ -1778,6 +1779,38 @@ def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
 
 
 @pytest.mark.usefixtures("no_chunk_floor")
+def test_a_prompt_finishes_before_the_next_one_starts():
+    """Start order: the prompt already mid-prefill takes the budget again,
+    even queued behind one that has not started."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 4, 10)}
+
+    sched.advance_chunk("p0", NODE, 4)
+    queue = manager.queues["wg0"]._ready
+    queue.pop("p0", None)
+    queue["p0"] = {NODE}  # readied after p1
+    second = _next_batch(sched, manager)
+    assert second.chunk_ranges == {"p0": (4, 8, 10)}
+
+    sched.advance_chunk("p0", NODE, 8)
+    queue["p0"] = {NODE}
+    third = _next_batch(sched, manager)
+    assert third.chunk_ranges == {"p0": (8, 10, 10), "p1": (0, 2, 10)}, "p1 takes what p0 leaves"
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_fair_share_builder_advances_every_prompt_each_step():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.batch_builder = FairShareBatchBuilder()
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10), "p1": (0, 2, 10)}
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
 def test_a_refused_chunk_waits_out_its_hold_and_runs_the_same_range():
     """An OOM refusal holds the rows and readies them again; nothing landed,
     so the chunk's progress has not moved and the retry runs the same tokens."""
@@ -1874,8 +1907,20 @@ def test_a_walk_cap_holds_its_rows_within_the_steps_budget():
 
 
 @pytest.mark.usefixtures("no_chunk_floor")
-def test_a_walk_cap_shares_itself_among_its_rows():
+def test_a_walk_cap_goes_to_its_first_row():
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8, walk_caps={"prefill": 2}))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+
+    first = _next_batch(sched, manager)
+
+    assert first.chunk_ranges == {"p0": (0, 2, 10)}
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_fair_share_walk_cap_shares_itself_among_its_rows():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, walk_caps={"prefill": 2}))
+    sched.batch_builder = FairShareBatchBuilder()
     sched.get_tensor = lambda uuid: uuid
     manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
 
@@ -2020,6 +2065,7 @@ def test_a_merge_that_keeps_to_its_walk_leaves_a_row_mid_prefill_to_its_chunk_la
 def test_a_row_mid_prefill_the_merge_leaves_out_is_neither_parked_nor_readied():
     """Left out by the cap, it waits for its chunk to land, which readies it."""
     sched = _combined_scheduler(_ChunkingEngine(max_bs={MIXED: 2, WALK: 8, "prefill": 8}), {NODE: True})
+    sched.batch_builder = FairShareBatchBuilder()  # so both rows are mid-prefill
     sched.get_tensor = lambda uuid: uuid
     manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
     assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10), "p1": (0, 2, 10)}

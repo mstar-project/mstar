@@ -14,7 +14,7 @@ sys.path.insert(0, ".")
 import torch
 
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
-from mstar.worker.batch_builder import fill_token_budget
+from mstar.worker.batch_builder import fill_token_budget, fill_token_budget_in_start_order
 
 # ── the token budget ────────────────────────────────────────────────────
 
@@ -88,6 +88,77 @@ def test_the_head_runs_over_budget_rather_than_nothing():
     take, dropped = fill_token_budget(["p0"], {"p0": 100}, set(), 10)
     assert take == {"p0": 100}
     assert not dropped
+
+
+# ── start order ─────────────────────────────────────────────────────────
+
+
+def test_a_prompt_mid_prefill_takes_the_budget_before_newer_ones():
+    prompts = {"a": 5000, "b": 5000, "c": 5000}
+    take, dropped = fill_token_budget_in_start_order(
+        ["a", "b", "c"], prompts, set(prompts), 2048, 128, {"c": 3, "b": 7},
+    )
+    assert take == {"c": 2048}
+    assert dropped == {"a", "b"}
+
+
+def test_the_next_prompt_takes_what_the_last_chunk_of_one_leaves():
+    take, dropped = fill_token_budget_in_start_order(
+        ["a", "b"], {"a": 500, "b": 5000}, {"a", "b"}, 2048, 128, {"a": 0},
+    )
+    assert take == {"a": 500, "b": 1548}
+    assert not dropped
+
+
+def test_a_short_prompt_goes_in_whole_ahead_of_a_long_one_mid_prefill():
+    take, _ = fill_token_budget_in_start_order(
+        ["a", "s"], {"a": 5000, "s": 50}, {"a", "s"}, 2048, 128, {"a": 0},
+    )
+    assert take == {"s": 50, "a": 1998}
+
+
+def test_a_prompt_that_can_finish_this_step_goes_ahead_of_one_mid_prefill():
+    prompts = {"a": 5000, "b": 1500, "c": 900}
+    take, dropped = fill_token_budget_in_start_order(
+        ["a", "b", "c"], prompts, set(prompts), 2048, 128, {"a": 0},
+    )
+    assert take == {"c": 900, "a": 1148}, "shortest first; the oldest takes the rest"
+    assert dropped == {"b"}
+
+
+def test_decode_rows_go_in_whole_beside_the_prompt_in_start_order():
+    decodes = _decodes(40)
+    take, dropped = fill_token_budget_in_start_order(
+        [*decodes, "p", "q"], decodes | {"p": 5000, "q": 5000}, {"p", "q"}, 2048, 128, {"q": 0},
+    )
+    assert take == decodes | {"q": 2008}
+    assert dropped == {"p"}
+
+
+def test_a_row_that_cannot_be_cut_does_not_hold_up_the_rows_behind_it():
+    take, dropped = fill_token_budget_in_start_order(
+        ["n", "p"], {"n": 3000, "p": 5000}, {"p"}, 2048, 128,
+    )
+    assert take == {"p": 2048}
+    assert dropped == {"n"}
+
+
+def test_in_start_order_decode_rows_that_fill_the_budget_leave_a_prompt_the_floor():
+    decodes = _decodes(2047)
+    take, dropped = fill_token_budget_in_start_order(
+        [*decodes, "p", "q"], decodes | {"p": 1000, "q": 1000}, {"p", "q"}, 2048, 128,
+    )
+    assert take["p"] == 128  # 127 over budget, rather than 1 token
+    assert dropped == {"q"}
+
+
+def test_in_start_order_the_head_runs_over_budget_rather_than_nothing():
+    take, dropped = fill_token_budget_in_start_order(["p0"], {"p0": 100}, set(), 10)
+    assert take == {"p0": 100}
+    assert not dropped
+    take, dropped = fill_token_budget_in_start_order(["d0", "p0"], {"d0": 3, "p0": 100}, {"p0"}, 0, 4)
+    assert take == {"d0": 3}
+    assert dropped == {"p0"}
 
 
 # ── engine: prepare once, cut per chunk ─────────────────────────────────
