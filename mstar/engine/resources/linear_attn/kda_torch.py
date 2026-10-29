@@ -287,30 +287,30 @@ class TorchKDAKernels:
         return out
 
     @torch.compiler.disable
-    def run_verify(self, qkv, g, beta, plan, conv_state, rec_state, spec, p, gate=None):
+    def run_verify(self, qkv, g, beta, plan, conv_state, rec_state, blocks, p, gate=None):
         """``kda_triton.kda_verify``'s scheme with the decode math: replay each row's accepted
         prefix from the checkpoint, store the state there, run the block and cache its inputs
         on the side the step does not read."""
         h, d = p.num_heads, p.head_dim
         t = qkv.shape[0]
         f = F.linear(g, p.f_b) if p.f_b is not None else g.reshape(t, h * d)
-        out = self._verify(qkv, f, beta, plan, conv_state, rec_state, spec, p)
+        out = self._verify(qkv, f, beta, plan, conv_state, rec_state, blocks, p)
         if gate is None or p.g_b is None:
             return out
         gate = F.linear(gate, p.g_b).view(t, h, d)
         return gated_rms_norm(out, gate, p.norm_weight, p.norm_eps).reshape(t, h * d)
 
     @staticmethod
-    def _verify(qkv, f, beta, plan, conv_state, rec_state, spec, p):
+    def _verify(qkv, f, beta, plan, conv_state, rec_state, blocks, p):
         """All rows at once, a row advancing through its prefix only while the token was
         accepted (a mask where the kernel branches): no host reads, so a graph captures it."""
         h, d = p.num_heads, p.head_dim
         n, block = plan.num_rows, plan.block
         weight = p.conv_weight.unsqueeze(1)  # the depthwise conv's [3P, 1, W]
         slots = plan.slot_ids[:n].long()
-        kmax = spec.prefix.shape[2]
-        plen = spec.prefix_len[:, 0].index_select(0, slots).clamp(0, kmax)
-        side = spec.side[:, 0].index_select(0, slots).long() & 1
+        kmax = blocks.prefix.shape[2]
+        plen = blocks.prefix_len[:, 0].index_select(0, slots).clamp(0, kmax)
+        side = blocks.side[:, 0].index_select(0, slots).long() & 1
         other = 1 - side
 
         def token(x, f_t, b_t, win, rec):
@@ -325,22 +325,22 @@ class TorchKDAKernels:
 
         # the conv window before the prefix: the pool's before a request's first verify
         win = torch.where((plen == 0)[:, None, None], conv_state.index_select(0, slots),
-                          spec.conv[slots, side])
+                          blocks.conv[slots, side])
         rec = rec_state.index_select(0, slots).transpose(-1, -2).contiguous()
         for i in range(kmax):
-            _, w, r = token(spec.prefix[slots, side, i], spec.g[slots, side, i],
-                            spec.beta[slots, side, i], win, rec)
+            _, w, r = token(blocks.prefix[slots, side, i], blocks.g[slots, side, i],
+                            blocks.beta[slots, side, i], win, rec)
             live = plen > i
             win = torch.where(live[:, None, None], w, win)
             rec = torch.where(live[:, None, None, None], r, rec)
         rec_state.index_copy_(0, slots, rec.transpose(-1, -2))
-        spec.conv[slots, other] = win.to(spec.conv.dtype)
+        blocks.conv[slots, other] = win.to(blocks.conv.dtype)
         outs = []
         for j in range(block):
             x, f_j, b_j = qkv[j::block], f[j::block], beta[j::block]
             o, win, rec = token(x, f_j, b_j, win, rec)
             outs.append(o)
-            spec.prefix[slots, other, j] = x.to(spec.prefix.dtype)
-            spec.g[slots, other, j] = f_j.reshape(n, h, d).to(spec.g.dtype)
-            spec.beta[slots, other, j] = b_j.to(spec.beta.dtype)
+            blocks.prefix[slots, other, j] = x.to(blocks.prefix.dtype)
+            blocks.g[slots, other, j] = f_j.reshape(n, h, d).to(blocks.g.dtype)
+            blocks.beta[slots, other, j] = b_j.to(blocks.beta.dtype)
         return torch.stack(outs, 1).reshape(n * block, h, d)

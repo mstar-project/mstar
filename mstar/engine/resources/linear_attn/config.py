@@ -87,9 +87,12 @@ class LinearAttnStep(ResourceStep):
     pool's own step says what becomes of the slots. The walk is derived from
     the spans.
 
-    ``speculative``: every row is a verify block of a speculating node, which
-    first replays the accepted part of the row's last block (the pool's
-    speculative blocks); the span is the block's length, the same for every row.
+    ``verify``: a draft-verify step (``with_draft_verify`` sets it). Every row is
+    a block of the same span whose tail the verdict may reject. GDN runs each
+    block from the slot without writing the state and settles the kept prefix
+    after the verdict (``GDNManager.settle_verify``); KDA first replays the kept
+    part of the row's last block from the pool's verify blocks, and the pool
+    settles the count (``RecurrentStatePool.settle_verify``).
     """
 
-    speculative: bool = False
+    verify: bool = False

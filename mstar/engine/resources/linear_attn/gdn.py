@@ -2,6 +2,8 @@
 
 One kernel per batch: all-one-token rows take the recurrent decode path,
 anything else the chunked path, which also handles span-1 and zero-span padding.
+A draft-verify step's blocks take the multi-token decode path, and its verdict
+settles the state (`GDNVerifyWrapper`).
 
 The pool's plan result arrives through ``ctx.plan_results`` and its per-layer
 block as a plain tensor argument to ``run``.
@@ -14,13 +16,14 @@ from collections.abc import Mapping
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, RewindKind
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
     GDNMixedWrapper,
     GDNPrefillWrapper,
+    GDNVerifyWrapper,
     GDNWrapper,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
@@ -45,6 +48,9 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 
 
 class GDNManager(LinearAttnManager):
+    # a verify step's verdict settles the state in the forward (`settle_verify`)
+    rewind_kind = RewindKind.DEVICE
+
     def __init__(
         self,
         config: LinearAttnConfig,
@@ -83,6 +89,8 @@ class GDNManager(LinearAttnManager):
 
         # (label, is_decode) -> wrapper
         self._eager_wrappers: dict[tuple[str, bool], GDNWrapper] = {}
+        # a draft-verify step's, per label eagerly and per slot key under capture
+        self._verify_wrappers: dict[str | CGSlotKey, GDNVerifyWrapper] = {}
 
         self._current: dict[str, GDNWrapper] = {}
 
@@ -149,6 +157,9 @@ class GDNManager(LinearAttnManager):
 
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
+            if getattr(step, "verify", False):
+                self._current[label] = self._build_verify_plan(label, segments, addressing[label], ctx)
+                continue
             self._current[label] = self._build_plan(
                 label, segments, addressing[label], ctx
             )
@@ -265,6 +276,34 @@ class GDNManager(LinearAttnManager):
             wrapper.plan(spans, slots, addressing.has_state[:num_rows])
         return wrapper
 
+    def _build_verify_plan(
+        self, label: str, segments: list[Segment], addressing: RecurrentAddressing, ctx: StepContext,
+    ) -> GDNVerifyWrapper:
+        if not self._has_sink:
+            raise ValueError("a GDN verify step needs the pool's sink slot; unset disable_sink_slot")
+        lease = ctx.slot_lease
+        key = label if lease is None else CGSlotKey(lease.bucket, lease.slot, label)
+        wrapper = self._verify_wrappers.get(key)
+        if wrapper is None:
+            wrapper = self._verify_wrappers[key] = GDNVerifyWrapper(
+                device=self._device,
+                pad_slot_id=PAD_SLOT_ID,
+                sm_scale=self.config.sm_scale,
+                qk_l2norm=self.config.qk_l2norm,
+                bs=None if lease is None else max(self._cg_max_bs, lease.bucket.bs),
+                accelerator_graph=lease is not None,
+                null_slot_id=SINK_SLOT,
+            )
+        spans = [seg.span for seg in segments]
+        wrapper.plan(spans, addressing.slot_indices[: len(spans)])
+        return wrapper
+
+    def settle_verify(self, accepted: torch.Tensor, label: str) -> None:
+        """Each verify row's state after its accepted prefix (`GDNVerifyWrapper.settle`)."""
+        wrapper = self._current.get(label)
+        if isinstance(wrapper, GDNVerifyWrapper):
+            wrapper.settle(accepted)
+
     def current_plan(self, label: str | None = None) -> GDNWrapper:
         if label is None:
             label = self._default_label
@@ -351,4 +390,5 @@ class GDNManager(LinearAttnManager):
     def cleanup(self):
         self._cg_wrappers.clear()
         self._eager_wrappers.clear()
+        self._verify_wrappers.clear()
         self._current.clear()

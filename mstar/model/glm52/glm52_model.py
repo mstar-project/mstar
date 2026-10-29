@@ -10,10 +10,12 @@ from jinja2 import TemplateError
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
+    DRAFT_VERIFY,
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
     AuxPlanes,
+    DraftVerifySpec,
     DSAConfig,
     DSASpec,
     KVLayout,
@@ -267,8 +269,13 @@ class Glm52Model(Model):
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,
                 vocab_size=self.config.vocab_size,
+                # MTP's drafts are verified by the sampler, by rejection sampling at a temperature
+                draft_verify=self.config.mtp_num_draft_tokens > 0,
+                enable_sampled_verify=self.config.mtp_num_draft_tokens > 0,
             ),
         ]
+        if self.config.mtp_num_draft_tokens > 0:
+            specs.append(DraftVerifySpec(resource_key=DRAFT_VERIFY, nodes=nodes, sampler=SAMPLER_RESOURCE))
         if self.config.dsa_long_context:
             # past index_topk each query attends its indexer's top index_topk latents
             specs.append(DSASpec(
@@ -414,14 +421,6 @@ class Glm52Model(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         if prompt is None:
             return {}
-        if self.config.mtp_num_draft_tokens > 0:
-            # what prepare_inputs refuses, as a 500 once every rank had the request
-            sampling = self.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
-            if sampling.temperature != 0 or sampling.repetition_penalty != 1:
-                raise ValueError(
-                    f"MTP drafting is greedy only (temperature={sampling.temperature}, "
-                    f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
-                )
         if self._tokenizer_mode == "byte":
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
             vocab = self.config.vocab_size
@@ -439,7 +438,11 @@ class Glm52Model(Model):
                 f"at most {self.config.max_prompt_tokens}"
             )
         n = input_ids.numel()
-        layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", 1),))
+        # a slot per kept token; under MTP the verify rows written past them are the lookahead
+        layout = LabelLayout(
+            spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", 1),),
+            lookahead=self.config.mtp_kv_lookahead,
+        )
         return ProcessPromptOutput(
             {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_RESOURCE: {"main": layout}}},
         )
@@ -483,12 +486,6 @@ class Glm52Model(Model):
         for k, cast in (("top_k", int), ("min_p", float)):
             if model_kwargs.get(k) is not None:
                 params[k] = cast(model_kwargs[k])
-        if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP is greedy-only, so greedy is the declared default on MTP
-            # configs: a bare request serves instead of inheriting the config
-            # temperature and being refused by prepare_inputs. An explicit
-            # temperature > 0 still refuses.
-            params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 
     def context_limit(self) -> int:

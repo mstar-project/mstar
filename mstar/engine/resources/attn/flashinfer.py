@@ -234,6 +234,33 @@ class FlashInferManager(AttentionManager):
         self._preplanned = False
         self._preplan_states = {}
 
+    corrects_preplan = True
+
+    def correct_preplan(self, verdicts, step: AttentionStep, ctx: StepContext) -> bool:
+        """Each staged wrapper with a rewound row, put right from the corrected KV plan: under
+        FA3 by rewriting its rows' lengths in the plan (`patch_kv_lens`), else planned again."""
+        if not self._preplanned:
+            return True
+        plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
+        rewound = set(zip(verdicts.request_ids, verdicts.labels, strict=True))
+        for label, wrapper in self._preplan_states.items():
+            kv_out = plan_outputs[label]
+            rows = kv_out.rows
+            if rows is None:
+                rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
+            if not any((rid, lab) in rewound for rid, lab, _ in rows):
+                continue
+            indptrs = kv_out.cpu_indptrs
+            if isinstance(wrapper, FlashInferPrefillWrapper) and (
+                wrapper.planned_for(indptrs.kv_lens) or wrapper.patch_kv_lens(indptrs.kv_lens)
+            ):
+                continue
+            wrapper.plan(
+                causal=step.causal, dtype=self._dtype, window_left=self._window_left,
+                **indptrs.to_kwargs_dict(),
+            )
+        return True
+
     ### Submodule-level functionality
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str="main") -> torch.Tensor | None:

@@ -23,7 +23,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnStep,
     LinearAttnVariant,
 )
-from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, SpecBlocks
+from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, VerifyBlocks
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import (
     TritonKDAKernels,
@@ -60,19 +60,19 @@ class _Recorder:
         self.runs.append((plan, conv_state, rec_state, gate))
         return qkv
 
-    def run_verify(self, qkv, g, beta, plan, conv_state, rec_state, spec, p, gate=None):
-        self.verifies.append((plan, spec, gate))
+    def run_verify(self, qkv, g, beta, plan, conv_state, rec_state, blocks, p, gate=None):
+        self.verifies.append((plan, blocks, gate))
         return qkv
 
 
-def specs(heads=HEADS, v_heads=HEADS, backend=LinearAttnBackend.TRITON, speculative_tokens=0,
+def specs(heads=HEADS, v_heads=HEADS, backend=LinearAttnBackend.TRITON, max_drafts=0,
           sink=True):
     geometry = DeltaNetGeometry(
         num_k_heads=heads, num_v_heads=v_heads, head_k_dim=DIM, head_v_dim=DIM,
         conv_kernel_size=4,
     )
     pool = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
-        num_layers=3, blocks=geometry.to_blocks(speculative_tokens=speculative_tokens),
+        num_layers=3, blocks=geometry.to_blocks(max_drafts=max_drafts),
         max_slots=6, disable_sink_slot=not sink,
     ))
     kda = LinearAttnSpec(KDA, {"llm"}, LinearAttnConfig(
@@ -91,14 +91,14 @@ def build(device=CPU, **kwargs) -> tuple[RecurrentStatePool, KDAManager]:
     return pool, kda
 
 
-def plan(pool, kda, rids, spans, ctx, speculative=False):
+def plan(pool, kda, rids, spans, ctx, verify=False):
     segments = tuple(Segment(rid, "main", n) for rid, n in zip(rids, spans, strict=True))
     for rid in rids:
         pool.ingest_request(rid)
     pool_step = RecurrentStep(segments=segments)
     assert pool.admit(pool_step, ctx).ok
     ctx.plan_results[POOL] = pool.plan(pool_step, ctx)
-    return kda.plan(LinearAttnStep(segments=segments, speculative=speculative), ctx)["main"]
+    return kda.plan(LinearAttnStep(segments=segments, verify=verify), ctx)["main"]
 
 
 def commit(pool, rids, spans, ctx):
@@ -247,7 +247,7 @@ def _ptr(t):
 
 def test_the_callable_hands_the_bundle_each_layers_blocks():
     """The layer names no block: the callable resolves its conv and state, by the cursor or
-    an explicit index, and a pool without speculative blocks has none to hand over."""
+    an explicit index, and a pool without verify blocks has none to hand over."""
     pool, kda = build()
     kda.set_kernels(rec := _Recorder())
     p = plan(pool, kda, ["a"], [4], eager(["a"]))
@@ -263,12 +263,12 @@ def test_the_callable_hands_the_bundle_each_layers_blocks():
         assert got is p and got_gate is gate
         assert _ptr(conv) == _ptr(pool.block("conv", layer))
         assert _ptr(state) == _ptr(pool.block("state", layer))
-    assert mix._blocks[1].spec is None
+    assert mix._blocks[1].verify is None
 
 
-def test_a_speculative_step_runs_verify_blocks():
-    pool, kda = build(speculative_tokens=2)
-    assert kda.speculative_tokens == 2
+def test_a_verify_step_runs_verify_blocks():
+    pool, kda = build(max_drafts=2)
+    assert kda.max_drafts == 2 and pool.max_drafts == 2
     kda.set_kernels(rec := _Recorder())
     mix = KDACallable(pool, kda)
     # each request's prefill commits before its first verify step
@@ -276,62 +276,61 @@ def test_a_speculative_step_runs_verify_blocks():
     plan(pool, kda, ["a", "b"], [4, 2], ctx)
     commit(pool, ["a", "b"], [4, 2], ctx)
     layouts = len(rec.layouts)
-    p = plan(pool, kda, ["a", "b"], [3, 3], eager(["a", "b"], walk="decode"), speculative=True)
+    p = plan(pool, kda, ["a", "b"], [3, 3], eager(["a", "b"], walk="decode"), verify=True)
     assert p.is_verify and p.block == 3 and not p.is_decode
     assert p.layout is None and len(rec.layouts) == layouts
     gate = torch.zeros(6, DIM)
     mix(torch.zeros(6, 3 * HEADS * DIM), torch.zeros(6, DIM), torch.zeros(6, HEADS), params(),
         gate=gate, layer_idx=1)
-    ((got, spec, got_gate),) = rec.verifies
+    ((got, blocks, got_gate),) = rec.verifies
     assert got is p and got_gate is gate and rec.runs == []
-    want = SpecBlocks.of(pool, 1)
-    assert spec.prefix.shape == (6, 2, 3, 3 * HEADS * DIM) and spec.prefix_len.shape == (6, 1)
-    assert [_ptr(t) for t in spec] == [_ptr(t) for t in want]
+    want = VerifyBlocks.of(pool, 1)
+    assert blocks.prefix.shape == (6, 2, 3, 3 * HEADS * DIM) and blocks.prefix_len.shape == (6, 1)
+    assert [_ptr(t) for t in blocks] == [_ptr(t) for t in want]
 
     # the verdicts: a keeps one of its two drafts, b none; the next step reads the other side
     slots = [pool._slots[r]["main"].index for r in "ab"]
-    mix.set_prefix_len(torch.tensor([1, 0]))
+    pool.settle_verify(torch.tensor([1, 0]))
     assert want.prefix_len[slots, 0].tolist() == [2, 1]
     assert want.side[slots, 0].tolist() == [1, 1]
     commit(pool, ["a", "b"], [3, 3], ctx)
-    plan(pool, kda, ["a", "b"], [3, 3], eager(["a", "b"], walk="decode"), speculative=True)
-    mix.set_prefix_len(torch.tensor([2, 2]))
+    plan(pool, kda, ["a", "b"], [3, 3], eager(["a", "b"], walk="decode"), verify=True)
+    pool.settle_verify(torch.tensor([2, 2]))
     assert want.prefix_len[slots, 0].tolist() == [3, 3]
     assert want.side[slots, 0].tolist() == [0, 0]
     # every layer shares the count
-    assert SpecBlocks.of(pool, 0).prefix_len.data_ptr() == want.prefix_len.data_ptr()
+    assert VerifyBlocks.of(pool, 0).prefix_len.data_ptr() == want.prefix_len.data_ptr()
 
 
-def test_set_prefix_len_leaves_the_slots_outside_the_step():
+def test_the_settle_leaves_the_slots_outside_the_step():
     """A captured verify bucket's padding row writes the sink; another request's slot,
     not in the step, keeps its count and side."""
-    pool, kda = build(speculative_tokens=2)
+    pool, kda = build(max_drafts=2)
     kda.set_kernels(_Recorder())
-    mix = KDACallable(pool, kda)
     ctx = eager(["a", "c"])
     plan(pool, kda, ["a", "c"], [2, 2], ctx)
     commit(pool, ["a", "c"], [2, 2], ctx)
-    spec = SpecBlocks.of(pool, 0)
+    blocks = VerifyBlocks.of(pool, 0)
     a, c = (pool._slots[r]["main"].index for r in "ac")
-    spec.prefix_len[c], spec.side[c] = 2, 1
+    blocks.prefix_len[c], blocks.side[c] = 2, 1
     plan(pool, kda, ["a", "pad"], [3, 3],
-         leased(["a"], ["a", "pad"], bs=2, tokens=6, walk="decode"), speculative=True)
-    mix.set_prefix_len(torch.tensor([1, 2]))
-    assert (spec.prefix_len[a, 0].item(), spec.side[a, 0].item()) == (2, 1)
-    assert (spec.prefix_len[c, 0].item(), spec.side[c, 0].item()) == (2, 1)
-    assert spec.prefix_len[SINK_SLOT, 0].item() == 3
+         leased(["a"], ["a", "pad"], bs=2, tokens=6, walk="decode"), verify=True)
+    pool.settle_verify(torch.tensor([1, 2]))
+    assert (blocks.prefix_len[a, 0].item(), blocks.side[a, 0].item()) == (2, 1)
+    assert (blocks.prefix_len[c, 0].item(), blocks.side[c, 0].item()) == (2, 1)
+    assert blocks.prefix_len[SINK_SLOT, 0].item() == 3
 
 
 def test_a_verify_step_fits_the_pools_blocks():
     pool, kda = build()
-    with pytest.raises(ValueError, match="one block of 1..1"):
-        plan(pool, kda, ["a"], [2], eager(["a"], walk="decode"), speculative=True)
-    pool, kda = build(speculative_tokens=2)
+    with pytest.raises(ValueError, match="this pool has none"):
+        plan(pool, kda, ["a"], [2], eager(["a"], walk="decode"), verify=True)
+    pool, kda = build(max_drafts=2)
     with pytest.raises(ValueError, match="got spans"):
-        plan(pool, kda, ["a", "b"], [3, 2], eager(["a", "b"], walk="decode"), speculative=True)
+        plan(pool, kda, ["a", "b"], [3, 2], eager(["a", "b"], walk="decode"), verify=True)
     kda.set_kernels(_Recorder())
-    plan(pool, kda, ["c"], [3], eager(["c"], walk="decode"), speculative=True)
-    with pytest.raises(ValueError, match="SpecBlocks"):
+    plan(pool, kda, ["c"], [3], eager(["c"], walk="decode"), verify=True)
+    with pytest.raises(ValueError, match="VerifyBlocks"):
         kda.run(torch.zeros(3, 3 * HEADS * DIM), torch.zeros(3, DIM), torch.zeros(3, HEADS),
                 pool.block("conv", 0), pool.block("state", 0), params())
 

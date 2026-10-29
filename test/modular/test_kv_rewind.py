@@ -1,15 +1,12 @@
-"""``KVManager.correct_len``: a verify step's rejected tail taken back."""
+"""``KVManager.rewind``: a verify step's rejected rows taken back off the stream's length."""
 
 from __future__ import annotations
-
-import sys
 
 import pytest
 import torch
 
-sys.path.insert(0, ".")
-
 from mstar.engine.resources import Segment, StepContext
+from mstar.engine.resources.draft_verify.config import VerdictBatch
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
@@ -43,15 +40,15 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransferManager)
 
 
-def _make_manager(max_num_pages: int = 8) -> KVManager:
+def _make_manager(max_num_pages: int = 8, device: str = "cpu", cpu_offload_pages: int = 0) -> KVManager:
     cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=4,
         max_seq_len=max_num_pages * PAGE_SIZE, max_num_pages=max_num_pages,
-        page_size=PAGE_SIZE,
+        page_size=PAGE_SIZE, cpu_offload_pages=cpu_offload_pages,
     )
     mgr = KVManager(
         cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
-        device=torch.device("cpu"), dtype=torch.float32,
+        device=torch.device(device), dtype=torch.float32,
     )
     mgr.ingest_request("r")
     return mgr
@@ -73,17 +70,21 @@ def _stream(mgr: KVManager):
     return mgr._streams["r"]["main"]
 
 
-def test_correct_len_shortens_the_stream_and_keeps_its_pages():
+def _rewind(mgr: KVManager, rows: int, label: str = "main", rid: str = "r"):
+    mgr.rewind(VerdictBatch([rid], [label], [rows]))
+
+
+def test_a_rewind_shortens_the_stream_and_keeps_its_pages():
     mgr = _make_manager()
     _step(mgr, 6)  # two pages
     pages = list(_stream(mgr).page_indices)
-    gen = _stream(mgr).generation
+    gen, content = _stream(mgr).generation, _stream(mgr).reset_generation
 
-    mgr.correct_len("r", "main", -4)
+    _rewind(mgr, 4)
 
     assert _stream(mgr).stored_len == 2
     assert _stream(mgr).page_indices == pages
-    assert _stream(mgr).generation == gen + 1
+    assert (_stream(mgr).generation, _stream(mgr).reset_generation) == (gen + 1, content + 1)
     assert mgr._arena.num_free == 8 - 1 - len(pages)  # sink + the two
     mgr.assert_pages_conserved()
     # the next step plans from the shortened length
@@ -92,33 +93,37 @@ def test_correct_len_shortens_the_stream_and_keeps_its_pages():
     assert view.page_idxs == pages[:1]
 
 
-def test_correct_len_then_regrow_reuses_the_same_pages():
+def test_a_rewound_stream_regrows_over_the_same_pages():
     mgr = _make_manager()
     _step(mgr, 5)
     pages = list(_stream(mgr).page_indices)
-    mgr.correct_len("r", "main", -3)
+    _rewind(mgr, 3)
     view = _step(mgr, 4)  # 2 + 4 = 6: still two pages, no allocation
     assert view.page_idxs == pages
     assert _stream(mgr).page_indices == pages
 
 
-def test_zero_is_a_no_op_and_a_rewind_past_zero_clamps():
+def test_a_rewind_past_zero_stops_at_zero():
     mgr = _make_manager()
     _step(mgr, 3)
-    gen = _stream(mgr).generation
-    mgr.correct_len("r", "main", 0)
-    assert (_stream(mgr).stored_len, _stream(mgr).generation) == (3, gen)
-    mgr.correct_len("r", "main", -5)
+    _rewind(mgr, 5)
     assert _stream(mgr).stored_len == 0
 
 
-@pytest.mark.parametrize("delta", [0, -1])
-def test_unknown_stream_raises(delta):
+def test_a_rewind_of_no_rows_moves_nothing():
     mgr = _make_manager()
-    with pytest.raises(KeyError, match="nope"):
-        mgr.correct_len("nope", "main", delta)
-    with pytest.raises(KeyError, match="side"):
-        mgr.correct_len("r", "side", delta)
+    _step(mgr, 3)
+    gen = _stream(mgr).generation
+    with mgr._lock:
+        mgr._take_back("r", "main", 0)
+    assert (_stream(mgr).stored_len, _stream(mgr).generation) == (3, gen)
+
+
+@pytest.mark.parametrize(("rid", "label"), [("nope", "main"), ("r", "side")])
+def test_an_unknown_stream_raises(rid, label):
+    mgr = _make_manager()
+    with pytest.raises(KeyError, match=label if rid == "r" else rid):
+        _rewind(mgr, 1, label=label, rid=rid)
 
 
 def test_refused_between_admit_and_commit():
@@ -129,11 +134,11 @@ def test_refused_between_admit_and_commit():
     step = KVStep(segments=(Segment("r", "main", 1),))
     assert mgr.admit(step, _ctx()).ok
     with pytest.raises(AssertionError, match="between admit and commit"):
-        mgr.correct_len("r", "main", -2)
+        _rewind(mgr, 2)
     assert _stream(mgr).stored_len == 5
     mgr.plan(step, _ctx())
     mgr.commit(step, _ctx())
-    mgr.correct_len("r", "main", -2)
+    _rewind(mgr, 2)
     assert _stream(mgr).stored_len == 4
 
 
@@ -145,7 +150,7 @@ def test_a_rewind_across_a_sealed_page_drops_it():
     mgr._arena.seal(pages[1:2])
     free = mgr._arena.num_free
 
-    mgr.correct_len("r", "main", -8)  # back to 4, the end of page 0
+    _rewind(mgr, 8)  # back to 4, the end of page 0
 
     assert _stream(mgr).page_indices == pages[:1]
     assert mgr._arena.num_owners[pages[1]] == 1, "the other owner keeps its page"
@@ -163,7 +168,7 @@ def test_a_rewind_ending_inside_a_sealed_page_keeps_a_copy():
     mgr._arena.retain(pages[1:])
     mgr._arena.seal(pages[1:])
 
-    mgr.correct_len("r", "main", -2)  # back to 6, inside page 1
+    _rewind(mgr, 2)  # back to 6, inside page 1
 
     copy = _stream(mgr).page_indices[1]
     assert copy != pages[1] and not mgr._arena.sealed[copy]
@@ -179,21 +184,24 @@ def test_a_rewind_above_the_sealed_pages_keeps_them():
     mgr._arena.retain(pages[:1])
     mgr._arena.seal(pages[:1])
 
-    mgr.correct_len("r", "main", -3)  # back to 7, page 0 untouched
+    _rewind(mgr, 3)  # back to 7, page 0 untouched
 
     assert _stream(mgr).page_indices == pages
 
 
-def test_the_position_rewinds_beside_the_kv_length():
-    """MTP takes a verify step's rejected rows back from both resources: the position counter
-    moves by the same delta, never below zero."""
-    from mstar.engine.resources.position.config import PositionConfig
-    from mstar.engine.resources.position.manager import RopeManager
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="offload needs pinned host memory")
+def test_an_offloaded_stream_rewinds_its_host_copy():
+    """A request evicted between its verify step and the next one: the reload restores the
+    host copy's length, so the rewind has to land there."""
+    mgr = _make_manager(device="cuda", cpu_offload_pages=8)
+    _step(mgr, 7)
+    assert mgr.offload("r") > 0
+    assert _stream(mgr).offloaded
 
-    pos = RopeManager(config=PositionConfig(kv_cache="kv"), device=torch.device("cpu"))
-    pos.ingest_request("r")
-    pos.correct_len("r", "main", 7)
-    pos.correct_len("r", "main", -3)
-    assert pos.position("r", "main") == 4
-    pos.correct_len("r", "main", -10)
-    assert pos.position("r", "main") == 0
+    _rewind(mgr, 3)
+
+    assert mgr._cpu_pool.offloaded["r"]["main"].stored_len == 4
+    assert mgr.reload("r")
+    assert _stream(mgr).stored_len == 4
+    view = _step(mgr, 1)
+    assert (view.length, view.to_compute) == (5, 1)

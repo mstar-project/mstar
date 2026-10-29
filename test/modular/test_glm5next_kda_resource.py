@@ -66,7 +66,7 @@ class _Stepper:
     def __init__(self, pool, kda):
         self.pool, self.kda = pool, kda
 
-    def open(self, spans: dict[str, int], walk: str, speculative: bool = False):
+    def open(self, spans: dict[str, int], walk: str, verify: bool = False):
         segments = tuple(Segment(rid, "main", n) for rid, n in spans.items())
         for rid in spans:
             self.pool.ingest_request(rid)
@@ -74,7 +74,7 @@ class _Stepper:
         pool_step = RecurrentStep(segments=segments)
         assert self.pool.admit(pool_step, ctx).ok
         ctx.plan_results[KDA_STATE] = self.pool.plan(pool_step, ctx)
-        self.kda.plan(LinearAttnStep(segments=segments, speculative=speculative), ctx)
+        self.kda.plan(LinearAttnStep(segments=segments, verify=verify), ctx)
         return pool_step, ctx
 
     def close(self, pool_step, ctx):
@@ -138,10 +138,10 @@ def test_verify_blocks_decode_only_the_accepted_tokens():
     _, rec, conv = layer.prefill(prompt.unsqueeze(0), *layer.init_state(1))
     for accepted in (1, 0, 2):
         block = torch.randn(3, layer.hidden_size, dtype=torch.float64)
-        step = steps.open({"r": 3}, "decode", speculative=True)
+        step = steps.open({"r": 3}, "decode", verify=True)
         assert kda.current_plan().is_verify
         got = layer(block, LAYER)
-        layer.mix.set_prefix_len(torch.tensor([accepted]))
+        pool.settle_verify(torch.tensor([accepted]))
         steps.close(*step)
         r, c = rec.clone(), conv.clone()
         for j in range(3):
