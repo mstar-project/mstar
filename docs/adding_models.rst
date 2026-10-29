@@ -1064,55 +1064,47 @@ Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
 
 **Chunked prefill (optional).** A walk with long prompts can run each across several steps,
-at most a token budget per step, so the decode rows batched beside it keep running. Three
-methods opt a walk in. The policy is declared on the **model**, not the submodule, because
-the graph build reads it: a chunkable walk runs the node inside a Loop, one iteration per
-chunk, and the model passes its walk dict through ``apply_chunking`` to get that. A walk
-declared chunkable whose node was left unwrapped is refused at startup.
+at most a token budget per step, so the decode rows batched beside it keep running. Each
+chunk is one iteration of a Loop around the node. To opt a walk in:
 
 - ``Model.get_chunking_policies()`` returns ``{node: (ChunkingPolicy, ...)}``, each policy
-  naming the ``walks`` it covers: ``chunkable=True``; ``max_batch_tokens``, the step's
-  budget (a combined walk that carries chunked rows sets one too, since its steps run
-  under it); ``max_chunks``, the chunk Loop's runaway guard, which defaults to no practical
-  cap and which a model normally leaves alone, since a cap below a prompt's chunk count
-  reports the prompt done early; ``accumulated_outputs`` for an output edge a consumer needs every
-  chunk of, which then arrives as one item per chunk (any other edge carries the final
-  chunk's tensors alone, earlier chunks' dropped as the loop advances);
-  ``reuses_cached_prefix`` when a row may have to write a
-  cached prefix again rather than start past it; and ``reserve_whole_prefill``, on by
-  default, which has a row's first chunk reserve the state its whole prefill needs so a
-  part-done row cannot wedge on a full pool. Turn it off for a walk whose state grows by
-  something other than the tokens a step runs, where that count would reserve the wrong
-  amount; a resource reads it as ``StepContext.reserve_whole_prefill`` and must check it
-  before reserving by ``StepContext.chunk_tokens_after``.
+  naming the ``walks`` it covers. It is declared on the model, not the submodule, because
+  the graph build reads it: pass the dict ``get_graph_walk_graphs`` returns through
+  ``self.apply_chunking(...)``, which wraps each chunkable node in its Loop. A chunkable
+  walk whose node is not wrapped is refused at startup. The fields:
 
-  A **streaming** consumer of a gathered edge needs one more decision, because its
-  ``ChunkPolicy`` counts items and a chunked producer sends one per chunk: to a
-  ``FixedChunkPolicy(1)`` the pieces look like separate items and it reads only the
-  first. Set ``Connection.join_dim`` to have the consumer's ``StreamBuffer`` join them
-  into the single item it expects, on arrival -- it owns those tensors outright, so
-  there is no cross-stream ordering to get wrong. Leave it unset for a consumer that
-  can take the pieces as they come, which is the better answer where the consumer can
-  do it; ``join_dim`` is for one that conditions on the whole prompt or whose shapes
-  are captured.
+  - ``chunkable=True`` lets the walk's rows be cut.
+  - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries
+    chunked rows sets one too, since its steps run under it.
+  - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
+    one item per chunk. Any other edge carries the final chunk's output alone.
+  - ``reuses_cached_prefix``: a callable saying whether a row may start past its cached
+    prefix; ``None`` (the default) is always. Set it where a row may have to write its
+    prefix again.
+  - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
+    whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
+    a walk whose state grows by something other than the tokens a step runs.
+  - ``max_chunks``: a runaway guard on the Loop. Leave it at its default.
+
+  A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
+  (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
+  joins the pieces into that item. Leave it unset for a consumer that can take the
+  pieces as they come.
 - ``get_input_sequence_len(graph_walk, fwd_info, inputs)`` gives a row's length from its
   input shapes, before ``prepare_inputs`` runs. The scheduler cuts the row by it, and a
   row whose prepared input turns out another length fails.
 - ``split_inputs(graph_walk, fwd_info, inputs, start, end)`` cuts the whole prepared input
-  to tokens ``[start, end)``. It is prepared once and cut per chunk. ``ARNodeSubmodule``'s
-  default cuts the token ids or embeddings and any custom position ids, and refuses inputs it
-  cannot see into (``tensor_inputs``, ``kwargs``, ``resource_step_info``).
+  to tokens ``[start, end)``. ``ARNodeSubmodule``'s default cuts the token ids or
+  embeddings and any custom position ids, and refuses inputs it cannot see into
+  (``tensor_inputs``, ``kwargs``, ``resource_step_info``).
 
-The engine holds a non-final chunk's outputs and routes them once, joined, with the final
-chunk. Each chunk is still a full forward, though, which samples a token. An autoregressive
-node that chunks must therefore do two things itself:
+Each chunk is a full forward, so it samples a token, but only the final chunk's token is
+real (``inputs.is_final_chunk``). An autoregressive node that chunks must therefore:
 
 - In ``declare_step``, wrap its sampler step in ``keep_final_chunk_samples(step,
   request_ids, inputs)``, so a non-final chunk's sample commits no RNG offset and marks no
   token as seen.
-- Drop a non-final chunk's sampled token in ``postprocess`` (when
-  ``inputs.is_final_chunk`` is false), or mark its output edge ``FINAL``. Otherwise the
-  token is routed as the prompt's first.
+- Drop a non-final chunk's sampled token in ``postprocess``.
 
 ``LLMSubmodule`` in ``mstar/model/qwen3_5/submodules.py`` does both. Nothing checks them at
 load, so cover them with a test: ``test/modular/test_chunked_prefill.py`` and
