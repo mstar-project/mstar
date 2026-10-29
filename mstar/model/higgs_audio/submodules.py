@@ -135,7 +135,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     # its segments, one per request, lay out LoRA's rows (see NodeSubmodule)
-    lora_segment_rows = True
+    segment_rows = True
 
     def __init__(self, llm: nn.Module, config: HiggsAudioModelConfig):
         super().__init__()

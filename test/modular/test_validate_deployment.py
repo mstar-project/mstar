@@ -479,49 +479,37 @@ def test_prefix_stream_laying_out_an_undeclared_resource_is_refused(tmp_path):
 # -- LoRA ---------------------------------------------------------------------
 
 
-def _lora_spec(key="lora", nodes=("llm",)):
-    from test_lora_pool import make_spec  # skips the test without safetensors
+def _lora_spec():
+    """One LoRA spec over a (its qkv target) and b (its o target)."""
+    from test_lora_pool import QKV, O, make_spec  # skips the test without safetensors
 
-    return dataclasses.replace(make_spec({}), resource_key=key, nodes=set(nodes))
+    targets = {"qkv": dataclasses.replace(QKV, node="a"), "o": dataclasses.replace(O, node="b")}
+    return dataclasses.replace(make_spec({}), nodes={"a", "b"}, targets=targets)
 
 
-class _LoraModel(_Model):
-    def __init__(self, lora, *args, **kw):
-        super().__init__(*args, **kw)
-        self._lora = lora
-
-    def get_lora_specs(self):
-        return list(self._lora)
+# a tensor-parallel LLM (a) and its vision tower (b), in different lockstep instances
+_A_TP_THEN_B = [{"node_names": ["a"], "ranks": [0, 1], "tp_size": 2}, {"node_names": ["b"], "ranks": [2]}]
 
 
 def test_a_lora_deployment_passes(tmp_path):
-    """The pass checks the specs the YAML turns on, as the workers build them: the
-    model's declaration alone has no `lora` resource for the block to override."""
-    _validate(_LoraModel([_lora_spec()]), _cfg(tmp_path, resources={"lora": {"max_slots": 2}}))
+    """The pass checks the specs the YAML turns on, as the workers build them: the opt-in
+    LoRA spec, for the `lora:` block to override, split into a pool per node."""
+    cfg = _cfg(tmp_path, _A_TP_THEN_B, resources={"lora": {"max_slots": 2}})
+    _validate(_Model(_a_then_b, specs=[_lora_spec()], tp_enabled_nodes=["a"]), cfg)
 
 
-@pytest.mark.parametrize("serves_lora, block, refusal", [
-    (True, {"max_slots": 0}, "resources.lora: max_slots must be an integer >= 1; got 0"),
-    # reported once, not again as an unknown resource
-    (False, {"max_slots": 0}, "declaring the LoRA specs failed: ValueError: the serving config "
-                              "has a `resources: lora:` block, but _LoraModel serves no LoRA adapters"),
-    (True, None, "declaring the LoRA specs failed: ValueError: `resources: lora:` must be a mapping; got None"),
-], ids=["bad_value", "no_lora_specs", "not_a_mapping"])
-def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, serves_lora, block, refusal):
-    """The `lora:` block sizes every LoRA spec; a bad value there is one problem, and the
-    other resources' checks still run."""
-    cfg = _cfg(tmp_path, [
-        {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
-        {"node_names": ["b"], "ranks": [2]},
-    ], resources={"lora": block})
-    model = _LoraModel(
-        [_lora_spec(nodes={"a"}), _lora_spec("lora_b", nodes={"b"})] if serves_lora else [],
-        _a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"],
-    )
-    assert _problems(model, cfg) == [
-        refusal,
-        "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas",
-    ]
+@pytest.mark.parametrize("block, refusal", [
+    ({"max_slots": 0}, r"resources\.lora: max_slots must be an integer >= 1; got 0"),
+    (["sql"], r"resources\.lora: .*argument after \*\* must be a mapping, not list"),
+], ids=["bad_value", "not_a_mapping"])
+def test_a_bad_lora_value_is_reported_once_with_the_other_problems(tmp_path, block, refusal):
+    """A refused `lora:` block leaves the spec as declared, so splitting it per node
+    reports nothing again, and the other resources' placement checks still run."""
+    cfg = _cfg(tmp_path, _A_TP_THEN_B, resources={"lora": block})
+    model = _Model(_a_then_b, specs=[_lora_spec(), _Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"])
+    problems = _problems(model, cfg)
+    assert len(problems) == 2 and re.fullmatch(refusal, problems[0]), problems
+    assert problems[1] == "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas"
 
 
 # -- every problem at once ----------------------------------------------------

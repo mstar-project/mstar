@@ -24,7 +24,6 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnSpec,
     LinearAttnVariant,
 )
-from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
@@ -220,6 +219,8 @@ class Qwen3_5DenseModel(Model):
         return torch.float32
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
+        from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+
         num_kv_layers = len(self.config.full_layer_indices)
         num_gdn_layers = len(self.config.linear_layer_indices)
         return [
@@ -272,13 +273,8 @@ class Qwen3_5DenseModel(Model):
                 enable_repetion_penalty=True,
             ),
             *self._vision_resources(),
+            qwen3_5_lora_spec(self.config, self.vision_config),
         ]
-
-    def get_lora_specs(self) -> list[LoraSpec]:
-        """The LLM's, then the vision encoder's when the checkpoint has a vision tower."""
-        from mstar.model.qwen3_5.lora import qwen3_5_lora_specs
-
-        return qwen3_5_lora_specs(self.config, self.vision_config)
 
     def _vision_resources(self) -> list[NodeResourceSpec]:
         """The ViT tower's attention, its only resource; none when text-only."""

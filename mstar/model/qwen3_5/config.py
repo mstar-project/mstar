@@ -8,8 +8,6 @@ import json
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
-
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
@@ -27,10 +25,6 @@ GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
 ROPE = "rope"
 SAMPLER = "sampler"
-# per-request LoRA adapters, declared only when the serving YAML turns them on: the
-# LLM's, and the vision encoder's (sized by the same YAML block)
-LORA = LORA_RESOURCE_KEY
-VISION_LORA = f"vision_{LORA_RESOURCE_KEY}"
 # the ViT tower's cacheless attention, on the `vision_encoder` node
 VISION_ATTN = "vision_attn"
 

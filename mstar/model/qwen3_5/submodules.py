@@ -31,7 +31,6 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.lora import LoraStep
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
@@ -88,7 +87,7 @@ class LLMSubmodule(ARNodeSubmodule):
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
     # every row's tokens, image tokens included, go through the adapted linears
-    lora_segment_rows = True
+    segment_rows = True
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
@@ -742,7 +741,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
 
     # the frames' segments, in order, are the rows the tower's linears see (the
     # merger's folded); the captured block loop declares its own (see there)
-    lora_segment_rows = True
+    segment_rows = True
 
     def __init__(
         self, model: Qwen3_5VisionModel, config: Qwen3_5VisionConfig,
@@ -794,14 +793,13 @@ class VisionEncoderSubmodule(NodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
-        # Leased, the captured block loop plans its own attention per replay. A node
-        # serving adapters still declares its frames: the engine adds their LoRA rows
-        # (this admit is the one that can wait for a slot, and the patch embed and
-        # merger run outside the loop).
+        # Leased, the captured block loop plans its own attention per replay. The step
+        # still declares the frames, from which the engine adds a LoRA pool's rows (this
+        # admit is the one that can wait for a slot, and the patch embed and merger run
+        # outside the loop).
         leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
-        if leased and not self.lora_keys:
-            return None
-        # one segment per frame: a frame attends to itself alone
+        # one segment per frame: a frame attends to itself alone, and the frames, in
+        # order, are the rows the tower's linears see (the merger's folded)
         segments = [
             Segment(request_id=rid, label="main", span=span)
             for rid, inp in zip(request_ids, inputs, strict=True)
@@ -843,17 +841,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
 
         def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
             (rid,) = request_ids
-            steps = {VISION_ATTN: AttentionStep(causal=False)}
-            # The region's step is the model's, not the engine's, so it declares its
-            # LoRA rows itself: the prompt as one row, what the bucket's one row holds.
-            # They address the slot the outer step took; the pool restores the outer
-            # plan when the region commits, for the merger after it.
-            prompt = (Segment(request_id=rid, label="main", span=sum(seq_lens)),)
-            for key in self.lora_keys:
-                steps[key] = LoraStep(segments=prompt)
             return SubmoduleStep(
                 segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
-                steps=steps,
+                steps={VISION_ATTN: AttentionStep(causal=False)},
             )
 
         return {
@@ -861,6 +851,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
                 capture_fn=self._capture_block_loop,
                 make_static_inputs=make_static_inputs,
                 declare_step=declare_step,
+                # the blocks' linears take the adapter: the engine adds a LoRA pool's
+                # rows, which address the slot the outer step took (the pool restores
+                # the outer plan when the region commits, for the merger after it)
+                segment_rows=True,
                 lease_before_step=True,
                 can_lease=self._fits_capture,
                 total_tokens=self.BLOCK_LOOP_PATCH_BUCKETS,
@@ -899,8 +893,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
     ) -> torch.Tensor | None:
         """The block loop replayed once per prompt, or None if not leased.
 
-        A leased step declares no attention of its own (`declare_step`: no step,
-        or only the engine's LoRA rows); a bucket that fits is not enough, as
+        A leased step declares no attention of its own (`declare_step`: its frames
+        alone); a bucket that fits is not enough, as
         ``can_lease`` may have refused the batch, and the eager tower then needs
         the attention plan its step declared. The bucket check keeps a forward
         driven outside the engine (no declaration either) eager.

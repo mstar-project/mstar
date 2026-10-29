@@ -36,10 +36,14 @@ class BucketKey:
     num_tokens: int
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
+    # captured without the kernels of the node's idle-capable resources
+    # (`Resource.idle_capture`), for steps none of whose rows uses them
+    idle: bool = False
 
     def __str__(self) -> str:
         key = "" if self.cg_key_info is None else f",key={self.cg_key_info}"
-        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}]"
+        idle = ",idle" if self.idle else ""
+        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}{idle}]"
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,10 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # the node's idle-capable resources (`Resource.idle_capture`) sit this step
+    # out: an idle lease's, or an eager step none of whose rows carries their
+    # request config. Set by the engine; a piecewise region's step is never idle.
+    idle: bool = False
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)

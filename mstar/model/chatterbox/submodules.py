@@ -213,7 +213,7 @@ class T3Submodule(ARNodeSubmodule):
 
     # its segments lay out LoRA's rows, under guidance two per request (cond,
     # uncond) in the order `preprocess` packs them (see NodeSubmodule)
-    lora_segment_rows = True
+    segment_rows = True
 
     def __init__(
         self, model: nn.Module, config: ChatterboxConfig, builtin_voice: BuiltinT3Voice | None,

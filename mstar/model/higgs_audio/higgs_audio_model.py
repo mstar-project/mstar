@@ -112,22 +112,20 @@ class HiggsAudioModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
-    def get_lora_specs(self) -> list[LoraSpec]:
+    def _lora_spec(self) -> LoraSpec:
         """Per-request adapters on the LLM: every linear of the Qwen3 stack and the text
         head (one row per request: the last token's), placed as the weight loader places
         the checkpoint's own tensors. The embedding takes none: ``prefill_text`` embeds in
         ``prepare_inputs``, outside the step. Adapters saved on a ``Qwen3ForCausalLM``
         layout (``model.layers.*``) are read as the flat checkpoint's."""
-        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
-
-        root = meta_root(lambda group: HiggsAudioLLM(self.config, comm_group=group))
-        return [module_lora_spec(
-            root, resource_key=LORA_RESOURCE_KEY, nodes={"LLM"}, root_path="model",
+        return module_lora_spec(
+            lambda group: HiggsAudioLLM(self.config, comm_group=group),
+            nodes={"LLM"}, root_path="model",
             adapter_roots=[("model.", "")],
             rows={"lm_head": PER_SEGMENT},
-        )]
+        )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """LLM paged KV + attention/positions/sampler. audio_encoder is
@@ -164,6 +162,7 @@ class HiggsAudioModel(Model):
                 # exposes no penalty knob, so no seen-token buffers.
                 enable_repetion_penalty=False,
             ),
+            self._lora_spec(),
         ]
 
     def get_request_resource_configs(

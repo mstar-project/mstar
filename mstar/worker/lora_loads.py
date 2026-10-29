@@ -11,15 +11,23 @@ from __future__ import annotations
 import logging
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 from mstar.engine.resources.lora.config import describe_load_error
 from mstar.utils.ipc_format import LoadLoraAdapter, UnloadLoraAdapter
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.base import Resource
     from mstar.engine.resources.lora.pool import LoraAdapterPool
 
 logger = logging.getLogger(__name__)
+
+
+def lora_pools(resources: Mapping[str, "Resource"]) -> list["LoraAdapterPool"]:
+    """The LoRA adapter pools among an engine's resources."""
+    from mstar.engine.resources.lora.pool import LoraAdapterPool
+
+    return [resource for resource in resources.values() if isinstance(resource, LoraAdapterPool)]
 
 
 @dataclass(slots=True)
@@ -48,7 +56,7 @@ class LoraLoads:
         """Hand every pool the read and return at once. A pool that refuses outright (the
         name already served) fails the load without the rest being asked."""
         load = LoraLoad(body)
-        digest = None if body.lora_digest is None else bytes.fromhex(body.lora_digest)
+        digest = bytes.fromhex(body.lora_digest)
         for pool in pools:
             try:
                 load.reads.append((pool, pool.load_adapter_async(body.lora_name, body.lora_path, digest)))

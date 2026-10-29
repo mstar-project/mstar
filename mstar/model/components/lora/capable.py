@@ -32,8 +32,8 @@ if TYPE_CHECKING:
 
 def apply_lora(delta: "LoraLayerDelta | None", x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """``y`` with the step's per-row delta of ``x`` added, or ``y`` itself when nothing is
-    bound or no row of the step names an adapter (a base-only step, which launches no
-    kernel). The one place a capable module calls LoRA, and callers use the return value,
+    bound or no row of the step names an adapter (an idle step, ``StepContext.idle``, which
+    launches no kernel). The one place a capable module calls LoRA, and callers use the return value,
     so the op form (in place on ``y`` today; a functional ``y + delta`` lets Inductor
     schedule fusions around it) changes here alone. Only bound (swapped) modules call it."""
     return y if delta is None else delta(x, y)

@@ -294,6 +294,11 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # from the submodule's `declare_step` because the region's shape is its
     # own: the runner admits, plans, and commits it per replay.
     declare_step: Callable[[list[str], list[int]], SubmoduleStep | None] | None = None
+    # As ``NodeSubmodule.segment_rows``, for a region that runs the node's adapted
+    # modules: its step's segments are the rows they see, so the engine adds the steps
+    # of the node's resources whose step is the segments (a LoRA pool) to it, a
+    # request's segments merged into one, as the region's bucket holds a row per request.
+    segment_rows: bool = False
     # Take this region's slot before the outer `declare_step` runs, and report
     # it on the step context. The region still declares, plans and commits its
     # own work; the lease only tells the outer declaration which resources are

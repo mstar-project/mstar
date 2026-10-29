@@ -7,14 +7,12 @@ communicator, its built resources and capture results, and live process
 groups across ranks.
 """
 
-import contextlib
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
-from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
-from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
+from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
+from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems
@@ -89,6 +87,12 @@ def validate_deployment(
             problems.append(f"validate_config_yaml failed: {type(e).__name__}: {e}")
         except _UNREADABLE as e:
             problems.append(_unreadable("validate_config_yaml", e))
+        try:
+            refuse_unresolved_lora_adapters(config)
+        except ValueError as e:
+            problems.append(str(e))
+        except _UNREADABLE as e:
+            problems.append(_unreadable("refuse_unresolved_lora_adapters", e))
 
     malformed = node_groups_problems(config)
     problems += malformed
@@ -114,7 +118,8 @@ def validate_deployment(
     # problems found so far, and only the checks that need the specs are skipped
     specs = None
     try:
-        specs = list(model.get_node_resources() or [])
+        # a `resources:` block check_resources refuses turns no resource on
+        specs = enabled_resources(model, config if resources_readable else {**config, "resources": None})
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
@@ -122,28 +127,8 @@ def validate_deployment(
         )
     except _UNREADABLE as e:
         problems.append(_unreadable("get_node_resources", e))
-    checked_config = config
-    # a `resources:` block check_resources refuses turns no LoRA on
-    if specs is not None and resources_readable and lora_enabled(config):
-        lora = None
-        try:
-            lora = declared_lora_specs(model, config)
-        except (ValueError, OSError) as e:
-            problems.append(f"declaring the LoRA specs failed: {type(e).__name__}: {e}")
-        except _UNREADABLE as e:
-            problems.append(_unreadable("declaring the LoRA specs", e))
-        if lora is None:
-            # reported above, not again as an unknown resource
-            checked_config = {
-                **config, "resources": {k: v for k, v in config["resources"].items() if k != LORA_RESOURCE_KEY},
-            }
-        else:
-            # the override step refuses the same block on the `lora` spec, with the rest
-            with contextlib.suppress(TypeError, ValueError):
-                size_lora_specs(lora, config)
-            specs += lora
     if specs is not None:
-        problems += _checked("checking the node resources", check_resources, model, specs, checked_config)
+        problems += _checked("checking the node resources", check_resources, model, specs, config)
         # the placement checks see what the workers build of them
         try:
             specs = built_resources(specs)

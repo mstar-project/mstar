@@ -420,6 +420,13 @@ def _model(name: str):
     return get_model_class(name)(**model_init_kwargs(name))
 
 
+def _lora_spec(model):
+    """The model's LoRA spec, declared beside its other resources."""
+    from mstar.engine.resources.lora.serving import lora_spec
+
+    return lora_spec(model.get_node_resources())
+
+
 def _submodule(model, node: str):
     import torch
 
@@ -523,10 +530,12 @@ def _lora_logits(spec_: ModelSpec, model, adapters: dict[str, str], prompts, rop
 
     from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig
     from mstar.engine.resources.lora.pool import LoraAdapterPool
+    from mstar.engine.resources.lora.store import check_adapters
     from mstar.engine.resources.step import StepContext
 
-    spec = model.get_lora_specs()[0]
+    spec = _lora_spec(model)
     spec.apply_yaml_overrides(max_slots=len(adapters), max_rank=_max_rank(adapters), adapters=adapters)
+    spec.adapter_digests = check_adapters(spec)  # as the API server pins them
     spec.dtype = torch.bfloat16
     pool = LoraAdapterPool(spec, "cuda")
     sub = _submodule(model, spec_.node)
@@ -536,7 +545,7 @@ def _lora_logits(spec_: ModelSpec, model, adapters: dict[str, str], prompts, rop
     rids = [r for r, _, _ in rows]
     step = spec_.declare(sub, rids, [ids.cuda() for _, _, ids in rows])
     for rid, adapter, _ in rows:
-        pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
+        pool.ingest_request(rid, None if adapter is None else LoraReqConfig(adapter))
     ctx = StepContext(request_ids=rids, graph_walk="prefill", slot=0, capture=False)
     assert pool.admit(step.get(LORA_RESOURCE_KEY), ctx).ok
     pool.plan(step.get(LORA_RESOURCE_KEY), ctx)
@@ -606,7 +615,7 @@ def merged(args, spec_: ModelSpec) -> int:
         # has the pool bound (and, after a merge, the previous adapter merged in)
         sub = _submodule(_model(args.model), spec_.node)
         if adapter is not None:
-            _merge_into(sub, model.get_lora_specs()[0], args.adapters[adapter])
+            _merge_into(sub, _lora_spec(model), args.adapters[adapter])
         for j, ids in enumerate(prompts):
             _set_positions([len(ids)])
             with torch.no_grad():
@@ -798,7 +807,7 @@ def _merged_checkpoint(args, out: Path, adapter_path: str) -> Path:
     from mstar.engine.resources.lora.checkpoint import read_lora_file
 
     model = _model(args.model)
-    spec = model.get_lora_specs()[0]
+    spec = _lora_spec(model)
     snapshot = Path(_snapshot(model))
     deltas, alias = {}, {}
     for module, layer in read_lora_file(adapter_path, convert_keys=spec.convert_keys).layers.items():
@@ -856,7 +865,7 @@ def main() -> int:
     chosen = dict(a.split("=", 1) for a in args.adapter) or DEFAULT_ADAPTERS.get(args.model, {})
     args.adapters = {name: _adapter_file(s) for name, s in chosen.items()}
     if not args.adapters or args.synthetic:
-        spec = _model(args.model).get_lora_specs()[0]
+        spec = _lora_spec(_model(args.model))
         args.adapters.update(_synthetic(spec, args.out / "adapters", args.synthetic or 2,
                                         std=args.synthetic_std))
     phases = {"merged": merged, "hf": hf, "serve": serve}
