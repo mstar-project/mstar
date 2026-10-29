@@ -274,15 +274,18 @@ def test_a_captured_step_follows_the_registers():
 
 
 def test_a_captured_sampled_step_draws_fresh_tokens_each_replay():
-    """The sampled verification (sort, filters, Gumbel noise) captures, draws
-    anew on every replay, and keeps greedy rows on the argmax."""
+    """The sampled verification (FlashInfer's top-k/top-p sampler with device
+    seeds and offsets) captures, draws anew on every replay, and keeps greedy
+    rows on the argmax."""
     k, rows, vocab = 2, 2, 64
     spec = _spec(k, rows, width=24)
     t = k + 1
     regs = slice(1, rows + 1)
     # row 0 samples flat logits; row 1 is greedy
     spec._temperature[regs] = torch.tensor([1.0, 0.0], device=DEV)
-    spec._top_p[regs], spec._top_k[regs] = 1.0, 0
+    # top-k and top-p cut by FlashInfer's sampler inside the graph
+    spec._top_p[regs], spec._top_k[regs] = 0.9, 40
+    spec._seed[regs] = torch.tensor([11, 12], device=DEV)
     flat = torch.zeros(rows * t, vocab, device=DEV)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
