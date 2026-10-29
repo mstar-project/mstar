@@ -170,7 +170,16 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
-       rows for up to the 4,077-frame maximum. Needs ``flash-attn``; one rollout per GPU.
+       rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
+       through the engine's ragged attention resource, its blocks are compiled (Inductor's
+       deterministic mode), the condition encode runs channels-last, and the VAE decode is
+       channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).
+       ``model_kwargs: {reference_numerics: true}`` runs the reference's numerics instead
+       (FlashAttention-2, needs ``flash-attn``; an eager DiT; the fp32 contiguous encode and
+       decode), with which a rollout is bit-identical to the reference's.
+       ``lingbot_world_1_3b_fast.yaml`` compiles the DiT with autotuned kernels
+       (``dit_compile_autotune``): ~5% faster, but the rollout for a seed then differs from one
+       server process to the next.
        The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
        before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (``Robbyant/lingbot-world``).
    * - ``flux2_klein``
@@ -623,8 +632,9 @@ Qwen3-TTS notes
   overlap, which raised c=32 throughput by about a fifth on an H100.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
-  deployment YAML halves its GPU time when throughput matters more than
-  bit-exactness (the Talker is bf16 either way).
+  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
+  B300 that is slower, not faster: cuDNN's heuristics run several of its
+  convs on a kernel without tensor cores, so measure before switching.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 
@@ -1030,11 +1040,21 @@ Cosmos3 environment requirements
   (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
-  one matching your environment. When it is not importable, the engine logs a
-  warning at startup and automatically falls back to the paged ``flashinfer``
-  backend — serving still works, only the bs=1 dense fast path is lost.
-  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects
-  the paged backend explicitly.
+  one matching your environment. It ships kernels for sm_80 and sm_90a only.
+  Where it is not importable or has no kernel for the GPU (Blackwell), the
+  same dense pass runs on FlashInfer's ragged prefill, whose ``auto`` kernel on
+  a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
+  against 6.3 ms for the paged prefill. ``resources: attn_gen:
+  flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``); the
+  server checks it at startup with a tiny plan and run, and a backend this GPU or
+  FlashInfer build cannot run (a typo, ``fa3`` on Blackwell, ``cutlass`` on
+  Hopper) stops it with a ``ValueError`` naming the backend.
+  Without a usable FlashInfer either, the engine logs a warning and switches to
+  the paged backend, but that is FlashInfer too (the default backend on every
+  platform for now), so it cannot run there either: the dense pass needs
+  fa3-fwd (AITER on ROCm) or FlashInfer.
+  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects the
+  paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
@@ -1047,11 +1067,6 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
-- Whole-clip decodes (``vae_decode_fast``, default on) run the shared Wan VAE
-  decoder channels-last and compiled per latent, on the decoder node's own
-  decoder-only copy of the VAE: 17% off the decode on an H200 (Nano 832x480x189
-  2.9 -> 2.4 s, Edge 832x480x121 1.84 -> 1.54 s), within ~40 dB PSNR of the stock
-  decode. ``vae_decode_fast: false`` restores the compiled stock ``vae.decode``.
 - Two GPUs: ``configs/cosmos3_nano_sp2.yaml`` halves one request's denoise
   (Nano 832x480x189x35: 1.47 -> 0.78 s per step), while
   ``configs/cosmos3_nano_dp2.yaml`` (a whole replica per GPU) serves more under
@@ -1110,6 +1125,32 @@ so an image or clip produced alongside other requests differs from its solo
 result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
 request at a time when outputs must be bitwise repeatable.
 
+The denoise step is compiled (``compile_denoise``) in Inductor's deterministic
+mode by default (``denoise_compile_mode: deterministic``, the engine's compile
+mode of that name): kernel configs are picked by rule, so a seed gives the same
+video from every server process. ``default`` is torch.compile's own defaults,
+and ``level`` takes the ``mstar serve -O`` level's options (``-O2``:
+max-autotune).
+
+Video clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
+one decoder call per latent, channels-last, in the decode dtype (bf16 with
+cuDNN >= 9.16, otherwise fp32; see above), on the decoder-only copy of the VAE
+the channels-last decoders on a GPU share. The first two calls (the clip-start latent and the one after it)
+run eager; every later call is compiled in Inductor's deterministic mode. An
+image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
+is faster for a single frame. False decodes everything with the compiled stock
+``vae.decode`` on the shared instance.
+
+Two or more requests at the same denoise step run one cross-request forward
+(``max_gen_batch_size``, default 8) for video, image and sound; the action step
+runs eager. With ``compile_denoise_batched`` (default on) its layer stack is
+compiled with the same mode, once, while the server starts, with the packed
+length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
+per-request patchify, rotary tables and unpatchify around it run eager. At
+832x480x121 one request's guidance pair is 24k tokens, which already fills the
+GPU's GEMM and attention throughput, so a batch of N costs about N single
+steps: batching keeps requests in step rather than adding throughput.
+
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``
@@ -1140,7 +1181,10 @@ own ``window_decoder`` partition; a request opts in per call:
    * - ``window_mode``
      - — (``chained`` with ``stream_video``)
      - ``chained``: every window is a full bidirectional denoise conditioned on
-       the previous window's tail (``overlap_frames`` pinned clean). ``kv``
+       the previous window's tail (``overlap_frames`` pinned clean: the last
+       frames are decoded and encoded again as a clip of their own, the
+       video-to-video conditioning layout, so the window's first latent frame
+       is a single-frame one as in training). ``kv``
        (experimental, see below): the finished window's clean K/V is committed
        to the cache and later windows attend to it block-causally; no overlap,
        and frames older than ``context_frames`` behind the frontier are
@@ -1151,8 +1195,9 @@ own ``window_decoder`` partition; a request opts in per call:
      - Pixel frames per window (quantized to latent frames).
    * - ``overlap_frames``
      - 32 on Edge, 8 elsewhere
-     - ``chained`` only: frames re-pinned from the previous window (at least two
-       latent frames).
+     - ``chained`` only: frames re-pinned from the previous window, as k = 1 +
+       (overlap_frames - 1) // 4 latent frames (at least two), which pin
+       1 + 4(k - 1) frames: 5 and 29 at the defaults.
    * - ``context_frames``
      - 61
      - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.

@@ -635,6 +635,8 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
 
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.worker_id = WORKERS[rank]
     w.device = torch.device("cpu")
     w.enable_nvtx = w.enable_prof = False

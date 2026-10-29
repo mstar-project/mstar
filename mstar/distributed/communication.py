@@ -492,32 +492,39 @@ class WorkerParallelGroups:
             timeout=timeout,
         )
 
-        # An instance agrees only on the host, so a multi-axis one gets a gloo
-        # group and no NCCL communicator (a single-axis one shares its axis's).
-        # torch names a members-only group after its ranks and how many groups
-        # this process holds, so every rank makes them first, in one global
-        # order, and a rank outside an instance makes a group of just itself:
-        # that keeps the count, and so the name the members rendezvous under,
-        # equal on every member. On XPU it is the world's mixed group, made on
-        # every rank like the XPU axis groups below.
-        rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        # Gloo groups, members only: one per rank tuple of a mesh axis, and one
+        # per multi-axis lockstep instance, which agrees only on the host and
+        # so gets no NCCL communicator (a single-axis instance shares its
+        # axis's). With the default group bound to a device, a non-member's
+        # call would join an ncclCommSplit that members never make for a gloo
+        # group. torch names a members-only group after its ranks and how many
+        # groups this process holds, so every rank makes them before the device
+        # groups (registered only on their members, they would skew the count),
+        # in one global order, and a rank outside a tuple makes a group of just
+        # itself: the count, and so the name the members rendezvous under, is
+        # then equal on every member. On XPU an axis's device group doubles as
+        # its cpu group, and an instance gets the world's mixed group, made on
+        # every rank.
         axis_tuples = set(self.world_parallel_groups)
-        for block in sorted({
-            block for blocks in self.node_to_instance_groups.values() for block in blocks
-            if len(block) > 1 and block not in axis_tuples
-        }):
-            member = self.global_rank in block
+        instance_tuples = {
+            block for blocks in self.node_to_instance_groups.values() for block in blocks if len(block) > 1
+        }
+        rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        for rank_tuple in sorted(axis_tuples | instance_tuples):
+            member = self.global_rank in rank_tuple
             if device.type == "xpu":
-                cpu_pg = dist.new_group(ranks=list(block), **timeout_kwargs)
+                if rank_tuple in axis_tuples:
+                    continue  # the device group doubles as the cpu group below
+                cpu_pg = dist.new_group(ranks=list(rank_tuple), **timeout_kwargs)
             else:
                 cpu_pg = dist.new_group(
-                    ranks=list(block) if member else [self.global_rank],
+                    ranks=list(rank_tuple) if member else [self.global_rank],
                     backend="gloo", use_local_synchronization=True, **timeout_kwargs,
                 )
             if member:
-                rank_tuple_to_cpu_pg[block] = cpu_pg
+                rank_tuple_to_cpu_pg[rank_tuple] = cpu_pg
 
-        # One subgroup per distinct rank tuple over every mesh axis —
+        # One device subgroup per distinct rank tuple over every mesh axis —
         # ``world_parallel_groups`` is the sorted union, so every rank
         # iterates it identically; ``new_group`` is collective and
         # tag-ordered (see the field comment). A tuple shared by two axes'
@@ -529,14 +536,6 @@ class WorkerParallelGroups:
             )
             if device.type == "xpu":
                 rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
-            else:
-                # Members only: with the default group bound to a device, a
-                # non-member's subgroup creation joins an ncclCommSplit that
-                # members never call for a gloo group, and blocks forever.
-                rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                    ranks=list(rank_tuple), backend="gloo",
-                    use_local_synchronization=True, **timeout_kwargs,
-                )
 
         seen: set[int] = set()
         for comm_group in (group for per_node in self.axis_groups.values() for group in per_node.values()):

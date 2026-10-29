@@ -272,22 +272,22 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     timeout = communication.default_group_timeout(expected_backend)
     assert store_calls == [("test://world", 0, 4, timeout)]
 
-    expected_group_calls = []
-    for ranks in ((0, 1), (2, 3)):
-        expected_group_calls.append((ranks, {}))
-        if device_type != "xpu":
-            expected_group_calls.append((
-                ranks, {"backend": "gloo", "use_local_synchronization": True},
-            ))
+    # The gloo groups first, axis twins and the instance in one sorted order,
+    # then the device groups. Rank 0 isn't in (2, 3), so it makes a gloo group
+    # of just itself there. On XPU the instance is the world's mixed group and
+    # an axis's device group is its cpu group.
+    gloo = {"backend": "gloo", "use_local_synchronization": True}
+    if device_type == "xpu":
+        expected_group_calls = [((0, 1, 2, 3), {})]
+    else:
+        expected_group_calls = [((0, 1), gloo), ((0, 1, 2, 3), gloo), ((0,), gloo)]
+    expected_group_calls += [((0, 1), {}), ((2, 3), {})]
     assert calls == [
         {
             "backend": expected_backend, "store": store, "timeout": timeout,
             "world_size": 4, "rank": 0,
             "device_id": device,
         },
-        # the instance first: gloo only, or on XPU the world's mixed group
-        # (like the XPU axis groups)
-        ((0, 1, 2, 3), {} if device_type == "xpu" else {"backend": "gloo", "use_local_synchronization": True}),
         *expected_group_calls,
     ]
     instance_backend = None if device_type == "xpu" else "gloo"
@@ -304,34 +304,3 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
             assert group.cpu_group is not group.device_group
     assert singleton.initialized
     assert singleton.device_group is None
-
-
-def test_every_rank_makes_the_instance_gloo_groups_first_and_alike(monkeypatch):
-    """torch names a members-only group after its ranks and how many groups the
-    process holds, so the members of an instance agree on its name only if
-    every rank has made the same number of groups before it: the instances go
-    first, and a rank outside one makes a group of just itself."""
-    from mstar.distributed import communication
-
-    wg = WorkerGraph(
-        section=SimpleNamespace(get_nodes=lambda: {"dit": None}),
-        graph_walks=set(), ranks=list(range(8)), tp_size=2, sp_size=2,
-    )
-    config = GlobalParallelConfig({"dit": wg}, [f"worker-{r}" for r in range(8)])
-    monkeypatch.setattr(communication, "rendezvous_store", lambda *args: object())
-    monkeypatch.setattr(communication.dist, "get_default_backend_for_device", lambda device: "gloo")
-    monkeypatch.setattr(communication.dist, "init_process_group", lambda **kwargs: None)
-    calls = []
-
-    def new_group(ranks, **kwargs):
-        calls.append((tuple(ranks), kwargs.get("backend")))
-        return object()
-
-    monkeypatch.setattr(communication.dist, "new_group", new_group)
-    for rank in range(8):
-        calls.clear()
-        config.per_worker_config[f"worker-{rank}"].init_dist(device=torch.device("cpu"))
-        mine = next(block for block in wg.replica_ranks if rank in block)
-        assert calls[:2] == [
-            (tuple(block) if block == mine else (rank,), "gloo") for block in wg.replica_ranks
-        ], rank
