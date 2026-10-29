@@ -247,7 +247,7 @@ def test_only_rocm_turns_off_miopens_split_k_conv_solvers(solver):
 
 
 def test_platform_knob_defaults_are_empty_but_for_rocm():
-    assert isinstance(RocmPlatform().knob_defaults(), dict)
+    assert RocmPlatform().knob_defaults() == {"dit_exact_ops": "0"}
     for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
         assert platform.knob_defaults() == {}
 @pytest.mark.parametrize("solver", MIOPEN_SPLIT_K)
