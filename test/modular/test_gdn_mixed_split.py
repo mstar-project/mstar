@@ -11,8 +11,22 @@ from __future__ import annotations
 import pytest
 import torch
 
+from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.linear_attn.config import (
+    LinearAttnConfig,
+    LinearAttnSpec,
+    LinearAttnVariant,
+)
+from mstar.engine.resources.linear_attn.gdn import GDNManager
 from mstar.engine.resources.linear_attn.wrappers import GDNMixedWrapper, GDNPrefillWrapper
+from mstar.engine.resources.recurrent.config import (
+    RecurrentBlockConfig,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+)
 from mstar.engine.resources.recurrent.pool import SINK_SLOT
+from mstar.engine.resources.spec import CombinedSplit
+from mstar.engine.resources.step import BucketKey, SlotLease
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 requires_gpu = pytest.mark.skipif(
@@ -74,7 +88,7 @@ def _reference(device, x, weight, inputs):
     return conv_out, out, state, conv
 
 
-def _mixed(device, x, weight, inputs, accelerator_graph):
+def _mixed(device, x, weight, inputs, accelerator_graph, decode_rows=None):
     state, conv = _pools(device)
     tokens = x.shape[0]
     if accelerator_graph:
@@ -95,8 +109,8 @@ def _mixed(device, x, weight, inputs, accelerator_graph):
         spans, slots, has = SPANS, SLOT_IDS, HAS_STATE
     w = GDNMixedWrapper(
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
-        num_tokens=bucket_tokens, bs=bucket_bs, accelerator_graph=accelerator_graph,
-        max_prefill_rows=4,
+        num_tokens=bucket_tokens, bs=decode_rows or bucket_bs,
+        accelerator_graph=accelerator_graph, max_prefill_rows=4,
     )
     w.plan(spans, tuple(slots), tuple(has))
     conv_out = w.run_conv(x, conv, weight)[:tokens]
@@ -135,6 +149,27 @@ def test_mixed_split_matches_the_chunked_path(accelerator_graph):
     assert torch.equal(mix_cstate[untouched], fresh_conv[untouched])
 
 
+@requires_gpu
+def test_the_decode_halfs_width_changes_no_real_rows_result():
+    """Sizing the decode half to the bucket rather than to the largest capture
+    only drops rows that address the null slot: outputs and every slot but the
+    sink, which padding rows write as scratch, are bit-identical."""
+    device = torch.device("cuda")
+    tokens = sum(SPANS)
+    torch.manual_seed(2)
+    x = torch.randn(tokens, CONV_DIM, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(CONV_DIM, WIDTH, device=device, dtype=torch.bfloat16) * 0.3
+    inputs = _inputs(tokens, device)
+
+    conv_out, out, state, cstate = _mixed(device, x, weight, inputs, accelerator_graph=True)
+    wide = _mixed(device, x, weight, inputs, accelerator_graph=True, decode_rows=128)
+
+    assert torch.equal(conv_out, wide[0]) and torch.equal(out, wide[1])
+    kept = [s for s in range(SLOTS) if s != SINK_SLOT]
+    assert torch.equal(state[kept], wide[2][kept])
+    assert torch.equal(cstate[kept], wide[3][kept])
+
+
 def test_too_many_prompt_rows_for_the_bucket_is_refused():
     w = GDNMixedWrapper(
         device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
@@ -142,3 +177,44 @@ def test_too_many_prompt_rows_for_the_bucket_is_refused():
     )
     with pytest.raises(RuntimeError, match="prompt rows"):
         w.plan([4, 4, 4, 1], (1, 2, 3, 4), (False, False, False, True))
+
+
+def test_a_captured_splits_decode_half_runs_the_buckets_rows():
+    """The decode half runs every row it is sized for, so it is sized to its
+    bucket rather than to the largest capture, as the other wrappers' buffers
+    are; a 16-row mixed step would otherwise run the decode kernel on 128."""
+    cpu = torch.device("cpu")
+    spec = RecurrentStateSpec(
+        "gdn_state", {"llm"},
+        RecurrentStateConfig(
+            num_layers=1,
+            blocks={
+                "state": RecurrentBlockConfig(shape=(HEADS, DIM, DIM), dtype=torch.float32),
+                # [q|k|v] with two k heads
+                "conv": RecurrentBlockConfig(shape=((4 + HEADS) * DIM, WIDTH - 1), dtype=torch.float32),
+            },
+            max_slots=SLOTS,
+        ),
+    )
+    manager = GDNManager.build(
+        LinearAttnSpec(
+            "linear_attn", {"llm"},
+            LinearAttnConfig(
+                recurrent_state="gdn_state", variant=LinearAttnVariant.GDN,
+                splits=(CombinedSplit("mixed", ("prefill_text",)),),
+            ),
+        ),
+        EngineResourceInfo(device=cpu, dependencies={"gdn_state": spec}),
+    )
+    manager.build_accelerator_graph_buffers([], max_bs=128, max_seq_len=2048)
+
+    def lease(walk, bs, tokens):
+        return SlotLease(slot=0, bucket=BucketKey(graph_walk=walk, bs=bs, num_tokens=tokens))
+
+    mixed = manager._get_wrapper(
+        "main", is_decode=False, lease=lease("mixed", 16, 512),
+        split=manager._splits["mixed"],
+    )
+    decode = manager._get_wrapper("main", is_decode=True, lease=lease("decode", 16, 16))
+    assert mixed._decode._bs == 16
+    assert decode._bs == 128
