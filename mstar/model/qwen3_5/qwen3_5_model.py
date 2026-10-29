@@ -172,6 +172,7 @@ class Qwen3_5DenseModel(Model):
         model_path_hf: str,
         cache_dir: str | None = None,
         num_draft_tokens: int = 0,
+        spec_sampling: bool = False,
         **kwargs: Any,
     ):
         self.model_path_hf = model_path_hf
@@ -193,6 +194,9 @@ class Qwen3_5DenseModel(Model):
                 "num_draft_tokens to 0"
             )
         self.num_draft_tokens = num_draft_tokens
+        # verify steps can also sample the target (`spec_sampling: true`),
+        # at the cost of a second decode capture
+        self.spec_sampling = bool(spec_sampling and num_draft_tokens)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
         self.vision_config = Qwen3_5VisionConfig.from_hf_or_none(self.local_dir)
@@ -298,7 +302,9 @@ class Qwen3_5DenseModel(Model):
         return [
             SpecDecodeSpec(
                 resource_key=SPEC_DECODE, nodes={"LLM"},
-                config=SpecDecodeConfig(num_draft_tokens=self.num_draft_tokens),
+                config=SpecDecodeConfig(
+                    num_draft_tokens=self.num_draft_tokens, sampling=self.spec_sampling,
+                ),
                 kv_cache=KV_CACHE, attn=ATTN,
                 stop_token_ids=tuple(self.config.stop_token_ids),
             ),
@@ -861,14 +867,15 @@ class Qwen3_5DenseModel(Model):
         keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
         sampling = SamplingReqConfig(**{k: model_kwargs[k] for k in keys if k in model_kwargs})
         if self.num_draft_tokens and (
-            sampling.temperature or sampling.repetition_penalty not in (None, 1)
+            (sampling.temperature and not self.spec_sampling)
+            or sampling.repetition_penalty not in (None, 1)
         ):
-            # Verification here is greedy: accepting a draft against a sampled
-            # target needs rejection sampling on the device, not built yet.
+            # Verify steps take the target's argmax unless the deployment
+            # samples (`spec_sampling`), and track no tokens for a penalty.
             raise ValueError(
-                "this deployment decodes speculatively and verifies greedily; send "
-                "temperature 0 and no repetition_penalty, or serve it without "
-                "num_draft_tokens"
+                "this deployment decodes speculatively; it takes temperature 0 "
+                "(or any, with spec_sampling) and no repetition_penalty. Serve it "
+                "without num_draft_tokens for those"
             )
         return {SAMPLER: sampling}
 
@@ -945,7 +952,7 @@ class Qwen3_5DenseModel(Model):
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
         return LLMSubmodule(
             model, self.config, self.vision_config,
-            num_draft_tokens=self.num_draft_tokens,
+            num_draft_tokens=self.num_draft_tokens, spec_sampling=self.spec_sampling,
         )
 
     @staticmethod

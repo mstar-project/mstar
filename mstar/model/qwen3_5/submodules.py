@@ -89,6 +89,7 @@ class LLMSubmodule(ARNodeSubmodule):
     # drafts a speculative decode step verifies (see `__init__`); 0 decodes one
     # token a step
     num_draft_tokens: int = 0
+    spec_sampling: bool = False
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
@@ -139,6 +140,7 @@ class LLMSubmodule(ARNodeSubmodule):
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
         num_draft_tokens: int = 0,
+        spec_sampling: bool = False,
     ):
         super().__init__()
         self.model = model
@@ -149,6 +151,9 @@ class LLMSubmodule(ARNodeSubmodule):
         # MTP head (`model.mtp`) and drafts the next ones, each row k + 1
         # tokens; the drafts and lengths live in the SPEC_DECODE resource.
         self.num_draft_tokens = num_draft_tokens
+        # verify steps may sample (a second decode capture, keyed by
+        # `cg_key_info`); off, they take the target's argmax
+        self.spec_sampling = spec_sampling and num_draft_tokens > 0
         if num_draft_tokens and model.mtp is None:
             raise ValueError("a speculative LLM submodule needs the model's MTP head")
 
@@ -204,13 +209,16 @@ class LLMSubmodule(ARNodeSubmodule):
                 token_layout=decode_rows_then_prompt,
             ),
         ]
+        # a speculative node that samples captures decode twice: greedy and sampled
+        decode_keys = (False, True) if self.spec_sampling else (None,)
         return [
-            BatchedAcceleratorGraphConfig(
+            *(BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 # a verify row under speculation
                 single_request_inputs=dummy(self._decode_tokens),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            ),
+                additional_key_info=key,
+            ) for key in decode_keys),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -510,7 +518,12 @@ class LLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep:
         if graph_walk == "decode" and self._speculative:
-            return self._declare_verify(request_ids)
+            lease = kwargs.get("slot_lease")
+            key = (
+                lease.bucket.cg_key_info if lease is not None
+                else self.cg_key_info(graph_walk, per_request_info or {})
+            )
+            return self._declare_verify(request_ids, key)
         prefill_tokens = {}
         if graph_walk in ("prefill_text", LLM_MIXED):
             # a mixed step's decode rows track their token through the sampler as usual
@@ -572,7 +585,24 @@ class LLMSubmodule(ARNodeSubmodule):
             steps=steps,
         )
 
-    def _declare_verify(self, request_ids: list[int]) -> SubmoduleStep:
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: Mapping[int, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs,
+    ):
+        """Under speculation with sampling, whether a decode batch samples:
+        any row at a temperature above 0 takes the sampled capture (its greedy
+        rows still take the argmax there)."""
+        del per_request_input_metadata, kwargs
+        if graph_walk != "decode" or not self.spec_sampling:
+            return None
+        return any(
+            (cfg := info.resource_configs.get(SAMPLER)) is not None and cfg.temperature > 0
+            for info in per_request_info.values()
+        )
+
+    def _declare_verify(self, request_ids: list[int], key=None) -> SubmoduleStep:
         """A speculative decode step: k + 1 tokens a row, positions and
         lengths settled on the device. Each row gives back the KV its earlier
         steps over-counted, as far as the host has learned."""
@@ -585,6 +615,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 retract[rid] = given
         return SubmoduleStep(
             segments=[Segment(request_id=rid, label="main", span=span) for rid in request_ids],
+            cg_key_info=key,
             steps={
                 KV_CACHE: KVStep(commit_adjust={
                     (rid, "main"): -given for rid, given in retract.items()
@@ -604,7 +635,7 @@ class LLMSubmodule(ARNodeSubmodule):
         and on the last prefill reserve the KV a verify step writes past the
         committed length (`SpecDecodeResource.seed_lookahead`)."""
         spec = self.node_resources[SPEC_DECODE]
-        budgets, ignore, adjust = {}, set(), {}
+        budgets, ignore, adjust, sampling = {}, set(), {}, {}
         for rid in request_ids:
             row = info.get(rid)
             if row is None:
@@ -613,14 +644,17 @@ class LLMSubmodule(ARNodeSubmodule):
             # so a request emits that many past it
             budgets[rid] = row.max_tokens
             # a capture or padding row carries no sampling config
-            sampling = row.resource_configs.get(SAMPLER)
-            if sampling is not None and sampling.ignore_eos:
+            cfg = row.resource_configs.get(SAMPLER)
+            if cfg is not None and cfg.ignore_eos:
                 ignore.add(rid)
+            if cfg is not None and self.spec_sampling and cfg.temperature > 0:
+                sampling[rid] = (float(cfg.temperature), float(cfg.top_p), int(cfg.top_k or 0))
             if row.step_metadata.get("last_prefill", False) and spec.seed_lookahead:
                 adjust[(rid, "main")] = spec.seed_lookahead
         steps[KV_CACHE] = KVStep(commit_adjust=adjust)
         steps[SPEC_DECODE] = SpecDecodeStep(
             phase=SpecPhase.SEED, budgets=budgets, ignore_stop=frozenset(ignore),
+            sampling=sampling,
         )
 
     # ------------------------------------------------------------------
@@ -701,7 +735,8 @@ class LLMSubmodule(ARNodeSubmodule):
         cos, sin = self._cos_sin_1d((positions[None, :] + shifts[:, None]).reshape(-1))
         cos, sin = cos.view(k, positions.shape[0], -1), sin.view(k, positions.shape[0], -1)
         hidden = lm(lm.embed_tokens(ids), label="main", cos_sin=(cos[0], sin[0]))
-        accepted = spec.accept(head(hidden))
+        step = engine_inputs.step
+        accepted = spec.accept(head(hidden), sample=bool(step is not None and step.cg_key_info))
         ids = accepted.target.reshape(-1)
         for j in range(k):
             spec.begin_draft_pass(j)
