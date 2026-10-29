@@ -5,13 +5,15 @@ model: "flux2_klein"
 max_seq_len: 512
 
 # FLUX.2 [klein] 4B, single GPU, all four nodes colocated. Serving knobs (forwarded to
-# Flux2KleinModel.__init__): attention_backend flashinfer|sdpa, torch.compile of the
+# Flux2KleinModel.__init__): attention_backend auto|sdpa, torch.compile of the
 # transformer per shape, CUDA-graph capture of the denoise step for the listed
 # (height, width) shapes and batch sizes (other shapes run the eager batched path).
 model_kwargs:
-  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
-  # reference kernel; flashinfer stays available
-  attention_backend: sdpa
+  # auto: the DiT's joint attention runs on the engine's ragged attention resource with the platform's default
+  # kernel: FlashInfer FA3 on an H100 (served as fast as sdpa, 0.355 vs 0.349 s at B=1), AITER's asm flash attention
+  # on MI300X/MI325X (where torch's sdpa is AOTriton, well short of it). sdpa keeps torch's kernel inline, the
+  # reference pipeline's, for parity runs. `resources: dit_attn: backend: aiter|flashinfer` pins a kernel.
+  attention_backend: auto
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
   # transformer still lands at a median 37.6 dB from the eager path over the 100 protocol prompts (67 of 100 below 40 dB)
