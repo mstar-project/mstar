@@ -1,7 +1,7 @@
 """Worker phases of one mstar row under a table workload, one window per concurrency.
 
     python -m benchmark.amd.phase_cells --row whisper_large --workload asr-libri --concurrency 8,32
-        --gpus 0 --out DIR --worktree TREE --numa [--arm mstar-split] [--config YAML] [--ktrace-ms 1500]
+        --gpus 0 --out DIR --worktree TREE --numa [--arm mstar-split] [--config YAML] [--ktrace-ms 1500] [--correctness]
 
 One server with MSTAR_PHASE_TIMING (long_prompt.phase_server) gets one benchmark.runner run per concurrency, with the
 workload's first-repeat warmup, and the phase records are cut by each run's time window: phases.txt has one table
@@ -11,7 +11,9 @@ wait (benchmark/worker_phases/README.md), so where it stays near zero the steps 
 With --ktrace-ms, each measured window is followed by a second client run of the same cell that is not
 measured: partway through it the worker's torch.profiler (benchmark/kernels/trace/proftrigger) records that
 many ms, and benchmark.kernels.trace.ktrace cuts the trace into steps (ktrace-c<N>/ktrace.txt). The tracer
-slows the host, which is why it stays out of the phase windows.
+slows the host, which is why it stays out of the phase windows. --correctness sends the sweep's greedy text
+pass (benchmark.amd.correctness.text_pass) right after the server starts and scores it once the server is
+down (correctness/summary.json).
 """
 
 from __future__ import annotations
@@ -23,8 +25,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
-from benchmark.amd import catalog, long_prompt, sweep, tables
+from benchmark.amd import catalog, correctness, long_prompt, sweep, tables
 from benchmark.amd.launch import REPO, Launch, gpu_list
 
 GAP_S = 5  # between windows, so no phase record straddles two
@@ -73,6 +76,7 @@ def main(argv=None) -> int:
     ap.add_argument("--numa", action="store_true", help="bind the server and the client to the GPU's NUMA node")
     ap.add_argument("--config", default=None, help="serving config instead of the row's (e.g. a resources override)")
     ap.add_argument("--ktrace-ms", type=int, default=0, help="trace each cell in an extra, unmeasured run")
+    ap.add_argument("--correctness", action="store_true", help="greedy text pass after startup, scored at the end")
     args = ap.parse_args(argv)
 
     row, arm, wl = catalog.ROWS[args.row], catalog.ARMS[args.arm], tables.WORKLOADS[args.workload]
@@ -93,7 +97,12 @@ def main(argv=None) -> int:
     launch = Launch(arm=arm, row=row, gpus=gpus, port=args.port, run_dir=out / "server", worktree=Path(args.worktree),
                     numa_node=numa, config=Path(args.config).resolve() if args.config else None)
     windows: dict[str, tuple[float, float]] = {}
+    plan = SimpleNamespace(correctness_src=correctness.prepare_source(out, None), worktree=launch.worktree)
     with long_prompt.phase_server(launch, out, args.period) as startup_s:
+        if args.correctness:
+            res = correctness.text_pass(plan, row, arm, args.port, out / "correctness")
+            print(f"correctness pass: {res}", flush=True)
+            time.sleep(GAP_S)
         for c in conc:
             rdir = out / f"c{c}"
             rdir.mkdir(exist_ok=True)
@@ -125,6 +134,9 @@ def main(argv=None) -> int:
         if res.is_file():
             summary["cells"].setdefault(f"c{c}", {})["client"] = sweep.repeat_stats(
                 json.loads(res.read_text()), row.family, secs, wl.output_len)
+    if args.correctness and (out / "correctness" / "pass.json").is_file():
+        C = correctness.load(plan.correctness_src)
+        summary["correctness"] = correctness.score_dir(C, launch.worktree, out / "correctness", "cuda:0")
     (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
     print(json.dumps({k: v.get("phases") for k, v in summary["cells"].items()}, indent=1))
     return 0
