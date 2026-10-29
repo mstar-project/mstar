@@ -610,6 +610,11 @@ def test_hip_devices_of_a_job_given_some_gpus(monkeypatch):
             monkeypatch.setenv("ROCR_VISIBLE_DEVICES", rocr)
             launch.smi_index_map.cache_clear()
             assert launch.smi_index_map() == (want or {0: 3, 1: 0, 2: 2, 3: 1, 4: 7, 5: 4, 6: 6, 7: 5}), rocr
+        # GPU locks sit in a /tmp the node's jobs share, so they name the node-wide GPU.
+        monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "4,5")
+        assert [launch.Launch._lock_path(None, g).name for g in (0, 1)] == ["gpu4", "gpu5"]
+        monkeypatch.delenv("ROCR_VISIBLE_DEVICES")
+        assert launch.Launch._lock_path(None, 1).name == "gpu1"
     finally:
         launch.smi_index_map.cache_clear()
 
