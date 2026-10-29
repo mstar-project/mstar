@@ -90,7 +90,14 @@ class _RecordingTransformer(_Transformer):
         self.proj_in = torch.nn.Linear(2, 2)
         self.batched_calls = []
 
+    # what the real step indexes per request; a warmup row missing one would raise here as it did on a server
+    REQ_KEYS = ("latents", "vision_timesteps", "rotary_cond", "rotary_uncond", "vision_token_shapes",
+                "vision_noisy_frame_indexes", "vision_mse_loss_indexes")
+
     def denoise_step_batched(self, requests, label, attn):
+        for req in requests:
+            for key in self.REQ_KEYS:
+                req[key]
         self.batched_calls.append((requests, label, attn))
         return [(None, None)] * len(requests)
 
@@ -103,11 +110,12 @@ def test_warmup_compiles_runs_one_two_request_step_at_the_default_size(monkeypat
     t = _RecordingTransformer()
     sub = Cosmos3DiTSubmodule(t, cfg)
     built = []
+    rotary = (torch.zeros(4, 2), torch.zeros(4, 2))
 
     def fake_static(ids, height, width, num_frames, fps, has_image_condition, device):
         built.append((height, width, num_frames, has_image_condition))
         return {
-            "num_noisy_vision_tokens": 4, "vision_mrope_ids": torch.zeros(3, 4),
+            "num_noisy_vision_tokens": 4, "rotary": rotary,
             "vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.zeros(1)],
             "mse_gen_indexes": torch.arange(4),
         }
@@ -121,6 +129,8 @@ def test_warmup_compiles_runs_one_two_request_step_at_the_default_size(monkeypat
     [(requests, label, attn)] = t.batched_calls
     assert len(requests) == 2 and label == submodules.CFG_BATCHED_LABEL
     assert requests[0]["latents"].shape == sub._latent_shape(480, 832, 121)
+    # both branches take the statics' table, as a served window's rows do
+    assert requests[0]["rotary_cond"] is rotary and requests[1]["rotary_uncond"] is rotary
     # the stand-in reads no plan and answers with the query's shape
     q = torch.randn(5, 2, 3)
     assert not attn.requires_kv_write and torch.equal(attn.run(q, k=q, v=q), torch.zeros_like(q))
