@@ -205,7 +205,7 @@ def _verify_step(spec, logits_rows, vocab, k, sample=False):
     drafted = out.target.reshape(-1)
     for j in range(k):
         spec.begin_draft_pass(j)
-        drafted = spec.record_draft(j, (drafted + 1) % vocab)
+        drafted = spec.record_draft(j, ((drafted + 1) % vocab)[spec.draft_slots()])
     return out
 
 
