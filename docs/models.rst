@@ -1486,10 +1486,13 @@ implementation on GH200 and H100 GPUs:
   concurrency. In streamed playback (the whole clip uploaded at
   once, not live input; a 320 ms client buffer), 8 concurrent sessions played
   without underruns; at 16, 17 of 48 sessions had at least one.
-- Audio quality has not been formally assessed. Whisper transcripts of M*'s
+- Audio is checked by transcription and by ear. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
-  differed on a second clip, after their tokens diverge; no listening study
-  has been done.
+  differed on a second clip, after their tokens diverge. Listening to matched
+  pairs, dense attention's output is indistinguishable from NVIDIA's; on the
+  paged path the replies start the same, then differ in wording, and both stay
+  coherent. The suite's ``listen.html`` plays the input, NVIDIA's reply and
+  M*'s reply side by side.
 
 Reference fixtures are generated outside Git by
 ``test/personaplex/reference_oracle.py`` (see
