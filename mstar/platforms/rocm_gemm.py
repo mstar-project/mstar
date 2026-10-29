@@ -22,6 +22,8 @@ import logging
 import torch
 from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
 
+from mstar.kernels import KernelOp, ShapePolicy, Tolerance
+
 logger = logging.getLogger(__name__)
 
 SKINNY_MAX_ROWS = 2
@@ -37,36 +39,67 @@ def _cu_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _skinny_gemm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+def _aiter_skinny_gemm():
     from aiter.ops.custom import wvSpltK
 
-    x = x.contiguous()
-    out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    wvSpltK(weight, x, out, x.shape[0], _cu_count(x.device.index or 0))
-    if bias is not None:
-        out += bias
-    return out
+    def skinny_gemm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        x = x.contiguous()
+        out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+        wvSpltK(weight, x, out, x.shape[0], _cu_count(x.device.index or 0))
+        if bias is not None:
+            out += bias
+        return out
+
+    return skinny_gemm
 
 
-_LIB = torch.library.Library("mstar", "FRAGMENT")
-_LIB.define("skinny_gemm(Tensor x, Tensor weight, Tensor? bias) -> Tensor")
-# The same op with any input layout allowed (it makes x contiguous itself), so
-# inductor can finish the norm feeding a one-row GEMM in one kernel. Not for
-# two rows: there inductor may pick a strided layout and pay for the copy.
-_LIB.define(
-    "skinny_gemm_any(Tensor x, Tensor weight, Tensor? bias) -> Tensor",
-    tags=(torch.Tag.flexible_layout,),
-)
-for _name in ("skinny_gemm", "skinny_gemm_any"):
-    _LIB.impl(_name, _skinny_gemm, "CUDA")
+def _skinny_gemm_reference(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+    out = x @ weight.T
+    return out if bias is None else out + bias
 
 
 def _skinny_gemm_fake(x, weight, bias):
     return x.new_empty((x.shape[0], weight.shape[0]))
 
 
-for _name in ("skinny_gemm", "skinny_gemm_any"):
-    torch.library.register_fake(f"mstar::{_name}", _skinny_gemm_fake, lib=_LIB)
+def _gemm_shape(x, weight, bias) -> dict[str, int]:
+    return {"rows": x.shape[0], "n": weight.shape[0], "k": x.shape[1]}
+
+
+def _gemm_inputs(shape, dtype, device, generator=None):
+    x = torch.randn(shape["rows"], shape["k"], dtype=dtype, device=device, generator=generator)
+    weight = torch.randn(shape["n"], shape["k"], dtype=dtype, device=device, generator=generator)
+    return x, weight * shape["k"] ** -0.5, None
+
+
+def _skinny_op(name: str, tags=()) -> KernelOp:
+    return KernelOp(
+        name,
+        "(Tensor x, Tensor weight, Tensor? bias) -> Tensor",
+        fake=_skinny_gemm_fake,
+        reference=_skinny_gemm_reference,
+        impls={f"rocm:{arch}": _aiter_skinny_gemm for arch in _ARCHS},
+        shapes=ShapePolicy(
+            dims=("rows", "n", "k"),
+            key=_gemm_shape,
+            inputs=_gemm_inputs,
+            warm=(
+                {"rows": 1, "n": 4096, "k": 4096}, {"rows": 2, "n": 24576, "k": 4096},
+                {"rows": 2, "n": 4096, "k": 12288},
+            ),
+            dtypes=(torch.bfloat16, torch.float16),
+        ),
+        # one rounding of a long fp32 sum, plus summation order
+        tolerance=Tolerance.accumulated(),
+        tags=tags,
+    )
+
+
+SKINNY_GEMM = _skinny_op("skinny_gemm")
+# The same op with any input layout allowed (it makes x contiguous itself), so
+# inductor can finish the norm feeding a one-row GEMM in one kernel. Not for
+# two rows: there inductor may pick a strided layout and pay for the copy.
+SKINNY_GEMM_ANY = _skinny_op("skinny_gemm_any", tags=(torch.Tag.flexible_layout,))
 
 
 def _val(node):
