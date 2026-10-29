@@ -170,7 +170,10 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        audio = inputs["audio"][0].reshape(-1).to(device=self.get_device(), dtype=torch.float32)
+        # The samples arrive in pageable host memory, whose copy would wait out
+        # the work queued on the stream (the step in flight); through pinned
+        # memory it queues behind that work instead.
+        audio = to_device_nonblocking(inputs["audio"][0].reshape(-1), self.get_device()).float()
         audio = self.log_mel.pad_or_trim(audio)  # zero-pad to the 30 s window
         return NodeInputs(tensor_inputs={"audio": audio}, input_seq_len=1)
 
