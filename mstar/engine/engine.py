@@ -50,12 +50,14 @@ from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
     BatchedModelOutput,
+    BatchedStopCheck,
     HostRows,
     InputMetadata,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopCheck,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -316,6 +318,9 @@ class ExecutingBatch:
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
     failed_requests: dict[int, str] = field(default_factory=dict)
+    # rid -> outputs the stop check found are not data this step
+    # (``StopCheck.withheld``); the worker does not route them
+    withheld_outputs: dict[int, tuple[str, ...]] = field(default_factory=dict)
     # A lockstep step whose rows' input reads every rank checks before
     # preparing it: the leader's rows in its order (see
     # ``Worker._drop_rows_whose_read_failed``); None for no check
@@ -732,6 +737,9 @@ class Engine:
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules()
+        for submodule_mgmt in self._submodules.values():
+            with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                submodule_mgmt.submodule.warmup_compiles()
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
@@ -881,6 +889,11 @@ class Engine:
             key for key in declared
             if key not in self._resources and specs_by_key[key].config.prefix_cache
         }
+        # resources that aren't keyed but opened, such as a recurrent pool's snapshots
+        restoring: set[str] = set()
+        for key, spec in specs_by_key.items():
+            if key in self._resources and spec.depends_on() <= self._resources.keys():
+                self._resources[key].bind_dependencies({dep: self._resources[dep] for dep in spec.depends_on()})
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
@@ -907,9 +920,11 @@ class Engine:
                 )
                 for label, kv_label in declared.get(key, {}).items()
             })
-            if not opened or not declared.get(key):
-                continue
-            opened_keys.add(key)
+            if opened:
+                (opened_keys if declared.get(key) else restoring).add(key)
+        self._close_unservable_nodes(specs_by_key, opened_keys, restoring)
+        for key in sorted(opened_keys & self._resources.keys()):
+            resource = self._resources[key]
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
@@ -933,6 +948,36 @@ class Engine:
                 for walk in label.keys.walks:
                     nodes = model.get_graph_walk_graphs()[walk].get_nodes()
                     self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
+
+    def _close_unservable_nodes(
+        self, specs_by_key: dict[str, NodeResourceSpec], opened_keys: set[str], restoring: set[str],
+    ) -> None:
+        """Close every prefix cache on a keyed node with a resource that can't
+        serve a cached prefix.
+
+        A resource that opened but isn't keyed serves a hit only when every cache
+        it depends on opened, and so does a resource that depends only on such
+        resources.
+        """
+        restorers = {key for key in restoring if specs_by_key[key].depends_on() <= opened_keys}
+        serving = opened_keys | restorers | {
+            key for key, resource in self._resources.items() if resource.prefix_skip_safe
+        } | {
+            key for key, spec in specs_by_key.items()
+            if spec.depends_on() and spec.depends_on() <= restorers
+        }
+        for node in sorted(self._keyed_walks):
+            on_node = {key for key, spec in specs_by_key.items() if node in spec.nodes and key in self._resources}
+            if on_node <= serving:
+                continue
+            del self._keyed_walks[node]
+            for key in sorted(on_node - serving):
+                logger.info("%s on %s can't serve a cached prefix: the prefix caches on %s stay off",
+                            key, node, node)
+            for key in sorted(on_node & (opened_keys | restoring)):
+                self._resources[key].close_prefix_cache()
+                opened_keys.discard(key)
+                restoring.discard(key)
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
@@ -1341,6 +1386,7 @@ class Engine:
                     submodule_mgmt, lease, raw, inputs, req_info,
                     request_ids=batch.request_ids,
                     step_request_ids=batch.step_context.padded_request_ids,
+                    graph_walk=batch.step_context.graph_walk,
                     rows_only=batch.rows_only,
                 )
             finally:
@@ -1458,6 +1504,7 @@ class Engine:
                 merged.update(self._collect_outputs(
                     submodule_mgmt, None, raw, [inp], req_info,
                     request_ids=[rid], step_request_ids=(rid,),
+                    graph_walk=batch.step_context.graph_walk,
                 ))
             finally:
                 if nvtx:
@@ -1722,11 +1769,12 @@ class Engine:
             "the unbatched forward takes one request; batch of "
             f"{len(request_ids)} needs running_batched"
         )
-        return BatchedModelOutput.coerce(
-            {request_ids[0]: submodule_mgmt.forward(
-                graph_walk, engine_inputs=engine_inputs, **preprocessed
-            )}
+        out = submodule_mgmt.forward(
+            graph_walk, engine_inputs=engine_inputs, **preprocessed
         )
+        if isinstance(out, BatchedModelOutput):
+            return out
+        return BatchedModelOutput.coerce({request_ids[0]: out})
 
     def postprocess_batch(
         self, batch: ExecutingBatch, outputs: BatchedModelOutput,
@@ -1832,6 +1880,9 @@ class Engine:
         With ``host_rows``, ``check_stop_batched`` checks the batch in one call;
         if it raises, the per-request path runs so a failure lands on its own
         request.
+
+        Outputs the check withholds (``StopCheck`` / ``BatchedStopCheck``) go
+        on ``batch.withheld_outputs``, for the caller to leave unrouted.
         """
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
@@ -1847,9 +1898,14 @@ class Engine:
                     batch.node_name, exc_info=True,
                 )
                 batched = None
+            if isinstance(batched, BatchedStopCheck):
+                if batched.withheld:
+                    batch.withheld_outputs = batched.withheld
+                return batched.stops
             if batched is not None:
                 return batched
         stops: dict[str, set[str]] = {}
+        withheld: dict[str, tuple[str, ...]] = {}
         for rid in batch.request_ids:
             rid_outputs = outputs.get(rid)
             if not rid_outputs:
@@ -1861,8 +1917,14 @@ class Engine:
             except Exception as error:
                 batch.register_failure(rid, error)
                 continue
+            if isinstance(rid_stops, StopCheck):
+                if rid_stops.withheld:
+                    withheld[rid] = rid_stops.withheld
+                rid_stops = rid_stops.stops
             if rid_stops:
                 stops[rid] = rid_stops
+        if withheld:
+            batch.withheld_outputs = withheld
         return stops
 
     def finalize_batch(
@@ -1959,6 +2021,7 @@ class Engine:
         req_info: Mapping[str, CurrentForwardPassInfo],
         request_ids: list[str],
         step_request_ids: tuple[str, ...],
+        graph_walk: str,
         rows_only: bool = False,
     ) -> BatchedModelOutput:
         """Per-rid outputs for the real requests: drop the padding rows and map
@@ -2006,6 +2069,9 @@ class Engine:
             outputs, raw_outputs, request_ids, submodule,
             inputs[:len(request_ids)], req_info,
         )
+        spans = raw_outputs.output_spans
+        if spans:
+            spans = self._real_spans(submodule, graph_walk, spans, len(request_ids))
         return BatchedModelOutput(
             per_rid_outputs=outputs,
             rows_only=rows_only and not outputs,
@@ -2018,7 +2084,43 @@ class Engine:
             # worker's later-rewritten request list
             row_request_ids=tuple(request_ids),
             row_views=row_views,
+            output_spans=spans or None,
+            span_request_ids=tuple(request_ids) if spans else None,
         )
+
+    @staticmethod
+    def _real_spans(
+        submodule: NodeSubmodule, graph_walk: str,
+        spans: dict[str, torch.Tensor], num_rows: int,
+    ) -> dict[str, torch.Tensor]:
+        """The step's spans narrowed to its real rows (a replay pads past
+        them), refusing a span on an output the walk does not declare and a
+        step that spans some declared outputs but not all: the per-request
+        path merges one forward's spans into another's by name, so every
+        forward on a walk has to return the same names."""
+        declared = submodule.spanned_outputs(graph_walk)
+        undeclared = spans.keys() - declared
+        if undeclared:
+            raise ValueError(
+                f"{type(submodule).__name__} returned spans for {sorted(undeclared)} "
+                f"on walk {graph_walk!r}, which spanned_outputs does not declare"
+            )
+        missing = declared - spans.keys()
+        if missing:
+            raise ValueError(
+                f"{type(submodule).__name__} returned spans for {sorted(spans)} on walk "
+                f"{graph_walk!r} but none for {sorted(missing)}: a step that returns spans "
+                f"returns one for every output spanned_outputs declares"
+            )
+        for name, span in spans.items():
+            if span.dim() != 2 or span.shape[1] != 2 or span.shape[0] < num_rows:
+                raise ValueError(
+                    f"{type(submodule).__name__}: the span of {name!r} is "
+                    f"{tuple(span.shape)}, not [{num_rows}, 2]"
+                )
+        # A view, not a clone: the gpu thread copies the spans to the host on
+        # this stream right behind the step, before a later replay can write them.
+        return {name: span[:num_rows] for name, span in spans.items()}
 
     def _merge_per_rid(
         self,
@@ -2657,8 +2759,19 @@ class Engine:
     def add_request(
         self, request_id: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
+        request_info: CurrentForwardPassInfo | None = None,
     ) -> None:
+        """Open the request on every resource, then tell each submodule. All or
+        nothing: a raise leaves the request on none of them."""
         self._runner.ingest_request(request_id, overrides)
+        if request_info is None:
+            return
+        try:
+            for submodule_mgmt in self._submodules.values():
+                submodule_mgmt.submodule.on_request_added(request_id, request_info)
+        except Exception:
+            self.remove_request(request_id)
+            raise
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down on every resource. Returns the resources it
