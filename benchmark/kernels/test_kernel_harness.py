@@ -337,4 +337,40 @@ def test_the_built_in_specs_list_their_candidates(capsys):
     names = capsys.readouterr().out.split()
     assert names[0] == "registry" and len([n for n in names if n.startswith("triton[")]) == 2
     assert search.main(["--spec", "linear", "--list"]) == 0
+    for name in ("fused_add_rms_norm", "decode_gemv", "decode_gemv_silu_mul"):
+        assert search.main(["--spec", name, "--list", "--budget", "2"]) == 0
     assert shape_key({"rows": 1, "n": 4096}, torch.bfloat16) == "rows1-n4096-bfloat16"
+
+
+def _timed(family, us, **knobs):
+    return {"family": family, "knobs": knobs, "us": us, "oracle": {"ok": True}}
+
+
+def test_best_promotion_picks_an_implementation_per_shape(tmp_path):
+    store = ResultsStore(tmp_path / "store", stack="torch-test-hip-test-triton-test")
+    results = {
+        # the tuned kernel wins by more than the margin: its knobs, as the class's entry
+        1: [_timed("vendor", 10.0), _timed("aiter", 9.0), _timed("tuned_a", 8.0, block=8)],
+        2: [_timed("vendor", 10.0), _timed("aiter", 9.5), _timed("tuned_a", 8.5, block=8)],
+        # within the margin of the vendor kernel: the vendor kernel, as a shape entry
+        4: [_timed("vendor", 10.0), _timed("tuned_a", 9.9, block=8), _timed("tuned_b", 9.95, block=16)],
+        # a failing tuned candidate does not count
+        8: [_timed("vendor", 10.0), {**_timed("tuned_a", 1.0, block=8), "oracle": {"ok": False}}],
+    }
+    for rows, timed in results.items():
+        record = {"shape": {"rows": rows, "n": 64, "k": 32}, "candidates": {f"c{i}": c for i, c in enumerate(timed)}}
+        store.write(MI300X, "gemv", record["shape"], torch.bfloat16, record)
+    impls = {"vendor": ("vendor", {}), "aiter": ("aiter", {}), "tuned_a": ("triton", {"dot": False}),
+             "tuned_b": ("triton", {"dot": True})}
+    path = store.promote_best(MI300X, "gemv", impls.get, lambda s: "small" if s["rows"] <= 4 else "large",
+                              margin=0.02, root=tmp_path / "configs", provenance={"job": "test"})
+    assert path == tmp_path / "configs" / "gfx942" / "mi300x" / "gemv.json"
+    config = json.loads(path.read_text())
+    assert config["classes"] == {"small": {"impl": "triton", "block": 8, "dot": False}, "large": {"impl": "vendor"}}
+    assert config["shapes"] == {"k32-n64-rows4": {"impl": "vendor"}}
+    configs._read.cache_clear()
+    loaded = configs.load_config("gemv", "gfx942", "mi300x", root=tmp_path / "configs")
+    assert configs.select(loaded, "small", {"rows": 4, "n": 64, "k": 32}) == {"impl": "vendor"}
+    assert configs.select(loaded, "small", {"rows": 2, "n": 64, "k": 32})["impl"] == "triton"
+    with pytest.raises(ValueError, match="no passing results"):
+        store.promote_best(MI300X, "gemv", lambda family: None, lambda s: None, root=tmp_path / "configs")
