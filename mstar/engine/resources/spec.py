@@ -38,14 +38,15 @@ class CombinedSplit:
 
 
 class RoutingContext(NamedTuple):
-    """The data-parallel replicas a routing mirror is built for, and the KV
-    declarations a mirror reads, which ``ReplicaRouter`` reads from the model."""
+    """The data-parallel replicas a routing mirror is built for, and what a
+    mirror reads of the model's KV declarations, which ``ReplicaRouter`` fills."""
     num_replicas: int
     # the walks of the worker graphs that hold the resource's nodes on these replicas
     walks: frozenset[str]
     # the resource's keyed labels, each with the walks whose writes it keys
     keyed: Mapping[str, Collection[str]]
-    # whether the workers open the resource's prefix cache (`opening_prefix_caches`)
+    # whether these replicas' workers open the resource's prefix cache: `opening_prefix_caches`
+    # at their instance size, derived by the router rather than declared
     prefix_cache_opens: bool
 
 

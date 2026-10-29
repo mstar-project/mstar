@@ -449,11 +449,14 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   least recently used snapshot that no request holds.
 
 Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
-cache, or when that cache's prefix cache doesn't open; in those cases the pool allocates
-no snapshot slots. Every cache on the node then stays shut, and the engine logs which
-resource kept it shut. ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py``
-is that rule over the specs, which the conductor's routing and the API server's prompt
-hashing read too.
+cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
+off or can't open at the pool's world size; in those cases the pool allocates no snapshot
+slots. A model that names no checkpoint and sets no salt keeps the slots, and the engine
+closes the pool with its cache. Every cache on the node of a pool without snapshots stays
+shut, and the engine logs which pool kept it shut. ``opening_prefix_caches`` in
+``mstar/engine/resources/kv/config.py`` is that rule over the specs: the engine opens
+exactly the caches it returns, and the conductor's routing and the API server's prompt
+hashing read it too.
 
 A model with a keyed label is checked at load time. Loading fails in two more cases:
 
@@ -1856,9 +1859,10 @@ spec, so models declare nothing for it.
 **The hook.** ``NodeResourceSpec.routing_mirror(ctx)`` returns a ``RoutingMirror`` or
 ``None``, the default. The router asks once per set of node groups with replicas that
 holds one of the spec's nodes, and ``ctx`` (a ``RoutingContext``) gives the replica count,
-the walks of the worker graphs there that hold the spec's nodes, and the model's KV
-declarations: the resource's keyed labels with the walks that key each (empty for a
-resource that is not a KV cache), and whether the workers open its prefix cache.
+the walks of the worker graphs there that hold the spec's nodes, the resource's keyed
+labels with the walks that key each (empty for a resource that is not a KV cache), and
+whether those replicas' workers open its prefix cache, which the router derives from the
+specs and the replicas' lockstep instance size.
 A mirror is conductor-side bookkeeping that follows the resource's own rules as far as
 the conductor's inputs allow. The module that defines one must stay free of kernels,
 since the conductor builds it.
