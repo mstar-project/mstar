@@ -1006,8 +1006,10 @@ placed exactly as weights are.
   depthwise conv, ``nn.Embedding``, a forward overridden on an instance or hooked) takes
   none: the walk records why, and an adapter touching it is refused with that reason. So
   does a child its parent runs through the weight itself rather than its forward (folded at
-  load, an ``F.linear`` over it), which the parent names in ``lora_unservable`` (child name
-  -> reason; MLA's absorbed projections, SigLIP's patch embedding).
+  load, an ``F.linear`` over it), which the parent names in ``lora_unservable`` (a path
+  below it -> reason; a path that is not one of its submodules is a ``ValueError``): MLA's
+  absorbed projections, SigLIP's patch embedding, Command-A+'s fused decoder-layer
+  projections.
 - **Targets.** One per role in a layer stack (``layers.N.<role>`` / ``blocks.N.<role>``,
   ``layers`` set where a role is on some layers only), named by the role's last
   component (``names`` overrides), plus one per module outside the stacks.

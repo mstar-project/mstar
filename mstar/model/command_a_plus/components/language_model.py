@@ -151,7 +151,8 @@ class CommandAPlusDecoderLayer(nn.Module):
     lora_unservable = dict.fromkeys(
         ("self_attn.qkv_proj", "self_attn.o_proj",
          "mlp.shared_experts.gate_up_proj", "mlp.shared_experts.down_proj"),
-        "fused into the decoder layer's GEMMs at load, never run through its own forward",
+        "fused into the decoder layer's GEMMs at load on CUDA (fuse_weights); refused on every "
+        "device so the spec does not depend on it",
     )
 
     def __init__(
