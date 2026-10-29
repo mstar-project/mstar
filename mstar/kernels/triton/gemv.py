@@ -47,8 +47,13 @@ _DOT_MIN_ROWS = 16
 
 
 @triton.jit
-def _fma_step(acc3, w, x_ptr, offs_m, m_mask, ks, stride_xm, K):
-    x = tl.load(x_ptr + offs_m[:, None] * stride_xm + ks[None, :], mask=m_mask[:, None] & (ks[None, :] < K), other=0.0)
+def _load_x(x_ptr, offs_m, m_mask, ks, stride_xm, K):
+    return tl.load(x_ptr + offs_m[:, None] * stride_xm + ks[None, :], mask=m_mask[:, None] & (ks[None, :] < K),
+                   other=0.0)
+
+
+@triton.jit
+def _fma_step(acc3, w, x):
     return acc3 + w[None, :, :].to(tl.float32) * x[:, None, :].to(tl.float32)
 
 
@@ -75,23 +80,24 @@ def _tile_product(
     else:
         acc3 = tl.zeros((BLOCK_M, BLOCK_N, BLOCK_K), dtype=tl.float32)
         if PREFETCH:
-            # Triton pipelines only loops around tl.dot: carry the next tile's
+            # Triton pipelines only loops around tl.dot: carry the next tiles'
             # loads across the multiply-adds so two are in flight
             ks = k_start + offs_k
             if EVEN:
                 w = tl.load(w_rows + ks[None, :])
             else:
                 w = tl.load(w_rows + ks[None, :], mask=n_mask[:, None] & (ks[None, :] < K), other=0.0)
+            x = _load_x(x_ptr, offs_m, m_mask, ks, stride_xm, K)
             for k0 in range(k_start + BLOCK_K, k_stop, BLOCK_K):
-                ks_next = k0 + offs_k
+                ks = k0 + offs_k
                 if EVEN:
-                    w_next = tl.load(w_rows + ks_next[None, :])
+                    w_next = tl.load(w_rows + ks[None, :])
                 else:
-                    w_next = tl.load(w_rows + ks_next[None, :], mask=n_mask[:, None] & (ks_next[None, :] < K),
-                                     other=0.0)
-                acc3 = _fma_step(acc3, w, x_ptr, offs_m, m_mask, ks, stride_xm, K)
-                w, ks = w_next, ks_next
-            acc3 = _fma_step(acc3, w, x_ptr, offs_m, m_mask, ks, stride_xm, K)
+                    w_next = tl.load(w_rows + ks[None, :], mask=n_mask[:, None] & (ks[None, :] < K), other=0.0)
+                x_next = _load_x(x_ptr, offs_m, m_mask, ks, stride_xm, K)
+                acc3 = _fma_step(acc3, w, x)
+                w, x = w_next, x_next
+            acc3 = _fma_step(acc3, w, x)
         else:
             for k0 in range(k_start, k_stop, BLOCK_K):
                 ks = k0 + offs_k
@@ -99,7 +105,7 @@ def _tile_product(
                     w = tl.load(w_rows + ks[None, :])
                 else:
                     w = tl.load(w_rows + ks[None, :], mask=n_mask[:, None] & (ks[None, :] < K), other=0.0)
-                acc3 = _fma_step(acc3, w, x_ptr, offs_m, m_mask, ks, stride_xm, K)
+                acc3 = _fma_step(acc3, w, _load_x(x_ptr, offs_m, m_mask, ks, stride_xm, K))
         acc = tl.trans(tl.sum(acc3, axis=2))
     return acc
 
