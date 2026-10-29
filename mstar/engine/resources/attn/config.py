@@ -144,6 +144,10 @@ class AttentionStep(ResourceStep):
     # `segments` then carry the query counts, the cache's segments the appended counts.
     # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
     context_only: bool = False
+    # every row of the step carries this many queries (a speculative verify
+    # step's k + 1), so a captured bucket may size its kernel for that rather
+    # than for one row holding all of the bucket's tokens
+    row_queries: int | None = None
 
 
 def refuse_context_only(step: AttentionStep, manager: str) -> None:

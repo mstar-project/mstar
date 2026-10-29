@@ -237,7 +237,10 @@ class KVPlanOutput:
     Output of KVManager.plan for a single label
     """
 
-    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+    __slots__ = (
+        "cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows",
+        "write_state",
+    )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
@@ -260,6 +263,9 @@ class KVPlanOutput:
         # (request_id, label, to_compute) per view, for consumers that need no
         # pages or lengths (the position resource); None means read the views
         self.rows = rows
+        # the device slots this step's writes go to (a `KVPlanState`), set by
+        # `KVManager.plan`; a speculative step rewrites them in-graph
+        self.write_state = None
 
     @property
     def views(self) -> "list[SequenceView]":

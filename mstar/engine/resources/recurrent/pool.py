@@ -48,6 +48,13 @@ class SlotState:
     # Counts forks into this slot, like `CacheStream.generation`; nothing in
     # the engine reads it yet (the pre-plan tests use it to see a fork land).
     generation: int = 0
+    # under speculative decoding, the slots after `index` that hold the state
+    # after each further token of a verify row
+    extra: tuple[int, ...] = ()
+
+    @property
+    def group(self) -> tuple[int, ...]:
+        return (self.index, *self.extra)
 
 
 @dataclass(frozen=True)
@@ -64,6 +71,9 @@ class RecurrentAddressing:
     # kernels by them must not read the device copies back
     host_slot_indices: Sequence[int] | None = None
     host_has_state: Sequence[bool] | None = None
+    # Under speculative decoding, each row's slots in token order (its
+    # `slot_indices` entry first), `pad_index` throughout for a row with none
+    host_slot_groups: Sequence[tuple[int, ...]] | None = None
 
 
 class RecurrentStatePool(Resource):
@@ -85,7 +95,8 @@ class RecurrentStatePool(Resource):
         # the slot-major view is K-contiguous (stride(-1) == 1).
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
-                (config.num_layers, config.max_slots, *block.shape),
+                (config.num_layers, config.max_slots,
+                 *block.storage_shape(config.spec_tokens)),
                 dtype=block.dtype,
                 device=device,
             )
@@ -173,9 +184,10 @@ class RecurrentStatePool(Resource):
             if not labels:
                 return
             for slot in labels.values():
-                self._zero_slot(slot.index)
-                if free:
-                    self._free.append(slot.index)
+                for index in slot.group:
+                    self._zero_slot(index)
+                    if free:
+                        self._free.append(index)
             if free:
                 labels.clear()
             else:
@@ -192,12 +204,15 @@ class RecurrentStatePool(Resource):
             slot = labels.get(label)
             if slot is not None:
                 return slot
-            if not self._free:
+            need = self.config.slots_per_request
+            if len(self._free) < need:
                 return None
             # Slot ids must be unique across the batch: kernels assume it rather
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
-            slot = labels[label] = SlotState(index=self._free.pop())
+            index = self._free.pop()
+            extra = tuple(self._free.pop() for _ in range(need - 1))
+            slot = labels[label] = SlotState(index=index, extra=extra)
             self._admit_taken[(rid, label)] = slot.index
             return slot
 
@@ -254,8 +269,9 @@ class RecurrentStatePool(Resource):
                 if slot is None or slot.index != index:
                     continue  # reset or removed under us; the slot went with it
                 del labels[label]
-                self._zero_slot(index)
-                self._free.append(index)
+                for taken_index in slot.group:
+                    self._zero_slot(taken_index)
+                    self._free.append(taken_index)
 
     def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
         return AdmitOutcome(
@@ -401,6 +417,9 @@ class RecurrentStatePool(Resource):
         pending_forks = pending_forks or {}
         indices = []
         has_state = []
+        spec = self.config.spec_tokens > 0
+        groups = [] if spec else None
+        pad_group = (pad,) * self.config.slots_per_request
         for seg in segments:
             slot = (
                 None if ctx.capture or ctx.is_padding_row(seg.request_id)
@@ -411,11 +430,15 @@ class RecurrentStatePool(Resource):
                 # sink (or the sentinel), which nothing reads back
                 indices.append(pad)
                 has_state.append(False)
+                if spec:
+                    groups.append(pad_group)
             else:
                 indices.append(slot.index)
                 has_state.append(
                     pending_forks.get((seg.request_id, label), slot.has_state)
                 )
+                if spec:
+                    groups.append(slot.group)
 
         num_rows = len(indices)
         target, mirrors = self._addressing_buffers(label, ctx, num_rows)
@@ -437,6 +460,7 @@ class RecurrentStatePool(Resource):
             # changes them after
             host_slot_indices=indices,
             host_has_state=has_state,
+            host_slot_groups=groups,
         )
 
     def _addressing_buffers(

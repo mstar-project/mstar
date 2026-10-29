@@ -19,7 +19,9 @@ from mstar.engine.resources.linear_attn.gdn_kernels import (
     GDNKernels,
     GDNPrefillKernel,
     GDNPrefillPlan,
+    GDNVerifyPlan,
 )
+from mstar.utils.h2d import H2DMirror, PinnedStager
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
@@ -605,3 +607,114 @@ class GDNMixedWrapper(GDNWrapper):
         front_out = self._prefill.run(qf, kf, vf, af, bf, state, a_log, dt_bias)
         rows_out = self._decode.run(qd, kd, vd, ad, bd, state, a_log, dt_bias)
         return self._merge(front_out, rows_out, n)
+
+
+class GDNVerifyWrapper(GDNWrapper):
+    """A speculative verify step: every row ``tokens_per_row`` tokens (a
+    request's last emitted token and its k drafts).
+
+    A request holds one slot per token (the pool's slot group). Its first token
+    starts from the slot its previous step accepted up to, which only the
+    device knows (``num_accepted``, written by the speculative resource), and
+    the state after token ``t`` lands in slot ``t`` of the group, so whatever
+    the step accepts, the next one finds that state without a copy. The conv
+    window is one slot wide by k + width - 1 and slides by the accepted count
+    the same way. Padding rows (a group on the pool's null slot) are skipped
+    by both kernels.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        pad_slot_id: int,
+        tokens_per_row: int,
+        bs: int | None = None,
+        accelerator_graph: bool = False,
+        null_slot_id: int = 0,
+        kernels: GDNKernels | None = None,
+    ):
+        super().__init__(
+            device=device, pad_slot_id=pad_slot_id,
+            num_tokens=None if bs is None else bs * tokens_per_row, bs=bs,
+            accelerator_graph=accelerator_graph, null_slot_id=null_slot_id,
+        )
+        if kernels is None:
+            raise ValueError("GDNVerifyWrapper needs the resource's GDNKernels")
+        self._kernel: GDNPrefillKernel = kernels.verify()
+        self._tokens = tokens_per_row
+        self._stager = PinnedStager(torch.int32)
+        self._mirror = H2DMirror() if accelerator_graph else None
+        # [slot_map | conv_slots | cu_seqlens], one H2D a step, sized once to
+        # the bucket under capture
+        self._image: torch.Tensor | None = None
+        self._rows_capacity = 0
+        self._plan_state: GDNVerifyPlan | None = None
+
+    def _views(self, rows: int):
+        t = self._tokens
+        cap = self._rows_capacity
+        image = self._image
+        slot_map = image[: cap * t].view(cap, t)
+        conv = image[cap * t: cap * t + cap]
+        cu = image[cap * (t + 1): cap * (t + 1) + cap + 1]
+        return slot_map[:rows], conv[:rows], cu[: rows + 1]
+
+    def plan(self, groups, num_accepted: torch.Tensor):
+        rows, t = len(groups), self._tokens
+        need = max(rows, self._bs or 0) if self._accelerator_graph else rows
+        if need > self._rows_capacity:
+            if self._image is not None and self._accelerator_graph:
+                raise RuntimeError(
+                    f"GDNVerifyWrapper: {rows} rows past the {self._rows_capacity} "
+                    "its captured graph holds"
+                )
+            self._rows_capacity = max(need, 1)
+            self._image = torch.zeros(
+                self._rows_capacity * (t + 2) + 1, dtype=torch.int32, device=self._device,
+            )
+            if self._mirror is not None:
+                self._mirror.invalidate()
+        cap = self._rows_capacity
+        null = self._null_slot_id
+        host = np.full(cap * (t + 2) + 1, -1, dtype=np.int32)
+        slot_map = host[: cap * t].reshape(cap, t)
+        conv = host[cap * t: cap * t + cap]
+        conv[:] = null
+        for i, group in enumerate(groups):
+            if group[0] != null:
+                slot_map[i] = group
+                conv[i] = group[0]
+        host[cap * (t + 1): cap * (t + 1) + cap + 1] = np.arange(cap + 1, dtype=np.int32) * t
+        self._stager.copy_(self._image, host, mirror=self._mirror)
+        slot_map_d, conv_d, cu_d = self._views(rows)
+        self._plan_state = GDNVerifyPlan(
+            slot_map=slot_map_d, conv_slots=conv_d, cu_seqlens=cu_d,
+            num_accepted=num_accepted[:rows], num_rows=rows, tokens_per_row=t,
+        )
+
+    def run_conv(
+        self,
+        x: torch.Tensor,
+        conv_layer: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        activation: str | None = "silu",
+    ):
+        from mstar.utils.causal_conv1d import causal_conv1d_update
+
+        plan = self._plan_state
+        return causal_conv1d_update(
+            x=x,
+            conv_state=conv_layer,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            conv_state_indices=plan.conv_slots,
+            num_accepted_tokens=plan.num_accepted,
+            query_start_loc=plan.cu_seqlens,
+            max_query_len=plan.tokens_per_row,
+            null_block_id=self._null_slot_id,
+        )
+
+    def run(self, q, k, v, a, b, state, a_log, dt_bias):
+        return self._kernel.run(self._plan_state, q, k, v, a, b, state, a_log, dt_bias)

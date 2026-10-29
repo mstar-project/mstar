@@ -55,6 +55,24 @@ class GDNDecodePlan:
     num_rows: int
 
 
+@dataclass(frozen=True)
+class GDNVerifyPlan:
+    """A speculative verify step: every row is ``tokens_per_row`` tokens.
+
+    Row ``i`` starts from the state in ``slot_map[i, num_accepted[i] - 1]``
+    and leaves the state after its token ``t`` in ``slot_map[i, t]``; -1 rows
+    are skipped. ``num_accepted`` is filled on the device by the speculative
+    resource before the layers run.
+    """
+
+    slot_map: torch.Tensor      # [n, tokens_per_row] int32
+    conv_slots: torch.Tensor    # [n] int32, each row's conv window
+    cu_seqlens: torch.Tensor    # [n + 1] int32
+    num_accepted: torch.Tensor  # [n] int32
+    num_rows: int
+    tokens_per_row: int
+
+
 def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
     """``t`` with ``rows`` zeroed rows appended along dim 0."""
     return torch.cat((t, t.new_zeros((rows, *t.shape[1:]))), dim=0)
@@ -139,6 +157,15 @@ class GDNKernels(ABC):
     @abstractmethod
     def decode(self, bs: int | None) -> GDNDecodeKernel:
         """For a decode wrapper: a capture bucket's ``bs``, None for eager."""
+
+    def verify(self) -> GDNPrefillKernel:
+        """For a speculative verify step: rows of k + 1 tokens, each starting
+        from the state its last step accepted and keeping the state after
+        every token (``GDNVerifyWrapper``)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no speculative verify kernel; the 'aiter' "
+            "GDN backend has one"
+        )
 
 
 # What each NVIDIA arch's chunked prefill kernel will read as its packed state.
