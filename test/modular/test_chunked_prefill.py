@@ -14,7 +14,11 @@ sys.path.insert(0, ".")
 import torch
 
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
-from mstar.worker.batch_builder import fill_token_budget, fill_token_budget_in_start_order
+from mstar.worker.batch_builder import (
+    fill_token_budget,
+    fill_token_budget_in_arrival_order,
+    fill_token_budget_in_start_order,
+)
 
 # ── the token budget ────────────────────────────────────────────────────
 
@@ -159,6 +163,53 @@ def test_in_start_order_the_head_runs_over_budget_rather_than_nothing():
     take, dropped = fill_token_budget_in_start_order(["d0", "p0"], {"d0": 3, "p0": 100}, {"p0"}, 0, 4)
     assert take == {"d0": 3}
     assert dropped == {"p0"}
+
+
+# ── arrival order ───────────────────────────────────────────────────────
+
+
+def test_arrival_keeps_a_short_prompt_behind_an_earlier_long_one():
+    take, dropped = fill_token_budget_in_arrival_order(
+        ["long", "short"], {"long": 3000, "short": 100}, {"long", "short"}, 1024, 128,
+    )
+    assert take == {"long": 1024}
+    assert dropped == {"short"}, "the short prompt ran ahead of the one that arrived first"
+
+
+def test_in_arrival_order_a_prompt_mid_prefill_goes_before_one_listed_ahead_of_it():
+    take, dropped = fill_token_budget_in_arrival_order(
+        ["fresh", "partway"], {"fresh": 900, "partway": 700}, {"fresh", "partway"}, 1024, 128,
+        {"partway": 0},
+    )
+    assert take == {"partway": 700, "fresh": 324}
+    assert not dropped
+
+
+def test_in_arrival_order_a_prompt_behind_decodes_that_fill_the_budget_runs_the_floor():
+    decodes = _decodes(16)
+    take, dropped = fill_token_budget_in_arrival_order(
+        [*decodes, "p0", "p1"], decodes | {"p0": 1000, "p1": 1000}, {"p0", "p1"}, 16, 128,
+    )
+    assert take == decodes | {"p0": 128}, "the prompt was cut to what the decodes left"
+    assert dropped == {"p1"}
+
+
+def test_held_new_prompts_wait_but_decode_rows_and_a_prompt_mid_prefill_run():
+    decodes = _decodes(4)
+    take, dropped = fill_token_budget_in_arrival_order(
+        [*decodes, "short", "partway"], decodes | {"short": 50, "partway": 5000},
+        {"short", "partway"}, 1024, 128, {"partway": 0}, hold_new=True,
+    )
+    assert take == decodes | {"partway": 1020}
+    assert dropped == {"short"}, "a prompt started while another is partway through elsewhere"
+
+
+def test_a_step_of_only_held_new_prompts_is_empty():
+    take, dropped = fill_token_budget_in_arrival_order(
+        ["a", "b"], {"a": 50, "b": 5000}, {"a", "b"}, 1024, 128, hold_new=True,
+    )
+    assert take == {}
+    assert dropped == {"a", "b"}
 
 
 # ── engine: prepare once, cut per chunk ─────────────────────────────────

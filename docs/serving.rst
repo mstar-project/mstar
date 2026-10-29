@@ -309,7 +309,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        a prompt mid-prefill takes the budget before a newer one, so it finishes first,
        and prompts short enough for an equal share still go in whole. ``fair_share``
        splits the budget max-min fair over every waiting prompt, so each advances every
-       step and all finish late together.
+       step and all finish late together. ``arrival`` serves prompts strictly in arrival
+       order: the first that does not fit is cut and every prompt behind it waits, a
+       short one too. It also keeps one prompt per node partway through: while that
+       prompt is outside a step (held after an OOM, or its chunk still running), no
+       other prompt starts, which keeps prompts on a tight KV pool from each holding
+       pages the others need.
    * - ``min_chunk_tokens``
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller. A positive int, for every
