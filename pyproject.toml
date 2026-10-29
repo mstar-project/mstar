@@ -468,7 +468,7 @@ target-version = "py312"
 [tool.ruff.lint]
 fixable = ["ALL"]
 unfixable = []
-select = ["F", "E", "W", "I", "B", "PL", "N"] 
+select = ["F", "E", "W", "I", "B", "PL", "N", "TID251"]
 ignore = [
     "B006",    # Do not use mutable data structures for argument defaults
     "B008",    # Do not perform function call in argument defaults
@@ -490,7 +490,21 @@ ignore = [
     "PLR0917", # Too many positional arguments
 ]
 
+# A new thread starts with its creator's CPU mask, so a thread or pool started
+# from a pinned step thread (step_thread_core) would share its CPU; the helpers
+# start theirs on the process mask.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"threading.Thread".msg = "use mstar.utils.threads.Thread, which starts on the process mask"
+"concurrent.futures.ThreadPoolExecutor".msg = "use mstar.utils.threads.ThreadPool, which starts on the process mask"
+"concurrent.futures.thread.ThreadPoolExecutor".msg = "use mstar.utils.threads.ThreadPool, which starts on the process mask"
+
 [tool.ruff.lint.per-file-ignores]
+# banned-api covers the serving code under mstar/: tests, benchmarks and
+# scripts never run on a pinned thread
+"!mstar/**" = ["TID251"]
+"mstar/**/tests/**" = ["TID251"]
+# the helpers themselves
+"mstar/utils/threads.py" = ["TID251"]
 # Intentional star-import re-export of the graph base API.
 "mstar/graph/graph_io.py" = ["F403", "F405"]
 # Imports are deliberately placed after a module-level pytest.skip().

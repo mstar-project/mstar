@@ -1,13 +1,17 @@
-"""The CPU a worker's main, GPU and plan threads share: how each worker picks
-it (``choose_step_core``), the knob, the GPU's local CPU list from sysfs, and
-the real ``Worker.run`` moving its three step threads onto it. The knob
-itself is in ``test_knobs``."""
+"""Pinning the step threads (``step_thread_core``): the CPU plan every process
+builds (``mstar.utils.cpus``) from sysfs and the process mask, the startup
+failures, the pool sizes, the thread helpers (``mstar.utils.threads``) and the
+ruff rule that enforces them, and the real ``Worker.run`` moving its three step
+threads onto their CPUs. The knob itself is in ``test_knobs``."""
 from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,152 +20,210 @@ torch = pytest.importorskip("torch")
 
 from mstar.engine.engine import ExecutingBatch  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.platforms import (  # noqa: E402
-    CpuPlatform,
-    CudaPlatform,
-    RocmPlatform,
-    interface,
-)
-from mstar.utils import step_threads  # noqa: E402
-from mstar.utils.cpu_list import format_cpu_list, parse_cpu_list  # noqa: E402
-from mstar.utils.step_threads import StepCore, api_thread_cpu, choose_step_core  # noqa: E402
+from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, interface  # noqa: E402
+from mstar.utils import cpus, threads  # noqa: E402
+from mstar.utils.cpus import CpuPlan, CpuPlanError, StepCpus, deployment_plan, parse_cpu_list  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
-NODE0, NODE1 = parse_cpu_list("0-31,128-159"), parse_cpu_list("32-63,160-191")
+REPO = Path(__file__).resolve().parents[2]
+NODES = [parse_cpu_list(f"{32 * n}-{32 * n + 31},{128 + 32 * n}-{128 + 32 * n + 31}") for n in range(4)]
 HOST = frozenset(range(256))
+# this test host's 8 GPUs, two per NUMA node, by PCI address
+GPUS = {"0000:1a:00.0": 0, "0000:40:00.0": 0, "0000:62:00.0": 1, "0000:73:00.0": 1,
+        "0000:9a:00.0": 2, "0000:da:00.0": 2, "0000:f3:00.0": 3, "0000:fa:00.0": 3}
 
 
-def smt(cpu: int) -> tuple[int, int]:
-    """Sibling order of the host above: CPU n and n + 128 share a core."""
-    return cpu // 128, cpu
+def smt(cpu: int) -> frozenset[int]:
+    """CPU n and n + 128 share a core."""
+    return frozenset({cpu % 128, cpu % 128 + 128})
 
 
-BOTH = NODE0 | NODE1  # a taskset over both nodes, narrower than the host
-HOST_CPUS = 256
+def _sysfs(tmp_path, gpus=GPUS, nodes=NODES) -> Path:
+    """A fake /sys/bus/pci/devices: the GPUs, plus a BMC display adapter and a
+    NIC that are not GPUs."""
+    root = tmp_path / "pci"
+    devices = {address: ("0x10de", "0x030200", node) for address, node in gpus.items()}
+    devices |= {"0000:2c:00.0": ("0x1a03", "0x030000", 0), "0000:3b:00.0": ("0x15b3", "0x020700", 0)}
+    for address, (vendor, cls, node) in devices.items():
+        d = root / address
+        d.mkdir(parents=True)
+        (d / "vendor").write_text(vendor + "\n")
+        (d / "class").write_text(cls + "\n")
+        (d / "numa_node").write_text(f"{node}\n")
+        local = cpus.format_cpu_list(nodes[node]) if node >= 0 else cpus.format_cpu_list(HOST)
+        (d / "local_cpulist").write_text(local + "\n")
+    return root
 
 
-def _cpus(setting, local_cpus, allowed, order=smt):
-    return [choose_step_core(setting, slot, local_cpus, allowed, order, host_cpus=HOST_CPUS).cpu
-            for slot in range(len(local_cpus))]
+def _plan(setting, addresses, mask, root, usable=None):
+    return deployment_plan(setting, addresses, mask=mask, usable=usable or len(mask), pci_root=root, siblings=smt)
 
 
-# ── choice ──────────────────────────────────────────────────────────────────
-
-def test_auto_takes_a_cpu_local_to_the_gpu_one_per_worker():
-    assert _cpus("auto", [NODE0], BOTH) == [0]
-    # two ranks on one GPU, or on two GPUs of one NUMA node
-    assert _cpus("auto", [NODE0, NODE0], BOTH) == [0, 1]
-    assert _cpus("auto", [NODE0, NODE1, NODE0], BOTH) == [0, 32, 1]
-    core = choose_step_core("auto", 0, [NODE0], BOTH, smt, host_cpus=HOST_CPUS)
-    assert core.source == "local to its device: 0-31,128-159"
+def _one(cpu) -> StepCpus:
+    return StepCpus(frozenset({cpu}), frozenset({cpu}), frozenset({cpu}), "")
 
 
-def test_auto_leaves_a_mask_that_is_the_whole_host_alone():
-    # one server per GPU with no taskset: the table covers one deployment, so
-    # every server would take the same CPUs
-    assert _cpus("auto", [NODE0, NODE1], HOST) == [None, None]
-    core = choose_step_core("auto", 0, [NODE0], HOST, smt, host_cpus=HOST_CPUS)
-    assert "narrower than the host" in core.source
-    assert api_thread_cpu("auto", HOST, smt, host_cpus=HOST_CPUS) is None
-    # a CPU number pins anywhere
-    assert _cpus(0, [NODE0, NODE1], HOST) == [0, 1]
-    assert api_thread_cpu(0, HOST, smt, host_cpus=HOST_CPUS) == 127
-    # the host's online CPUs by default
-    assert choose_step_core("auto", 0, [None], set(range(os.cpu_count()))).cpu is None
+def _cpus(plan: CpuPlan) -> list[int | None]:
+    return [None if w is None else min(w.main) for w in plan.workers]
 
 
-def test_smt_siblings_come_after_every_first_thread():
-    two_cores = parse_cpu_list("0-1,128-129")
-    assert _cpus("auto", [two_cores] * 3, BOTH) == [0, 1, 128]
-    # without topology the order is numeric
-    assert _cpus("auto", [parse_cpu_list("0,128")] * 2, BOTH, order=None) == [0, 128]
+# ── where a GPU sits ────────────────────────────────────────────────────────
+
+def test_the_hosts_gpus_are_the_functions_of_one_vendor_and_class_by_address(tmp_path):
+    root = _sysfs(tmp_path)
+    gpus = cpus.host_gpus("0000:40:00.0", root)
+    # the display adapter on node 0 (another vendor and class) and the NIC are not GPUs
+    assert [g.address for g in gpus] == list(GPUS)
+    assert gpus[1] == cpus.HostGpu("0000:40:00.0", "0", NODES[0])
+    assert cpus.host_gpus("0000:ff:00.0", root) == []   # no such device
+    assert cpus.host_gpus("0000:40:00.0", tmp_path / "absent") == []
 
 
-def test_a_taskset_off_the_gpu_node_falls_back_to_the_process_mask():
-    allowed = parse_cpu_list("32-39")
-    assert _cpus("auto", [NODE0], allowed) == [32]
-    assert "process affinity" in choose_step_core("auto", 0, [NODE0], allowed, host_cpus=HOST_CPUS).source
-    # no local list at all (no sysfs entry, a CPU device, macOS)
-    assert _cpus("auto", [None, None], allowed) == [32, 33]
-
-
-def test_workers_never_share_when_only_some_lists_meet_the_mask():
-    # worker 0's GPU is on node 1, worker 1's on node 0; only CPU 8 of node 0
-    # is allowed, so worker 1 must not fall back onto worker 0's CPU 32
-    allowed = parse_cpu_list("8,32-39")
-    assert _cpus("auto", [NODE1, NODE0], allowed) == [32, 8]
-    assert _cpus("auto", [NODE1, NODE0, NODE0], allowed) == [32, 8, 33]
-    picks = _cpus("auto", [NODE0, None, NODE1, NODE0], parse_cpu_list("0-1,32-33,40"))
-    assert len(set(picks)) == 4
-
-
-def test_too_few_allowed_cpus_skips_rather_than_shares():
-    # every worker needs its own CPU and one is left for everything else
-    assert _cpus("auto", [NODE0, NODE0], parse_cpu_list("0-1")) == [None, None]
-    assert "skipped" in choose_step_core("auto", 0, [NODE0, NODE0], parse_cpu_list("0-1")).source
-    assert _cpus("auto", [NODE0, NODE0], parse_cpu_list("0-2")) == [0, 1]
-    assert _cpus("auto", [None], {5}) == [None]
-
-
-def test_off_and_explicit_values():
-    assert choose_step_core("off", 0, [NODE0], HOST) == StepCore(None, "off")
-    allowed = parse_cpu_list("32-39")
-    # the first worker on that CPU, the others on the allowed CPUs upward of it
-    assert _cpus(34, [NODE0, NODE0], allowed) == [34, 35]
-    assert _cpus(38, [None, None, None], allowed) == [38, 39, None]
-    # a CPU outside the mask is refused, not forced
-    assert _cpus(8, [NODE0], allowed) == [None]
-    assert _cpus(0, [None, None], parse_cpu_list("0-1")) == [None, None]
-
-
-def test_the_api_server_takes_the_last_cpu_and_the_workers_leave_it():
-    assert api_thread_cpu("auto", BOTH, smt, HOST_CPUS) == 63  # the last first hardware thread
-    assert api_thread_cpu("auto", parse_cpu_list("32-39"), smt, HOST_CPUS) == 39
-    assert api_thread_cpu(34, parse_cpu_list("32-39"), smt, HOST_CPUS) == 39
-    assert api_thread_cpu("off", BOTH, smt, HOST_CPUS) is None
-    assert api_thread_cpu("auto", {4, 5}, smt, HOST_CPUS) is None  # too small to spare one
-    # the workers build their table without it
-    allowed = parse_cpu_list("37-39")
-    api = api_thread_cpu("auto", allowed, smt, HOST_CPUS)
-    assert _cpus("auto", [None], allowed - {api}) == [37]
-    assert _cpus("auto", [None, None], allowed - {api}) == [None, None]
-
-
-# ── local CPU list ─────────────────────────────────────────────────────────
-
-def test_cpu_lists_round_trip():
-    assert parse_cpu_list("0-3,8,10-11\n") == {0, 1, 2, 3, 8, 10, 11}
-    assert parse_cpu_list("") == frozenset()
-    assert format_cpu_list({11, 0, 1, 2, 3, 8, 10}) == "0-3,8,10-11"
-
-
-def test_local_cpus_follow_the_pci_address_on_cuda_and_rocm(tmp_path, monkeypatch):
-    real_open = open
-    sysfs = tmp_path / "0000:4a:00.0"
-    sysfs.mkdir()
-    (sysfs / "local_cpulist").write_text("0-31,128-159\n")
-
-    def fake_open(path, *args, **kwargs):
-        prefix = "/sys/bus/pci/devices/"
-        if str(path).startswith(prefix):
-            path = tmp_path / str(path)[len(prefix):]
-        return real_open(path, *args, **kwargs)
-
-    props = {0: SimpleNamespace(pci_domain_id=0, pci_bus_id=0x4A, pci_device_id=0),
-             1: SimpleNamespace(pci_domain_id=0, pci_bus_id=0x9A, pci_device_id=0)}
+def test_pci_addresses_come_from_torch_on_cuda_and_rocm(monkeypatch):
+    props = {0: SimpleNamespace(pci_domain_id=0, pci_bus_id=0x40, pci_device_id=0)}
 
     def get_props(index):
         if index not in props:
             raise AssertionError("Invalid device id")
         return props[index]
 
-    monkeypatch.setattr(interface, "open", fake_open, raising=False)
     monkeypatch.setattr(interface.torch.cuda, "get_device_properties", get_props)
     for platform in (CudaPlatform(), RocmPlatform()):
-        assert platform.local_cpus(0) == NODE0
-        assert platform.local_cpus(1) is None  # no sysfs entry
-        assert platform.local_cpus(5) is None  # no such device
-    assert CpuPlatform().local_cpus(0) is None
+        assert platform.pci_address(0) == "0000:40:00.0"
+        assert platform.pci_address(5) is None
+    assert CpuPlatform().pci_address(0) is None
+
+
+# ── auto ────────────────────────────────────────────────────────────────────
+
+def test_auto_takes_the_cores_at_the_gpus_rank_on_its_node(tmp_path):
+    root = _sysfs(tmp_path)
+    plan = _plan("auto", ["0000:40:00.0"], HOST, root)
+    # GPU 2 of 2 on node 0: the worker the second core from the bottom, the
+    # API server the second from the top
+    assert plan.workers[0][:3] == _one(1)[:3] and plan.result == 30
+    assert "GPU 2 of 2 on its NUMA node" in plan.workers[0].why
+    plan = _plan("auto", ["0000:62:00.0"], HOST, root)
+    assert _cpus(plan) == [32] and plan.result == 63
+
+
+@pytest.mark.parametrize(("mask", "a", "b"), [
+    (HOST, "0000:1a:00.0", "0000:40:00.0"),                          # one node, no taskset
+    (NODES[0] | NODES[1], "0000:40:00.0", "0000:62:00.0"),           # two nodes under one taskset
+    (parse_cpu_list("0-19,128-147"), "0000:1a:00.0", "0000:40:00.0"),  # a 40-CPU taskset on their node
+    (parse_cpu_list("32-39,96-103"), "0000:40:00.0", "0000:fa:00.0"),  # one GPU's node left out
+    (parse_cpu_list("32-39"), "0000:40:00.0", "0000:fa:00.0"),         # both left out
+])
+def test_two_servers_one_per_gpu_under_one_taskset_take_different_cpus(tmp_path, mask, a, b):
+    """Each server knows only its own GPU, and no two pick a CPU in common."""
+    root = _sysfs(tmp_path)
+    first, second = _plan("auto", [a], mask, root), _plan("auto", [b], mask, root)
+    assert first.pinned and second.pinned
+    assert not first.pinned & second.pinned
+
+
+def test_a_vm_without_numa_nodes_still_ranks_its_gpus(tmp_path):
+    root = _sysfs(tmp_path, gpus={"0000:07:00.0": -1, "0000:08:00.0": -1})
+    mask = parse_cpu_list("0-39")
+    one, two = (_plan("auto", [a], mask, root) for a in ("0000:07:00.0", "0000:08:00.0"))
+    assert (_cpus(one), one.result, _cpus(two), two.result) == ([0], 39, [1], 38)
+
+
+def test_workers_of_one_server_on_one_gpu_take_distinct_cores(tmp_path):
+    root = _sysfs(tmp_path)
+    # a split config (two workers on GPU 0) plus a worker on the node's other GPU
+    plan = _plan("auto", ["0000:40:00.0", "0000:40:00.0", "0000:1a:00.0"], HOST, root)
+    assert _cpus(plan) == [1, 3, 0] and plan.result == 30
+
+
+def test_a_mask_off_the_gpus_node_falls_back_to_its_rank_on_the_host(tmp_path):
+    root = _sysfs(tmp_path)
+    plan = _plan("auto", ["0000:40:00.0"], parse_cpu_list("32-39"), root)
+    # node 1's two GPUs would take 32, 33, 38 and 39; GPU 2 of 8 takes from 34-37
+    assert _cpus(plan) == [35] and plan.result == 36
+    assert "no allowed CPU on its NUMA node, so GPU 2 of 8 on the host" in plan.workers[0].why
+    # a device sysfs doesn't place (a CPU worker) takes the mask from the bottom
+    plan = _plan("auto", [None, None], parse_cpu_list("32-39"), root)
+    assert _cpus(plan) == [32, 33] and plan.result == 39
+
+
+def test_auto_pins_nothing_when_the_mask_is_too_small(tmp_path):
+    root = _sysfs(tmp_path)
+    plan = _plan("auto", ["0000:40:00.0"], {32, 33}, root)   # a worker and the API server would take both
+    assert plan.workers == () and plan.result is None
+    assert plan.why.startswith("not pinned: ") and "leaving none for the rest" in plan.why
+    plan = _plan("auto", [None] * 3, {32, 33, 34}, root)
+    assert plan.pinned == frozenset() and "more cores than the mask has" in plan.why
+
+
+def test_siblings_share_a_core_and_stay_off_the_step_cpu(tmp_path):
+    root = _sysfs(tmp_path)
+    mask = parse_cpu_list("32-35,160-163")
+    plan = _plan("auto", [None, None], mask, root)
+    # cores, not hardware threads: the second worker gets the next core
+    assert _cpus(plan) == [32, 33] and plan.result == 35
+    assert all(160 + i not in plan.pinned for i in range(4))
+
+
+# ── a CPU number, and off ───────────────────────────────────────────────────
+
+def test_a_number_is_the_first_workers_cpu_and_the_api_takes_the_last_core(tmp_path):
+    root = _sysfs(tmp_path)
+    mask = parse_cpu_list("32-39")
+    plan = _plan(34, ["0000:40:00.0", "0000:40:00.0"], mask, root)
+    assert _cpus(plan) == [34, 35] and plan.result == 39
+    assert _cpus(_plan(32, [None], HOST, root)) == [32]
+
+
+@pytest.mark.parametrize(("setting", "n", "message"), [
+    (8, 1, "step_thread_core 8 is outside the process mask 32-39"),
+    (38, 2, "step_thread_core 38 leaves 1 core(s) at or above it for 2 worker(s) in the process mask 32-39 "
+            "(the last, 39, is the API server's)"),
+    (39, 1, "leaves 0 core(s)"),
+])
+def test_a_number_the_mask_cannot_honour_fails_at_startup(tmp_path, setting, n, message):
+    with pytest.raises(CpuPlanError, match=message.replace("(", r"\(").replace(")", r"\)")):
+        _plan(setting, [None] * n, parse_cpu_list("32-39"), _sysfs(tmp_path))
+
+
+def test_off_pins_nothing_and_the_pools_get_every_usable_cpu(tmp_path):
+    plan = _plan("off", ["0000:40:00.0"], parse_cpu_list("32-39"), _sysfs(tmp_path))
+    assert plan == CpuPlan(parse_cpu_list("32-39"), 8, why="step_thread_core off")
+    assert plan.left == 8
+
+
+# ── pool sizes ──────────────────────────────────────────────────────────────
+
+def test_the_pools_are_sized_from_the_cpus_left_after_the_pins():
+    mask = parse_cpu_list("32-47")
+    free = CpuPlan(mask, usable=16)
+    pinned = CpuPlan(mask, usable=16, workers=(_one(32), _one(33)), result=47)
+    assert (free.left, free.preprocess_threads, free.png_threads, free.encode_workers) == (16, 4, 8, 2)
+    assert (pinned.left, pinned.preprocess_threads, pinned.png_threads, pinned.encode_workers) == (13, 3, 8, 1)
+    # the cgroup quota caps the count; a pinned CPU outside the mask isn't taken from it
+    assert CpuPlan(mask, usable=6, workers=(_one(32),), result=99).left == 5
+
+
+def test_the_api_server_reads_the_deployments_plan_from_its_config(monkeypatch):
+    from mstar.api_server import entrypoint
+
+    seen = {}
+
+    def plan(setting, addresses, **kw):
+        seen.update(setting=setting, addresses=addresses)
+        return CpuPlan(frozenset(range(8)), 8)
+
+    monkeypatch.setattr(entrypoint.cpus, "deployment_plan", plan)
+    monkeypatch.setattr(entrypoint.cpus, "device_addresses", lambda idx: [f"dev{i}" for i in idx])
+    monkeypatch.delenv("MSTAR_STEP_THREAD_CORE", raising=False)
+    config = {"knobs": {"step_thread_core": "auto"}, "rank_devices": {2: 0},
+              "node_groups": [{"node_names": ["a"], "ranks": [2]}, {"node_names": ["b"], "ranks": [0, 1]}]}
+    entrypoint.deployment_cpu_plan(config)
+    # ranks in order, rank 2 placed on device 0 as the conductor places it
+    assert seen == {"setting": "auto", "addresses": ["dev0", "dev1", "dev0"]}
+    entrypoint.deployment_cpu_plan({**config, "knobs": {"step_thread_core": 33}})
+    assert seen == {"setting": 33, "addresses": [None, None, None]}
+    entrypoint.knobs.configure(None)
 
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -173,96 +235,181 @@ def _bare_worker(worker_id="worker_1", device="cuda:1"):
     return w
 
 
-def test_the_worker_picks_its_row_and_logs_it(monkeypatch, caplog):
+def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
     import mstar.worker.worker as worker_mod
 
-    local = {0: NODE0, 1: NODE0, 2: NODE1}
-    monkeypatch.setattr(worker_mod, "current_platform", SimpleNamespace(local_cpus=local.get))
-    monkeypatch.setattr(worker_mod, "PINNABLE", True)
-    monkeypatch.setattr(worker_mod, "smt_order", smt)
-    monkeypatch.setattr(os, "cpu_count", lambda: 512)  # the 256-CPU mask is then a taskset
-    monkeypatch.setattr(worker_mod.os, "sched_getaffinity", lambda pid: set(HOST), raising=False)
-    monkeypatch.delenv("MSTAR_STEP_THREAD_CORE", raising=False)
+    root = _sysfs(tmp_path)
+    addresses = {0: "0000:1a:00.0", 1: "0000:40:00.0", 2: "0000:62:00.0"}
+
+    def plan(setting, addrs):
+        return deployment_plan(setting, addrs, mask=HOST, usable=54, pci_root=root, siblings=smt)
+
+    monkeypatch.setattr(worker_mod.cpus, "device_addresses", lambda idx: [addresses.get(i) for i in idx])
+    monkeypatch.setattr(worker_mod.cpus, "deployment_plan", plan)
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "auto")
     w = _bare_worker()
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
-        w._choose_step_core(["worker_0", "worker_1", "worker_2"], ["cuda:0", "cuda:1", "cuda:2"])
-    assert w._step_core.cpu == 1 and w._process_cpus == HOST
-
-    # the API server's CPU (the last of the mask) is never a worker's
-    monkeypatch.setattr(worker_mod.os, "sched_getaffinity", lambda pid: {37, 38, 39}, raising=False)
-    w = _bare_worker(worker_id="worker_0", device="cpu")
-    w._choose_step_core(["worker_0", "worker_1"], ["cpu", "cpu"])
-    assert w._step_core.cpu is None  # 37 and 38 for two workers leave nothing else
-    w._choose_step_core(["worker_0"], ["cpu"])
-    assert w._step_core.cpu == 37
-    monkeypatch.setattr(worker_mod.os, "sched_getaffinity", lambda pid: set(HOST), raising=False)
-    assert "step threads (main, GPU, plan) on CPU 1 (local to its device: 0-31,128-159; " \
-           "cuda:1, worker 2 of 3, allowed 0-255)" in caplog.text
+        w._plan_step_cpus(["worker_0", "worker_1", "worker_2"], ["cuda:0", "cuda:1", "cuda:2"])
+    assert w._step_cpus[:3] == _one(1)[:3] and w._process_cpus == HOST
+    assert cpus.plan().result == 31 and cpus.plan().left == 54 - 4
+    assert ("step threads on CPUs main 1, GPU 1, plan 1 (auto: GPU 2 of 2 on its NUMA node, over its allowed "
+            "CPUs 0-31,128-159; cuda:1, worker 2 of 3, mask 0-255)") in caplog.text
 
     # standalone (no conductor list): the only worker
     w = _bare_worker()
-    w._choose_step_core(["worker_1"], None)
-    assert w._step_core.cpu == 0
+    w._plan_step_cpus(["worker_1"], None)
+    assert w._step_cpus[:3] == _one(1)[:3]
+
+    # a number the mask can't honour stops the worker
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "300")
+    with pytest.raises(CpuPlanError, match="outside the process mask"):
+        _bare_worker()._plan_step_cpus(["worker_1"], None)
 
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "off")
     w = _bare_worker()
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
-        w._choose_step_core(["worker_1"], None)
-    assert w._step_core.cpu is None and "step threads not pinned (off)" in caplog.text
-
-
-def test_without_sched_setaffinity_the_worker_pins_nothing(monkeypatch, caplog):
-    import mstar.worker.worker as worker_mod
-
-    monkeypatch.setattr(worker_mod, "PINNABLE", False)
-    w = _bare_worker()
-    with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
-        w._choose_step_core(["worker_1"], None)
-    assert w._step_core.cpu is None and "no sched_setaffinity" in caplog.text
-    w._pin_step_thread()  # a no-op, never reaches os.sched_setaffinity
+        w._plan_step_cpus(["worker_1"], None)
+    assert w._step_cpus is None and "step threads not pinned (step_thread_core off)" in caplog.text
+    w._pin_step_thread("main")  # a no-op
+    cpus.install(None)
 
 
 # ── threads a pinned thread starts ─────────────────────────────────────────
 
-@pytest.mark.skipif(not step_threads.PINNABLE, reason="needs os.sched_setaffinity (Linux)")
-def test_a_pool_a_pinned_thread_starts_goes_back_to_the_process_mask():
-    """A new thread copies its creator's mask, so a pool started after the pin
-    sits on the step CPU unless its initializer is ``unpin_thread``."""
+needs_affinity = pytest.mark.skipif(not cpus.PINNABLE, reason="needs os.sched_setaffinity (Linux)")
+
+
+@pytest.fixture
+def intra_op_pool():
+    """At least two intra-op threads, so a pool exists to start, under any
+    OMP_NUM_THREADS (CI sets 1)."""
+    before = torch.get_num_threads()
+    torch.set_num_threads(max(2, before))
+    yield
+    torch.set_num_threads(before)
+
+
+def _two_cpus():
     allowed = frozenset(os.sched_getaffinity(0))
     if len(allowed) < 2:
         pytest.skip("needs two allowed CPUs")
-    cpu = max(allowed)
+    return allowed, max(allowed)
+
+
+def _in_thread(target):
+    """Run ``target`` on a fresh thread: pinning pins the caller, and pytest's
+    own thread must keep its mask."""
+    errors = []
+
+    def run():
+        try:
+            target()
+        except BaseException as e:  # noqa: BLE001 — reported below
+            errors.append(e)
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(60)
+    assert not t.is_alive() and not errors, errors
+
+
+@needs_affinity
+def test_threads_and_pools_a_pinned_thread_starts_run_on_the_process_mask():
+    """A new thread copies its creator's mask: a bare pool started after the
+    pin sits on the pinned CPU, the helpers' threads do not."""
+    allowed, cpu = _two_cpus()
     seen = {}
 
     def pinned():
-        step_threads.pin_step_thread(cpu, allowed)
+        threads.pin_thread({cpu}, allowed)
         with ThreadPoolExecutor(1) as pool:
-            seen["inherited"] = pool.submit(os.sched_getaffinity, 0).result()
-        with ThreadPoolExecutor(1, initializer=step_threads.unpin_thread) as pool:
-            seen["unpinned"] = pool.submit(os.sched_getaffinity, 0).result()
+            seen["bare pool"] = pool.submit(os.sched_getaffinity, 0).result()
+        with threads.ThreadPool(1, initializer=lambda: seen.setdefault("init", os.sched_getaffinity(0))) as pool:
+            seen["pool"] = pool.submit(os.sched_getaffinity, 0).result()
+        t = threads.Thread(target=lambda: seen.setdefault("thread", os.sched_getaffinity(0)))
+        t.start()
+        t.join()
 
-    # pin_step_thread pins the thread that calls it; keep that off pytest's own thread
-    t = threading.Thread(target=pinned)
-    t.start()
-    t.join(30)
-    assert seen == {"inherited": {cpu}, "unpinned": allowed}
+    _in_thread(pinned)
+    assert seen == {"bare pool": {cpu}, "init": allowed, "pool": allowed, "thread": allowed}
+
+
+def _tids() -> set[int]:
+    return set(map(int, os.listdir("/proc/self/task")))
+
+
+def _confined_to(cpu: int, besides: set[int]) -> list[int]:
+    """This process's threads, other than ``besides``, whose mask is just
+    ``cpu``. ``besides`` holds the threads a test started with: an earlier
+    test's idle pool threads may still be on their way out."""
+    stray = []
+    for tid in map(int, os.listdir("/proc/self/task")):
+        try:
+            if tid not in besides and os.sched_getaffinity(tid) == {cpu}:
+                stray.append(tid)
+        except OSError:  # exited meanwhile
+            pass
+    return stray
+
+
+@needs_affinity
+def test_the_pin_starts_the_intra_op_pool_on_the_process_mask(intra_op_pool):
+    """Without the warm-up op in ``pin_thread`` the pinned thread's first
+    parallel op would start its pool on the pinned CPU."""
+    allowed, cpu = _two_cpus()
+    seen = {}
+    before = _tids()
+
+    def pinned():
+        threads.pin_thread({cpu}, allowed)
+        torch.ones(torch.get_num_threads() * 65536).sum()
+        # the pool lives as long as its master thread, so look now
+        seen["stray"] = _confined_to(cpu, before | {threading.get_native_id()})
+
+    _in_thread(pinned)
+    assert seen == {"stray": []}
+
+
+# ── the ruff rule ───────────────────────────────────────────────────────────
+
+def _ruff() -> str:
+    path = shutil.which("ruff")
+    if path is None:
+        try:
+            from ruff.__main__ import find_ruff_bin
+            path = find_ruff_bin()
+        except (ImportError, FileNotFoundError):
+            pytest.skip("ruff is not installed")
+    return path
+
+
+@pytest.mark.parametrize(("path", "flagged"), [
+    ("mstar/worker/new_module.py", True),
+    ("mstar/utils/threads.py", False),             # the helpers
+    ("mstar/model/foo/tests/test_foo.py", False),  # tests
+    ("test/modular/test_foo.py", False),
+    ("benchmark/foo.py", False),
+])
+def test_bare_threads_are_refused_under_mstar_only(path, flagged):
+    source = ("import threading\nfrom concurrent.futures import ThreadPoolExecutor\n\n"
+              "threading.Thread(target=print).start()\nThreadPoolExecutor(1).shutdown()\n")
+    out = subprocess.run([_ruff(), "check", "--no-cache", "--select", "TID251", "--stdin-filename", path, "-"],
+                         input=source, capture_output=True, text=True, cwd=REPO, check=False)
+    assert ("TID251" in out.stdout) == flagged, out.stdout + out.stderr
 
 
 # ── API server ─────────────────────────────────────────────────────────────
 
-@pytest.mark.skipif(not step_threads.PINNABLE, reason="needs os.sched_setaffinity (Linux)")
+@needs_affinity
 def test_the_api_message_thread_and_the_bridge_move_to_the_result_cpu(monkeypatch):
     from api_server_helpers import make_test_api_server
 
     from mstar.api_server.rust_frontend import RustFrontendBridge
 
-    allowed = frozenset(os.sched_getaffinity(0))
-    if len(allowed) < 2:
-        pytest.skip("needs two allowed CPUs")
-    cpu = max(allowed)
+    allowed, cpu = _two_cpus()
     exited = SimpleNamespace(pid=5, is_alive=lambda: False, exitcode=1)
     server = make_test_api_server(
-        conductor_proc=exited, _liveness_interval_s=0.0, _result_core=StepCore(cpu, "test"), _process_cpus=allowed,
+        conductor_proc=exited, _liveness_interval_s=0.0, _result_cpu=cpu, _process_cpus=allowed,
         communicator=SimpleNamespace(get_all_new_messages=list),
     )
     seen = {}
@@ -277,42 +424,37 @@ def test_the_api_message_thread_and_the_bridge_move_to_the_result_cpu(monkeypatc
     bridge = RustFrontendBridge.__new__(RustFrontendBridge)
     bridge.server = server
     monkeypatch.setattr(bridge, "_serve", serve, raising=False)
-    # both pin the thread that runs them; keep that off pytest's own thread
     for target in (message_thread, bridge.run):
-        t = threading.Thread(target=target)
-        t.start()
-        t.join(30)
+        _in_thread(target)
     assert seen == {"message": {cpu}, "bridge": {cpu}}
     # a server built without a CPU (tests, ``off``, macOS) pins nothing
     make_test_api_server().pin_result_thread()
 
 
-def test_the_api_server_logs_its_choice(monkeypatch, caplog):
+def test_the_api_server_takes_its_cpu_from_the_plan_and_logs_it(monkeypatch, caplog):
     from api_server_helpers import make_test_api_server
 
-    from mstar.api_server import entrypoint
-
-    monkeypatch.setattr(entrypoint, "PINNABLE", True)
-    monkeypatch.setattr(os, "cpu_count", lambda: 256)
-    monkeypatch.setattr(entrypoint.os, "sched_getaffinity", lambda pid: set(range(32, 40)), raising=False)
-    monkeypatch.delenv("MSTAR_STEP_THREAD_CORE", raising=False)
-    server = make_test_api_server(_model_config={"knobs": {"step_thread_core": "auto"}})
+    mask = parse_cpu_list("32-39")
+    monkeypatch.setattr(cpus, "_plan", CpuPlan(mask, 8, (_one(33),), 38, "auto: test"))
+    server = make_test_api_server()
     with caplog.at_level(logging.INFO, logger="mstar.api_server.entrypoint"):
-        server._choose_result_cpu()
-    assert server._result_core.cpu == 39
-    assert "message thread and frontend bridge on CPU 39 (last CPU of the process mask 32-39)" in caplog.text
-    server = make_test_api_server(_model_config={"knobs": {"step_thread_core": False}})
-    server._choose_result_cpu()
-    assert server._result_core.cpu is None
-    entrypoint.knobs.configure(None)
+        server._take_result_cpu()
+    assert (server._result_cpu, server._process_cpus) == (38, mask)
+    assert "message thread and frontend bridge on CPU 38 (auto: test; mask 32-39)" in caplog.text
+    monkeypatch.setattr(cpus, "_plan", CpuPlan(mask, 8, why="not pinned: too small"))
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "auto")
+    with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):
+        server._take_result_cpu()
+    assert server._result_cpu is None and "result threads not pinned (not pinned: too small)" in caplog.text
 
 
 class _StopLoopError(BaseException):
     """Ends ``Worker.run``, whose loop handles only ``Exception``."""
 
 
-@pytest.mark.skipif(not step_threads.PINNABLE, reason="needs os.sched_setaffinity (Linux)")
-def test_run_moves_the_main_gpu_and_plan_threads_to_the_chosen_cpu(monkeypatch):
+@needs_affinity
+@pytest.mark.parametrize("split", ["one CPU", "plan on another"])
+def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intra_op_pool, split):
     """The real ``Worker.run``, every collaborator stubbed: one scheduled step,
     then a speculated one the plan thread pre-plans. Each of the three threads
     reports its mask from inside its own work; a thread one of them starts
@@ -321,10 +463,9 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_the_chosen_cpu(monkeypatch):
     from mstar.worker.micro_scheduler import ScheduledBatch
     from mstar.worker.worker import Speculation
 
-    allowed = frozenset(os.sched_getaffinity(0))
-    if len(allowed) < 2:
-        pytest.skip("needs two allowed CPUs")
-    cpu = max(allowed)
+    allowed, cpu = _two_cpus()
+    plan_cpu = cpu if split == "one CPU" else min(allowed)
+    before = _tids()
     monkeypatch.setenv("MSTAR_PRE_PLAN_SPEC", "1")
     monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
         collect=lambda: None, freeze=lambda: None, get_freeze_count=lambda: 0))
@@ -332,8 +473,8 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_the_chosen_cpu(monkeypatch):
     schedule = [("a", 2), None]
     iteration = [0]
 
-    def mask(name):
-        seen[name] = threading.get_native_id(), os.sched_getaffinity(0)
+    def mask(name, stray=()):
+        seen[name] = threading.get_native_id(), os.sched_getaffinity(0), stray
 
     def scheduled(name, rows):
         return ScheduledBatch(node_name="LLM", graph_walk=name,
@@ -363,10 +504,11 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_the_chosen_cpu(monkeypatch):
         return {}
 
     def preplan(pending, spec):
-        mask("plan")
-        # a pool this thread starts now inherits its CPU; one it started
-        # before moving does not
+        # a pool this thread started before moving keeps the process mask; one
+        # it started now would sit on its CPU
         torch.ones(torch.get_num_threads() * 65536).sum()
+        steps = before | {seen[n][0] for n in ("main", "gpu") if n in seen} | {threading.get_native_id()}
+        mask("plan", _confined_to(cpu, steps) + _confined_to(plan_cpu, steps))
         return True
 
     def build_speculation(pending, consecutive, fair):
@@ -392,7 +534,8 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_the_chosen_cpu(monkeypatch):
     w.tp_async_sched, w.is_tp_follower = False, False
     w._in_flight_rids = set()
     w._metrics = None
-    w._step_core, w._process_cpus = StepCore(cpu, "test"), allowed
+    w._step_cpus = StepCpus(frozenset({cpu}), frozenset({cpu}), frozenset({plan_cpu}), "test")
+    w._process_cpus = allowed
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: None)
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
@@ -432,16 +575,8 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_the_chosen_cpu(monkeypatch):
     main.start()
     main.join(60)
     assert not main.is_alive() and not errors, errors
-    assert {name: m for name, (_, m) in seen.items()} == {"main": {cpu}, "gpu": {cpu}, "plan": {cpu}}
-    step_tids = {tid for tid, _ in seen.values()}
-    assert len(step_tids) == 3
-    # no other thread of the process landed on the CPU, the intra-op pool the
-    # plan thread just used included
-    stray = []
-    for tid in map(int, os.listdir("/proc/self/task")):
-        try:
-            if tid not in step_tids and os.sched_getaffinity(tid) == {cpu}:
-                stray.append(tid)
-        except OSError:  # exited meanwhile
-            pass
-    assert stray == []
+    assert {name: m for name, (_, m, _) in seen.items()} == {"main": {cpu}, "gpu": {cpu}, "plan": {plan_cpu}}
+    assert len({tid for tid, _, _ in seen.values()}) == 3
+    # no other thread of the process landed on a step CPU, the intra-op pool
+    # the plan thread just used included (looked at while it was alive)
+    assert seen["plan"][2] == []

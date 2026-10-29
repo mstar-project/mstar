@@ -62,6 +62,7 @@ from mstar.communication.rust_communicator import (
 )
 from mstar.model.multimodal import PromptPart
 from mstar.utils.client_errors import client_error_text
+from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +275,10 @@ class RustFrontendBridge:
     async def _serve(self) -> None:
         logger.info("Rust-frontend bridge serving")
         loop = asyncio.get_running_loop()
+        # asyncio would start its default pool from this thread, and so on
+        # the result CPU when the bridge is pinned; handlers' to_thread work
+        # (audio planning, request decoding) belongs on the process mask
+        loop.set_default_executor(ThreadPool(thread_name_prefix="mstar-bridge"))
         # Blocking receive on an executor thread: the wait happens inside the
         # transport (GIL released), so an arriving submit is picked up
         # immediately instead of on the next tick of a sleep/poll loop — and

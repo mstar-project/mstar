@@ -39,7 +39,7 @@ def test_a_malformed_block_fails_the_startup_check(bad):
 
 
 def test_step_thread_core_from_the_config_and_the_environment(monkeypatch):
-    assert knobs.step_thread_core() == "auto"
+    assert knobs.step_thread_core() == "off"
     # yaml reads a bare off as False
     for value, expected in ((False, "off"), (True, "auto"), ("auto", "auto"), ("OFF", "off"), (12, 12)):
         knobs.configure({"step_thread_core": value})

@@ -7,7 +7,6 @@ from collections.abc import Callable
 import torch
 
 from mstar.platforms.ptxas import blackwell_ptxas_env
-from mstar.utils.cpu_list import parse_cpu_list
 
 
 class Platform:
@@ -73,24 +72,22 @@ class Platform:
         """
         return {}
 
-    def local_cpus(self, device_index: int) -> frozenset[int] | None:
-        """The CPUs on the device's NUMA node, as the host lists them; None
-        where the platform or the host doesn't say."""
+    def pci_address(self, device_index: int) -> str | None:
+        """The device's PCI address (``0000:40:00.0``), its name under
+        ``/sys/bus/pci/devices``; None where the platform doesn't say."""
         return None
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
 
 
-def _pci_local_cpus(device_index: int) -> frozenset[int] | None:
-    """The device's ``local_cpulist`` in sysfs, found by the PCI address torch
-    reports. ROCm builds report it the same way, so this needs no NVML."""
+def _torch_pci_address(device_index: int) -> str | None:
+    """The PCI address torch reports for a ``torch.cuda`` device. ROCm builds
+    report it the same way, so this needs no NVML; it creates no context."""
     try:
         props = torch.cuda.get_device_properties(device_index)
-        bdf = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
-        with open(f"/sys/bus/pci/devices/{bdf}/local_cpulist") as f:
-            return parse_cpu_list(f.read()) or None
-    except (AssertionError, AttributeError, OSError, RuntimeError, ValueError):
+        return f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+    except (AssertionError, AttributeError, RuntimeError):
         return None
 
 
@@ -107,8 +104,8 @@ class CudaPlatform(Platform):
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
 
-    def local_cpus(self, device_index: int) -> frozenset[int] | None:
-        return _pci_local_cpus(device_index)
+    def pci_address(self, device_index: int) -> str | None:
+        return _torch_pci_address(device_index)
 
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
@@ -133,8 +130,8 @@ class RocmPlatform(Platform):
         # none until one is measured to help on AMD GPUs
         return {}
 
-    def local_cpus(self, device_index: int) -> frozenset[int] | None:
-        return _pci_local_cpus(device_index)
+    def pci_address(self, device_index: int) -> str | None:
+        return _torch_pci_address(device_index)
 
 
 class XpuPlatform(Platform):

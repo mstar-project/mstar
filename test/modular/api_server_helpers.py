@@ -14,7 +14,6 @@ import tempfile
 from pathlib import Path
 
 from mstar.api_server.entrypoint import APIServer
-from mstar.utils.step_threads import StepCore
 
 
 def make_test_api_server(**overrides) -> APIServer:
@@ -39,7 +38,7 @@ def make_test_api_server(**overrides) -> APIServer:
     server.preprocess_worker = None
     server.communicator = None
     server._msg_thread = None
-    server._result_core = StepCore(None, "not chosen")  # never pins a test's thread
+    server._result_cpu = None  # never pins a test's thread
     server._process_cpus = frozenset()
     for name, value in overrides.items():
         if not hasattr(server, name):

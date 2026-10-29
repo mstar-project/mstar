@@ -16,7 +16,7 @@ import shutil
 import threading
 import uuid
 from abc import ABC, abstractmethod
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -25,7 +25,7 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from mstar.engine.resources.kv.cache import KVCache, KVLayout
 from mstar.engine.resources.kv.page_copier import make_page_copier
-from mstar.utils.step_threads import unpin_thread
+from mstar.utils.threads import ThreadPool
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import (
@@ -224,16 +224,13 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         self._copy_stream = torch.cuda.Stream(device=self._device)
 
         self._pending: list[Future] = []
-        self._executor = ThreadPoolExecutor(
+        self._executor = ThreadPool(
             max_workers=max_workers, initializer=self._bind_device,
         )
 
     def _bind_device(self) -> None:
         """CUDA's current device is per-thread and defaults to 0; an unbound
-        pool thread has no context to open the peer's IPC handle against.
-        The pool starts under the worker's pinned main thread, so its threads
-        go back to the process mask first."""
-        unpin_thread()
+        pool thread has no context to open the peer's IPC handle against."""
         if self._device.type == "cuda":
             torch.cuda.set_device(self._device)
 

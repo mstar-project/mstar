@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState, encode_workers
+from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState
+from mstar.utils import cpus
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.streaming.topology import PartitionTopology
 
@@ -80,7 +81,7 @@ class _Comm:
 def worker(monkeypatch):
     # The tests hold one encode on a gate while another finishes, so two
     # threads whatever the host's CPUs.
-    monkeypatch.setattr("mstar.api_server.data_worker.encode_workers", lambda: 2)
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(16)), usable=16))
     wt = PreprocessWorkerThread(
         in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
         profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
@@ -133,10 +134,11 @@ def _pass_until(wt, n: int, timeout_s: float = 5.0) -> list:
     return chunks
 
 
-@pytest.mark.parametrize(("cpus", "workers"), [(1, 1), (8, 1), (16, 2), (40, 4), (256, 4)])
-def test_the_pool_times_a_pngs_own_threads_fits_the_cpus(cpus, workers):
-    assert encode_workers(cpus, png_workers=8) == workers
-    assert workers * 8 <= max(cpus, 8)
+@pytest.mark.parametrize(("usable", "workers"), [(1, 1), (8, 1), (16, 2), (40, 4), (256, 4)])
+def test_the_pool_times_a_pngs_own_threads_fits_the_cpus(usable, workers):
+    plan = cpus.CpuPlan(frozenset(range(256)), usable)
+    assert plan.encode_workers == workers
+    assert workers * plan.png_threads <= usable
 
 
 def test_a_whole_video_is_pooled_and_a_loops_frames_stay_inline(worker):

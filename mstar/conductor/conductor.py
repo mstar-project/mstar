@@ -5,7 +5,6 @@ import multiprocessing as mp
 import os
 import signal
 import socket
-import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Collection
@@ -68,6 +67,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.utils.threads import Thread
 from mstar.validation import validate_deployment
 from mstar.validation.resources import streamed_partitions
 
@@ -284,7 +284,7 @@ def _worker_process_target(
     )
     quiet_noisy_loggers()
     built: list = []  # the Worker, once it exists
-    threading.Thread(
+    Thread(
         target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
         kwargs={"before_hard_exit": lambda: [_unlink_owned_files(w.tensor_manager) for w in built]},
     ).start()
@@ -798,8 +798,8 @@ class Conductor:
                 raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
             self._mps = MpsDaemon()
             self._mps.start()
-        # every worker runs on this host; each picks its step-thread CPU knowing
-        # the others' devices (see mstar.utils.step_threads)
+        # every worker runs on this host and builds the same CPU plan from all
+        # of their devices (see mstar.utils.cpus)
         devices = [worker_device(self.device_type, rank, self.rank_devices) for rank in self._sorted_ranks]
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
