@@ -3323,6 +3323,8 @@ class Worker:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
         rids = list(batch_N.batch.request_to_worker_graph)
+        if self._hop_keys:
+            self._hop(rids, "wk.postprocess")
         # What the runtime dereferenced to zero and cannot reclaim itself: a
         # runtime behind the contract has the bookkeeper, not the shm files or
         # the registered memory.
