@@ -801,9 +801,13 @@ _QWEN3_TTS_VARIANTS = {
 
 def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
-    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
+    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, codec_dtype
     kind, size = _QWEN3_TTS_VARIANTS[name]
-    return _bare(Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size))
+    return _bare(
+        Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size),
+        # get_node_resources sizes the codec state pool in this dtype
+        codec_dtype=codec_dtype(model_kwargs.get("codec_dtype", "float32")),
+    )
 
 
 def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):

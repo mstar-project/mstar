@@ -139,3 +139,65 @@ def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
 
 
+def test_qwen3_tts_depth_loop_matches_its_layers_unfused():
+    """Qwen3-TTS's depth loop drives the kernels with its own head counts, eps
+    and RoPE theta: a frame's 16 depth steps (``depth_step``, the fused
+    projections and ``cp_attend``) against the same layers over the whole frame
+    at once, norms, RoPE and causal attention in fp32, compared as each
+    position's logits."""
+    from mstar.model.components.code_predictor_kernels import depth_partials
+    from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor
+    from mstar.model.qwen3_tts.config import (
+        Qwen3TTSCodePredictorConfig,
+        Qwen3TTSModelConfig,
+        Qwen3TTSTalkerConfig,
+    )
+
+    torch.manual_seed(6)
+    cp = Qwen3TTSCodePredictorConfig(num_hidden_layers=2)
+    config = Qwen3TTSModelConfig(talker=Qwen3TTSTalkerConfig(code_predictor=cp))
+    predictor = Qwen3TTSCodePredictor(config).to("cuda", torch.bfloat16).eval()
+    for name, param in predictor.named_parameters():
+        if name.endswith("norm.weight"):
+            param.data.uniform_(0.5, 1.5)  # a skipped or swapped norm weight shows
+        else:
+            param.data.normal_(std=0.02)
+    predictor.consolidate_stacked_weights(
+        torch.randn(config.talker.vocab_size, config.talker.hidden_size, device="cuda", dtype=torch.bfloat16),
+    )
+    hq, hkv, d = cp.num_attention_heads, cp.num_key_value_heads, cp.head_dim
+    bs, depth = 3, config.num_code_groups
+    x = torch.randn(bs, depth, config.talker.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+    cache = torch.zeros(cp.num_hidden_layers, bs, 2, depth, hkv, d, device="cuda", dtype=torch.bfloat16)
+    pos = torch.zeros(bs, 1, dtype=torch.int32, device="cuda")
+    partials = depth_partials(torch.device("cuda"))
+    got = []
+    with torch.no_grad():
+        for s in range(depth):
+            pos.fill_(s)
+            predictor.depth.bind_step(cache, pos, cache_pos=s)
+            step_in, n_part = predictor.depth_input(x[:, s], partials)
+            got.append(predictor.depth_step(step_in, partials, n_part, head=max(s - 1, 0)))
+
+        # the projection is the identity at these widths; linears run in bf16
+        h = x.float()
+        flat_pos = torch.arange(depth, device="cuda").repeat(bs)
+        for layer in predictor.model.layers:
+            attn = layer.self_attn
+            qkv = attn.qkv_proj(_rms(h, layer.input_layernorm.weight, cp.rms_norm_eps).bfloat16()).float()
+            q, k, v = qkv.split((hq * d, hkv * d, hkv * d), dim=-1)
+            q = _norm_rope(q.reshape(-1, hq, d), attn.q_norm.weight, flat_pos, cp.rms_norm_eps, cp.rope_theta)
+            k = _norm_rope(k.reshape(-1, hkv, d), attn.k_norm.weight, flat_pos, cp.rms_norm_eps, cp.rope_theta)
+            q = q.view(bs, depth, hq, d).transpose(1, 2)
+            k = k.view(bs, depth, hkv, d).repeat_interleave(hq // hkv, dim=2).transpose(1, 2)
+            v = v.view(bs, depth, hkv, d).repeat_interleave(hq // hkv, dim=2).transpose(1, 2)
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+            h = h + attn.o_proj(out.transpose(1, 2).reshape(bs, depth, -1).bfloat16()).float()
+            h = h + layer.mlp(_rms(h, layer.post_attention_layernorm.weight, cp.rms_norm_eps).bfloat16()).float()
+        want = _rms(h, predictor.model.norm.weight, cp.rms_norm_eps)
+        heads = predictor.lm_head_weight.float()
+        want = torch.stack([want[:, s] @ heads[max(s - 1, 0)].t() for s in range(depth)], 1)
+
+    got = torch.stack(got, 1).float()
+    torch.testing.assert_close(got, want, rtol=5e-2, atol=5e-2 * want.abs().max().item())
