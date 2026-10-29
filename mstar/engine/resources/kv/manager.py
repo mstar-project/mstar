@@ -2077,6 +2077,7 @@ class KVManager(AttentionResource):
             # the counts are in tokens; the setting names the rows whose KV
             # grows by them, so they are a span this label can reserve
             reserve_ahead = ctx.reserve_whole_prefill
+            adjust = step.commit_adjust
             ahead = ctx.chunk_tokens_after \
                 if reserve_ahead.value is not SettingValue.UNSET else None
             # One pass for the reservations and the streams the in-flight mark
@@ -2089,7 +2090,7 @@ class KVManager(AttentionResource):
             # chunked row reserves ahead, so those steps take every row here.
             ready: list[CacheStream] = []
             rows = step.segments
-            if not ctx.capture and not ahead and len(self._groups) == 1:
+            if not ctx.capture and not ahead and not adjust and len(self._groups) == 1:
                 ready, slow = self._arena.admit_rows(streams, rows, ctx.real_rows(), sink or None, page_size)
                 rows = [rows[i] for i in slow]
             for segment in rows:
@@ -2112,6 +2113,8 @@ class KVManager(AttentionResource):
                 if ahead and reserve_ahead.holds_for(rid):
                     span += ahead.get(rid, 0)
                 seq_len = span + stream.stored_len
+                if adjust:
+                    seq_len += max(adjust.get((rid, label), 0), 0)
                 # the common decode row: its pages already cover the token it
                 # appends, so there is nothing to acquire and nothing to record
                 if (
@@ -2462,6 +2465,7 @@ class KVManager(AttentionResource):
                     pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
+                indptrs.write_state = plan_state
                 if ctx.is_preplan:
                     self._preplan_states[label] = plan_state
                 else:
@@ -2476,6 +2480,7 @@ class KVManager(AttentionResource):
                     lease.bucket.num_tokens, page_size,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
+                indptrs.write_state = plan_state
                 if ctx.is_preplan:
                     self._preplan_states[label] = plan_state
                 else:
@@ -2498,6 +2503,7 @@ class KVManager(AttentionResource):
             if eager_write and ctx.is_preplan and plan_state.token_to_page.is_cuda:
                 plan_state.ready = torch.cuda.Event()
                 plan_state.ready.record()
+            indptrs.write_state = plan_state
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
             else:
@@ -3279,11 +3285,13 @@ class KVManager(AttentionResource):
                 # another batch that is as big (surely sharing rows) or that
                 # names a cached row: the cache no longer describes the streams
                 self._plan_epoch += 1
-        if not step.commit:
+        if not step.commit or step.commit_adjust:
             self._plan_epoch += 1
         rows = self._readonly_rows
         if rows and any(seg.span and seg.request_id in rows for seg in step.segments):
             self._drop_readonly_plans()
+
+        adjust = step.commit_adjust
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         windows = self._windows
@@ -3300,8 +3308,8 @@ class KVManager(AttentionResource):
             is_pad = ctx.is_padding_row
             sink = step.sink
             rows = () if ctx.capture else step.segments
-            if rows and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
-                # nothing to index, adopt, retain or check: the arena moves
+            if rows and self._index is None and not retention and not windows and not adjust and not _DEBUG_ASSERTS:
+                # nothing to index, adopt, retain, adjust or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't
                 slow = self._arena.commit_rows(streams, rows, ctx.real_rows(), sink or None, step.commit)
                 rows = [rows[i] for i in slow]
@@ -3347,6 +3355,14 @@ class KVManager(AttentionResource):
                             self._assert_layout(segment, stream, touched, ctx, policy)
                     if index_on and stream.chain is not None:
                         self._index_filled_pages(segment, stream, ctx, touched)
+                    if adjust:
+                        # after the layout and index saw the span; pages are a
+                        # high-water mark, so a tail given back keeps them
+                        stream.stored_len = max(
+                            stream.stored_len
+                            + adjust.get((segment.request_id, segment.label), 0),
+                            0,
+                        )
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
