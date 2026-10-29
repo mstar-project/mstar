@@ -140,7 +140,10 @@ def chunks_from_chat(body: bytes, tok, eos_ids: set[int]) -> tuple[list[str], in
     return chunks, (doc.get("usage") or {}).get("prompt_tokens")
 
 
-def text_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = None) -> dict:
+def text_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = None,
+              concurrency: int | None = None) -> dict:
+    """``concurrency`` overrides the family's; at 1 every request decodes alone, so two arms' tokens can be
+    compared one for one (batch composition otherwise changes which GEMM kernels a step runs)."""
     C = load(plan.correctness_src)
     config = catalog.family_config_name(row, arm.name)
     tree = worktree or plan.worktree
@@ -148,9 +151,10 @@ def text_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = 
     sset = C.sets.load_set(fam.set_name, SETS_ROOT)
     base = f"http://127.0.0.1:{port}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    concurrency = concurrency or fam.default_concurrency
     t0 = time.monotonic()
     if arm.engine == "mstar":
-        responses = C.client.send_all(base, fam.requests(sset), concurrency=fam.default_concurrency,
+        responses = C.client.send_all(base, fam.requests(sset), concurrency=concurrency,
                                       timeout_s=fam.request_timeout_s, progress=False)
     else:
         from transformers import AutoTokenizer
@@ -160,7 +164,7 @@ def text_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = 
                            tok.convert_tokens_to_ids("<|endoftext|>")) if isinstance(i, int) and i >= 0}
         reqs = [C.client.Request(it.id, route="/v1/chat/completions", json_body=b)
                 for it, b in zip(sset.items, openai_bodies(fam, sset, row.hf_id, arm.engine), strict=True)]
-        responses = C.client.send_all(base, reqs, concurrency=fam.default_concurrency,
+        responses = C.client.send_all(base, reqs, concurrency=concurrency,
                                       timeout_s=fam.request_timeout_s, progress=False)
         prompt_tokens = {}
         for r in responses:
@@ -174,7 +178,7 @@ def text_pass(plan, row, arm, port: int, out_dir: Path, worktree: Path | None = 
             r.text_chunks = [c.encode("utf-8") for c in chunks]
         (out_dir / "prompt_tokens.json").write_text(json.dumps(prompt_tokens, indent=1))
     header = {"config": config, "model": cfg.get("model"), "arm": arm.name, "engine": arm.engine,
-              "restarts": 1, "concurrency": fam.default_concurrency, "family_opts": {},
+              "restarts": 1, "concurrency": concurrency, "family_opts": {},
               "seconds": round(time.monotonic() - t0, 1), "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     return _write_pass(C, fam, sset, responses, out_dir, header, cfg)
 
