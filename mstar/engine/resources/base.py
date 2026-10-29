@@ -124,6 +124,14 @@ class Resource(ABC):
         True if anything opened."""
         return False
 
+    def close_prefix_cache(self) -> None:
+        """Undo `enable_prefix_cache`. Called before any request."""
+        return
+
+    def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:
+        """The live resources this one's spec names in `depends_on`, once all are built."""
+        return
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs: Any,
     ) -> CachedPrefix | None:
@@ -132,6 +140,13 @@ class Resource(ABC):
         None leaves the answer to other resources; 0 tokens means nothing can be skipped.
         """
         return None
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """The longest prefix up to ``prefix`` this resource can serve, for a
+        resource that holds only some lengths."""
+        return prefix
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,

@@ -114,7 +114,8 @@ def test_generate_ws_refuses_in_band_and_serves_the_longest_id(server):
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
         for request_id in BAD_IDS:
             ws.send_text(json.dumps({"text": "hi", "request_id": request_id}))
-            assert json.loads(ws.receive_text()) == {"request_id": request_id, "error": REQUEST_ID_ERROR}
+            assert json.loads(ws.receive_text()) == {
+                "request_id": request_id, "error": REQUEST_ID_ERROR, "status": 400}
         ws.send_text(json.dumps({"text": "hi", "request_id": LONGEST}))
         replies = [json.loads(ws.receive_text()) for _ in range(2)]
     assert replies[-1] == {"request_id": LONGEST, "finish": True}
