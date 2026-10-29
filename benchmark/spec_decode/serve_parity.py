@@ -35,10 +35,11 @@ def prompt_set(n_chat: int = 32, n_long: int = 16, chat_new: int = 256, long_new
     ]
 
 
-def one(url: str, model: str, pid: str, prompt: str, max_new: int, timeout: float) -> dict:
+def one(url: str, model: str, pid: str, prompt: str, max_new: int, timeout: float,
+        sampling: dict | None = None) -> dict:
     body = {
         "model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_new,
-        "temperature": 0.0, "stream": True, "enable_thinking": False,
+        "temperature": 0.0, "stream": True, "enable_thinking": False, **(sampling or {}),
     }
     t0 = time.monotonic()
     arrivals, parts = [], []
@@ -77,12 +78,24 @@ def save(args) -> int:
         r["tokens"] = len(tok.encode(r["text"], add_special_tokens=False))
         r["ms_per_token"] = 1000 * r["decode_s"] / (r["tokens"] - 1) if r["tokens"] > 1 else None
     rates = sorted(r["ms_per_token"] for r in results if r["ms_per_token"])
+    sampled = []
+    for pid, p, _ in items[:args.sampled]:
+        # a smoke check of sampled decoding: it must answer, and answer differently each time
+        try:
+            texts = [one(args.url, args.tokenizer, pid, p, 64, args.timeout,
+                         {"temperature": 0.7, "top_p": 0.95})["text"] for _ in range(2)]
+            sampled.append({"id": pid, "texts": texts, "distinct": texts[0] != texts[1]})
+        except Exception as e:  # noqa: BLE001 - recorded, the greedy pass stands on its own
+            sampled.append({"id": pid, "error": f"{type(e).__name__}: {e}"})
     out = {"url": args.url, "concurrency": args.concurrency, "wall_s": wall, "results": results,
+           "sampled": sampled,
            "ms_per_token_p50": rates[len(rates) // 2] if rates else None,
            "tokens_per_chunk": sum(r["tokens"] for r in results) / max(sum(r["chunks"] for r in results), 1)}
     Path(args.out).write_text(json.dumps(out, indent=1))
     print(f"{len(results)} prompts, wall {wall:.1f} s, decode p50 {out['ms_per_token_p50']} ms/token, "
-          f"{out['tokens_per_chunk']:.2f} tokens/chunk")
+          f"{out['tokens_per_chunk']:.2f} tokens/chunk"
+          + (f", sampled {sum(1 for x in sampled if 'texts' in x)}/{len(sampled)} answered, "
+             f"{sum(1 for x in sampled if x.get('distinct'))} distinct" if sampled else ""))
     return 0
 
 
@@ -121,6 +134,8 @@ def main(argv=None) -> int:
     s.add_argument("--tokenizer", required=True, help="the served checkpoint's HF id")
     s.add_argument("--concurrency", type=int, default=1)
     s.add_argument("--timeout", type=float, default=600)
+    s.add_argument("--sampled", type=int, default=0,
+                   help="also send this many prompts twice at temperature 0.7, top-p 0.95 (64 tokens)")
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")
