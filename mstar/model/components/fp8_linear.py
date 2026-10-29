@@ -3,9 +3,10 @@ quantised per token on the fly, the product on the platform's fp8 GEMM
 (``mstar::fp8_rowwise_mm``).
 
 A model opts in per deployment config (``linear_dtype: fp8``) for the linears
-it declares eligible, as fnmatch patterns over module names: the GEMMs over
-the token stream, never the small modulation, embedding or output
-projections. ``apply_linear_dtype`` swaps those modules once at load (after
+it declares eligible, as module-name patterns: the GEMMs over the token stream,
+never the small modulation, embedding or output projections. A config can keep
+some of those in bf16 too (``fp8_keep_bf16``), the ones the output is most
+sensitive to. ``apply_linear_dtype`` swaps the rest once at load (after
 any LoRA merge, before compile), so the compiled forward sees the per-token
 quantisation as plain torch and fuses it into the producer of the
 activations, usually the modulated norm, with no extra pass over the hidden
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import re
 from collections.abc import Sequence
 
 import torch
@@ -75,20 +77,42 @@ class Fp8Linear(nn.Module):
         return f"in_features={self.in_features}, out_features={self.out_features}, dtype={self.weight.dtype}"
 
 
+_RANGE = re.compile(r"(\d+)-(\d+)")
+
+
+def matches(name: str, pattern: str) -> bool:
+    """Whether a dotted module name matches ``pattern`` segment by segment: each pattern segment
+    is an fnmatch pattern for one name segment (``*`` never spans a dot) or an inclusive index
+    range, so ``single_blocks.0-3.*`` names the first four single blocks' linears."""
+    parts, pats = name.split("."), pattern.split(".")
+    if len(parts) != len(pats):
+        return False
+    for part, pat in zip(parts, pats, strict=True):
+        span = _RANGE.fullmatch(pat)
+        if span is not None:
+            if not part.isdigit() or not int(span.group(1)) <= int(part) <= int(span.group(2)):
+                return False
+        elif not fnmatch.fnmatchcase(part, pat):
+            return False
+    return True
+
+
 def _fits(linear: nn.Module) -> bool:
     out_features, in_features = linear.weight.shape
     return out_features % _ALIGN == 0 and in_features % _ALIGN == 0
 
 
-def quantize_linears(module: nn.Module, patterns: Sequence[str], fp8_dtype: torch.dtype) -> list[str]:
+def quantize_linears(
+    module: nn.Module, patterns: Sequence[str], fp8_dtype: torch.dtype, keep: Sequence[str] = (),
+) -> list[str]:
     """Replace every ``nn.Linear`` / ``FusedColumnLinear`` under ``module`` whose name matches
-    one of ``patterns`` with an ``Fp8Linear``; returns the names replaced. A match whose
-    dimensions the GEMM cannot take keeps its weights."""
+    one of ``patterns`` and none of ``keep`` with an ``Fp8Linear``; returns the names replaced.
+    A match whose dimensions the GEMM cannot take keeps its weights."""
     replaced = []
     for name, child in list(module.named_modules()):
         if not isinstance(child, (nn.Linear, FusedColumnLinear)):
             continue
-        if not any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+        if not any(matches(name, p) for p in patterns) or any(matches(name, k) for k in keep):
             continue
         if not _fits(child):
             logger.info("%s stays %s: %s is not a multiple of %d", name, child.weight.dtype,
@@ -116,19 +140,26 @@ def check_linear_dtype(linear_dtype: str) -> str:
     return linear_dtype
 
 
-def apply_linear_dtype(module: nn.Module, linear_dtype: str, patterns: Sequence[str], what: str) -> list[str]:
+def apply_linear_dtype(
+    module: nn.Module, linear_dtype: str, patterns: Sequence[str], what: str, keep: Sequence[str] = (),
+) -> list[str]:
     """Serve ``module``'s linears matching ``patterns`` in ``linear_dtype`` (a model config's
-    ``linear_dtype``). ``bf16`` keeps the checkpoint's weights. ``fp8`` quantises them where
-    the platform has an fp8 GEMM and keeps them otherwise, with a warning, so one config
-    serves on every GPU. Returns the names quantised."""
+    ``linear_dtype``), except those matching ``keep`` (its ``fp8_keep_bf16``). ``bf16`` keeps the
+    checkpoint's weights. ``fp8`` quantises them where the platform has an fp8 GEMM and keeps them
+    otherwise, with a warning, so one config serves on every GPU. Returns the names quantised."""
     if check_linear_dtype(linear_dtype) == "bf16":
         return []
+    eligible = [n for n, _ in module.named_modules() if any(matches(n, p) for p in patterns)]
+    unused = [k for k in keep if not any(matches(n, k) for n in eligible)]
+    if unused:
+        raise ValueError(f"{what}: fp8_keep_bf16 entries {unused} name none of its fp8-eligible linears")
     reason = fp8_unavailable_reason()
     if reason is not None:
         logger.warning("%s: linear_dtype fp8 requested, but %s; its linears stay bf16", what, reason)
         return []
-    replaced = quantize_linears(module, patterns, current_platform.fp8_dtype())
+    replaced = quantize_linears(module, patterns, current_platform.fp8_dtype(), keep)
     if not replaced:
         raise ValueError(f"{what}: linear_dtype fp8 matched no linear (patterns {list(patterns)})")
-    logger.info("%s: %d linears run fp8 (%s)", what, len(replaced), current_platform.fp8_dtype())
+    logger.info("%s: %d linears run fp8 (%s), %d of the eligible kept bf16", what, len(replaced),
+                current_platform.fp8_dtype(), len(eligible) - len(replaced))
     return replaced
