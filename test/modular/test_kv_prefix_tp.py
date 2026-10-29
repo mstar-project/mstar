@@ -238,6 +238,39 @@ def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike():
     assert _pages(leader, "big") == _pages(follower, "big"), "one rank kept pages the other evicted"
 
 
+def test_ranks_evict_alike_when_a_lease_straddles_a_commit_that_files_under_a_page_only_the_index_holds():
+    ranks = leader, follower = _manager(0, max_num_pages=12), _manager(1, max_num_pages=12)
+    x = _tokens(2 * PAGE_SIZE + 1, seed=40)
+    z, h = (x[:2 * PAGE_SIZE] + _tokens(n, seed=s) for n, s in ((PAGE_SIZE + 3, 41), (3, 42)))
+    steps = {}
+    for kv in ranks:
+        for rid, tokens in (("x", x), ("z", z), ("h", h)):
+            _ingest(kv, rid, tokens)
+        # x and z prefill in one step, so z finds nothing cached and loses x's keys at commit
+        steps[kv] = (_step(kv, "x", len(x)), _step(kv, "z", len(z)))
+        kv.commit(steps[kv][0], _ctx("x"))
+        kv.remove_request("x")
+    head = _send(leader, "h")  # rank 0 leases x's pages before z commits, the follower adopts after
+    head.speculative, head.spec_from_seq = True, 4
+    for kv in ranks:
+        kv.commit(steps[kv][1], _ctx("z"))
+    worker = _follower_worker(follower)
+    worker.scheduler.register_tp_follow(head)
+    assert worker.scheduler.settle_tp_follow_delta(caught_up=True)
+    worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
+    _abandon(leader, "h")
+    for kv in ranks:
+        kv.remove_request("z")
+        kv.remove_request("h")
+
+    big = _tokens(9 * PAGE_SIZE, seed=43)
+    for kv in ranks:
+        _ingest(kv, "big", big)
+        _run(kv, "big", big)
+
+    assert _pages(leader, "big") == _pages(follower, "big"), "the ranks linked z's page differently and evicted apart"
+
+
 def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
     ranks = leader, follower = _manager(0), _manager(1)
     for kv in ranks:

@@ -548,6 +548,7 @@ class Engine:
                             spec.nodes, relevant_nodes
                         )
                     ),
+                    nodes=frozenset(relevant_nodes),
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
@@ -2340,6 +2341,13 @@ class Engine:
             graph_walk=request_info.graph_walk,
             published=request_info.resource_publish_info,
         )
+
+    def admit_waiting(
+        self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
+    ) -> list[tuple[str, str]]:
+        """The (node, rid) pairs admitted since `check_ready` answered them ``queued``; see
+        `Admission.admit_waiting`."""
+        return self._runner.admit_waiting(published_of)
 
     def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:
         """Lease the slot this batch will replay on, before it is dispatched.

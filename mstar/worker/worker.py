@@ -3041,8 +3041,18 @@ class Worker:
         laps.lap("backlog_check")
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
-        # assumes that.
-        candidates = [r for r in walk_rids if not self._is_tearing_down(r)]
+        # assumes that. A rid is also filtered when the target node isn't ready
+        # to run it, since the target's admit would otherwise skip the readiness
+        # check. The teardown filter comes first, since the readiness check would
+        # queue a torn-down rid or reload its pages.
+        partition = None if speculating_same_node else self.request_state.get_partition_for_node(spec_node_name)
+        candidates = [
+            r for r in walk_rids
+            if not self._is_tearing_down(r)
+            and (speculating_same_node or self.scheduler._check_ready(
+                spec_node_name, r, self.request_state.get_fwd_info(r, partition),
+            ))
+        ]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []

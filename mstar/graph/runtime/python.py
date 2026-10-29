@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 
-from mstar.api_server.request_types import APIServerMessage, ResultTensors
+from mstar.api_server.request_types import APIServerMessage, ResultTensors, ResultTokens
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -89,6 +89,8 @@ class CompletionState:
     rid_walk: dict[int, str]
     # rid -> the node's loop context before the completion advanced it
     nested_loop_indices: dict[int, NestedLoopIndices]
+    # (rid, signal, modality, value) of each emit that rides inline
+    emit_inline: list[tuple[int, str, str, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -119,6 +121,8 @@ class PythonGraphRuntime(GraphRuntime):
     against. Everything below is today's behavior behind the new contract; no
     new semantics belong here.
     """
+
+    supports_inline_emit = True
 
     def __init__(
         self,
@@ -1343,6 +1347,10 @@ class PythonGraphRuntime(GraphRuntime):
         new_token_idxs: list[int] = []
         streaming_by_signal: dict[str, ParallelList[int, int]] = {}
         staged: set[int] = set()
+        # This signal's emit edge carries its value inline, with no staging and
+        # no per-request frame. A persisted one keeps the tensor for the conductor.
+        inline_on = input.inline_signal is not None and len(input.inline_values) == len(rids)
+        emit_inline: list[tuple[int, str, str, int]] = []
 
         cursor = 0
         for i, (rid, wg_id) in enumerate(zip(rids, wg_ids, strict=True)):
@@ -1381,6 +1389,14 @@ class PythonGraphRuntime(GraphRuntime):
                 graph_walk=walk,
             )
             routing_per_rid[rid] = routing
+            if inline_on and routing.emit_to_client:
+                tensor_emits = []
+                for edge in routing.emit_to_client:
+                    if edge.name == input.inline_signal and not edge.persist:
+                        emit_inline.append((rid, edge.name, edge.output_modality, input.inline_values[i]))
+                    else:
+                        tensor_emits.append(edge)
+                routing.emit_to_client = tensor_emits
 
             # Even when this batch produced none of them: an accumulated output
             # carries earlier iterations' tensors.
@@ -1463,6 +1479,7 @@ class PythonGraphRuntime(GraphRuntime):
             routing=routing_per_rid,
             nested_loop_indices=nested_idxs,
             rid_walk=rid_walk,
+            emit_inline=emit_inline,
         )
         return RouteOutput(
             completion_id=completion_id,
@@ -1498,6 +1515,9 @@ class PythonGraphRuntime(GraphRuntime):
             else dict(iter(input.resource_publish_info))
         )
         sent_rids: list[int] = []
+
+        # counted before any WORKER_GRAPHS_DONE below reports them
+        result_tokens = self._result_tokens(completion, input.failed_rids)
 
         for rid, routing in completion.routing.items():
             if rid in input.failed_rids:
@@ -1581,7 +1601,29 @@ class PythonGraphRuntime(GraphRuntime):
                     profiling=profiling.get(rid),
                 )
                 sent_rids.append(rid)
+
+        for frame in result_tokens:
+            self._communicator.send("api_server", APIServerMessage(message_type="result_tokens", body=frame))
         return sent_rids
+
+    def _result_tokens(self, completion: CompletionState, failed_rids: frozenset[int]) -> list[ResultTokens]:
+        """The step's inline emits as one RESULT_TOKENS frame per (signal,
+        modality), each chunk counted for the request as a tensor emit is."""
+        frames: dict[tuple[str, str], ResultTokens] = {}
+        for rid, signal, modality, value in completion.emit_inline:
+            if rid not in completion.routing or rid in failed_rids:
+                continue
+            self._request_info[rid].current_output_chunks.append(signal)
+            frame = frames.get((signal, modality))
+            if frame is None:
+                frame = frames[(signal, modality)] = ResultTokens(
+                    request_ids=[], values=[], loop_indices=[],
+                    signal=signal, modality=modality,
+                )
+            frame.request_ids.append(self.get_rid_string(rid))
+            frame.values.append(value)
+            frame.loop_indices.append(completion.nested_loop_indices.get(rid))
+        return list(frames.values())
 
     def _send_input_signals(
         self, rid: int, worker_id: str, edges: list[GraphEdge],
