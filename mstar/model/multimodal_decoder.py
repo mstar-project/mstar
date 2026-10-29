@@ -411,16 +411,22 @@ class MultimodalDecoderModel(Model):
         autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule | None:
         if node_name not in self._submodule_cache:
+            # the weights' dtype, and the fused kernel's: they must agree
+            dtype = autocast_dtype or torch.bfloat16
             self._submodule_cache[node_name] = self._create_submodule(
-                node_name, device, autocast_dtype, tp_group,
+                node_name, device, dtype, tp_group,
             )
+            if tp_group is not None and tp_group.world_size > 1:
+                # the LLM's norms reduce its row-parallel partial sums in one
+                # fused kernel; collective, and every rank builds the node here
+                tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         return self._submodule_cache[node_name]
 
     def _create_submodule(
-        self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
-        """The node's submodule with its weights loaded, or None for a node
-        this model does not run."""
+        """The node's submodule with its weights loaded in ``dtype``, or None
+        for a node this model does not run."""
         raise NotImplementedError
 
     @staticmethod

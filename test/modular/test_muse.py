@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed.linear import RowParallelLinear
 from mstar.model.loader.base import _apply_stacked
 from mstar.model.muse.components.text import (
     GatedQKVParallelLinear,
@@ -280,10 +281,37 @@ def _reference_logits(model: MuseGlimmerForCausalLM, ids: torch.Tensor, cfg: Mus
     return cfg.final_logit_softcapping * torch.tanh(logits.float() / cfg.final_logit_softcapping)
 
 
-def test_the_text_stack_matches_the_reference_layer(ckpt_dir):
+class _SumOfOneGroup(CommGroup):
+    """Two ranks whose partial sums are this one's and zeros: the reduce is the
+    identity, and each call is counted, the norm-fused ones apart."""
+
+    def __init__(self):
+        super().__init__(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+        self.reduces = 0
+        self.norm_reduces = 0
+
+    def all_reduce(self, input_):
+        self.reduces += 1
+        return input_
+
+    def allreduce_rmsnorm(self, *args, **kwargs):
+        self.norm_reduces += 1
+        return super().allreduce_rmsnorm(*args, **kwargs)
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_the_text_stack_matches_the_reference_layer(ckpt_dir, tp):
     torch.manual_seed(0)
     cfg = MuseGlimmerConfig.from_hf(ckpt_dir)
     model = MuseGlimmerForCausalLM(cfg).double()
+    group = _SumOfOneGroup() if tp == 2 else None
+    if group is not None:
+        # every reduce goes through the group: the post-norms' and any the
+        # row-parallel projections would make themselves
+        model.model.comm_group = group
+        for m in model.modules():
+            if isinstance(m, RowParallelLinear):
+                m.comm_group, m.tp_size = group, group.world_size
     for p in model.parameters():
         torch.nn.init.normal_(p, std=0.2)
     resources = {
@@ -303,6 +331,9 @@ def test_the_text_stack_matches_the_reference_layer(ckpt_dir):
     ref = _reference_logits(model, ids, cfg)
     # the norms compute in fp32 on both sides; the rest is fp64
     assert torch.allclose(ours, ref, atol=1e-4, rtol=1e-4), (ours - ref).abs().max()
+    if group is not None:
+        # once a projection: in its post-norm, not also in the linear
+        assert group.norm_reduces == group.reduces == 2 * cfg.num_hidden_layers
 
 
 # --- vision index helpers ----------------------------------------------------------

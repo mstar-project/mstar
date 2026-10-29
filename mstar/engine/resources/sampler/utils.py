@@ -407,24 +407,28 @@ _SPLIT_CHUNK = 16384
 _SPLIT_MAX_BLOCK = 8192
 
 
-def _split_count(batch: int, vocab: int, device: torch.device) -> int:
-    """How many chunks to cut the vocab into.
+def _split_layout(batch: int, vocab: int, device: torch.device) -> tuple[int, int]:
+    """``(nsplit, chunk)``: how many chunks to cut the vocab into, and their width.
 
     The vocab's call alone: any vocab wider than one chunk splits, so for real
     LLM vocabularies the fused kernel is only reached from tests. ``batch`` is
-    accepted for a future rule.
+    accepted for a future rule. 16-aligned chunk starts let the loads vectorize
+    when the vocab (the row stride) is a multiple of 16 too, as Triton
+    specializes ints divisible by 16: an odd chunk (vocab 202,048 in 13 splits)
+    made the prep 3.8x slower.
     """
     del batch, device
-    return max(1, -(-vocab // _SPLIT_CHUNK))
+    nsplit = max(1, triton.cdiv(vocab, _SPLIT_CHUNK))
+    chunk = triton.cdiv(triton.cdiv(vocab, nsplit), 16) * 16
+    return triton.cdiv(vocab, chunk), chunk
 
 
 def _split_v_softmax(
-    logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
+    logits, temperature, pen_ptr, mask_ptr, probs, nsplit, chunk,
     apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
 ):
     """The three-kernel path; see the kernels above for why."""
     B, V = logits.shape
-    chunk = -(-V // nsplit)
     # sized to the chunk: a small block makes a long chunk many serial iterations
     block = min(_SPLIT_MAX_BLOCK, triton.next_power_of_2(chunk))
     hist_args, hist_flags = hist
@@ -510,10 +514,10 @@ def fused_temperature_softmax(
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
     hist = _history_kernel_args(history, logits)
 
-    nsplit = _split_count(B, V, logits.device)
+    nsplit, chunk = _split_layout(B, V, logits.device)
     if nsplit > 1:
         _split_v_softmax(
-            logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
+            logits, temperature, pen_ptr, mask_ptr, probs, nsplit, chunk,
             apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
         )
         return probs
