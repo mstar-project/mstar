@@ -1317,10 +1317,24 @@ rotary positions (``num_frames`` up to 4,093), and height and width are at most
 16,384, the largest side the mp4 encoder (libx264) opens. Each is a 400 naming
 the limit.
 
+**The denoise loop.** The ``dit`` node runs on the DiT scaffold
+(``dit_loop: scaffold``, the default): requests at the same shape (latent grid,
+CFG on or off, T2V or I2V) batch, up to ``max_batch_size`` (default 2), at any mix
+of steps, and every shape in ``compile_dit_sizes`` is compiled and captured as an
+accelerator graph at startup for T2V and I2V with CFG, at each of
+``capture_batch_sizes`` (default ``[1, 2]``; ``accelerator_graph: false`` runs the
+same loop uncaptured). The UniPC update runs in a coefficient form, its per-step
+branches folded into per-row weights staged with the request's schedule, which
+matches the reference solver to float32 rounding. ``dit_loop: legacy`` keeps the
+one-request loop the reference-equivalence tests pin bit-exact (uncaptured,
+unbatched).
+
 **Compiled DiT shapes.** With ``compile_dit`` the DiT compiles one graph per
 input shape, so only the ``"WxHxF"`` shapes in ``compile_dit_sizes`` (default
-``1280x704x81``) use the compiled transformer; each compiles on first use, once
-with CFG and once without, so at most two compiles per listed shape. Any other
+``1280x704x81``; ``configs/wan22.yaml`` adds ``832x480x33``) use the compiled
+transformer. The scaffold loop compiles them at startup, once per captured batch
+size; the legacy loop compiles each on first use, once with CFG and once without,
+so at most two compiles per listed shape. Any other
 size or frame count runs the same transformer eager, with no compile, which is
 slower per request once warm: on an H200, about 49% more at 640x352x17 and 55%
 more at 832x480x33 than the same shape compiled. List the shapes a deployment
@@ -1337,10 +1351,12 @@ Requests are therefore independent and the loop is resumable across ranks.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,
-channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
-yaml's ``model_kwargs`` for stock ``vae.decode``). Both compile on first use:
-the DiT only for the ``compile_dit_sizes`` shapes (see Compiled DiT shapes), so
-the first request at a listed shape is slower. The VAE decode compiles once per resolution, and only
+compiled (``vae_decode_fast``; set it to ``false`` under the yaml's
+``model_kwargs`` for stock ``vae.decode``), channels-last on NVIDIA GPUs and in
+the default layout on AMD GPUs, where MIOpen's channels-last conv3d is about 2x
+slower. The DiT compiles at startup (the legacy loop: on first use) for the
+``compile_dit_sizes`` shapes (see Compiled DiT shapes). The VAE decode compiles on
+first use, once per resolution, and only
 for the sizes in ``vae_decode_fast_sizes`` (default ``1280x704``); any other
 size decodes with stock ``vae.decode``, frames identical to
 ``vae_decode_fast: false``. The compile uses Inductor's deterministic mode, so
@@ -1349,8 +1365,7 @@ has no such mode, and there two processes can differ by a few uint8 levels.
 The VAE decode
 tiles only when free VRAM at decode time is short of the untiled estimate
 (the ``auto`` policy; ``WAN22_VAE_DECODE_TILING`` forces a path), which keeps the untiled conv3d from OOMing a
-32 GiB card. No CUDA-graph capture, no continuous batching (one request per
-step) and no component offload.
+32 GiB card. No component offload.
 
 LTX-2.5 (``ltx2_5``)
 --------------------
