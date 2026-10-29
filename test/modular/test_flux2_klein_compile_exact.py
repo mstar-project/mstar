@@ -1,6 +1,6 @@
 """``exclude_from_compile`` / ``compile_exact_ops``: norms and activations stay on the eager kernels
-inside a compiled transformer, the excluded modules compute exactly what they did before, and the
-knob reaches both denoise nodes."""
+inside a compiled transformer, the excluded modules compute exactly what they did before, the
+setting reaches both denoise nodes, and the ``dit_exact_ops`` knob (off on AMD GPUs) drops it."""
 
 from __future__ import annotations
 
@@ -8,10 +8,16 @@ import pytest
 import torch
 from torch import nn
 
-from mstar.model.components.diffusion.compile_utils import EXACT_OP_TYPES, exact_op_types, exclude_from_compile
+from mstar.model.components.diffusion.compile_utils import (
+    EXACT_OP_TYPES,
+    compile_transformer_forward,
+    exact_op_types,
+    exclude_from_compile,
+)
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
 from mstar.model.flux2_klein.config import Flux2TransformerConfig
 from mstar.model.z_image.components.transformer import ScaledRMSNorm
+from mstar.utils import knobs
 
 TINY = Flux2TransformerConfig(
     in_channels=8, out_channels=8, num_layers=1, num_single_layers=2, attention_head_dim=8,
@@ -91,3 +97,43 @@ def test_knob_reaches_both_models():
     assert Flux2KleinModel(model_path_hf="x", compile_exact_ops=["norms"]).compile_exact_ops == ["norms"]
     assert Flux2KleinModel(model_path_hf="x").compile_exact_ops is False
     assert ZImageModel(model_path_hf="x").compile_exact_ops is False
+
+
+def _disabled(module: nn.Module) -> int:
+    return sum(bool(getattr(m.forward, "_torchdynamo_disable", False)) for m in module.modules())
+
+
+@pytest.fixture
+def no_knob_overrides(monkeypatch):
+    monkeypatch.delenv("MSTAR_DIT_EXACT_OPS", raising=False)
+    knobs.configure(None)
+    yield monkeypatch
+    knobs.configure(None)
+
+
+def test_dit_exact_ops_knob_on_keeps_the_configured_modules_eager(no_knob_overrides):
+    dit = Flux2DiT(TINY)
+    norms = exclude_from_compile(Flux2DiT(TINY), exact_op_types(["norms"]))
+    compile_transformer_forward(dit, exact_ops=["norms"])  # lazy: nothing is traced until a call
+    assert _disabled(dit) == norms > 0
+
+
+def test_rocm_compiles_the_exact_ops_unless_a_config_or_env_asks(no_knob_overrides):
+    from mstar import platforms
+    from mstar.platforms import RocmPlatform
+
+    rocm = RocmPlatform()
+    no_knob_overrides.setattr(platforms, "resolve_platform", lambda: rocm)
+    knobs.configure(None)
+    dit = Flux2DiT(TINY)
+    compile_transformer_forward(dit, exact_ops=["norms"])
+    assert _disabled(dit) == 0
+    knobs.configure({"dit_exact_ops": True})
+    dit = Flux2DiT(TINY)
+    compile_transformer_forward(dit, exact_ops=["norms"])
+    assert _disabled(dit) > 0, "the deployment config wins over the platform"
+    knobs.configure(None)
+    no_knob_overrides.setenv("MSTAR_DIT_EXACT_OPS", "1")
+    dit = Flux2DiT(TINY)
+    compile_transformer_forward(dit, exact_ops=True)
+    assert _disabled(dit) == len(_excluded(Flux2DiT(TINY))), "and an exported variable wins too"

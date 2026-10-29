@@ -262,7 +262,16 @@ class RocmPlatform(Platform):
         # Step threads stay on the process mask: on MI325X the pin gains no
         # tok/s at c=1 or c=64, raises 0.8B c=64 TTFT (57.5 -> 62.2 ms) and
         # graph-replay launch p95 (0.34-0.47 -> 1.3-3.3 ms).
-        return {"ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1", "step_thread_core": "off"}
+        #
+        # A DiT's eager norms (compile_exact_ops) exist to match cuBLAS/cuDNN
+        # reference output bit for bit. hipBLASLt picks GEMM kernels per M, so
+        # that match does not hold here and the bar is the reference's own
+        # cross-seed spread; the eager norms only cost fusion (one graph break
+        # each, 137 on FLUX.2 klein 9B).
+        return {
+            "ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1", "step_thread_core": "off",
+            "dit_exact_ops": "0",
+        }
 
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
