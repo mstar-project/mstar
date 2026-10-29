@@ -467,8 +467,7 @@ then run every node's steps in one order. The conductor refuses lockstep nodes o
 in different TP or SP groups, and two lockstep nodes on one worker that share a KV resource:
 rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
 per node, riding on one node's next step, so two nodes on one pool could admit out of step on
-a follower. Journaling a shared pool across lockstep nodes in one stream belongs with the
-journal rework of mstar PR #873, and until then this layout is refused: place these nodes on
+a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on
 different workers.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its

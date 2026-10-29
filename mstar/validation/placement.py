@@ -334,10 +334,10 @@ def _worker_parallelism(
     same groups the conductor hands it: every lockstep-parallel node on a
     worker in the same TP and SP groups (one lockstep instance), every
     resource spec's nodes on one TP x SP shape and, on each worker, in one
-    parallel group, and no KV resource under two lockstep nodes of a worker.
-    Over every node placed on the worker; the engine checked only nodes it
-    built a submodule for, so a dummy run (no weights) skipped the resource
-    checks."""
+    parallel group, and no resource that journals resident moves under two
+    lockstep nodes of a worker. Over every node placed on the worker; the
+    engine checked only nodes it built a submodule for, so a dummy run (no
+    weights) skipped the resource checks."""
     ranks = sorted({rank for wg in worker_graphs for rank in wg.ranks})
     if not ranks:
         return
@@ -377,7 +377,7 @@ def _worker_parallelism(
         if not groups.all_in_same_group(parallel_nodes):
             placed = "; ".join(_placement(groups, node) for node in parallel_nodes)
             yield (
-                f"Lockstep-parallel nodes on {wid} are in different lockstep instances: "
+                f"Lockstep-parallel nodes on {wid} are not in the same TP and SP groups: "
                 f"{placed}. A worker's lockstep nodes must share one instance: the same "
                 "TP and SP groups, of the same ranks in the same order."
             )
@@ -392,6 +392,7 @@ def _worker_parallelism(
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same TP x SP shape across replicas"
             )
+        shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes
             if local and not per_worker[wid].all_in_same_group(sorted(local)):
@@ -399,20 +400,20 @@ def _worker_parallelism(
                     f"Resource spec {spec.resource_key} local nodes {sorted(local)} "
                     f"on {wid} must all be in the same parallel (tp x sp) group"
                 )
-            # Rank 0's resident journal is per node, so a page move on a pool reaches
-            # a follower only with one node's next step. Refused at any offload
-            # setting until rank 0 journals a shared pool's moves in one stream.
-            lockstep = sorted(
+            lockstep = tuple(sorted(
                 node for node in local
                 if per_worker[wid].get_instance_world_size_for_node(node) > 1
-            )
+            ))
             if spec.journals_resident_moves and len(lockstep) > 1:
-                yield (
-                    f"KV resource {spec.resource_key} is shared by lockstep-parallel nodes "
-                    f"{lockstep} on {wid}. Rank 0 replicates the page moves it makes on a pool "
-                    "(host offloads and reloads, for example) to the other ranks per node, riding "
-                    "on one node's next step, so two lockstep nodes on one pool could admit out of "
-                    "step on a follower. Journaling a shared pool across lockstep nodes in one "
-                    "stream belongs with the journal rework of mstar PR #873, and until then this "
-                    "layout is refused: place these nodes on different workers."
-                )
+                shared.setdefault(lockstep, []).append(wid)
+        # Rank 0's resident journal is per node, so a move on a shared pool reaches a
+        # follower only with one node's next step. Separate pools are safe: each
+        # node's moves ride on its own next step. Refused at any offload setting
+        # until rank 0 journals a shared pool's moves in one stream.
+        for lockstep, wids in shared.items():
+            yield (
+                f"Resource {spec.resource_key} is shared by lockstep-parallel nodes "
+                f"{list(lockstep)} on {', '.join(wids)}; rank 0 replays its moves on the pool "
+                "to the other ranks per node, so a shared pool can admit out of step. "
+                "Place these nodes on different workers."
+            )

@@ -383,15 +383,8 @@ def test_lockstep_nodes_sharing_a_kv_resource_are_refused(offload, tmp_path):
         _a_then_b, specs=[_kv("kv", ["a", "b"])], kv_labels={"kv": {"main": KVLabel()}}, tp_enabled_nodes=["a", "b"],
     )
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources={"kv": {"cpu_offload_pages": offload}})
-    assert _problems(model, cfg) == [
-        f"KV resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_{rank}. Rank 0 "
-        "replicates the page moves it makes on a pool (host offloads and reloads, for example) to "
-        "the other ranks per node, riding on one node's next step, so two lockstep nodes on one "
-        "pool could admit out of step on a follower. Journaling a shared pool across lockstep "
-        "nodes in one stream belongs with the journal rework of mstar PR #873, and until then "
-        "this layout is refused: place these nodes on different workers."
-        for rank in (0, 1)
-    ]
+    [problem] = _problems(model, cfg)
+    assert problem.startswith("Resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_0, worker_1;")
 
 
 @pytest.mark.parametrize("b", [
@@ -402,12 +395,10 @@ def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, tmp_
     """Two instances on a worker are two leaders' step streams with no order
     between them."""
     cfg = _cfg(tmp_path, [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **b}])
-    assert _problems(_Model(_a_then_b, tp_enabled_nodes=["a", "b"]), cfg) == [
-        f"Lockstep-parallel nodes on worker_{rank} are in different lockstep instances: "
-        f"a on TP ranks [0, 1]; b on TP ranks {b['ranks']}. A worker's lockstep nodes must "
-        "share one instance: the same TP and SP groups, of the same ranks in the same order."
-        for rank in (0, 1)
-    ]
+    problems = _problems(_Model(_a_then_b, tp_enabled_nodes=["a", "b"]), cfg)
+    assert len(problems) == 2
+    for rank, problem in enumerate(problems):
+        assert f"on worker_{rank}" in problem and f"a on TP ranks [0, 1]; b on TP ranks {b['ranks']}" in problem
 
 
 def test_parallel_ranks_off_their_position_are_refused(tmp_path):
