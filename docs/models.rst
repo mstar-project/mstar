@@ -1477,8 +1477,9 @@ implementation on GH200 and H100 GPUs:
   medians of three rounds in one container, a fresh server per run), M*
   delivered 3.9 seconds of audio per second at one request, 11.4 at four and
   30 at 32. With the graphs off it delivered 1.7, 5.8 and 23; with the graphs
-  off and the depformer running all 16 steps, 1.3, 4.2 and 19. Greedy output
-  was byte-identical across the three. The eager step is bound by CPU overhead
+  off and the depformer running all 16 steps, 1.3, 4.2 and 19. At one
+  request, all 90 greedy responses across the three were byte-identical.
+  The eager step is bound by CPU overhead
   (``benchmark/worker_phases``), so speed also varies between hosts: another
   H100 run gave 3.4 seconds of audio per second at one request and 25 at 32.
   Streaming the audio costs an estimated 0 to 8% of throughput, more at higher
