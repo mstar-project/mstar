@@ -976,9 +976,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if self.device == "cpu":
             # A CPU consumer owns a copy past reclaim. clone() would split it
             # over torch's intra-op pool, sized for small ops; copy_into is one
-            # memcpy for those and a few threads of its own for a video.
+            # memcpy for those and a few threads of its own for a video. The
+            # destination is torch's: numpy madvises large arrays for huge pages,
+            # and with THP defrag=madvise their faults can stall in compaction.
             src = np.frombuffer(view, dtype=np.uint8, count=info.nbytes, offset=start)
-            flat = torch.from_numpy(copy_into(np.empty_like(src), src))
+            flat = torch.empty(info.nbytes, dtype=torch.uint8)
+            copy_into(flat.numpy(), src)
             return flat.view(info.dtype).reshape(info.dims)
         flat = torch.frombuffer(
             view[start:start + info.nbytes], dtype=torch.uint8)

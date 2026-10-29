@@ -38,7 +38,11 @@ def _copy_pool() -> tuple[ThreadPoolExecutor, int]:
 
 def copy_into(dst: np.ndarray, src: np.ndarray) -> np.ndarray:
     """``dst[...] = src``, in slices along the first axis on the copy pool once
-    ``dst`` is at least ``PARALLEL_COPY_BYTES``. Returns ``dst``."""
+    ``dst`` is at least ``PARALLEL_COPY_BYTES``. Returns ``dst``.
+
+    Give it a destination torch allocated (``torch.empty(...).numpy()``), not
+    ``np.empty``: numpy madvises large arrays for huge pages, and under THP
+    ``defrag=madvise`` their first-touch faults can stall in compaction."""
     if dst.shape != src.shape:
         raise ValueError(f"copy_into: shape {src.shape} into {dst.shape}")
     parts = 1
