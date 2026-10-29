@@ -131,6 +131,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [Cosmos3 Policy DROID](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID) | Robot policy | text, image, video → robot actions, video | `/generate`, `/v1/images/generations`, `/v1/videos/generations` |
 | [Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) | 480p world model + VLM | text, image, video → image, video (streamed windows), robot actions, text | `/v1/chat/completions`, `/v1/images/generations`, `/v1/videos/generations`, `/generate`, `/generate/ws` |
 | [Pi0.5](https://huggingface.co/lerobot/pi05_base) | Vision-language-action | text, image, state → robot actions | `/generate` |
+| [GR00T N1.7](https://huggingface.co/nvidia/GR00T-N1.7-3B) | Vision-language-action | text, camera frames, state → robot actions (named joint groups; backbone config from the gated Cosmos-Reason2-2B) | `/generate` |
 | [V-JEPA 2 / 2-AC](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256) | World model | video (+ actions) → latents, rollouts | `/generate` |
 | [Waypoint-1.5](https://huggingface.co/Overworld/Waypoint-1.5-1B) | Interactive world model | controller input (mouse, buttons, scroll) → live video frames | `/generate` |
 | [LingBot-World-V2 1.3B](https://huggingface.co/robbyant/lingbot-world-v2-1.3b-causal-fast) | Interactive world model | text, image, camera trajectory → video (streamed chunks; weights CC-BY-NC-SA-4.0) | `/generate` |

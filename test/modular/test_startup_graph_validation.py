@@ -759,6 +759,38 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
     return model
 
 
+def _gr00t_n17(name, model_kwargs, tmp_path, monkeypatch):
+    """``__init__`` reads the checkpoint's config and the backbone repo's processor (Hub access); the
+    graph reads only the attention geometry (the checkpoint's, here) and the widest camera
+    layout (3 views x 2 steps), so both reads are stubbed and the shipped capture settings
+    still go through ``__init__``."""
+    from mstar.model.gr00t_n17.config import Gr00tN17Config, Gr00tN17StackConfig, Gr00tN17TextConfig
+    from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
+    from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
+    config = Gr00tN17Config(
+        text=Gr00tN17TextConfig(
+            hidden_size=2048, intermediate_size=6144, num_attention_heads=16, num_key_value_heads=8,
+            head_dim=128, num_hidden_layers=16, rms_norm_eps=1e-6, rope_theta=5000000,
+            vocab_size=151936, mrope_section=(24, 20, 20), mrope_interleaved=True,
+            image_token_id=151655, vision_start_token_id=151652,
+        ),
+        vision=Qwen3_5VisionConfig(
+            depth=24, hidden_size=1024, intermediate_size=4096, num_heads=16, in_channels=3,
+            patch_size=16, temporal_patch_size=2, spatial_merge_size=2,
+            num_position_embeddings=2304, out_hidden_size=2048,
+        ),
+        dit=Gr00tN17StackConfig(num_layers=32, num_attention_heads=32, attention_head_dim=48, output_dim=1024),
+        bridge=Gr00tN17StackConfig(num_layers=4, num_attention_heads=32, attention_head_dim=64),
+        deepstack_visual_indexes=(5, 11, 17), backbone_embedding_dim=2048,
+    )
+    processor = types.SimpleNamespace(
+        video_keys={"robot": ["a", "b", "c"]}, video_steps={"robot": 2}, embodiment_ids={"robot": 0},
+    )
+    monkeypatch.setattr(Gr00tN17Config, "from_hf", lambda *args: config)
+    monkeypatch.setattr(Gr00tN17Preprocessor, "from_pretrained", lambda *args, **kwargs: processor)
+    return _constructed(name, model_kwargs, model_path_hf=str(tmp_path), backbone_path_hf=str(tmp_path))
+
+
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
@@ -852,6 +884,7 @@ _FACTORIES = {
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
     "Flux2KleinModel": _flux2,
+    "Gr00tN17Model": _gr00t_n17,
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,

@@ -21,6 +21,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
     "glm52": ("mstar.model.glm52.glm52_model", "Glm52Model"),
+    "gr00t_n17": ("mstar.model.gr00t_n17.gr00t_n17_model", "Gr00tN17Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnilingual_asr_ctc_300m": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
@@ -141,6 +142,11 @@ HF_MODELS: dict[str, dict] = {
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
+    # GR00T N1.7: the action head's weights are here, but its backbone *config*
+    # and processor come from `nvidia/Cosmos-Reason2-2B`, which is a **gated**
+    # repo: accept its terms on the Hub first or construction fails. Pass it as
+    # `backbone_path_hf` to use a different one.
+    "gr00t_n17": {"model_path_hf": "nvidia/GR00T-N1.7-3B"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
     # Qwen3-ASR: AuT audio encoder + dense Qwen3 decoder. ``qwen3_asr`` is
     # the 1.7B transcription model, ``qwen3_asr_realtime`` the 0.6B variant

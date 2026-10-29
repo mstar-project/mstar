@@ -51,6 +51,34 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
      - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
        stochastic sampler); TP=2 deployments.
+   * - ``gr00t_n17`` *(Beta)*
+     - ``nvidia/GR00T-N1.7-3B``
+     - Vision-language-action robotics model: a Qwen3-VL backbone cut to 16 layers
+       with DeepStack, and a 32-block flow-matching action head that denoises a
+       40-step action chunk in four steps. One request is a language instruction
+       plus the robot's camera views and its proprioceptive state; the reply is
+       msgpack, one entry per joint group, each with its ``dtype``, ``shape`` and
+       raw ``data``. Request knobs: ``embodiment_tag`` (the checkpoint's own
+       spelling, matched case-insensitively — eight are shipped, and the error
+       lists them), ``state`` as ``{joint_group: float32 (1, 1, D)}`` (one
+       request, one timestep: the checkpoint's ``state_history_length``) with the
+       embodiment's own joint-group names, and ``walk``, which selects one of the
+       two reuse walks (``backbone`` or ``state``) instead of running the full
+       path. A reuse walk answers ``output_modalities=("tensor",)`` with its
+       features (``backbone_features``, ``state_features``) as one msgpack entry
+       laid out like an action group. **Camera frames are attached as images,
+       not passed in ``model_kwargs``**: one lossless image per camera view per
+       timestep, in time-major order over the embodiment's view order — ``(t0,v0)``,
+       ``(t0,v1)``, ``(t1,v0)``, … — so a two-camera robot sends four. The format
+       must be **lossless** (PNG or lossless WebP): the pixels are compared against
+       the reference's bit for bit, so JPEG moves them 167x further than PNG while
+       passing every other check. JPEG is refused; a lossy WebP is not detected
+       (Pillow reports one format for both WebP modes), so send WebP lossless. The
+       backbone's config **and its tokenizer and image
+       processor** come from the **gated** ``nvidia/Cosmos-Reason2-2B``; accept its
+       terms on the Hub first. Needs the ``gr00t_n17`` extra: OpenCV for the
+       ``INTER_AREA`` resize the reference's image transform uses, ``diffusers``
+       for the action head's feed-forward, and the Hugging Face loaders.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet

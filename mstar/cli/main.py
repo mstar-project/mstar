@@ -74,6 +74,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
+    "gr00t_n17": "gr00t_n17.yaml",
 }
 
 # qwen 3.5 series (dense)
@@ -163,6 +164,20 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
         lines.append("                           action_mode=\"policy\", domain_name=\"droid_lerobot\",")
         lines.append("                           raw_action_dim=10, action_chunk_size=16)")
+    if model == "gr00t_n17":
+        # DROID, the smallest shipped embodiment. The frames arrive as one
+        # positional list, so their order is what names each camera.
+        lines.append("    # lossless frames: every view 15 steps back, then every view now")
+        lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
+        lines.append("        images=[\"ext_t-15.png\", \"wrist_t-15.png\", \"ext_t0.png\", \"wrist_t0.png\"],")
+        lines.append("        output_modalities=(\"action\",),")
+        lines.append("        embodiment_tag=\"oxe_droid_relative_eef_relative_joint\",")
+        lines.append("        # eef, grip, joints: plain lists of 9, 1 and 7 floats (.tolist() an array)")
+        lines.append("        state={\"eef_9d\": [[eef]], \"gripper_position\": [[grip]],")
+        lines.append("               \"joint_position\": [[joints]]})")
+        lines.append("    import msgpack, numpy as np")
+        lines.append("    actions = {k: np.frombuffer(g[\"data\"], g[\"dtype\"]).reshape(g[\"shape\"])")
+        lines.append("               for k, g in msgpack.unpackb(res.raw[0][\"bytes\"]).items()}  # (1, 40, D)")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
     if model == "omnivoice":
