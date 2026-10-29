@@ -740,10 +740,18 @@ class LLMSubmodule(ARNodeSubmodule):
         step = engine_inputs.step
         accepted = spec.accept(head(hidden), sample=bool(step is not None and step.cg_key_info))
         ids = accepted.target.reshape(-1)
+        rows = positions.shape[0] // (k + 1)
         for j in range(k):
             spec.begin_draft_pass(j)
-            hidden = self.model.mtp(hidden, lm.embed_tokens(ids), label="main", cos_sin=(cos[j], sin[j]))
-            ids = spec.record_draft(j, head(hidden).argmax(dim=-1))
+            # only each row's last accepted slot is a real query: the head's
+            # work after attention, and the lm_head, run on that row alone, and
+            # the next pass reads its output in every slot
+            out = self.model.mtp(
+                hidden, lm.embed_tokens(ids), label="main", cos_sin=(cos[j], sin[j]),
+                keep=spec.draft_slots(),
+            )
+            ids = spec.record_draft(j, head(out).argmax(dim=-1))
+            hidden = out[:, None, :].expand(rows, k + 1, out.shape[-1]).reshape(rows * (k + 1), -1)
         return accepted
 
     def forward(
