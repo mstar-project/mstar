@@ -1379,19 +1379,29 @@ class PreprocessWorkerThread:
                     )[0]
                 else:
                     data = datas[i]
+                metadata = {} if not logprobs or logprobs[i] is None else {"logprob": logprobs[i]}
+                if self._wants_token_ids(request_id, item.modality):
+                    metadata["token_ids"] = [values[i]]
                 self._queue_completed_output(
                     request_id,
                     sequence,
-                    ResultChunk(
-                        request_id=request_id, modality=item.modality, data=data,
-                        metadata={} if not logprobs or logprobs[i] is None else {"logprob": logprobs[i]},
-                    ),
+                    ResultChunk(request_id=request_id, modality=item.modality, data=data, metadata=metadata),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
                     request_id, exc, f"{item.modality} output postprocessing",
                     sequence=sequence,
                 )
+
+    def _wants_token_ids(self, request_id: str, modality: str) -> bool:
+        """A text chunk of a request that set ``return_token_ids``."""
+        return modality == "text" and bool((self.request_model_kwargs.get(request_id) or {}).get("return_token_ids"))
+
+    def _with_token_ids(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
+        """``metadata`` plus the chunk's sampled ids, stop tokens included."""
+        if not self._wants_token_ids(request_id, modality):
+            return metadata
+        return {**metadata, "token_ids": tensor.reshape(-1).tolist()}
 
     def _queue_completed_output(
         self,
@@ -1456,6 +1466,7 @@ class PreprocessWorkerThread:
             )
 
         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
+        chunk_metadata = self._with_token_ids(request_id, modality, tensor, chunk_metadata)
         # Audio is emitted as headerless 16-bit PCM; surface the
         # model's output sample rate + channel count so clients can
         # wrap it.

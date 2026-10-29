@@ -175,6 +175,19 @@ def test_inline_logprobs_land_in_their_chunks_metadata():
     assert chunks == {"req": {"logprob": -0.5}, "quiet": {}}
 
 
+def test_a_request_that_asks_gets_each_text_chunks_token_ids():
+    worker, stop = _thread()
+    worker.request_model_kwargs = {"req": {"return_token_ids": True}}
+    worker.result_tensor_queue.put(InlineTokens(["req", "other"], [11, 12], "text", [-0.5, None]))
+    chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
+    assert chunks["req"].metadata == {"logprob": -0.5, "token_ids": [11]}
+    assert chunks["other"].metadata == {}
+    # a tensor chunk's ids too, and nothing on a modality that is not text
+    ids = torch.tensor([[5, 151645]])
+    assert worker._with_token_ids("req", "text", ids, {}) == {"token_ids": [5, 151645]}
+    assert worker._with_token_ids("req", "audio", ids, {"sample_rate": 1}) == {"sample_rate": 1}
+
+
 def test_the_facade_accounts_an_inline_token_like_a_tensor():
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.result_tensor_input_queue = queue.Queue()
