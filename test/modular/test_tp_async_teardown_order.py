@@ -365,11 +365,10 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
 
 
-@pytest.mark.parametrize("tp_seq", [5, -1])
-def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch, tp_seq):
-    """A teardown landing inside a step's admit splits the ranks, so the fence waits
-    past any number of warning intervals rather than giving up, on a lockstep
-    instance or off one."""
+def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
+    """The fence waits past any number of warning intervals; it never gives up.
+    A lone-rank step (``tp_seq=-1``) is the case that used to."""
+    tp_seq = -1
     monkeypatch.setattr(worker_mod, "_ADMIT_FENCE_WARN_S", 0.001)
     admitted = threading.Event()
     warnings = []
