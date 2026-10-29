@@ -87,6 +87,13 @@ class LinearAttnSpec(NodeResourceSpec):
         # its state is the pool's
         return True
 
+    def restore_refusal(self) -> str | None:
+        if self.config.variant is not LinearAttnVariant.GDN:
+            return None
+        from mstar.engine.resources.linear_attn.gdn_kernels import snapshot_refusal
+
+        return snapshot_refusal(self.config.backend)
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.linear_attn.base import LinearAttnManager

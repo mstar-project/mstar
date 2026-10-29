@@ -243,10 +243,12 @@ class RecurrentStatePool(Resource):
 
         # Snapshots:
         # `_kv` is the KV cache whose page keys name them, None while they are off.
+        # `_snapshot_refusal` says why a resource over the pool can't write them, which keeps them off.
         # `_snap_meta` maps a filed slot to its key and whether it is a decode snapshot (a reply's),
         # least recently filed or restored first. Eviction takes a reply's first.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
         self._kv: KVManager | None = None
+        self._snapshot_refusal: str | None = None
         first = config.max_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
@@ -759,8 +761,17 @@ class RecurrentStatePool(Resource):
 
     def bind_kv(self, kv: "KVManager") -> None:
         """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names.
-        A pool with no snapshot slots keys none."""
-        self._kv = kv if self.config.prefix_slots else None
+        A pool with no snapshot slots, or one a resource over it can't write, keys none."""
+        self._kv = kv if self.config.prefix_slots and self._snapshot_refusal is None else None
+
+    def refuse_snapshots(self, reason: str) -> None:
+        """A resource over this pool cannot write the snapshots a cached prefix
+        restores (``reason``), so the pool keys none. The engine keeps the node's
+        caches shut with it, from the spec (`NodeResourceSpec.restore_refusal`)."""
+        if self._snapshot_refusal is None and self.config.prefix_slots:
+            logger.info("recurrent state pool %r keeps no prefix snapshots: %s", self._name, reason)
+        self._snapshot_refusal = reason
+        self._kv = None
 
     def close_prefix_cache(self) -> None:
         self._kv = None
