@@ -24,7 +24,6 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import logging
-import threading
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
@@ -117,7 +116,6 @@ class KernelOp:
         self.impl_keys = tuple(impls)
         # key -> why its factory failed, for the last resolution
         self._failures: dict[str, str] = {}
-        self._lock = threading.Lock()
         guarded = {key: self._guard(key, factory) for key, factory in impls.items()}
         default = guarded.pop("default", None)
         self._default_is_reference = default is None and fallback_to_reference
