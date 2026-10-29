@@ -9,7 +9,6 @@ up as pool exhaustion rather than as a scheduling bug.
 """
 
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -17,31 +16,30 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import chunk_loop_name
+from mstar.worker.chunk_loops import ChunkLoops
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
 NODE = "LLM"
 
 
 def _batch(rows, chunk_ranges=None):
-    """``rows`` is rid -> walk."""
-    return SimpleNamespace(
+    """``rows`` is rid -> walk: a combined step if they differ."""
+    walks = set(rows.values())
+    return ScheduledBatch(
         node_name=NODE,
-        batch=SimpleNamespace(
-            request_to_worker_graph=dict.fromkeys(rows, 0),
-            walk_of=rows.get,
-            chunk_ranges=chunk_ranges or {},
-        ),
+        graph_walk=next(iter(walks)) if len(walks) == 1 else "mixed",
+        request_to_worker_graph=dict.fromkeys(rows, 0),
+        request_walks=dict(rows) if len(walks) > 1 else {},
+        chunk_ranges=chunk_ranges or {},
     )
 
 
 def _run(rows, chunk_ranges=None, stops=None, chunkable=("prefill",)):
-    worker = Worker.__new__(Worker)
-    # what the worker precomputes at load from the model's chunking policies
-    worker._chunk_loop_walks = frozenset((NODE, w) for w in chunkable)
+    # what the worker reads off its graphs at load
+    loops = ChunkLoops((NODE, w) for w in chunkable)
     stops = stops if stops is not None else {}
-    mid = Worker._end_finished_chunk_loops(
-        worker, _batch(rows, chunk_ranges), stops,
-    )
+    mid = loops.end_finished(_batch(rows, chunk_ranges), stops)
     return stops, mid
 
 
@@ -153,13 +151,13 @@ def _wg(section):
 
 
 def test_the_worker_finds_its_chunk_loops_in_its_own_graphs():
-    assert Worker._chunk_loops_in([_wg(_wrapped_walk(True))]) == {(NODE, "prefill")}
+    assert ChunkLoops.walks_in([_wg(_wrapped_walk(True))]) == {(NODE, "prefill")}
 
 
 def test_an_unwrapped_walk_contributes_no_chunk_loop():
     """A deployment that excludes a node from chunking builds no Loop there,
     and the worker must not expect one -- it would end a loop that is not."""
-    assert Worker._chunk_loops_in([_wg(_wrapped_walk(False))]) == frozenset()
+    assert ChunkLoops.walks_in([_wg(_wrapped_walk(False))]) == frozenset()
 
 
 def test_another_loop_is_not_mistaken_for_a_chunk_loop():
@@ -172,7 +170,7 @@ def test_another_loop_is_not_mistaken_for_a_chunk_loop():
         ),
         max_iters=8, outputs=[],
     )
-    assert Worker._chunk_loops_in([_wg(decode)]) == frozenset()
+    assert ChunkLoops.walks_in([_wg(decode)]) == frozenset()
 
 
 def test_a_row_the_cache_served_whole_still_ends_its_loop():

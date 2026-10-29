@@ -56,12 +56,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
-from mstar.model.submodule_base import (
-    BatchedModelOutput,
-    HostRows,
-    InputMetadata,
-    chunk_loop_name,
-)
+from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils import knobs
@@ -96,12 +91,12 @@ from mstar.utils.profiler import (
     range_push,
 )
 from mstar.worker.batch_builder import BatchBuilderType
+from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import (
     MicroScheduler,
     MidPrefillRow,
     ScheduledBatch,
-    runs_final_chunk,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker_metrics import WorkerMetrics
@@ -378,10 +373,10 @@ class Worker:
     computation via engines.
     """
 
-    # (node, walk) pairs whose prefill runs as a chunk Loop, set at load. Empty
-    # here so a worker built without one -- any test fake -- chunks nowhere
-    # rather than raising from postprocess.
-    _chunk_loop_walks: frozenset = frozenset()
+    # This worker's chunk Loops, set at load. Empty here so a worker built
+    # without one -- any test fake -- chunks nowhere rather than raising from
+    # postprocess.
+    chunk_loops: ChunkLoops = ChunkLoops()
 
     # Rids that own a stream buffer (a streaming model's chunked inputs).
     # Empty for a text model, which lets a speculation build skip its three
@@ -528,7 +523,7 @@ class Worker:
             my_walks.update(
                 (node, walk) for node in wg_nodes for walk in wg.graph_walks
             )
-        self._chunk_loop_walks = self._chunk_loops_in(my_worker_graphs)
+        self.chunk_loops = ChunkLoops.from_graphs(my_worker_graphs)
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
@@ -631,10 +626,7 @@ class Worker:
         # Request ids are strings on the wire and ints (handles) inside this
         # worker; the runtime holds the table where the two meet.
         self.scheduler.runtime = self._graph_runtime
-        self.scheduler.chunk_loop_walks = {
-            node: frozenset(w for n, w in self._chunk_loop_walks if n == node)
-            for node, _ in self._chunk_loop_walks
-        }
+        self.scheduler.chunk_loop_walks = self.chunk_loops.walks_by_node
         self.scheduler.rid_of = self._rid
         self.scheduler.get_tensor = self.tensor_manager.get_tensor
         self.tensor_manager.rid_to_str = self._rid_str
@@ -3659,7 +3651,10 @@ class Worker:
 
         _pp_stage("completion_event_sync")
         if batch_N.batch.chunk_ranges:
-            self._advance_chunks(batch_N)
+            self.chunk_loops.advance(
+                batch_N.batch, self.scheduler,
+                self.engine_manager.get_engine(batch_N.node_name),
+            )
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -3695,7 +3690,7 @@ class Worker:
             if loop_name is not None:
                 stops.setdefault(rid, set()).add(loop_name)
 
-        mid_prefill_rids = self._end_finished_chunk_loops(batch_N, stops)
+        mid_prefill_rids = self.chunk_loops.end_finished(batch_N.batch, stops)
 
         # The stop check's host copy, so a request ending here still indexes
         # its pages. After the stop loops, which name the rows mid-prefill: a
@@ -3838,76 +3833,6 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
-
-    @staticmethod
-    def _chunk_loops_in(
-        worker_graphs: "list[WorkerGraph]",
-    ) -> frozenset[tuple[str, str]]:
-        """``(node, walk)`` pairs these graphs run inside a chunk Loop.
-
-        Read off the graphs rather than off the model's chunking policy: the
-        policy says where a Loop may be built, and a deployment that excludes
-        a node from chunking builds none there. The graph cannot disagree with
-        itself, and a Loop nothing ends spins to ``max_iters`` holding the
-        request's state.
-        """
-        found: set[tuple[str, str]] = set()
-        for wg in worker_graphs:
-            loops = wg.section.get_loops()
-            found.update(
-                (node, walk)
-                for node in wg.section.get_nodes() for walk in wg.graph_walks
-                if chunk_loop_name(node, walk) in loops
-            )
-        return frozenset(found)
-
-    def _end_finished_chunk_loops(
-        self, batch_N: PendingBatch, stops: dict,
-    ) -> set[int]:
-        """End the chunk Loop of every row that just ran its last chunk, and
-        name the rows still mid-prefill.
-
-        Keyed on the walk having a Loop rather than on the row having a chunk
-        range: a row with no range ran whole, which is also a final chunk -- a
-        walk with no token budget is never measured or cut, and without this
-        its Loop would run to ``max_iters`` and the request would never release
-        its state.
-
-        Until its last chunk a row's sampled token is not a real sample, so it
-        decides no stop -- a spurious one would cut the prompt short
-        mid-prefill -- and keys no prefix. Its own output the Loop drops.
-        """
-        node = batch_N.node_name
-        mid_prefill: set[int] = set()
-        if not self._chunk_loop_walks:
-            return mid_prefill
-        for rid in batch_N.batch.request_to_worker_graph:
-            walk = batch_N.batch.walk_of(rid)
-            if (node, walk) not in self._chunk_loop_walks:
-                continue
-            loop_name = chunk_loop_name(node, walk)
-            if runs_final_chunk(batch_N.batch.chunk_ranges.get(rid)):
-                stops.setdefault(rid, set()).add(loop_name)
-            else:
-                stops.pop(rid, None)
-                mid_prefill.add(rid)
-        return mid_prefill
-
-    def _advance_chunks(self, batch_N: PendingBatch) -> None:
-        """Record what each chunked row ran, and let go of a finished prompt's
-        prepared input.
-
-        The chunk Loop does the rest: the re-injected prompt re-readies the
-        node, and the Loop's edges drop or gather each chunk's output.
-        """
-        batch, node = batch_N.batch, batch_N.node_name
-        engine = self.engine_manager.get_engine(node)
-        for rid, (_, end, total) in batch.chunk_ranges.items():
-            if rid not in batch.request_to_worker_graph:
-                continue
-            self.scheduler.advance_chunk(rid, node, end)
-            if end >= total:
-                engine.release_chunk_inputs(rid, node)
 
     def _store_and_route(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,

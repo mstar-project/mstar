@@ -26,6 +26,7 @@ from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
+from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
@@ -150,7 +151,7 @@ def _postprocess(sub, rids=(1, 2), pending_stops=(), cached=(), chunk_loop=False
     })
     w = _worker(eng, runtime)
     if chunk_loop:
-        w._chunk_loop_walks = frozenset({(NODE, WALK)})
+        w.chunk_loops = ChunkLoops({(NODE, WALK)})
     pending = PendingBatch(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK,
