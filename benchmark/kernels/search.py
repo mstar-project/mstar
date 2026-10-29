@@ -25,7 +25,7 @@ import sys
 import zlib
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -80,14 +80,21 @@ def check(spec: KernelSpec, fn: Callable[..., Any], args: Sequence[Any], expecte
             "rel_norm": worst.rel_norm, "mismatched": worst.mismatched}
 
 
-def build(candidates: Sequence[Candidate]) -> dict[str, tuple[Candidate, Callable | None, str | None]]:
+class Built(NamedTuple):
+    """A candidate after its build: the callable, or why there is none."""
+    candidate: Candidate
+    fn: Callable[..., Any] | None
+    error: str | None
+
+
+def build(candidates: Sequence[Candidate]) -> dict[str, Built]:
     built = {}
     for cand in candidates:
         try:
-            built[cand.name] = (cand, cand.build(), None)
+            built[cand.name] = Built(cand, cand.build(), None)
         except Exception as exc:  # noqa: BLE001  recorded for every shape
-            built[cand.name] = (cand, None, f"{type(exc).__name__}: {exc}"[:500])
-            logger.warning("candidate %s did not build: %s", cand.name, built[cand.name][2])
+            built[cand.name] = Built(cand, None, f"{type(exc).__name__}: {exc}"[:500])
+            logger.warning("candidate %s did not build: %s", cand.name, built[cand.name].error)
     return built
 
 
@@ -127,7 +134,7 @@ def search_shape(
         entry.update(us=timing.us, runs_us=timing.runs_us, captured=timing.captured, calls=timing.calls,
                      copies=timing.copies, note=timing.note, pct_of_floor=line.pct_of_floor(timing.us),
                      gbps=line.bytes_moved / timing.us / 1e3, tflops=line.flops / timing.us / 1e6)
-        cand, fn, _ = built[name]
+        cand, fn = built[name].candidate, built[name].fn
         if cand.isa is not None:
             try:
                 entry["isa"] = cand.isa(fn, arg_sets[0])
