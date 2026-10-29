@@ -364,9 +364,11 @@ class _ShapeBatched:
 
 
 class LTXVideoDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
-    """Packed fp32 video latents ``[Lv, 128]`` -> uint8 frames ``[3, F, H, W]``, through the
-    convolutional VAE. The reference casts the final latents to bf16 before
-    denormalizing; quantizing at the worker boundary keeps the edge one byte per channel."""
+    """Packed fp32 video latents ``[Lv, 128]`` -> uint8 rgb24 frames ``[F, H, W, 3]``, through
+    the convolutional VAE. The reference casts the final latents to bf16 before
+    denormalizing; quantizing at the worker boundary keeps the edge one byte per channel,
+    and laying the frames out on the GPU as PyAV encodes them saves the API server a
+    host copy out of a strided view."""
 
     disable_torch_compile = True
     output_keys = (VIDEO_OUTPUT,)
@@ -402,7 +404,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
         self.vae.use_tiling = shape.height * sc * shape.width * sc > self.tile_min_pixels
         video = self.vae.decode(x, None, return_dict=False)[0]
         frames = ((video / 2 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)
-        return {VIDEO_OUTPUT: frames}
+        return {VIDEO_OUTPUT: frames.permute(0, 2, 3, 4, 1).contiguous()}
 
 
 class LTXAudioDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):

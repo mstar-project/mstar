@@ -393,7 +393,7 @@ class LTX25Model(Model):
         )
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """``video``: uint8 ``[3, F, H, W]`` -> H.264 mp4 at the request's fps. ``audio``:
+        """``video``: uint8 ``[F, H, W, 3]`` frames -> H.264 mp4 at the request's fps. ``audio``:
         ``[2, samples]`` in ``[-1, 1]`` -> headerless interleaved 16-bit PCM (the API layer
         wraps it with ``get_output_sample_rate``)."""
         if modality == "audio":
@@ -405,7 +405,7 @@ class LTX25Model(Model):
         import av
 
         fps = self.resolve_request(request_kwargs or {})["fps"]
-        frames = (output[0] if output.ndim == 5 else output).permute(1, 2, 3, 0).cpu().numpy()
+        frames = (output[0] if output.ndim == 5 else output).cpu().numpy()
         buffer = io.BytesIO()
         container = av.open(buffer, mode="w", format="mp4")
         # PyAV wants a rational rate: 24 -> 24, 23.976 -> 2997/125
