@@ -521,6 +521,23 @@ def test_a_budget_the_model_does_not_set_is_refused():
         engine.set_token_budgets({"LLM": 0}, {"prefill"})
 
 
+def test_the_chunk_floor_defaults_to_128_and_a_serving_config_can_set_it():
+    import pytest
+
+    engine = _budgeted_engine()
+    engine.set_token_budgets({}, {"prefill"})
+    assert engine.min_chunk_tokens(512) == 128
+    # never more than the budget itself
+    assert engine.min_chunk_tokens(64) == 64
+
+    engine.set_token_budgets({}, {"prefill"}, min_chunk_tokens=32)
+    assert engine.min_chunk_tokens(512) == 32
+
+    for bad in (0, -1, True, 1.5, None):
+        with pytest.raises(ValueError, match="min_chunk_tokens"):
+            engine.set_token_budgets({}, {"prefill"}, min_chunk_tokens=bad)
+
+
 # ── engine: budgets under a combined walk ──────────────────────────────
 
 COMBINED = {("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"}

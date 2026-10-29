@@ -22,7 +22,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
-from mstar.engine.chunking import ChunkingManagement
+from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -2355,10 +2355,15 @@ class Engine:
         combined_walk_of: Mapping[tuple[str, str], str] | None = None,
         override_mixed: Collection[str] = (),
         no_chunking: Collection[str] = (),
+        min_chunk_tokens: int = DEFAULT_MIN_CHUNK_TOKENS,
     ) -> None:
         self._chunking.set_budgets(
             overrides, walks, combined_walk_of, override_mixed, no_chunking,
+            min_chunk_tokens,
         )
+
+    def min_chunk_tokens(self, budget: int) -> int:
+        return self._chunking.min_chunk_tokens(budget)
 
     def set_chunking_policies(
         self, policies: Mapping[tuple[str, str], ChunkingPolicy],

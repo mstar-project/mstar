@@ -9,7 +9,6 @@ from enum import Enum
 from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.chunking import min_chunk_tokens
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
 from mstar.model.submodule_base import InputMetadata, chunk_loop_name
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
@@ -1051,7 +1050,8 @@ class MicroScheduler:
             # nodes off their ready queues with nowhere to run them, so leave
             # them and the backlog as they are for the next pass.
             return None
-        max_tokens = self.engine_manager.get_engine(node_walk[0]).get_max_batch_tokens(*node_walk)
+        engine = self.engine_manager.get_engine(node_walk[0])
+        max_tokens = engine.get_max_batch_tokens(*node_walk)
         row_tokens: dict[int, int] = {}
         chunkable: set[int] = set()
         started: dict[int, int] = {}
@@ -1091,7 +1091,7 @@ class MicroScheduler:
             return None
         min_chunk = 1
         if max_tokens is not None and row_tokens:
-            min_chunk = min_chunk_tokens(max_tokens)
+            min_chunk = engine.min_chunk_tokens(max_tokens)
             seq_lens = pre_existing_seq_lens() if pre_existing_seq_lens is not None else ()
             max_tokens -= _pre_existing_tokens(seq_lens, pre_existing_batch_size)
         return self._build_and_schedule(request_state, BatchBuildRequest(
@@ -1105,7 +1105,7 @@ class MicroScheduler:
             pre_existing_walk=pre_existing_walk,
             max_batch_tokens=max_tokens if row_tokens else None,
             walk_max_tokens=(
-                self.engine_manager.get_engine(node_walk[0]).walk_token_caps(*node_walk)
+                engine.walk_token_caps(*node_walk)
                 if row_tokens and max_tokens is not None else None
             ),
             row_tokens=row_tokens,

@@ -5,6 +5,7 @@ import torch
 
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -231,6 +232,7 @@ class EngineManager:
             combined_walk_of=model.combined_walk_of(),
             override_mixed={node for node, flag in override_mixed.items() if flag},
             no_chunking=loaded.no_chunking,
+            min_chunk_tokens=model_config.get("min_chunk_tokens", DEFAULT_MIN_CHUNK_TOKENS),
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 

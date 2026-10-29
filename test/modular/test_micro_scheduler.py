@@ -20,6 +20,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
+from mstar.engine.chunking import ChunkingManagement
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
@@ -1640,10 +1641,15 @@ class _SizedEngine(_Engine):
         self.measured = []
         # wide enough to cut nothing: these tests are about what gets measured
         self._max_batch_tokens = max_batch_tokens
+        # the real chunk floor, at the serving config's default
+        self._chunking = ChunkingManagement({})
 
     def get_max_batch_tokens(self, node_name, graph_walk):
         del node_name, graph_walk
         return self._max_batch_tokens
+
+    def min_chunk_tokens(self, budget):
+        return self._chunking.min_chunk_tokens(budget)
 
     def walk_token_caps(self, node_name, graph_walk):
         del node_name, graph_walk
@@ -1726,7 +1732,7 @@ def no_chunk_floor(monkeypatch):
     of a few tokens is shared, which the chunk floor would round up."""
     import mstar.engine.chunking
 
-    monkeypatch.setattr(mstar.engine.chunking, "MIN_CHUNK_TOKENS", 1)
+    monkeypatch.setattr(mstar.engine.chunking, "DEFAULT_MIN_CHUNK_TOKENS", 1)
 
 
 class _ChunkingEngine(_SizedEngine):
@@ -2000,7 +2006,7 @@ def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
 def test_rows_that_use_up_the_budget_leave_a_prompt_the_chunk_floor():
     """A merge whose continuing rows ran the whole budget of 4 leaves the
     prompt nothing; it still runs the floor (the whole budget here, which is
-    under MIN_CHUNK_TOKENS), not a token a step."""
+    under the default min_chunk_tokens), not a token a step."""
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
     sched.get_tensor = lambda uuid: uuid
 

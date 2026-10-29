@@ -303,6 +303,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        and prompts short enough for an equal share still go in whole. ``fair_share``
        splits the budget max-min fair over every waiting prompt, so each advances every
        step and all finish late together.
+   * - ``min_chunk_tokens``
+     - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
+       in a step, or the whole budget if that is smaller. A positive int, for every
+       chunked walk. See *Chunked prefill budgets* below.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -401,8 +405,9 @@ It doesn't replace the cap.
 budget per step, and a longer prompt is split across steps. Each model sets its own
 budgets. A deployment can override them per node, either with one budget for every walk
 the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
-that is cut runs at least 128 tokens a step, or the whole budget if that is smaller, so
-when decode rows fill the budget, a step can run over it by up to that many tokens.
+that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
+budget if that is smaller, so when decode rows fill the budget, a step can run over it by
+up to that many tokens.
 
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for

@@ -21,14 +21,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The fewest tokens the scheduler cuts a row to (one KV page at the default
-# page size), or the whole budget when that is smaller. Without it, decode rows
-# that fill the budget leave a prompt a token or two a step.
-MIN_CHUNK_TOKENS = 128
-
-
-def min_chunk_tokens(budget: int) -> int:
-    return min(MIN_CHUNK_TOKENS, budget)
+# The serving config's ``min_chunk_tokens`` unless it sets one: one KV page at
+# the default page size.
+DEFAULT_MIN_CHUNK_TOKENS = 128
 
 
 class ChunkingManagement:
@@ -50,6 +45,7 @@ class ChunkingManagement:
         self._overruns: dict[tuple[str, str], int] = {}
         # nodes the worker chunks nowhere, whatever the model declares
         self._no_chunking: frozenset[str] = frozenset()
+        self._min_chunk_tokens = DEFAULT_MIN_CHUNK_TOKENS
         # (rid, node) -> a chunked row's whole input, prepared on its first chunk
         self.prepared: dict[tuple[int, str], NodeInputs] = {}
 
@@ -90,8 +86,10 @@ class ChunkingManagement:
         combined_walk_of: Mapping[tuple[str, str], str] | None = None,
         override_mixed: Collection[str] = (),
         no_chunking: Collection[str] = (),
+        min_chunk_tokens: int = DEFAULT_MIN_CHUNK_TOKENS,
     ) -> None:
-        """Apply a serving config's ``max_batch_tokens`` to this engine's nodes.
+        """Apply a serving config's ``max_batch_tokens`` and
+        ``min_chunk_tokens`` to this engine's nodes.
 
         Overrides the budgets ``set_policies`` declared, so it runs after it.
 
@@ -111,6 +109,10 @@ class ChunkingManagement:
         validated but has no effect, since the deployment, not the config, is
         what turned chunking off there.
         """
+        if isinstance(min_chunk_tokens, bool) or not isinstance(min_chunk_tokens, int) \
+                or min_chunk_tokens < 1:
+            raise ValueError(f"min_chunk_tokens: {min_chunk_tokens!r} is not a positive int")
+        self._min_chunk_tokens = min_chunk_tokens
         self._no_chunking = frozenset(no_chunking)
         self._combined_walk_of = dict(combined_walk_of or {})
         self._override_mixed = frozenset(override_mixed)
@@ -139,6 +141,12 @@ class ChunkingManagement:
                 if self.policy(node, walk).max_batch_tokens is None:
                     raise ValueError(f"max_batch_tokens for {node}/{walk}: the model sets no budget there to override")
                 self._overrides[(node, walk)] = budget
+
+    def min_chunk_tokens(self, budget: int) -> int:
+        """The fewest tokens the scheduler cuts a row to under ``budget``, or
+        the whole budget when that is smaller. Without a floor, decode rows
+        that fill the budget leave a prompt a token or two a step."""
+        return min(self._min_chunk_tokens, budget)
 
     def walk_caps(self, node_name: str, graph_walk: str) -> dict[str, int] | None:
         """Under a combined walk on a node with ``can_override_mixed_max_tokens``:
@@ -182,7 +190,7 @@ class ChunkingManagement:
             return
         total = sum(inp.input_seq_len for inp in node_inputs)
         # a row cut to the chunk floor may run the step over by up to that floor
-        if total <= budget + min_chunk_tokens(budget):
+        if total <= budget + self.min_chunk_tokens(budget):
             return
         key = (batch.node_name, walk)
         count = self._overruns[key] = self._overruns.get(key, 0) + 1
