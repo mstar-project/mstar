@@ -74,9 +74,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        request, one timestep: the checkpoint's ``state_history_length``) with the
        embodiment's own joint-group names, and ``walk``, which selects one of the
        two reuse walks (``backbone`` or ``state``) instead of running the full
-       path. **Camera frames are attached as images, not passed in
-       ``model_kwargs``**: one lossless image per camera view per timestep, in
-       time-major order over the embodiment's view order — ``(t0,v0)``,
+       path. A reuse walk answers ``output_modalities=("tensor",)`` with its
+       features (``backbone_features``, ``state_features``) as one msgpack entry
+       laid out like an action group. **Camera frames are attached as images,
+       not passed in ``model_kwargs``**: one lossless image per camera view per
+       timestep, in time-major order over the embodiment's view order — ``(t0,v0)``,
        ``(t0,v1)``, ``(t1,v0)``, … — so a two-camera robot sends four. The format
        must be **lossless** (PNG, BMP, TIFF, PPM or lossless WebP) and a lossy one
        is refused: the pixels are compared against the reference's bit for bit, so
