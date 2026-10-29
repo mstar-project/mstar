@@ -609,7 +609,9 @@ class LLMSubmodule(ARNodeSubmodule):
                 continue
             # the prompt's step emits the first token; decode the rest
             budgets[rid] = max(row.max_tokens - 1, 0)
-            if row.resource_configs[SAMPLER].ignore_eos:
+            # a capture or padding row carries no sampling config
+            sampling = row.resource_configs.get(SAMPLER)
+            if sampling is not None and sampling.ignore_eos:
                 ignore.add(rid)
             if row.step_metadata.get("last_prefill", False) and spec.seed_lookahead:
                 adjust[(rid, "main")] = spec.seed_lookahead

@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -95,9 +95,10 @@ class SpecDecodeStep(ResourceStep):
     ignore_stop: frozenset[int] = frozenset()
 
 
-@dataclass(frozen=True)
-class AcceptedTokens:
-    """What a verify step hands back, one row per request.
+class AcceptedTokens(NamedTuple):
+    """What a verify step hands back, one row per request. A NamedTuple, so a
+    compiled forward takes it back from the (uncompiled) resource call as a
+    plain tuple of tensors.
 
     ``tokens`` holds the tokens the step emits in order, -1 past the last one;
     ``accepted`` how many of the row's k + 1 positions the target took (the
