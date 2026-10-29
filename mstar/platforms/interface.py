@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 
+from mstar.platforms.facts import DeviceFacts, device_facts
 from mstar.platforms.ptxas import blackwell_ptxas_env
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,12 @@ class Platform:
     def has_block_scaled_gemm(self, device=None) -> bool:
         """cuBLASLt's MXFP8 and NVFP4 GEMMs (``torch._scaled_mm``) run on this GPU."""
         return False
+    def device_facts(self, device=None) -> DeviceFacts:
+        """The GPU's architecture, product, compute units, caches and peak
+        bandwidth and throughput, for kernel heuristics and the kernel harness
+        (see ``mstar.platforms.facts``); never for model code. Unknown fields
+        are None."""
+        return device_facts(self, device)
 
     def inductor_overrides(
         self, num_tokens: int | None = None, rows: int | None = None,
@@ -195,8 +202,9 @@ class CudaPlatform(Platform):
         return None if capability is None else f"sm_{capability[0]}{capability[1]}"
 
     def cuda_capability(self, device=None) -> tuple[int, int] | None:
-        # a CPU device (tests that drive GPU resources with stand-ins) has none
-        if device is not None and torch.device(device).type != "cuda":
+        # a CPU device (tests that drive GPU resources with stand-ins) has none; an
+        # index names a cuda device, and torch.device(index) refuses on a CPU-only build
+        if device is not None and not isinstance(device, int) and torch.device(device).type != "cuda":
             return None
         return torch.cuda.get_device_capability(device)
 
