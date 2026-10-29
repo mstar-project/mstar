@@ -47,6 +47,7 @@ import torch
 
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.kv.plan import SINK_PAGE
+from mstar.engine.resources.sampler import utils as sampling
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.spec_decode.config import (
     AcceptedTokens,
@@ -82,6 +83,7 @@ class _StepImage(NamedTuple):
     top_k: torch.Tensor          # seed steps: the request's top_k (0: off)
     # seed steps: [temperature | top_p] per row, float32, its own copy
     params: torch.Tensor
+    seeds: torch.Tensor          # seed steps: each request's sampling seed, int64
     num_accepted: torch.Tensor   # verify steps: the row's last accepted count, for the recurrent kernels
 
 
@@ -157,6 +159,9 @@ class SpecDecodeResource(Resource):
         self._temperature = torch.zeros(rows, dtype=torch.float32, device=device)
         self._top_p = torch.ones(rows, dtype=torch.float32, device=device)
         self._top_k = torch.zeros(rows, **i32)
+        # the request's seed, and the Philox offset its next verify step draws at
+        self._seed = torch.zeros(rows, dtype=torch.long, device=device)
+        self._rng_offset = torch.zeros(rows, dtype=torch.long, device=device)
         self._stop_ids = torch.tensor(
             sorted(set(stop_token_ids)) or [-2], dtype=torch.long, device=device,
         )
@@ -172,6 +177,7 @@ class SpecDecodeResource(Resource):
 
         self._stager = PinnedStager(torch.int32)
         self._param_stager = PinnedStager(torch.float32)
+        self._seed_stager = PinnedStager(torch.int64)
         self._cg_max_bs = 0
         self._cg_images: dict[CGSlotKey, tuple[_StepImage, H2DMirror]] = {}
         self._eager_images: dict[int, _StepImage] = {}
@@ -280,6 +286,7 @@ class SpecDecodeResource(Resource):
         )
         temperature = np.zeros(num_rows, dtype=np.float32)
         top_p = np.ones(num_rows, dtype=np.float32)
+        seeds = np.zeros(num_rows, dtype=np.int64)
         views = None
         if step.phase is SpecPhase.SEED:
             kv_plan = ctx.plan_results[self._kv_key].get("main")
@@ -295,7 +302,7 @@ class SpecDecodeResource(Resource):
                 budget[i] = step.budgets.get(rid, 0)
                 stop_on[i] = rid not in step.ignore_stop
                 if rid in step.sampling:
-                    temperature[i], top_p[i], top_k[i] = step.sampling[rid]
+                    temperature[i], top_p[i], top_k[i], seeds[i] = step.sampling[rid]
         width = image.rows.numel()
         packed = np.zeros(len(_FIELDS) * width, dtype=np.int32)
         for f, values in enumerate((rows, real, base, budget, stop_on, top_k)):
@@ -306,6 +313,7 @@ class SpecDecodeResource(Resource):
             params[:num_rows] = temperature
             params[width: width + num_rows] = top_p
             self._param_stager.copy_(image.params, params)
+            self._seed_stager.copy_(image.seeds, seeds, pad_value=0)
 
         plan = SpecDecodePlan(phase=step.phase, num_rows=num_rows, image=image)
         if step.phase is SpecPhase.VERIFY:
@@ -369,6 +377,7 @@ class SpecDecodeResource(Resource):
             image=image, rows=views[0], real=views[1], base=views[2],
             budget=views[3], stop_on=views[4], top_k=views[5],
             params=torch.ones(2 * rows, dtype=torch.float32, device=self._device),
+            seeds=torch.zeros(rows, dtype=torch.long, device=self._device),
             num_accepted=torch.ones(rows, dtype=torch.int32, device=self._device),
         )
 
@@ -423,6 +432,8 @@ class SpecDecodeResource(Resource):
             self._temperature.index_copy_(0, rows, image.params[:b])
             self._top_p.index_copy_(0, rows, image.params[width: width + b])
             self._top_k.index_copy_(0, rows, image.top_k[:b])
+            self._seed.index_copy_(0, rows, image.seeds[:b])
+            self._rng_offset.index_fill_(0, rows, 0)
 
     @torch.compiler.disable
     def verify_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -443,16 +454,17 @@ class SpecDecodeResource(Resource):
     def accept(self, logits: torch.Tensor, sample: bool = False) -> AcceptedTokens:
         """Verification of this step's drafts against ``logits`` (``[rows *
         (k + 1), vocab]``, the target's at each verify position): its argmax,
-        or with ``sample`` a draw at each row's temperature (greedy where the
-        row's temperature is 0).
+        or with ``sample`` a draw from each row's top-k/top-p distribution at
+        its temperature (greedy where the row's temperature is 0).
 
         The drafts are the draft head's argmax, a point mass, for which
         rejection sampling is: draw the target's token at every position
         independently and accept while it equals the next draft. A rejected
         position then holds a draw from the target's distribution with the
         draft taken out, which is the residual the rule prescribes, so the
-        emitted tokens follow the target exactly. The draws come from the
-        device's default generator, not the request's seed.
+        emitted tokens follow the target exactly. The draws use the
+        request's seed (see `_sample`), so they repeat for it, but they are not
+        the draws a non-speculative step would make with that seed.
         """
         if not sample:
             return self.accept_tokens(logits.argmax(dim=-1))
@@ -461,17 +473,26 @@ class SpecDecodeResource(Resource):
         return self.accept_tokens(self._sample(logits))
 
     def _sample(self, logits: torch.Tensor) -> torch.Tensor:
-        """One draw per row of ``logits`` at the row's temperature, by the
-        Gumbel-max trick over the whole vocabulary. No top-k or top-p: their
-        cut needs the vocabulary sorted, and the sort cannot be captured on
-        every platform (ROCm refuses it inside a graph)."""
+        """One draw per row of ``logits``: top-k, then top-p over what is
+        left, at the row's temperature (argmax at temperature 0), by the
+        sampler's captured kernel (`draw_tokens`). Each verify position draws
+        from its own stream (the request's seed, offset per position), so the
+        positions are independent; the offset advances once a step, so steps
+        are too, and a request's draws repeat for its seed."""
         plan = self._plan_now(SpecPhase.VERIFY)
         rows, _ = self._rows(plan)
-        temperature = self._temperature[rows].repeat_interleave(self.tokens_per_row)
-        scaled = logits.float() / temperature.clamp_min(1e-5)[:, None]
-        noise = -torch.empty_like(scaled).exponential_().log()
-        sampled = (scaled + noise).argmax(dim=-1)
-        return torch.where(temperature > 0, sampled, logits.argmax(dim=-1))
+        t, vocab = self.tokens_per_row, logits.shape[-1]
+        temperature = self._temperature[rows].repeat_interleave(t)
+        top_p = self._top_p[rows].repeat_interleave(t)
+        # 0 is off for the request, which the kernel would read as k = 0
+        top_k = self._top_k[rows].repeat_interleave(t)
+        top_k = torch.where(top_k > 0, top_k, vocab)
+        offset = self._rng_offset[rows]
+        position = torch.arange(t, dtype=torch.long, device=logits.device)
+        seed = self._seed[rows].repeat_interleave(t)
+        offsets = (offset[:, None] * t + position[None, :]).reshape(-1)
+        self._rng_offset.index_copy_(0, rows, offset + 1)
+        return sampling.draw_tokens(logits, temperature, top_k, top_p, seed, offsets).long()
 
     @torch.compiler.disable
     def accept_tokens(self, target: torch.Tensor) -> AcceptedTokens:

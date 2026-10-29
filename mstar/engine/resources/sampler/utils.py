@@ -1328,6 +1328,25 @@ def _sample_cuda(
         return result[0] if isinstance(result, tuple) else result
 
 
+def draw_tokens(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
+) -> torch.Tensor:
+    """One token per row of ``logits`` from its top-k, then top-p, distribution
+    at its temperature (argmax where the temperature is 0), drawn with per-row
+    device ``seed``/``offset`` so a captured graph draws afresh on each replay
+    with the offsets it is handed. For a caller that samples rows of its own
+    (a speculative verify step); the sampler resource's per-request state is
+    not involved. Accelerator devices only."""
+    return _sample_cuda(
+        logits, temperature, top_k, top_p, 1.0, None, True, None, seed, offset,
+    )
+
+
 def _needs_explicit_filter(history: HistoryRows | None, order: FilterOrder | None) -> bool:
     """Whether the draw needs the filtered distribution in hand: FlashInfer's
     fused sampler has neither HF's order nor a floor applied after filtering."""
