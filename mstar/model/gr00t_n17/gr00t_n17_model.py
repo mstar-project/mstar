@@ -208,15 +208,6 @@ class Gr00tN17Model(Model):
             self.backbone_path_hf, "config.json", cache_dir=self.cache_dir,
         ))
 
-    @property
-    def max_views(self) -> int:
-        """The most camera views any embodiment in this checkpoint uses.
-
-        Sizes `vision_encoder`'s segment bound. Derived, not configured: the
-        processor already reads the per-tag video keys off the checkpoint.
-        """
-        return max(len(keys) for keys in self.processor.video_keys.values())
-
     # ----------------------------------------------------------- resources
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The five attention resources, one per geometry and kind. Every attention is
@@ -244,9 +235,9 @@ class Gr00tN17Model(Model):
                     # `vision_encoder` declares one segment per *frame* -- a frame
                     # attends to itself alone
                     # (`Gr00tN17VisionEncoderSubmodule.declare_step`) -- so the bound is
-                    # the most camera views any embodiment has, which the processor
-                    # reads off the checkpoint (`Gr00tN17Preprocessor.video_keys`).
-                    max_segments_per_request=self.max_views,
+                    # a request's most frames, views x timesteps, the count the data
+                    # worker already caps a request's files at
+                    max_segments_per_request=self.max_input_files()["image"],
                     dtype=torch.bfloat16,
                 ),
             ),
@@ -461,16 +452,13 @@ class Gr00tN17Model(Model):
         return None
 
     def max_input_files(self) -> dict[str, int]:
-        """One frame per camera view per timestep, and no more.
-
-        The widest embodiment in this checkpoint has 3 views and every one has 2
-        frames per view, so 6. The data worker refuses a request over this
-        before decoding any file (`check_file_counts` in
-        `PreprocessWorkerThread._load_media`).
+        """One frame per camera view per timestep, and no more: the most frames any
+        embodiment's request carries (6 in this checkpoint: 3 views x 2 timesteps).
+        The data worker refuses a request over this before decoding any file
+        (`check_file_counts` in `PreprocessWorkerThread._load_media`).
         """
-        views = max(len(v) for v in self.processor.video_keys.values())
-        steps = max(self.processor.video_steps.values())
-        return {"image": views * steps}
+        keys, steps = self.processor.video_keys, self.processor.video_steps
+        return {"image": max(len(keys[tag]) * steps[tag] for tag in keys)}
 
     def load_image(self, filepath: str, device: str):
         """A camera frame as **uint8 HWC**, which is what the reference's transform
