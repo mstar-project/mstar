@@ -133,6 +133,29 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     }
 
 
+class ResultQueue(queue.Queue):
+    """The data worker's output chunks, for the API message thread.
+
+    A put doesn't wake that thread: ``flush`` signals ``wakeup`` once for
+    everything put since the last flush, and the data worker thread flushes
+    after each batch of outputs, so one step's chunks cost the message thread
+    one wake and one pass, however many rows the step had."""
+
+    def __init__(self, wakeup: EventWakeup):
+        super().__init__()
+        self.wakeup = wakeup
+        self._unsignaled = False
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        self._unsignaled = True
+
+    def flush(self) -> None:
+        if self._unsignaled:
+            self._unsignaled = False
+            self.wakeup.signal()
+
+
 class PreprocessWorker:
     def __init__(
         self,
@@ -152,7 +175,9 @@ class PreprocessWorker:
         self.abort_request_queue = queue.Queue()
         self.reads_done_queue = queue.Queue()
         self.discard_tensor_queue = queue.Queue()
-        self.output_queue = queue.Queue()
+        # The API message thread polls this with its socket (``ResultQueue``).
+        self.results_wakeup = EventWakeup()
+        self.output_queue = ResultQueue(self.results_wakeup)
         self.profile_queue = queue.Queue()
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
@@ -1269,6 +1294,8 @@ class PreprocessWorkerThread:
         if not self.stop_event.is_set():
             warm_up_model(getattr(self, "model", None))
         idle_wait = self._idle_wait()
+        # a plain queue in tests that build the thread around their own
+        flush_results = getattr(self.out_queue, "flush", lambda: None)
         while not self.stop_event.is_set():
             did_work = False
             try:
@@ -1279,7 +1306,14 @@ class PreprocessWorkerThread:
                 # queued read-starts / acks / cleanups must never wait behind a
                 # multi-second media preprocess. Drain them fully every pass
                 # and take at most one preprocess item afterwards.
+                batch = self.result_tensor_queue.qsize()
                 while not self.result_tensor_queue.empty():
+                    if batch == 0:
+                        # what came in meanwhile is the next batch: one wake
+                        # each, also when the queue refills faster than it drains
+                        flush_results()
+                        batch = self.result_tensor_queue.qsize()
+                    batch -= 1
                     did_work = True
                     result = self.result_tensor_queue.get()
                     if isinstance(result, InlineToken):
@@ -1304,6 +1338,7 @@ class PreprocessWorkerThread:
                             f"{result.modality} output transfer",
                             count=len(result.graph_edge.tensor_info),
                         )
+                flush_results()
                 did_work = self._process_releases() or did_work
                 while not self.discard_tensor_queue.empty():
                     did_work = True
@@ -1313,6 +1348,7 @@ class PreprocessWorkerThread:
                     req_id = self.cleanup_request_queue.get()
                     self._cleanup_request_state(req_id)
                 did_work = self._process_read_tensors() or did_work
+                flush_results()
                 # Reads may have just resolved; ACK any drains now free of them.
                 for rid in list(self._draining_rids):
                     self._complete_drain_if_ready(rid)
@@ -1349,6 +1385,8 @@ class PreprocessWorkerThread:
                         self._removed(pre_input.request_id)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
+            # the error chunks of a failed input, and anything a raise skipped
+            flush_results()
 
             # getattr: tests drive this loop with stand-in tensor managers
             transfers = getattr(self.tensor_manager, "transfer_stats", None)

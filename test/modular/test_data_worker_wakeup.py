@@ -3,13 +3,17 @@ and is woken by a producer's signal, a finished tensor read or shutdown,
 instead of sleeping 1 ms and sweeping its queues."""
 from __future__ import annotations
 
+import os
 import queue
 import select
 import threading
 import time
 from concurrent.futures import Future
+from types import SimpleNamespace
 
-from mstar.api_server.data_worker import InlineToken, PreprocessWorkerThread
+import pytest
+
+from mstar.api_server.data_worker import InlineToken, PreprocessWorkerThread, ResultQueue
 from mstar.communication.event import EventWakeup
 from mstar.graph.loop_indices import NestedLoopIndices
 
@@ -73,10 +77,11 @@ class _TM:
         pass
 
 
-def _thread(comm, wakeup, idle_wait_ms=2000):
+def _thread(comm, wakeup, idle_wait_ms=2000, out_queue=None):
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(),
+        out_queue=out_queue if out_queue is not None else queue.Queue(),
         profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop, communicator=comm,
@@ -168,3 +173,118 @@ def test_without_a_wakeup_the_thread_keeps_the_sleep():
     stop.set()
     t.join(timeout=1.0)
     assert not t.is_alive()
+
+
+# -- the other direction: the data worker waking the API message thread --------
+
+
+def _signals(wakeup) -> int:
+    """How many signals ``wakeup`` took since it was last drained (the
+    eventfd adds them up), draining it."""
+    try:
+        return os.eventfd_read(wakeup.fd)
+    except BlockingIOError:
+        return 0
+
+
+def test_a_flush_signals_once_for_every_put_since_the_last():
+    out = ResultQueue(EventWakeup())
+    out.flush()
+    assert _signals(out.wakeup) == 0
+    for i in range(16):
+        out.put(i)
+    out.flush()
+    out.flush()
+    assert _signals(out.wakeup) == 1 and out.qsize() == 16
+
+
+def test_a_step_of_results_wakes_the_message_thread_once():
+    comm, wakeup = _PollingComm(), EventWakeup()
+    out = ResultQueue(EventWakeup())
+    worker, stop, t = _thread(comm, wakeup, out_queue=out)
+    assert _wait_until(lambda: comm.waits >= 1, 1.0)
+    # one step's frame: every row's token handed over, then one wake
+    for i in range(16):
+        worker.result_tensor_queue.put(InlineToken(f"r{i}", i, _loop(0), "text"))
+    wakeup.signal()
+    assert _wait_until(lambda: out.qsize() == 16, 1.0)
+    assert _wait_until(lambda: comm.waits >= 2, 1.0)  # the pass is over
+    assert _signals(out.wakeup) == 1
+    stop.set()
+    wakeup.signal()
+    t.join(timeout=1.0)
+    assert not t.is_alive()
+
+
+def test_a_queue_that_refills_while_draining_wakes_once_a_batch():
+    """The next step's tokens landing mid-drain are a batch of their own:
+    the chunks drained so far go out first instead of waiting for the
+    queue to run dry."""
+    comm, wakeup = _PollingComm(), EventWakeup()
+    out = ResultQueue(EventWakeup())
+    flushed_at = []
+    flush = out.flush
+
+    def recording_flush():
+        if out._unsignaled:
+            flushed_at.append(out.qsize())
+        flush()
+
+    out.flush = recording_flush
+    worker, stop, t = _thread(comm, wakeup, out_queue=out)
+    assert _wait_until(lambda: comm.waits >= 1, 1.0)
+    late = [InlineToken(f"late{i}", i, _loop(1), "text") for i in range(4)]
+
+    class _Refilling(_Model):
+        def postprocess(self, output, modality, request_kwargs=None):
+            while late:  # the message thread hands over the next step
+                worker.result_tensor_queue.put(late.pop())
+            return super().postprocess(output, modality, request_kwargs)
+
+    worker.model = _Refilling()
+    for i in range(4):
+        worker.result_tensor_queue.put(InlineToken(f"r{i}", i, _loop(0), "text"))
+    wakeup.signal()
+    assert _wait_until(lambda: out.qsize() == 8, 1.0)
+    assert _wait_until(lambda: comm.waits >= 2, 1.0)
+    assert flushed_at == [4, 8]
+    stop.set()
+    wakeup.signal()
+    t.join(timeout=1.0)
+    assert not t.is_alive()
+
+
+def _communicator(kind, tmp_path):
+    if kind == "rust":
+        pytest.importorskip("mstar_rust")
+        from mstar.communication.rust_communicator import RustZMQCommunicator as Comm
+    else:
+        from mstar.communication.communicator import ZMQCommunicator as Comm
+    return Comm(f"api_{kind}", push_ids=[], ipc_socket_path_prefix=str(tmp_path) + "/")
+
+
+@pytest.mark.parametrize("kind", ["python", "rust"])
+def test_the_message_loop_waits_on_the_results_wakeup(kind, tmp_path):
+    """The message thread's wait between passes ends on the data worker's
+    signal and drains it, on either transport; unsignalled, it is the 1 ms
+    backstop the loop's nap was."""
+    from api_server_helpers import make_test_api_server
+
+    results = EventWakeup()
+    server = make_test_api_server(
+        communicator=_communicator(kind, tmp_path),
+        preprocess_worker=SimpleNamespace(results_wakeup=results),
+    )
+    wait = server._pass_wait()
+    t0 = time.monotonic()
+    for _ in range(20):
+        wait()
+    assert 0.015 < time.monotonic() - t0 < 1.0
+    results.signal()
+    wait()
+    assert _signals(results) == 0, "the wait drained the signal"
+    # a stand-in without the poll keeps the nap
+    bare = make_test_api_server(communicator=SimpleNamespace(), preprocess_worker=SimpleNamespace())
+    t0 = time.monotonic()
+    bare._pass_wait()()
+    assert time.monotonic() - t0 >= 0.001
