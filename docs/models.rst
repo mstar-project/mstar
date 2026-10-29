@@ -1067,8 +1067,9 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
-- Two GPUs: ``configs/cosmos3_nano_sp2.yaml`` halves one request's denoise
-  (Nano 832x480x189x35: 1.47 -> 0.78 s per step), while
+- Two GPUs (H200 numbers, measured before the Cosmos3-Edge Blackwell changes,
+  so the one-GPU baselines are older): ``configs/cosmos3_nano_sp2.yaml`` halves
+  one request's denoise (Nano 832x480x189x35: 1.47 -> 0.78 s per step), while
   ``configs/cosmos3_nano_dp2.yaml`` (a whole replica per GPU) serves more under
   concurrency: 2.13 videos/min at 2 concurrent vs 1.63 for sp2 and 1.07 on one GPU.
   For Edge (832x480x121, 20 steps): ``configs/cosmos3_edge_sp2.yaml`` takes one
