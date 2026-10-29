@@ -547,6 +547,14 @@ The spec types are:
        Leave it at ``AUTO`` unless the model needs a specific kernel. FlashInfer,
        dense, MLA and XPU paged attention require a ``PagedKVConfig``; FlexAttention
        requires a ``RingKVConfig``. Select ``XPU_PAGED`` for Intel GPUs.
+       ``DENSE`` runs one varlen pass over each stream's frozen
+       prefix (gathered from the pages once) and the step's fresh K/V, eager only:
+       FA3 (AITER on ROCm), or FlashInfer's ragged prefill where FA3 has no kernel for
+       the GPU, the same choice the ragged resources make (``dense_or_flashinfer``), with
+       ``flashinfer_backend`` picking its kernel. The engine plans and runs a tiny layout on
+       that kernel when it builds the resource, so a backend the GPU or FlashInfer build
+       cannot run stops the server with a ``ValueError`` naming it. Its wrappers share one
+       workspace, taken at build.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
        ``"fa3"`` when the FlashInfer backend is selected. ``decode_tensor_cores``
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
@@ -1502,9 +1510,15 @@ Both types share the base ``AcceleratorGraphConfig`` fields:
 - ``compile_mode`` is that ``torch.compile``'s mode. The default, ``None``, takes the
   deployment's compile level (``mstar serve -O``, ``MSTAR_COMPILE_LEVEL``); naming a
   mode takes the config out of that level. ``default`` keeps Inductor's fusion but takes cuBLAS for
-  every GEMM and skips autotuning. Building the config refuses an unknown mode, and one
-  that turns on Inductor's own CUDA graphs (``reduce-overhead``, ``max-autotune``), which
-  fail inside the runner's capture.
+  every GEMM and skips autotuning. ``deterministic`` is the engine's own: Inductor's
+  defaults in its deterministic mode, which picks kernel configs by rule rather than timing
+  them on the device, so every process compiles the same kernels (a torch without the mode
+  logs a warning and compiles with the defaults). A compile outside the runner takes the same
+  options from ``accelerator_graph_runner.compile_kwargs("deterministic")``, or
+  ``deterministic_inductor_options()`` where it builds its own; the Wan VAE decode, the DiT
+  scaffold's ``compile_blocks`` and Cosmos3's denoise step do. Building the config refuses
+  an unknown mode, and one that turns on Inductor's own CUDA graphs (``reduce-overhead``,
+  ``max-autotune``), which fail inside the runner's capture.
 - ``required`` makes every bucket in the config mandatory. If capture fails locally or
   on another participating rank, warmup raises after rank-wide agreement instead of
   dropping the bucket and falling back to eager execution. The default is ``False``.

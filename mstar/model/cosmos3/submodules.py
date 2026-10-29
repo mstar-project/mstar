@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -167,6 +168,15 @@ REASONER_DECODE_LOOP = "reasoner_decode_loop"
 REASONER_LABEL = "main"
 
 
+def denoise_compile_kwargs(mode: str) -> dict:
+    """``torch.compile`` arguments for the denoise step; see
+    ``Cosmos3Config.denoise_compile_mode``. "deterministic" and "default" are
+    the engine's compile modes of those names, "level" its -O level."""
+    from mstar.engine.accelerator_graph_runner import compile_kwargs
+
+    return compile_kwargs(None if mode == "level" else mode)
+
+
 def latent_frames(num_frames: int, config) -> int:
     return 1 if num_frames == 1 else 1 + (num_frames - 1) // config.vae.scale_factor_temporal
 
@@ -275,6 +285,23 @@ class GenStepInfo:
     retention: Mapping[str, RetentionPolicy] | None = None
 
 
+class _WarmupAttention:
+    """What ``Cosmos3DiTSubmodule.warmup_compiles`` binds in place of the
+    attention resource: no plan to read, a zero output of the query's size."""
+
+    requires_kv_write = False
+
+    def set_default_label(self, label: str) -> None:
+        del label
+
+    def set_default_layer_idx(self, layer_idx: int) -> None:
+        del layer_idx
+
+    def run(self, q: torch.Tensor, **kwargs) -> torch.Tensor:
+        del kwargs
+        return torch.zeros_like(q)
+
+
 class Cosmos3DiTSubmodule(ARNodeSubmodule):
     """Dual-pathway DiT node (understanding tower + generation denoiser)."""
 
@@ -333,13 +360,58 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # attention; ``config.compile_denoise=False`` keeps the eager step for
         # the bit-exact parity tests.
         if config.compile_denoise and transformer is not None:
-            self.transformer.denoise_step = torch.compile(
-                self.transformer.denoise_step, fullgraph=False, dynamic=False,
-            )
+            kwargs = denoise_compile_kwargs(config.denoise_compile_mode)
+            self.transformer.denoise_step = torch.compile(self.transformer.denoise_step, **kwargs)
             self.transformer.denoise_step_batched_cfg = torch.compile(
-                self.transformer.denoise_step_batched_cfg, fullgraph=False, dynamic=False,
+                self.transformer.denoise_step_batched_cfg, **kwargs,
             )
-            logger.info("Cosmos3 denoise compute torch.compile enabled")
+            if config.compile_denoise_batched:
+                # Only the cross-request step's layer stack, with the pack
+                # length dynamic: one compile, built by `warmup_compiles`
+                # before the first request, serves every batch size and mix of
+                # resolutions. The per-request patchify, rotary and unpatchify
+                # around it run eager.
+                self.transformer.gen_layers_batched = torch.compile(
+                    self.transformer.gen_layers_batched, **{**kwargs, "dynamic": True},
+                )
+            logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
+
+    def warmup_compiles(self) -> None:
+        """Build the compiled cross-request layer stack before the first
+        request: one two-request step at the default size, through
+        ``denoise_step_batched`` with a stand-in attention, since no request
+        has planned one yet. The attention call is a graph break, so what the
+        stand-in returns never enters a compiled graph, and the graph does not
+        depend on the size it was built at."""
+        if not (self.config.compile_denoise and self.config.compile_denoise_batched) or self.transformer is None:
+            return
+        cfg = self.config
+        frames = cfg.num_frames_video if cfg.video_size_default is not None else 1
+        width, height = (int(x) for x in (cfg.video_size_default or cfg.image_size_default))
+        device = self.get_device()
+        static = self._build_static(
+            [0] * 8, height, width, num_frames=frames, fps=24.0, has_image_condition=False, device=device,
+        )
+        row = {
+            "latents": torch.zeros(
+                self._latent_shape(height, width, frames), device=device,
+                dtype=self.transformer.proj_in.weight.dtype,
+            ),
+            "vision_timesteps": torch.zeros(static["num_noisy_vision_tokens"], device=device),
+            "position_ids_cond": static["vision_mrope_ids"],
+            "position_ids_uncond": static["vision_mrope_ids"],
+            "vision_token_shapes": static["vision_token_shapes"],
+            "vision_noisy_frame_indexes": static["vision_noisy_frame_indexes"],
+            "vision_mse_loss_indexes": static["mse_gen_indexes"],
+        }
+        t0 = time.perf_counter()
+        # as `forward_batched` runs it: native dtype, no autocast
+        with torch.autocast(device_type=device.type, enabled=False):
+            self.transformer.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
+        logger.info(
+            "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two requests)",
+            time.perf_counter() - t0, width, height, frames,
+        )
 
     def to(self, *args, **kwargs):
         # The engine casts this submodule to bf16; the timestep embedder must stay
@@ -2769,16 +2841,22 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     # One-shot decode per request; accelerator graph capture (not torch.compile) is the
     # speedup path.
     disable_torch_compile = True
-
-    def __init__(self, vae, config, channels_last: bool = False):
+    def __init__(self, vae, config, channels_last: bool = False, fast: bool = False):
         super().__init__()
         self.vae = vae
         self.config = config
         self._decode_dtype_cached = None
+        # ``fast`` (config.vae_decode_fast, whole-clip node only): clips decode
+        # through the shared Wan VAE decoder, always channels-last.
+        fast = vae is not None and fast
+        if fast:
+            # Cast before the layout switch and the compile trace, so both see
+            # the weights the decode runs with.
+            self.vae = vae = vae.to(self._decode_dtype())
         # Channels-last weights and activations (cuDNN's native conv3d layout),
         # converted in place before any compile traces the decode; only the
         # instance given here is converted (see Cosmos3Model).
-        self._channels_last = vae is not None and channels_last
+        self._channels_last = vae is not None and (channels_last or fast)
         if self._channels_last:
             _wan_vae().to_channels_last(vae)
         # The decode is 3D-conv bound, one-shot per request at request-specific
@@ -2793,12 +2871,18 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
             "0", "false", "no", "off",
         ):
+            # with ``fast``, only images (one latent) decode through this
             self._decode = _wan_vae().compile_decode(vae.decode)
             self._decode_compiled = True
             logger.info("Cosmos3 VAE decode torch.compile enabled")
         # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the
         # choice is fixed at startup, not on the first request.
         self._decode_dtype()
+        self._fast_step = None
+        if fast:
+            self._fast_step = _wan_vae().DecoderStep(vae, compile=self._decode_compiled, deterministic=True)
+            logger.info("Cosmos3 VAE decode: video clips on the shared Wan VAE decoder (channels-last), "
+                        "images through the stock decode")
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
@@ -2840,6 +2924,14 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""
         vae_dtype = self._decode_dtype()
         z = self._vae_input(latents)
+        # one latent (an image) is faster through the stock decode (24 vs 36 ms on an H200)
+        if self._fast_step is not None and z.shape[2] > 1:
+            wan_vae = _wan_vae()
+            with torch.autocast(device_type="cuda", enabled=False):
+                decoded = wan_vae.decode_causal(
+                    self.vae, z, wan_vae.new_feat_cache(self.vae), self._fast_step, clip_start=True,
+                )
+            return self._to_uint8(decoded)
         with torch.autocast(device_type="cuda", enabled=False):
             if (
                 self._decode_compiled
