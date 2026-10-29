@@ -5,10 +5,10 @@
    "elems_per_thread": 8,
    "impl": "triton",
    "rows_per_program": 1,
-   "waves_per_eu": 0
+   "waves_per_eu": 4
   },
   "prefill": {
-   "elems_per_thread": 4,
+   "elems_per_thread": 8,
    "impl": "triton",
    "rows_per_program": 2,
    "waves_per_eu": 0
@@ -17,12 +17,15 @@
  "kernel": "fused_add_rms_norm",
  "product": "mi325x",
  "provenance": {
-  "harness": "benchmark.kernels.search --spec fused_add_rms_norm, one MI325X VF GPU, one run per cell",
-  "job": "45",
-  "kernel": "row loop (one row of the tile at a time)",
+  "harness": "benchmark.kernels.search, one MI325X VF GPU, one run per cell",
+  "jobs": [
+   "45",
+   "83"
+  ],
   "margin": 0.02,
-  "sha": "e82e18819",
-  "stack": "torch-2.12.1_rocm7.2-hip-7.2.53211-triton-3.7.1"
+  "note": "the 2-D tile kernel; job 83 searched every knob point on each shape",
+  "stack": "torch-2.12.1_rocm7.2-hip-7.2.53211-triton-3.7.1",
+  "store": "amd/results/innovation/f2-kernels/store/gfx942/mi325x"
  },
  "shapes": {
   "hidden1024-rows1": {
@@ -35,24 +38,24 @@
    "elems_per_thread": 2,
    "impl": "triton",
    "rows_per_program": 1,
-   "waves_per_eu": 1
+   "waves_per_eu": 4
   },
   "hidden1024-rows16": {
    "elems_per_thread": 2,
    "impl": "triton",
    "rows_per_program": 1,
-   "waves_per_eu": 2
+   "waves_per_eu": 4
   },
   "hidden1024-rows4": {
    "elems_per_thread": 2,
    "impl": "triton",
    "rows_per_program": 1,
-   "waves_per_eu": 2
+   "waves_per_eu": 1
   },
   "hidden1024-rows512": {
    "elems_per_thread": 8,
    "impl": "triton",
-   "rows_per_program": 1,
+   "rows_per_program": 4,
    "waves_per_eu": 1
   },
   "hidden1024-rows64": {
@@ -61,35 +64,23 @@
    "rows_per_program": 1,
    "waves_per_eu": 2
   },
-  "hidden2048-rows1": {
-   "elems_per_thread": 8,
-   "impl": "triton",
-   "rows_per_program": 1,
-   "waves_per_eu": 2
-  },
   "hidden2048-rows128": {
-   "elems_per_thread": 4,
-   "impl": "triton",
-   "rows_per_program": 1,
-   "waves_per_eu": 1
-  },
-  "hidden2048-rows16": {
-   "elems_per_thread": 8,
-   "impl": "triton",
-   "rows_per_program": 1,
-   "waves_per_eu": 4
-  },
-  "hidden2048-rows2048": {
-   "elems_per_thread": 8,
+   "elems_per_thread": 16,
    "impl": "triton",
    "rows_per_program": 2,
-   "waves_per_eu": 4
+   "waves_per_eu": 1
+  },
+  "hidden2048-rows2048": {
+   "elems_per_thread": 32,
+   "impl": "triton",
+   "rows_per_program": 8,
+   "waves_per_eu": 2
   },
   "hidden2048-rows4": {
    "elems_per_thread": 8,
    "impl": "triton",
    "rows_per_program": 1,
-   "waves_per_eu": 4
+   "waves_per_eu": 0
   },
   "hidden2048-rows512": {
    "elems_per_thread": 8,
@@ -97,35 +88,47 @@
    "rows_per_program": 1,
    "waves_per_eu": 2
   },
-  "hidden2048-rows64": {
-   "elems_per_thread": 8,
-   "impl": "triton",
-   "rows_per_program": 1,
-   "waves_per_eu": 4
-  },
   "hidden4096-rows1": {
    "elems_per_thread": 8,
    "impl": "triton",
    "rows_per_program": 1,
    "waves_per_eu": 1
   },
-  "hidden4096-rows2048": {
-   "elems_per_thread": 16,
-   "impl": "triton",
-   "rows_per_program": 4,
-   "waves_per_eu": 2
-  },
-  "hidden4096-rows4": {
+  "hidden4096-rows128": {
    "elems_per_thread": 8,
    "impl": "triton",
    "rows_per_program": 1,
    "waves_per_eu": 1
   },
-  "hidden4096-rows512": {
+  "hidden4096-rows16": {
    "elems_per_thread": 8,
    "impl": "triton",
    "rows_per_program": 1,
-   "waves_per_eu": 4
+   "waves_per_eu": 0
+  },
+  "hidden4096-rows2048": {
+   "elems_per_thread": 32,
+   "impl": "triton",
+   "rows_per_program": 4,
+   "waves_per_eu": 0
+  },
+  "hidden4096-rows4": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 2
+  },
+  "hidden4096-rows512": {
+   "elems_per_thread": 32,
+   "impl": "triton",
+   "rows_per_program": 4,
+   "waves_per_eu": 1
+  },
+  "hidden4096-rows64": {
+   "elems_per_thread": 8,
+   "impl": "triton",
+   "rows_per_program": 1,
+   "waves_per_eu": 0
   }
  }
 }
