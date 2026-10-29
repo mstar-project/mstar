@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from mstar.model.components.diffusion.exact_norm import exact_rms_norm
+from mstar.utils import knobs
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,14 @@ def compile_transformer_forward(
 
     ``recompile_limit`` replaces the process-wide limit for this forward only, where ``torch.compile`` takes it
     (torch 2.12 and up); an older torch gets the process-wide limit raised to it instead, since the keyword would
-    raise at load. Past the limit a frame silently runs uncompiled, inside the captured graphs too."""
+    raise at load. Past the limit a frame silently runs uncompiled, inside the captured graphs too.
+
+    The ``dit_exact_ops`` knob (off by default on AMD GPUs) drops ``exact_ops``, so a model
+    config can keep its CUDA setting while each platform decides whether it applies."""
+    if exact_ops and not knobs.dit_exact_ops():
+        logger.info("compile_exact_ops %s not applied: the dit_exact_ops knob is off (`knobs: dit_exact_ops: "
+                    "true` keeps those modules eager)", exact_ops)
+        exact_ops = False
     types = exact_op_types(exact_ops)
     if types:
         kept = exclude_from_compile(transformer, types)

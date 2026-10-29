@@ -301,8 +301,13 @@ class RocmPlatform(Platform):
         return _torch_pci_address(device_index)
 
     def knob_defaults(self) -> dict[str, str]:
-        # the AMD-specific knob defaults, as measured on MI300X / MI325X
-        return {}
+        # A DiT's eager norms (compile_exact_ops) exist to match cuBLAS/cuDNN
+        # reference output bit for bit. hipBLASLt picks GEMM kernels per M, so
+        # that match does not hold here and the bar is the reference's own
+        # cross-seed spread; the eager norms only cost fusion (one graph break
+        # each, 137 on FLUX.2 klein 9B).
+        return {"dit_exact_ops": "0"}
+
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
     ) -> dict[str, str]:
