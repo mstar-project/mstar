@@ -3,23 +3,22 @@
 A linear with up to 16 rows is a weight stream. AITER's ``wvSpltK`` reads the
 weight once across every CU and beats both hipBLASLt (10-30% on MI300X) and
 inductor's own one-row GEMV reduction; from four rows on it loses, badly once
-K * rows outgrows its LDS tile. ``mstar::decode_gemv`` serves 1-16 rows on a
-weight stream in Triton (``mstar.kernels.triton.gemv``) or HIP
-(``mstar.kernels.hip.gemv``), and ``mstar::decode_gemv_silu_mul`` also folds a
-gated MLP's ``silu(gate) * up`` into the gate/up projection's store.
+K * rows outgrows its LDS tile. ``mstar::decode_gemv``, a Triton weight
+stream with split-K (``mstar.kernels.triton.gemv``), serves 1-16 rows, and
+``mstar::decode_gemv_silu_mul`` also folds a gated MLP's ``silu(gate) * up``
+into the gate/up projection's store.
 
 Inductor can't pick these, so two graph passes swap such linears for them:
 one before inductor's decompositions (a one-row ``mm`` becomes a reduction
 there, and the gated activation is still one ``mul`` of a ``silu``), one after
 (``mm``/``addmm`` that only appear in the lowered graph). Which kernel serves
 a shape is the device's tuned ``decode_gemv`` config (``mstar.kernels.
-configs``): ``"aiter"``, ``"triton"``, ``"hip"`` or ``"hipblaslt"`` (left to
-inductor).
+configs``): ``"aiter"``, ``"triton"`` or ``"hipblaslt"`` (left to inductor).
 Without one, 1-2 row linears go to AITER and the rest stay on hipBLASLt, as
 before the Triton kernel. ``RocmPlatform.inductor_overrides`` installs the
 passes for buckets of up to ``DECODE_GEMV_MAX_ROWS`` tokens only.
 
-AITER, Triton and the HIP build load on first call, never at module import.
+AITER and Triton are imported on first call, never at module import.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ SKINNY_MAX_ROWS = 2
 DECODE_GEMV_MAX_ROWS = 16
 # what AITER's prebuilt module_custom serves
 _ARCHS = ("gfx90a", "gfx942", "gfx950")
-IMPLS = ("aiter", "triton", "hip", "hipblaslt")
+IMPLS = ("aiter", "triton", "hipblaslt")
 _DTYPES = (torch.bfloat16, torch.float16)
 # shapes already logged, so a server log lists what the pass covers once each
 _logged: set[tuple] = set()
@@ -125,20 +124,13 @@ _ROW_CLASSES = (
 
 
 def _decode_kernel(op: KernelOp, silu_mul: bool, rows: int, n: int, k: int, dtype: torch.dtype):
-    """The kernel (HIP or Triton, at its knobs) the device's config names for
-    this shape, as a callable with the op's signature. HIP serves bf16 only."""
+    """The Triton kernel at the knobs the device's config names for this
+    shape, as a callable with the op's signature."""
     from mstar.kernels.triton import gemv as triton_gemv
 
     entry = op.config({"rows": rows, "n": n, "k": k}) or {}
-    knobs = {name: value for name, value in entry.items() if name != "impl"}
-    if entry.get("impl") == "hip" and dtype == torch.bfloat16:
-        from mstar.kernels.hip import gemv as hip_gemv
-
-        kernel, knobs = (hip_gemv.decode_gemv_silu_mul if silu_mul else hip_gemv.decode_gemv), {
-            **hip_gemv.DEFAULT_KNOBS, **knobs}
-    else:
-        kernel = triton_gemv.decode_gemv_silu_mul if silu_mul else triton_gemv.decode_gemv
-        knobs = {**triton_gemv.DEFAULT_KNOBS, **{k: v for k, v in knobs.items() if k in triton_gemv.KNOBS}}
+    knobs = {**triton_gemv.DEFAULT_KNOBS, **{k: v for k, v in entry.items() if k in triton_gemv.KNOBS}}
+    kernel = triton_gemv.decode_gemv_silu_mul if silu_mul else triton_gemv.decode_gemv
     return functools.partial(kernel, knobs=knobs)
 
 
@@ -224,8 +216,7 @@ def _have_aiter() -> bool:
 
 def gemv_impl(rows: int, n: int, k: int) -> str:
     """Which kernel serves ``[rows, k] @ [n, k].T`` here: ``"aiter"``,
-    ``"triton"``, ``"hip"`` or ``"hipblaslt"``, from the device's
-    ``decode_gemv`` config."""
+    ``"triton"`` or ``"hipblaslt"``, from the device's ``decode_gemv`` config."""
     entry = DECODE_GEMV.config({"rows": rows, "n": n, "k": k})
     if entry is None:
         impl = "aiter" if rows <= SKINNY_MAX_ROWS else "hipblaslt"
@@ -240,7 +231,7 @@ def fuses_silu_mul(rows: int, n: int, k: int) -> bool:
     """Whether a gated MLP's gate/up projection of stacked width ``n`` and its
     ``silu(gate) * up`` run as one ``decode_gemv_silu_mul`` here."""
     entry = DECODE_GEMV_SILU_MUL.config({"rows": rows, "n": n, "k": k})
-    return entry is not None and entry.get("impl") in ("triton", "hip")
+    return entry is not None and entry.get("impl") == "triton"
 
 
 def _val(node):
@@ -298,7 +289,7 @@ def _op_for(x, weight, bias):
     impl = gemv_impl(*shape)
     if impl == "aiter":
         return torch.ops.mstar.skinny_gemm_any if shape[0] == 1 else torch.ops.mstar.skinny_gemm
-    if impl in ("triton", "hip"):
+    if impl == "triton":
         return torch.ops.mstar.decode_gemv
     return None
 
