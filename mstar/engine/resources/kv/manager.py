@@ -42,6 +42,7 @@ from mstar.engine.resources.kv.plan import (
     SequenceView,
     build_paged_indptrs,
     group_by_plan_label,
+    packed_token_locations,
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
@@ -578,7 +579,7 @@ class KVManager(AttentionResource):
 
         # (slot, label) -> KVPlanState, sized for the largest capture bucket
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
-        # copy-only H2D into those, see `_stage_decode_plan_state`
+        # copy-only H2D into those, see `_setup_plan_states`
         self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
         # the plan cache (`_fast_decode_plan`): bumped by everything that
@@ -1927,73 +1928,6 @@ class KVManager(AttentionResource):
             ))
         return views
 
-    def _compute_plan_state(
-        self, cuda_indptrs: PagedIndptrs,
-        total_tokens: int
-    ) -> KVPlanState:
-        qo_indptr = cuda_indptrs.qo_indptr
-        paged_kv_indptr = cuda_indptrs.paged_kv_indptr
-        paged_kv_last_page_len = cuda_indptrs.paged_kv_last_page_len
-        paged_kv_indices = cuda_indptrs.paged_kv_indices
-
-        # Compute per-token page and offset for vectorized KV writes
-        n_req = qo_indptr.shape[0] - 1
-        starts = qo_indptr[:-1].to(torch.int32)
-        lens = (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32)
-
-        # Pages/lengths AFTER append
-        num_pages_after = (
-            paged_kv_indptr[1:] - paged_kv_indptr[:-1]
-        ).to(torch.int32)
-        kv_len_after = (
-            (num_pages_after - 1) * self.kv_cache.page_size + paged_kv_last_page_len
-        )
-
-        # Flatten to per-token indices
-        # output_size keeps repeat_interleave from syncing to read `lens`
-        seg = torch.repeat_interleave(
-            torch.arange(n_req, dtype=torch.int32, device=self._device), lens,
-            output_size=total_tokens
-        )
-        intra = torch.arange(
-            total_tokens, dtype=torch.int32, device=self._device
-        ) - torch.repeat_interleave(starts, lens, output_size=total_tokens)
-
-        # Absolute KV position per token
-        start_new = kv_len_after[seg] - lens[seg]
-        g = start_new + intra
-
-        # Map to page + offset
-        page_off = torch.div(g, self.kv_cache.page_size, rounding_mode="floor").to(
-            torch.int32
-        )
-        off_in_page = (g - page_off * self.kv_cache.page_size).to(torch.int32)
-        abs_page_ptr = paged_kv_indptr[:-1][seg] + page_off
-
-        return KVPlanState(
-            token_to_page=paged_kv_indices[abs_page_ptr].to(torch.long),
-            token_to_cache=off_in_page.to(torch.long),
-            total_tokens=total_tokens
-        )
-
-    def _decode_plan_state(self, views: list[SequenceView]) -> KVPlanState:
-        """Write addressing for a step appending one token per request.
-
-        The packed path needs the indptrs on device and ~a dozen kernels to
-        unpack them per token. A decode step's slot is just the end of each
-        stream, so build it in the same CPU pass the views came from and send
-        it over as one H2D.
-        """
-        pages, offsets = self._decode_locations(views)
-        locations = torch.tensor(
-            [pages, offsets], dtype=torch.long
-        ).to(self._device, non_blocking=True)
-        return KVPlanState(
-            token_to_page=locations[0],
-            token_to_cache=locations[1],
-            total_tokens=len(views),
-        )
-
     def _decode_locations(
         self, views: list[SequenceView],
     ) -> tuple[list[int], list[int]]:
@@ -2007,63 +1941,43 @@ class KVManager(AttentionResource):
         offsets = [(view.last_page_len(page_size) or page_size) - 1 for view in views]
         return pages, offsets
 
-    def _stage_decode_plan_state(
-        self, views: list[SequenceView] | None, static_state: KVPlanState,
-        capture_len: int, pages=None, offsets=None,
-    ) -> KVPlanState:
-        """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
-        tensor; rows past the real tokens get SINK_PAGE / 0."""
-        if pages is None or offsets is None:
-            pages, offsets = self._decode_locations(views)
-        self._plan_stager.copy_(
-            static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
-        )
-        self._plan_stager.copy_(
-            static_state.token_to_cache[:capture_len], offsets, pad_value=0,
-        )
-        static_state.total_tokens = len(pages)
-        return static_state
-
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
         ctx: StepContext, lease,
     ):
+        """Each label's write addressing (token -> page, offset) in one pinned
+        H2D per buffer: a captured step's straight into its static buffers,
+        padded past the real tokens with the sink page (the graph scatters
+        there too), an eager step's into fresh ones. This runs in the pre-plan
+        beside a live graph, where a device-side copy, fill or index kernel
+        would slow it (see mstar.utils.h2d)."""
         for label, indptrs in plan_output.items():
-            if indptrs.is_decode and lease is not None:
-                # Straight into the captured buffers in one H2D per buffer:
-                # this runs in the pre-plan beside a live graph, where a
-                # device-side copy + fill would slow it (see mstar.utils.h2d).
+            if indptrs.is_decode:
                 # a cached plan hands its locations; reading `views` there
                 # would build them eagerly and defeat the lazy builder
-                cached = indptrs.decode_pages is not None
-                plan_state = self._stage_decode_plan_state(
-                    None if cached else indptrs.views,
-                    self._static_plan_state(lease.slot, label),
-                    lease.bucket.num_tokens,
-                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
-                )
-                if ctx.is_preplan:
-                    self._preplan_states[label] = plan_state
+                if indptrs.decode_pages is not None:
+                    pages, offsets = indptrs.decode_pages, indptrs.decode_offsets
                 else:
-                    self._current_plan_states[label] = plan_state
-                continue
-            if indptrs.is_decode:
-                plan_state = self._decode_plan_state(indptrs.views)
+                    pages, offsets = self._decode_locations(indptrs.views)
             else:
                 indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
-                plan_state = self._compute_plan_state(
-                    indptrs.cuda_indptrs,
-                    total_tokens=indptrs.get_total_len()
-                )
+                pages, offsets = packed_token_locations(indptrs.cpu_indptrs, self.kv_cache.page_size)
             if lease is not None:
-                static_state = self._static_plan_state(lease.slot, label)
-                static_state.copy_(plan_state, lease.bucket.num_tokens)
-                plan_state = static_state
+                plan_state = self._static_plan_state(lease.slot, label)
+                n_capture = lease.bucket.num_tokens
+                self._plan_stager.copy_(plan_state.token_to_page[:n_capture], pages, pad_value=SINK_PAGE)
+                self._plan_stager.copy_(plan_state.token_to_cache[:n_capture], offsets, pad_value=0)
+                plan_state.total_tokens = len(pages)
+            else:
+                locations = torch.empty((2, len(pages)), dtype=torch.long, device=self._device)
+                self._plan_stager.copy_(locations.view(-1), np.concatenate([pages, offsets]))
+                plan_state = KVPlanState(
+                    token_to_page=locations[0], token_to_cache=locations[1], total_tokens=len(pages),
+                )
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
             else:
                 self._current_plan_states[label] = plan_state
-
 
     def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
         return KVPlanOutput(

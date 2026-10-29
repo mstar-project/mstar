@@ -147,6 +147,23 @@ def build_paged_indptrs(
     )
 
 
+def packed_token_locations(indptrs: PagedIndptrs, page_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Each new token's (page, offset-in-page) for a packed step, from the host
+    index arrays: row ``i`` appends ``qo_indptr[i + 1] - qo_indptr[i]`` tokens
+    at the end of its pages. The int64 arrays go to the device in one copy,
+    where the same math on device tensors is a dozen small kernels."""
+    qo = indptrs.qo_indptr.numpy().astype(np.int64)
+    kv = indptrs.paged_kv_indptr.numpy().astype(np.int64)
+    last = indptrs.paged_kv_last_page_len.numpy().astype(np.int64)
+    lens = np.diff(qo)
+    kv_len_after = (np.diff(kv) - 1) * page_size + last
+    seg = np.repeat(np.arange(len(lens)), lens)
+    pos = kv_len_after[seg] - lens[seg] + np.arange(qo[-1]) - qo[:-1][seg]
+    page_off, offsets = np.divmod(pos, page_size)
+    pages = indptrs.paged_kv_indices.numpy()[kv[:-1][seg] + page_off].astype(np.int64)
+    return pages, offsets
+
+
 def _int32_tensor(values: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.array(values, dtype=np.int32))
 
