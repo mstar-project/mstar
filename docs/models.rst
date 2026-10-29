@@ -619,11 +619,12 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
-- Numerics: the code predictor's residual adds fold into the next RMSNorm
-  (FlashInfer's fused add + norm) and its attention is a Triton kernel
-  (``cp_attention``), neither bit-exact with the unfused ops. Its 15 depth
-  steps feed each sampled code into the next, so small differences can change
-  later codes at near-ties.
+- Numerics: the code predictor (shared with Qwen3-TTS, see its notes) runs
+  each projection with its RMSNorm folded in and its residual add in the same
+  Triton kernel (``cp_linear``), and its attention as another (``cp_attend``),
+  neither bit-exact with the unfused ops. Its 15 depth steps feed each sampled
+  code into the next, so small differences can change later codes at
+  near-ties.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another.
@@ -718,12 +719,18 @@ Qwen3-TTS notes
   It is the same component as Qwen3-Omni's code predictor
   (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``):
   the depth sequence opens with the Talker hidden state in a one-token pass
-  and takes one token per group after it, each layer's q/k norm, RoPE and KV write
-  run in one launch and attention in ``cp_attention``, and the frame's 16 codec
-  embeddings are summed in one launch per group. Each Talker keeps the sum it
-  had before the two shared the component: Qwen3-TTS accumulates in the model
-  dtype, rounding after every add (the reference sums in fp32 and rounds once),
-  and Qwen3-Omni in fp32, rounded once.
+  and takes one token per group after it, five launches a layer. Each
+  projection is one ``cp_linear`` launch with the RMSNorm folded into its
+  weight (a row scale from partial sums of squares its producer recorded) and
+  the residual add or the SwiGLU in its epilogue; the q/k norm, RoPE, KV write
+  and attention are one ``cp_attend`` launch, and the frame's 16 codec
+  embeddings are summed in one launch per group. Where the predictor projects
+  its inputs (``small_to_mtp_projection``, the 1.7B), every embedding table a
+  later depth step reads is kept projected. None of this is bit-exact with the
+  unfused ops: the sampled residual codes can differ at near-ties. Each Talker
+  keeps the sum it had before the two shared the component: Qwen3-TTS
+  accumulates in the model dtype, rounding after every add (the reference sums
+  in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.

@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.model.components.code_predictor_kernels import cp_attention
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.utils.attention import apply_rope_pos_ids
 
@@ -119,41 +118,6 @@ def test_fused_code_predictor_rope_matches_checkpoint_formula():
 
     torch.testing.assert_close(actual_q, expected_q, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(actual_k, expected_k, rtol=1e-2, atol=2e-2)
-
-
-@pytest.mark.parametrize("cache_len", [1, 8, 16])
-def test_code_predictor_decode_attention_matches_sdpa(cache_len: int):
-    generator = torch.Generator(device="cuda:0").manual_seed(1234 + cache_len)
-    q = torch.randn(
-        2, 1, 16, 128,
-        dtype=torch.bfloat16,
-        device="cuda:0",
-        generator=generator,
-    )
-    k_cache = torch.randn(
-        2, 16, 8, 128,
-        dtype=torch.bfloat16,
-        device="cuda:0",
-        generator=generator,
-    )
-    v_cache = torch.randn(
-        2, 16, 8, 128,
-        dtype=torch.bfloat16,
-        device="cuda:0",
-        generator=generator,
-    )
-
-    expected = torch.nn.functional.scaled_dot_product_attention(
-        q.transpose(1, 2),
-        k_cache[:, :cache_len].transpose(1, 2),
-        v_cache[:, :cache_len].transpose(1, 2),
-        is_causal=False,
-        enable_gqa=True,
-    ).transpose(1, 2)
-    # the query is depth position cache_len - 1, attending over every position up to it
-    actual = cp_attention(q, k_cache, v_cache, cache_len - 1)
-
-    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
 
 
 def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):

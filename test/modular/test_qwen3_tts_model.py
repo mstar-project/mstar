@@ -1365,54 +1365,43 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
     _assert_same_tensor(capture["suppress_eos"], torch.ones(3, dtype=torch.bool))
 
 
-class _IdentityNorm(torch.nn.Module):
-    """A CPU stand-in for the FlashInfer RMSNorm, fused residual add included:
-    like FlashInfer's, the add updates the residual stream in place."""
-
-    def forward(self, hidden_states):
-        return hidden_states.clone()
-
-    def forward_residual(self, hidden_states, residual, comm_group=None):
-        if residual is None:
-            return hidden_states.clone(), hidden_states
-        residual.add_(hidden_states)
-        return residual.clone(), residual
-
-
 def _fake_cp_kernels(monkeypatch, calls=None):
-    """The code predictor's Triton kernels on CPU: the prologue writes k and v
-    into the cache without norm or rope, and attention is SDPA over the depth
-    positions so far."""
+    """The code predictor's attention kernel on CPU: k and v written into the
+    cache without norm or rope, and SDPA over the depth positions so far."""
     import mstar.model.components.code_predictor_kernels as kernels
 
-    def prologue(qkv, wq, wk, kv_layer, cache_pos, seq_len, eps_q, eps_k, theta, hq, hkv, d):
-        k, v = qkv[:, hq * d:].view(-1, seq_len, 2, hkv, d).unbind(2)
+    def attend(qkv, wq, wk, kv_layer, cache_pos, seq_len, eps_q, eps_k, theta, hq, hkv, d):
+        q, k, v = qkv.view(-1, seq_len, hq + 2 * hkv, d).split((hq, hkv, hkv), dim=2)
         kv_layer[:, 0, cache_pos:cache_pos + seq_len] = k
         kv_layer[:, 1, cache_pos:cache_pos + seq_len] = v
-
-    def attention(q, k_cache, v_cache, cache_pos):
-        n = cache_pos + q.shape[1]
+        n = cache_pos + seq_len
         if calls is not None:
-            calls.append((q.shape, k_cache.shape, v_cache.shape, n))
-        return torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(1, 2), k_cache[:, :n].transpose(1, 2), v_cache[:, :n].transpose(1, 2), enable_gqa=True,
+            calls.append((q.shape, kv_layer[:, 0].shape, kv_layer[:, 1].shape, n))
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), kv_layer[:, 0, :n].transpose(1, 2), kv_layer[:, 1, :n].transpose(1, 2),
+            enable_gqa=True,
         ).transpose(1, 2)
+        return out.reshape(-1, hq * d)
 
-    monkeypatch.setattr(kernels, "cp_qk_norm_rope_kv_write", prologue)
-    monkeypatch.setattr(kernels, "cp_attention", attention)
+    monkeypatch.setattr(kernels, "cp_attend", attend)
 
 
 def _cpu_predictor(monkeypatch, config=None, bs=2, calls=None):
-    """A code predictor with identity norms over the fake kernels, and one
-    depth step's input for ``bs`` rows."""
+    """A consolidated code predictor over the fake attention kernel, and one
+    depth step's Talker-width input for ``bs`` rows."""
     config = config or _tiny_model_config()
     predictor = _code_predictor(config)
-    for layer in predictor.model.layers:
-        layer.input_layernorm = _IdentityNorm()
-        layer.post_attention_layernorm = _IdentityNorm()
-    predictor.model.norm = _IdentityNorm()
+    predictor.consolidate_stacked_weights()
     _fake_cp_kernels(monkeypatch, calls)
-    return predictor, torch.randn(bs, 1, config.talker.hidden_size)
+    return predictor, torch.randn(bs, config.talker.hidden_size)
+
+
+def _first_step(predictor, x, head=0):
+    """Position 0 of the depth loop for ``x``: bind, project, run the layers."""
+    partials = predictor.depth.scratch(x)
+    predictor.depth.bind_step(0)
+    step_in, n_part = predictor.depth_input(x, partials)
+    return predictor.depth_step(step_in, partials, n_part, head=head)
 
 
 def test_qwen3_tts_code_predictor_projects_wider_talker_inputs(monkeypatch):
@@ -1436,34 +1425,32 @@ def test_qwen3_tts_code_predictor_projects_wider_talker_inputs(monkeypatch):
     assert {"small_to_mtp_projection.weight", "small_to_mtp_projection.bias"} <= set(
         dict(predictor.named_parameters())
     )
+    # every embedding table a later depth step reads, already projected
+    assert [tuple(t.shape) for t in predictor.input_tables] == [(32, 16)] * (wide.talker.num_code_groups - 2)
 
-    predictor.depth.bind_step(0)
-    out = predictor.forward_depth_unrolled(x)
-    assert out.shape == (2, 1, 16)
+    out = _first_step(predictor, x)
+    assert out.shape == (2, wide.talker.code_predictor.vocab_size)
 
 
 def test_qwen3_tts_code_predictor_leaves_its_input_alone(monkeypatch):
-    """The fused add + norm updates the residual stream in place, and on 0.6B
-    the predictor's input projection is the identity: the stream must not be
-    the caller's tensor, which the Talker's captured step reads again."""
+    """A step updates its residual stream in place, and on 0.6B the
+    predictor's input projection is the identity: the stream must not be the
+    caller's tensor, which the Talker's captured step reads again."""
     predictor, inputs = _cpu_predictor(monkeypatch)
     assert isinstance(predictor.small_to_mtp_projection, torch.nn.Identity)
     before = inputs.clone()
-    predictor.depth.bind_step(0)
-    predictor.forward_depth_unrolled(inputs)
+    _first_step(predictor, inputs)
     assert torch.equal(inputs, before)
 
 
 def test_qwen3_tts_code_predictor_uses_the_shared_kernels(monkeypatch):
-    # FlashInfer RMSNorm and the Triton kernels are CUDA-only, so replace them
-    # without changing attention geometry.
+    # cp_attend is CUDA-only, so replace it without changing attention geometry.
     config, calls = _tiny_model_config(), []
     predictor, x = _cpu_predictor(monkeypatch, config, bs=1, calls=calls)
-    predictor.depth.bind_step(0)
-    output = predictor.forward_depth_unrolled(x)
+    output = _first_step(predictor, x)
 
     query_shape, key_shape, value_shape, cache_len = calls[0]
-    assert output.shape == (1, 1, config.talker.hidden_size)
+    assert output.shape == (1, config.talker.code_predictor.vocab_size)
     assert query_shape[2] == config.talker.code_predictor.num_attention_heads
     assert key_shape[2] == config.talker.code_predictor.num_key_value_heads
     assert value_shape[2] == config.talker.code_predictor.num_key_value_heads
@@ -1476,10 +1463,9 @@ def test_code_predictor_depth_step_is_bound_once_per_pass(monkeypatch):
     """A pass whose step was not bound must fail, not write and attend over
     the previous step's depth positions."""
     predictor, x = _cpu_predictor(monkeypatch)
-    predictor.depth.bind_step(0)
-    predictor.forward_depth_unrolled(x)
+    _first_step(predictor, x)
     with pytest.raises(ValueError, match="bind_step"):
-        predictor.forward_depth_unrolled(x)
+        predictor.depth_step(x.clone(), predictor.depth.partials)
 
 
 def test_code_predictor_attention_keeps_its_depth_kv_when_the_node_binds(monkeypatch):
@@ -1488,8 +1474,7 @@ def test_code_predictor_attention_keeps_its_depth_kv_when_the_node_binds(monkeyp
     predictor, x = _cpu_predictor(monkeypatch)
     NodeSubmodule.bind_node_resources(predictor, {"attn": object(), "kv": object(), "rope": object()})
     assert all(layer.self_attn.attend is predictor.depth for layer in predictor.model.layers)
-    predictor.depth.bind_step(0)
-    predictor.forward_depth_unrolled(x)
+    _first_step(predictor, x)
 
 
 @torch.compiler.disable
@@ -1505,29 +1490,26 @@ class _OpaqueKernel:
 
 
 @torch.compiler.disable
-def _fake_embed_accumulate(tokens, weight, emb_sum, codes, group):
+def _fake_embed_accumulate(tokens, weight, emb_sum, codes, group, inputs=None, partials=None):
     """``cp_embed_accumulate`` on CPU."""
     codes[:, group] = tokens
     emb = weight[tokens]
     emb_sum.add_(emb)
-    return emb
+    return emb if inputs is None else inputs[tokens]
 
 
 def _depth_loop(monkeypatch, groups=4):
-    """A code predictor of ``groups`` codec groups over the kernels' opaque
-    launches, and ``(fn, args)``: its depth loop over one frame."""
+    """A consolidated code predictor of ``groups`` codec groups over the
+    attention kernel's opaque launch, and ``(fn, args)``: its depth loop over
+    one frame."""
     import mstar.model.components.code_predictor_kernels as kernels
 
-    monkeypatch.setattr(kernels, "_cp_qk_norm_rope_kv_kernel", _OpaqueKernel())
-    monkeypatch.setattr(kernels, "_cp_attn_kernel", _OpaqueKernel())
+    monkeypatch.setattr(kernels, "_cp_attend_kernel", _OpaqueKernel())
     monkeypatch.setattr(kernels, "cp_embed_accumulate", _fake_embed_accumulate)
     config = _tiny_model_config()
     config.talker.code_predictor.num_code_groups = groups
     predictor = _code_predictor(config)
-    for layer in predictor.model.layers:
-        layer.input_layernorm = _IdentityNorm()
-        layer.post_attention_layernorm = _IdentityNorm()
-    predictor.model.norm = _IdentityNorm()
+    predictor.consolidate_stacked_weights()
     bs, hidden = 2, config.talker.hidden_size
 
     def depth_loop(last_hidden, layer0_codes, layer0_embed):
@@ -1544,16 +1526,6 @@ def test_code_predictor_depth_loop_compiles_no_frame_per_position(monkeypatch, d
     _, fn4, args4 = _depth_loop(monkeypatch, groups=5)
     _, fn2, args2 = _depth_loop(monkeypatch, groups=3)
     assert dynamo_counts(fn4, *args4).compiles == dynamo_counts(fn2, *args2).compiles
-
-
-def test_code_predictor_attention_projections_compile(monkeypatch, dynamo_counts):
-    """``DepthKV`` runs eager (it holds the depth ints), but the qkv and o
-    projections around it must compile: at -O1 Inductor turns a one-row GEMM
-    into a fused reduction, which eager cuBLAS misses."""
-    predictor, fn, args = _depth_loop(monkeypatch)
-    attn = predictor.model.layers[0].self_attn
-    traced = dynamo_counts(fn, *args).traced
-    assert {attn.qkv_proj.weight.data_ptr(), attn.o_proj.weight.data_ptr()} <= traced
 
 
 def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
