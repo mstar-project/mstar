@@ -54,8 +54,10 @@ class DepthDecoder(nn.Module):
     def num_code_groups(self) -> int:
         return len(self.model.codec_embedding) + 1
 
+    @torch.compiler.disable
     def depth_kv_cache(self, batch_size: int, max_batch_size: int) -> torch.Tensor:
-        """The KV scratch for ``batch_size`` rows, allocated once for ``max_batch_size``."""
+        """The KV scratch for ``batch_size`` rows, allocated once for ``max_batch_size``
+        (eagerly, so a compiled forward never owns it)."""
         if self._depth_kv is None:
             attn = self.model.layers[0].self_attn
             weight = attn.qkv_proj.weight
