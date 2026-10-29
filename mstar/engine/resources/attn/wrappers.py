@@ -420,9 +420,9 @@ class FlashInferMixedWrapper:
     the decode planner does, and its kernel runs the one-token rows as
     prefill queries. The engine orders a split walk's rows decode first
     (``CombinedSplit``), so the step's leading run of one-token rows is its
-    first tokens, row i token i. The decode wrapper takes the bucket's first
+    first tokens, row i token i. The decode half takes the bucket's first
     ``batch_size`` tokens as its rows (a row of the run attends its own pages;
-    any other reads one token of the sink page, and its output is dropped),
+    any other reads the sink page, and its output is dropped),
     and the prefill wrapper takes every token: the run as one row on the sink
     page, at most ``max_prefill_rows`` prompt rows, and a sink-page tail row
     over the bucket's padding. Both read the step's queries in place, at
@@ -460,11 +460,25 @@ class FlashInferMixedWrapper:
             num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
             head_dim=head_dim, page_size=page_size, device=device, backend=backend,
         )
-        self._decode = FlashInferDecodeWrapper(
-            workspace_buffer=decode_workspace, batch_size=batch_size,
-            max_num_pages=max_num_pages, accelerator_graph=True,
-            use_tensor_cores=use_tensor_cores, **kv,
-        )
+        self._tensor_cores = use_tensor_cores
+        if use_tensor_cores:
+            # The kernel FlashInfer's tensor-core decode runs (FA2 paged
+            # prefill), planned with this step's qo_indptr: its KV split budget
+            # (2 CTAs per SM over the KV heads) charges each row with a query,
+            # so the rows outside the run take none, where the decode wrapper
+            # gives each one token. One row carries the outside rows' tokens.
+            self._decode = FlashInferPrefillWrapper(
+                workspace_buffer=decode_workspace, batch_size=batch_size,
+                max_total_tokens=batch_size, max_num_pages=max_num_pages,
+                accelerator_graph=True,
+                **{**kv, "backend": "fa2" if backend == "auto" else backend},
+            )
+        else:
+            self._decode = FlashInferDecodeWrapper(
+                workspace_buffer=decode_workspace, batch_size=batch_size,
+                max_num_pages=max_num_pages, accelerator_graph=True,
+                use_tensor_cores=False, **kv,
+            )
         # a row ahead of the prompt rows takes the decode run's tokens, and one
         # behind them the bucket's padding (see `plan`)
         self._prefill = FlashInferPrefillWrapper(
@@ -582,13 +596,29 @@ class FlashInferMixedWrapper:
         )
         self._num_rows = rows
 
-        self._decode.plan(
-            paged_kv_indptr=self._pin("d_indptr", d_indptr, torch.int32),
-            paged_kv_indices=self._pin("d_indices", d_indices, torch.int32),
-            paged_kv_last_page_len=self._pin("d_last", d_last, torch.int32),
-            kv_lens=self._pin("d_lens", d_lens, torch.int32).as_subclass(HostLens),
-            dtype=dtype, window_left=window_left,
-        )
+        if self._tensor_cores:
+            # the run's rows one token each, and the last row the rest, so
+            # qo_indptr ends at the row count FlashInfer checks
+            d_qo = np.zeros(rows + 1, dtype=np.int32)
+            d_qo[1 : run + 1] = np.arange(1, run + 1)
+            d_qo[run + 1 :] = run
+            d_qo[-1] = rows
+            self._decode.plan(
+                qo_indptr=torch.from_numpy(d_qo),
+                paged_kv_indptr=torch.from_numpy(d_indptr),
+                paged_kv_indices=torch.from_numpy(d_indices),
+                paged_kv_last_page_len=torch.from_numpy(d_last),
+                kv_lens=torch.from_numpy(d_lens).as_subclass(HostLens),
+                causal=False, dtype=dtype, window_left=window_left,
+            )
+        else:
+            self._decode.plan(
+                paged_kv_indptr=self._pin("d_indptr", d_indptr, torch.int32),
+                paged_kv_indices=self._pin("d_indices", d_indices, torch.int32),
+                paged_kv_last_page_len=self._pin("d_last", d_last, torch.int32),
+                kv_lens=self._pin("d_lens", d_lens, torch.int32).as_subclass(HostLens),
+                dtype=dtype, window_left=window_left,
+            )
         self._prefill.plan(
             qo_indptr=torch.from_numpy(p_qo),
             paged_kv_indptr=torch.from_numpy(p_kvp),

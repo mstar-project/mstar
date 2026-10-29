@@ -92,7 +92,8 @@ def test_decode_plan_stages_pinned_indices_only_for_graphs(
         assert planned_indices is indices
 
 
-def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch):
+@pytest.mark.parametrize("tensor_cores", [True, False])
+def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_cores):
     """The mixed-walk wrapper is only ever built for a captured bucket, so a
     keyword its halves do not take fails every mixed capture."""
     decode = Mock(return_value=SimpleNamespace(plan=Mock()))
@@ -106,12 +107,16 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch):
         prefill_workspace=torch.empty(8, dtype=torch.uint8),
         num_qo_heads=2, num_kv_heads=2, head_dim=64, page_size=16,
         batch_size=8, max_total_tokens=64, max_num_pages=32, max_prefill_rows=2,
-        device=torch.device("cpu"),
+        device=torch.device("cpu"), use_tensor_cores=tensor_cores,
     )
 
     assert mixed._decode.accelerator_graph and mixed._prefill.accelerator_graph
     assert mixed._decode.batch_size == 8
     # a sink row ahead of the prompt rows and one behind them
     assert mixed._prefill.batch_size == 4
-    assert decode.call_args.kwargs["use_cuda_graph"] is True
-    assert prefill.call_args.kwargs["use_cuda_graph"] is True
+    # the tensor-core decode half is the paged prefill kernel (FA2)
+    built = prefill.call_args_list + decode.call_args_list
+    assert len(built) == 2 and all(c.kwargs["use_cuda_graph"] for c in built)
+    assert decode.call_count == (0 if tensor_cores else 1)
+    if tensor_cores:
+        assert prefill.call_args_list[0].kwargs["backend"] == "fa2"

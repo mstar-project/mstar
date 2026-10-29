@@ -73,7 +73,8 @@ def _kw(device):
 @requires_gpu
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 @pytest.mark.parametrize("window_left", [-1, 7])
-def test_mixed_split_attends_as_the_packed_prefill_does(window_left, layout):
+@pytest.mark.parametrize("tensor_cores", [True, False])
+def test_mixed_split_attends_as_the_packed_prefill_does(window_left, layout, tensor_cores):
     device = torch.device("cuda")
     ROWS = LAYOUTS[layout]
     plan, num_pages = _layout(ROWS)
@@ -101,7 +102,7 @@ def test_mixed_split_attends_as_the_packed_prefill_does(window_left, layout):
         decode_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
         prefill_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
         batch_size=BUCKET_BS, max_total_tokens=BUCKET_TOKENS,
-        max_prefill_rows=MAX_PROMPTS, **_kw(device),
+        max_prefill_rows=MAX_PROMPTS, use_tensor_cores=tensor_cores, **_kw(device),
     )
     mixed.plan(causal=True, dtype=torch.bfloat16, window_left=window_left, **plan)
     out = mixed.run(q, cache)
