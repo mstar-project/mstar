@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
+from mstar.platforms.ptxas import blackwell_ptxas_env
 from mstar.utils.cpu_list import parse_cpu_list
 
 
@@ -58,10 +61,15 @@ class Platform:
         """
         return {}
 
-    def process_env_defaults(self) -> dict[str, str]:
+    def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         """Environment variables for settings a runtime or library reads once
         at init. Workers apply them with ``os.environ.setdefault`` before their
         first device call, so a value the user exported wins.
+
+        A callable adds to the user's value instead: it gets the current value
+        (None when unset) and returns the one to set. The conductor applies the
+        defaults and each worker again, so it must return a value that already
+        has its addition unchanged.
         """
         return {}
 
@@ -102,9 +110,9 @@ class CudaPlatform(Platform):
     def local_cpus(self, device_index: int) -> frozenset[int] | None:
         return _pci_local_cpus(device_index)
 
-    def process_env_defaults(self) -> dict[str, str]:
+    def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
-        return {"NCCL_GRAPH_REGISTER": "0"}
+        return {"NCCL_GRAPH_REGISTER": "0", **blackwell_ptxas_env()}
 
 
 class RocmPlatform(Platform):

@@ -332,8 +332,9 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_SERVER_BIN``
      - unset
      - Path to the ``mstar-server`` binary. Fallback order:
-       ``--rust-frontend-bin``, this variable, ``$PATH``, then the in-repo
-       ``rust/server/target/release`` build.
+       ``--rust-frontend-bin``, this variable, the running environment's
+       scripts directory (where the Linux wheels install it), ``$PATH``, then
+       the in-repo ``rust/server/target/release`` build.
    * - ``MSTAR_API_KEY``
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
@@ -641,7 +642,8 @@ Worker scheduling
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
        ``remove_request``, check the KV page bookkeeping against the streams
-       holding the pages, and each commit against its request's layout. Logs a
+       holding the pages, and each commit against its request's layout. A recurrent
+       snapshot's key is checked against the KV chain's key at its boundary. Logs a
        label left under its footprint at removal. Tests and debugging only.
 
 Compilation
@@ -665,6 +667,21 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``TRITON_PTXAS_BLACKWELL_PATH``
+     - torch's ptxas, when needed
+     - Triton's own variable: the ptxas it runs for sm_100 and up. ptxas
+       before 13.1.115, including the 13.1.80 that Triton 3.7.1 bundles,
+       miscompiles some integer floor divisions on sm_103 (Inductor's fused
+       interleaved mRoPE table came out wrong on B300). Unset, the conductor
+       points its workers at torch's ``torch/bin/ptxas`` when a compute
+       capability 10.x GPU is present, Triton's bundled ptxas predates
+       13.1.115 and torch's does not; it then also sets
+       ``TORCH_COMPILE_CACHE_KEY_TAG``, since Inductor's graph cache would
+       otherwise reuse kernels compiled by the bundled ptxas (decided by
+       :func:`mstar.platforms.ptxas.blackwell_ptxas_env`). A value you set
+       is kept, and the cache tag then names the ptxas you chose, so a cache
+       another ptxas wrote is not reused. A ``TORCH_COMPILE_CACHE_KEY_TAG``
+       you set gets ``-ptxas-blackwell-<version>`` appended.
    * - ``TORCHINDUCTOR_CACHE_DIR``
      - ``$XDG_CACHE_HOME/mstar/torchinductor`` (``~/.cache/mstar/torchinductor`` when unset)
      - torch's own variable; M* sets this default when importing

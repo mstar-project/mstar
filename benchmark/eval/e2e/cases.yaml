@@ -728,7 +728,7 @@ models:
     optional: true
     family: World
     tags: [new-model, world, frames, image-in, streaming]
-    requires: [ftfy, scipy, flash_attn]
+    requires: [ftfy, scipy]
     est_min: 10
     cases:
       - id: world

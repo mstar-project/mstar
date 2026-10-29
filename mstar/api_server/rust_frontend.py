@@ -51,6 +51,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sysconfig
 from pathlib import Path
 
 from mstar.api_server.auth import API_KEY_ENV
@@ -87,10 +88,14 @@ def openai_adapter_class(model_name: str) -> str:
 
 def find_server_binary(explicit: str | None = None) -> str:
     """Resolve the ``mstar-server`` binary: explicit arg, ``MSTAR_SERVER_BIN``,
-    ``$PATH``, then the in-repo release build."""
+    the running environment's scripts directory (where a Linux wheel installs
+    it, also when the venv is not activated), ``$PATH``, then the in-repo
+    release build. The scripts directory goes before ``$PATH`` so another
+    environment's older binary never serves this one's bridge."""
     for candidate in (
         explicit,
         os.getenv("MSTAR_SERVER_BIN"),
+        str(Path(sysconfig.get_path("scripts")) / "mstar-server"),
         shutil.which("mstar-server"),
         str(Path(__file__).resolve().parents[2]
             / "rust" / "server" / "target" / "release" / "mstar-server"),
@@ -172,6 +177,14 @@ class RustFrontendBridge:
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
             )
+        except (ValueError, TypeError) as e:
+            # a refused input: an in-band error chunk carries its 400 to the client
+            logger.info("submit %s refused: %s", rid, e)
+            self._send({
+                "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
+                "data": str(e).encode("utf-8"), "metadata": {"status": 400},
+            })
+            return
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
             status = getattr(e, "status_code", None)
             if isinstance(status, int):

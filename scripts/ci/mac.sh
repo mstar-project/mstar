@@ -97,7 +97,7 @@ for job in "${jobs[@]}"; do
     echo "=== $job ($platform) ==="
     started=$SECONDS
     docker build --platform "$platform" --target "$target" \
-        --tag "$image" --file scripts/ci/Dockerfile scripts/ci \
+        --tag "$image" --file scripts/ci/Dockerfile --build-context repo=. scripts/ci \
         > "$job_reports/image-build.log" 2>&1 &
     active_pid=$!
     if ! wait "$active_pid"; then
