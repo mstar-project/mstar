@@ -362,7 +362,13 @@ def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors():
      {"X", "Y"}, ("prefill_text", "prefill_vit"), [(0, 1), (2, 3)]),
     # no walk keys the cache: no mirror to keep
     ([_wg(0, [0, 1], nodes=("LLM",), walk="prefill")], {"LLM"}, (), []),
-], ids=["bagel_cfg_parallel", "cfg_nodes_in_the_llm_group", "keyed_walks_on_two_nodes", "unkeyed"])
+    # one node at one rank for one walk and at two for another: without prefix_cache_tp
+    # the two-rank replicas keep the cache shut, so only the one-rank set has a mirror
+    ([_wg(0, [0, 1], walk="prefill_text"), _wg(1, [2, 3, 4, 5], sp_size=2, walk="prefill_vit")],
+     {"llm"}, ("prefill_text", "prefill_vit"), [(0, 1)]),
+], ids=[
+    "bagel_cfg_parallel", "cfg_nodes_in_the_llm_group", "keyed_walks_on_two_nodes", "unkeyed", "tp1_and_tp2_groups",
+])
 def test_a_cache_has_a_mirror_where_a_walk_that_keys_it_runs(worker_graphs, nodes, walks, where):
     spec = KVSpec(resource_key="kv", nodes=nodes, config=_kv_spec().config)
     every_walk = set().union(*(wg.graph_walks for wg in worker_graphs))

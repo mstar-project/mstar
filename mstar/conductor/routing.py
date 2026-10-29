@@ -131,15 +131,14 @@ class ReplicaRouter:
             key: {label: kv_label.keys.walks for label, kv_label in labels.items()}
             for key, labels in keyed_labels(model).items()
         }
-        # each node's smallest lockstep instance among the groups that run it, as the data worker sizes it
-        instance: dict[str, int] = {}
-        for wg in worker_graphs:
-            size = len(wg.replica_ranks[0])
-            for node in wg.section.get_nodes():
-                instance[node] = min(size, instance.get(node, size))
-        opened = opening_prefix_caches(specs, instance, names_checkpoint(model))
+        checkpoint_named = names_checkpoint(model)
         self._units: list[_Unit] = []
         for instances, wgs in units.items():
+            # the unit's nodes at its instance size, as its engines see their own
+            opened = opening_prefix_caches(
+                specs, {node: len(instances[0]) for wg in wgs for node in wg.section.get_nodes()},
+                checkpoint_named,
+            )
             mirrors = []
             for spec in specs if len(instances) > 1 else ():
                 holding = [wg for wg in wgs if not spec.nodes.isdisjoint(wg.section.get_nodes())]
