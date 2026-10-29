@@ -1457,7 +1457,7 @@ trimmed to the input's sample count and lags it by one frame, as in NVIDIA's
 ignored. Text frames that are padding or special tokens produce empty chunks.
 
 Status, checked with the released checkpoint against NVIDIA's reference
-implementation on GH200 and H100 GPUs:
+implementation on H100 GPUs:
 
 - With dense attention, M* reproduces NVIDIA's greedy tokens exactly and its
   audio to within 5.1e-7 on the measured clips. The served path uses FlashInfer paged attention, whose
