@@ -1082,10 +1082,9 @@ methods are:
    there is returned as ``END_PARTITION`` (from ``mstar.model.submodule_base``) instead:
    the worker reports the partition done with that pass, and the conductor ends it rather
    than start decode. Return it only from a row outside any loop; from inside one the
-   request fails. ``TokenStepNode`` does this for its ``PREFILL_WALK``; Qwen3.5, Command-A+,
-   GLM-5.2 and BAGEL (for a text reply) do it for their last prefill. It suits a partition
+   request fails. ``TokenStepNode`` does this for its ``PREFILL_WALK``. It suits a partition
    with nothing left to run once generation stops: a model that runs another walk after its
-   loop (Whisper's ``align``, BAGEL's think-then-image generation) or publishes final-only
+   loop (an ``align`` walk, or image generation after thinking) or publishes final-only
    state at the loop's stop needs its own transition instead. Keep ``check_stop_batched``,
    if you write one, in agreement.
    To also keep some of this step's outputs from being routed, return
