@@ -9,6 +9,8 @@ ones its weight loader uses). The model states only what its modules cannot: how
 target's rows relate to the step's tokens (``rows``), modules it calls outside the step
 (``exclude``, ``deferred``), names kept for compatibility (``names``), the prefixes
 adapters write the root under (``adapter_roots``) and adapter-only renames (``aliases``).
+A module itself names the children it runs through their weights rather than their
+forward (``lora_unservable``), which the walk refuses.
 
 ``bind_module_lora`` binds each placed module to its delta when the node's resources
 include the spec's pool (``NodeSubmodule.bind_node_resources`` calls it), checking the
