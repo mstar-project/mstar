@@ -7,14 +7,13 @@ sampler looks rows up by request handle) and not their count. Either guard
 recompiled the forward for each new batch while the GPU sat idle.
 """
 
-from types import SimpleNamespace
 
 import pytest
 import torch
 
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 V = 32
@@ -167,7 +166,7 @@ def test_the_sampler_reads_only_a_planned_step(monkeypatch):
 
 def test_a_leased_step_hands_the_graph_sampler_its_padded_rows(monkeypatch):
     res, _ = _resource(monkeypatch, _GraphBuffers())
-    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", 4, 4))
     _plan(res, [0, 1], lease=lease, padded=[0, 1, -1, -2])
     res.sample(torch.zeros(4, V))
     assert res._cg_buffers.sampler.calls == [((0, 1, -1, -2), res._apply_penalty_this_step)]
