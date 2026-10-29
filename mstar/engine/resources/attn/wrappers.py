@@ -48,6 +48,13 @@ def check_flashinfer_head_dim(head_dim: int, device: torch.device | None = None)
         )
 
 
+def _host_lens(kv_lens) -> np.ndarray:
+    """Row lengths as an int32 host array (a tensor's numpy view, no copy)."""
+    if isinstance(kv_lens, torch.Tensor):
+        return kv_lens.numpy().astype(np.int32, copy=False)
+    return np.asarray(kv_lens, dtype=np.int32)
+
+
 class FlashInferPrefillWrapper:
     """Batched prefill attention with paged KV cache.
 
@@ -145,6 +152,9 @@ class FlashInferPrefillWrapper:
         # page-locked staging for an inline plan's host arrays (`_stage_pinned`)
         self._pinned: dict[str, torch.Tensor] = {}
         self._pinned_done = None
+        # the row lengths the last plan was made for, and the stager `patch_kv_lens` copies through
+        self._planned_lens: np.ndarray | None = None
+        self._lens_stager = None
 
     def _stage_pinned(self, qo_indptr, kv_indptr, last_page_len, kv_lens, indices):
         """Copy the plan's host arrays into this wrapper's page-locked buffers,
@@ -208,6 +218,7 @@ class FlashInferPrefillWrapper:
         per-token bookkeeping below.
         """
         self.dtype = dtype
+        self._planned_lens = None if kv_lens is None else _host_lens(kv_lens).copy()
         if self.accelerator_graph and paged_kv_indices.device.type != "cuda":
             # planned inline behind the step in flight, which a pageable copy
             # would wait for: stage page-locked, copy the indices in ourselves
@@ -248,6 +259,41 @@ class FlashInferPrefillWrapper:
             if qo_indptr.device.type != "cuda":
                 qo_indptr = qo_indptr.to(self.device, non_blocking=True)
             self._qo_indptr_buf = qo_indptr
+
+    def planned_for(self, kv_lens) -> bool:
+        """Whether the last plan was made for these row lengths."""
+        return self._planned_lens is not None and np.array_equal(self._planned_lens, _host_lens(kv_lens))
+
+    def patch_kv_lens(self, kv_lens) -> bool:
+        """Make the last plan one for rows ``kv_lens`` long, rows that were planned at least
+        as long, with page lists that still cover them, by rewriting each work's length in
+        the plan buffer: one H2D on the current stream. Only FlashInfer's Hopper (FA3)
+        prefill plan allows it: it splits no row by length, and its kernel takes a row's
+        length from the plan (``kv_lens[work]``), not from the page arrays. False anywhere
+        else, or when the plan's host copy doesn't hold the lengths it was planned for (a
+        FlashInfer whose plan layout moved); then re-plan."""
+        fi = self.attn_wrapper
+        old = self._planned_lens
+        if not self.accelerator_graph or old is None or getattr(fi, "_backend", None) != "fa3":
+            return False
+        info = getattr(fi, "_plan_info", None)
+        new = _host_lens(kv_lens)
+        if info is None or len(info) != 9 or new.shape != old.shape or (new > old).any():
+            return False
+        kv_len_at, works_at, batch_at = int(info[4]), int(info[6]), int(info[7])
+        ctas = torch.cuda.get_device_properties(self.device).multi_processor_count
+        host = fi._pin_memory_int_workspace_buffer.numpy()
+        total = int(host[works_at:works_at + 4 * (ctas + 1)].view(np.int32)[ctas])
+        planned = host[kv_len_at:kv_len_at + 4 * total].view(np.int32)
+        rows = host[batch_at:batch_at + 4 * total].view(np.int32)
+        if total == 0 or rows.min() < 0 or rows.max() >= old.shape[0] or not np.array_equal(planned, old[rows]):
+            return False
+        if self._lens_stager is None:
+            from mstar.utils.h2d import PinnedStager
+            self._lens_stager = PinnedStager(torch.int32)
+        dst = fi._int_workspace_buffer[kv_len_at:kv_len_at + 4 * total].view(torch.int32)
+        self._lens_stager.copy_(dst, new[rows])
+        return True
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:

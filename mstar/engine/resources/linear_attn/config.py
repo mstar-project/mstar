@@ -93,3 +93,7 @@ class LinearAttnStep(ResourceStep):
     """
 
     speculative: bool = False
+    # A draft-verify step (``with_draft_verify`` sets it): every row is a block whose tail
+    # the verdict may reject, so the forward leaves the state as it was and the verdict
+    # settles each row's accepted prefix (``GDNManager.settle_verify``).
+    verify: bool = False

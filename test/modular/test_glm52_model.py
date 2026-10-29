@@ -97,7 +97,10 @@ def test_glm52_graph_walks_are_one_node():
 
 
 def _specs(config):
-    kv, attn, pos, sampler = _make_model(config).get_node_resources()
+    kv, attn, pos, sampler, *extra = _make_model(config).get_node_resources()
+    # under MTP the draft-verify resource, and the sampler declared to verify
+    assert [spec.resource_key for spec in extra] == (["draft_verify"] if config.mtp_num_draft_tokens else [])
+    assert sampler.draft_verify == (config.mtp_num_draft_tokens > 0)
     assert isinstance(kv, KVSpec) and kv.resource_key == KV_RESOURCE
     assert isinstance(sampler, SamplerSpec) and sampler.resource_key == SAMPLER_RESOURCE
     assert attn.resource_key == ATTN_RESOURCE
@@ -288,15 +291,14 @@ def test_glm52_request_config_is_the_sampler_config():
     assert over.temperature == cfg.temperature
 
 
-def test_glm52_mtp_declares_greedy_default_but_honors_explicit_asks():
-    """MTP decode is raw argmax unless the request asks for something else."""
-    k2 = _make_model_k(2)
-    assert k2.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == 0.0
-    assert k2.get_request_resource_configs(
-        {}, {"temperature": 0.7})[SAMPLER_RESOURCE].temperature == 0.7
-    # k=0 keeps the model default — speculation is what forces greedy.
-    k0 = _make_model_k(0)
-    assert k0.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == k0.config.temperature
+def test_glm52_mtp_keeps_the_model_default_temperature():
+    """MTP verifies by rejection sampling, so a request samples as it would without MTP: the
+    config's temperature by default, its own when it asks."""
+    for k in (2, 0):
+        model = _make_model_k(k)
+        assert model.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == model.config.temperature
+        assert model.get_request_resource_configs(
+            {}, {"temperature": 0.7})[SAMPLER_RESOURCE].temperature == 0.7
 
 
 def test_glm52_mtp_refuses_a_shallower_trunk_than_the_checkpoint():

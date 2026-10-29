@@ -23,7 +23,7 @@ tp_allreduce: "symm_multimem"
 # a 2048-token prefill moves 24 MiB, which the 512 KiB default sends to NCCL
 tp_allreduce_max_kb: 32768
 tp_async_sched: true
-# A request holds at most 16 pages (17 with MTP's verify rows): 64 of them
+# A request holds at most 16 pages, MTP's verify rows included: 64 of them
 # fit the pool below, so a decode step never finds it empty.
 max_concurrent_requests: 64
 model_kwargs:

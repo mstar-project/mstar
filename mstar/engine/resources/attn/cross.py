@@ -25,6 +25,7 @@ from mstar.engine.resources.base import (
     AttentionResource,
     CGSlotKey,
     EngineResourceInfo,
+    RewindKind,
 )
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
@@ -56,6 +57,8 @@ class QueryPacking(NamedTuple):
 
 class CrossAttentionManager(AttentionResource):
     prefix_skip_safe = True
+    # reads a context written once
+    rewind_kind = RewindKind.NONE
 
     # Remains abstract except for build; will build based
     # on the attention backend
