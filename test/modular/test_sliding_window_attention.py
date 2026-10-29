@@ -27,9 +27,12 @@ from mstar.engine.resources.kv.config import (
     DEFAULT_PAGE_SIZE,
     KVGroup,
     KVLayout,
+    KVReqConfig,
     KVSpec,
     KVStep,
     PagedKVConfig,
+    PrefixSpan,
+    StreamLayout,
 )
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
 from mstar.engine.resources.runner import StepRunner
@@ -235,6 +238,46 @@ class SlidingWindowTests(unittest.TestCase):
         named = sum(len(v.page_idxs) for v in kv._sequence_views(list(step.segments), ctx=ctx))
         num_tokens = sum(s.span for s in step.segments)
         self.assertLessEqual(named, captured_page_capacity(len(step.segments), num_tokens, cfg, cfg.groups[0]))
+
+    def test_a_window_pool_allots_every_group(self):
+        """A request is allotted its pages in every group, so one that fits only if the window's
+        pages went uncounted waits, and the allotment stays whole as the window releases pages."""
+        from mstar.communication.tensors import LocalTransferEngine
+        from mstar.engine.resources.kv import manager as manager_mod
+        from mstar.engine.resources.kv.manager import KVManager, RoomMark
+        from mstar.engine.resources.kv.transfer import TransferEngineInfo
+
+        # 17 arena pages for requests; a 48-token prompt takes 3 of the full layer and 6 of the window
+        cfg = window_pool(num_qo_heads=1, num_kv_heads=1, head_dim=4)
+        layout = StreamLayout(spans=(PrefixSpan(48, 48, "walk"),), growth=(("loop", 1),))
+        self.assertEqual(cfg.request_pages, 17)
+        self.assertEqual(KVReqConfig(kv_layout={"main": layout}).pages(None, {"loop": 0}, cfg), 9)
+        # the window's pages peak at its budget plus the prompt's step, while the full layer's grow
+        self.assertEqual(KVReqConfig(kv_layout={"main": layout}).pages(None, {"loop": 32}, cfg), 5 + 8)
+        self.enterContext(patch.object(manager_mod, "_DEBUG_ASSERTS", True))
+        kv = KVManager(cfg=cfg, name="kv", joint_comm_group=None,
+                       transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
+                       device=torch.device("cpu"), dtype=torch.float32)
+        for rid in ("a", "b"):
+            kv.ingest_request(rid, KVReqConfig(kv_layout={"main": layout}, loop_caps={"loop": 16}))
+            kv.ask(rid, "LLM", "walk")
+        self.assertIsNone(kv.reserve("a", "LLM", "walk", None))
+        self.assertIsInstance(kv.reserve("b", "LLM", "walk", None), RoomMark)
+        for span in (48, *[1] * 16):
+            step, ctx = KVStep(segments=(Segment("a", "main", span),)), StepContext(("a",), "walk", 0, False)
+            self.assertTrue(kv.admit(step, ctx).ok)
+            kv.plan(step, ctx)
+            kv.commit(step, ctx)
+            self.assertIsInstance(kv.reserve("b", "LLM", "walk", None), RoomMark)
+        kv.remove_request("a")
+        self.assertIsNone(kv.reserve("b", "LLM", "walk", None))
+        # an admit unwound gives back the pages it took in each group
+        free = kv._arena.num_free
+        step, ctx = KVStep(segments=(Segment("b", "main", 48),)), StepContext(("b",), "walk", 0, False)
+        self.assertTrue(kv.admit(step, ctx).ok)
+        self.assertEqual(free - kv._arena.num_free, 9)
+        kv.rollback_admit(step, ctx)
+        self.assertEqual(kv._arena.num_free, free)
 
     def test_window_pool_refusals(self):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only
