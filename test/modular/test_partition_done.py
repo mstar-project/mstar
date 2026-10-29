@@ -52,6 +52,7 @@ def _conductor(rid="r"):
     c._send_partition_inputs = lambda request_id, pname, fwd_args: rec.partition_inputs.append(pname)
     c._un_persist_tensors = lambda request_id, tensors: None
     c._set_partition_worker_graph_ids = lambda request_id, pname, walk: None
+    c.producer_triggered_partitions = set()
     meta = lambda walk: CurrentForwardConductorMetadata(graph_walk=walk, is_prefill=False)  # noqa: E731
     conns = {
         "A->B": StreamingConnectionState(from_partition="A", to_partition="B", edge_name="tok"),
