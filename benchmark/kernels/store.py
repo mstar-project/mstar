@@ -153,9 +153,10 @@ class ResultsStore:
         ``tuned`` implementations (kernels of this repo, with knobs) replaces the
         fastest other one only where it is at least ``margin`` faster. Each
         class gets the entry most of its shapes chose, and a shape that chose
-        otherwise its own entry; with ``class_default``,
-        each class gets ``class_default(class)`` instead, so only the measured
-        shapes change (for an op that also serves shapes nobody searched).
+        otherwise its own entry; with ``class_default``, each class gets
+        ``class_default(class)`` instead and a measured shape leaves it only
+        for an implementation ``margin`` faster, so shapes nobody searched run
+        what they did before.
         ``dims`` names the shape dimensions the op's configs are keyed by (all of
         them by default).
         """
@@ -176,8 +177,15 @@ class ResultsStore:
             pick = best_other
             if best_tuned is not None and (best_other is None or best_tuned[0] <= (1 - margin) * best_other[0]):
                 pick = best_tuned
+            klass = shape_class(record["shape"]) or "default"
+            if class_default is not None:
+                # leaving what the class runs by default takes the margin too
+                default = class_default(klass).get("impl")
+                kept = min((t for t in timed if t[1] == default), default=None, key=lambda t: t[0])
+                if kept is not None and pick[1] != default and pick[0] > (1 - margin) * kept[0]:
+                    pick = kept
             shape = {k: v for k, v in record["shape"].items() if dims is None or k in dims}
-            chosen[json.dumps(shape)] = (shape_class(record["shape"]) or "default", {"impl": pick[1], **pick[2]})
+            chosen[json.dumps(shape)] = (klass, {"impl": pick[1], **pick[2]})
         if not chosen:
             raise ValueError(f"no passing results for {kernel} on {facts.arch}/{facts.product}")
         votes: dict[str, dict[str, int]] = {}
