@@ -545,12 +545,13 @@ def run_variants(args) -> dict[str, Any]:
         for mode in (0, ds.SYNC_LOAD_POLL, ds.SYNC_GATHER, ds.SYNC_GATHER | ds.SYNC_LOAD_POLL):
             configs.append((8, ds.SCOPE_XCD, per_cu, mode))
         for groups in (4, 2):
-            for mode in (0, ds.SYNC_GATHER):
+            for mode in (0, ds.SYNC_GATHER, ds.SYNC_HIER, ds.SYNC_HIER | ds.SYNC_LOAD_POLL):
                 configs.append((groups, ds.SCOPE_AGENT, per_cu, mode))
     for groups, scope, per_cu, mode in configs:
         grid = ds.default_grid(cus, groups, per_cu)
-        name = (f"g{groups}_{'xcd' if scope else 'agent'}_grid{grid}_"
-                f"{'gather' if mode & ds.SYNC_GATHER else 'counter'}{'_loadpoll' if mode & ds.SYNC_LOAD_POLL else ''}")
+        algo = "hier" if mode & ds.SYNC_HIER else "gather" if mode & ds.SYNC_GATHER else "counter"
+        name = (f"g{groups}_{'xcd' if scope else 'agent'}_grid{grid}_{algo}"
+                f"{'_loadpoll' if mode & ds.SYNC_LOAD_POLL else ''}")
         entry: dict[str, Any] = {}
         try:
             k = Kernel(program, w, codebook, bs, groups, scope, grid, device, top_k, top_p, temperature, mode)

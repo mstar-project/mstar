@@ -295,9 +295,16 @@ __device__ __forceinline__ f32x4 reduce_waves(f32x4 acc, f32x4* red) {
 // sync_mode bit 0: the barrier's algorithm, 0 = every member adds to one counter and polls it, 1 = every member
 // stores its own epoch flag, member 0 polls all of them with one wave and stores a release flag the others poll.
 // bit 1: inside one XCD, poll with a workgroup-scope load (sc0) instead of a compare-and-swap (both read L2).
+// bit 2 (agent scope, a group over several XCDs): hierarchical. Members arrive on their XCD's counter in that
+// XCD's L2; the XCD's first member waits for them, writes the XCD's L2 back once (an agent-scope release, which
+// covers every member's stores since they are in that L2), exchanges flags with the other XCDs' first members at
+// agent scope, invalidates (agent-scope acquire) and releases its XCD's members, which invalidate their L1.
 constexpr int kSyncGather = 1;
 constexpr int kSyncLoadPoll = 2;
-constexpr int kSyncWords = 1024;  // per group: [0] counter, [32] release flag, [64 + m] member m's flag
+constexpr int kSyncHier = 4;
+// per group: [0] counter, [32] release flag, [64 + m] member m's flag (m < 448); hierarchical: [512 + 32 i] the
+// i-th XCD's counter, [520 + 32 i] its release flag, [768 + 32 i] its flag among the XCDs
+constexpr int kSyncWords = 1024;
 
 __device__ __forceinline__ unsigned poll_value(unsigned* p, int scope, int mode) {
   if (scope == AGENT) return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -333,6 +340,20 @@ __device__ bool spin_geq(const Params& P, unsigned* p, unsigned target, uint64_t
   }
 }
 
+// spin_geq for a flag only this XCD writes, read in this XCD's L2 whatever the barrier's scope
+__device__ bool spin_local(const Params& P, unsigned* p, unsigned target, uint64_t t0) {
+  for (unsigned spins = 1;; ++spins) {
+    if (poll_value(p, XCD, P.sync_mode) >= target) return true;
+    if ((spins & 31u) == 0u) {
+      if (aborted(P)) return false;
+      if (now() - t0 > kSpinTicks) {
+        __hip_atomic_store(P.ctl, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        return false;
+      }
+    }
+  }
+}
+
 __device__ __forceinline__ void acquire(const Params& P) {
   if (P.scope == AGENT) {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -341,10 +362,54 @@ __device__ __forceinline__ void acquire(const Params& P) {
   }
 }
 
+// The hierarchical barrier (kSyncHier), for a group whose members span 8 / groups XCDs. Workgroup i is on XCD
+// i % 8, so a group's members on one XCD are those with the same i % 8; the lowest of them leads the XCD.
+__device__ bool hier_barrier(const Params& P, const Group& G, unsigned epoch, uint4 (&wnext)[8], const ChunkIt& next,
+                             bool prefetch, int* ok_flag) {
+  const int xcds = 8 / P.groups;                // XCDs a group spans
+  const int xi = (int)((blockIdx.x % 8) / P.groups);  // this workgroup's XCD among them
+  const int local = G.members / xcds;           // members on each of them
+  unsigned* xcounter = G.sync + 512 + 32 * xi;
+  unsigned* xgo = G.sync + 520 + 32 * xi;
+  const bool leader = (int)blockIdx.x < 8;      // the lowest workgroup id on its XCD
+  if (threadIdx.x == 0) {
+    __hip_atomic_fetch_add(xcounter, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+  }
+  if (prefetch) load_chunk(wnext, P, next);
+  const uint64_t t0 = now();
+  if (threadIdx.x == 0) {
+    bool ok;
+    if (leader) {
+      ok = spin_local(P, xcounter, epoch * (unsigned)local, t0);
+      if (ok) {
+        // one write-back of this XCD's L2 publishes every local member's stores
+        __hip_atomic_store(G.sync + 768 + 32 * xi, epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        for (int y = 0; y < xcds && ok; ++y) {
+          if (y != xi) ok = spin_geq(P, G.sync + 768 + 32 * y, epoch, t0);
+        }
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        if (ok) {
+          wait_stores();
+          __hip_atomic_store(xgo, epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+        }
+      }
+    } else {
+      ok = spin_local(P, xgo, epoch, t0);
+      invalidate_l1();
+    }
+    *ok_flag = ok ? 1 : 0;
+  }
+  __syncthreads();
+  return *ok_flag != 0;
+}
+
 __device__ bool group_barrier(const Params& P, const Group& G, unsigned epoch, uint4 (&wnext)[8],
                               const ChunkIt& next, bool prefetch, int* ok_flag) {
   wait_stores();
   __syncthreads();
+  if ((P.sync_mode & kSyncHier) != 0 && P.scope == AGENT && P.groups < 8) {
+    return hier_barrier(P, G, epoch, wnext, next, prefetch, ok_flag);
+  }
   const bool gather = (P.sync_mode & kSyncGather) != 0;
   if (threadIdx.x == 0) {
     if (gather) {
@@ -670,8 +735,9 @@ __global__ void __launch_bounds__(kThreads, 2) depth_step_kernel(Params P) {
   G.row0 = (G.g * P.bs) / P.groups;
   G.nrows = ((G.g + 1) * P.bs) / P.groups - G.row0;
   G.sync = P.sync + G.g * kSyncWords;
-  if (P.scope == XCD && (int)xcc_id() != G.g % 8) {
-    // the XCD-local protocol is only correct inside one XCD
+  const bool placed = P.scope == XCD || (P.sync_mode & kSyncHier) != 0;
+  if (placed && (int)xcc_id() != (int)(blockIdx.x % 8)) {
+    // the XCD-local protocols rely on workgroup i running on XCD i % 8
     if (threadIdx.x == 0) {
       atomicAdd(P.ctl + 1, 1u);
       __hip_atomic_store(P.ctl, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);

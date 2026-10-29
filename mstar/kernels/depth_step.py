@@ -20,8 +20,9 @@ from mstar.kernels.hip.build import JitExtension
 SOURCE = Path(__file__).resolve().parent / "hip" / "depth_step.cu"
 SCOPE_AGENT, SCOPE_XCD = 0, 1
 # barrier variants (``sync_mode`` bits): flags gathered by one member instead of one shared counter; inside
-# one XCD, polls by load instead of compare-and-swap
-SYNC_GATHER, SYNC_LOAD_POLL = 1, 2
+# one XCD, polls by load instead of compare-and-swap; for a group over several XCDs, a counter per XCD and one
+# agent-scope exchange among the XCDs' first members
+SYNC_GATHER, SYNC_LOAD_POLL, SYNC_HIER = 1, 2, 4
 SYNC_WORDS = 1024  # per group
 
 
