@@ -472,6 +472,17 @@ def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
     ), "the cap and the stop check end decode on different iterations"
 
 
+@pytest.mark.parametrize("drafts", [0, 3])
+def test_qwen3_5_keys_its_prompts_only_without_speculation(drafts):
+    # a speculative node keeps no prefix, and the deployment check refuses a keyed label there
+    from mstar.model.base import keyed_labels
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = object.__new__(Qwen3_5DenseModel)
+    model.num_draft_tokens = drafts
+    assert bool(keyed_labels(model)) == (drafts == 0)
+
+
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])
 def test_glm52_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.glm52.glm52_model import Glm52Model
