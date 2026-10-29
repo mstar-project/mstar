@@ -20,7 +20,6 @@ from mstar.api_server.request_types import (
     RequestFailed,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
-from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -53,7 +52,7 @@ from mstar.model.base import (
 from mstar.model.submodule_base import chunk_tick_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
-from mstar.platforms import apply_process_env_defaults, current_platform
+from mstar.platforms import WorkerColocation, apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.streaming.topology import CLIENT, ClientStream, find_client_streams
@@ -504,11 +503,12 @@ class Conductor:
             "max_concurrent_requests", None
         )
         self._settle_lora_adapters(lora_adapter_digests)
-        # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
-        # conductor owns, so workers sharing a GPU overlap their kernels instead
-        # of time-slicing. validate_deployment checked the value.
+        # Optional ``mps: true``: workers sharing a GPU overlap their kernels
+        # instead of time-slicing, the way the platform does it (a CUDA MPS
+        # daemon the conductor owns; nothing to start on ROCm).
+        # validate_deployment checked the value.
         self._mps_requested = self.model_config.get("mps", False)
-        self._mps: MpsDaemon | None = None
+        self._colocation: WorkerColocation | None = None
 
         self.default_sharding_config = deployment.sharding_config
         # The conductor is the only process that sees every worker graph, so it
@@ -870,10 +870,8 @@ class Conductor:
         atexit.register(self.shutdown)
         if self._mps_requested:
             # a host check, not a config one: shipped configs validate on any machine
-            if not current_platform.is_cuda():
-                raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
-            self._mps = MpsDaemon()
-            self._mps.start()
+            self._colocation = current_platform.colocated_workers()
+            self._colocation.start()
         # every worker runs on this host and builds the same CPU plan from all
         # of their devices (see mstar.utils.cpus)
         for worker_id, device in zip(self.worker_ids, self._worker_devices, strict=True):
@@ -902,7 +900,7 @@ class Conductor:
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
                     "status_interval_s": self._status_interval_s,
-                    "env": self._mps.client_env if self._mps is not None else None,
+                    "env": self._colocation.client_env if self._colocation is not None else None,
                 },
                 daemon=False,
             )
@@ -910,12 +908,13 @@ class Conductor:
             self._worker_processes.append(p)
 
     def shutdown(self):
-        """Terminate and join all worker processes, then stop the MPS daemon if any."""
+        """Terminate and join all worker processes, then whatever ``mps: true``
+        started (the MPS daemon on NVIDIA)."""
         try:
             self._stop_workers()
         finally:
-            if self._mps is not None:
-                self._mps.stop()
+            if self._colocation is not None:
+                self._colocation.stop()
 
     def _stop_workers(self):
         if not self._worker_processes:

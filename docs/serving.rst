@@ -592,13 +592,16 @@ other's memory only as used, so the first to capture can take the other's room. 
 ``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
 counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
 
-Workers that share a GPU time-slice it by default: one process's kernels wait for the
-other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of its own
-before it spawns the workers, run every worker as its client so their kernels overlap,
-and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
-processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
-driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
-Chatterbox models and OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+Workers that share an NVIDIA GPU time-slice it by default: one process's kernels wait
+for the other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of
+its own before it spawns the workers, run every worker as its client so their kernels
+overlap, and quit the daemon at shutdown. The daemon uses a private pipe directory, so
+other processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the
+NVIDIA driver) must be on ``PATH``. On AMD GPUs there is nothing to start: the hardware
+scheduler runs the queues of different processes concurrently, so ``mps: true`` only
+logs that, and the same configs serve unchanged (``Platform.colocated_workers``).
+The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three Chatterbox models and
+OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
 
 **A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
 group runs that node's steps on a lane of their own instead of the worker's main chain:
