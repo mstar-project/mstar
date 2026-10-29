@@ -200,12 +200,28 @@ class RocmPlatform(Platform):
         if num_tokens > limit:
             return {}
         overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
-        from mstar.platforms.rocm_gemm import DECODE_GEMV_MAX_ROWS, skinny_gemm_passes
+        from mstar.platforms.rocm_gemm import (
+            DECODE_GEMV_MAX_ROWS,
+            DECODE_LINEAR_MAX_ROWS,
+            SKINNY_MAX_ROWS,
+            ChainedGraphPass,
+            decode_linear_pass,
+            skinny_gemm_passes,
+        )
 
+        post = None
         if num_tokens <= DECODE_GEMV_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
             # linears of up to 16 rows on AITER's skinny GEMM or the Triton
             # weight stream, as the device's tuned config picks per shape
-            overrides["pre_grad_custom_pass"], overrides["post_grad_custom_post_pass"] = passes
+            overrides["pre_grad_custom_pass"], post = passes
+        if (
+            decode and SKINNY_MAX_ROWS < num_tokens <= DECODE_LINEAR_MAX_ROWS
+            and (tuned := decode_linear_pass()) is not None
+        ):
+            # decode linears still on hipBLASLt take its tuned solution, where the device has one
+            post = tuned if post is None else ChainedGraphPass(post, tuned)
+        if post is not None:
+            overrides["post_grad_custom_post_pass"] = post
         return overrides
 
     def process_env_defaults(self) -> dict[str, str]:
