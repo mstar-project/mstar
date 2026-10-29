@@ -29,10 +29,25 @@ THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
 
 THINKER_SAMPLER = "thinker_sampler"
-# combined walk of the Thinker's text/audio prefill and decode
+# combined walk of the Thinker's prefill walks and decode
 THINKER_MIXED = "thinker_mixed"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_sampler"
+
+# A request prefills its whole prompt in one Thinker step. The walk is named
+# for the encoders it runs first; each walk takes any interleaving of text and
+# the media its encoders cover.
+PREFILL_TEXT = "prefill_text"
+PREFILL_AUDIO = "prefill_audio"
+PREFILL_VISION = "prefill_vision"
+PREFILL_AUDIO_VISION = "prefill_audio_vision"
+THINKER_PREFILL_WALKS = (PREFILL_TEXT, PREFILL_AUDIO, PREFILL_VISION, PREFILL_AUDIO_VISION)
+# the walks whose rows carry deepstack features
+VISION_PREFILL_WALKS = (PREFILL_VISION, PREFILL_AUDIO_VISION)
+
+# `prefill_order` tags, in prompt order. The nth tag of a kind takes the nth
+# tensor of that kind; images and videos share the vision encoder's outputs.
+TEXT_PART, AUDIO_PART, IMAGE_PART, VIDEO_PART = 0, 1, 2, 3
 
 # ---------------------------------------------------------------------------
 # Thinker text backbone
