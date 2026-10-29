@@ -610,8 +610,9 @@ class LLMSubmodule(ARNodeSubmodule):
             row = info.get(rid)
             if row is None:
                 continue
-            # the prompt's step emits the first token; decode the rest
-            budgets[rid] = max(row.max_tokens - 1, 0)
+            # decode runs `max_tokens` steps after the prompt's token (`check_stop`),
+            # so a request emits that many past it
+            budgets[rid] = row.max_tokens
             # a capture or padding row carries no sampling config
             sampling = row.resource_configs.get(SAMPLER)
             if sampling is not None and sampling.ignore_eos:
