@@ -288,8 +288,8 @@ class SlidingWindowTests(unittest.TestCase):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only
         with self.assertRaises(ValueError):
             build_manager(WINDOW, kv_config=window_pool(), layers=(1, 2), flashinfer_backend="trtllm-gen")
-        ampere = SimpleNamespace(cuda_capability=lambda device=None: (8, 0))
-        with patch("mstar.engine.resources.attn.base.current_platform", ampere), self.assertRaises(ValueError):
+        ampere = SimpleNamespace(cuda_capability=lambda device=None: (8, 0), name="cuda")
+        with patch("mstar.engine.resources.attn.backends.current_platform", ampere), self.assertRaises(ValueError):
             build_manager(WINDOW, kv_config=window_pool(), layers=(1, 2), flashinfer_backend="fa3")
         # the backend as it resolves, whatever was declared when the pool resolved
         with self.assertRaisesRegex(ValueError, "flashinfer"):
@@ -351,8 +351,8 @@ class SlidingWindowTests(unittest.TestCase):
 
     def test_default_auto_plans_fa2_from_sm100(self):
         """From SM100 FlashInfer's auto can send short rows to cuDNN, and its fa3 is SM90's only."""
-        blackwell = SimpleNamespace(cuda_capability=lambda device=None: (10, 0))
-        with patch("mstar.engine.resources.attn.base.current_platform", blackwell):
+        blackwell = SimpleNamespace(cuda_capability=lambda device=None: (10, 0), name="cuda")
+        with patch("mstar.engine.resources.attn.backends.current_platform", blackwell):
             ctx = context([7, 5], [7, 5])
             plans = KVPlanOutputs(ctx.plan_results["kv"], later_groups=(ctx.plan_results["kv"],))
             for window in (None, WINDOW):
