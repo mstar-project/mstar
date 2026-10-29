@@ -1417,7 +1417,7 @@ class MicroScheduler:
                 result.scheduled, result.chunk_tokens or {}, request.row_tokens,
                 mid_prefill_starts or {}, speculative,
             )
-            self._mark_final_chunks(result.scheduled)
+            self._do_not_speculate_final_chunks(result.scheduled)
             result.scheduled.relabel_if_uniform()
         return result.scheduled
 
@@ -1484,9 +1484,9 @@ class MicroScheduler:
             if end < total:
                 batch.incomplete_node_rids.add(rid)
 
-    def _mark_final_chunks(self, batch: ScheduledBatch) -> None:
-        """Tell the runtime which rows run their chunk Loop's last iteration,
-        so the step after this one is not speculated into another."""
+    def _do_not_speculate_final_chunks(self, batch: ScheduledBatch) -> None:
+        """Mark the rows running their final chunk do-not-speculate, so the
+        step after this one does not speculate into another chunk of theirs."""
         walks = self.chunk_loop_walks.get(batch.node_name)
         if not walks or (not batch.request_walks and batch.graph_walk not in walks):
             return
@@ -1497,7 +1497,7 @@ class MicroScheduler:
                 rids.append(rid)
                 row_walks.append(walk)
         if rids:
-            self.runtime.mark_last_loop_iters(
+            self.runtime.mark_do_not_speculate_loops(
                 rids, row_walks, [chunk_loop_name(batch.node_name, w) for w in row_walks],
             )
 
@@ -1532,9 +1532,9 @@ class MicroScheduler:
             for key, progress in self.chunk_progress.items():
                 if key[0] == rid and node_name in (None, key[1]):
                     progress.cursor = progress.cursor_spec = None
-        # a last-iteration mark is a lookahead too; the retry is marked again
+        # a do-not-speculate mark is a lookahead too; the retry is marked again
         if self.chunk_loop_walks:
-            self.runtime.clear_last_loop_iters(list(rids))
+            self.runtime.clear_do_not_speculate_loops(list(rids))
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
         """Park ``batch``, folding it into whatever already waits under this key.

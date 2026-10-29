@@ -160,9 +160,9 @@ class PythonGraphRuntime(GraphRuntime):
 
         # Loop stops from this iteration's check_stop; cleared every iteration.
         self._pending_loop_stops: set[PendingLoopStop] = set()
-        # (rid, walk, loop) whose scheduled iteration is its last; see
-        # mark_last_loop_iters
-        self._last_loop_iters: set[tuple[int, str, str]] = set()
+        # (rid, walk, loop) speculation does not continue; see
+        # mark_do_not_speculate_loops
+        self._do_not_speculate_loops: set[tuple[int, str, str]] = set()
 
         # Routing parked between complete_and_route_batch and send_outputs.
         self._completions: dict[int, CompletionState] = {}
@@ -309,9 +309,9 @@ class PythonGraphRuntime(GraphRuntime):
         self._pending_loop_stops = {
             stop for stop in self._pending_loop_stops if stop.rid != rid
         }
-        if self._last_loop_iters:
-            self._last_loop_iters = {
-                mark for mark in self._last_loop_iters if mark[0] != rid
+        if self._do_not_speculate_loops:
+            self._do_not_speculate_loops = {
+                mark for mark in self._do_not_speculate_loops if mark[0] != rid
             }
         # Recycling means a stale handle held anywhere else now points at a
         # DIFFERENT request; see GraphRuntime.remove_request for what has to be
@@ -946,7 +946,7 @@ class PythonGraphRuntime(GraphRuntime):
             return True
         if self.has_pending_loop_stop(rid, graph_walk, spec_info.loop_name):
             return False
-        if (rid, graph_walk, spec_info.loop_name) in self._last_loop_iters:
+        if (rid, graph_walk, spec_info.loop_name) in self._do_not_speculate_loops:
             return False
         loop = wgio.loops.get(spec_info.loop_name)
         if loop is not None and (
@@ -1231,8 +1231,8 @@ class PythonGraphRuntime(GraphRuntime):
             self._pending_loop_stops.update(
                 PendingLoopStop(rid, graph_walk, name) for name in wanted
             )
-            if self._last_loop_iters:
-                self._last_loop_iters.difference_update(
+            if self._do_not_speculate_loops:
+                self._do_not_speculate_loops.difference_update(
                     (rid, graph_walk, name) for name in wanted
                 )
             self._fan_out_loop_stops(rid, partition, wanted)
@@ -1339,16 +1339,16 @@ class PythonGraphRuntime(GraphRuntime):
     def clear_pending_loop_stops(self):
         self._pending_loop_stops.clear()
 
-    def mark_last_loop_iters(
+    def mark_do_not_speculate_loops(
         self, rids: list[int], graph_walks: list[str], loop_names: list[str],
     ) -> None:
-        self._last_loop_iters.update(zip(rids, graph_walks, loop_names, strict=True))
+        self._do_not_speculate_loops.update(zip(rids, graph_walks, loop_names, strict=True))
 
-    def clear_last_loop_iters(self, rids: list[int]) -> None:
-        if self._last_loop_iters:
+    def clear_do_not_speculate_loops(self, rids: list[int]) -> None:
+        if self._do_not_speculate_loops:
             drop = set(rids)
-            self._last_loop_iters = {
-                mark for mark in self._last_loop_iters if mark[0] not in drop
+            self._do_not_speculate_loops = {
+                mark for mark in self._do_not_speculate_loops if mark[0] not in drop
             }
 
     def complete_and_route_batch(

@@ -1860,19 +1860,19 @@ def test_a_refused_chunk_waits_out_its_hold_and_runs_the_same_range():
 
 
 def _recording_marks(sched, manager):
-    """Bind ``manager``'s runtime and record the last-iteration marks the
+    """Bind ``manager``'s runtime and record the do-not-speculate marks the
     scheduler hands it: ``marked`` as (rid, walk, loop), ``cleared`` as rids."""
     marked, cleared = [], []
-    manager.runtime.mark_last_loop_iters = (
+    manager.runtime.mark_do_not_speculate_loops = (
         lambda rids, walks, loops: marked.extend(zip(rids, walks, loops, strict=True))
     )
-    manager.runtime.clear_last_loop_iters = cleared.extend
+    manager.runtime.clear_do_not_speculate_loops = cleared.extend
     sched.chunk_loop_walks = {NODE: frozenset({"prefill"})}
     return marked, cleared
 
 
 @pytest.mark.usefixtures("no_chunk_floor")
-def test_only_a_final_chunk_marks_its_loop_iteration_the_last():
+def test_only_a_final_chunk_marks_its_loop_do_not_speculate():
     """A row cut short of its prompt runs another chunk, so speculation may
     follow it; one that finishes it does not. Decode rows are no chunk Loop's."""
     from mstar.model.submodule_base import chunk_loop_name
@@ -1896,7 +1896,7 @@ def test_only_a_final_chunk_marks_its_loop_iteration_the_last():
 
 
 @pytest.mark.usefixtures("no_chunk_floor")
-def test_a_refused_step_clears_its_last_iteration_marks():
+def test_a_refused_step_clears_its_do_not_speculate_marks():
     """The marked iteration did not run; its retry is marked when scheduled."""
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8, budget=64))
     sched.get_tensor = lambda uuid: uuid

@@ -163,9 +163,9 @@ pub struct GraphRuntime {
     node_owner: FxHashMap<(Sym, Sym), WgIndex>,
     /// Loop stops from this iteration's check_stop; cleared every iteration.
     pending_loop_stops: FxHashSet<(u32, Sym, Sym)>,
-    /// (rid, walk, loop) whose scheduled iteration is its last; see
-    /// `mark_last_loop_iters`.
-    last_loop_iters: FxHashSet<(u32, Sym, Sym)>,
+    /// (rid, walk, loop) speculation does not continue; see
+    /// `mark_do_not_speculate_loops`.
+    do_not_speculate_loops: FxHashSet<(u32, Sym, Sym)>,
     /// Routing parked between complete_and_route_batch and send_outputs.
     completions: FxHashMap<u64, Completion>,
     completion_counter: u64,
@@ -762,7 +762,7 @@ pub struct GraphRuntime {
         let loop_name = g.lp(lid).name;
         if let Some(w) = self.interner.get(graph_walk) {
             if self.pending_loop_stops.contains(&(rid, w, loop_name))
-                || self.last_loop_iters.contains(&(rid, w, loop_name))
+                || self.do_not_speculate_loops.contains(&(rid, w, loop_name))
             {
                 return false;
             }
@@ -1582,7 +1582,7 @@ impl GraphRuntime {
             walk_to_local_wgs,
             node_owner,
             pending_loop_stops: FxHashSet::default(),
-            last_loop_iters: FxHashSet::default(),
+            do_not_speculate_loops: FxHashSet::default(),
             completions: FxHashMap::default(),
             completion_counter: 0,
             staged_specs: FxHashMap::default(),
@@ -1780,8 +1780,8 @@ impl GraphRuntime {
         // worker drops its outputs on a speculative new iteration and prep
         // excludes it from speculation.
         self.pending_loop_stops.retain(|&(r, _, _)| r != rid);
-        if !self.last_loop_iters.is_empty() {
-            self.last_loop_iters.retain(|&(r, _, _)| r != rid);
+        if !self.do_not_speculate_loops.is_empty() {
+            self.do_not_speculate_loops.retain(|&(r, _, _)| r != rid);
         }
     }
 
@@ -1921,27 +1921,27 @@ impl GraphRuntime {
         self.pending_loop_stops.clear();
     }
 
-    fn mark_last_loop_iters(
+    fn mark_do_not_speculate_loops(
         &mut self, rids: Vec<u32>, graph_walks: Vec<String>, loop_names: Vec<String>,
     ) -> PyResult<()> {
         if rids.len() != graph_walks.len() || rids.len() != loop_names.len() {
             return Err(PyValueError::new_err(
-                "mark_last_loop_iters: rids, graph_walks and loop_names differ in length",
+                "mark_do_not_speculate_loops: rids, graph_walks and loop_names differ in length",
             ));
         }
         for ((rid, walk), name) in rids.into_iter().zip(graph_walks).zip(loop_names) {
             // A walk or loop never interned names nothing in these graphs.
             if let (Some(w), Some(l)) = (self.interner.get(&walk), self.interner.get(&name)) {
-                self.last_loop_iters.insert((rid, w, l));
+                self.do_not_speculate_loops.insert((rid, w, l));
             }
         }
         Ok(())
     }
 
-    fn clear_last_loop_iters(&mut self, rids: Vec<u32>) {
-        if !self.last_loop_iters.is_empty() {
+    fn clear_do_not_speculate_loops(&mut self, rids: Vec<u32>) {
+        if !self.do_not_speculate_loops.is_empty() {
             let drop: FxHashSet<u32> = rids.into_iter().collect();
-            self.last_loop_iters.retain(|(r, _, _)| !drop.contains(r));
+            self.do_not_speculate_loops.retain(|(r, _, _)| !drop.contains(r));
         }
     }
 
@@ -3137,7 +3137,7 @@ impl GraphRuntime {
                 for name in &wanted {
                     if let Some(l) = self.interner.get(name) {
                         self.pending_loop_stops.insert((rid, walk, l));
-                        self.last_loop_iters.remove(&(rid, walk, l));
+                        self.do_not_speculate_loops.remove(&(rid, walk, l));
                     }
                 }
                 let mut per_worker: FxHashMap<Sym, Vec<String>> = FxHashMap::default();

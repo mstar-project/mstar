@@ -569,8 +569,8 @@ class GraphRuntime(ABC):
         state. Known handle-keyed maps: MicroScheduler.{failed_rids,
         admit_errors, held_until, backlog, pending_tp_follow_count} (purged by
         clear_rid), Worker.{_last_active, _pending_removes}, the runtime's
-        pending loop stops and last-iteration marks, and the tensor manager's
-        per-request maps.
+        pending loop stops and do-not-speculate marks, and the tensor
+        manager's per-request maps.
         """
         pass
 
@@ -939,22 +939,23 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
-    def mark_last_loop_iters(
+    def mark_do_not_speculate_loops(
         self, rids: list[int], graph_walks: list[str], loop_names: list[str],
     ) -> None:
-        """Row ``i``'s most recently scheduled iteration of ``loop_names[i]``
-        (under ``graph_walks[i]``) is its last: speculation offers no iteration
-        after it.
+        """Speculation offers row ``i`` no further iteration of
+        ``loop_names[i]`` (under ``graph_walks[i]``): its most recently
+        scheduled one is its last.
 
-        Only speculation reads this. The loop still ends by its stop, so a
-        mark left on an iteration that never ran cannot end a loop early; it
-        costs at most a step that is not speculated. A mark goes when that
-        loop's stop is applied, on ``clear_last_loop_iters`` and on removal.
+        Only speculation reads this; the normal scheduling path does not, and
+        the loop still ends by its stop. So a mark left on an iteration that
+        never ran cannot end a loop early; it costs at most a step that is not
+        speculated. A mark goes when that loop's stop is applied, on
+        ``clear_do_not_speculate_loops`` and on removal.
         """
         pass
 
     @abstractmethod
-    def clear_last_loop_iters(self, rids: list[int]) -> None:
+    def clear_do_not_speculate_loops(self, rids: list[int]) -> None:
         """Drop every mark of ``rids``: the iteration marked did not run, and
         its retry is marked again when scheduled."""
         pass

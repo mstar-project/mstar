@@ -391,13 +391,13 @@ class RustGraphRuntime(GraphRuntime):
     def clear_pending_loop_stops(self):
         self._rust.clear_pending_loop_stops()
 
-    def mark_last_loop_iters(
+    def mark_do_not_speculate_loops(
         self, rids: list[int], graph_walks: list[str], loop_names: list[str],
     ) -> None:
-        self._rust.mark_last_loop_iters(rids, graph_walks, loop_names)
+        self._rust.mark_do_not_speculate_loops(rids, graph_walks, loop_names)
 
-    def clear_last_loop_iters(self, rids: list[int]) -> None:
-        self._rust.clear_last_loop_iters(rids)
+    def clear_do_not_speculate_loops(self, rids: list[int]) -> None:
+        self._rust.clear_do_not_speculate_loops(rids)
 
     # --------- Inputs ----------
 
