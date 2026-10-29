@@ -161,11 +161,18 @@ def _entries(doc) -> list[dict]:
 def smi_index_map() -> dict[int, int]:
     """amd-smi's number for each HIP device. HIP counts GPUs in KFD topology order and amd-smi by PCI address,
     which differ on some nodes, so every amd-smi lookup about a HIP device goes through this. Identity if
-    amd-smi doesn't give the KFD node."""
+    amd-smi doesn't give the KFD node.
+
+    A job that gets some of a node's GPUs through ROCR_VISIBLE_DEVICES (node-wide indices in KFD order, with no
+    device cgroup, so amd-smi still lists every GPU) sees them as HIP 0, 1, ..."""
     entries = [e for e in _entries(amd_smi_json("list")) if isinstance(e.get("gpu"), int)]
     if not entries or any(not isinstance(e.get("node_id"), int) for e in entries):
         return {}
-    return {hip: e["gpu"] for hip, e in enumerate(sorted(entries, key=lambda e: e["node_id"]))}
+    order = [e["gpu"] for e in sorted(entries, key=lambda e: e["node_id"])]
+    rocr = os.environ.get("ROCR_VISIBLE_DEVICES", "")
+    if re.fullmatch(r"\d+(,\d+)*", rocr) and all(int(i) < len(order) for i in rocr.split(",")):
+        order = [order[int(i)] for i in rocr.split(",")]
+    return dict(enumerate(order))
 
 
 def smi_gpu(hip: int) -> int:
