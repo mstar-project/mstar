@@ -2241,9 +2241,8 @@ class Worker:
             return False
         try:
             if pending is not None:
-                # Safety timeout — the engine releases this event even on its
-                # failure paths, so it should only fire if the GPU thread died.
-                # Bail out rather than block plan_executor forever.
+                # A step N this slow (a long admit, say) skips the pre-plan
+                # rather than holding plan_executor; exec plans N+1 inline.
                 with self._span("worker.plan_thread.await_commit"):
                     committed = pending.node_batch.commit_done.wait(timeout=10.0)
                 if not committed:
