@@ -32,7 +32,7 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
     worker._is_tearing_down = lambda rid: False
     worker._stream_buffer_rids = set()
     worker.scheduler = SimpleNamespace(
-        backlog_splits_from=lambda *_: False, room_for_continuing=lambda target: None,
+        backlog_splits_from=lambda *_: False, room_for_continuing=lambda target, *_: None,
         # the decoder isn't ready to run request 2
         _check_ready=lambda node, rid, info: rid != 2,
     )
