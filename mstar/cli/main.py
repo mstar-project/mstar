@@ -4,6 +4,8 @@
     mstar serve qwen3_omni --gpus 0,1,2
     mstar serve orpheus --port 9000
 
+``mstar cache`` packs and unpacks compile-cache bundles (mstar/cli/cache.py).
+
 ``serve <model>`` resolves a sensible default config, fills in the
 plumbing that the low-level ``mstar-serve`` requires (socket/upload dirs, a
 single-node-safe tensor protocol, HF cache), and then delegates to the same
@@ -17,11 +19,13 @@ import argparse
 import getpass
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import mstar
+from mstar.cli import cache
 from mstar.utils.socket_prefix import per_port_socket_prefix
 
 # Model name -> default config (relative to the repo's configs/).
@@ -228,6 +232,14 @@ def _serve(args: argparse.Namespace) -> None:
     apply_visible_devices(args.gpus)
     if args.compile_level is not None:
         os.environ["MSTAR_COMPILE_LEVEL"] = str(args.compile_level)
+    if args.compile_bundle:
+        # A child process, so this one never touches the GPU before the server's own processes do.
+        p = subprocess.run([sys.executable, "-m", "mstar.cli.main", "cache", "unpack", args.compile_bundle],
+                           check=False)
+        if p.returncode == cache.EXIT_NO_MATCH:
+            print("warning: no compile-cache bundle for this stack; starting cold", file=sys.stderr)
+        elif p.returncode != 0:
+            sys.exit(f"error: unpacking {args.compile_bundle} failed (exit {p.returncode})")
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
     socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
@@ -302,6 +314,11 @@ def build_parser() -> argparse.ArgumentParser:
              "fastest start; -O1 (default) coordinate descent; -O2 full max-autotune",
     )
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
+    serve.add_argument(
+        "--compile-bundle", default=None, metavar="SRC",
+        help="unpack this compile-cache bundle (or the one for this stack in a root of bundles) into the "
+             "compile caches before starting; see `mstar cache`",
+    )
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
     serve.add_argument(
         "--socket-path-prefix", default=None,
@@ -341,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
              "$PATH, then rust/server/target/release)",
     )
     serve.set_defaults(func=_serve)
+    cache.add_parser(sub)
     return parser
 
 
