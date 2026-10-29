@@ -80,6 +80,13 @@ def test_pack_then_unpack_restores_the_caches(tmp_path):
     assert os.stat(fresh["triton"] / "HASH" / "k.hsaco").st_mtime == 1_700_000_000
 
 
+def test_packing_inductor_alone_still_leaves_its_triton_dir_out(tmp_path):
+    dirs = _caches(tmp_path / "built")
+    bundle, results = cb.pack(tmp_path / "b", KEY, dirs, kinds=["inductor"], log=lambda _: None)
+    assert [r.kind for r in results] == ["inductor"]
+    assert sorted(_names(bundle / "inductor.tar")) == ["./fxgraph/ab/entry", "./wq/kernel.py"]
+
+
 def test_a_second_pack_appends_only_new_and_changed_files(tmp_path):
     dirs = _caches(tmp_path / "built")
     root = tmp_path / "bundles"
@@ -162,14 +169,14 @@ def test_cli_wires_cache_subcommands(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cb, "stack_key", lambda device=None: KEY)
     monkeypatch.setattr(cb, "cache_dirs", lambda: {"inductor": tmp_path / "i", "triton": tmp_path / "t"})
 
-    def pack(root, key, dirs, note=None):
-        calls["pack"] = (root, dirs, note)
+    def pack(root, key, dirs, kinds=None, note=None):
+        calls["pack"] = (root, dirs, kinds, note)
         return root, []
 
     monkeypatch.setattr(cb, "pack", pack)
     args = build_parser().parse_args(["cache", "pack", str(tmp_path / "r"), "--kinds", "triton", "--note", "n"])
     args.func(args)
-    assert calls["pack"] == (tmp_path / "r", {"triton": tmp_path / "t"}, "n")
+    assert calls["pack"] == (tmp_path / "r", {"inductor": tmp_path / "i", "triton": tmp_path / "t"}, ["triton"], "n")
 
     def refuse(*a, **k):
         raise cb.BundleMismatchError("nothing for this stack")
