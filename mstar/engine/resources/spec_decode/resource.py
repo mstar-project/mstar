@@ -172,6 +172,11 @@ class SpecDecodeResource(Resource):
         self._ids: torch.Tensor | None = None
         self._base: torch.Tensor | None = None
         self._accepted: torch.Tensor | None = None
+        # draft passes 1 .. k-1: their KV write slots and attention lengths,
+        # computed together once the step knows what it accepted
+        self._draft_pages: torch.Tensor | None = None
+        self._draft_offsets: torch.Tensor | None = None
+        self._draft_lens: torch.Tensor | None = None
 
     def depends_on(self) -> set[str]:
         # their plans are what this one rewrites on the device
@@ -357,7 +362,7 @@ class SpecDecodeResource(Resource):
         self._eager_images.clear()
 
     # In-graph operations, called by the forward in this order: `seed` on a
-    # prompt's step; `verify_inputs`, `accept`, then `draft_positions` /
+    # prompt's step; `verify_inputs`, `accept`, then `begin_draft_pass` /
     # `record_draft` once per draft pass on a decode step.
 
     def _plan_now(self, phase: SpecPhase) -> SpecDecodePlan:
@@ -440,6 +445,7 @@ class SpecDecodeResource(Resource):
         emit &= slots < (self._budget[rows] - emitted)[:, None]
         emitted = emitted + emit.sum(dim=1, dtype=torch.int32)
         self._emitted.index_copy_(0, rows, emitted)
+        self._address_draft_passes(plan, accepted)
         return AcceptedTokens(
             tokens=torch.where(emit, y, -1),
             accepted=accepted.int(),
@@ -447,19 +453,39 @@ class SpecDecodeResource(Resource):
             target=y,
         )
 
+    def _address_draft_passes(self, plan: SpecDecodePlan, accepted: torch.Tensor) -> None:
+        """KV write slots and attention lengths of draft passes 1 .. k - 1.
+
+        Pass ``j`` sits at the verify positions plus ``j``; only slot ``n``
+        (the last accepted) is a real query, so the others write the sink page.
+        """
+        passes = self.num_draft_tokens - 1
+        if passes < 1:
+            return
+        b, t = plan.num_rows, self.tokens_per_row
+        shift = torch.arange(1, passes + 1, dtype=torch.int32, device=self._device)
+        positions = self._base[None, :, None] + shift[:, None, None] + self._slot_offsets[None, None, :]
+        page = torch.div(positions, self._page_size, rounding_mode="floor")
+        table = plan.block_table[None].expand(passes, *plan.block_table.shape)
+        pages = table.gather(2, page.long()).long()
+        mask = self._slot_offsets[None, None, :] == (accepted - 1)[None, :, None]
+        self._draft_pages = torch.where(mask, pages, SINK_PAGE).view(passes, b * t)
+        self._draft_offsets = torch.where(
+            mask, (positions - page * self._page_size).long(), 0,
+        ).view(passes, b * t)
+        self._draft_lens = (self._base[None, :] + t + shift[:, None]).int()
+
     @torch.compiler.disable
-    def draft_positions(self, j: int) -> torch.Tensor:
-        """Positions of draft pass ``j`` (``[rows * (k + 1)]``), and its KV
-        writes and attention lengths: pass 0 at the verify positions, writing
-        every slot; pass ``j > 0`` one further on, writing only slot ``n``."""
+    def begin_draft_pass(self, j: int) -> None:
+        """Point the KV writes and attention lengths at draft pass ``j > 0``.
+        Pass 0 runs at the verify step's own positions, already in place; pass
+        ``j`` at those plus ``j``, writing only slot ``n``."""
+        if j < 1:
+            return
         plan = self._plan_now(SpecPhase.VERIFY)
-        base, t = self._base, self.tokens_per_row
-        positions = base[:, None] + j + self._slot_offsets[None, :]
-        mask = None
-        if j > 0:
-            mask = self._slot_offsets[None, :] == (self._accepted - 1)[:, None]
-        self._address(plan, positions, mask, base + t + j)
-        return positions.reshape(-1)
+        plan.write_pages.copy_(self._draft_pages[j - 1])
+        plan.write_offsets.copy_(self._draft_offsets[j - 1])
+        plan.kv_lens.copy_(self._draft_lens[j - 1])
 
     @torch.compiler.disable
     def record_draft(self, j: int, draft: torch.Tensor) -> torch.Tensor:

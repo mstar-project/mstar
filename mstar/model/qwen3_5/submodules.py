@@ -691,16 +691,18 @@ class LLMSubmodule(ARNodeSubmodule):
         tokens (see `SpecDecodeResource`)."""
         spec = engine_inputs.resources[SPEC_DECODE]
         lm, head = self.model.model, self.model.lm_head
+        k = self.num_draft_tokens
         ids, positions = spec.verify_inputs()
-        cos_sin = self._cos_sin_1d(positions)
-        hidden = lm(lm.embed_tokens(ids), label="main", cos_sin=cos_sin)
+        # draft pass j sits at the verify positions plus j: one table for all
+        shifts = torch.arange(k, dtype=positions.dtype, device=positions.device)
+        cos, sin = self._cos_sin_1d((positions[None, :] + shifts[:, None]).reshape(-1))
+        cos, sin = cos.view(k, positions.shape[0], -1), sin.view(k, positions.shape[0], -1)
+        hidden = lm(lm.embed_tokens(ids), label="main", cos_sin=(cos[0], sin[0]))
         accepted = spec.accept(head(hidden))
         ids = accepted.target.reshape(-1)
-        for j in range(self.num_draft_tokens):
-            if j:
-                # pass 0 runs at the verify's positions, which are planned
-                cos_sin = self._cos_sin_1d(spec.draft_positions(j))
-            hidden = self.model.mtp(hidden, lm.embed_tokens(ids), label="main", cos_sin=cos_sin)
+        for j in range(k):
+            spec.begin_draft_pass(j)
+            hidden = self.model.mtp(hidden, lm.embed_tokens(ids), label="main", cos_sin=(cos[j], sin[j]))
             ids = spec.record_draft(j, head(hidden).argmax(dim=-1))
         return accepted
 

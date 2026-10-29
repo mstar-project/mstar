@@ -204,8 +204,7 @@ def _verify_step(spec, logits_rows, vocab, k):
     out = spec.accept(logits)
     drafted = out.target.reshape(-1)
     for j in range(k):
-        if j:
-            spec.draft_positions(j)
+        spec.begin_draft_pass(j)
         drafted = spec.record_draft(j, (drafted + 1) % vocab)
     return out
 
