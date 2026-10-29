@@ -77,10 +77,11 @@ def test_init_dist_threads_timeout_into_world_and_every_subgroup(monkeypatch):
     expected = timedelta(seconds=3600)
     assert calls["store"] == [expected]
     assert [c["timeout"] for c in calls["init"]] == [expected]
-    # ``new_group`` runs once for the instance, then once per rank tuple on
-    # every rank, members or not, for the device group and its gloo twin.
+    # ``new_group`` runs once per gloo group (each axis tuple's twin, a
+    # non-member's stand-in included, and the instance's), then once per axis
+    # tuple for its device group.
     assert [c["timeout"] for c in calls["new_group"]] == [expected] * 5
-    assert calls["new_group"][0]["ranks"] == [0, 1, 2, 3]
+    assert [0, 1, 2, 3] in [c["ranks"] for c in calls["new_group"]]
 
 
 def test_init_dist_without_timeout_leaves_torch_default(monkeypatch):
