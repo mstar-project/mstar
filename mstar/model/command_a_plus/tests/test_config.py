@@ -1,5 +1,6 @@
 """Offline config contract tests; run with unittest, without model dependencies."""
 
+import copy
 import json
 import tempfile
 import unittest
@@ -80,6 +81,17 @@ class ConfigTests(unittest.TestCase):
             CommandAPlusConfig.from_dict(self.data)
         with self.assertRaisesRegex(ValueError, "JSON object"):
             CommandAPlusConfig.from_dict([])
+
+    def test_vision_config_and_unsupported_architectures(self):
+        self.assertEqual(CommandAPlusConfig.from_dict(self.data).vision_config.tokens_per_tile, 4)
+        for in_vision, name, value in (
+            (True, "hidden_act", "gelu"), (False, "alignment_activation_fn", "gelu"),
+            (False, "vision_feature_layer", -2), (False, "vision_feature_select_strategy", "default"),
+        ):
+            data = copy.deepcopy(self.data)
+            (data["vision_config"] if in_vision else data)[name] = value
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, name):
+                CommandAPlusConfig.from_dict(data)
 
 
 if __name__ == "__main__":

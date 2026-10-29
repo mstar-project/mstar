@@ -20,6 +20,7 @@ from mstar.engine.resources import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedAttnBackend,
+    RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     apply_yaml_overrides,
 )
@@ -28,7 +29,12 @@ from mstar.engine.resources.attn.base import AttentionManager, resolve_attn_back
 from mstar.engine.resources.attn.cross import CrossAttentionManager, FlashInferCrossManager
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.attn.ragged.base import resolve_ragged_attn_backend
+from mstar.engine.resources.attn.ragged.dense import (
+    DenseRaggedCrossManager,
+    DenseRaggedManager,
+)
 from mstar.engine.resources.attn.ragged.flashinfer import (
+    FlashInferRaggedBlockCausalManager,
     FlashInferRaggedCrossManager,
     FlashInferRaggedManager,
 )
@@ -93,8 +99,9 @@ def test_an_explicit_backend_is_kept(backend):
     assert resolve_attn_backend(backend, CPU) is backend
 
 
-def test_an_explicit_ragged_backend_is_kept():
-    assert resolve_ragged_attn_backend(RaggedAttnBackend.FLASHINFER, CPU) is RaggedAttnBackend.FLASHINFER
+@pytest.mark.parametrize("backend", [b for b in RaggedAttnBackend if b is not RaggedAttnBackend.AUTO], ids=str)
+def test_an_explicit_ragged_backend_is_kept(backend):
+    assert resolve_ragged_attn_backend(backend, CPU) is backend
 
 
 # --- builds ----------------------------------------------------------------------
@@ -127,6 +134,35 @@ def test_dense_without_a_varlen_kernel_falls_back_to_autos_backend(monkeypatch, 
     assert "using the paged 'flashinfer' backend" in caplog.text
 
 
+class _FakeCudaPlatform:
+    def __init__(self, capability):
+        self.capability = capability
+
+    def cuda_capability(self, device=None):
+        return self.capability
+
+
+@pytest.mark.parametrize(
+    ("capability", "has_kernel"),
+    [((8, 0), True), ((8, 9), True), ((9, 0), True), ((7, 5), False), ((10, 0), False), ((10, 3), False),
+     ((12, 0), False)],
+    ids=str,
+)
+def test_dense_needs_a_kernel_for_the_gpus_capability(capability, has_kernel, monkeypatch):
+    """fa3-fwd imports on any NVIDIA GPU but has kernels only for sm_80 and sm_90a."""
+    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", None)
+    monkeypatch.setattr(dense_module, "current_platform", _FakeCudaPlatform(capability))
+    dense_module._fa3_unavailable_reason.cache_clear()
+    try:
+        reason = dense_module._fa3_unavailable_reason(torch.device("cuda", 0))
+    finally:
+        dense_module._fa3_unavailable_reason.cache_clear()
+    if has_kernel:
+        assert reason is None
+    else:
+        assert reason == f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
+
+
 @pytest.mark.parametrize("backend", [AttnBackend.AUTO, AttnBackend.FLASHINFER], ids=str)
 def test_cross_attention_builds_flashinfer(backend):
     manager = CrossAttentionManager.build(cross_spec(backend=backend), kv_info(paged_config()))
@@ -138,7 +174,7 @@ def test_cross_attention_rejects_a_backend_it_does_not_implement():
         CrossAttentionManager.build(cross_spec(backend=AttnBackend.FLEX), kv_info(paged_config()))
 
 
-@pytest.mark.parametrize("backend", list(RaggedAttnBackend), ids=str)
+@pytest.mark.parametrize("backend", [RaggedAttnBackend.AUTO, RaggedAttnBackend.FLASHINFER], ids=str)
 @pytest.mark.parametrize(
     ("spec_class", "manager_class"),
     [
@@ -150,6 +186,76 @@ def test_ragged_attention_builds_flashinfer(spec_class, manager_class, backend):
     spec = spec_class(resource_key="ragged", nodes={"node"}, config=ragged_config(backend=backend))
     manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
     assert type(manager) is manager_class
+
+
+def _clear_fa3_caches():
+    dense_module._fa3_unavailable_reason.cache_clear()
+    from mstar.engine.resources.attn.ragged import dense as ragged_dense
+
+    ragged_dense._warn_ragged_dense_fallback.cache_clear()
+    ragged_dense._warn_dense_on_flashinfer.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("spec_class", "manager_class"),
+    [
+        (RaggedAttentionSpec, DenseRaggedManager),
+        (RaggedCrossAttentionSpec, DenseRaggedCrossManager),
+    ],
+)
+def test_explicit_ragged_dense_builds_when_the_kernel_is_present(spec_class, manager_class, monkeypatch):
+    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", None)
+    _clear_fa3_caches()
+    try:
+        spec = spec_class(
+            resource_key="ragged", nodes={"node"},
+            config=ragged_config(backend=RaggedAttnBackend.DENSE),
+        )
+        manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+    finally:
+        _clear_fa3_caches()
+    assert type(manager) is manager_class
+
+
+@pytest.mark.parametrize(
+    ("spec_class", "manager_class"),
+    [
+        (RaggedAttentionSpec, FlashInferRaggedManager),
+        (RaggedCrossAttentionSpec, FlashInferRaggedCrossManager),
+    ],
+)
+def test_explicit_ragged_dense_falls_back_when_the_kernel_is_missing(
+    spec_class, manager_class, monkeypatch, caplog,
+):
+    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", "ImportError: not installed")
+    _clear_fa3_caches()
+    try:
+        spec = spec_class(
+            resource_key="ragged", nodes={"node"},
+            config=ragged_config(backend=RaggedAttnBackend.DENSE),
+        )
+        with caplog.at_level(logging.WARNING, logger="mstar.engine.resources.attn.ragged.dense"):
+            manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+    finally:
+        _clear_fa3_caches()
+    assert type(manager) is manager_class
+    assert "running it on FlashInfer's ragged prefill" in caplog.text
+
+
+def test_block_causal_dense_falls_back_even_with_the_kernel_present(monkeypatch, caplog):
+    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", None)
+    _clear_fa3_caches()
+    try:
+        spec = RaggedBlockCausalAttentionSpec(
+            resource_key="ragged", nodes={"node"}, block_size=16,
+            config=ragged_config(backend=RaggedAttnBackend.DENSE),
+        )
+        with caplog.at_level(logging.WARNING, logger="mstar.engine.resources.attn.ragged.dense"):
+            manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+    finally:
+        _clear_fa3_caches()
+    assert type(manager) is FlashInferRaggedBlockCausalManager
+    assert "no block-causal kernel" in caplog.text
 
 
 # --- deployment overrides --------------------------------------------------------
@@ -170,7 +276,12 @@ def test_yaml_names_an_attention_backend(value, expected):
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"), [("auto", RaggedAttnBackend.AUTO), ("flashinfer", RaggedAttnBackend.FLASHINFER)],
+    ("value", "expected"),
+    [
+        ("auto", RaggedAttnBackend.AUTO),
+        ("flashinfer", RaggedAttnBackend.FLASHINFER),
+        ("dense", RaggedAttnBackend.DENSE),
+    ],
 )
 def test_yaml_names_a_ragged_backend(value, expected):
     spec = RaggedAttentionSpec(resource_key="ragged", nodes={"node"}, config=ragged_config())

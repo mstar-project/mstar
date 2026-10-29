@@ -38,7 +38,6 @@ from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM  # 
 from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel  # noqa: E402
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
 from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
-from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP, VisionEncoderSubmodule  # noqa: E402
 from mstar.model.submodule_base import declared_step  # noqa: E402
 
@@ -118,16 +117,17 @@ QWEN3_5_SIZES = json.loads((FIXTURES / "qwen3_5_configs.json").read_text())["siz
 
 
 def _released(name: str, size: str | None = None):
-    """The model at its released config (Qwen3.5: ``size``), and per node its LoRA spec
-    reaches, in the spec's order, ``(TP group -> the root it binds in, whether that root
-    is TP)``."""
+    """The model's LoRA spec and config at its released size (Qwen3.5: ``size``), and per
+    node the spec reaches, in the spec's order, ``(TP group -> the root it binds in,
+    whether that root is TP)``."""
     if name != "qwen3_5":
         model, root = H.STACKS[name]().released()
-        return model, [(lambda g: root(model.config, g), True)]
+        return lora_spec(model.get_node_resources()), model.config, [(lambda g: root(model.config, g), True)]
     entry = QWEN3_5_SIZES[size]
     text = Qwen3_5Config(**entry["text_config"], tie_word_embeddings=entry["tie_word_embeddings"])
     vision = Qwen3_5VisionConfig(**entry["vision_config"])
-    return H.model_object(Qwen3_5DenseModel, text, vision_config=vision), [
+    # what `get_node_resources` declares, without the HF image processor its vision specs load
+    return qwen3_5_lora_spec(text, vision), text, [
         (lambda g: Qwen3_5ForCausalLM(text, g), True), (lambda g: Qwen3_5VisionModel(vision), False),
     ]
 
@@ -151,8 +151,7 @@ def _shipped() -> list[tuple[str, int]]:
 def test_every_placed_module_binds_at_the_released_size(name, size, world):
     """What generic binding checks on each rank: the module is the declared target, and
     its rank-local shape is the pool's shard of it (whole, on a root that is not TP)."""
-    model, roots = _released(name, size)
-    spec = lora_spec(model.get_node_resources())
+    spec, config, roots = _released(name, size)
     nodes = list(dict.fromkeys(t.node or next(iter(spec.nodes)) for t in spec.targets.values()))
     for rank in sorted({0, world - 1}):
         group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world)))
@@ -166,7 +165,7 @@ def test_every_placed_module_binds_at_the_released_size(name, size, world):
                        path, spec.resource_key)
             if isinstance(root, Qwen3_5ForCausalLM):
                 # the delta-net's slices are this rank's [q|k|v|z|a+pad|b]
-                q, k, v, z, a, pad, b = root.model.layers[model.config.linear_layer_indices[0]].self_attn.in_proj_blocks
+                q, k, v, z, a, pad, b = root.model.layers[config.linear_layer_indices[0]].self_attn.in_proj_blocks
                 assert spec.targets["in_proj_fused"].shard(world).out_slices == (q, k, v, z, a + pad, b)
 
 
@@ -194,7 +193,7 @@ def test_expert_lora_refuses_expert_parallelism_and_more_ids_than_the_align_op_g
     assert "split by expert parallelism" in problem
     assert not list(_expert_lora_split_by_ep([spec], {"node_groups": [{**ep, "ep_config": None}]}))
 
-    released = lora_spec(_released("qwen3_omni_thinker")[0].get_node_resources())
+    released = _released("qwen3_omni_thinker")[0]
     with pytest.raises(ValueError, match="serve at most 7 slots"):
         released.apply_yaml_overrides(max_slots=8, targets=["qkv_proj", "experts_down_proj"])
     assert "experts_down_proj" not in released.targets and released.max_slots != 8
@@ -268,7 +267,7 @@ HUB["qwen3_omni_thinker"] = {
 
 def _validate(model: str, size: str | None, repo: str, keys: dict, targets: list[str] | None = None) -> LoraSpec:
     """What registering an adapter checks (``check_adapter_file``), from the shapes its header lists."""
-    spec = (lora_spec(_released(model, size)[0].get_node_resources()) if size != "tiny"
+    spec = (_released(model, size)[0] if size != "tiny"
             else H.STACKS[model]().lora_spec(H.tiny()))
     spec.apply_yaml_overrides(max_rank=512, targets=targets)
     spec.check_adapter(repo, H.header_info(spec, sorted(keys.items())))

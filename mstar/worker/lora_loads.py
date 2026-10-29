@@ -61,6 +61,7 @@ class LoraLoads:
             try:
                 load.reads.append((pool, pool.load_adapter_async(body.lora_name, body.lora_path, digest)))
             except Exception as exc:  # noqa: BLE001 - a bad adapter fails the load, not the worker
+                logger.error("LoRA adapter %s failed to load: %s", body.lora_name, exc)
                 load.error = describe_load_error(exc)
                 break
         self._loads.append(load)

@@ -145,6 +145,7 @@ def _send(rt, completion_id, **aos):
         stream_tokens_consumed=[dict(c) for c in con],
         prof_rids=prof_rids, profiling=prof,
         publish_rids=publish_rids, publications=publications,
+        skip_rids=aos.get("skip_rids", []),
     )
 
 
@@ -197,7 +198,7 @@ def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path):
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
             request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
-            partition_name="default",
+            partition_name="default", graph_walk=WALK,
         ),
     ))]
     assert got["api_server"] == [] and got[PEER] == []
@@ -232,6 +233,20 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
     # The WGD names one entry per emitted chunk, for the conductor to count.
     wgd = got["conductor"][0].body
     assert wgd.output_signal_names == ["out"]
+
+
+def test_a_skipped_rid_sends_nothing(tmp_path):
+    """A rid that failed after routing: no peer, client or conductor frame."""
+    mesh = _Mesh(
+        tmp_path, outs=[("out", "remote", False), ("txt", "emit_to_client", True)],
+        remote=[{"wg_id": 1, "graph_walks": [WALK],
+                 "nodes": ["remote"], "dyn_loops": []}],
+    )
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    got = mesh.run(rid, uuids=[1], skip_rids=[rid])
+
+    assert got == {"conductor": [], "api_server": [], PEER: []}
 
 
 def test_a_remote_destination_gets_input_signals(tmp_path):
@@ -1039,7 +1054,8 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
 
 def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     """A mixed step routes rows of two walks in one call; each request's
-    worker-graphs-done names its own walk's graph, not the call's first."""
+    worker-graphs-done names its own walk and that walk's graph, not the
+    call's first."""
     book = RustTensorBookkeeping()
     comm = ZmqCommunicator(ME, str(tmp_path))
     conductor = ZmqCommunicator("conductor", str(tmp_path))
@@ -1070,5 +1086,8 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids],
           new_token_counts=[], stream_tokens_consumed=[], profiling=[])
 
-    done = {m.body.request_id: m.body.worker_graph_ids for m in _collect(conductor)}
-    assert done == {"r_prefill": [0], "r_decode": [1]}
+    done = {
+        m.body.request_id: (m.body.worker_graph_ids, m.body.graph_walk)
+        for m in _collect(conductor)
+    }
+    assert done == {"r_prefill": ([0], "prefill"), "r_decode": ([1], "decode")}

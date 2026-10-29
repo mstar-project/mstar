@@ -120,6 +120,7 @@ def _worker(eng, runtime):
     w.device = torch.device("cpu")
     w._last_active = {}
     w._graph_runtime = runtime
+    w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(
         cleanup_collectable=lambda *a: None,
         store_and_return_tensor_info_batch=_store,

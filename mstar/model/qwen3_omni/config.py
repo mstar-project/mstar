@@ -156,6 +156,7 @@ class AudioEncoderConfig:
     encoder_attention_heads: int = 20
     output_dim: int = 3584
     max_source_positions: int = 1500
+    n_window: int = 50
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AudioEncoderConfig:

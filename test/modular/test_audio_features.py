@@ -1,17 +1,23 @@
-"""The shared Whisper-family audio front end against HF's feature extractor.
+"""The shared audio front ends against HF's feature extractors.
 
-Log-mel features to ~1e-4 for 80- and 128-bin banks, the frame-count
-convention (``samples // hop``), padding/trimming to the 30 s window, the
-sinusoidal position table, and the FFmpeg-free file loader.
+Whisper-family log-mel features to ~1e-4 for 80- and 128-bin banks, the
+frame-count convention (``samples // hop``), padding/trimming to the 30 s
+window, the sinusoidal position table, the FFmpeg-free file loader, and the
+FastConformer (NeMo) front end with its librosa filter bank.
 """
 
 import numpy as np
 import pytest
 import torch
 
+from mstar.api_server.media_io import AudioTooLongError
 from mstar.model.components.audio_features import (
     LogMelSpectrogram,
+    NemoLogMel,
+    clip_samples,
+    librosa_mel_filters,
     load_audio_file,
+    load_speech_file,
     sinusoid_positions,
     slaney_mel_filter_bank,
 )
@@ -88,3 +94,108 @@ def test_load_audio_file_decodes_and_resamples(tmp_path):
     assert abs(wave.numel() - 16_000) <= 16
     sf.write(tmp_path / "b.wav", stereo[:, :1], 16_000)
     assert load_audio_file(str(tmp_path / "b.wav")).numel() == 8000
+    # a bounded decode refuses a longer file, and a shorter one comes back whole
+    with pytest.raises(AudioTooLongError):
+        load_audio_file(str(tmp_path / "b.wav"), 16_000, max_seconds=0.25)
+    assert load_audio_file(str(tmp_path / "b.wav"), 16_000, max_seconds=5.0).numel() == 8000
+
+
+def test_load_speech_file_refuses_a_file_past_the_limit_as_it_decodes(tmp_path):
+    sf = pytest.importorskip("soundfile")
+    sf.write(tmp_path / "long.wav", np.zeros(16_000 * 30, dtype=np.float32), 16_000)
+    with pytest.raises(ValueError, match="longer than the 10 s limit"):
+        load_speech_file(str(tmp_path / "long.wav"), 16_000, 10.0)
+    with pytest.raises(ValueError, match="takes up to 10 s"):
+        clip_samples({"audio_inputs": [torch.zeros(16_000 * 11)]}, 10.0, "this model")
+
+
+def test_librosa_mel_filters_are_bit_identical():
+    librosa = pytest.importorskip("librosa")
+    expected = librosa.filters.mel(sr=16_000, n_fft=512, n_mels=128, fmin=0.0, fmax=8000, norm="slaney")
+    assert np.array_equal(librosa_mel_filters(16_000, 512, 128), expected)
+
+
+@pytest.mark.parametrize("seconds", [0.5, 3.37])
+def test_nemo_log_mel_matches_hf_parakeet_extractor(seconds):
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "ParakeetFeatureExtractor"):
+        pytest.skip("transformers has no ParakeetFeatureExtractor")
+    pytest.importorskip("librosa")
+    torch.manual_seed(5)
+    wave = torch.randn(int(16_000 * seconds)) * 0.1
+    hf = transformers.ParakeetFeatureExtractor(feature_size=128)(
+        wave.numpy(), sampling_rate=16_000, return_tensors="pt",
+    )
+    frames = int(hf["attention_mask"].sum())
+    ours = NemoLogMel()(wave)
+    assert ours.shape == (frames, 128) == (wave.numel() // 160, 128)
+    assert torch.allclose(ours, hf["input_features"][0, :frames], atol=1e-4)
+
+
+def test_nemo_log_mel_standardizes_each_bin():
+    torch.manual_seed(6)
+    feats = NemoLogMel()(torch.randn(16_000) * 0.3)
+    assert torch.allclose(feats.mean(dim=0), torch.zeros(128), atol=1e-4)
+    assert torch.allclose(feats.std(dim=0), torch.ones(128), atol=1e-3)
+    raw = NemoLogMel(normalize=False)(torch.randn(16_000) * 0.3)
+    assert raw.mean() < -1.0  # natural-log energies, left as they are
+
+
+def test_nemo_log_mel_keeps_digital_silence_at_zero():
+    feats = NemoLogMel()(torch.zeros(16_000 * 5))
+    assert torch.equal(feats, torch.zeros_like(feats))
+
+
+def test_nemo_log_mel_refuses_clips_under_two_frames():
+    with pytest.raises(ValueError):
+        NemoLogMel()(torch.randn(300))
+
+
+
+@pytest.mark.parametrize("normalize", [True, False])
+def test_nemo_log_mel_batch_gives_each_clip_what_it_gets_alone(normalize):
+    """The encoder node computes a batch's features in one pass: padding a
+    clip, and the preemphasis reaching past its end, must not change it."""
+    torch.manual_seed(7)
+    clips = [torch.randn(n) * 0.2 for n in (16_000, 5_123, 40_000, 321)]
+    clips.append(torch.zeros(8_000))  # digital silence stays zero in a batch too
+    log_mel = NemoLogMel(normalize=normalize)
+    batch = log_mel.batch(clips)
+    for clip, feats in zip(clips, batch, strict=True):
+        alone = log_mel.batch([clip])[0]
+        assert feats.shape == alone.shape == (clip.numel() // 160, 128)
+        torch.testing.assert_close(feats, alone, rtol=1e-5, atol=1e-5)
+    assert torch.equal(batch[-1], torch.zeros_like(batch[-1])) or not normalize
+
+
+def test_nemo_log_mel_batch_refuses_a_clip_under_two_frames():
+    with pytest.raises(ValueError, match="300 samples"):
+        NemoLogMel().batch([torch.randn(16_000), torch.randn(300)])
+
+def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
+    from mstar.model.components import audio_features
+
+    def raises(exc):
+        def load(*args, **kwargs):
+            raise exc
+        return load
+
+    # the decoders ran and refused the file: the client's error
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: True)
+    monkeypatch.setattr(audio_features, "_decode", raises(RuntimeError("Invalid data found")))
+    with pytest.raises(ValueError):
+        load_speech_file("x.wav", 16_000, 10.0)
+    # no decoder to run, or no memory: the server's
+    for exc in (ImportError("torchcodec"), MemoryError()):
+        monkeypatch.setattr(audio_features, "_decode", raises(exc))
+        with pytest.raises(type(exc)):
+            load_speech_file("x.wav", 16_000, 10.0)
+    # it decoded, and resampling failed: the server's too
+    monkeypatch.setattr(audio_features, "_decode", lambda *args: (torch.zeros(4800), 48_000))
+    monkeypatch.setattr(audio_features, "_resample", raises(RuntimeError("can't allocate memory")))
+    with pytest.raises(RuntimeError):
+        load_speech_file("x.wav", 16_000, 10.0)
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: False)
+    monkeypatch.setattr(audio_features, "_decode", raises(RuntimeError("Could not load libtorchcodec")))
+    with pytest.raises(RuntimeError):
+        load_speech_file("x.wav", 16_000, 10.0)
