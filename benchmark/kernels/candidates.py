@@ -99,12 +99,18 @@ def space(
     return points
 
 
+# The shuffle a budget is drawn from; a search sets another (``--shuffle-seed``)
+# to reach points an earlier search with the same budget did not try.
+SHUFFLE_SEED = 0
+
+
 def search_order(
     points: Sequence[Mapping[str, Any]], seeds: Iterable[Mapping[str, Any]] = (), budget: int | None = None,
-    seed: int = 0,
+    seed: int | None = None,
 ) -> list[dict[str, Any]]:
     """``seeds`` that are in ``points`` first (earlier winners), then the rest
     in a seeded random order, at most ``budget`` in all."""
+    seed = SHUFFLE_SEED if seed is None else seed
     pool = [dict(p) for p in points]
     first = [dict(s) for s in seeds if dict(s) in pool]
     rest = [p for p in pool if p not in first]
