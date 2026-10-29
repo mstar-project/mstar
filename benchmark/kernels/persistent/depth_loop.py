@@ -152,9 +152,10 @@ def group_errors(logits: torch.Tensor, ref: torch.Tensor) -> dict[str, Any]:
 class Kernel:
     """The resident kernel at one configuration, with its own scratch."""
 
-    def __init__(self, program, w, codebook, bs, groups, scope, grid, device, top_k, top_p, temperature):
+    def __init__(self, program, w, codebook, bs, groups, scope, grid, device, top_k, top_p, temperature,
+                 sync_mode=0):
         self.program, self.codebook, self.bs = program, codebook, bs
-        self.groups, self.scope, self.grid = groups, scope, grid
+        self.groups, self.scope, self.grid, self.sync_mode = groups, scope, grid, sync_mode
         self.table = sp.lower(program, w, device)
         self.rope = sp.rope_table(program.shape, device)
         self.scratch = ds.DepthStepScratch.allocate(program.shape, bs, groups, program.ss_slots, device)
@@ -163,7 +164,8 @@ class Kernel:
     def run(self, last_hidden, embed0, emb_sum, codes, *, seed=0, forced=None, stop_after=-1):
         ds.launch(self.table, self.rope, last_hidden, embed0, self.codebook, emb_sum, codes, self.scratch,
                   groups=self.groups, scope=self.scope, grid=self.grid, shape=self.program.shape, top_k=self.top_k,
-                  top_p=self.top_p, temperature=self.temperature, seed=seed, forced=forced, stop_after=stop_after)
+                  top_p=self.top_p, temperature=self.temperature, seed=seed, forced=forced, stop_after=stop_after,
+                  sync_mode=self.sync_mode)
 
     def ctl(self) -> list[int]:
         return [int(v) for v in self.scratch.ctl.tolist()]
@@ -459,6 +461,61 @@ def run(args) -> dict[str, Any]:
     return result
 
 
+def run_variants(args) -> dict[str, Any]:
+    """Barrier variants of the resident kernel: each one's teacher-forced logits
+    against the default configuration's, then its captured time per frame."""
+    device = torch.device("cuda")
+    from mstar.platforms import current_platform
+
+    cus = current_platform.device_facts().compute_units or 304
+    w, codebook, talker_codec = (checkpoint_weights if args.weights == "checkpoint" else random_weights)(device)
+    program = sp.depth_decoder_program(OMNI, sampler_key="code_sampler")
+    bs = args.bs
+    last_hidden, embed0, forced = make_inputs(bs, talker_codec, device)
+    top_k, top_p, temperature = 50, 0.8, 1.0
+
+    def forced_logits(k: Kernel) -> torch.Tensor:
+        emb_sum = embed0.float().clone()
+        codes = forced.clone()
+        k.zero_state()
+        k.run(last_hidden, embed0, emb_sum, codes, forced=forced)
+        torch.cuda.synchronize()
+        return k.scratch.logits.clone()
+
+    ref = forced_logits(Kernel(program, w, codebook, bs, 8, ds.SCOPE_XCD, ds.default_grid(cus, 8), device, top_k,
+                               top_p, temperature))
+    out: dict[str, Any] = {"weights": args.weights, "bs": bs, "variants": {}}
+    emb_sum_t = embed0.float().clone()
+    codes_t = forced.clone()
+    configs = []
+    for per_cu in (1, 2):
+        for mode in (0, ds.SYNC_LOAD_POLL, ds.SYNC_GATHER, ds.SYNC_GATHER | ds.SYNC_LOAD_POLL):
+            configs.append((8, ds.SCOPE_XCD, per_cu, mode))
+        for groups in (4, 2):
+            for mode in (0, ds.SYNC_GATHER):
+                configs.append((groups, ds.SCOPE_AGENT, per_cu, mode))
+    for groups, scope, per_cu, mode in configs:
+        grid = ds.default_grid(cus, groups, per_cu)
+        name = (f"g{groups}_{'xcd' if scope else 'agent'}_grid{grid}_"
+                f"{'gather' if mode & ds.SYNC_GATHER else 'counter'}{'_loadpoll' if mode & ds.SYNC_LOAD_POLL else ''}")
+        entry: dict[str, Any] = {}
+        try:
+            k = Kernel(program, w, codebook, bs, groups, scope, grid, device, top_k, top_p, temperature, mode)
+            entry["rel_to_default"] = rel(forced_logits(k), ref)
+            entry["ctl_forced"] = k.ctl()
+            t = time_graph(functools.partial(k.run, last_hidden, embed0, emb_sum_t, codes_t, seed=7), args.replays)
+            t.pop("graph")
+            entry.update(t)
+            entry["ctl"] = k.ctl()
+        except Exception as exc:  # noqa: BLE001  recorded
+            entry["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        out["variants"][name] = entry
+        (args.out / f"partial_variants_{args.weights}.json").write_text(json.dumps(out, indent=1, default=str))
+        print(f"[depth_loop] {time.strftime('%H:%M:%S')} variant {name}: {entry.get('ms', entry.get('error'))}",
+              flush=True)
+    return out
+
+
 def table(r: dict[str, Any]) -> str:
     lines = [f"# depth loop, bs {r['bs']}: {r['device']} ({r['arch']}), {r['weights']} weights, {r['phases']} phases",
              "", "## time per frame, captured (one replay per sync, median)", "",
@@ -498,8 +555,15 @@ def main(argv=None) -> int:
     ap.add_argument("--bs", type=int, default=27)
     ap.add_argument("--replays", type=int, default=30)
     ap.add_argument("--draws", type=int, default=150, help="sampler draws per row")
+    ap.add_argument("--variants", action="store_true", help="only the barrier variants")
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
+    if args.variants:
+        res = run_variants(args)
+        (args.out / f"depth_loop_variants_{args.weights}.json").write_text(json.dumps(res, indent=1, default=str))
+        for name, e in res["variants"].items():
+            print(name, {k: e[k] for k in ("ms", "rel_to_default", "ctl", "error") if k in e})
+        return 0
     result = run(args)
     (args.out / f"depth_loop_{args.weights}.json").write_text(json.dumps(result, indent=1, default=str))
     text = table(result)

@@ -19,6 +19,10 @@ from mstar.kernels.hip.build import JitExtension
 
 SOURCE = Path(__file__).resolve().parent / "hip" / "depth_step.cu"
 SCOPE_AGENT, SCOPE_XCD = 0, 1
+# barrier variants (``sync_mode`` bits): flags gathered by one member instead of one shared counter; inside
+# one XCD, polls by load instead of compare-and-swap
+SYNC_GATHER, SYNC_LOAD_POLL = 1, 2
+SYNC_WORDS = 1024  # per group
 
 
 def extension() -> JitExtension:
@@ -51,7 +55,7 @@ class DepthStepScratch:
         f32 = dict(dtype=torch.float32, device=device)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         n_ss = ss_slots * bs
-        zeroed = torch.zeros(n_ss + groups * 64 + 4, dtype=torch.int32, device=device)
+        zeroed = torch.zeros(n_ss + groups * SYNC_WORDS + 4, dtype=torch.int32, device=device)
         return cls(
             logits=torch.zeros((s.positions - 1, bs, s.vocab), **f32),
             h=torch.zeros((bs, s.hidden), **f32),
@@ -60,7 +64,7 @@ class DepthStepScratch:
             act=torch.zeros((bs, s.intermediate), **bf16),
             kv=torch.zeros((s.layers, bs, 2, s.positions, s.kv_heads, s.head_dim), **bf16),
             zeroed=zeroed, ss=zeroed[:n_ss].view(torch.float32).view(ss_slots, bs),
-            sync=zeroed[n_ss:n_ss + groups * 64], ctl=zeroed[n_ss + groups * 64:])
+            sync=zeroed[n_ss:n_ss + groups * SYNC_WORDS], ctl=zeroed[n_ss + groups * SYNC_WORDS:])
 
     def reset(self) -> None:
         self.zeroed.zero_()
@@ -69,12 +73,13 @@ class DepthStepScratch:
 def launch(table: torch.Tensor, rope: torch.Tensor, last_hidden: torch.Tensor, embed0: torch.Tensor,
            codebook: torch.Tensor, emb_sum: torch.Tensor, codes: torch.Tensor, scratch: DepthStepScratch, *,
            groups: int, scope: int, grid: int, shape: DepthDecoderShape, top_k: int, top_p: float,
-           temperature: float, seed: int, forced: torch.Tensor | None = None, stop_after: int = -1) -> None:
+           temperature: float, seed: int, forced: torch.Tensor | None = None, stop_after: int = -1,
+           sync_mode: int = 0) -> None:
     """One frame: zero the scratch counters, run the kernel (both capturable)."""
     scratch.reset()
     op()(table, rope, last_hidden, embed0, codebook, forced, emb_sum, codes, scratch.logits, scratch.h,
          scratch.qkv, scratch.attn, scratch.act, scratch.kv, scratch.ss, scratch.sync, scratch.ctl, groups, scope,
-         grid, stop_after, top_k, top_p, temperature, shape.eps, seed)
+         sync_mode, grid, stop_after, top_k, top_p, temperature, shape.eps, seed)
 
 
 def default_grid(compute_units: int, groups: int, per_cu: int = 1) -> int:

@@ -75,7 +75,7 @@ struct Params {
   float* ss;                  // [slots][bs]
   unsigned* sync;             // [groups][64]
   unsigned* ctl;              // [0] abort, [1] XCC mismatches, [2] phases completed by group 0's member 0
-  int n_phases, bs, groups, scope, stop_after, top_k;
+  int n_phases, bs, groups, scope, sync_mode, stop_after, top_k;
   float top_p, inv_temperature, eps, attn_scale;
   uint64_t seed;
 };
@@ -291,49 +291,97 @@ __device__ __forceinline__ f32x4 reduce_waves(f32x4 acc, f32x4* red) {
 // ---------------------------------------------------------------------------------------------------------
 // barrier among a group's members; the chunk after it is requested between the arrival and the wait
 
-__device__ __forceinline__ unsigned poll_counter(unsigned* p, int scope) {
+// sync_mode bit 0: the barrier's algorithm, 0 = every member adds to one counter and polls it, 1 = every member
+// stores its own epoch flag, member 0 polls all of them with one wave and stores a release flag the others poll.
+// bit 1: inside one XCD, poll with a workgroup-scope load (sc0) instead of a compare-and-swap (both read L2).
+constexpr int kSyncGather = 1;
+constexpr int kSyncLoadPoll = 2;
+constexpr int kSyncWords = 1024;  // per group: [0] counter, [32] release flag, [64 + m] member m's flag
+
+__device__ __forceinline__ unsigned poll_value(unsigned* p, int scope, int mode) {
   if (scope == AGENT) return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  // a returning atomic is performed in L2, past this CU's L1 (a load might hit a stale L1 line)
+  if (mode & kSyncLoadPoll) return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+  // a returning atomic is performed in L2, past this CU's L1
   unsigned seen = 0xffffffffu;
   __hip_atomic_compare_exchange_strong(p, &seen, 0xffffffffu, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
                                        __HIP_MEMORY_SCOPE_WORKGROUP);
   return seen;
 }
 
+__device__ __forceinline__ void store_flag(unsigned* p, unsigned v, int scope) {
+  if (scope == AGENT) {
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+  } else {
+    wait_stores();
+    __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+  }
+}
+
+// Spin (one lane) until *p >= target; false on abort or timeout. The abort flag and the clock are read every
+// 32 polls, so a satisfied wait is seen one poll late at most.
+__device__ bool spin_geq(const Params& P, unsigned* p, unsigned target, uint64_t t0) {
+  for (unsigned spins = 1;; ++spins) {
+    if (poll_value(p, P.scope, P.sync_mode) >= target) return true;
+    if ((spins & 31u) == 0u) {
+      if (aborted(P)) return false;
+      if (now() - t0 > kSpinTicks) {
+        __hip_atomic_store(P.ctl, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        return false;
+      }
+    }
+  }
+}
+
+__device__ __forceinline__ void acquire(const Params& P) {
+  if (P.scope == AGENT) {
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  } else {
+    invalidate_l1();
+  }
+}
+
 __device__ bool group_barrier(const Params& P, const Group& G, unsigned epoch, uint4 (&wnext)[8],
                               const ChunkIt& next, bool prefetch, int* ok_flag) {
   wait_stores();
   __syncthreads();
+  const bool gather = (P.sync_mode & kSyncGather) != 0;
   if (threadIdx.x == 0) {
-    if (P.scope == AGENT) {
+    if (gather) {
+      store_flag(G.sync + 64 + G.member, epoch, P.scope);
+    } else if (P.scope == AGENT) {
       __hip_atomic_fetch_add(G.sync, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
     } else {
       __hip_atomic_fetch_add(G.sync, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
     }
   }
   if (prefetch) load_chunk(wnext, P, next);
-  if (threadIdx.x == 0) {
-    const unsigned target = epoch * (unsigned)G.members;
-    const uint64_t t0 = now();
-    int ok = 1;
-    // the abort flag and the clock are read every 32 polls, so a satisfied barrier is seen one poll late at most
-    for (unsigned spins = 1;; ++spins) {
-      if (poll_counter(G.sync, P.scope) >= target) break;
-      if ((spins & 31u) == 0u) {
-        if (aborted(P)) { ok = 0; break; }
-        if (now() - t0 > kSpinTicks) {
-          __hip_atomic_store(P.ctl, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-          ok = 0;
+  const uint64_t t0 = now();
+  if (gather && G.member == 0) {
+    if (threadIdx.x < 64) {
+      bool done = false, ok = true;
+      for (unsigned spins = 1; !done; ++spins) {
+        bool mine = true;
+        for (int m = threadIdx.x; m < G.members; m += 64) {
+          mine &= poll_value(G.sync + 64 + m, P.scope, P.sync_mode) >= epoch;
+        }
+        done = __all(mine);
+        // decided by the whole wave, so the vote above stays uniform
+        if (!done && (spins & 31u) == 0u && __any(aborted(P) || now() - t0 > kSpinTicks)) {
+          if (threadIdx.x == 0) __hip_atomic_store(P.ctl, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          ok = false;
           break;
         }
       }
+      acquire(P);
+      if (threadIdx.x == 0) {
+        if (ok) store_flag(G.sync + 32, epoch, P.scope);
+        *ok_flag = ok ? 1 : 0;
+      }
     }
-    if (P.scope == AGENT) {
-      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    } else {
-      invalidate_l1();
-    }
-    *ok_flag = ok;
+  } else if (threadIdx.x == 0) {
+    const bool ok = spin_geq(P, gather ? G.sync + 32 : G.sync, gather ? epoch : epoch * (unsigned)G.members, t0);
+    acquire(P);
+    *ok_flag = ok ? 1 : 0;
   }
   __syncthreads();
   return *ok_flag != 0;
@@ -620,7 +668,7 @@ __global__ void __launch_bounds__(kThreads, 2) depth_step_kernel(Params P) {
   G.members = (int)(gridDim.x / P.groups);
   G.row0 = (G.g * P.bs) / P.groups;
   G.nrows = ((G.g + 1) * P.bs) / P.groups - G.row0;
-  G.sync = P.sync + G.g * 64;
+  G.sync = P.sync + G.g * kSyncWords;
   if (P.scope == XCD && (int)xcc_id() != G.g % 8) {
     // the XCD-local protocol is only correct inside one XCD
     if (threadIdx.x == 0) {
@@ -668,7 +716,7 @@ void depth_step(const at::Tensor& program, const at::Tensor& rope, const at::Ten
                 const at::Tensor& emb_sum, const at::Tensor& codes, const at::Tensor& logits, const at::Tensor& h,
                 const at::Tensor& qkv, const at::Tensor& attn, const at::Tensor& act, const at::Tensor& kv,
                 const at::Tensor& ss, const at::Tensor& sync, const at::Tensor& ctl, int64_t groups, int64_t scope,
-                int64_t grid, int64_t stop_after, int64_t top_k, double top_p, double temperature, double eps,
+                int64_t sync_mode, int64_t grid, int64_t stop_after, int64_t top_k, double top_p, double temperature, double eps,
                 int64_t seed) {
   TORCH_CHECK(program.scalar_type() == at::kLong && program.dim() == 2 && program.size(1) == kPhaseFields,
               "program int64[n, ", kPhaseFields, "]");
@@ -676,7 +724,8 @@ void depth_step(const at::Tensor& program, const at::Tensor& rope, const at::Ten
   TORCH_CHECK(bs <= groups * kMaxRows, "at most ", kMaxRows, " rows per group");
   TORCH_CHECK(grid % groups == 0 && grid / groups >= kMaxRows, "members per group >= ", kMaxRows);
   TORCH_CHECK(top_k >= 1 && top_k <= 64, "top_k in [1, 64]");
-  TORCH_CHECK(sync.numel() >= groups * 64 && ctl.numel() >= 4, "sync[groups * 64], ctl[4]");
+  TORCH_CHECK(sync.numel() >= groups * kSyncWords && ctl.numel() >= 4, "sync[groups * ", kSyncWords, "], ctl[4]");
+  TORCH_CHECK(grid / groups <= kSyncWords - 64, "at most ", kSyncWords - 64, " members per group");
   Params P;
   P.program = ptr<const int64_t>(program);
   P.rope = ptr<const float>(rope);
@@ -699,6 +748,7 @@ void depth_step(const at::Tensor& program, const at::Tensor& rope, const at::Ten
   P.bs = bs;
   P.groups = (int)groups;
   P.scope = (int)scope;
+  P.sync_mode = (int)sync_mode;
   P.stop_after = stop_after < 0 ? (int)program.size(0) : (int)stop_after;
   P.top_k = (int)top_k;
   P.top_p = (float)top_p;
@@ -716,7 +766,8 @@ void depth_step(const at::Tensor& program, const at::Tensor& rope, const at::Ten
 TORCH_LIBRARY(mstar_persistent, m) {
   m.def("depth_step(Tensor program, Tensor rope, Tensor last_hidden, Tensor embed0, Tensor codebook, Tensor? forced, "
         "Tensor(a!) emb_sum, Tensor(b!) codes, Tensor(c!) logits, Tensor(d!) h, Tensor(e!) qkv, Tensor(f!) attn, "
-        "Tensor(g!) act, Tensor(h!) kv, Tensor(i!) ss, Tensor(j!) sync, Tensor(k!) ctl, int groups, int scope, int grid, "
+        "Tensor(g!) act, Tensor(h!) kv, Tensor(i!) ss, Tensor(j!) sync, Tensor(k!) ctl, int groups, int scope, "
+        "int sync_mode, int grid, "
         "int stop_after, int top_k, float top_p, float temperature, float eps, int seed) -> ()");
 }
 
