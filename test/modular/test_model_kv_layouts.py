@@ -444,7 +444,7 @@ def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
-    llm = SimpleNamespace(config=SimpleNamespace(stop_token_ids=()))
+    llm = SimpleNamespace(config=SimpleNamespace(stop_token_ids=()), num_draft_tokens=0)
 
     def check_stop(request_id, request_info, outputs):
         return LLMSubmodule.check_stop(llm, request_id, request_info, outputs)
