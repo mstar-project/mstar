@@ -65,16 +65,17 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        """A stop id on a PREFILL_WALK or decode row, or on a decode row the
-        token budget."""
+        """A stop id, or the token budget, on a PREFILL_WALK or decode row.
+        The budget counts the token PREFILL_WALK samples."""
         walk = request_info.graph_walk
-        if walk != self.DECODE_WALK and walk != self.PREFILL_WALK:
+        if walk == self.DECODE_WALK:
+            generated = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 2
+        elif walk == self.PREFILL_WALK:
+            generated = 1
+        else:
             return False
         ignore_eos = request_info.resource_configs[self.SAMPLER].ignore_eos
-        if not ignore_eos and token in self.stop_token_ids:
-            return True
-        decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
-        return walk == self.DECODE_WALK and decoded >= request_info.max_tokens
+        return (not ignore_eos and token in self.stop_token_ids) or generated >= request_info.max_tokens
 
     def _stop_names(self, token: int, request_info: CurrentForwardPassInfo) -> set[str]:
         """``check_stop``'s answer for one row: a decode row stops the loop,

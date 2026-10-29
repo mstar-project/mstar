@@ -395,8 +395,10 @@ def test_llm_check_stop():
     assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
     # any other walk outside the loop may be followed by one the transition runs
     assert sub.check_stop("r", info("detect_language", 0), im_end) == set()
-    # a prompt walk ends only on a stop id; the budget is checked on decode rows, as on main
-    assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == set()
+    # the budget counts the prefill's token: 1 ends there, 10 after nine decode steps
+    assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == {END_PARTITION}
+    assert sub.check_stop("r", info(DECODE_WALK, 8, max_tokens=10), word) == {"decode_loop"}
+    assert sub.check_stop("r", info(DECODE_WALK, 7, max_tokens=10), word) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
