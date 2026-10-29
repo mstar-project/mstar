@@ -77,7 +77,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.components.audio_features import NemoLogMel
-from mstar.model.components.fastconformer_stream import encoder_kv_config, encoder_state_blocks, front_state_blocks
+from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
 from mstar.model.nemotron_duplex.config import (
@@ -543,25 +543,9 @@ class NemotronDuplexModel(Model):
             max_num_pages=self.nano_kv_pages(PagedKVConfig.page_size),
         )
         return [
-            RecurrentStateSpec(
-                resource_key=ENCODER_STATE, nodes={"conformer_encoder"},
-                config=RecurrentStateConfig(
-                    num_layers=self.config.stt.encoder.num_layers,
-                    blocks=encoder_state_blocks(self.config.stt.encoder),       # in the engine's compute dtype
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
-            ),
-            RecurrentStateSpec(
-                resource_key=ENCODER_FRONT, nodes={"conformer_encoder"},
-                config=RecurrentStateConfig(
-                    num_layers=1, blocks=front_state_blocks(self.config.stt.encoder, self.config.stt.hop_length),
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
-            ),
-            # no sink slot: padding rows read and write nothing in it
-            BoundedKVSpec(
-                resource_key=ENCODER_KV, nodes={"conformer_encoder"},
-                config=encoder_kv_config(self.config.stt.encoder, max_slots=self.DEFAULT_SESSIONS),
+            *stream_node_resources(
+                self.config.stt.encoder, self.config.stt.hop_length, "conformer_encoder", self.DEFAULT_SESSIONS,
+                kv_key=ENCODER_KV, conv_key=ENCODER_STATE, front_key=ENCODER_FRONT,
             ),
             KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
             AttentionSpec(

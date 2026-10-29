@@ -35,9 +35,15 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
 )
-from mstar.engine.resources import Segment, SubmoduleStep
-from mstar.engine.resources.kv.bounded import BoundedKVConfig, BoundedKVStep, SinkWindow, StreamPosition
-from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.resources import NodeResourceSpec, Segment, SubmoduleStep
+from mstar.engine.resources.kv.bounded import (
+    BoundedKVConfig,
+    BoundedKVSpec,
+    BoundedKVStep,
+    SinkWindow,
+    StreamPosition,
+)
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec, RecurrentStep
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer import FastConformerConfig, FastConformerEncoder
@@ -99,6 +105,24 @@ def encoder_kv_config(config: FastConformerConfig, max_slots: int) -> BoundedKVC
         max_source_len=0, retention=SinkWindow(0, config.left_context),
         query_window=config.left_context, max_slots=max_slots, dtype=None,
     )
+
+
+def stream_node_resources(
+    config: FastConformerConfig, hop_length: int, node: str, max_streams: int, *,
+    kv_key: str, conv_key: str, front_key: str,
+) -> list[NodeResourceSpec]:
+    """The stream node's resources for ``max_streams`` streams: the conv and
+    front pools, each with a sink slot for a capture's padding rows, and the
+    bounded KV, which padding rows leave alone."""
+    def pool(key: str, num_layers: int, blocks: dict[str, RecurrentBlockConfig]) -> RecurrentStateSpec:
+        return RecurrentStateSpec(resource_key=key, nodes={node}, config=RecurrentStateConfig(
+            num_layers=num_layers, blocks=blocks, max_slots=max_streams + 1))
+
+    return [
+        pool(conv_key, config.num_layers, encoder_state_blocks(config)),
+        pool(front_key, 1, front_state_blocks(config, hop_length)),
+        BoundedKVSpec(resource_key=kv_key, nodes={node}, config=encoder_kv_config(config, max_slots=max_streams)),
+    ]
 
 
 class FastConformerStreamSubmodule(NodeSubmodule):
