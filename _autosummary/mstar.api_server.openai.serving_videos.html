@@ -226,6 +226,7 @@
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -686,7 +687,7 @@
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_videos.create_videos" title="mstar.api_server.openai.serving_videos.create_videos"><code class="xref py py-obj docutils literal notranslate"><span class="pre">create_videos</span></code></a>(api, model_name, adapter, req)</p></td>
-<td><p></p></td>
+<td><p>The response dict, or for <code class="docutils literal notranslate"><span class="pre">stream_video</span></code> the NDJSON response itself.</p></td>
 </tr>
 </tbody>
 </table>
@@ -694,7 +695,8 @@
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.openai.serving_videos.create_videos">
 <span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_videos.</span></span><span class="sig-name descname"><span class="pre">create_videos</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">api</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">adapter</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raw_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_videos.html#create_videos"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_videos.create_videos" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
+<dd><p>The response dict, or for <code class="docutils literal notranslate"><span class="pre">stream_video</span></code> the NDJSON response itself.</p>
+</dd></dl>
 
 </section>
 

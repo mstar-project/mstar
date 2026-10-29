@@ -579,6 +579,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -968,6 +969,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">now</span><span class="p">,</span> <span class="n">rid</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.streaming_response</span><span class="w"> </span><span class="kn">import</span> <span class="n">ReleasingStreamingResponse</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -975,6 +977,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="create_videos">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html#mstar.api_server.openai.serving_videos.create_videos">[docs]</a>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_videos</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">raw_request</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>  <span class="c1"># noqa: ARG001</span>
+<span class="w">    </span><span class="sd">"""The response dict, or for ``stream_video`` the NDJSON response itself."""</span>
     <span class="n">args</span> <span class="o">=</span> <span class="n">adapter</span><span class="o">.</span><span class="n">video_to_request</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"vid"</span><span class="p">)</span>
 
@@ -991,7 +994,13 @@ window.runMermaid = runMermaid;</script>
             <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">if</span> <span class="n">stream</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">_stream_ndjson</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">)</span>
+            <span class="c1"># A windowed request delivering each window as it lands: NDJSON</span>
+            <span class="c1"># lines (see _stream_ndjson) instead of one JSON body.</span>
+            <span class="k">return</span> <span class="n">ReleasingStreamingResponse</span><span class="p">(</span>
+                <span class="n">_stream_ndjson</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">),</span>
+                <span class="n">release</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="n">api</span><span class="o">.</span><span class="n">release_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">),</span>
+                <span class="n">media_type</span><span class="o">=</span><span class="s2">"application/x-ndjson"</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
+            <span class="p">)</span>
         <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
     <span class="k">finally</span><span class="p">:</span>
         <span class="n">media_io</span><span class="o">.</span><span class="n">schedule_upload_cleanup</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
