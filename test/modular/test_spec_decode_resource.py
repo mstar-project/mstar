@@ -263,7 +263,7 @@ class Harness:
             self.spec.begin_draft_pass(j)
             positions = verify_positions + j
             self._write(plan, drafted, layer=1)
-            drafted = self.spec.record_draft(j, self._draft(plan, b, positions))
+            drafted = self.spec.record_draft(j, self._draft(plan, b, positions)[self.spec.draft_slots()])
         self.kv.commit(kv_step, ctx)
         self.pool.commit(pool_step, ctx)
         self.spec.commit(spec_step, ctx)
