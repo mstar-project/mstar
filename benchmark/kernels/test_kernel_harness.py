@@ -359,9 +359,10 @@ def test_best_promotion_picks_an_implementation_per_shape(tmp_path):
         record = {"shape": {"rows": rows, "n": 64, "k": 32}, "candidates": {f"c{i}": c for i, c in enumerate(timed)}}
         store.write(MI300X, "gemv", record["shape"], torch.bfloat16, record)
     impls = {"vendor": ("vendor", {}), "aiter": ("aiter", {}), "tuned_a": ("triton", {"dot": False}),
-             "tuned_b": ("triton", {"dot": True})}
+             "tuned_b": ("hip", {"dot": True})}
     path = store.promote_best(MI300X, "gemv", impls.get, lambda s: "small" if s["rows"] <= 4 else "large",
-                              margin=0.02, root=tmp_path / "configs", provenance={"job": "test"})
+                              tuned=("triton", "hip"), margin=0.02, root=tmp_path / "configs",
+                              provenance={"job": "test"})
     assert path == tmp_path / "configs" / "gfx942" / "mi300x" / "gemv.json"
     config = json.loads(path.read_text())
     assert config["classes"] == {"small": {"impl": "triton", "block": 8, "dot": False}, "large": {"impl": "vendor"}}
@@ -372,9 +373,15 @@ def test_best_promotion_picks_an_implementation_per_shape(tmp_path):
     assert configs.select(loaded, "small", {"rows": 2, "n": 64, "k": 32})["impl"] == "triton"
     # with a default per class, every measured shape that chose otherwise is its own entry
     path = store.promote_best(MI300X, "gemv", impls.get, lambda s: "small" if s["rows"] <= 4 else "large",
-                              class_default=lambda klass: {"impl": "vendor"}, root=tmp_path / "configs")
+                              tuned=("triton", "hip"), class_default=lambda klass: {"impl": "vendor"},
+                              root=tmp_path / "configs")
     config = json.loads(path.read_text())
     assert config["classes"] == {"small": {"impl": "vendor"}, "large": {"impl": "vendor"}}
     assert set(config["shapes"]) == {"k32-n64-rows1", "k32-n64-rows2"}
+    # aiter is 10% faster than the default at rows 1 but only 5% at rows 2: rows 2 keeps the default
+    path = store.promote_best(MI300X, "gemv", {"vendor": ("vendor", {}), "aiter": ("aiter", {})}.get,
+                              lambda s: "all", class_default=lambda klass: {"impl": "vendor"}, margin=0.08,
+                              root=tmp_path / "configs")
+    assert json.loads(path.read_text())["shapes"] == {"k32-n64-rows1": {"impl": "aiter"}}
     with pytest.raises(ValueError, match="no passing results"):
         store.promote_best(MI300X, "gemv", lambda family: None, lambda s: None, root=tmp_path / "configs")

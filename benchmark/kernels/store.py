@@ -136,7 +136,7 @@ class ResultsStore:
         kernel: str,
         impl_of: Callable[[str], tuple[str, Mapping[str, Any]] | None],
         shape_class: Callable[[Mapping[str, int]], str | None],
-        tuned: str = "triton",
+        tuned: tuple[str, ...] = ("triton",),
         margin: float = 0.02,
         dims: tuple[str, ...] | None = None,
         class_default: Callable[[str], Mapping[str, Any]] | None = None,
@@ -149,12 +149,14 @@ class ResultsStore:
 
         ``impl_of(family)`` names the implementation a candidate family stands
         for and the knobs it adds (``("triton", {"use_dot": True})``), or None
-        for families that cannot ship (a torch expression). The ``tuned``
-        implementation replaces the fastest other one only where it is at least
-        ``margin`` faster. Each class gets the entry most of its shapes chose,
-        and a shape that chose otherwise its own entry; with ``class_default``,
-        each class gets ``class_default(class)`` instead, so only the measured
-        shapes change (for an op that also serves shapes nobody searched).
+        for families that cannot ship (a torch expression). The fastest of the
+        ``tuned`` implementations (kernels of this repo, with knobs) replaces the
+        fastest other one only where it is at least ``margin`` faster. Each
+        class gets the entry most of its shapes chose, and a shape that chose
+        otherwise its own entry; with ``class_default``, each class gets
+        ``class_default(class)`` instead and a measured shape leaves it only
+        for an implementation ``margin`` faster, so shapes nobody searched run
+        what they did before.
         ``dims`` names the shape dimensions the op's configs are keyed by (all of
         them by default).
         """
@@ -166,17 +168,24 @@ class ResultsStore:
                 if mapped is None or not _ok(cand):
                     continue
                 impl, extra = mapped
-                knobs = {**cand.get("knobs", {}), **extra} if impl == tuned else {}
+                knobs = {**cand.get("knobs", {}), **extra} if impl in tuned else {}
                 timed.append((cand["us"], impl, knobs))
             if not timed:
                 continue
-            best_tuned = min((t for t in timed if t[1] == tuned), default=None)
-            best_other = min((t for t in timed if t[1] != tuned), default=None)
+            best_tuned = min((t for t in timed if t[1] in tuned), default=None, key=lambda t: t[0])
+            best_other = min((t for t in timed if t[1] not in tuned), default=None, key=lambda t: t[0])
             pick = best_other
             if best_tuned is not None and (best_other is None or best_tuned[0] <= (1 - margin) * best_other[0]):
                 pick = best_tuned
+            klass = shape_class(record["shape"]) or "default"
+            if class_default is not None:
+                # leaving what the class runs by default takes the margin too
+                default = class_default(klass).get("impl")
+                kept = min((t for t in timed if t[1] == default), default=None, key=lambda t: t[0])
+                if kept is not None and pick[1] != default and pick[0] > (1 - margin) * kept[0]:
+                    pick = kept
             shape = {k: v for k, v in record["shape"].items() if dims is None or k in dims}
-            chosen[json.dumps(shape)] = (shape_class(record["shape"]) or "default", {"impl": pick[1], **pick[2]})
+            chosen[json.dumps(shape)] = (klass, {"impl": pick[1], **pick[2]})
         if not chosen:
             raise ValueError(f"no passing results for {kernel} on {facts.arch}/{facts.product}")
         votes: dict[str, dict[str, int]] = {}
