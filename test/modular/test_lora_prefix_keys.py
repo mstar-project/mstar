@@ -44,6 +44,7 @@ from mstar.model.base import (  # noqa: E402
     declared_resources,
     serving_resources,
 )
+from mstar.streaming.topology import PartitionTopology  # noqa: E402
 
 PAGE_SIZE = 16
 NODE, WALK = "LLM", "prefill"
@@ -68,6 +69,9 @@ class _Model:
 
     def max_input_files(self):
         return {}
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(

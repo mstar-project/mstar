@@ -100,3 +100,41 @@ def test_kv_scatter_rejects_what_index_put_rejects(mismatch):
         page = page[:4]
     with pytest.raises((RuntimeError, IndexError)):
         _kv_scatter_nhd_eager(cache, 1, k, v, page, slot)
+
+
+def test_kv_scatter_takes_int32_indices_and_no_tokens():
+    cache = torch.zeros(3, 10, 2, 16, 2, 128, dtype=torch.bfloat16, device="cuda")
+    expected = cache.clone()
+    empty = torch.empty(0, 2, 128, device="cuda", dtype=torch.bfloat16)
+    none = torch.empty(0, device="cuda", dtype=torch.int32)
+    _kv_scatter_nhd_eager(cache, 0, empty, empty, none, none)
+    assert torch.equal(cache, expected)
+    k = torch.randn(2, 2, 128, device="cuda").to(torch.bfloat16)
+    v = torch.randn(2, 2, 128, device="cuda").to(torch.bfloat16)
+    page = torch.tensor([8, 3], device="cuda", dtype=torch.int32)
+    slot = torch.tensor([15, 0], device="cuda", dtype=torch.int32)
+    expected = _expected(cache, 2, k, v, page.long(), slot.long())
+    _kv_scatter_nhd_eager(cache, 2, k, v, page, slot)
+    torch.testing.assert_close(cache, expected, atol=0, rtol=0)
+
+
+def test_kv_scatter_replay_follows_its_index_buffers():
+    """Captured, the write reads the indices at replay, not at capture."""
+    cache = torch.zeros(1, 10, 2, 16, 2, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros(4, 2, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    page = torch.zeros(4, device="cuda", dtype=torch.long)
+    slot = torch.arange(4, device="cuda", dtype=torch.long)
+    _kv_scatter_nhd_eager(cache, 0, k, v, page, slot)  # warm the JIT
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _kv_scatter_nhd_eager(cache, 0, k, v, page, slot)
+    k.copy_(torch.randn_like(k))
+    v.copy_(torch.randn_like(v))
+    page.copy_(torch.tensor([5, 5, 7, 1], device="cuda"))
+    slot.copy_(torch.tensor([2, 9, 0, 15], device="cuda"))
+    expected = _expected(cache, 0, k, v, page, slot)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(cache, expected, atol=0, rtol=0)

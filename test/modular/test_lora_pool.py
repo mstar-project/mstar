@@ -473,11 +473,10 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
     with caplog.at_level(logging.WARNING):
         assert w._try_offload_cold_request("LLM", {1}, affected_resources={"lora"}) is None
     assert asked == [] and "No eviction candidate" not in caplog.text
-    # control: a KV refusal with nothing reclaimable warns, once per interval
+    # control: a KV refusal with nothing reclaimable looks for a victim and warns
     with caplog.at_level(logging.WARNING):
-        for _ in range(3):
-            assert w._try_offload_cold_request("LLM", {1}, affected_resources={"kv"}) is None
-    assert caplog.text.count("No eviction candidate") == 1
+        assert w._try_offload_cold_request("LLM", {1}, affected_resources={"kv"}) is None
+    assert asked and "No eviction candidate" in caplog.text
 
 
 def test_a_node_running_sequence_parallelism_refuses_lora(adapters):

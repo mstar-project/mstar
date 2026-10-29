@@ -42,6 +42,7 @@ from mstar.model.base import (
     KVLabel,
     LabelLayout,
     Model,
+    PrefixKeys,
     ProcessPromptOutput,
     Span,
     TensorAndMetadata,
@@ -82,7 +83,7 @@ from mstar.model.qwen3_5.video import (
     sample_video,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import drop_stop_tokens
+from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,8 @@ class Qwen3_5DenseModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
+
+    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -253,6 +256,7 @@ class Qwen3_5DenseModel(Model):
                         head_v_dim=self.config.linear_value_head_dim,
                         conv_kernel_size=self.config.linear_conv_kernel_dim
                     ).to_blocks(state_dtype=self._gdn_state_dtype()),
+                    kv_cache=KV_CACHE,
                 )
             ),
             LinearAttnSpec(
@@ -574,7 +578,12 @@ class Qwen3_5DenseModel(Model):
             return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
 
         plan = prefill_plan(expand_video_parts(parts, groups))
-        layout = LabelLayout(spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),))
+        layout = LabelLayout(
+            spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
+            # The keys name `prefill_text` alone, and the preprocess worker refuses
+            # a keyed span in any other walk.
+            keyed_spans=0 if walk == "prefill_vision" else None,
+        )
         # always set, so a `video_groups` the client sent never reaches the schedule
         return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
 
@@ -584,7 +593,11 @@ class Qwen3_5DenseModel(Model):
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(
             growth=(("decode", "decode_loop"),),
+            keys=PrefixKeys("text_inputs", ("prefill_text",), growth=True),
         )}}
+
+    def checkpoint_path(self) -> str:
+        return self._resolve_weights()
 
 
     def postprocess(
@@ -595,8 +608,9 @@ class Qwen3_5DenseModel(Model):
         ) -> bytes:
             if modality == "text":
                 ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-                detok = self.tokenizer.decode(ids)
-                return detok.encode("utf-8")
+                if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+                    self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+                return self._text_detokenizer.to_bytes(ids)
             raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
 
     # ------------------------------------------------------------------

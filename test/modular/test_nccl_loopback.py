@@ -75,6 +75,7 @@ def test_the_conductor_sets_it_before_spawning_workers(clean_env, monkeypatch):
         _dist_init_method="", model=None, enable_nvtx=False, enable_prof=False, device_type="cuda",
         rank_devices=None, log_level="INFO", tensor_comm_protocol=None, tcp_transfer_device="",
         _status_interval_s=None,
+        _mps_requested=False, _mps=None,
         shutdown=None,
     )
     conductor.Conductor._launch_workers(spawner)

@@ -28,6 +28,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Resource
 from mstar.engine.resources.kv import manager as manager_mod
@@ -38,6 +39,7 @@ from mstar.engine.resources.position.manager import RopeManager
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys
+from mstar.streaming.topology import StreamingGraphEdge
 from mstar.validation.resources import _unservable_walks
 
 KV = "kv"
@@ -436,8 +438,10 @@ def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_
     }
     walks = ("prefill", "prefill_image")
     label = KVLabel(keys=PrefixKeys("text_inputs", walks))
+    partition = PartitionDefinition(name="LLM", graph_walks=set(graphs), initial_walk="prefill", producer_partitions=[])
     return SimpleNamespace(
         kv_labels=lambda: {KV: {"main": label}}, get_graph_walk_graphs=lambda: graphs,
+        get_partitions=lambda: [partition],
         checkpoint_path=lambda: None, preprocess_fingerprint=lambda: "laid out",
     )
 
@@ -463,6 +467,23 @@ def test_a_walk_the_cache_cannot_serve_whole_is_refused_at_startup(node, model, 
     assert problems and re.search(message, problems[0]), problems
 
 
+def test_a_keyed_node_that_streams_into_another_partition_loads():
+    model = _laid_out()
+    for graph in model.get_graph_walk_graphs().values():
+        graph.get_nodes()["LLM"].outputs.append(
+            StreamingGraphEdge(next_node="talker", name="hidden", target_partition="Talker"),
+        )
+    spec = KVSpec(
+        resource_key=KV, nodes={"LLM"},
+        config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
+    )
+
+    assert not list(_unservable_walks([spec], model)), (
+        "a keyed node that streams into another partition was refused, though a walk the cache "
+        "serves whole leaves its own partition nothing to read"
+    )
+
+
 def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch):
     engine = Engine.__new__(Engine)
     engine._resources = {}
@@ -482,4 +503,24 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
     assert compiled == {"vit": True, "LLM": None, "vae": None}, (
         "an image encoder left to recompile caches KV it no longer computes for the same "
         "file, or a node the cache never keys from lost the compile main gives it"
+    )
+
+
+def test_an_encoder_that_marks_its_own_dims_compiles_with_the_default_while_its_output_is_cached(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
+    engine = Engine.__new__(Engine)
+    engine._resources = {}
+    engine._device = torch.device("cuda")
+    spec = KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
+    ))
+    engine._open_prefix_caches({KV: spec}, _laid_out())
+    vit = SimpleNamespace(forward="eager", forward_batched="eager", marks_dynamic_dims=True)
+    engine._submodules = {"vit": SimpleNamespace(submodule=vit, forward="eager")}
+
+    engine._compile_submodules()
+
+    assert engine._submodules["vit"].forward is None, (
+        "an encoder that marks its own dynamic dimensions was compiled with dynamic=True while its KV is cached"
     )

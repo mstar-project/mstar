@@ -18,6 +18,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -52,6 +53,20 @@ class ProcessPromptOutput(NamedTuple):
     """
     new_input_tensors: NameToTensorList
     metadata: dict
+
+
+class ClientChunk(NamedTuple):
+    """One append the client sends to a running request, as
+    ``Model.process_stream_chunk`` sees it."""
+    text: str | None
+    # the append's files, loaded as a request's are (``audio_inputs`` and so on)
+    tensors: NameToTensorList
+    input_metadata: dict[str, list[dict]]
+    # per ``tensors`` list, the client stream each file names, None where it names none
+    streams: dict[str, list[str | None]]
+    # this append's model_kwargs, and the opening message's
+    model_kwargs: dict
+    request_kwargs: dict
 
 
 class Span(NamedTuple):
@@ -483,11 +498,14 @@ class Model(ABC):
     # Request keys that set an output length. A request that sets one is refused when it
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
+    # Request keys the conductor reads for every model, never logged as ignored.
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", LORA_ADAPTER_KWARG)
 
     # Intra-op threads for the API server's preprocessing of this model's
-    # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
-    # default of one per core; ``preprocess_torch_threads`` in the model's
-    # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
+    # inputs (``load_image``, ``process_prompt``, ...). None takes a default
+    # sized from the CPUs the process may use; ``preprocess_torch_threads`` in
+    # the model's config.yaml overrides either. See
+    # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
 
     def _get_worker_graphs_for_graph_walk(
@@ -770,6 +788,26 @@ class Model(ABC):
         ``MSTAR_MAX_MEDIA_FILES``."""
         return {}
 
+    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
+        """Turn one append the client sends to a running request into items of
+        the model's client streams (``Connection(from_partition=CLIENT, ...)``).
+
+        Called by the API server data worker for each append that carries text
+        or files, after it has loaded the files the way it loads a request's
+        (``chunk.tensors``: ``audio_inputs``, ``image_inputs``,
+        ``video_inputs``). ``chunk.streams`` names the stream the client meant
+        each file for, where it named one; ``chunk.model_kwargs`` are the
+        append's own, beside the opening's ``chunk.request_kwargs``. Returns
+        items by client edge name; each list entry is one item of that stream.
+        Raise ``ValueError`` for an append the model can't take (the client
+        gets a 400); an append with text that yields no item is refused.
+
+        Keep it stateless: the consuming node folds items into its own state.
+        Tensors ``process_prompt`` returns under a client edge's name are the
+        stream's first chunk, so a one-shot request needs no append.
+        """
+        raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
+
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.
@@ -817,6 +855,10 @@ class Model(ABC):
         ``request_kwargs`` is the request's model_kwargs, so encoders can honor
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
+
+        An image or video artifact encodes on the API server's pool, beside the
+        data worker's inline calls for the request's other outputs, so an
+        override must not keep state across calls.
 
         Modality to expected encoding type:
         - text: utf-8
@@ -874,8 +916,8 @@ class Model(ABC):
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an
         OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key named in the ``X-MStar-Ignored-Params`` response header.
-        None (the default) declares nothing, so nothing is reported.
+        and the key logged as ignored. None (the default) declares nothing, so
+        nothing is logged.
         """
         return None
 
@@ -900,9 +942,10 @@ class Model(ABC):
     def warmup_preprocess(self) -> None:
         """Called once in the preprocess worker before it takes requests.
 
-        Build what ``process_prompt`` needs lazily (a G2P front end, a
-        tokenizer, a feature extractor) so the first request does not pay for
-        it. The default does nothing.
+        Build what ``process_prompt`` and ``postprocess`` would otherwise build
+        lazily (a G2P front end, a tokenizer, a feature extractor, a compiled
+        kernel) so the first request does not pay for it. The default does
+        nothing.
         """
         return None
 

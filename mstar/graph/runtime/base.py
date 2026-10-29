@@ -512,6 +512,11 @@ class SendInput(NamedTuple):
     profiling: ParallelList[int, Profiling] | None = None
     # Only metadata produced by this worker since its last completion.
     resource_publish_info: ParallelList[int, dict[str, PublishedInfo]] | None = None
+    # Rids that failed after routing (their outputs could not be registered
+    # for send): nothing of theirs leaves -- no peer edges, client emits,
+    # persist signals or WORKER_GRAPHS_DONE. The worker has already failed
+    # them, so the conductor tears them down.
+    failed_rids: frozenset[int] = frozenset()
 
 
 class GraphRuntime(ABC):
@@ -595,6 +600,15 @@ class GraphRuntime(ABC):
 
     @abstractmethod
     def set_walk(self, rid: int, partition: str, walk: str):
+        pass
+
+    @abstractmethod
+    def is_partition_idle(self, rid: int, partition: str) -> bool:
+        """Whether nothing of this partition's current walk is under way for
+        the request: no input held, no node in flight, no loop mid-run. Only
+        then can the walk change without stranding state in the old walk's
+        graphs. False for an unknown request or partition.
+        """
         pass
 
     @abstractmethod

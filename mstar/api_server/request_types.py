@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphEdge
@@ -145,3 +146,25 @@ class PreprocessInput:
     # the API server selected (``ServedModels.select``), empty for the base model. Set
     # in process, never from the client's kwargs.
     prefix_root: bytes = b""
+    # the client streams the opening ends; the others stay open for appends
+    ends: frozenset[str] = frozenset()
+
+
+@dataclass
+class ClientAppend:
+    """One append to a running request's client streams, queued behind the
+    request's own ``PreprocessInput`` so its chunks stay in order. The
+    streams in ``ends`` end after this chunk. Stays inside the API server
+    process."""
+    request_id: str
+    file_paths: dict[str, list[str]] | None = None
+    ends: frozenset[str] = frozenset()
+    text: str | None = None
+    # per modality, in file_paths' order, the client stream each file names (None: unnamed)
+    file_streams: dict[str, list[str | None]] | None = None
+    # this append's own model_kwargs; the opening's stay the request's
+    model_kwargs: dict | None = None
+    # Answers the append as late, with an error naming why; called from the
+    # preprocess thread when the model routes items to a stream the client
+    # already ended. None: nobody to answer.
+    on_late: Callable[[str], None] | None = field(default=None, compare=False)

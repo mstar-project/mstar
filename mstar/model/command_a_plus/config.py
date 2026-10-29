@@ -9,6 +9,8 @@ GLOBAL_ATTN = "global_attn"
 ROPE = "rope"
 SAMPLER = "sampler"
 
+PREFILL_WALKS = ("prefill", "prefill_image")
+
 
 @dataclass
 class CommandAPlusTextConfig:
@@ -73,11 +75,55 @@ class CommandAPlusTextConfig:
         return cls(**{name: data[name] for name in cls.__dataclass_fields__})
 
 
+@dataclass(frozen=True)
+class CommandAPlusVisionConfig:
+    """The SigLIP tower, pixel shuffle and SwiGLU projector that feed image tiles to the LLM."""
+
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    image_size: int
+    patch_size: int
+    layer_norm_eps: float
+    downsample_factor: int
+    alignment_intermediate_size: int
+    image_token_id: int
+
+    @property
+    def tokens_per_tile(self) -> int:
+        return (self.image_size // self.patch_size // self.downsample_factor) ** 2
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CommandAPlusVisionConfig":
+        """``data`` is the whole checkpoint config; the tower's own fields sit in ``vision_config``."""
+        vision = data["vision_config"]
+        # Shapes are checked when weights load; these would load fine and compute the wrong thing.
+        for source, name, supported in (
+            (vision, "hidden_act", "gelu_pytorch_tanh"),
+            (data, "alignment_activation_fn", "swiglu"),
+            (data, "vision_feature_layer", -1),
+            (data, "vision_feature_select_strategy", "full"),
+        ):
+            if source.get(name) != supported:
+                raise ValueError(f"{name} must be {supported!r}; got {source.get(name)!r}")
+        return cls(
+            **{name: vision[name] for name in (
+                "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
+                "image_size", "patch_size", "layer_norm_eps",
+            )},
+            downsample_factor=data["downsample_factor"],
+            alignment_intermediate_size=data["alignment_intermediate_size"],
+            image_token_id=data["image_token_id"],
+        )
+
+
 @dataclass
 class CommandAPlusConfig:
-    """Text-only view of the outer Cohere2 Vision checkpoint configuration."""
+    """The outer Cohere2 Vision checkpoint configuration."""
 
     text_config: CommandAPlusTextConfig
+    vision_config: CommandAPlusVisionConfig
 
     @classmethod
     def from_dict(cls, data: dict) -> "CommandAPlusConfig":
@@ -89,7 +135,10 @@ class CommandAPlusConfig:
             raise ValueError("Outer tie_word_embeddings must be True")
         if "text_config" not in data:
             raise ValueError("Missing required text_config")
-        return cls(text_config=CommandAPlusTextConfig.from_dict(data["text_config"]))
+        return cls(
+            text_config=CommandAPlusTextConfig.from_dict(data["text_config"]),
+            vision_config=CommandAPlusVisionConfig.from_dict(data),
+        )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "CommandAPlusConfig":

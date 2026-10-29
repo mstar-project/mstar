@@ -37,6 +37,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.utils.ipc_format import (
     AbortRequest,
+    ClientStreamInput,
     ConductorMessage,
     DrainRequest,
     EnableMetrics,
@@ -88,6 +89,7 @@ _TYPES: dict[str, type] = {
     "fail_requests": FailRequests,
     "worker_status": WorkerStatus,
     "enable_metrics": EnableMetrics,
+    "client_stream_input": ClientStreamInput,
     # runtime LoRA adapters: api server -> conductor -> workers, and the acks back
     "load_lora_adapter": LoadLoraAdapter,
     "unload_lora_adapter": UnloadLoraAdapter,
