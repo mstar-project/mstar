@@ -81,6 +81,15 @@ def send(client: MStarClient, obs, seed: int) -> bytes:
     return entry["bytes"]
 
 
+def send_walk(client: MStarClient, obs, walk: str) -> np.ndarray:
+    """A reuse walk's features: one ``tensor`` entry, laid out like an action group."""
+    text, frames, kwargs = obs
+    res = client.generate(text=text, images=frames, output_modalities=("tensor",), walk=walk, **kwargs)
+    (entry,) = [r for r in res.raw if r["modality"] == "tensor"]
+    e = msgpack.unpackb(entry["bytes"])
+    return np.frombuffer(e["data"], e["dtype"]).reshape(e["shape"])
+
+
 def send_streamed(url: str, obs, seed: int) -> bytes:
     """The streamed action off the binary frames. ``MStarClient.stream`` cannot carry it:
     its event fallback decodes an action's bytes as UTF-8 (``MStarClient._to_event``)."""
@@ -201,6 +210,20 @@ def main() -> int:
         obs = observation(load(args.dump, name))
         report["repeat_identical"] = send(client, obs, seed) == payload
         report["stream_identical"] = send_streamed(url, obs, seed) == payload
+        # each reuse walk returns its features, the same bytes twice
+        report["walks"] = {}
+        for walk in ("backbone", "state"):
+            try:
+                got = send_walk(client, obs, walk)
+                same = np.array_equal(got, send_walk(client, obs, walk))
+            except Exception as exc:  # a refused walk is a finding, not the end of the run
+                report["walks"][walk] = f"{type(exc).__name__}: {exc}"[:300]
+                failures.append(f"walk {walk}: {report['walks'][walk]}")
+                continue
+            report["walks"][walk] = {"shape": list(got.shape), "finite": bool(np.isfinite(got).all()),
+                                     "repeat_identical": same}
+            if not (same and np.isfinite(got).all()):
+                failures.append(f"walk {walk}: {report['walks'][walk]}")
         report["malformed_status"] = malformed(url, obs, seed)
         report["serves_after_malformed"] = send(client, obs, seed) == payload
         for key in ("repeat_identical", "stream_identical", "serves_after_malformed"):

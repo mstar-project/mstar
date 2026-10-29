@@ -81,6 +81,18 @@ DENOISE_LOOP = "denoise_loop"
 _LOSSLESS_IMAGE_FORMATS = frozenset({"PNG", "BMP", "TIFF", "PPM", "WEBP"})
 
 
+def _entry(value: np.ndarray) -> dict:
+    """One array on the wire: float32 like the reference's own cast of its actions (numpy has
+    no bfloat16, and widening bf16 is exact; float64 would double the payload for precision
+    the decode's floor does not support), with the dtype and shape a client needs to rebuild
+    it: ``np.frombuffer(e["data"], e["dtype"]).reshape(e["shape"])``."""
+    return {
+        "dtype": "float32",
+        "shape": list(value.shape),
+        "data": np.ascontiguousarray(value, dtype=np.float32).tobytes(),
+    }
+
+
 class Gr00tN17Model(Model):
     """`nvidia/GR00T-N1.7-3B` on M\\*."""
 
@@ -663,9 +675,15 @@ class Gr00tN17Model(Model):
         stripping them from the conductor's copy leaves the data worker's
         (`PreprocessWorkerThread._process_input`), which is the one handed back
         here.
+
+        A reuse walk's features (`backbone_features`, `state_features`) come back
+        as one entry laid out like an action group, so the same three lines read
+        either.
         """
+        if modality == "tensor":
+            return msgpack.packb(_entry(output.detach().to(torch.float32).cpu().numpy()))
         if modality != "action":
-            raise ValueError(f"gr00t_n17 emits actions, not {modality!r}")
+            raise ValueError(f"gr00t_n17 emits actions or a reuse walk's tensor, not {modality!r}")
         kwargs = request_kwargs or {}
         tag = kwargs.get("embodiment_tag")
         if tag is None:
@@ -677,16 +695,7 @@ class Gr00tN17Model(Model):
         if chunk.ndim == 2:  # one request, as the engine hands it back
             chunk = chunk[None]
         groups = self.processor.unapply(tag, chunk, kwargs.get("state"))
-        # float32 like the reference's own cast, and because float64 would double
-        # the payload for precision the decode's own floor does not support
-        return msgpack.packb({
-            name: {
-                "dtype": "float32",
-                "shape": list(value.shape),
-                "data": np.ascontiguousarray(value, dtype=np.float32).tobytes(),
-            }
-            for name, value in groups.items()
-        })
+        return msgpack.packb({name: _entry(value) for name, value in groups.items()})
 
     # -------------------------------------------------------- forward passes
     def get_initial_forward_pass_args(

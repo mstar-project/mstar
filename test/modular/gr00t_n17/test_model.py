@@ -1400,6 +1400,29 @@ def test_postprocess_refuses_a_modality_this_model_does_not_emit(modality):
         _decoding_model().postprocess(_CHUNK, modality, {"embodiment_tag": "bot", "state": _RAW_STATE})
 
 
+def test_every_output_a_walk_sends_the_client_is_one_postprocess_encodes():
+    """The data worker hands every client output to ``postprocess``; an edge whose modality it
+    refuses runs the whole walk and then answers 400. The reuse walks did that once."""
+    model = _decoding_model()
+    walks = model.get_graph_walk_graphs()
+    kwargs = {"embodiment_tag": "bot", "state": _RAW_STATE}
+    for walk, section in walks.items():
+        edges = _edges(section) + list(getattr(section, "outputs", None) or [])
+        for edge in (e for e in edges if e.next_node == EMIT_TO_CLIENT):
+            assert isinstance(model.postprocess(_CHUNK, edge.output_modality, kwargs), bytes), walk
+
+
+@pytest.mark.parametrize("shape", [(5, 4), (1, 1, 3)], ids=["backbone rows", "one state token"])
+def test_a_reuse_walks_tensor_comes_back_exactly_with_its_dtype_and_shape(shape):
+    """bf16 features widen to float32 exactly, and the entry carries what a client needs to
+    rebuild them, laid out like an action group."""
+    features = torch.randn(shape, generator=torch.Generator().manual_seed(0)).to(torch.bfloat16)
+    entry = msgpack.unpackb(_decoding_model().postprocess(features, "tensor", {}))
+    rebuilt = np.frombuffer(entry["data"], entry["dtype"]).reshape(entry["shape"])
+    assert entry["dtype"] == "float32" and tuple(entry["shape"]) == shape
+    assert np.array_equal(rebuilt, features.float().numpy())
+
+
 # ----------------------------------------------------------------------------
 # Against the checkpoint
 # ----------------------------------------------------------------------------
