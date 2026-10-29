@@ -107,6 +107,20 @@ def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
     return kwargs
 
 
+def mark_bucket_dims_dynamic(
+    static_inputs: Mapping[str, Any], seq_dims: Mapping[tuple[int, str], int],
+    config_idx: int, num_tokens: int,
+) -> None:
+    """Hint dynamo that each static input's bucket-varying dim (the one its
+    shared buffer is sliced along) is dynamic, so one compiled graph serves
+    every bucket. Only a hint: a forward that needs the size fixed (a reshape
+    to a constant, say) still compiles per bucket, and size 1 always does."""
+    for key, value in static_inputs.items():
+        dim = seq_dims.get((config_idx, key))
+        if isinstance(value, torch.Tensor) and dim is not None and value.shape[dim] == num_tokens:
+            torch._dynamo.maybe_mark_dynamic(value, dim)
+
+
 def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:
     """Return resource keys that prevent capture of the declared step."""
     if step is None:
@@ -1185,6 +1199,10 @@ class AcceleratorGraphRunner:
                 key for key, value in static_inputs.items()
                 if isinstance(value, torch.Tensor)
             )
+            if config.compile and config.compile_dynamic:
+                mark_bucket_dims_dynamic(
+                    static_inputs, self._static_buffer_seq_dims, spec.config_idx, spec.num_tokens,
+                )
 
             forward = self._forward_for(spec)
 
@@ -1235,7 +1253,8 @@ class AcceleratorGraphRunner:
 
         The platform's inductor overrides wrap that shared callable per bucket,
         so each bucket compiles on its first call under the overrides for its
-        own token count.
+        own token count. A ``compile_dynamic`` config's graph serves every
+        bucket, so it takes the overrides for any count.
         """
         forward = getattr(self._submodule, spec.config.capture_forward_method)
         if not spec.config.compile:
@@ -1244,6 +1263,8 @@ class AcceleratorGraphRunner:
             self._compiled_forwards[spec.config_idx] = torch.compile(
                 forward, **compile_kwargs(spec.config.compile_mode),
             )
+        if spec.config.compile_dynamic:
+            return with_inductor_overrides(self._compiled_forwards[spec.config_idx])
         return with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens, spec.bs,
         )
