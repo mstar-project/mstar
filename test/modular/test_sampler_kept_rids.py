@@ -19,7 +19,7 @@ import torch
 
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 
 V = 64
 KEPT, DROPPED = 0, 1
@@ -60,7 +60,7 @@ def _resource(graph: bool, device: torch.device) -> SamplerResource:
 def _step(res: SamplerResource, step: SamplerStep, graph: bool) -> torch.Tensor:
     ctx = StepContext(
         request_ids=(KEPT, DROPPED), graph_walk="prefill", slot=0, capture=False,
-        slot_lease=SlotLease(slot=0, bucket=SimpleNamespace(bs=2)) if graph else None,
+        slot_lease=SlotLease(slot=0, bucket=BucketKey("prefill", 2, 2)) if graph else None,
     )
     res.plan(step, ctx)
     logits = torch.randn(2, V).to(res._device)
@@ -131,7 +131,7 @@ def test_commit_keeps_only_selected_rows_and_ignores_padding(buffer_device, kept
     step = SamplerStep(kept_rids=kept_rids)
     ctx = StepContext(
         request_ids=(DROPPED, KEPT), graph_walk="prefill", slot=0, capture=False,
-        slot_lease=SlotLease(slot=0, bucket=SimpleNamespace(bs=4)),
+        slot_lease=SlotLease(slot=0, bucket=BucketKey("prefill", 4, 4)),
     )
     res.plan(step, ctx)
     sampler = res._cg_sampler

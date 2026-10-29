@@ -1748,6 +1748,39 @@ class AcceleratorGraphableSampler(BaseSampler):
         return codes
 
     @torch.compiler.disable
+    def sample_unfiltered(self, logits: torch.Tensor) -> torch.Tensor:
+        """``sample`` for a batch none of whose rows filters, penalises or
+        reads a history (``sampler.unfiltered``): one read of the logits, with
+        the offset and token bookkeeping in the same two kernels. The bucket
+        captured for such batches runs this instead of ``sample``."""
+        from mstar.engine.resources.sampler.unfiltered import SAMPLE_UNFILTERED
+
+        tokens = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+        step = _rng_offset_stride(logits.device.type, logits.shape[-1])
+        # under TP the kept token is rank 0's, so it is written after the broadcast
+        single = self.tp_group is None or self.tp_group.world_size == 1
+        if self.ingraph_scatter and single:
+            SAMPLE_UNFILTERED(
+                logits, self.temperature_buf, self.seed_buf, self.offset_buf, tokens, step,
+                self.slot_idx_view, self.offset_master, self.last_token_master,
+            )
+            return tokens
+        if self.ingraph_scatter:
+            self.gather_in_graph()
+        SAMPLE_UNFILTERED(
+            logits, self.temperature_buf, self.seed_buf, self.offset_buf, tokens, step,
+            token_master=self.last_token_buf if single else None,
+        )
+        codes = self._broadcast_tokens(tokens)
+        if single:
+            return codes
+        if self.last_token_buf is not None:
+            self.last_token_buf.copy_(codes)
+        if self.ingraph_scatter:
+            self.scatter_in_graph(codes)
+        return codes
+
+    @torch.compiler.disable
     def sync_seen_token_masks(
         self, seen_masks: "Iterable[SeenTokenMask]",
         keep: list[bool] | None = None,
