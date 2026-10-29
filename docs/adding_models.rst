@@ -1861,9 +1861,9 @@ lengths, rotary positions and recurrent start slots are corrected from the regis
 on the device. That needs an attention backend whose plan reads per-row KV lengths and
 a block table on the device: AITER's unified attention on AMD GPUs. Verification is
 greedy, or with ``SpecDecodeConfig(sampling=True)`` a draw of the target's token at each
-position at the request's temperature (with argmax drafts, accepting while the draw
-equals the next draft is rejection sampling); no top-k or top-p, whose cut needs a sort
-that ROCm will not capture, and no ``repetition_penalty``.
+position from the request's top-k/top-p distribution at its temperature, by the
+sampler's captured kernel (``draw_tokens``; with argmax drafts, accepting while the draw
+equals the next draft is rejection sampling). No ``repetition_penalty``.
 
 Tuning resources per deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
