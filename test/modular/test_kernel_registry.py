@@ -19,6 +19,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from mstar import platforms
 from mstar.engine.resources.rms_norm import run_rms_norm
 from mstar.kernels import KernelOp, ShapePolicy, Tolerance, configs, registry
+from mstar.kernels.numerics import as_tensors
 from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, XpuPlatform
 from mstar.platforms.dispatch import PlatformDispatch
 from mstar.platforms.facts import DeviceFacts
@@ -214,6 +215,13 @@ def test_a_platform_without_an_implementation(declare, on_platform):
     assert lenient.implementation() is _scale
 
 
+def test_the_dispatch_is_what_accelerator_tensors_reach(declare, on_platform):
+    on_platform(RocmPlatform())
+    op = declare(impls={"rocm": _Impl("rocm")})
+    assert op.dispatch(None, 2.0) == ("rocm", None, 2.0)
+    assert op.dispatch.resolve() is op.implementation()
+
+
 def test_a_default_implementation_covers_other_platforms(declare, on_platform):
     on_platform(XpuPlatform())
     op = declare(impls={"cuda": _Impl("cuda"), "default": _Impl("default")})
@@ -332,8 +340,8 @@ def test_every_declared_op_has_a_reference_fake_and_warm_shapes():
             for dtype in op.shapes.dtypes:
                 args = op.shapes.inputs(shape, dtype, torch.device("cpu"), None)
                 assert op.shapes.key(*args) == dict(shape), (op, shape)
-                out, fake = op.reference(*args), op.fake(*args)
-                assert (fake.shape, fake.dtype) == (out.shape, out.dtype), (op, shape, dtype)
+                outs, fakes = as_tensors(op.reference(*args)), as_tensors(op.fake(*args))
+                assert [(t.shape, t.dtype) for t in fakes] == [(t.shape, t.dtype) for t in outs], (op, shape)
 
 
 def _kernel_op_modules() -> set[str]:
