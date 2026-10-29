@@ -99,6 +99,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.profiler import (
     PHASE_PERIOD,
     PhaseLaps,
+    hop_stamp,
     nvtx_enabled,
     phase_buffer,
     phase_end,
@@ -496,6 +497,11 @@ class Worker:
     _rows_by_lane: Mapping[int, frozenset[int]] = MappingProxyType({})
     _process_cpus: frozenset[int] = frozenset()
 
+    # Handle -> wire key of the requests whose first step has not sent its
+    # outputs yet, for the TTFT hop stamps (``_hop``). Filled only while
+    # MSTAR_PHASE_TIMING is on; purged with the handle.
+    _hop_keys: dict[int, str] = {}
+
     @cached_property
     def device_capability(self) -> DeviceCapability:
         return DeviceCapability.of(self.device)
@@ -790,6 +796,7 @@ class Worker:
         #   deferred (a dict for that order: a follower's is rank 0's).
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
+        self._hop_keys = {}
 
         # step seq -> rids rank 0 released after that step, held until this rank
         # has consumed it. See ``_removal_step_reached``.
@@ -1028,6 +1035,9 @@ class Worker:
             # does for an admitted rid, while committed TP steps still run.
             self.scheduler.fail_rids({request_id})
         laps.lap("runtime_add")
+        if PHASE_PERIOD:
+            self._hop_keys.setdefault(request_id, body.request_id)
+            hop_stamp(body.request_id, "wk.ingest")
 
         # One NewRequest comes per partition this worker serves, and a later one
         # can land after a step already ran. The tensor manager and the engine
@@ -1209,6 +1219,7 @@ class Worker:
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.pop(request_id, None)
+        self._hop_keys.pop(request_id, None)
 
         laps.lap("misc")
         # DEBUG: once per request on the main thread, it cost as much as the
@@ -1815,6 +1826,8 @@ class Worker:
                 self._graph_runtime.ingest_inputs_batch(
                     self._one_rids_edges(request_id, normal), can_buffer=True,
                 )
+                if self._hop_keys:
+                    self._hop((request_id,), "wk.ready")
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2340,6 +2353,16 @@ class Worker:
         if self._step_cpus is not None:
             pin_thread(self._step_cpus.cpus, self._process_cpus)
 
+    def _hop(self, rids, hop: str, done: bool = False) -> None:
+        """Stamp ``hop`` for those of ``rids`` still before their first step's
+        send (``_hop_keys``); ``done`` takes them out. Callers check
+        ``self._hop_keys`` first, so this costs nothing with timing off."""
+        keys = self._hop_keys
+        for rid in rids:
+            key = keys.pop(rid, None) if done else keys.get(rid)
+            if key is not None:
+                hop_stamp(key, hop)
+
     @contextmanager
     def _span(self, name: str, cpu: str | None = None):
         """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
@@ -2500,10 +2523,14 @@ class Worker:
                     f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
                 )
             laps.lap("pre_exec")
+            if self._hop_keys:
+                self._hop(node_batch.request_ids, "wk.launch")
             with self._span(
                 "worker.gpu_thread.exec", cpu="worker.gpu_thread.exec.cpu",
             ):
                 outputs = engine.exec_and_postprocess(node_batch)
+            if self._hop_keys:
+                self._hop(node_batch.request_ids, "wk.enqueued")
             laps.skip()
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
@@ -2621,6 +2648,8 @@ class Worker:
         if not speculated:
             self._set_in_flight_flag(batch, True)
         submitted_at = _time.perf_counter() if self._metrics is not None and not speculated else 0.0
+        if self._hop_keys:
+            self._hop(batch.request_to_worker_graph, "wk.submit")
         future = self._submit_gpu_step(gpu_executor, batch, node_batch, plan_future, execute=execute)
         self.wakeup_event.register_future(future)
         step.setdefault("partition", self.request_state.get_partition_for_node(batch.node_name))
@@ -3900,6 +3929,8 @@ class Worker:
         # TODO: may need to refine this based on how it affects performance?
         if batch_N.batch.request_to_worker_graph:
             self._wait_for_step(batch_N)
+        if self._hop_keys:
+            self._hop(batch_N.node_batch.request_ids, "wk.gpu_done")
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -4006,6 +4037,8 @@ class Worker:
             rt.update_dynamic_loop_iters(
                 batch_N.node_batch.per_request_info, batch_N.partition,
             )
+        if self._hop_keys:
+            self._hop(batch_N.node_batch.request_ids, "wk.sent", done=True)
         for rid in step.completed_rids:
             self.request_state.flush_publish_info(rid, batch_N.partition)
         # Those sends were the last readers of this step's host copies.
