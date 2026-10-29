@@ -522,6 +522,15 @@ class Gr00tN17Preprocessor:
                 for t in range(steps)
                 for v in views
             ]
+            # the reference stacks the transformed frames of every view
+            # (`processing_gr00t_n1d7.py:746`), so cameras may differ in size but
+            # must transform to one: the same aspect ratio
+            sizes = {tuple(f.shape[1:]) for f in item}
+            if len(sizes) > 1:
+                raise ValueError(
+                    f"GR00T needs every camera at one aspect ratio, as the reference stacks "
+                    f"their transformed frames; these transform to {sorted(sizes)}"
+                )
             # formalize_language: lowercase, strip punctuation
             text = re.sub(r"[^\w\s]", "", language[b].lower())
             conversation = [{
