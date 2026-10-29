@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 from mstar import platforms
-from mstar.model.components import depth_decoder
 from mstar.model.components.depth_decoder import DepthDecoder
 from mstar.model.qwen3_omni.components import talker as omni_talker
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
@@ -116,10 +115,9 @@ def _run(loop, cp: DepthDecoder, group0: torch.nn.Embedding, rows: int, sum_dtyp
     layer0 = torch.randint(0, group0.num_embeddings, (rows,), generator=g)
     sampler = _Greedy()
     cp._depth_kv = None
-    kv = cp.depth_kv_cache(rows, 8)
     with torch.no_grad():
-        codes, embed_sum = loop(cp, last_hidden.clone(), layer0, group0, sampler, kv, sum_dtype)
-    return codes, embed_sum, torch.stack(sampler.logits), kv.clone()
+        codes, embed_sum = loop(cp, last_hidden.clone(), layer0, group0, sampler, 8, sum_dtype)
+    return codes, embed_sum, torch.stack(sampler.logits), cp.depth_kv_cache(rows, 8).clone()
 
 
 @pytest.mark.parametrize("rows", [1, 3])
@@ -161,8 +159,7 @@ def test_run_depth_loop_keeps_the_per_position_forward_off_amd_gpus(omni, monkey
     forward = cp.forward_depth_unrolled
     monkeypatch.setattr(cp, "forward_depth_unrolled", lambda *a, **k: calls.append(k["cache_pos"]) or forward(*a, **k))
     with torch.no_grad():
-        cp.run_depth_loop(torch.randn(2, 32), torch.tensor([1, 2]), group0, lambda x: x.argmax(-1),
-                          cp.depth_kv_cache(2, 4))
+        cp.run_depth_loop(torch.randn(2, 32), torch.tensor([1, 2]), group0, lambda x: x.argmax(-1), 4)
     assert calls == list(range(GROUPS))
 
 
@@ -222,24 +219,79 @@ def test_depth_attention_reference_is_per_head_attention(cache_pos):
         torch.testing.assert_close(out[:, h * d:(h + 1) * d], want, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("platform", [RocmPlatform(), CudaPlatform(), CpuPlatform()], ids=lambda p: p.name)
-def test_the_fused_loop_and_its_kernels_run_on_amd_gpus_only(monkeypatch, platform):
-    dispatches = (depth_decoder._depth_loop, ops._depth_attention_impl, ops._codec_embed_accumulate_impl,
-                  ops._silu_and_mul_impl, ops.decode_linear)
+def _omni_on(platform, monkeypatch):
+    """A tiny Omni code predictor built while ``current_platform`` is ``platform``."""
     monkeypatch.setattr(platforms, "resolve_platform", lambda: platform)
-    for dispatch in dispatches:
+    for dispatch in _DISPATCHES:
         dispatch.reset()
-    try:
-        rocm = platform.is_rocm()
-        assert depth_decoder._depth_loop._resolve() is (
-            DepthDecoder._fused_loop if rocm else DepthDecoder._reference_loop)
-        assert ops._depth_attention_impl._resolve() is (
-            ops._depth_attention_triton if rocm else ops.depth_attention_reference)
-        assert ops._codec_embed_accumulate_impl._resolve() is (
-            ops._codec_embed_accumulate_triton if rocm else ops.codec_embed_accumulate_reference)
-        assert ops._silu_and_mul_impl._resolve() is (ops._silu_and_mul_triton if rocm else ops.silu_and_mul_reference)
-        if not rocm:
-            assert ops.decode_linear._resolve() is F.linear
-    finally:
-        for dispatch in dispatches:
-            dispatch.reset()
+    cfg = Qwen3OmniModelConfig(
+        talker=TalkerConfig(num_code_groups=GROUPS),
+        code_predictor=CodePredictorConfig(vocab_size=16, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+                                           num_attention_heads=4, num_key_value_heads=2, head_dim=8),
+    )
+    cp = Qwen3OmniCodePredictor(cfg)
+    _randomize(cp, 3)
+    cp.consolidate_stacked_weights()
+    return cp.eval(), torch.nn.Embedding(24, 32)
+
+
+_DISPATCHES = (ops._depth_attention_impl, ops._codec_embed_accumulate_impl, ops._silu_and_mul_impl,
+               ops.decode_linear)
+
+
+@pytest.fixture
+def reset_dispatches():
+    yield
+    for dispatch in _DISPATCHES:
+        dispatch.reset()
+
+
+@pytest.mark.parametrize("platform", [RocmPlatform(), CudaPlatform(), CpuPlatform()], ids=lambda p: p.name)
+def test_the_fused_loop_and_its_kernels_run_on_amd_gpus_only(monkeypatch, reset_dispatches, platform):
+    cp, _ = _omni_on(platform, monkeypatch)
+    rocm = platform.is_rocm()
+    assert cp.run_depth_loop.__func__ is (DepthDecoder._fused_loop if rocm else DepthDecoder._reference_loop)
+    assert cp.run_depth_loop.__self__ is cp
+    assert ops._depth_attention_impl._resolve() is (
+        ops._depth_attention_triton if rocm else ops.depth_attention_reference)
+    assert ops._codec_embed_accumulate_impl._resolve() is (
+        ops._codec_embed_accumulate_triton if rocm else ops.codec_embed_accumulate_reference)
+    assert ops._silu_and_mul_impl._resolve() is (ops._silu_and_mul_triton if rocm else ops.silu_and_mul_reference)
+    if not rocm:
+        assert ops.decode_linear._resolve() is F.linear
+
+
+class _GraphBreakingSampler:
+    """Greedy, out of dynamo like the engine's samplers, so every group's sampling is a graph break."""
+
+    @torch.compiler.disable
+    def sample(self, logits):
+        return logits.argmax(-1)
+
+
+@pytest.mark.parametrize("platform", [RocmPlatform(), CpuPlatform()], ids=["fused", "per-position"])
+def test_a_compiled_caller_reaches_the_loop_without_recompiling(monkeypatch, reset_dispatches, platform):
+    """The Talkers call the loop from torch.compile'd forwards and capture them under the fail_on_recompile stance.
+    Nothing between the caller and the loop may be compiled around the bound-method sampler, which is new on every
+    call (on CPU tensors the fused loop runs its op references)."""
+    monkeypatch.setattr(omni_talker, "fused_qk_norm_rope", _qk_norm_rope)
+    monkeypatch.setattr(omni_talker, "decode_attn_nhd", _decode_attn)
+    cp, group0 = _omni_on(platform, monkeypatch)
+    sampler = _GraphBreakingSampler()
+
+    def forward(last_hidden, layer0):
+        hidden = last_hidden * 1.0
+        return cp.run_depth_loop(hidden, layer0, group0, sampler.sample, 4, sum_dtype=torch.float32)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(forward, backend="eager", fullgraph=False, dynamic=False)
+    x, codes = torch.randn(3, 32), torch.tensor([1, 5, 7])
+    with torch.no_grad():
+        want = forward(x, codes)
+        for _ in range(2):
+            compiled(x, codes)
+        with torch.compiler.set_stance("fail_on_recompile"):
+            got = compiled(x, codes)
+    torch._dynamo.reset()
+    assert torch.equal(got[0], want[0])
+    torch.testing.assert_close(got[1], want[1])
