@@ -92,7 +92,7 @@ def _check(out, q, cache, rows, plan):
 
 def _mixed():
     from mstar.engine.resources.attn.aiter import flashinfer_rocm_unavailable_reason
-    from mstar.engine.resources.attn.base import flashinfer_kwargs
+    from mstar.engine.resources.attn.backends import flashinfer_kwargs
 
     reason = flashinfer_rocm_unavailable_reason()
     if reason is not None:
