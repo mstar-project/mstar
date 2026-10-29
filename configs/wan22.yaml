@@ -4,28 +4,37 @@ model: "wan22"
 # conductor's config check and matches the UMT5 text length (512 tokens).
 max_seq_len: 512
 
-# The untiled VAE decode runs the shared Wan VAE decoder, compiled (1.74x faster
-# decode at 1280x704 x 121 frames on an H200). The compile is per output
-# resolution, not frame count, about 20 s on an H200, so it runs only for the
-# listed sizes (default: 1280x704); any other size decodes with stock vae.decode.
+# The DiT runs on the DiT scaffold's denoise loop (dit_loop: scaffold): requests at
+# the same shape batch (up to max_batch_size, default 2), and each shape in
+# compile_dit_sizes ("WxHxF"; default 1280x704x81) is compiled and captured as an
+# accelerator graph at startup, for T2V and I2V with CFG, at every
+# capture_batch_sizes entry (default [1, 2]). Any other shape runs the DiT eager.
+# dit_loop: legacy is the one-request loop the reference-equivalence tests pin
+# bit-exact. Requests above max_video_pixels (height x width x num_frames, default
+# 268435456) get a 400.
 #
-# The DiT is compiled per input shape, so only the listed "WxHxF" shapes
-# (default: 1280x704x81) use it, each compiling once with CFG and once without;
-# any other shape runs the DiT eager. Requests above max_video_pixels
-# (height x width x num_frames, default 268435456) get a 400.
+# The untiled VAE decode at the vae_decode_fast_sizes ("WxH"; default 1280x704)
+# runs the shared Wan VAE decoder, compiled (channels-last on NVIDIA GPUs, 1.74x
+# faster decode at 1280x704 x 121 frames on an H200; the default layout on AMD
+# GPUs, where MIOpen's channels-last convs are the slow ones); any other size
+# decodes with stock vae.decode.
 #
 # The DiT's attention runs on the engine's ragged attention resources with the
 # platform's default kernel (attention_backend: auto; FlashInfer FA3 on an H100,
 # AITER's asm flash attention on MI300X/MI325X). attention_backend: sdpa keeps
 # torch's kernel inline, the reference pipeline's, for parity runs.
 #
-# Uncomment the lines you need (one model_kwargs block) to list more decode
-# sizes or DiT shapes, restore stock vae.decode everywhere, raise the ceiling,
-# or switch the attention kernel:
-# model_kwargs:
-#   vae_decode_fast_sizes: ["1280x704", "832x480"]
+# Served here: the default 1280x704x81 clip and the 832x480x33 clip the video
+# benchmarks request. Add a shape to both lists to serve it compiled.
+model_kwargs:
+  compile_dit_sizes: ["1280x704x81", "832x480x33"]
+  vae_decode_fast_sizes: ["1280x704", "832x480"]
+# Other knobs (one model_kwargs block):
+#   dit_loop: legacy
+#   accelerator_graph: false
+#   capture_batch_sizes: [1, 2, 4]
+#   max_batch_size: 4
 #   vae_decode_fast: false
-#   compile_dit_sizes: ["1280x704x81", "1280x704x121", "832x480x81"]
 #   max_video_pixels: 536870912
 #   attention_backend: sdpa
 

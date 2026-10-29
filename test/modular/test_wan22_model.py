@@ -50,11 +50,13 @@ CONFIG_PATH = str(
     Path(__file__).resolve().parents[2] / "configs" / "wan22.yaml"
 )
 
-# The dit node's loop-back edges (see Wan22DitSubmodule for the inventory).
-LOOP_BACK_NAMES = {"latents", "time_index", "unipc_model_outputs", "unipc_last_sample"}
+# The dit node's loop-back edges (see Wan22DenoiseSubmodule / Wan22DitSubmodule for
+# the inventory); the legacy loop also carries its step index.
+LOOP_BACK_NAMES = {"latents", "unipc_model_outputs", "unipc_last_sample"}
+LEGACY_LOOP_BACK_NAMES = LOOP_BACK_NAMES | {"time_index"}
 
 
-def _make_model(attention_backend: str = "auto") -> Wan22Model:
+def _make_model(attention_backend: str = "auto", dit_loop: str = "scaffold") -> Wan22Model:
     """Construct a Wan2.2 model without touching tokenizer or weights."""
     model = object.__new__(Wan22Model)
     model.model_path_hf = "test/wan22"
@@ -62,6 +64,10 @@ def _make_model(attention_backend: str = "auto") -> Wan22Model:
     model.config = Wan22Config()
     model.attention_backend = attention_backend
     model.use_ragged_attention = attention_backend != "sdpa"
+    model.dit_loop = dit_loop
+    model.accelerator_graph = True
+    model.capture_batch_sizes = [1, 2]
+    model.max_batch_size = 2
     model.skip_weight_loading = True  # dummy mode: get_submodule returns None
     model.tokenizer = None
     model._tokenizer_initialized = True  # pin the byte-fallback path
@@ -221,8 +227,11 @@ def test_wan22_encoder_walks_persist_embeddings():
     (Wan22Model.VIDEO_GEN_WALK, False),
     (Wan22Model.VIDEO_GEN_I2V_WALK, True),
 ])
-def test_wan22_video_gen_walk_structure(walk_name, expect_image_latent):
-    model = _make_model()
+@pytest.mark.parametrize("dit_loop,loop_back_names", [
+    ("scaffold", LOOP_BACK_NAMES), ("legacy", LEGACY_LOOP_BACK_NAMES),
+])
+def test_wan22_video_gen_walk_structure(walk_name, expect_image_latent, dit_loop, loop_back_names):
+    model = _make_model(dit_loop=dit_loop)
     walk = model.get_graph_walk_graphs()[walk_name]
 
     assert isinstance(walk, Sequential)
@@ -236,12 +245,12 @@ def test_wan22_video_gen_walk_structure(walk_name, expect_image_latent):
     body = loop.section
     assert isinstance(body, GraphNode) and body.name == "dit"
     # Async scheduling on; the speculative overshoot iteration is vetoed by
-    # Wan22DitSubmodule.prepare_inputs returning None.
+    # the dit's prepare_inputs returning None.
     assert body.enable_async_scheduling is True
-    assert {e.name for e in body.outputs} == LOOP_BACK_NAMES
+    assert {e.name for e in body.outputs} == loop_back_names
     assert all(e.next_node == "dit" for e in body.outputs)
 
-    expected_inputs = {"text_embeds_pos", "text_embeds_neg"} | LOOP_BACK_NAMES
+    expected_inputs = {"text_embeds_pos", "text_embeds_neg"} | loop_back_names
     if expect_image_latent:
         expected_inputs.add("image_latent")
     assert body.input_names == expected_inputs
@@ -251,7 +260,7 @@ def test_wan22_video_gen_walk_structure(walk_name, expect_image_latent):
     terminal = loop.outputs[0]
     assert terminal.next_node == "vae_decoder"
     assert terminal.name == "latents"
-    assert terminal.name in LOOP_BACK_NAMES
+    assert terminal.name in loop_back_names
 
     # -- vae_decoder emits the video to the client --
     assert isinstance(decoder, GraphNode) and decoder.name == "vae_decoder"

@@ -22,6 +22,7 @@ the v1 engine supplies neither the autocast nor the no-grad wrapper.
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
@@ -39,11 +40,16 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.attention import RaggedAttentionFn
+from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepScalar
+from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.components.unipc import (
     SOLVER_ORDER,
+    UniPCCoefficients,
     UniPCState,
     make_unipc_tables,
+    unipc_coefficient_step,
+    unipc_coefficients,
     unipc_convert_model_output,
     unipc_corrector_step,
     unipc_effective_order,
@@ -188,6 +194,53 @@ def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, in
     h_lat = int(step_metadata["height"]) // config.vae_scale_factor_spatial
     w_lat = int(step_metadata["width"]) // config.vae_scale_factor_spatial
     return t_lat, h_lat, w_lat
+
+
+class _GridCompiledDiT:
+    """The DiT's forward compiled for the latent grids of ``config.compile_dit_sizes``.
+
+    The inner DiT region only (tensors in, tensor out; nothing CPU-resident crosses
+    it), compiled IN PLACE so the transformer keeps its identity: fp32 islands,
+    ``.dtype``, the tests' transformer swap. ``dynamic=False`` traces one graph per
+    input shape (batch included, so CFG and no-CFG are distinct graphs);
+    ``fullgraph=False`` allows the attention graph breaks. Every other grid runs the
+    transformer's own eager forward, so a request at an unlisted size never costs a
+    compile on the shared worker.
+    """
+
+    def __init__(self, transformer: nn.Module | None, config: Wan22Config):
+        self.enabled = bool(config.compile_dit)
+        self.grids = config.compile_dit_grids()
+        self._shapes: set[tuple[int, ...]] = set()
+        self._eager = None
+        if self.enabled and transformer is not None:
+            # with the transformer it belongs to: one swapped in later runs its own forward
+            self._eager = (transformer, transformer.forward)
+            transformer.forward = torch.compile(transformer.forward, fullgraph=False, dynamic=False)
+            logger.info(
+                "Wan2.2 DiT: torch.compile enabled on the transformer region "
+                "(fullgraph=False, dynamic=False) for latent (frames, height, width) %s; other "
+                "shapes and the UniPC solver run eager.",
+                sorted(self.grids),
+            )
+
+    def forward_for(self, transformer: nn.Module, hidden_states: torch.Tensor):
+        """The callable to run ``hidden_states`` (``[B, C, F, H, W]``) through."""
+        if self.enabled and tuple(hidden_states.shape[2:]) in self.grids:
+            shape = tuple(hidden_states.shape)
+            if shape not in self._shapes:
+                # so an operator watching the log knows why the first request at a new
+                # resolution is slow
+                self._shapes.add(shape)
+                logger.info(
+                    "Wan2.2 DiT: first forward at shape %s — torch.compile is tracing "
+                    "this resolution now (one-time pause); later requests reuse it.",
+                    shape,
+                )
+            return transformer
+        if self._eager is not None and self._eager[0] is transformer:
+            return self._eager[1]
+        return transformer
 
 
 class Wan22StepInfo(NamedTuple):
@@ -404,30 +457,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         # compiled region guards on their identity
         self._ragged_fns: tuple[RaggedAttentionFn, RaggedAttentionFn] | None = None
         self._record_fp32_islands()
-        # Compile the inner DiT region only (tensors in, tensor out; nothing
-        # CPU-resident crosses it), IN PLACE so ``self.transformer`` keeps its
-        # identity — fp32 islands, ``.dtype``, the tests' transformer swap.
-        # dynamic=False traces one graph per shape (first request at a new
-        # resolution pauses; logged in ``_noise_prediction``); fullgraph=False
-        # allows the SDPA graph break, matching cosmos3. Only the latent grids
-        # of ``config.compile_dit_sizes`` reach the compiled forward; every
-        # other grid runs ``_eager_forward``, the transformer's own forward.
-        self._compile_dit = bool(config.compile_dit)
-        self._compile_grids = config.compile_dit_grids()
-        self._compiled_shapes: set[tuple[int, ...]] = set()
-        self._eager_forward = None
-        if self._compile_dit and transformer is not None:
-            # with the transformer it belongs to: one swapped in later runs its own forward
-            self._eager_forward = (transformer, transformer.forward)
-            transformer.forward = torch.compile(
-                transformer.forward, fullgraph=False, dynamic=False,
-            )
-            logger.info(
-                "Wan2.2 DiT: torch.compile enabled on the transformer region "
-                "(fullgraph=False, dynamic=False) for latent (frames, height, width) %s; other "
-                "shapes and the UniPC solver run eager.",
-                sorted(self._compile_grids),
-            )
+        self._compiled = _GridCompiledDiT(transformer, config)
 
     def bind_node_resources(self, resources) -> None:
         super().bind_node_resources(resources)
@@ -630,26 +660,10 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         batch = 2 if do_cfg else 1
         hidden_states = model_input.repeat(batch, 1, 1, 1, 1)
         timestep = temp_ts.unsqueeze(0).expand(batch, -1)
-        # dynamic=False keys the compiled trace on the full input shape (batch
-        # included, so CFG and no-CFG are distinct graphs). Announce the one-time
-        # compile pause the first time a shape is seen, so an operator watching the
-        # log knows why the first request at a new resolution is slow.
-        compiled = self._compile_dit and tuple(hidden_states.shape[2:]) in self._compile_grids
-        if compiled:
-            shape_key = tuple(hidden_states.shape)
-            if shape_key not in self._compiled_shapes:
-                self._compiled_shapes.add(shape_key)
-                logger.info(
-                    "Wan2.2 DiT: first forward at shape %s — torch.compile is tracing "
-                    "this resolution now (one-time pause); later requests reuse it.",
-                    shape_key,
-                )
         encoder_hidden_states = (
             torch.cat([text_embeds_pos, text_embeds_neg], dim=0) if do_cfg else text_embeds_pos
         ).to(self.transformer.dtype)
-        transformer = self.transformer
-        if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
-            transformer = self._eager_forward[1]
+        transformer = self._compiled.forward_for(self.transformer, hidden_states)
         attention = {}
         ragged = self._ragged_attention()
         if ragged is not None:
@@ -688,6 +702,269 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         return set()
 
 
+# Loop-back edges of the scaffold's denoise loop beyond ``latents``: UniPC's ring of the
+# last two converted outputs and the sample its predictor last started from.
+UNIPC_MODEL_OUTPUTS = "unipc_model_outputs"
+UNIPC_LAST_SAMPLE = "unipc_last_sample"
+
+
+@dataclass(frozen=True)
+class Wan22Shape:
+    """What has to match for two requests to share a denoise forward: the latent grid,
+    the text length, whether CFG runs both branches and whether frame 0 is an I2V
+    conditioning frame. Requests batch, and accelerator-graph buckets key, on it."""
+
+    grid: tuple[int, int, int]  # latent (frames, height, width)
+    text_len: int
+    cfg: bool
+    i2v: bool
+    video_tokens: int  # per guidance branch, after the patch
+
+    @property
+    def rows(self) -> int:
+        """Transformer rows a request contributes: one per guidance branch."""
+        return 2 if self.cfg else 1
+
+
+def wan22_shape(config: Wan22Config, step_metadata: dict, i2v: bool) -> Wan22Shape:
+    grid = _latent_grid(config, step_metadata)
+    p_t, p_h, p_w = config.patch_size
+    guidance_scale = float(step_metadata.get("guidance_scale", config.guidance_scale))
+    return Wan22Shape(
+        grid=grid, text_len=config.text_max_seq_len, cfg=guidance_scale > 1.0, i2v=i2v,
+        video_tokens=(grid[0] // p_t) * (grid[1] // p_h) * (grid[2] // p_w),
+    )
+
+
+@dataclass(frozen=True)
+class Wan22Schedule(FlowMatchSchedule):
+    """One request's UniPC schedule: the reference's sigma and timestep tables, the
+    request's guidance scale and the solver's per-step weights."""
+
+    guidance_scale: float
+    unipc: UniPCCoefficients
+
+
+class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
+    """One Wan2.2 denoise step on the DiT scaffold: CFG as one forward over both
+    guidance branches, then UniPC in its coefficient form.
+
+    Unlike ``Wan22DitSubmodule``, every per-step decision (the solver's order ramp,
+    the corrector at step 0, I2V's final write-back) is a per-row weight staged with
+    the request's schedule, so requests at different steps batch (equal
+    ``Wan22Shape`` only) and each served shape replays a captured graph. Loop-carried,
+    float32 over the latent grid ``[C, F, H, W]``: ``latents``, the
+    ``unipc_model_outputs`` ring ``[2, C, F, H, W]`` and ``unipc_last_sample``.
+
+    The UniPC update matches the step functions in ``components/unipc.py`` to float32
+    rounding; the CFG combine and the x0 conversion round through bf16 where the
+    reference does.
+    """
+
+    _I2V_WALK = Wan22DitSubmodule._I2V_WALK
+
+    SOLVER_STATE = (UNIPC_MODEL_OUTPUTS, UNIPC_LAST_SAMPLE)
+    # Every scalar is a plain [B] and is viewed per row in ``denoise``: the latents are
+    # [B, C, F, H, W], which the base's [B, 1, 1] would not broadcast over.
+    STEP_SCALARS = {
+        "sigma": StepScalar("sigmas", broadcast=False),
+        "timestep": StepScalar("timesteps", broadcast=False, capture_fill=1000.0),
+        "guidance": StepScalar("guidance", broadcast=False, capture_fill=5.0),
+        "final": StepScalar("final", broadcast=False, capture_fill=0.0),
+        **{name: StepScalar(name, broadcast=False, capture_fill=0.0) for name in UniPCCoefficients._fields},
+    }
+
+    def __init__(
+        self,
+        transformer: nn.Module,
+        config: Wan22Config,
+        *,
+        use_ragged_attention: bool = False,
+        max_batch_size: int = 2,
+        capture_buckets=(),
+        capture_batch_sizes=(1, 2),
+    ):
+        super().__init__(
+            loop_name=DENOISE_LOOP_NAME, max_batch_size=max_batch_size, attn_resource_key=None,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+        )
+        self.transformer = transformer
+        self.config = config
+        self.use_ragged_attention = bool(use_ragged_attention)
+        self._attention: dict[str, RaggedAttentionFn] | None = None
+        self._record_fp32_islands()
+        self._compiled = _GridCompiledDiT(transformer, config)
+
+    # hooks -----------------------------------------------------------------
+    def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> Wan22Shape:
+        return wan22_shape(self.config, fwd_info.step_metadata, i2v=fwd_info.graph_walk == self._I2V_WALK)
+
+    def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: Wan22Shape) -> Wan22Schedule:
+        num_steps = int(fwd_info.step_metadata["num_inference_steps"])
+        sigmas, timesteps = make_unipc_tables(num_steps, self.config.flow_shift)
+        return Wan22Schedule(
+            # the integer timesteps are exact in float32, the dtype the reference's
+            # per-token timestep grid has
+            sigmas=sigmas, timesteps=timesteps.to(torch.float32), mu=None,
+            guidance_scale=float(fwd_info.step_metadata.get("guidance_scale", self.config.guidance_scale)),
+            unipc=unipc_coefficients(sigmas, num_steps),
+        )
+
+    def _step_scalar_sources(self, schedule: Wan22Schedule, device: torch.device) -> dict[str, torch.Tensor]:
+        # Every per-step table in one pinned copy instead of a blocking copy each.
+        n = schedule.num_steps
+        final = torch.zeros(n, dtype=torch.float32)
+        final[-1] = 1.0
+        sources = {
+            "sigmas": schedule.sigmas[:n],
+            "timesteps": schedule.timesteps,
+            "guidance": torch.full((n,), schedule.guidance_scale, dtype=torch.float32),
+            "final": final,
+            **schedule.unipc._asdict(),
+        }
+        table = self.stage_seed(torch.stack(list(sources.values())), device)
+        return dict(zip(sources, table.unbind(0), strict=True))
+
+    def seed_loop_back(self, fwd_info, bucket_key: Wan22Shape, generator: torch.Generator) -> dict[str, torch.Tensor]:
+        # randn_tensor parity: the reference's [1, C, F, H, W] fp32 draw on the CPU generator
+        shape = (self.config.in_channels, *bucket_key.grid)
+        device = self.get_device()
+        return {
+            self.LATENTS: torch.randn((1, *shape), generator=generator, dtype=torch.float32)[0],
+            # zeros until written; the step-0 weights never read them
+            UNIPC_MODEL_OUTPUTS: torch.zeros((SOLVER_ORDER, *shape), dtype=torch.float32, device=device),
+            UNIPC_LAST_SAMPLE: torch.zeros(shape, dtype=torch.float32, device=device),
+        }
+
+    def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: Wan22Shape) -> dict[str, torch.Tensor]:
+        tensors = {"text_embeds_pos": inputs["text_embeds_pos"][0][0]}
+        if bucket_key.cfg:
+            tensors["text_embeds_neg"] = inputs["text_embeds_neg"][0][0]
+        if bucket_key.i2v:
+            tensors["image_latent"] = inputs["image_latent"][0][0]
+        return tensors
+
+    def num_tokens(self, bucket_key: Wan22Shape) -> int:
+        return bucket_key.video_tokens * bucket_key.rows
+
+    def capture_request_inputs(self, bucket_key: Wan22Shape, device) -> dict[str, torch.Tensor]:
+        shape = (self.config.in_channels, *bucket_key.grid)
+        text = torch.zeros(bucket_key.text_len, self.config.text_dim, dtype=torch.bfloat16, device=device)
+        tensors = {
+            self.LATENTS: torch.zeros(shape, dtype=torch.float32, device=device),
+            UNIPC_MODEL_OUTPUTS: torch.zeros((SOLVER_ORDER, *shape), dtype=torch.float32, device=device),
+            UNIPC_LAST_SAMPLE: torch.zeros(shape, dtype=torch.float32, device=device),
+            "text_embeds_pos": text,
+        }
+        if bucket_key.cfg:
+            tensors["text_embeds_neg"] = text.clone()
+        if bucket_key.i2v:
+            tensors["image_latent"] = torch.zeros(
+                (self.config.in_channels, 1, *bucket_key.grid[1:]), dtype=torch.float32, device=device,
+            )
+        return tensors
+
+    def build_layout(self, bucket_key: Wan22Shape, device) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """I2V's first-frame mask over the latent grid and over the patched tokens
+        (frame 0 keeps the conditioning and is denoised at timestep 0); None for T2V."""
+        if not bucket_key.i2v:
+            return None
+        mask = torch.ones(1, 1, *bucket_key.grid, dtype=torch.float32, device=device)
+        mask[:, :, 0] = 0
+        p_t, p_h, p_w = self.config.patch_size
+        return mask, mask[0, 0][::p_t, ::p_h, ::p_w].flatten()
+
+    def denoise(
+        self, engine_inputs, bucket_key: Wan22Shape, latents, unipc_model_outputs, unipc_last_sample,
+        sigma, timestep, guidance, final, text_embeds_pos, text_embeds_neg=None, image_latent=None, **coeffs,
+    ):
+        batch = latents.shape[0]
+
+        def per_row(t: torch.Tensor) -> torch.Tensor:
+            return t.view(batch, 1, 1, 1, 1)
+
+        with _inference_ctx():
+            dtype = self.transformer.dtype
+            if bucket_key.i2v:
+                mask, token_mask = self.layout(bucket_key, latents.device)
+                model_input = (1 - mask) * image_latent + mask * latents
+                timesteps = token_mask * timestep.view(batch, 1)
+            else:
+                model_input = latents
+                timesteps = timestep.view(batch, 1).expand(batch, bucket_key.video_tokens)
+            # one transformer row per guidance branch, a request's two adjacent (cond
+            # first), the order declare_step gives the attention segments
+            rows = bucket_key.rows
+            hidden_states = model_input.to(dtype).repeat_interleave(rows, dim=0)
+            text = torch.stack([text_embeds_pos, text_embeds_neg], dim=1).flatten(0, 1) if bucket_key.cfg \
+                else text_embeds_pos
+            out = self._compiled.forward_for(self.transformer, hidden_states)(
+                hidden_states=hidden_states,
+                timestep=timesteps.repeat_interleave(rows, dim=0),
+                encoder_hidden_states=text.to(dtype),
+                **self.attention(),
+            )
+            if bucket_key.cfg:
+                cond, uncond = out.unflatten(0, (batch, 2)).unbind(1)
+                # the reference's bf16 combine with a Python-float scale: the product
+                # in float32, rounded to bf16
+                out = uncond + (per_row(guidance) * (cond - uncond).float()).to(out.dtype)
+            # x0 conversion, rounded to bf16 as the reference's CPU-scalar product is
+            this_output = latents - (per_row(sigma) * out.float()).to(out.dtype)
+            new_latents, ring, corrected = unipc_coefficient_step(
+                latents, this_output, unipc_model_outputs, unipc_last_sample,
+                UniPCCoefficients(**{name: per_row(coeffs[name]) for name in UniPCCoefficients._fields}),
+            )
+            if bucket_key.i2v:
+                # the reference writes the conditioning frame back after the loop; the
+                # last step's latents are what reach the decoder
+                inject = per_row(final) * (1 - mask)
+                new_latents = inject * image_latent + (1 - inject) * new_latents
+        return {self.LATENTS: new_latents, UNIPC_MODEL_OUTPUTS: ring, UNIPC_LAST_SAMPLE: corrected}
+
+    # attention ------------------------------------------------------------
+    def bind_node_resources(self, resources) -> None:
+        super().bind_node_resources(resources)
+        self._attention = None  # the memoized callables hold the old resources
+
+    def attention(self) -> dict[str, RaggedAttentionFn]:
+        """The transformer's ``ragged_self`` / ``ragged_cross`` callables, built once
+        per resource binding (the compiled region guards on their identity); empty
+        for SDPA."""
+        if self._attention is None:
+            self_attn = self.node_resources.get(DIT_ATTN) if self.use_ragged_attention else None
+            cross_attn = self.node_resources.get(DIT_XATTN) if self.use_ragged_attention else None
+            self._attention = {}
+            if self_attn is not None and cross_attn is not None:
+                self._attention = {
+                    "ragged_self": RaggedAttentionCallable(self_attn, VIDEO_SPAN),
+                    "ragged_cross": RaggedAttentionCallable(cross_attn, cross_label(VIDEO_SPAN, TEXT_SPAN)),
+                }
+        return self._attention
+
+    def declare_step(
+        self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
+        slot_lease: SlotLease | None = None, piecewise_leases=None, **kwargs,
+    ) -> SubmoduleStep | None:
+        """One video segment per guidance branch in the forward's row order, and the
+        text span each branch's cross-attention reads."""
+        if not self.use_ragged_attention:
+            return None
+        video, text = [], []
+        for rid, inp in zip(request_ids, inputs, strict=True):
+            shape: Wan22Shape = inp.resource_step_info
+            for _ in range(shape.rows):
+                video.append(Segment(rid, VIDEO_SPAN, shape.video_tokens))
+                text.append(Segment(rid, TEXT_SPAN, shape.text_len))
+        return SubmoduleStep(
+            steps={
+                DIT_ATTN: AttentionStep(segments=tuple(video), causal=False),
+                DIT_XATTN: RaggedCrossAttentionStep(segments=tuple(video + text), pairs=((VIDEO_SPAN, TEXT_SPAN),)),
+            },
+            cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
+        )
+
+
 # ---------------------------------------------------------------------------
 # vae_decoder
 # ---------------------------------------------------------------------------
@@ -721,10 +998,12 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
     With ``config.vae_decode_fast`` the untiled path at a size in
     ``config.vae_decode_fast_sizes`` runs the shared Wan VAE decoder
     (``mstar.model.components.wan_vae``) instead of ``vae.decode``: the same
-    per-latent decoder calls from an empty cache, on channels-last weights and
-    activations, compiled. Every other decode switches the VAE back to the
-    layout it loaded in first (an exact copy of the decoder weights), so it is
-    stock ``vae.decode`` / ``tiled_decode`` and compiles nothing. The engine
+    per-latent decoder calls from an empty cache, compiled, on channels-last
+    weights and activations where the platform's conv library wants them
+    (``wan_vae.decode_prefers_channels_last``; not MIOpen). With channels-last,
+    every other decode switches the VAE back to the layout it loaded in first
+    (an exact copy of the decoder weights), so it is stock ``vae.decode`` /
+    ``tiled_decode`` and compiles nothing. The engine
     still never wraps the forward; only the decoder's steady-state call is
     compiled.
     """
@@ -746,17 +1025,21 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         self._record_fp32_islands()
         self._fast_step = None
         self._fast_sizes = config.fast_decode_sizes()
+        self._channels_last = False
         if config.vae_decode_fast:
             from mstar.model.components import wan_vae
 
             # Before the compile traces the decoder; this VAE instance is the
             # decoder node's own.
-            wan_vae.to_channels_last(self.vae)
+            self._channels_last = wan_vae.decode_prefers_channels_last()
+            if self._channels_last:
+                wan_vae.to_channels_last(self.vae)
             self._fast_step = wan_vae.DecoderStep(self.vae, compile=True, deterministic=True)
             logger.info(
-                "Wan2.2 VAE decode: untiled %s on the shared Wan VAE decoder (channels-last, compiled); "
+                "Wan2.2 VAE decode: untiled %s on the shared Wan VAE decoder (%s, compiled); "
                 "other sizes decode stock",
                 ", ".join(f"{w}x{h}" for w, h in sorted(self._fast_sizes)),
+                "channels-last" if self._channels_last else "default layout",
             )
 
     def _decode_dtype(self):
@@ -777,7 +1060,9 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
+        latents = inputs["latents"][0]
+        # the scaffold's loop carries one request's latents without the batch dim
+        return NodeInputs(tensor_inputs={"latents": latents if latents.dim() == 5 else latents.unsqueeze(0)})
 
     def _output_size(self, latents: torch.Tensor) -> tuple[int, int, int]:
         """(height, width, num_frames) the latent grid decodes to — the inverse of
@@ -866,7 +1151,7 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
             fast = self._fast_step is not None and not tiled and (width, height) in self._fast_sizes
             if self._fast_step is not None:
                 from mstar.model.components import wan_vae
-
+            if self._channels_last:
                 # One request per step, so nothing else decodes on this VAE
                 # while its layout switches. Outside inference mode: a weight
                 # made in it is an inference tensor, whose dispatch keys the
