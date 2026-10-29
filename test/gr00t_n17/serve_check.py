@@ -129,6 +129,9 @@ def malformed(url: str, obs, seed: int) -> dict[str, int]:
         "a lossy frame": ([("f.jpg", jpeg.getvalue()), *frames[1:]], json.dumps({**kwargs, "seed": seed})),
         "one frame short": (frames[:-1], json.dumps({**kwargs, "seed": seed})),
         "a state group one value short": (frames, json.dumps({**kwargs, "state": narrow, "seed": seed})),
+        # the wrong JSON type, which once reached an AttributeError and a 500
+        "state a list, not an object": (frames, json.dumps({**kwargs, "state": [1.0], "seed": seed})),
+        "embodiment_tag a number": (frames, json.dumps({**kwargs, "embodiment_tag": 3, "seed": seed})),
     }
     status = {}
     for name, (files, mk) in cases.items():

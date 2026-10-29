@@ -574,29 +574,35 @@ class Gr00tN17Model(Model):
         (:meth:`request_kwargs`) and selects the normalisation stats, the
         video keys and the per-robot weights.
         """
-        tag = kwargs.get("embodiment_tag")
-        if tag is None:
-            raise ValueError(
-                "gr00t_n17 needs an `embodiment_tag`: it selects the joint "
-                "groups, the normalisation stats and the per-robot weights"
-            )
         # `PreprocessWorkerThread._fail_request` answers `400 if isinstance(exc,
-        # (ValueError, TypeError)) else 500`, so a bare KeyError here would answer a
-        # malformed request with a 500 whose body is just the missing key's name.
-        if "state" not in kwargs:
+        # (ValueError, TypeError)) else 500`, so a missing field's KeyError, or the
+        # AttributeError a wrong JSON type raises at `.lower()` or `.items()`, would
+        # answer a malformed request with a 500. Both kwargs are checked by type here.
+        tag = kwargs.get("embodiment_tag")
+        if not isinstance(tag, str):
             raise ValueError(
-                "gr00t_n17 needs `state`: an observation is a language instruction "
-                "plus the camera views and the robot's proprioceptive state"
+                f"gr00t_n17 needs an `embodiment_tag` string, got {tag!r}: it selects the "
+                "joint groups, the normalisation stats and the per-robot weights"
+            )
+        if not isinstance(kwargs.get("state"), dict):
+            raise ValueError(
+                "gr00t_n17 needs `state`, a JSON object of joint groups: an observation is a "
+                "language instruction plus the camera views and the robot's proprioceptive state"
             )
         # The reference asserts the history length (`gr00t_n1d7.py`, `prepare_input`);
         # here it is the client's input, so a 400. Past this point a wrong `T` fails in the
         # state encoder's forward, which fails every request in that worker step, and a
         # bare `(D,)` fails the decode's `[:, -1]` after the whole forward has run.
         history = self.config.state_history_length
-        wrong = {
-            k: np.shape(v) for k, v in kwargs["state"].items()
-            if np.ndim(v) != 3 or np.shape(v)[:2] != (1, history)
-        }
+        wrong = {}
+        for k, v in kwargs["state"].items():
+            try:
+                shape = np.asarray(v, dtype=np.float32).shape
+            except (TypeError, ValueError):  # ragged, or not numbers: name the group
+                wrong[k] = "not a numeric array"
+                continue
+            if len(shape) != 3 or shape[:2] != (1, history):
+                wrong[k] = shape
         if wrong:
             raise ValueError(
                 f"gr00t_n17 takes each state group as `(1, {history}, D)`, one request and "
