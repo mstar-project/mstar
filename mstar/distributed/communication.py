@@ -65,8 +65,9 @@ class CommGroup:
         self.group_members = group_members
         self.world_size = len(group_members)
         self.device_group = None
-        # gloo twin of ``device_group``, for object collectives (workspace
-        # rendezvous) that should not go through NCCL
+        # host channel of ``device_group``, for rank votes (``agree``) and
+        # object collectives (workspace rendezvous) that should not go through
+        # NCCL: a gloo twin, or on XPU the mixed group's gloo side
         self.cpu_group = None
         self.initialized = False
         # see ``init_allreduce_fusion``
@@ -80,6 +81,20 @@ class CommGroup:
         ``AllReduce.new``). Collective across the group — every member calls
         this from ``init_dist`` at the same point."""
         self._all_reduce = AllReduce.new(self, mode, max_kb)
+
+    def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
+        """Reduce each of ``values`` over the group's ranks with ``op``: ``MIN`` ANDs
+        flags, ``MAX`` takes the largest. Collective: every member calls it at the
+        same point. Over ``cpu_group``, so the answer costs no device sync."""
+        if self.world_size == 1 or not values:
+            return list(values)
+        if self.cpu_group is None:
+            raise ValueError(
+                f"agree over ranks {self.group_members} before init_dist set up their cpu_group"
+            )
+        t = torch.tensor(values, dtype=torch.int64)
+        dist.all_reduce(t, op=op, group=self.cpu_group)
+        return t.tolist()
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -300,6 +315,12 @@ class JointGroups:
         sp_src, tp_src = divmod(src, self.tp_group.world_size)
         tensor = self.tp_group.broadcast(tensor, tp_src)
         return self.sp_group.broadcast(tensor, sp_src)
+
+    def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
+        """``CommGroup.agree`` over the whole TP x SP block."""
+        for group in (self.tp_group, self.sp_group):
+            values = group.agree(values, op)
+        return values
 
 
 
