@@ -653,6 +653,11 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosyvoice3.html">mstar.model.cosyvoice3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosyvoice3.components.html">mstar.model.cosyvoice3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosyvoice3.config.html">mstar.model.cosyvoice3.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
 </ul>
@@ -1039,6 +1044,11 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="p">[</span><span class="n">q</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">pieces</span> <span class="k">for</span> <span class="n">q</span> <span class="ow">in</span> <span class="p">(</span><span class="n">_cut_evenly</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">max_chars</span><span class="p">)</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_chars</span> <span class="k">else</span> <span class="p">[</span><span class="n">p</span><span class="p">])]</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_join</span><span class="p">(</span><span class="n">left</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">right</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Two sentences of one chunk: a space after a Latin sentence, none after a CJK one."""</span>
+    <span class="k">return</span> <span class="n">left</span> <span class="o">+</span> <span class="n">right</span> <span class="k">if</span> <span class="n">left</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="ow">in</span> <span class="s2">"。！？；"</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">left</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">right</span><span class="si">}</span><span class="s2">"</span>
+
+
 <div class="viewcode-block" id="split_sentences">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.speech_chunking.html#mstar.api_server.openai.speech_chunking.split_sentences">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">split_sentences</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">max_chars</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">400</span><span class="p">,</span> <span class="n">min_chars</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">24</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
@@ -1072,7 +1082,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">chunks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">current</span><span class="p">)</span>
             <span class="n">current</span> <span class="o">=</span> <span class="n">sentence</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">current</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">current</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">sentence</span><span class="si">}</span><span class="s2">"</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+            <span class="n">current</span> <span class="o">=</span> <span class="n">_join</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">sentence</span><span class="p">)</span> <span class="k">if</span> <span class="n">current</span> <span class="k">else</span> <span class="n">sentence</span>
     <span class="k">if</span> <span class="n">current</span><span class="p">:</span>
         <span class="n">chunks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">current</span><span class="p">)</span>
 
@@ -1081,7 +1091,7 @@ window.runMermaid = runMermaid;</script>
         <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span> <span class="o">&lt;</span> <span class="n">min_chars</span>
         <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">])</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span> <span class="o">&lt;=</span> <span class="n">max_chars</span> <span class="o">*</span> <span class="mi">5</span> <span class="o">//</span> <span class="mi">4</span>
     <span class="p">):</span>
-        <span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span> <span class="o">=</span> <span class="p">[</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">]</span>
+        <span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span> <span class="o">=</span> <span class="p">[</span><span class="n">_join</span><span class="p">(</span><span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="n">chunks</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])]</span>
     <span class="k">return</span> <span class="n">chunks</span></div>
 
 </pre></div>

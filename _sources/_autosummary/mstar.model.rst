@@ -35,6 +35,7 @@
    command_a_plus
    components
    cosmos3
+   cosyvoice3
    fish_s2_pro
    flux2_klein
    glm52
