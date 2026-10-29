@@ -21,6 +21,8 @@ model_kwargs:
   # op classes kept on the eager kernels inside the compiled forward: with the norms eager the compiled transformer
   # is bit-exact with the eager one (the activations add nothing but graph breaks); every served image is then
   # >= 53 dB from the eager path on all 100 protocol prompts (the compiled VAE) — [norms] 0.371 s at B=1 vs 0.356 plain and 0.383 with the activations too; 0.461 without compile
+  # On AMD GPUs this is not applied (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M kernel choice
+  # keeps the output off the reference bit for bit either way.
   compile_exact_ops: [norms]
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
