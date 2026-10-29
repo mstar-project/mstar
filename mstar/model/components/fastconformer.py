@@ -471,6 +471,30 @@ class FastConformerEncoder(nn.Module):
             FastConformerBlock(config, i, kv_key, conv_key) for i in range(config.num_layers)
         )
 
+    @classmethod
+    def load(
+        cls,
+        config: FastConformerConfig,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype | None = None,
+        kv_key: str | None = None,
+        conv_key: str | None = None,
+    ) -> FastConformerEncoder:
+        """Built on ``device`` in ``dtype`` from HF-named ``weights``
+        (``load_hf_weights``), every parameter loaded, in eval mode."""
+        from mstar.model.utils import check_loaded
+
+        with torch.device("meta"):
+            encoder = cls(config, kv_key, conv_key)
+        # cast first, so storage is allocated in the target dtype
+        if dtype is not None:
+            encoder = encoder.to(dtype)
+        encoder = encoder.to_empty(device=device)
+        check_loaded(encoder, encoder.load_hf_weights(weights), "FastConformer encoder")
+        return encoder.eval()
+
     def forward(
         self, features: torch.Tensor, lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -609,14 +633,10 @@ def load_nemo_perception(
     ``out_dim``; and the featurizer with ``log_mel_settings`` and the
     checkpoint's own (rounded) filters and window."""
     from mstar.model.components.audio_features import NemoLogMel
-    from mstar.model.utils import check_loaded
 
     with torch.device("meta"):
-        encoder = FastConformerEncoder(config, kv_key, conv_key)
         proj = nn.Linear(config.hidden_size, out_dim)
-    if dtype is not None:
-        encoder, proj = encoder.to(dtype), proj.to(dtype)
-    encoder, proj = encoder.to_empty(device=device), proj.to_empty(device=device)
+    proj = (proj if dtype is None else proj.to(dtype)).to_empty(device=device)
     featurizer: dict[str, torch.Tensor] = {}
     head: dict[str, torch.Tensor] = {}
 
@@ -632,7 +652,9 @@ def load_nemo_perception(
                 # e.g. a modality adapter's: skipping it would serve without it
                 raise ValueError(f"unexpected NeMo perception weight {name!r}")
 
-    check_loaded(encoder, encoder.load_hf_weights(encoder_weights()), "FastConformer encoder")
+    encoder = FastConformerEncoder.load(
+        config, encoder_weights(), device=device, dtype=dtype, kv_key=kv_key, conv_key=conv_key,
+    )
     with torch.no_grad():
         proj.weight.copy_(head["weight"])
         proj.bias.copy_(head["bias"])
@@ -640,4 +662,4 @@ def load_nemo_perception(
         num_mel_bins=config.num_mel_bins, device=device,
         mel_filters=featurizer["fb"], window=featurizer["window"], **log_mel_settings,
     )
-    return encoder.eval(), proj.eval(), log_mel
+    return encoder, proj.eval(), log_mel
