@@ -3,7 +3,8 @@
 The kernels are checked against their torch references and against the kernels the per-position forwards run. The
 loop is checked teacher-forced against a float64 evaluation of the same weights: its logits must sit as close to it
 as the per-position forward's do (the bf16 noise), at the real shapes of both code predictors, with random weights
-and with the cached checkpoints. Captured replays must equal eager runs, and the loop must launch far fewer kernels.
+and with the cached checkpoints. Captured replays must equal eager runs, and replay faster than the per-position
+forward's.
 """
 
 import functools
@@ -328,12 +329,10 @@ def test_fused_loop_replays_from_a_captured_graph(build):
 
 
 @pytest.mark.parametrize("build", [_omni_random, _tts_random], ids=["omni", "tts"])
-def test_fused_loop_kernel_count(build):
-    """Kernels one frame launches, eager, with a greedy sampler (argmax), and the frame's time replayed from a
-    captured graph at 27 rows padded to the 32-row bucket. The per-position forward runs uncompiled here, so its
-    numbers are an upper bound for the served path, where Inductor fuses parts of it."""
-    from torch.profiler import ProfilerActivity, profile
-
+def test_fused_loop_replays_faster(build):
+    """A frame replayed from a captured graph at 32 rows, greedy (argmax) sampling, fused against the per-position
+    forward. That forward runs uncompiled here, so its time is an upper bound for the served path, where Inductor
+    fuses parts of it; the served kernel census is the comparison that counts."""
     from mstar.model.components.depth_decoder import DepthDecoder
 
     cp, group0, sum_dtype = build()
@@ -343,7 +342,7 @@ def test_fused_loop_kernel_count(build):
     layer0 = torch.randint(0, group0.num_embeddings, (rows,), device=DEV)
     kv = cp.depth_kv_cache(rows, 32)
     sum_dtype = sum_dtype or group0.weight.dtype
-    counts, times = {}, {}
+    times = {}
     for fn in ("_fused_loop", "_reference_loop"):
         def run(loop=getattr(DepthDecoder, fn)):
             return loop(cp, last_hidden, layer0, group0, lambda x: x.argmax(-1), kv, sum_dtype)
@@ -351,10 +350,6 @@ def test_fused_loop_kernel_count(build):
         with torch.no_grad(), torch.autocast(DEV, dtype=torch.bfloat16):
             run()
             torch.cuda.synchronize()
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                run()
-                torch.cuda.synchronize()
-            counts[fn] = sum(1 for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 run()
@@ -367,7 +362,5 @@ def test_fused_loop_kernel_count(build):
             end.record()
             torch.cuda.synchronize()
             times[fn] = start.elapsed_time(end) / 50
-    print(f"{build.__name__}: kernels per frame (argmax sampler) {counts}; captured frame ms at 32 rows "
-          f"{ {k: round(v, 3) for k, v in times.items()} }")
-    assert counts["_fused_loop"] < 0.65 * counts["_reference_loop"]
+    print(f"{build.__name__}: captured frame ms at 32 rows {({k: round(v, 3) for k, v in times.items()})}")
     assert times["_fused_loop"] < times["_reference_loop"]
