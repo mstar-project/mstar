@@ -163,6 +163,40 @@ def _rocm_fused_add_rms_norm():
     return fused_add_rmsnorm
 
 
+def _tuned_fused_add_rms_norm():
+    """The Triton kernel for the shape classes this device's config promotes
+    it for, FlashInfer's ROCm fork for the rest and wherever no config exists,
+    so a product nobody has measured keeps the fork."""
+    from mstar.engine.resources.rms_norm.rocm import fused_add_rmsnorm as fork
+    from mstar.kernels import configs
+    from mstar.platforms import current_platform
+
+    facts = current_platform.device_facts()
+    if configs.load_config(FUSED_ADD_RMS_NORM.name, facts.arch, facts.product) is None:
+        fork.kernel_selection = f"flashinfer-rocm (no config for {facts.arch}/{facts.product})"
+        return fork
+    from mstar.kernels.triton.norm import fused_add_rms_norm as triton_kernel
+
+    chosen: dict[tuple[int, int], object] = {}
+
+    def choose(rows: int, hidden: int):
+        entry = FUSED_ADD_RMS_NORM.config({"rows": rows, "hidden": hidden})
+        if entry is None or entry.get("impl") != "triton":
+            return fork
+        knobs = {k: v for k, v in entry.items() if k != "impl"}
+        return lambda h, r, w, eps, gemma: triton_kernel(h, r, w, eps, gemma, knobs)
+
+    def run(hidden_states, residual, weight, eps, gemma):
+        key = (hidden_states.shape[0], hidden_states.shape[1])
+        impl = chosen.get(key)
+        if impl is None:
+            impl = chosen[key] = choose(*key)
+        impl(hidden_states, residual, weight, eps, gemma)
+
+    run.kernel_selection = f"triton by shape class ({facts.arch}/{facts.product} config), else flashinfer-rocm"
+    return run
+
+
 def _fused_add_inputs(shape, dtype, device, generator=None):
     rows, hidden = shape["rows"], shape["hidden"]
     hidden_states = torch.randn(rows, hidden, dtype=dtype, device=device, generator=generator)
@@ -181,6 +215,8 @@ FUSED_ADD_RMS_NORM = KernelOp(
     impls={
         "cuda": _flashinfer_fused_add_rms_norm,
         "rocm": _rocm_fused_add_rms_norm,
+        "rocm:gfx942": _tuned_fused_add_rms_norm,
+        "rocm:gfx950": _tuned_fused_add_rms_norm,
         "xpu": lambda: _fused_add_rms_norm_reference,
     },
     shapes=ShapePolicy(
@@ -191,6 +227,7 @@ FUSED_ADD_RMS_NORM = KernelOp(
         warm=({"rows": 1, "hidden": 4096}, {"rows": 64, "hidden": 4096}, {"rows": 513, "hidden": 2048}),
         dtypes=(torch.bfloat16,),
     ),
+    # fp32 math, one round-to-nearest-even store per output
     tolerance=Tolerance.rounded_once(),
 )
 
