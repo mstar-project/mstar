@@ -2110,4 +2110,16 @@ class Conductor:
             # Outside the try above so DeadWorkerError leaves the loop instead of
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
-            time.sleep(0.001)
+            self._pass_wait()
+
+    def _pass_wait(self) -> bool:
+        """Wait between passes of the main loop. A message ends the wait, so a
+        new request or a finished pass is handled when it lands rather than on
+        the next tick of a 1 ms grid; 1 ms stays as the backstop for the timed
+        checks (expiry, status, worker liveness). True when a message is
+        waiting. getattr: tests drive the loop with stand-in communicators."""
+        poll = getattr(self.communicator, "poll_for_messages", None)
+        if callable(poll):
+            return poll(timeout_ms=1)
+        time.sleep(0.001)
+        return False
