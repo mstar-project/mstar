@@ -9,6 +9,8 @@ ones its weight loader uses). The model states only what its modules cannot: how
 target's rows relate to the step's tokens (``rows``), modules it calls outside the step
 (``exclude``, ``deferred``), names kept for compatibility (``names``), the prefixes
 adapters write the root under (``adapter_roots``) and adapter-only renames (``aliases``).
+A module itself names the children it runs through their weights rather than their
+forward (``lora_unservable``), which the walk refuses.
 
 ``bind_module_lora`` binds each placed module to its delta when the node's resources
 include the spec's pool (``NodeSubmodule.bind_node_resources`` calls it), checking the
@@ -167,6 +169,15 @@ def _match(path: str, patterns) -> str | None:
     return None
 
 
+def _declared(path: str, declared: Mapping[str, str]) -> str | None:
+    """The reason ``declared`` gives for ``path`` or a module holding it."""
+    while True:
+        reason = declared.get(path)
+        if reason is not None or "." not in path:
+            return reason
+        path = path.rsplit(".", 1)[0]
+
+
 class _Found(NamedTuple):
     path: str
     layer: int
@@ -233,9 +244,9 @@ def module_lora_spec(
 
     Linear-like modules that cannot take a delta (a depthwise conv, MoE experts) are
     recorded with the reason, which an adapter touching them is refused with, and so are
-    the children a module declares in ``lora_unservable`` (child name -> reason): ones it
-    runs through their weights itself, never through their forward (folded at load, an
-    ``F.linear`` over the weight).
+    the children a module declares in ``lora_unservable`` (path below it -> reason, each
+    one of its submodules): ones it runs through their weights itself, never through
+    their forward (folded at load, an ``F.linear`` over the weight).
     """
     own_rules = getattr(root, "checkpoint_rules", None)
     if rules is None:
@@ -249,18 +260,29 @@ def module_lora_spec(
     rows, names = dict(rows or {}), dict(names or {})
     groups: dict[tuple[str | None, str], list[_Found]] = defaultdict(list)
     unservable: dict[str, str] = {}
+    declared: dict[str, str] = {}  # modules' own `lora_unservable`, by exact path
     for path, module in root.named_modules():
         # children the module runs through their weights itself (pre-order: before them)
         prefix = f"{path}." if path else ""
-        excluded.update({prefix + c: r for c, r in getattr(module, "lora_unservable", {}).items()})
+        for child, reason in getattr(module, "lora_unservable", {}).items():
+            try:
+                module.get_submodule(child)
+            except AttributeError:
+                raise ValueError(
+                    f"{type(module).__name__}.lora_unservable names {child!r}, which is not "
+                    "one of its submodules"
+                ) from None
+            declared[prefix + child] = reason
         if not path:
             continue
         capability = lora_capability(module)
         if capability is None:
             continue
-        pattern = _match(path, excluded)
-        if pattern is not None:
-            unservable[path] = excluded[pattern]
+        reason = _declared(path, declared)
+        if reason is None and (pattern := _match(path, excluded)) is not None:
+            reason = excluded[pattern]
+        if reason is not None:
+            unservable[path] = reason
             continue
         if capability.capable is None:
             unservable[path] = capability.reason
