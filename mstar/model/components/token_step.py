@@ -80,7 +80,8 @@ class TokenStepNode:
     def _stop_names(self, token: int, request_info: CurrentForwardPassInfo) -> set[str]:
         """``check_stop``'s answer for one row: a decode row stops the loop,
         and a PREFILL_WALK row, which runs before the loop exists, ends the
-        partition."""
+        partition. A batched decode step answers from ``_stops`` without
+        calling this, so an override changes only the other rows."""
         if not self._stops(token, request_info):
             return set()
         return {self.DECODE_LOOP} if request_info.graph_walk == self.DECODE_WALK else {END_PARTITION}
