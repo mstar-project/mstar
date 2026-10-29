@@ -120,6 +120,11 @@ class _FakeRunner:
             released=False,
             release_all=lambda: setattr(self._dummy_rows, "released", True),
         )
+        # what the node's resources hear was kept
+        self.reported: list = []
+        self._step_runner = SimpleNamespace(
+            buckets_captured=lambda buckets, node_name=None: self.reported.append((node_name, list(buckets))),
+        )
 
     def prepare_for_capture(self):
         return self._specs
@@ -423,6 +428,18 @@ def test_a_dropped_bucket_is_listed_and_logged_as_an_error(caplog):
     clean = _FakeRunner(_specs(walks=("decode", "prefill")))
     clean.warmup_and_capture()
     assert clean.dropped_buckets == []
+
+
+def test_the_resources_hear_only_the_buckets_kept():
+    """A resource that picks between captures (the sampler's unfiltered one)
+    must not pick a bucket that was dropped on any rank."""
+    runner = _FakeRunner(_specs(walks=("decode", "prefill")), fail={("decode", 1)})
+
+    runner.warmup_and_capture()
+
+    ((node, kept),) = runner.reported
+    assert node == "node"
+    assert [key.graph_walk for key in kept] == ["prefill"]
 
 
 def test_a_bucket_a_resource_refuses_is_never_captured_and_runs_eagerly(caplog):

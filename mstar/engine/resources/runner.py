@@ -17,6 +17,7 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
+    BucketKey,
     FullAdmitOutcome,
     SubmoduleStep,
 )
@@ -733,6 +734,12 @@ class StepRunner:
             self._resources[key].build_accelerator_graph_buffers(
                 slots, max_bs, max_seq_len
             )
+
+    def buckets_captured(self, buckets: list[BucketKey], node_name: str | None = None) -> None:
+        """Tell ``node_name``'s resources which buckets a runner kept; swept
+        over the same resources as ``build_accelerator_graph_buffers``."""
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].buckets_captured(buckets)
 
     def capture_refusal(
         self, spec: CGSlotSpec, node_name: str | None = None,

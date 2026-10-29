@@ -802,6 +802,7 @@ class _StubPlannedRunner:
         )
         self._blocked_buckets = []
         self._executables = {}
+        self._step_runner = SimpleNamespace(buckets_captured=lambda buckets, node_name=None: None)
         self.tried: list[BucketKey] = []
         self.forwards: list[int] = []
 

@@ -1007,6 +1007,9 @@ class AcceleratorGraphRunner:
         self._report_dropped(
             [spec.bucket for spec in slot_specs if spec.slot == 0], agreed, refused,
         )
+        self._step_runner.buckets_captured(
+            [key for key in captured if key in agreed], node_name=self._submodule_name,
+        )
 
         mem_after = self._graph_backend.memory_allocated()
         self._log_memory(mem_before, mem_after)
