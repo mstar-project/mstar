@@ -46,6 +46,7 @@ _LIB = torch.library.Library(NAMESPACE, "FRAGMENT")
 # Modules that declare ops, imported by `load_all` so a listing sees them all.
 DECLARING_MODULES = (
     "mstar.engine.resources.rms_norm.rms_norm",
+    "mstar.engine.resources.sampler.unfiltered",
     "mstar.platforms.rocm_gemm",
 )
 
