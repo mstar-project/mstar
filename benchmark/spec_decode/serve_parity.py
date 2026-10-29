@@ -102,7 +102,8 @@ def compare(args) -> int:
         entry = {"id": r["id"], "char": div, "a": x[max(div - 40, 0):div + 40], "b": y[max(div - 40, 0):div + 40]}
         if tok is not None:
             ia, ib = tok.encode(x, add_special_tokens=False), tok.encode(y, add_special_tokens=False)
-            entry["token"] = next((i for i, (t1, t2) in enumerate(zip(ia, ib, strict=False)) if t1 != t2), min(len(ia), len(ib)))
+            pairs = enumerate(zip(ia, ib, strict=False))
+            entry["token"] = next((i for i, (t1, t2) in pairs if t1 != t2), min(len(ia), len(ib)))
             entry["len_a"], entry["len_b"] = len(ia), len(ib)
         diffs.append(entry)
     print(f"identical {same}/{len(b['results'])}")
