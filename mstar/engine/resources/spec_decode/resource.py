@@ -392,8 +392,8 @@ class SpecDecodeResource(Resource):
         self._eager_images.clear()
 
     # In-graph operations, called by the forward in this order: `seed` on a
-    # prompt's step; `verify_inputs`, `accept`, then `begin_draft_pass` /
-    # `record_draft` once per draft pass on a decode step.
+    # prompt's step; `verify_inputs`, `accept`, then `begin_draft_pass`,
+    # `draft_slots` and `record_draft` once per draft pass on a decode step.
 
     def _plan_now(self, phase: SpecPhase) -> SpecDecodePlan:
         plan = self._current
@@ -563,13 +563,24 @@ class SpecDecodeResource(Resource):
         plan.kv_lens.copy_(self._draft_lens[j - 1])
 
     @torch.compiler.disable
+    def draft_slots(self) -> torch.Tensor:
+        """Each row's slot ``n``, the one real query of a draft pass, as flat
+        indices into ``[rows * (k + 1)]``: what a draft head reads its output
+        from, so its work after attention can run on these rows alone."""
+        plan = self._plan_now(SpecPhase.VERIFY)
+        t = self.tokens_per_row
+        base = torch.arange(plan.num_rows, device=self._device) * t
+        return base + (self._accepted - 1).long()
+
+    @torch.compiler.disable
     def record_draft(self, j: int, draft: torch.Tensor) -> torch.Tensor:
-        """Keep slot ``n`` of pass ``j``'s tokens (``[rows * (k + 1)]``) as
-        draft ``j + 1``; returns it in every slot, as pass ``j + 1``'s input."""
+        """Keep pass ``j``'s token of each row (``[rows]``, read at
+        `draft_slots`) as draft ``j + 1``; returns it in every slot,
+        ``[rows * (k + 1)]``, as pass ``j + 1``'s input."""
         plan = self._plan_now(SpecPhase.VERIFY)
         rows, _ = self._rows(plan)
         b, t = plan.num_rows, self.tokens_per_row
-        chosen = draft.view(b, t).long().gather(1, (self._accepted - 1)[:, None].long())
+        chosen = draft.view(b, 1).long()
         self._tokens[:, j + 1: j + 2].index_copy_(0, rows, chosen)
         return chosen.expand(b, t).reshape(-1)
 

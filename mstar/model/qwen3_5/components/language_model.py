@@ -320,7 +320,12 @@ class Qwen3_5MTPHead(nn.Module):
     def forward(
         self, hidden: torch.Tensor, next_embeds: torch.Tensor, *, label: str,
         cos_sin: tuple[torch.Tensor, torch.Tensor],
+        keep: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """The head over every token (its KV written for each), and its output
+        at the rows ``keep`` indexes (all of them by default): a speculative
+        draft pass reads one row of each request, so everything after the
+        attention runs on those alone."""
         cg = self.comm_group if self.comm_group.world_size > 1 else None
         x = self.fc(torch.cat(
             (self.pre_fc_norm_embedding(next_embeds), self.pre_fc_norm_hidden(hidden)), dim=-1,
@@ -331,6 +336,8 @@ class Qwen3_5MTPHead(nn.Module):
         attend.bind_step(label)
         attend.set_layer_idx(self.kv_layer_idx)
         h = layer.self_attn(layer.input_layernorm(x))
+        if keep is not None:
+            h, x = h.index_select(0, keep), x.index_select(0, keep)
         h, residual = layer.post_attention_layernorm.forward_residual(h, x, cg)
         h = layer.mlp(h)
         normed, _ = self.norm.forward_residual(h, residual, cg)
