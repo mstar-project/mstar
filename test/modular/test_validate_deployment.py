@@ -7,6 +7,7 @@ including the ones that used to fail on every worker after spawn, and two
 that several problems come back together. The input limit is checked
 against the Rust graph runtime's own compiler.
 """
+import dataclasses
 import re
 from dataclasses import dataclass, field
 
@@ -135,6 +136,11 @@ def test_missing_node_groups_is_refused(tmp_path):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("max_seq_len: 64\n")
     _refused(_Model(), str(cfg), r"must define `node_groups`")
+
+
+def test_unknown_autocast_dtype_is_refused(tmp_path):
+    """Each worker refused it after spawn."""
+    _refused(_Model(), _cfg(tmp_path, autocast_dtype="bf16"), r"autocast_dtype 'bf16' is not a torch dtype")
 
 
 @pytest.mark.parametrize("node_groups,pattern", [
@@ -468,6 +474,54 @@ def test_prefix_stream_laying_out_an_undeclared_resource_is_refused(tmp_path):
         "_Model lays 'vk'/'main' out, but declares no resource 'vk'; its resources are ['kv']"
         in _problems(model, _cfg(tmp_path))
     )
+
+
+# -- LoRA ---------------------------------------------------------------------
+
+
+def _lora_spec(key="lora", nodes=("llm",)):
+    from test_lora_pool import make_spec  # skips the test without safetensors
+
+    return dataclasses.replace(make_spec({}), resource_key=key, nodes=set(nodes))
+
+
+class _LoraModel(_Model):
+    def __init__(self, lora, *args, **kw):
+        super().__init__(*args, **kw)
+        self._lora = lora
+
+    def get_lora_specs(self):
+        return list(self._lora)
+
+
+def test_a_lora_deployment_passes(tmp_path):
+    """The pass checks the specs the YAML turns on, as the workers build them: the
+    model's declaration alone has no `lora` resource for the block to override."""
+    _validate(_LoraModel([_lora_spec()]), _cfg(tmp_path, resources={"lora": {"max_slots": 2}}))
+
+
+@pytest.mark.parametrize("serves_lora, block, refusal", [
+    (True, {"max_slots": 0}, "resources.lora: max_slots must be an integer >= 1; got 0"),
+    # reported once, not again as an unknown resource
+    (False, {"max_slots": 0}, "declaring the LoRA specs failed: ValueError: the serving config "
+                              "has a `resources: lora:` block, but _LoraModel serves no LoRA adapters"),
+    (True, None, "declaring the LoRA specs failed: ValueError: `resources: lora:` must be a mapping; got None"),
+], ids=["bad_value", "no_lora_specs", "not_a_mapping"])
+def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, serves_lora, block, refusal):
+    """The `lora:` block sizes every LoRA spec; a bad value there is one problem, and the
+    other resources' checks still run."""
+    cfg = _cfg(tmp_path, [
+        {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
+        {"node_names": ["b"], "ranks": [2]},
+    ], resources={"lora": block})
+    model = _LoraModel(
+        [_lora_spec(nodes={"a"}), _lora_spec("lora_b", nodes={"b"})] if serves_lora else [],
+        _a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"],
+    )
+    assert _problems(model, cfg) == [
+        refusal,
+        "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas",
+    ]
 
 
 # -- every problem at once ----------------------------------------------------

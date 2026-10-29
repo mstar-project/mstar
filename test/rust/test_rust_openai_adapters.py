@@ -36,6 +36,7 @@ from test_rust_frontend import (
 from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, OpenAIAdapter
 from mstar.api_server.rust_frontend import OPENAI_ADAPTER_ENV, openai_adapter_class
+from mstar.api_server.served_models import ServedModels
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
@@ -250,6 +251,7 @@ class _PythonServer:
 
     def __init__(self, model_name, upload_dir):
         self.model_name, self.upload_dir, self.model = model_name, upload_dir, None
+        self.served_models = ServedModels.of(model_name, None)
 
     def submit_request(self, **kwargs):
         return kwargs["request_id"]

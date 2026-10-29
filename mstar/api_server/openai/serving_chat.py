@@ -34,7 +34,11 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             prompt_parts=args.prompt_parts,
             streaming=bool(req.stream),
             request_id=request_id,
+            model=req.model,
         )
+        if req.model in api.served_models.adapters:
+            # the response names the adapter that served it, as vLLM's does
+            model_name = req.model
         if req.stream:
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)

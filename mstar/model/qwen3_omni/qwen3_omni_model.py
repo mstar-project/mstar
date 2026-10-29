@@ -1512,7 +1512,7 @@ class Qwen3OmniModel(Model):
         E = self.config.thinker_text.num_experts
         # MoE expert rules MUST come before dense MLP rules because
         # the dense ".gate_proj" suffix would also match the remapped
-        # MoE key "experts.gate_proj.__expertN__.weight". _apply_stacked
+        # MoE key "experts.gate_proj.__expertN__.weight". apply_stacked
         # returns on first match, so longer/more-specific rules go first.
         rules = []
         for i in range(E):

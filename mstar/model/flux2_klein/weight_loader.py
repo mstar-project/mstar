@@ -41,7 +41,7 @@ from pathlib import Path
 
 import torch
 
-from mstar.model.components.diffusion.lora import LoraSpec, apply_loras
+from mstar.model.components.diffusion.lora import apply_loras
 from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig, Qwen3HiddenStateEncoder
 from mstar.model.components.diffusion.qwen3.weight_loading import (
     QKV_RULES_LM,
@@ -55,6 +55,7 @@ from mstar.model.components.diffusion.weight_loading import (
     load_native,
     materialize,
 )
+from mstar.model.components.lora import LoraFile
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
 from mstar.model.flux2_klein.components.vae import Flux2VAE, remap_flux2_vae_key
 from mstar.model.flux2_klein.config import Flux2KleinConfig
@@ -204,6 +205,6 @@ def convert_bfl_lora_keys(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
     return out
 
 
-def apply_transformer_loras(dit: Flux2DiT, specs: list[LoraSpec]) -> None:
+def apply_transformer_loras(dit: Flux2DiT, files: list[LoraFile]) -> None:
     """Fold the configured adapters into the transformer weights (static merge)."""
-    apply_loras(dit, specs, remap_transformer_key, _QKV_RULES_DIT, convert_keys=convert_bfl_lora_keys)
+    apply_loras(dit, files, remap_transformer_key, _QKV_RULES_DIT, convert_keys=convert_bfl_lora_keys)

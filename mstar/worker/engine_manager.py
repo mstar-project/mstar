@@ -7,10 +7,10 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
+from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs
+from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -116,8 +116,7 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
-        specs = model.get_node_resources()
-        apply_yaml_overrides(specs, model_config)
+        specs = serving_resources(model, model_config)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
@@ -125,7 +124,7 @@ class EngineManager:
         # without forcing every config file to set the same value).
         autocast_dtype = model.get_autocast_dtype()
         if "autocast_dtype" in model_config:
-            autocast_dtype = model_config["autocast_dtype"]
+            autocast_dtype = parse_autocast_dtype(model_config["autocast_dtype"])
 
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
@@ -153,13 +152,9 @@ class EngineManager:
             )
             if submodule is None:
                 continue
-            if submodule.disable_autocast:
-                # keeps the dtype it was built in; the engine won't autocast it
-                submodules[name] = submodule.to(device=device)
-                continue
-            # A submodule that must run in its own dtype (an audio codec in
-            # fp32, say) says so; otherwise it takes the engine's.
-            node_dtype = submodule.get_autocast_dtype() or autocast_dtype
+            # A submodule that must run in its own dtype (an audio codec in fp32, say)
+            # says so; one that disables autocast keeps the dtype it was built in.
+            node_dtype = submodule.compute_dtype(autocast_dtype)
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)

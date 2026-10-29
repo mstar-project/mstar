@@ -60,6 +60,9 @@ class EngineResourceInfo:
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
+    # the dtype this resource's nodes compute in (their autocast dtype); None when they
+    # disagree or run outside autocast
+    compute_dtype: torch.dtype | None = None
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
     # the specs this one named in `depends_on`, by resource key
@@ -260,6 +263,17 @@ class Resource(ABC):
 
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         """record step consumption"""
+        return
+
+    def enter_compute(self) -> None:
+        """The planned step's ``preprocess`` and forward (or a capture's warmup and
+        capture) start: what model code calls on this resource now addresses this
+        step's plan. Paired with ``exit_compute``, nested for a piecewise region's step
+        inside its enclosing forward. Only a resource that overrides it is called."""
+        return
+
+    def exit_compute(self) -> None:
+        """See ``enter_compute``."""
         return
 
     def publish(self, request_id: str) -> "PublishedInfo | None":

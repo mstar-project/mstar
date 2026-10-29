@@ -1759,7 +1759,9 @@ class Worker:
         reclaimed.
         """
         engine = self.engine_manager.get_engine(node_name)
-        if not engine.evictable(node_name):
+        # quietly: a resource that never evicts (a LoRA pool) ran out, which is
+        # backpressure for the scheduler, not a working set that does not fit
+        if not engine.evictable(node_name, affected_resources):
             return None
 
         active = [

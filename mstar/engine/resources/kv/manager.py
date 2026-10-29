@@ -149,6 +149,8 @@ class PrefixChain:
     looked_up: bool = False
     # how many of this stream's pages the index already holds
     cursor: int = 0
+    # the parent of the first page's key (`KVReqConfig.prefix_root`)
+    root: bytes = b""
     # set once this stream has been reported, so a request that is admitted
     # again (a refused admit, a second partition) is still one line
     reported: bool = False
@@ -157,13 +159,14 @@ class PrefixChain:
     @classmethod
     def seed(
         cls, keys: list[bytes], tail: list[int], spans: list[PrefixSpan], page_size: int,
+        root: bytes = b"",
     ) -> "PrefixChain":
         total = sum(span.length for span in spans)
         whole = total // page_size
         items = page_items(((span.length, span.digest) for span in spans), page_size)
         return cls(
             keys=list(keys), unkeyed=tail, keyed_pages=whole, covered_len=total,
-            spans=list(spans), unkeyed_items=items.get(whole, []),
+            spans=list(spans), unkeyed_items=items.get(whole, []), root=root,
         )
 
     def extend(self, tokens: list[int], page_size: int) -> None:
@@ -174,7 +177,7 @@ class PrefixChain:
         while len(self.unkeyed) >= room:
             whole = self.keyed_pages
             key = page_key(
-                self.keys[whole - 1] if whole else b"",
+                self.keys[whole - 1] if whole else self.root,
                 self.unkeyed[:room], self.unkeyed_items,
             )
             # overwrites the partial key the prompt left here, if any
@@ -1233,6 +1236,7 @@ class KVManager(AttentionResource):
         tail = list((overrides.prefix_tail or {}).get(label) or ())
         stream.chain = PrefixChain.seed(
             keys, tail, layout.spans[:layout.keyed_spans], self.config.page_size,
+            root=overrides.prefix_root,
         )
 
     @property

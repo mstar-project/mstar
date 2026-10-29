@@ -47,9 +47,13 @@ from mstar.api_server.request_types import (
     PreprocessInput,
     ResultChunk,
 )
+from mstar.api_server.served_models import ServedModels
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
+from mstar.engine.resources.lora.config import lora_enabled
+from mstar.engine.resources.lora.serving import lora_specs
+from mstar.engine.resources.lora.store import check_adapters
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -128,9 +132,11 @@ def _conductor_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    lora_adapter_digests: dict[str, str] | None = None,
 ):
     """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
-    turns on the conductor's status message (metrics on)."""
+    turns on the conductor's status message (metrics on). ``lora_adapter_digests``
+    are the API server's checked serving-config adapters (name -> hex digest)."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -184,6 +190,7 @@ def _conductor_process_target(
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
         status_interval_s=status_interval_s,
+        lora_adapter_digests=lora_adapter_digests,
     )
     try:
         conductor.run()
@@ -427,6 +434,19 @@ class APIServer:
         # tokenizer-only model the API server already builds for preprocessing.
         self.model = model
         self.model_name = model_name
+        # what an OpenAI request's `model` field may name: the base model, or an adapter
+        self.served_models = ServedModels.of(model_name, model_config)
+        specs = lora_specs(model, model_config)
+        lora_spec = specs[0] if specs else None
+        # Every adapter the serving config names, checked against every LoRA spec and
+        # read once before anything else starts. Their digests key the prefix cache here
+        # and travel to the conductor, which pins them for the workers' reads. So a LoRA
+        # deployment's `resources:` block is read here, before the conductor's
+        # validate_deployment; one without LoRA reads nothing here.
+        self.lora_adapter_digests: dict[str, bytes] = (
+            check_adapters(lora_spec, others=specs[1:])
+            if lora_spec is not None and lora_spec.adapters else {}
+        )
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
         self.client_streams = frozenset(
@@ -446,6 +466,7 @@ class APIServer:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
             enable_nvtx=self.enable_nvtx,
+            adapter_digests=self.lora_adapter_digests,
             is_pending=self.is_pending,
         )
 
@@ -627,10 +648,15 @@ class APIServer:
         prompt_parts: list[PromptPart] | None = None,
         streaming: bool = True,
         request_id: str | None = None,
+        model: str | None = None,
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
+
+        ``model`` is an OpenAI request's ``model`` field: with LoRA on, it selects an
+        adapter (see :meth:`ServedModels.select`), and an unknown name is a 400. A
+        ``lora_adapter`` kwarg is checked the same way.
 
         Returns the ``request_id``. If a ``request_id`` is provided by the
         caller it is used as-is (useful for deterministic-noise debugging,
@@ -674,6 +700,7 @@ class APIServer:
         # here, before anything is queued: null is unset, types and ranges are
         # checked once for every endpoint, and an over-wide seed cannot be packed
         model_kwargs = normalize_generation_kwargs(model_kwargs)
+        model_kwargs = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
 
         if file_streams:
@@ -733,6 +760,14 @@ class APIServer:
             request_id, key, input_modalities, output_modalities,
         )
         return request_id
+
+    def lora_kwargs(self, model: str | None, model_kwargs: dict | None) -> dict | None:
+        """``model_kwargs`` naming the LoRA adapter ``model`` or a ``lora_adapter`` kwarg
+        selects; an adapter this deployment does not serve is a 400."""
+        try:
+            return self.served_models.select(model, model_kwargs)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
 
     def _in_flight(self, request_id: str) -> bool:
         """The newest submission under ``request_id`` is still running: not
@@ -2639,6 +2674,14 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    if args.rust_frontend and lora_enabled(config):
+        # The Rust frontend translates OpenAI requests itself: it does not map the `model`
+        # field onto an adapter, so it would serve every request on the base model.
+        raise SystemExit(
+            "LoRA adapters (`resources: lora:` in the serving config) are served by the "
+            "Python frontend only; drop --rust-frontend"
+        )
+
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
     # model instance too, so it sees the same Pi05Config (action_horizon, etc.)
@@ -2691,7 +2734,12 @@ def main(argv: list[str] | None = None):
             args.tcp_transfer_device
         ),
         # The API server drops these until enable_metrics(), after the warmups.
-        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None},
+        kwargs={
+            "status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None,
+            "lora_adapter_digests": {
+                name: digest.hex() for name, digest in api_server.lora_adapter_digests.items()
+            },
+        },
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)

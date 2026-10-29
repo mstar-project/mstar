@@ -7,11 +7,14 @@ communicator, its built resources and capture results, and live process
 groups across ranks.
 """
 
+import contextlib
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
-from mstar.model.base import Model, WorkerGraph
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
+from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems
@@ -69,10 +72,15 @@ def validate_deployment(
     problems = list(check_knobs())
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
+    try:
+        parse_autocast_dtype(config.get("autocast_dtype"))
+    except ValueError as e:
+        problems.append(str(e))
     if not isinstance(mps := config.get("mps", False), bool):
         problems.append(f"mps must be true or false, got {mps!r}")
     # model hooks read `resources:` as a mapping; check_resources reports a bad one
-    if resources_shape_problem(config) is None:
+    resources_readable = resources_shape_problem(config) is None
+    if resources_readable:
         try:
             model.validate_config_yaml(config, config_path)
         except ValueError as e:
@@ -106,7 +114,7 @@ def validate_deployment(
     # problems found so far, and only the checks that need the specs are skipped
     specs = None
     try:
-        specs = model.get_node_resources()
+        specs = list(model.get_node_resources() or [])
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
@@ -114,8 +122,34 @@ def validate_deployment(
         )
     except _UNREADABLE as e:
         problems.append(_unreadable("get_node_resources", e))
+    checked_config = config
+    # a `resources:` block check_resources refuses turns no LoRA on
+    if specs is not None and resources_readable and lora_enabled(config):
+        lora = None
+        try:
+            lora = declared_lora_specs(model, config)
+        except (ValueError, OSError) as e:
+            problems.append(f"declaring the LoRA specs failed: {type(e).__name__}: {e}")
+        except _UNREADABLE as e:
+            problems.append(_unreadable("declaring the LoRA specs", e))
+        if lora is None:
+            # reported above, not again as an unknown resource
+            checked_config = {
+                **config, "resources": {k: v for k, v in config["resources"].items() if k != LORA_RESOURCE_KEY},
+            }
+        else:
+            # the override step refuses the same block on the `lora` spec, with the rest
+            with contextlib.suppress(TypeError, ValueError):
+                size_lora_specs(lora, config)
+            specs += lora
     if specs is not None:
-        problems += _checked("checking the node resources", check_resources, model, specs, config)
+        problems += _checked("checking the node resources", check_resources, model, specs, checked_config)
+        # the placement checks see what the workers build of them
+        try:
+            specs = built_resources(specs)
+        except (ValueError, OSError) as e:
+            problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
+            specs = None
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked("checking the client streams", check_client_streams, model, config)
     if deployment is not None:
