@@ -267,6 +267,7 @@ class Cosmos3Model(Model):
                         "field; ignored.", k,
                     )
         cfg.check_streaming_decode()
+        cfg.check_compile()
         return cfg
 
     def _load_tokenizer(self):
@@ -854,10 +855,11 @@ class Cosmos3Model(Model):
             return self._process_reasoner_prompt(
                 prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
             )
+        # The DiT prefill waits on text_inputs, so no prompt means the empty
+        # prompt (as in the reference), not a missing edge. /generate sends an
+        # empty text field as None.
         if prompt is None:
-            p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
-            layout = self._gen_layout(p, [], [], input_modalities, tensors or {})
-            return self._action_prompt_output({}, kwargs, {"kv_layout": {KV_CACHE: layout}})
+            prompt = ""
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             return self._action_prompt_output({
@@ -1840,9 +1842,14 @@ class Cosmos3Model(Model):
                 vae=self._build_encode_vae(device), config=self.config
             )
         if node_name == VAE_DECODER_NODE:
-            return Cosmos3VAEDecoderSubmodule(
-                vae=self._build_vae(device), config=self.config
+            # The fast decode converts its VAE to channels-last in place, so it
+            # takes the decoder-only copy rather than the shared instance.
+            vae = (
+                self._build_decoder_only_vae(device)
+                if self.config.vae_decode_fast
+                else self._build_vae(device)
             )
+            return Cosmos3VAEDecoderSubmodule(vae=vae, config=self.config, fast=self.config.vae_decode_fast)
         if node_name == VAE_DECODER_AR_NODE:
             return Cosmos3VAEDecoderARSubmodule(vae=self._build_streaming_decode_vae(device), config=self.config)
         if node_name == AUDIO_DECODER_NODE:

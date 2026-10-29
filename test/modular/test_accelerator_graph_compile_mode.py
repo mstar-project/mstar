@@ -62,3 +62,39 @@ def test_configs_carry_the_field():
     assert packed.compile_mode == "default"
     assert _piecewise("default").compile_mode == "default"
     assert _piecewise(None).compile_mode is None
+
+
+@pytest.fixture
+def fresh_deterministic_check():
+    from mstar.engine import accelerator_graph_runner
+
+    accelerator_graph_runner._has_deterministic_mode.cache_clear()
+    yield
+    accelerator_graph_runner._has_deterministic_mode.cache_clear()
+
+
+@pytest.mark.parametrize("build", [_batched, _piecewise])
+def test_the_deterministic_mode_is_the_engines_own(build, fresh_deterministic_check):
+    """Not a torch.compile mode: it turns into Inductor's deterministic option."""
+    import torch._inductor.config as inductor_config
+
+    assert build("deterministic").compile_mode == "deterministic"
+    kwargs = compile_kwargs("deterministic")
+    assert kwargs["fullgraph"] is False and kwargs["dynamic"] is False and "mode" not in kwargs
+    if hasattr(inductor_config, "deterministic"):
+        assert kwargs["options"] == {"deterministic": True}
+
+
+def test_a_torch_without_the_deterministic_mode_says_so(monkeypatch, caplog, fresh_deterministic_check):
+    import logging
+
+    import torch._inductor.config as inductor_config
+
+    from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+
+    if hasattr(inductor_config, "deterministic"):
+        monkeypatch.delattr(inductor_config, "deterministic")
+    with caplog.at_level(logging.WARNING, logger="mstar.engine.accelerator_graph_runner"):
+        assert deterministic_inductor_options() == {}
+        assert compile_kwargs("deterministic") == {"fullgraph": False, "dynamic": False}
+    assert caplog.text.count("has no Inductor deterministic mode") == 1
