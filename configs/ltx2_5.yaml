@@ -8,9 +8,10 @@ max_seq_len: 1024
 # encoder + connectors (30 GB) and both decoders on rank 1, so one request's text
 # encoding and decode overlap another's denoising.
 model_kwargs:
-  # flashinfer: every DiT attention through the engine's ragged resources; sdpa: the
-  # reference pipeline's kernel, for parity runs
-  attention_backend: flashinfer
+  # auto: every DiT attention through the engine's ragged resources on the platform's default
+  # kernel (FlashInfer FA3 on an H100, AITER on MI300X/MI325X); sdpa: the reference pipeline's
+  # kernel, for parity runs
+  attention_backend: auto
   max_batch_size: 4
 
 node_groups:

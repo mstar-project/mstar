@@ -19,15 +19,24 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources import RaggedAttentionSpec, RaggedCrossAttentionSpec, Segment
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
-from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import (
+    DIT_ATTN,
+    DIT_XATTN,
+    TEXT_SPAN,
+    VIDEO_SPAN,
+    WAN22_VARIANT_TI2V_5B,
+    Wan22Config,
+)
 from mstar.model.wan22.submodules import (
     _DECODE_TILING_ENV,
     _DECODE_UNTILED_SAFETY_MARGIN,
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
+    Wan22StepInfo,
     Wan22TextEncoderSubmodule,
     Wan22VaeDecoderSubmodule,
     Wan22VaeEncoderSubmodule,
@@ -45,12 +54,14 @@ CONFIG_PATH = str(
 LOOP_BACK_NAMES = {"latents", "time_index", "unipc_model_outputs", "unipc_last_sample"}
 
 
-def _make_model() -> Wan22Model:
+def _make_model(attention_backend: str = "auto") -> Wan22Model:
     """Construct a Wan2.2 model without touching tokenizer or weights."""
     model = object.__new__(Wan22Model)
     model.model_path_hf = "test/wan22"
     model.cache_dir = None
     model.config = Wan22Config()
+    model.attention_backend = attention_backend
+    model.use_ragged_attention = attention_backend != "sdpa"
     model.skip_weight_loading = True  # dummy mode: get_submodule returns None
     model.tokenizer = None
     model._tokenizer_initialized = True  # pin the byte-fallback path
@@ -108,11 +119,24 @@ def test_wan22_declares_expected_nodes():
     assert walk_nodes == {"text_encoder", "vae_encoder", "dit", "vae_decoder"}
 
 
-def test_wan22_declares_no_engine_resources():
-    """Nothing here is cached across steps, so the engine builds nothing."""
+def test_wan22_resources_follow_the_attention_backend():
+    """The dit's attention runs on two ragged resources (self over the video tokens, cross
+    over the text), both sized for the two guidance branches; nothing else is cached
+    across steps, and ``sdpa`` declares nothing."""
+    specs = {s.resource_key: s for s in _make_model().get_node_resources()}
+    assert set(specs) == {DIT_ATTN, DIT_XATTN}
+    assert isinstance(specs[DIT_ATTN], RaggedAttentionSpec)
+    assert isinstance(specs[DIT_XATTN], RaggedCrossAttentionSpec)
+    for spec in specs.values():
+        assert spec.nodes == {"dit"}
+        cfg = spec.config
+        assert (cfg.num_qo_heads, cfg.num_kv_heads, cfg.head_dim) == (24, 24, 128)
+        assert cfg.max_segments_per_request == 2 and cfg.dtype == torch.bfloat16
     model = _make_model()
-    assert model.get_node_resources() == []
     assert model.get_request_resource_configs(partition_fwd_args={}) == {}
+    assert _make_model(attention_backend="sdpa").get_node_resources() == []
+    with pytest.raises(ValueError):
+        Wan22Model(model_path_hf="test/wan22", skip_weight_loading=True, attention_backend="flash")
 
 
 def test_wan22_submodules_route_through_forward_batched():
@@ -506,6 +530,31 @@ def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
     )
     assert node_inputs is not None
     assert int(node_inputs.tensor_inputs["time_index"][0]) == 1
+    # with SDPA the step declares nothing: no resource to plan
+    assert node_inputs.resource_step_info is None
+    assert submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None
+
+
+@pytest.mark.parametrize("guidance_scale,branches", [(5.0, 2), (1.0, 1)])
+def test_wan22_dit_declares_one_segment_per_guidance_branch(guidance_scale, branches):
+    """Each guidance branch of the batch-2 CFG forward is its own segment, under the
+    video label for the self-attention and paired with its text for the cross-attention;
+    the spans come from the latent grid (patch 1x2x2) and the text embeds, host facts."""
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config(), use_ragged_attention=True)
+    info = _fwd_info(requested_steps=2, iter_count=1)
+    info.step_metadata["guidance_scale"] = guidance_scale
+    node_inputs = submodule.prepare_inputs(
+        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=info, inputs=_dit_loop_inputs(k=1),
+    )
+    # latents [1, 4, 2, 2, 2] -> 2 frames x (2 // 2) x (2 // 2) tokens; text embeds [1, 8, 16]
+    assert node_inputs.resource_step_info == Wan22StepInfo(video_tokens=2, text_tokens=8, cfg=branches == 2)
+    step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
+    assert set(step.steps) == {DIT_ATTN, DIT_XATTN}
+    video = tuple(Segment("r0", VIDEO_SPAN, 2) for _ in range(branches))
+    text = tuple(Segment("r0", TEXT_SPAN, 8) for _ in range(branches))
+    assert step.steps[DIT_ATTN].segments == video and step.steps[DIT_ATTN].causal is False
+    assert step.steps[DIT_XATTN].segments == video + text
+    assert step.steps[DIT_XATTN].pairs == ((VIDEO_SPAN, TEXT_SPAN),)
 
 
 @pytest.mark.parametrize("guidance,expect_negative", [

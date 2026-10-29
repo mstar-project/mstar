@@ -10,7 +10,9 @@ A captured step stages its lengths into static buffers per (bucket, slot,
 label), padded to the bucket's segment count with empty segments. The kernel
 grid is sized on the host from ``max_seqlen_q``/``max_seqlen_k``, so those are
 fixed at the bucket's token ceiling and ``run`` reads nothing back from the
-device.
+device. The kernel allocates each call's output itself: under capture that is
+the graph pool's memory, a distinct block per layer, so one layer's result is
+never copied out of the way of the next.
 """
 
 import functools
@@ -63,8 +65,6 @@ class _RaggedPlan(NamedTuple):
     num_segments: int  # real, before padding to a bucket
     num_tokens: int  # real query tokens
     causal: bool
-    # a captured step's output buffer, its tail past num_tokens zeroed
-    out: torch.Tensor | None
 
 
 def _cu(segments: list[Segment]) -> np.ndarray:
@@ -98,7 +98,6 @@ class _AiterRaggedBase:
         self._dtype = dtype
 
         self._cg_images: dict[CGSlotKey, _PlanImage] = {}
-        self._cg_out: dict[CGSlotKey, torch.Tensor] = {}
         self._eager_images: dict[EagerSlotKey, _PlanImage] = {}
 
         self._current_plans: dict[str, _RaggedPlan] = {}
@@ -176,7 +175,6 @@ class _AiterRaggedBase:
                 if image is not None:
                     image.wait()
                 image = self._eager_images[key] = _PlanImage(max(numel, 256), self._device)
-            out = None
         else:
             bucket = lease.bucket
             seg_cap = self._config.max_segments_for(bucket.bs)
@@ -193,14 +191,6 @@ class _AiterRaggedBase:
             image = self._cg_images.get(key)
             if image is None:
                 image = self._cg_images[key] = _PlanImage(2 * _round(seg_cap + 1), self._device)
-                self._cg_out[key] = torch.zeros(
-                    max_tokens, self._config.num_qo_heads, self._config.head_dim,
-                    dtype=self._dtype, device=self._device,
-                )
-            out = self._cg_out[key]
-            # rows past the layout read back zero, like FlashInfer's ragged
-            # wrapper. Zeroed here, outside the graph.
-            out[q_tokens:].zero_()
         k_off = _round(seg_cap + 1)
         image.wait()
         host = image.np
@@ -218,7 +208,6 @@ class _AiterRaggedBase:
             num_segments=n_seg,
             num_tokens=q_tokens,
             causal=causal,
-            out=out,
         )
 
     ### Submodule-level functionality
@@ -249,29 +238,20 @@ class _AiterRaggedBase:
         ``q`` is [total_tokens, Hq, D] in the query layout, ``k`` and ``v`` are
         [total_kv_tokens, Hkv, D] in the key layout (the query layout, for
         self-attention). The output is in the resource's dtype, like
-        FlashInfer's. In a captured step, rows past the planned tokens read
-        back zero.
+        FlashInfer's, and is the kernel's own allocation: a fresh tensor per
+        call, which under capture is a block of the graph pool that a replay
+        writes at the same address. Rows past the planned tokens (a padded
+        bucket's empty segments) are not written and are not a result.
         """
         plan = self._plan(label)
         qk, kk, vk = (t if t.dtype == self._dtype else t.to(self._dtype) for t in (q, k, v))
-        if plan.out is None:
-            out = torch.empty(qk.shape, dtype=self._dtype, device=qk.device)
-        else:
-            n = qk.shape[0]
-            assert n <= plan.out.shape[0], (
-                f"ragged attention: {n} rows exceed the {plan.out.shape[0]} the "
-                "bucket was built for"
-            )
-            out = plan.out[:n]
-        _varlen()(
+        out = _varlen()(
             qk, kk, vk, plan.cu_seqlens_q, plan.cu_seqlens_k,
             plan.max_seqlen_q, plan.max_seqlen_k,
-            softmax_scale=self._config.sm_scale, causal=plan.causal, out=out,
+            softmax_scale=self._config.sm_scale, causal=plan.causal,
         )
-        if plan.out is not None:
-            # every layer shares this buffer, and the next call overwrites it
-            out = out.clone()
-        return out
+        # the kernel returns (out, lse) when asked for the log-sum-exp; plain out otherwise
+        return out[0] if isinstance(out, tuple) else out
 
 
 def _round(n: int) -> int:

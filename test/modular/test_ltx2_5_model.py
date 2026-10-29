@@ -166,6 +166,7 @@ def test_generate_walk_structure(walk, decoders):
 
 
 def test_resources_follow_the_attention_backend():
+    assert _make_model().use_ragged_attention and _make_model(attention_backend="auto").use_ragged_attention
     specs = {s.resource_key: s for s in _make_model(attention_backend="flashinfer").get_node_resources()}
     assert set(specs) == {VIDEO_ATTN, AUDIO_ATTN, VIDEO_XATTN, AUDIO_XATTN}
     assert {k for k, s in specs.items() if isinstance(s, RaggedCrossAttentionSpec)} == {VIDEO_XATTN, AUDIO_XATTN}

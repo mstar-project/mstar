@@ -103,11 +103,17 @@ def test_denoise_walk_structure(walk, edit):
 
 
 def test_resources_follow_the_attention_backend():
-    flashinfer = _make_model(attention_backend="flashinfer").get_node_resources()
-    assert len(flashinfer) == 1 and flashinfer[0].resource_key == DIT_ATTN and flashinfer[0].nodes == {"dit"}
-    cfg = flashinfer[0].config
-    assert cfg.num_qo_heads == 24 and cfg.head_dim == 128 and cfg.max_segments_per_request == 1
-    assert _make_model(attention_backend="sdpa").get_node_resources() == []
+    # auto (the default) and its earlier spelling flashinfer both put the DiT on the ragged resource
+    for backend in ("auto", "flashinfer"):
+        model = _make_model(attention_backend=backend)
+        assert model.use_ragged_attention
+        (spec,) = model.get_node_resources()
+        assert spec.resource_key == DIT_ATTN and spec.nodes == {"dit"}
+        cfg = spec.config
+        assert cfg.num_qo_heads == 24 and cfg.head_dim == 128 and cfg.max_segments_per_request == 1
+    assert _make_model().use_ragged_attention
+    sdpa = _make_model(attention_backend="sdpa")
+    assert not sdpa.use_ragged_attention and sdpa.get_node_resources() == []
     with pytest.raises(ValueError):
         _make_model(attention_backend="flash")
 
