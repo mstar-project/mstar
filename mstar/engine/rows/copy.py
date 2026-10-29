@@ -39,9 +39,28 @@ if triton is not None:
             tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
 
 
-# device -> the kernel compiled for it: launched directly, a launch costs
-# half what the jit's dispatch does, and a step makes one or two
-_COMPILED: dict[torch.device, object] = {}
+# (kernel, device, constexprs, pointer alignments) -> the kernel compiled for
+# them: launched directly, a launch costs a fraction of the jit's dispatch.
+# The alignments are the jit's own specialization (the gather and scatter
+# slots sit 4 bytes into the step header)
+_COMPILED: dict[tuple, object] = {}
+
+
+def _launch(jit, grid: tuple[int, int, int], stream: int | None, args: tuple, **constexprs) -> None:
+    device = args[0].device
+    aligned = tuple(a.data_ptr() % 16 == 0 for a in args if isinstance(a, torch.Tensor))
+    key = (jit, device, aligned, *sorted(constexprs.items()))
+    kernel = _COMPILED.get(key)
+    if kernel is None:
+        kernel = _COMPILED[key] = jit.warmup(*args, **constexprs, grid=(1, 1, 1))
+    if stream is None:
+        stream = torch._C._cuda_getCurrentRawStream(device.index)
+    kernel.run(
+        *grid, stream, kernel.function, kernel.packed_metadata,
+        kernel.launch_metadata(grid, stream, *args),
+        knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
+        *args,
+    )
 
 
 def copy_segments(
@@ -52,20 +71,7 @@ def copy_segments(
     ``block`` (``int64``; ``host_view`` is the same bytes on the host), on
     ``stream`` (a raw handle; the current stream if None)."""
     if block.device.type == "cuda" and triton is not None:
-        kernel = _COMPILED.get(block.device)
-        if kernel is None:
-            kernel = _COMPILED[block.device] = _copy_segments_kernel.warmup(
-                block, 0, CHUNK=_CHUNK, grid=(1, 1),
-            )
-        if stream is None:
-            stream = torch.cuda.current_stream(block.device).cuda_stream
-        grid = (count, -(-longest // _CHUNK), 1)
-        kernel.run(
-            *grid, stream, kernel.function, kernel.packed_metadata,
-            kernel.launch_metadata(grid, stream, block, at // 8),
-            knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
-            block, at // 8,
-        )
+        _launch(_copy_segments_kernel, (count, -(-longest // _CHUNK), 1), stream, (block, at // 8), CHUNK=_CHUNK)
         return
     if block.device.type != "cpu" and triton is not None:
         _copy_segments_kernel[(count, triton.cdiv(longest, _CHUNK))](block, at // 8, CHUNK=_CHUNK)
@@ -122,7 +128,7 @@ def move_rows(table: RowTable, idx: torch.Tensor, n: int, gather: bool) -> None:
         return
     if idx.device.type == "cuda" and triton is not None:
         grid = (len(table), n, -(-table.longest // _CHUNK))
-        _move_rows_kernel[grid](table.table, idx, GATHER=gather, CHUNK=_CHUNK)
+        _launch(_move_rows_kernel, grid, None, (table.table, idx), GATHER=gather, CHUNK=_CHUNK)
         return
     at = idx[:n].long()
     for resident, dense in table.pairs:
