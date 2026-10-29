@@ -233,13 +233,14 @@ class KVPlanOutput:
 
     __slots__ = (
         "cpu_indptrs", "_views", "_view_builder", "decode_pages", "decode_offsets",
-        "rows", "_decode", "columns",
+        "rows", "_decode", "columns", "device_rows",
     )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
         decode_pages=None, decode_offsets=None,
         rows=None, view_builder=None, decode: bool | None = None, columns=None,
+        device_rows=None,
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
@@ -261,6 +262,10 @@ class KVPlanOutput:
         # columns. Unlike ``cpu_indptrs``, which may sit in a pinned ring a
         # later plan rewrites, they stay valid as long as the output does.
         self.columns = columns
+        # a persistent walk's rows (`kv.rows.KVDeviceRows`): its graph builds
+        # the paged arrays from them, and ``cpu_indptrs`` holds only what a
+        # planner reads (qo_indptr, paged_kv_indptr, kv_lens)
+        self.device_rows = device_rows
 
     @property
     def views(self) -> "list[SequenceView]":

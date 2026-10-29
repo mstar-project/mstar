@@ -247,7 +247,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
-       a 503.
+       a 503. It also sizes the resident slots of a node's persistent-row walks (see
+       "Persistent rows" in :doc:`adding_models`), so that requests the scheduler rotates
+       through its steps keep their rows on the device.
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of

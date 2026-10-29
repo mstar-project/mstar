@@ -144,6 +144,7 @@ def test_kv_snapshot_is_none_for_an_unknown_request_and_mirrors_an_empty_stream(
 def test_position_snapshot_matches_publish_and_does_not_track_later_advances():
     pm = RopeManager.__new__(RopeManager)
     pm._counters = {"r0": {"main": 17}}
+    pm._rows = {}
     eager = pm.publish("r0")
     snap = pm.publish_snapshot_for_step("r0", "node", "w")
     pm._counters["r0"]["main"] = 18

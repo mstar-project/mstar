@@ -11,7 +11,7 @@ class _Rows:
         self.calls = calls
         self._released = released
 
-    def commit(self):
+    def commit(self, forward=True):
         self.calls.append("commit")
         return self._released
 
