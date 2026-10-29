@@ -12,7 +12,7 @@ to whichever request gets that handle next. Known handle-keyed state:
 MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog, last_ran,
 arrival, chunk_started, cached_prefix} (purged by clear_rid),
 Worker.{_pending_removes, _pending_loop_stops, streaming_buffers,
-_lockstep_unread}, RequestStateManager.{per_request_info, _fwd_by_partition}
+_lockstep_unread, _hop_keys}, RequestStateManager.{per_request_info, _fwd_by_partition}
 and StreamBufferManager._rids (purged by remove_request), the engine's and
 tensor manager's per-request state (including ChunkingManagement.prepared,
 Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and

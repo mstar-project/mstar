@@ -865,6 +865,7 @@ class PreprocessWorkerThread:
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
     ):
+        profiler.hop_stamp(input.request_id, "dw.start")
         self._start_input(input)
         self._finish_input(input, self._prepare_input(input), profile)
 
@@ -945,6 +946,7 @@ class PreprocessWorkerThread:
         """Store a prepared request's tensors and hand it to the conductor."""
         tensors, input_metadata, model_kwargs = prepared
 
+        profiler.hop_stamp(input.request_id, "dw.tokenized")
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
         # conductor, so a failure here still finds no remote reader; held
@@ -976,6 +978,7 @@ class PreprocessWorkerThread:
             ),
         )
         self.communicator.send("conductor", msg)
+        profiler.hop_stamp(input.request_id, "dw.sent")
 
         # Record preprocess-side profiling: the moment the fully preprocessed
         # request was handed off to the conductor, plus the per-modality sizes of
@@ -1756,6 +1759,8 @@ class PreprocessWorkerThread:
                             request_id,
                             loop_indices,
                         )
+                        if sequence == 0:
+                            profiler.hop_stamp(request_id, "dw.read")
                         if self.enable_nvtx:
                             profiler.range_push(f"dataworker.get_tensor.{modality}")
                         read_time = time.perf_counter() if self.enable_prof else None
