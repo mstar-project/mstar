@@ -327,5 +327,6 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::tensors::TensorInfoOut>()?;
     m.add_function(wrap_pyfunction!(crate::kv_plan::kv_plan_columns, m)?)?;
     m.add_function(wrap_pyfunction!(crate::kv_plan::kv_packed_addressing, m)?)?;
+    m.add_class::<crate::rows::PyRowStage>()?;
     Ok(())
 }
