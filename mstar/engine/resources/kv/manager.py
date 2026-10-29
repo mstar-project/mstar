@@ -591,6 +591,17 @@ class KVManager(AttentionResource):
             PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
         )
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
+        # A read-only step (every segment span 0: a decoder attending the
+        # encoder context it wrote at prefill) plans the same as the last one
+        # on its slot while its segments are the same and no stream of its
+        # rows moved: slot -> (key, plan). The key holds `_readonly_epoch`,
+        # which moves when a stream of a row in `_readonly_rows` changes.
+        self._readonly_plans: dict[int, tuple] = {}
+        self._readonly_rows: set = set()
+        self._readonly_epoch = 0
+        self.readonly_stats = {"hit": 0, "miss": 0}
+        # what a label no segment writes is planned to; read, never staged
+        self._empty_state: KVPlanState | None = None
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
 
@@ -2048,6 +2059,12 @@ class KVManager(AttentionResource):
             total_tokens=total_tokens
         )
 
+    def _empty_plan_state(self) -> KVPlanState:
+        if self._empty_state is None:
+            empty = torch.empty(0, dtype=torch.long, device=self._device)
+            self._empty_state = KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
+        return self._empty_state
+
     def _decode_plan_state(self, views: list[SequenceView]) -> KVPlanState:
         """Write addressing for a step appending one token per request.
 
@@ -2119,13 +2136,23 @@ class KVManager(AttentionResource):
                 else:
                     self._current_plan_states[label] = plan_state
                 continue
+            total_tokens = None if indptrs.is_decode else indptrs.get_total_len()
+            if total_tokens == 0:
+                # every segment span 0: nothing is written, so there is no
+                # addressing to upload, unpack or stage, and a captured graph
+                # of the step baked in a write of none
+                if ctx.is_preplan:
+                    self._preplan_states[label] = self._empty_plan_state()
+                else:
+                    self._current_plan_states[label] = self._empty_plan_state()
+                continue
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
             else:
                 indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
                 plan_state = self._compute_plan_state(
                     indptrs.cuda_indptrs,
-                    total_tokens=indptrs.get_total_len()
+                    total_tokens=total_tokens,
                 )
             if lease is not None:
                 static_state = self._static_plan_state(lease.slot, label)
@@ -2156,11 +2183,69 @@ class KVManager(AttentionResource):
 
     def _touch_plan_cache(self, rid: str | None = None) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
-        commit: the plan cache no longer describes the streams if it holds
-        that request."""
+        commit: the plan caches no longer describe the streams if they hold
+        that request. A padding row's reset after a replay holds nothing."""
+        if rid is None or rid in self._readonly_rows:
+            self._drop_readonly_plans()
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
+
+    def _drop_readonly_plans(self) -> None:
+        self._readonly_epoch += 1
+        # rebound, not cleared: a plan thread recording rows for the entry
+        # this epoch makes stale may still hold the old set
+        self._readonly_rows = set()
+
+    @staticmethod
+    def _is_readonly(step: KVStep, ctx: StepContext) -> bool:
+        # a capture's rows and sink labels change the views without changing
+        # the segments the key holds; the steps that repeat have neither
+        return (
+            not ctx.capture and bool(step.segments) and not step.pre_forks
+            and not step.post_forks and not step.sink
+            and all(seg.span == 0 for seg in step.segments)
+        )
+
+    def _plan_readonly(self, step: KVStep, ctx: StepContext) -> "KVPlanOutputs":
+        """A read-only step's plan: the views and host indptrs its slot's last
+        read-only step built, when that step had the same segments and no
+        stream of its rows has moved since, else built afresh. Nothing is
+        written, so no label has addressing to stage."""
+        lease = ctx.slot_lease
+        key = (
+            step.segments, None if lease is None else lease.bucket,
+            self._plan_epoch, self._readonly_epoch,
+        )
+        cached = self._readonly_plans.get(ctx.slot)
+        if cached is not None and cached[0] == key:
+            res = cached[1]
+            self.readonly_stats["hit"] += 1
+        else:
+            self.readonly_stats["miss"] += 1
+            # the rows before the views: a stream that moves from here on
+            # moves the epoch the key was taken at
+            self._readonly_rows.update(
+                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
+            )
+            res = KVPlanOutputs()
+            for label, segments in group_by_plan_label(step.segments, step.combined_labels).items():
+                views = self._sequence_views(segments, None, ctx, step.sink)
+                # off the pinned ring: the plan outlives the ring's turn
+                res[label] = KVPlanOutput(
+                    cpu_indptrs=build_paged_indptrs(views, self.kv_cache.page_size), views=views,
+                )
+            self._readonly_plans[ctx.slot] = (key, res)
+        states = self._preplan_states if ctx.is_preplan else self._current_plan_states
+        for label in res:
+            states[label] = self._empty_plan_state()
+        if ctx.is_preplan:
+            self._preplan_key = self._plan_key(step, ctx)
+            self._preplanned = True
+            self._cached_plan_output = res
+        else:
+            self._copy_image_ends()
+        return res
 
     def _split_padding(self, step: KVStep, ctx: StepContext):
         """``(n_real, (n_pad, span))`` of a step whose real segments come
@@ -2482,6 +2567,11 @@ class KVManager(AttentionResource):
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
 
+        if self._is_readonly(step, ctx):
+            res = self._plan_readonly(step, ctx)
+            laps.lap("readonly")
+            return res
+
         # Forks run ahead of the views, which record length and generation;
         # staging only reads what the fork will land.
         if ctx.is_preplan:
@@ -2617,6 +2707,7 @@ class KVManager(AttentionResource):
                 self._plan_epoch += 1
         if not step.commit:
             self._plan_epoch += 1
+        readonly_rows = self._readonly_rows
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
@@ -2647,6 +2738,9 @@ class KVManager(AttentionResource):
                         self._plan_epoch += 1
                         continue
                     stream.stored_len += segment.span
+                    if readonly_rows and segment.request_id in readonly_rows:
+                        self._drop_readonly_plans()
+                        readonly_rows = None
                     if stream.converted and self._world_size > 1 and stream.chain is not None:
                         # Above one rank a hit is stamped at commit, which every rank runs in step order,
                         # so every rank evicts the same pages.

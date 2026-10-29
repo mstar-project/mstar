@@ -158,25 +158,50 @@ class FlashInferPrefillWrapper:
             # FlashInfer's `get_seq_lens`, here so it is staged with the rest
             kv_lens = (kv_indptr[1:] - kv_indptr[:-1] - 1).clamp_min(0) * self.page_size \
                 + last_page_len
-        out = []
-        for name, t in (
-            ("qo", qo_indptr), ("kv", kv_indptr), ("last", last_page_len),
-            ("lens", kv_lens), ("indices", indices),
-        ):
-            n = t.shape[0]
-            buf = self._pinned.get(name)
-            if buf is None or buf.shape[0] < n:
-                buf = self._pinned[name] = torch.empty(
-                    max(n, 2 * (buf.shape[0] if buf is not None else 0), 256),
-                    dtype=torch.int32, pin_memory=True,
-                )
-            view = buf[:n]
-            view.copy_(t)
-            out.append(view)
-        qo, kv, last, lens, idx = out
+        qo, kv, last, lens, idx = (
+            self._pin(name, t) for name, t in (
+                ("qo", qo_indptr), ("kv", kv_indptr), ("last", last_page_len),
+                ("lens", kv_lens), ("indices", indices),
+            )
+        )
         # keep the fast row iteration FlashInfer's `max(seq_lens)` relies on
         from mstar.engine.resources.kv.plan import HostLens
         return qo, kv, last, lens.as_subclass(HostLens), idx.shape[0]
+
+    def _pin(self, name: str, t: torch.Tensor) -> torch.Tensor:
+        """``t`` in this wrapper's page-locked buffer ``name``."""
+        n = t.shape[0]
+        buf = self._pinned.get(name)
+        if buf is None or buf.shape[0] < n:
+            buf = self._pinned[name] = torch.empty(
+                max(n, 2 * (buf.shape[0] if buf is not None else 0), 256),
+                dtype=torch.int32, pin_memory=True,
+            )
+        view = buf[:n]
+        view.copy_(t)
+        return view
+
+    @property
+    def replans_from_indices(self) -> bool:
+        """Whether a plan whose indptrs and lengths are the last plan's can
+        take only its page indices (`set_indices`): in graph mode FlashInfer's
+        fa2/fa3 schedule is built from the indptrs and lengths alone, and the
+        indices are only copied into the buffer the kernel reads. Other
+        backends derive state from the indices themselves (trtllm-gen's block
+        tables)."""
+        return self.accelerator_graph and getattr(self.attn_wrapper, "_backend", None) in ("fa2", "fa3")
+
+    @torch.compiler.disable
+    def set_indices(self, paged_kv_indices: torch.Tensor) -> None:
+        """The last plan over other pages; see `replans_from_indices`."""
+        assert self.replans_from_indices
+        if self._pinned_done is None:
+            self._pinned_done = torch.cuda.Event()
+        else:
+            self._pinned_done.synchronize()
+        n = paged_kv_indices.shape[0]
+        self._paged_kv_indices_buf[:n].copy_(self._pin("indices", paged_kv_indices), non_blocking=True)
+        self._pinned_done.record()
 
     @torch.compiler.disable
     def plan(

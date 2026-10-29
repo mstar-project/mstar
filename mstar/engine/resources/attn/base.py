@@ -191,6 +191,14 @@ class PlanCacheKey(NamedTuple):
     q_seq_lens: tuple
     page_indices: tuple
     last_page_lens: tuple
+    kv_indptr: tuple = ()
+
+    def same_shape(self, other: "PlanCacheKey") -> bool:
+        """Every row the same query and KV length, on whatever pages."""
+        return (
+            self.q_seq_lens == other.q_seq_lens and self.kv_indptr == other.kv_indptr
+            and self.last_page_lens == other.last_page_lens
+        )
 
 
 class EagerSlotKey(NamedTuple):
