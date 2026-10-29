@@ -28,7 +28,7 @@ from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
-from mstar.model.components.dft import stft_as_real, stft_basis
+from mstar.model.components.dft import stft_as_real
 from mstar.utils.h2d import to_device_nonblocking
 
 
@@ -224,8 +224,6 @@ class NemoLogMel:
             window = torch.hann_window(win_length, periodic=False)
         self.mel_filters = mel_filters.reshape(num_mel_bins, n_fft // 2 + 1).to(device=device, dtype=torch.float32)
         self.window = window.to(device=device, dtype=torch.float32)
-        # ``windows``' STFT as a matmul, built here: before any capture, on the device
-        self._stft_basis = stft_basis(self.window, n_fft)
 
     @staticmethod
     def frames(num_samples: int, hop_length: int, reflect_edges: bool) -> int:
@@ -325,14 +323,14 @@ class NemoLogMel:
             mel = (mel - mean) / (std + 1e-5)
         return [mel[row, :, :f].T for row, f in enumerate(frames)]
 
-    def windows(self, x: torch.Tensor, by_matmul: bool = False) -> torch.Tensor:
+    def windows(self, x: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
         """``(B, samples)`` preemphasized samples -> ``(B, T, n_mels)`` log-mel
         frames, one per ``n_fft`` window at each hop, with no padding (a
-        stream's front end cuts the windows itself). ``by_matmul`` takes the
-        STFT as a matmul, for a captured graph, which must not hold a cuFFT
-        plan (see ``dft``)."""
-        if by_matmul:
-            spec = stft_as_real(x, self._stft_basis, self.n_fft, self.hop_length)
+        stream's front end cuts the windows itself). ``basis``
+        (``stft_basis(self.window, n_fft)``) takes the STFT as a matmul, for a
+        captured graph, which must not hold a cuFFT plan (see ``dft``)."""
+        if basis is not None:
+            spec = stft_as_real(x, basis, self.n_fft, self.hop_length)
         else:
             spec = torch.view_as_real(torch.stft(
                 x, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
