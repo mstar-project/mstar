@@ -459,6 +459,19 @@ def run(args) -> dict[str, Any]:
             timings[name] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
         result["timing"] = timings
         _stage(args, result, f"timing {name}")
+    # the sampler's share of the per-op frame: its kernels for the 15 groups on fixed logits
+    fixed_logits = torch.randn(OMNI.positions - 1, bs, OMNI.vocab, device=device).to(torch.bfloat16)
+
+    def samplers_only():
+        for g in range(OMNI.positions - 1):
+            perop.sampler(state, fixed_logits[g])
+
+    try:
+        t = time_graph(samplers_only, args.replays)
+        t.pop("graph")
+        timings["per_op_samplers_only"] = t
+    except Exception as exc:  # noqa: BLE001  recorded
+        timings["per_op_samplers_only"] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
     try:
         loop = ModelLoop(w, codebook, bs, device, state)
         t = time_graph(lambda: loop.frame(last_hidden, embed0, emb_sum_t, codes_t), args.replays)
@@ -509,6 +522,10 @@ def run(args) -> dict[str, Any]:
         _stage(args, result, f"timing {name}")
     result["timing"] = timings
     base = timings.get("per_op_sampled", {}).get("ms")
+    if base is None and "ms" in timings.get("per_op_forced", {}) and "ms" in timings.get("per_op_samplers_only", {}):
+        # the sampled frame did not capture: the forced frame plus the samplers stands in for it
+        base = timings["per_op_forced"]["ms"] + timings["per_op_samplers_only"]["ms"]
+        result["per_op_base_note"] = "per_op_forced + per_op_samplers_only"
     if base:
         result["ratio_to_per_op"] = {k2: v["ms"] / base for k2, v in timings.items() if "ms" in v}
     return result
