@@ -1844,7 +1844,9 @@ module docstring. What a model declares and calls:
   ``AttentionStep(row_queries=k + 1)``; no sampler or position step. The forward calls
   ``verify_inputs()`` (tokens and positions), runs the target, ``accept(logits)``,
   then for each draft pass ``begin_draft_pass(j)``, the draft head, and
-  ``record_draft(j, tokens)``. Pass ``j`` sits at the verify positions plus ``j``.
+  ``record_draft(j, tokens)``. Pass ``j`` sits at the verify positions plus ``j``, and
+  only each row's last accepted slot (``draft_slots()``) is a real query, so the head's
+  work after attention, and its vocabulary projection, run on that row alone.
 - **The prompt's last step.** It declares ``SpecDecodeStep(phase=SEED)`` (budgets
   and ``ignore_eos`` rows) and ``KVStep.commit_adjust`` of ``seed_lookahead`` tokens,
   runs the draft head over the prompt, and calls ``seed(first_token, first_draft)``.
