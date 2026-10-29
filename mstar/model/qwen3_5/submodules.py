@@ -632,10 +632,11 @@ class LLMSubmodule(ARNodeSubmodule):
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         hit_eos = not ignore_eos and token in self.config.stop_token_ids
         if request_info.graph_walk != "decode":
-            # the last prefill's token comes before decode_loop exists
-            return {END_PARTITION} if hit_eos else set()
+            # the last prefill's token, the first of max_tokens, comes before
+            # decode_loop exists
+            return {END_PARTITION} if hit_eos or request_info.max_tokens <= 1 else set()
         out_of_budget = (
-            request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
+            request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
             >= request_info.max_tokens
         )
         return {"decode_loop"} if hit_eos or out_of_budget else set()
@@ -668,10 +669,9 @@ class LLMSubmodule(ARNodeSubmodule):
             # a prefill or mixed step reads each row's walk; a decode step need not
             if step_walk != "decode" and info.graph_walk != "decode":
                 # as check_stop: only the last prefill's token is the request's
-                if (
-                    value in stop_ids
-                    and self._token_is_real(info)
-                    and not info.resource_configs[SAMPLER].ignore_eos
+                if self._token_is_real(info) and (
+                    info.max_tokens <= 1
+                    or (value in stop_ids and not info.resource_configs[SAMPLER].ignore_eos)
                 ):
                     stops[rid] = {END_PARTITION}
                 continue
@@ -681,7 +681,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 value in stop_ids
                 and not info.resource_configs[SAMPLER].ignore_eos
             ) or (
-                info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
+                info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
                 >= info.max_tokens
             ):
                 stops[rid] = {"decode_loop"}

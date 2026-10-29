@@ -454,7 +454,7 @@ def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
     ), "the cap and the stop check end decode on different iterations"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
 def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     from mstar.model.qwen3_5.submodules import LLMSubmodule

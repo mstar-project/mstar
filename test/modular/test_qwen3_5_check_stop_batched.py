@@ -79,6 +79,27 @@ def test_a_last_prefill_stop_token_ends_the_partition(step_walk):
         assert per_request == got.get(rid, set())
 
 
+@pytest.mark.parametrize("step_walk", [None, "prefill_text"], ids=["mixed", "prefill"])
+def test_the_budget_counts_the_last_prefills_token(step_walk):
+    """max_output_tokens=N gives N tokens, the first of them the last prefill's."""
+    infos = {
+        "one": _info(walk="prefill_text", last_prefill=True, max_tokens=1),
+        "early": _info(walk="prefill_text", max_tokens=1),  # not the request's token
+        "two": _info(walk="prefill_text", last_prefill=True, max_tokens=2),
+    }
+    if step_walk is None:
+        infos["tenth"] = _info(done=8, max_tokens=10)  # the prefill's and 9 decoded
+        infos["ninth"] = _info(done=7, max_tokens=10)
+    tokens = torch.full((len(infos),), 3)
+    got = LLMSubmodule.check_stop_batched(
+        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}), step_walk=step_walk,
+    )
+    assert got == {"one": {END_PARTITION}, **({"tenth": {"decode_loop"}} if step_walk is None else {})}
+    for rid, info in infos.items():
+        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[:1]]})
+        assert per_request == got.get(rid, set())
+
+
 def test_no_token_row_means_per_request_path():
     got = LLMSubmodule.check_stop_batched(
         _sub(), ["a"], {"a": _info()}, HostRows(("a",), {"other": torch.zeros(1)}),
