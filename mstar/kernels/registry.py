@@ -38,8 +38,9 @@ logger = logging.getLogger(__name__)
 
 NAMESPACE = "mstar"
 # One fragment for every op declared here. Ops are defined through `Library`
-# rather than `torch.library.custom_op`, whose Python wrapper cost about 45 us
-# per eager call on an MI300X host against about 14 for this path.
+# rather than `torch.library.custom_op`, whose Python wrapper costs more per
+# eager call: 24 us against 16 for this path on an MI300X host, where calling
+# the kernel directly takes 12.
 _LIB = torch.library.Library(NAMESPACE, "FRAGMENT")
 
 # Modules that declare ops, imported by `load_all` so a listing sees them all.
