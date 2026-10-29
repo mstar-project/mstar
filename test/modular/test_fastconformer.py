@@ -914,6 +914,19 @@ def test_encoder_offers_nothing_to_the_stop_check():
     assert len(out.per_rid_outputs[1]["audio_frame"]) > 0
 
 
+def test_encoder_steps_do_not_reproject_the_relative_positions():
+    """The distances a stream's frame sees are fixed, so each layer projects
+    them once, at bind, not every step."""
+    enc = _Encoder()
+    calls = []
+    for layer in enc.node.encoder.layers:
+        layer.self_attn.relative_k_proj.register_forward_hook(lambda *a: calls.append(1))
+    wav = torch.randn(16000) * 0.1
+    for at in range(0, wav.numel(), 1280):
+        enc.encode(1, wav[at:at + 1280])
+    assert not calls
+
+
 def test_encoder_waits_for_enough_audio_to_featurize():
     enc = _Encoder()
     assert enc.encode(1, torch.zeros(10)) == []

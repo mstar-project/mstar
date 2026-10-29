@@ -244,14 +244,17 @@ class RelPositionAttention(nn.Module):
     """``softmax(((q + u) k^T + skew((q + v) R^T)) / sqrt(d))`` with ``R``
     the projected position sinusoids; the second term enters SDPA as a bias.
     A stream step attends its new frames in the bounded KV ``kv_key`` names
-    instead, which keeps each stream's window of keys and values."""
+    instead, which keeps each stream's window of keys and values, with the
+    distances it can see projected once, at bind (``band``)."""
 
     def __init__(self, config: FastConformerConfig, layer_idx: int = 0, kv_key: str | None = None):
         super().__init__()
         h, d = config.num_heads, config.head_dim
         self.num_heads, self.head_dim = h, d
         self.layer_idx, self._kv_key = layer_idx, kv_key
+        self.left_context = config.left_context
         self.kv = None
+        self.band = None
         self.qkv_proj = nn.Linear(config.hidden_size, 3 * h * d, bias=config.attention_bias)
         self.o_proj = nn.Linear(h * d, config.hidden_size, bias=config.attention_bias)
         self.relative_k_proj = nn.Linear(config.hidden_size, h * d, bias=False)
@@ -261,21 +264,27 @@ class RelPositionAttention(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         if self._kv_key is not None:
             self.kv = resources[self._kv_key]
+            # distances 0..left_context, all a stream's frame sees (row d is
+            # distance d), projected in the weights' dtype, which is what autocast
+            # computes it in: fixed weights, so once, here, before any capture
+            w = self.relative_k_proj.weight
+            n = self.left_context + 1
+            with torch.no_grad():
+                band = rel_positional_encoding(n, w.shape[1], w.device, w.dtype)[:n].flip(0)
+                self.band = self.relative_k_proj(band).view(n, self.num_heads, self.head_dim).transpose(0, 1)
 
     def forward(
-        self, x: torch.Tensor, pos_emb: torch.Tensor | None, mask: torch.Tensor | None,
-        band: torch.Tensor | None = None,
+        self, x: torch.Tensor, pos_emb: torch.Tensor | None, mask: torch.Tensor | None, stream: bool = False,
     ) -> torch.Tensor:
         """``x`` is ``(B, T, hidden)``, ``pos_emb`` ``(P, hidden)`` with
         ``P >= 2T-1`` (rows past ``2T-1`` are zero padding) and ``mask``
-        ``(B, 1, T, T)`` with True where a query may attend. A stream step
-        passes ``band`` instead, the sinusoids of distances ``0..left_context``,
-        row d distance d."""
+        ``(B, 1, T, T)`` with True where a query may attend; or ``stream``, a
+        stream step, which takes neither."""
         b, t, _ = x.shape
         h, d = self.num_heads, self.head_dim
         q, k, v = self.qkv_proj(x).view(b, t, 3, h, d).unbind(2)  # (B, T, H, D) each
-        if band is not None:
-            return self._attend_stream(q, k, v, band)
+        if stream:
+            return self._attend_stream(q, k, v)
         r = self.relative_k_proj(pos_emb).view(-1, h, d).permute(1, 2, 0)  # (H, D, P)
         # one GEMM per head over all B*T queries: no copy of r per row
         bd = torch.bmm((q + self.bias_v).reshape(b * t, h, d).transpose(0, 1), r)  # (H, B*T, P)
@@ -291,13 +300,13 @@ class RelPositionAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         return self.o_proj(out.transpose(1, 2).reshape(b, t, h * d))
 
-    def _attend_stream(self, q, k, v, band) -> torch.Tensor:
+    def _attend_stream(self, q, k, v) -> torch.Tensor:
         """Each new frame attends the ``left_context`` frames before it and
         itself, the older ones from the KV, which then keeps this step's. The
         position term depends on the distance alone, so it goes in as the band
         of distances, unscaled: the kernel scales the sum."""
         b, t, h, d = q.shape
-        r = self.relative_k_proj(band).view(-1, h, d).transpose(0, 1)  # (H, left + 1, D)
+        r = self.band  # (H, left + 1, D)
         # in k's dtype: under autocast the bias add promotes q, and the kernel takes one dtype
         q_u = (q + self.bias_u).to(k.dtype).transpose(1, 2)
         bias = torch.matmul((q + self.bias_v).transpose(1, 2), r.transpose(-2, -1))  # (B, H, T, left + 1)
@@ -392,19 +401,20 @@ class FastConformerBlock(nn.Module):
 
     def forward(
         self, x: torch.Tensor, pos_emb: torch.Tensor | None, mask: torch.Tensor | None, valid: torch.Tensor | None,
-        tails: torch.Tensor | None = None, band: torch.Tensor | None = None,
+        tails: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Offline: ``pos_emb``, ``mask`` and ``valid``. A stream step:
-        ``tails`` for the conv and ``band`` for the attention (see theirs)."""
+        """Offline: ``pos_emb``, ``mask`` and ``valid``. A stream step: ``tails``
+        for the conv (see its), which also streams the attention."""
+        stream = tails is not None
         if use_triton(x):
             # each residual add runs in the kernel of the norm that reads it
             x, h = add_layer_norm(x, self.feed_forward1(self.norm_feed_forward1(x)), 0.5, self.norm_self_att)
-            x, h = add_layer_norm(x, self.self_attn(h, pos_emb, mask, band), 1.0, self.norm_conv)
+            x, h = add_layer_norm(x, self.self_attn(h, pos_emb, mask, stream), 1.0, self.norm_conv)
             x, h = add_layer_norm(x, self.conv(h, valid, tails), 1.0, self.norm_feed_forward2)
             return add_layer_norm(x, self.feed_forward2(h), 0.5, self.norm_out, keep_sum=False)[1]
         # alpha folds the half step into the add (0.5 * y is exact either way)
         x = torch.add(x, self.feed_forward1(self.norm_feed_forward1(x)), alpha=0.5)
-        x = x + self.self_attn(self.norm_self_att(x), pos_emb, mask, band)
+        x = x + self.self_attn(self.norm_self_att(x), pos_emb, mask, stream)
         x = x + self.conv(self.norm_conv(x), valid, tails)
         x = torch.add(x, self.feed_forward2(self.norm_feed_forward2(x)), alpha=0.5)
         return self.norm_out(x)
@@ -507,15 +517,12 @@ class FastConformerEncoder(nn.Module):
 
     def _stream_blocks(self, x: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
         b, c = x.shape[0], self.config
-        left = c.left_context
-        # distances 0..left, all a frame sees: row d is distance d
-        band = rel_positional_encoding(left + 1, c.hidden_size, x.device, x.dtype)[: left + 1].flip(0)
         keep = c.conv_kernel_size - 1
         # each stream keeps its newest k - 1 conv inputs: new .. new + k - 1 of cached ++ this step's
         tails = (new.view(b, 1, 1) + torch.arange(keep, device=x.device).view(1, 1, keep)).expand(
             b, c.hidden_size, keep)
         for layer in self.layers:
-            x = layer(x, None, None, None, tails, band)
+            x = layer(x, None, None, None, tails=tails)
         return x
 
     # ------------------------------------------------------------------
