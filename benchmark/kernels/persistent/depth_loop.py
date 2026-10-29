@@ -352,44 +352,64 @@ def run(args) -> dict[str, Any]:
     ds.extension().load()
     result["kernel_build_s"] = time.time() - t1
 
+    def guarded(name, fn):
+        """A stage's result, or its error, so one broken stage leaves the others standing."""
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001  recorded
+            import traceback
+
+            traceback.print_exc()
+            return {"error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+        finally:
+            _stage(args, result, name)
+
     # 1. phase-by-phase agreement with the mirror (one configuration per sync scope)
-    checks = {}
-    for groups, scope in ((8, ds.SCOPE_XCD), (4, ds.SCOPE_AGENT)):
-        k = Kernel(program, w, codebook, bs, groups, scope, ds.default_grid(cus, groups), device, top_k, top_p,
-                   temperature)
-        checks[f"g{groups}_{'xcd' if scope else 'agent'}"] = phase_checks(k, program, w, codebook, last_hidden,
-                                                                          embed0, forced)
-    result["phase_checks"] = checks
-    _stage(args, result, "phase checks")
+    def stage_checks():
+        checks = {}
+        for groups, scope in ((8, ds.SCOPE_XCD), (4, ds.SCOPE_AGENT)):
+            kc = Kernel(program, w, codebook, bs, groups, scope, ds.default_grid(cus, groups), device, top_k, top_p,
+                        temperature)
+            checks[f"g{groups}_{'xcd' if scope else 'agent'}"] = phase_checks(kc, program, w, codebook, last_hidden,
+                                                                              embed0, forced)
+        return checks
+
+    result["phase_checks"] = guarded("phase checks", stage_checks)
 
     # 2. parity, teacher-forced, against float64
     ref = sp.interpret(program, w, codebook, last_hidden, embed0, forced, kernel_rounding=False)
-    parity = {}
     k = Kernel(program, w, codebook, bs, 8, ds.SCOPE_XCD, ds.default_grid(cus, 8), device, top_k, top_p, temperature)
-    emb_sum = embed0.float().clone()
-    codes = forced.clone()
-    k.zero_state()
-    k.run(last_hidden, embed0, emb_sum, codes, forced=forced)
-    torch.cuda.synchronize()
-    parity["kernel"] = group_errors(k.scratch.logits, ref["logits"])
-    parity["kernel"]["emb_sum_rel"] = rel(emb_sum, ref["emb_sum"])
-    parity["kernel"]["ctl"] = k.ctl()
     state = perop.PerOpState.allocate(OMNI, bs, device, top_k, top_p, temperature, seed=0)
-    emb_sum_p = embed0.float().clone()
-    codes_p = forced.clone()
     rope = sp.rope_table(OMNI, device)
-    perop.depth_frame(w, OMNI, rope, state, last_hidden, embed0, codebook, emb_sum_p, codes_p, forced=forced)
-    torch.cuda.synchronize()
-    parity["per_op"] = group_errors(state.logits, ref["logits"])
-    parity["per_op"]["emb_sum_rel"] = rel(emb_sum_p, ref["emb_sum"])
-    parity["kernel_vs_per_op_rel_sum"] = sum(rel(k.scratch.logits[g], state.logits[g]) for g in range(15))
+
+    def stage_kernel_parity():
+        emb_sum = embed0.float().clone()
+        codes = forced.clone()
+        k.zero_state()
+        k.run(last_hidden, embed0, emb_sum, codes, forced=forced)
+        torch.cuda.synchronize()
+        out = group_errors(k.scratch.logits, ref["logits"])
+        out["emb_sum_rel"] = rel(emb_sum, ref["emb_sum"])
+        out["ctl"] = k.ctl()
+        return out
+
+    def stage_per_op_parity():
+        emb_sum_p = embed0.float().clone()
+        codes_p = forced.clone()
+        perop.depth_frame(w, OMNI, rope, state, last_hidden, embed0, codebook, emb_sum_p, codes_p, forced=forced)
+        torch.cuda.synchronize()
+        out = group_errors(state.logits, ref["logits"])
+        out["emb_sum_rel"] = rel(emb_sum_p, ref["emb_sum"])
+        out["kernel_vs_per_op_rel_sum"] = sum(rel(k.scratch.logits[g], state.logits[g]) for g in range(15))
+        return out
+
+    parity = {"kernel": guarded("kernel parity", stage_kernel_parity)}
+    parity["per_op"] = guarded("per-op parity", stage_per_op_parity)
     result["parity"] = parity
-    _stage(args, result, "parity")
 
     # 3. sampler distribution
-    result["sampler"] = sampler_check(k, program, w, codebook, talker_codec, device, args.draws, top_k, top_p,
-                                      temperature)
-    _stage(args, result, "sampler")
+    result["sampler"] = guarded("sampler", lambda: sampler_check(k, program, w, codebook, talker_codec, device,
+                                                                 args.draws, top_k, top_p, temperature))
 
     # 4. captured time per frame
     timings = {}
@@ -531,15 +551,27 @@ def table(r: dict[str, Any]) -> str:
     lines += ["", "## parity, teacher-forced, logits vs float64 (sum over the 15 groups of the relative L2 error)", "",
               "| path | rel sum | worst row rel | argmax agreement |", "|---|---|---|---|"]
     for name in ("kernel", "per_op"):
-        lines.append(f"| {name} | {p[name]['rel_sum']:.4f} | {p[name]['worst_row_rel']:.4f} | "
-                     f"{p[name]['argmax_agreement']:.4f} |")
-    lines.append(f"\nkernel vs per-op, rel sum {p['kernel_vs_per_op_rel_sum']:.4f}")
+        e = p[name]
+        if "error" in e:
+            lines.append(f"| {name} | {e['error']} | | |")
+            continue
+        lines.append(f"| {name} | {e['rel_sum']:.4f} | {e['worst_row_rel']:.4f} | {e['argmax_agreement']:.4f} |")
+    if "kernel_vs_per_op_rel_sum" in p["per_op"]:
+        lines.append(f"\nkernel vs per-op, rel sum {p['per_op']['kernel_vs_per_op_rel_sum']:.4f}")
     s = r["sampler"]
-    lines += ["", f"## sampler: {s['draws']} draws over a support of {s['support']}: TV kernel {s['tv_kernel']:.4f}, "
-              f"SamplerResource {s['tv_sampler_resource']:.4f}, noise ~{s['expected_tv_noise']:.4f}, kernel mass "
-              f"outside the support {s['kernel_mass_outside_support']:.2e}", "",
-              "## phase checks (rel error vs mirror)"]
-    for cfg, rows in r["phase_checks"].items():
+    if "error" in s:
+        lines += ["", f"## sampler: {s['error']}"]
+    else:
+        lines += ["", f"## sampler: {s['draws']} draws over a support of {s['support']}: TV kernel "
+                  f"{s['tv_kernel']:.4f}, SamplerResource {s['tv_sampler_resource']:.4f}, noise "
+                  f"~{s['expected_tv_noise']:.4f}, kernel mass outside the support "
+                  f"{s['kernel_mass_outside_support']:.2e}"]
+    lines += ["", "## phase checks (rel error vs mirror)"]
+    checks = r["phase_checks"]
+    if "error" in checks:
+        lines.append(checks["error"])
+        checks = {}
+    for cfg, rows in checks.items():
         lines.append(f"\n{cfg}")
         for e in rows:
             vals = " ".join(f"{k}={e[k]:.1e}" if e[k] is not None else f"{k}=-" for k in
