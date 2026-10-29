@@ -583,6 +583,7 @@ class PreprocessWorkerThread:
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
     ):
+        profiler.hop_stamp(input.request_id, "dw.start")
         tensors: NameToTensorList = {}
         input_metadata = {}
         file_states: dict[str, list[tuple[int, int, int]]] = {}
@@ -675,6 +676,7 @@ class PreprocessWorkerThread:
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
 
+        profiler.hop_stamp(input.request_id, "dw.tokenized")
         initial_signals = self.tensor_manager.store_and_return_tensor_info(
             request_id=input.request_id,
             tensors=tensors # dict(modality_input: list[tensors])
@@ -707,6 +709,7 @@ class PreprocessWorkerThread:
             ),
         )
         self.communicator.send("conductor", msg)
+        profiler.hop_stamp(input.request_id, "dw.sent")
 
         # Record preprocess-side profiling: the moment the fully preprocessed
         # request was handed off to the conductor, plus the per-modality sizes of
@@ -1083,6 +1086,8 @@ class PreprocessWorkerThread:
                             request_id,
                             loop_indices,
                         )
+                        if sequence == 0:
+                            profiler.hop_stamp(request_id, "dw.read")
                         if self.enable_nvtx:
                             profiler.range_push(f"dataworker.get_tensor.{modality}")
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)

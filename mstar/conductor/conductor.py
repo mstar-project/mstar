@@ -61,7 +61,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
-from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.utils.profiler import hop_stamp, nvtx_enabled, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -1080,6 +1080,7 @@ class Conductor:
         When a new request comes in from the API server, assign workers,
         initialize partition states, and kick off all partitions.
         """
+        hop_stamp(body.request_id, "cond.arrival")
 
         if body.request_id in self._early_abort_requests:
             # The abort outran this NEW_REQUEST. The preprocess worker's input
@@ -1333,6 +1334,7 @@ class Conductor:
                         body=message,
                     ),
                 )
+                hop_stamp(body.request_id, "cond.dispatch")
 
         request_data.resource_configs = without_layouts(request_data.resource_configs)
 

@@ -84,6 +84,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.profiler import (
     PHASE_PERIOD,
     PhaseLaps,
+    hop_stamp,
     nvtx_enabled,
     phase_buffer,
     range_pop,
@@ -389,6 +390,11 @@ class Worker:
     _step_core: StepCore = StepCore(None, "not chosen")
     _process_cpus: frozenset[int] = frozenset()
 
+    # Handle -> wire key of the requests whose first step has not sent its
+    # outputs yet, for the TTFT hop stamps (``_hop``). Filled only while
+    # MSTAR_PHASE_TIMING is on; purged with the handle.
+    _hop_keys: dict[int, str] = {}
+
     @cached_property
     def device_capability(self) -> DeviceCapability:
         return DeviceCapability.of(self.device)
@@ -654,6 +660,7 @@ class Worker:
         #   deferred (a dict for that order: a follower's is rank 0's).
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
+        self._hop_keys = {}
 
         # step seq -> rids rank 0 released after that step, held until this rank
         # has consumed it. See ``_removal_step_reached``.
@@ -849,6 +856,9 @@ class Worker:
             loop_caps=body.loop_caps,
         )
         body.request_info.rid_handle = request_id
+        if PHASE_PERIOD:
+            self._hop_keys.setdefault(request_id, body.request_id)
+            hop_stamp(body.request_id, "wk.ingest")
 
         now = _time.monotonic()
         for node_name in self.engine_manager.evictable_nodes():
@@ -1032,6 +1042,7 @@ class Worker:
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.pop(request_id, None)
+        self._hop_keys.pop(request_id, None)
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
@@ -1495,6 +1506,8 @@ class Worker:
                 self._graph_runtime.ingest_inputs_batch(
                     self._one_rids_edges(request_id, normal), can_buffer=True,
                 )
+                if self._hop_keys:
+                    self._hop((request_id,), "wk.ready")
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2072,6 +2085,16 @@ class Worker:
         if self._step_core.cpu is not None:
             pin_step_thread(self._step_core.cpu, self._process_cpus)
 
+    def _hop(self, rids, hop: str, done: bool = False) -> None:
+        """Stamp ``hop`` for those of ``rids`` still before their first step's
+        send (``_hop_keys``); ``done`` takes them out. Callers check
+        ``self._hop_keys`` first, so this costs nothing with timing off."""
+        keys = self._hop_keys
+        for rid in rids:
+            key = keys.pop(rid, None) if done else keys.get(rid)
+            if key is not None:
+                hop_stamp(key, hop)
+
     @contextmanager
     def _span(self, name: str, cpu: str | None = None):
         """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
@@ -2222,10 +2245,14 @@ class Worker:
                     f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
                 )
             laps.lap("pre_exec")
+            if self._hop_keys:
+                self._hop(node_batch.request_ids, "wk.launch")
             with self._span(
                 "worker.gpu_thread.exec", cpu="worker.gpu_thread.exec.cpu",
             ):
                 outputs = engine.exec_and_postprocess(node_batch)
+            if self._hop_keys:
+                self._hop(node_batch.request_ids, "wk.enqueued")
             laps.skip()
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
@@ -3368,6 +3395,8 @@ class Worker:
         # TODO: may need to refine this based on how it affects performance?
         if batch_N.batch.request_to_worker_graph:
             self._wait_for_step(batch_N)
+        if self._hop_keys:
+            self._hop(batch_N.node_batch.request_ids, "wk.gpu_done")
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -3538,6 +3567,8 @@ class Worker:
             batch_N, rids, stored, route_output, signals,
             engine, buffered_publish,
         )
+        if self._hop_keys:
+            self._hop(rids, "wk.sent", done=True)
 
         _pp_stage("send_outputs")
         if self.enable_nvtx:
@@ -4779,6 +4810,8 @@ class Worker:
                             # thread reaches the forward launch; see exec.
                             spec_launch_started = threading.Event()
                             spec_node_batch.launch_started_event = spec_launch_started
+                            if self._hop_keys:
+                                self._hop(spec_batch.request_to_worker_graph, "wk.submit")
                             spec_future = gpu_executor.submit(
                                 self._execute_on_gpu_thread,
                                 spec_batch, spec_node_batch,
@@ -4908,6 +4941,8 @@ class Worker:
                 node_batch.launch_started_event = threading.Event()
                 self._set_in_flight_flag(batch, True)
                 submitted_at = _time.perf_counter() if metrics is not None else 0.0
+                if self._hop_keys:
+                    self._hop(batch.request_to_worker_graph, "wk.submit")
                 future = gpu_executor.submit(
                     self._execute_on_gpu_thread, batch, node_batch, None,
                 )

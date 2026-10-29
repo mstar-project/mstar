@@ -930,6 +930,7 @@ class _ForwardingLeader:
         self._last_active: dict = {}
         self.streaming_buffers: dict = {}
         self._stream_buffer_rids: set[int] = set()
+        self._hop_keys: dict[int, str] = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
         self._removes_awaiting_step: dict[int, list[str]] = {}

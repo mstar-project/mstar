@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import base64
 import codecs
+from time import perf_counter
 
 from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.utils.profiler import PHASE_PERIOD, hop_stamp
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
+    t_in = perf_counter()
     args = adapter.chat_to_request(req, api.upload_dir)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
@@ -33,8 +36,11 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             streaming=bool(req.stream),
             request_id=request_id,
         )
+        key = api.submission_key(request_id) if PHASE_PERIOD else None
+        if key is not None:
+            hop_stamp(key, "api.http_in", t_in)
         if req.stream:
-            return _stream(api, model_name, request_id, sample_rate)
+            return _stream(api, model_name, request_id, sample_rate, key)
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
@@ -83,13 +89,15 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
     }
 
 
-def _stream(api, model_name, request_id, sample_rate):
+def _stream(api, model_name, request_id, sample_rate, key=None):
     # Bound to the submission now: the body is iterated later, by Starlette.
     batches = api.iter_result_chunk_batches(request_id)
-    return _stream_events(batches, model_name, request_id, sample_rate)
+    return _stream_events(batches, model_name, request_id, sample_rate, key)
 
 
-async def _stream_events(batches, model_name, request_id, sample_rate):
+async def _stream_events(batches, model_name, request_id, sample_rate, key=None):
+    """``key`` (the submission's, while MSTAR_PHASE_TIMING is on) stamps the
+    first text delta's hand-off to the HTTP layer."""
     created = now()
 
     def chunk(delta, finish=None) -> str:
@@ -147,6 +155,9 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
                     failed = True
                     yield error(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500)))
             if text_events:
+                if key is not None:
+                    hop_stamp(key, "api.first_out")
+                    key = None
                 yield "".join(text_events)
     except HTTPException as exc:
         # The delivery timeout raises out of the iterator (which aborts the
