@@ -166,6 +166,8 @@ class InlineToken:
     value: int
     loop_indices: NestedLoopIndices | None
     modality: str
+    # the frame's metadata (its weight_version), shared by every value in it
+    metadata: dict = field(default_factory=dict)
 
 
 def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
@@ -366,7 +368,7 @@ class PreprocessWorker:
     def new_result_token(
         self, request_id: str, value: int,
         loop_indices: NestedLoopIndices | None, signal: str, modality: str,
-        wake: bool = True,
+        wake: bool = True, metadata: dict | None = None,
     ):
         """A value that rode inline: same accounting as a result tensor, no
         transport read and nothing to ack. ``wake=False`` queues without
@@ -379,7 +381,7 @@ class PreprocessWorker:
         counts[signal] = counts.get(signal, 0) + 1
         self.per_request_reading_tensors[request_id] += 1
         self.result_tensor_input_queue.put(
-            InlineToken(request_id, value, loop_indices, modality)
+            InlineToken(request_id, value, loop_indices, modality, metadata or {})
         )
         if wake:
             self._signal()
@@ -1098,6 +1100,7 @@ class PreprocessWorkerThread:
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
         sequence: int | None = None, abort: bool = True, traceback: bool = True,
+        weight_version: str | None = None,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -1115,6 +1118,9 @@ class PreprocessWorkerThread:
 
         ``traceback`` False logs one line, for an error already logged where
         it happened.
+
+        ``weight_version`` is the failed output's, from its frame, so the error
+        chunk carries it like the chunk it replaces would have.
         """
         text, _ = client_error_text(
             exc, f"{stage} failed for request {request_id}", log=logger,
@@ -1126,7 +1132,8 @@ class PreprocessWorkerThread:
                 request_id=request_id,
                 modality="error",
                 data=f"{stage} failed: {text}".encode("utf-8"),
-                metadata={"status": status},
+                metadata={"status": status} if weight_version is None
+                else {"status": status, "weight_version": weight_version},
             )
             for _ in range(max(count, 1))
         ]
@@ -1217,13 +1224,13 @@ class PreprocessWorkerThread:
                     request_id=request_id,
                     modality=item.modality,
                     data=postprocessed,
-                    metadata={},
+                    metadata=dict(item.metadata),
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — must reach the client
             self._fail_request(
                 request_id, exc, f"{item.modality} output postprocessing",
-                sequence=sequence,
+                sequence=sequence, weight_version=item.metadata.get("weight_version"),
             )
 
     def _queue_completed_output(
@@ -1266,11 +1273,12 @@ class PreprocessWorkerThread:
         metadata = self.tensor_uuid_to_metadata_per_request.get(request_id, {})
         for edge in failed.graph_edges:
             for info in edge.tensor_info:
-                metadata.pop(info.uuid, None)
+                frame = metadata.pop(info.uuid, None) or {}
                 slot = state.order.pop(info.uuid, None) if state is not None else None
                 self._fail_request(
                     request_id, failed.error, "output tensor read",
                     sequence=slot[0] if slot is not None else None, traceback=False,
+                    weight_version=frame.get("weight_version"),
                 )
 
     def _postprocess_inline(
@@ -1380,6 +1388,7 @@ class PreprocessWorkerThread:
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
                     request_id, exc, f"{modality} output postprocessing", sequence=sequence,
+                    weight_version=(metadata or {}).get("weight_version"),
                 )
                 continue
             self._queue_completed_output(
@@ -1429,9 +1438,11 @@ class PreprocessWorkerThread:
                         else:
                             self._postprocess_inline(request_id, sequence, modality, tensor_info.uuid, tensor)
                     except Exception as exc:  # noqa: BLE001 — must reach the client
+                        frame = self.tensor_uuid_to_metadata_per_request.get(
+                            request_id, {}).get(tensor_info.uuid) or {}
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
-                            sequence=sequence,
+                            sequence=sequence, weight_version=frame.get("weight_version"),
                         )
                     self.tensor_uuid_to_metadata_per_request.get(
                         request_id, {}
@@ -1677,6 +1688,7 @@ class PreprocessWorkerThread:
                             result.request_id, exc,
                             f"{result.modality} output transfer",
                             count=len(result.graph_edge.tensor_info),
+                            weight_version=result.metadata.get("weight_version"),
                         )
                 did_work = self._process_releases() or did_work
                 while not self.discard_tensor_queue.empty():

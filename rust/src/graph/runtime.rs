@@ -87,6 +87,11 @@ impl InternedRids {
     fn len(&self) -> usize {
         self.rid_names.len()
     }
+
+    /// Handles held by a request now; `len` counts freed ones too.
+    fn live(&self) -> usize {
+        self.rid_to_handle.len()
+    }
 }
 
 
@@ -186,6 +191,8 @@ pub struct GraphRuntime {
     /// handed back to Python one at a time. None where the worker built the
     /// pyzmq communicator, which has no shareable object.
     communicator: Option<Arc<RawZmqCommunicator>>,
+    /// Stamped on every result frame; see `set_weight_version`.
+    weight_version: Option<String>,
 }
 
  impl GraphRuntime {
@@ -1582,6 +1589,7 @@ impl GraphRuntime {
             combined_walk_of,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
+            weight_version: None,
         })
     }
 
@@ -1772,6 +1780,25 @@ impl GraphRuntime {
         // worker drops its outputs on a speculative new iteration and prep
         // excludes it from speculation.
         self.pending_loop_stops.retain(|&(r, _, _)| r != rid);
+    }
+
+    /// The version stamped on every result frame from now on; the worker
+    /// sets it once a reload copies, None until then.
+    #[pyo3(signature = (version))]
+    fn set_weight_version(&mut self, version: Option<String>) {
+        self.weight_version = version;
+    }
+
+    /// `(requests, parked_routes, staged_specs)`: requests still registered,
+    /// routing parked between complete_and_route_batch and send_outputs, and
+    /// speculative ingests staged but not settled. All zero means nothing here
+    /// can race a weight reload.
+    fn idle_counts(&self) -> (usize, usize, usize) {
+        (
+            self.rids.live(),
+            self.completions.len(),
+            self.staged_specs.len(),
+        )
     }
 
     fn get_rid_handle(&self, rid: &str) -> Option<u32> {
@@ -3386,6 +3413,7 @@ impl GraphRuntime {
                         signal: &signal,
                         infos,
                         loop_indices,
+                        weight_version: self.weight_version.as_deref(),
                     }
                     .encode(&self.interner, bk.strings())
                 };
@@ -3426,6 +3454,7 @@ impl GraphRuntime {
                         loop_indices: &loop_indices,
                         signal: &signal,
                         modality: &modality,
+                        weight_version: self.weight_version.as_deref(),
                     }
                     .encode(&self.interner);
                     frames.push(("api_server".to_string(), bytes));
@@ -3801,6 +3830,22 @@ mod tests {
         let (b, _) = rids.intern("x");
         let (c, _) = rids.intern("y");
         assert_ne!(b, c, "a double free would have aliased these");
+    }
+
+    #[test]
+    fn live_counts_held_handles_not_slots() {
+        // idle_counts reads this: a freed slot must not keep a worker from
+        // reading idle for a weight reload.
+        let mut rids = InternedRids::new();
+        let (a, _) = rids.intern("req-a");
+        rids.intern("req-b");
+        rids.intern("req-b");
+        assert_eq!(rids.live(), 2);
+        assert!(rids.release(a));
+        assert!(!rids.release(a));
+        assert_eq!((rids.live(), rids.len()), (1, 2));
+        rids.intern("req-c");
+        assert_eq!((rids.live(), rids.len()), (2, 2), "the freed slot was reused");
     }
 
     #[test]

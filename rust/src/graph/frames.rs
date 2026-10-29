@@ -405,6 +405,15 @@ impl InputSignals<'_> {
     }
 }
 
+/// A result frame's `metadata`: `{weight_version}` once a reload named one,
+/// else empty, the same bytes as before versions existed.
+fn result_metadata(out: &mut Vec<u8>, weight_version: Option<&str>) {
+    match weight_version {
+        Some(v) => w_map_counted(out, |m| w_str(m.key("weight_version"), v)),
+        None => w_map(out, 0),
+    }
+}
+
 /// One emitted output to the api server.
 pub struct ResultTensors<'a> {
     pub request_id: &'a str,
@@ -412,6 +421,8 @@ pub struct ResultTensors<'a> {
     pub signal: &'a str,
     pub infos: Vec<TensorPointerInfo>,
     pub loop_indices: Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+    /// The weights that produced it; None until a reload names a version.
+    pub weight_version: Option<&'a str>,
 }
 
 impl ResultTensors<'_> {
@@ -434,7 +445,7 @@ impl ResultTensors<'_> {
                 }
                 None => w_nil(m.key("loop_indices")),
             }
-            w_map(m.key("metadata"), 0);
+            result_metadata(m.key("metadata"), self.weight_version);
         });
         out
     }
@@ -448,6 +459,8 @@ pub struct ResultTokens<'a> {
     pub loop_indices: &'a [Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>],
     pub signal: &'a str,
     pub modality: &'a str,
+    /// As on ResultTensors: one version for the whole frame.
+    pub weight_version: Option<&'a str>,
 }
 
 impl ResultTokens<'_> {
@@ -475,7 +488,7 @@ impl ResultTokens<'_> {
             }
             w_str(m.key("signal"), self.signal);
             w_str(m.key("modality"), self.modality);
-            w_map(m.key("metadata"), 0);
+            result_metadata(m.key("metadata"), self.weight_version);
         });
         out
     }

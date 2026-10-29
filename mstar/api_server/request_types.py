@@ -57,6 +57,9 @@ class RequestComplete:
     # When the conductor took the request in (queued or admitted), in the same
     # clock as conductor_ingest_time. Only stamped while metrics are on.
     conductor_arrival_time: float | None = None
+    # The weight version the request was admitted under; None until a reload
+    # names one.
+    weight_version: str | None = None
 
 
 @dataclass
@@ -69,6 +72,8 @@ class RequestFailed:
     request_id: str
     error_message: str
     status: int = 500
+    # As on RequestComplete; None also for a request never admitted.
+    weight_version: str | None = None
 
 
 @dataclass
@@ -79,11 +84,32 @@ class ConductorStatus:
     metrics: list[MetricSnapshot]
 
 
+@dataclass
+class GenerationControlResult:
+    """The conductor's answer to a pause, continue, weight update or state
+    query, matched to the call by ``op_id``.
+
+    ``status`` is an HTTP status: 200 done, 400 checkpoint refused (nothing
+    copied), 409 wrong state, 500 a rank failed mid-copy, 503 no pause control
+    on this conductor, 504 a rank did not answer in time. ``ranks`` maps each worker that answered the last
+    protocol step to ``"ok"`` or its error, plus the version it holds.
+    """
+    op_id: str
+    status: int
+    state: str
+    paused: bool
+    weight_version: str | None = None
+    error_message: str | None = None
+    ranks: dict[str, str] = field(default_factory=dict)
+    rank_versions: dict[str, str | None] = field(default_factory=dict)
+
+
 # what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder
 # tries branches in order and takes the first whose required fields are all
 # present, so a body must lack a required field of every branch before it.
 APIServerMessageBody = (
-    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus | None
+    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus
+    | GenerationControlResult | None
 )
 
 
@@ -91,7 +117,7 @@ APIServerMessageBody = (
 class APIServerMessage:
     """Envelope for messages received by the API server."""
     # "result_tensors" | "result_tokens" | "request_complete" | "request_failed"
-    # | "conductor_status" | "setup_done"
+    # | "conductor_status" | "generation_control_result" | "setup_done"
     message_type: str
     body: APIServerMessageBody = None
 

@@ -457,6 +457,10 @@ class ExecutingBatch:
 
 
 class Engine:
+    # The model the submodules came from; set by ``load_model``. Class-level so
+    # an engine built without it refuses a weight reload instead of raising.
+    _model: "Model | None" = None
+
     @property
     def device_capability(self) -> DeviceCapability:
         capability = getattr(self, "_device_capability", None)
@@ -512,6 +516,7 @@ class Engine:
         model: "Model | None" = None,
     ):
         self._device = device
+        self._model = model
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
         self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
@@ -600,6 +605,60 @@ class Engine:
                     enable = getattr(resource, "enable_device_loopback_reader", None)
                     if enable is not None:
                         enable()
+
+    def _reload_target(self) -> tuple["Model", dict[str, torch.nn.Module]]:
+        from mstar.model.loader.reload import WeightReloadRefusedError
+
+        if self._model is None:
+            raise WeightReloadRefusedError("this engine was built without a model")
+        return self._model, {name: mgmt.submodule for name, mgmt in self._submodules.items()}
+
+    def check_weight_reload(self, path: str) -> None:
+        """Raise ``WeightReloadRefusedError`` unless the model can reload ``path`` in
+        place. Reads checkpoint headers only; copies nothing."""
+        model, modules = self._reload_target()
+        model.reload_weights(path, modules, check_only=True)
+
+    def reload_weights(self, path: str, weight_version: str) -> None:
+        """Drop what was derived from the old weights, then copy ``path`` into
+        the loaded parameters. Only with nothing in flight on this engine.
+
+        The drop comes first so that every rank asked to copy drops, whether
+        or not its copy then succeeds: a rank whose copy failed would otherwise
+        keep its old prefix-cache root and drift from the others.
+
+        Raises if the model's reload moved any parameter's storage: compiled
+        code and captured graphs would keep reading the old storage.
+        """
+        model, modules = self._reload_target()
+
+        def storage() -> dict[str, tuple[int, tuple[int, ...], torch.dtype]]:
+            return {
+                f"{node}.{name}": (param.data_ptr(), tuple(param.shape), param.dtype)
+                for node, module in modules.items()
+                for name, param in module.named_parameters()
+            }
+
+        accelerator = self._device is not None and self._device.type != "cpu"
+        before = storage()
+        if accelerator:
+            # side-stream work of the last step may still read the weights
+            torch.accelerator.synchronize(self._device)
+        for resource in self._resources.values():
+            resource.drop_weight_derived_state(weight_version)
+        with torch.no_grad():
+            model.reload_weights(path, modules)
+        if accelerator:
+            # the next step may launch on another stream than the copies
+            torch.accelerator.synchronize(self._device)
+        after = storage()
+        moved = sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
+        if moved:
+            raise RuntimeError(
+                f"{type(model).__name__}.reload_weights moved or resized {len(moved)} "
+                f"parameter(s), e.g. {moved[:3]}; compiled code and captured graphs "
+                "still point at the old storage"
+            )
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""

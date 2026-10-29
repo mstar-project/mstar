@@ -198,6 +198,14 @@ class Resource(ABC):
         order, for a TP follower to check against rank 0's. None where it keeps no trail."""
         return None
 
+    def drop_weight_derived_state(self, salt: str) -> int:
+        """Forget whatever this resource keeps across requests that was computed
+        from the weights, which are about to be reloaded in place as version
+        ``salt``. Called on every rank before the copy, with nothing in flight,
+        so ranks stay in step even where a copy then fails. Returns how much
+        was dropped (pages, entries), for the log."""
+        return 0
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 

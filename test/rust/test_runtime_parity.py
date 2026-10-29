@@ -827,6 +827,33 @@ def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
     assert parked == 0, f"{parked} completions left parked"
 
 
+def test_idle_counts_agree(pair):
+    """What a weight reload waits on: registered requests and routing parked
+    for a send. Both runtimes count the same through admit, route and remove."""
+    rt, _book, _store = pair
+    assert rt.idle_counts() == (0, 0, 0)
+    first, second = _admit(rt, "r1"), _admit(rt, "r2")
+    assert rt.idle_counts() == (2, 0, 0)
+
+    rt.ingest_inputs_batch(_ingest_block([first], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [first])
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="prefill",
+            output_signals=[], wg_ids=ParallelList([first], [WG_ID]),
+            tensors=[], num_tensors=[],
+        ),
+    )
+    requests, parked, staged = rt.idle_counts()
+    assert (requests, staged) == (2, 0)
+    assert parked == 1, "a pass routed and not yet sent is not idle"
+
+    rt.remove_request(first)
+    assert rt.idle_counts() == (1, 0, 0)
+    rt.remove_request(second)
+    assert rt.idle_counts() == (0, 0, 0)
+
+
 def _graph_opts_out(node_name: str):
     """Same shape, but ``node_name`` refuses async scheduling.
 

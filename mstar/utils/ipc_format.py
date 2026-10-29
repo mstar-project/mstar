@@ -41,6 +41,7 @@ class WorkerMessageType(Enum):
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
     ENABLE_METRICS = "enable_metrics"
+    WEIGHT_CONTROL = "weight_control"
 
 
 @dataclass
@@ -208,6 +209,28 @@ class TPNoSpeculation(MessageBody):
     graph_walk: str
     spec_from_seq: int
 
+
+class WeightOp(str, Enum):
+    """What the conductor asks every worker during a pause or weight update."""
+    # confirm nothing is in flight; acked only once that holds
+    QUIESCE = "quiesce"
+    # check the checkpoint against the loaded one, copying nothing
+    PREPARE = "prepare"
+    # copy the checkpoint into the loaded parameters
+    APPLY = "apply"
+    # report the weight version this rank holds
+    VERIFY = "verify"
+
+
+@dataclass
+class WeightControl(MessageBody):
+    """One step of the pause / reload protocol, sent to every rank of every
+    worker. ``epoch`` names the step; an ack for an older one is ignored."""
+    op: str
+    epoch: int
+    model_path: str = ""
+    weight_version: str | None = None
+
 @dataclass
 class WorkerMessage:
     message_type: WorkerMessageType
@@ -227,6 +250,11 @@ class ConductorMessageType(Enum):
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
+    PAUSE_GENERATION = "pause_generation"
+    CONTINUE_GENERATION = "continue_generation"
+    UPDATE_WEIGHTS_FROM_DISK = "update_weights_from_disk"
+    GET_GENERATION_STATE = "get_generation_state"
+    WEIGHT_CONTROL_ACK = "weight_control_ack"
     CLIENT_STREAM_INPUT = "client_stream_input"
 
 
@@ -325,6 +353,54 @@ class EnableMetrics(MessageBody):
     """Start the workers' histograms and counters. The API server sends it to
     the conductor after its warmup requests; the conductor forwards it to
     every worker (``WorkerMetrics.start_counting``)."""
+
+
+@dataclass
+class PauseGeneration(MessageBody):
+    """Stop admitting requests. ``mode`` is ``"wait"`` (let in-flight requests
+    finish) or ``"abort"`` (fail them with a 503). Answered once no request is
+    left and every worker rank has confirmed it is idle."""
+    op_id: str
+    mode: str = "abort"
+
+
+@dataclass
+class ContinueGeneration(MessageBody):
+    """Resume admitting requests, only if every rank reports the committed
+    weight version."""
+    op_id: str
+
+
+@dataclass
+class UpdateWeightsFromDisk(MessageBody):
+    """Reload weights in place from ``model_path``, only while paused. The
+    deployment stays paused either way."""
+    op_id: str
+    model_path: str
+    weight_version: str
+
+
+@dataclass
+class GetGenerationState(MessageBody):
+    """Report the pause state and the committed weight version."""
+    op_id: str
+
+
+@dataclass
+class WeightControlAck(MessageBody):
+    """A worker's answer to one ``WeightControl`` step. ``error`` is None on
+    success. The rest describe what this rank holds afterwards:
+    ``weight_version`` is the label it was copied under and ``weight_epoch``
+    the epoch of the apply step that copied it (0: the startup checkpoint), so
+    two ranks with one label but different copies tell apart. ``dirty`` means a
+    copy may have stopped partway, so the rank holds no known version."""
+    epoch: int
+    worker_id: str
+    op: str
+    error: str | None = None
+    weight_version: str | None = None
+    weight_epoch: int = 0
+    dirty: bool = False
 
 
 @dataclass
