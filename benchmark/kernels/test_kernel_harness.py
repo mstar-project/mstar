@@ -370,5 +370,11 @@ def test_best_promotion_picks_an_implementation_per_shape(tmp_path):
     loaded = configs.load_config("gemv", "gfx942", "mi300x", root=tmp_path / "configs")
     assert configs.select(loaded, "small", {"rows": 4, "n": 64, "k": 32}) == {"impl": "vendor"}
     assert configs.select(loaded, "small", {"rows": 2, "n": 64, "k": 32})["impl"] == "triton"
+    # with a default per class, every measured shape that chose otherwise is its own entry
+    path = store.promote_best(MI300X, "gemv", impls.get, lambda s: "small" if s["rows"] <= 4 else "large",
+                              class_default=lambda klass: {"impl": "vendor"}, root=tmp_path / "configs")
+    config = json.loads(path.read_text())
+    assert config["classes"] == {"small": {"impl": "vendor"}, "large": {"impl": "vendor"}}
+    assert set(config["shapes"]) == {"k32-n64-rows1", "k32-n64-rows2"}
     with pytest.raises(ValueError, match="no passing results"):
         store.promote_best(MI300X, "gemv", lambda family: None, lambda s: None, root=tmp_path / "configs")
