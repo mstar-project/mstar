@@ -407,7 +407,7 @@ class Gr00tN17Preprocessor:
         if ref.ndim == 2:  # (T, D) -- one request, as the reference also allows
             ref = ref[None]
         # the reference frame is the state's **last** timestep
-        # (`state_action_processor.py:511-513`), per request
+        # (`state_action_processor.py:511-515`), per request
         ref = ref[:, -1, :]
         if ref.shape[0] != relative.shape[0] or ref.shape[-1] != relative.shape[-1]:
             raise ValueError(

@@ -424,7 +424,7 @@ class Gr00tN17Shape:
     The scaffold stacks a step's conditioning rectangularly, so a batch's requests
     have to agree on both span lengths; ``can_batch`` keys on this and so do the
     graph buckets. Measured over the 20 recorded requests: the image span is
-    constant (448, four camera views) and only the text span varies (13 or 21), so
+    constant (448: two cameras at two timesteps, four frames) and only the text span varies (13 or 21), so
     in practice this buckets on the prompt. The image count is carried all the same,
     because nothing makes it a constant -- another camera set is another number.
     """
@@ -473,15 +473,16 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
 
     # ------------------------------------------------------------------ shape
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> Gr00tN17Shape:
-        """The spans are needed before their tensors arrive, so they ride on the
-        request: preprocess counts them where `input_ids` and the image rows are."""
+        """The spans are needed before their tensors arrive, so they ride in the step
+        metadata: the model reads them off the persisted bridge tensors' `dims`
+        (`Gr00tN17Model.get_partition_forward_pass_args`)."""
         meta = fwd_info.step_metadata
         missing = [k for k in ("vl_text_rows", "vl_image_rows") if k not in meta]
         if missing:
             raise KeyError(
-                f"denoise_step has no {missing} in step_metadata; the model's "
-                "preprocess counts the bridge's two spans and puts them there, "
-                "because the key is needed before their tensors arrive"
+                f"denoise_step has no {missing} in step_metadata; the model reads "
+                "the bridge's two spans off their persisted tensors and puts them "
+                "there, because the key is needed before the tensors arrive"
             )
         return Gr00tN17Shape(
             text_rows=int(meta["vl_text_rows"]), image_rows=int(meta["vl_image_rows"]),
@@ -512,7 +513,7 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         """The noisy trajectory the loop carries, ``[40, 132]`` without a batch dim.
 
         Drawn at the **weights'** dtype, as the reference draws it at
-        ``vl_embeds.dtype`` (`gr00t_n1d7.py:347-351`). That keeps the carried dtype
+        ``vl_embeds.dtype`` (`gr00t_n1d7.py:349-353`). That keeps the carried dtype
         the same at every iteration, which `denoise` returns and which a captured
         graph records -- an fp32 seed feeding a bf16 step would change dtype after
         iteration 0 and need two graphs.
@@ -543,8 +544,8 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
             raise ValueError(
                 f"denoise_step was told {bucket_key.text_rows} text and "
                 f"{bucket_key.image_rows} image rows by step_metadata, but the "
-                f"bridge sent {text.shape[0]} and {image.shape[0]}; the model's "
-                "preprocess counts them and must count what it then emits"
+                f"bridge sent {text.shape[0]} and {image.shape[0]}; the counts the "
+                "model put in step_metadata must be the spans the bridge emits"
             )
         embodiment_id = inputs["embodiment_id"][0].reshape(())
         return {
@@ -598,7 +599,8 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
                 )
 
             # All or nothing. Nothing bound is the parity backend -- every span on
-            # SDPA, which is how the CPU tests and an unconfigured deployment run.
+            # SDPA, which is how the CPU tests run; a deployment always binds both,
+            # since `get_node_resources` declares every resource unconditionally.
             # *Partly* bound is incoherent: `declare_step` declares both resources,
             # so the engine plans a step whose kernel the forward would not use, and
             # a captured graph would record SDPA where the plan says ragged.
