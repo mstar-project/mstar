@@ -66,32 +66,6 @@ def _aiter_skinny():
     return linear
 
 
-# AITER's bf16 asm GEMMs for gfx942 (hsa/gfx942/bf16gemm), by tile; "auto" lets AITER pick. Their split-K
-# variants reduce through a 16x64 semaphore array, so a grid wider than that (any vocab head) runs unsplit.
-ASM_TILES = ("auto", "32x64_pf3_splitk", "48x64_pf3_splitk", "64x64_pf3_splitk", "96x64_pf3_splitk",
-             "64x64_splitk_clean", "96x64_splitk_clean")
-ASM_SPLITS = (1, 2, 4)
-
-
-def _aiter_asm(tile: str, split_k: int):
-    def build():
-        from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID, gemm_a16w16_asm
-
-        name = None if tile == "auto" else f"bf16gemm_fp32bf16_tn_{tile}"
-        name = None if name is None else f"_ZN5aiter{len(name)}{name}E"
-
-        def linear(x, w):
-            tile_m = 32 if tile == "auto" else int(tile.split("x", maxsplit=1)[0])
-            if split_k > 1 and -(-x.shape[0] // tile_m) * -(-w.shape[0] // 64) > ASM_SPLITK_MAX_GRID:
-                raise ValueError("grid wider than the split-K semaphore array")
-            out = torch.empty((x.shape[0], w.shape[0]), dtype=x.dtype, device=x.device)
-            return gemm_a16w16_asm(x.contiguous(), w, out, None, split_k, name, False)
-
-        return linear
-
-    return build
-
-
 def _aiter_triton():
     from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
@@ -107,11 +81,18 @@ def _tunableop():
     tunable.tuning_enable(True)
     tunable.set_max_tuning_iterations(30)
 
+    seen: set[tuple[int, int, int]] = set()
+
     def linear(x, w):
         tunable.enable(True)
         try:
             return F.linear(x, w)
         finally:
+            key = (x.shape[0], w.shape[0], w.shape[1])
+            if key not in seen:
+                # the chosen solutions, for a table (PYTORCH_TUNABLEOP_FILENAME)
+                seen.add(key)
+                tunable.write_file()
             tunable.enable(False)
 
     return linear
@@ -121,25 +102,32 @@ def _tunableop():
 HIPBLASLT_CHOICES: dict[tuple[int, int, int], tuple[int, float, float, int]] = {}
 
 
-def _quick_us(fn, x, weights, reps: int = 10) -> float:
-    """Median us of ``fn(x, w)`` over ``reps`` calls cycling ``weights`` (eager, events)."""
-    times = []
-    for i in range(reps + 2):
-        w = weights[i % len(weights)]
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn(x, w)
-        end.record()
-        end.synchronize()
-        if i >= 2:
-            times.append(start.elapsed_time(end) * 1e3)
-    return sorted(times)[len(times) // 2]
+def _graph_us(fn, x, weights, calls: int = 8) -> float:
+    """GPU us per call of ``fn(x, w)``, ``calls`` of them cycling ``weights`` in one captured graph, so the
+    host's launch cost (larger than a decode GEMM) stays out of the number."""
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for w in weights:
+            fn(x, w)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for i in range(calls):
+            fn(x, weights[i % len(weights)])
+    graph.replay()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(3):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1e3 / (3 * calls)
 
 
 def _hipblaslt_best():
-    """hipBLASLt at the fastest of all its solutions for a shape (AITER's ``hipb_findallsols``), picked on
-    the first call per shape by a quick eager timing over weight copies that outgrow the MALL; the
-    captured timings then run that solution. The choice is kept in ``HIPBLASLT_CHOICES``."""
+    """hipBLASLt at the fastest of all its solutions for a shape (AITER's ``hipb_findallsols``), each timed
+    on the first call per shape in a captured graph over weight copies that outgrow the MALL; the harness
+    then times that solution like any other candidate. The choice is kept in ``HIPBLASLT_CHOICES``."""
     import aiter
 
     aiter.hipb_create_extension()
@@ -154,15 +142,15 @@ def _hipblaslt_best():
             timed = []
             for sol in sols:
                 try:
-                    timed.append((_quick_us(lambda a, b, sol=sol: aiter.hipb_mm(a, b.t(), sol), x, weights), sol))
+                    timed.append((_graph_us(lambda a, b, sol=sol: aiter.hipb_mm(a, b.t(), sol), x, weights), sol))
                 except Exception:  # noqa: BLE001  a solution that cannot run this shape
-                    continue
+                    torch.cuda.synchronize()
             best_us, best = min(timed)
-            default_us = _quick_us(F.linear, x, weights)
+            default_us = _graph_us(F.linear, x, weights)
             chosen[key] = best
             HIPBLASLT_CHOICES[key] = (best, best_us, default_us, len(sols))
-            print(f"hipblaslt_best rows={key[0]} n={key[1]} k={key[2]}: solution {best} {best_us:.1f} us "
-                  f"(default {default_us:.1f} us, {len(sols)} solutions)", flush=True)
+            print(f"hipblaslt_best rows={key[0]} n={key[1]} k={key[2]}: solution {best} {best_us:.2f} us "
+                  f"(default {default_us:.2f} us, {len(timed)} of {len(sols)} solutions ran)", flush=True)
             del weights
         return aiter.hipb_mm(x, w.t(), chosen[key])
 
@@ -174,8 +162,8 @@ def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> lis
     if is_amd(facts):
         found.append(Candidate("aiter_skinny", {}, _aiter_skinny))
         found.append(Candidate("aiter_triton", {}, _aiter_triton))
-        found += [Candidate("aiter_asm", {"tile": t, "split_k": k}, _aiter_asm(t, k))
-                  for t in ASM_TILES for k in ASM_SPLITS if t != "auto" or k == 1]
+        # AITER's bf16 asm GEMMs are left out: one (32x64 split-K "clean") faulted on a 4096x4096 weight on
+        # MI325X, which takes the whole search down
         found.append(Candidate("tunableop", {}, _tunableop))
         found.append(Candidate("hipblaslt_best", {}, _hipblaslt_best))
     return found
