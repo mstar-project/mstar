@@ -122,6 +122,12 @@ class _RecordingServer:
     async def wait_for_request_id(self, request_id):
         pass
 
+    def submission_key(self, request_id):
+        return None
+
+    def release_submission(self, key):
+        pass
+
     def __getattr__(self, name):
         raise AttributeError(name)
 

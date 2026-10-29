@@ -737,6 +737,9 @@ class Engine:
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules()
+        for submodule_mgmt in self._submodules.values():
+            with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                submodule_mgmt.submodule.warmup_compiles()
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
