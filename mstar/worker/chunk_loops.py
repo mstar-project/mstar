@@ -2,7 +2,8 @@
 chunk Loop, ending a Loop on its final chunk, and recording what each chunk
 ran. The Loop itself does the rest (``Model.apply_chunking``)."""
 
-from collections.abc import Iterable
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 from mstar.model.submodule_base import chunk_loop_name
@@ -16,9 +17,16 @@ if TYPE_CHECKING:
 class ChunkLoops:
     """This worker's chunk Loops, read off its graphs at load."""
 
-    def __init__(self, walks: Iterable[tuple[str, str]] = ()):
+    def __init__(
+        self, walks: Iterable[tuple[str, str]] = (),
+        speculated: Iterable[tuple[str, str]] | None = None,
+    ):
         # (node, walk) pairs whose prefill runs as a chunk Loop
         self.walks: frozenset[tuple[str, str]] = frozenset(walks)
+        # the ones whose rows mid-prefill take their next chunk in the speculative step
+        self.speculated: frozenset[tuple[str, str]] = (
+            self.walks if speculated is None else self.walks & frozenset(speculated)
+        )
         # node -> those walks, which the scheduler marks final chunks by
         self.walks_by_node: dict[str, frozenset[str]] = {
             node: frozenset(w for n, w in self.walks if n == node)
@@ -26,8 +34,15 @@ class ChunkLoops:
         }
 
     @classmethod
-    def from_graphs(cls, worker_graphs: "list[WorkerGraph]") -> "ChunkLoops":
-        return cls(cls.walks_in(worker_graphs))
+    def from_graphs(
+        cls, worker_graphs: "list[WorkerGraph]",
+        speculate_mid_prefill: Mapping[str, object] | None = None,
+        chunked: Iterable[tuple[str, str]] = (),
+    ) -> "ChunkLoops":
+        """``speculate_mid_prefill`` is the serving config's, checked against
+        ``chunked``, every (node, walk) the model chunks."""
+        walks = cls.walks_in(worker_graphs)
+        return cls(walks, walks - mid_prefill_speculation_off(speculate_mid_prefill, chunked))
 
     @staticmethod
     def walks_in(worker_graphs: "list[WorkerGraph]") -> frozenset[tuple[str, str]]:
@@ -98,3 +113,28 @@ class ChunkLoops:
             scheduler.advance_chunk(rid, node, end)
             if end >= total:
                 engine.release_chunk_inputs(rid, node)
+
+
+def mid_prefill_speculation_off(
+    setting: Mapping[str, object] | None, chunked: Iterable[tuple[str, str]],
+) -> frozenset[tuple[str, str]]:
+    """The (node, walk) pairs the serving config's ``speculate_mid_prefill``
+    turns off: per node, one bool for every walk it chunks, or a mapping of
+    walk -> bool. On (the default), a row mid-prefill takes its next chunk in
+    the speculative step, as a decode row takes its next token."""
+    walks_of_node: dict[str, set[str]] = defaultdict(set)
+    for node, walk in chunked:
+        walks_of_node[node].add(walk)
+    off = set()
+    for node, value in (setting or {}).items():
+        if node not in walks_of_node:
+            raise ValueError(f"speculate_mid_prefill names {node!r}, which chunks no walk")
+        per_walk = value if isinstance(value, Mapping) else dict.fromkeys(walks_of_node[node], value)
+        for walk, on in per_walk.items():
+            if walk not in walks_of_node[node]:
+                raise ValueError(f"speculate_mid_prefill names walk {walk!r} of {node!r}, which it does not chunk")
+            if not isinstance(on, bool):
+                raise ValueError(f"speculate_mid_prefill for {node}/{walk}: {on!r} is not a bool")
+            if not on:
+                off.add((node, walk))
+    return frozenset(off)

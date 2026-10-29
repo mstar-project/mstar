@@ -2124,6 +2124,23 @@ def test_the_last_chunk_of_a_row_mid_prefill_runs_whole_in_the_merge():
     assert not merged.incomplete_node_rids
 
 
+def test_a_prompt_chain_alone_runs_the_next_chunk_of_its_row_in_flight():
+    """A chunk-only step speculates with no continuing row: the merge is
+    handed only the rows mid-prefill, and keeps to their walk."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 4, 10)}
+    # a decode row comes ready behind it
+    manager.per_request_info["d0"], manager.walks["d0"] = object(), WALK
+    manager.ingest("d0")
+
+    merged = _next_batch(sched, manager, target=(NODE, "prefill"), mid_prefill=[_mid("p0", 4)])
+
+    assert merged.chunk_ranges == {"p0": (4, 8, 10)}
+    assert list(merged.request_to_worker_graph) == ["p0"], "a decode row is another walk's"
+
+
 # ── the chunk lookahead ─────────────────────────────────────────────────
 
 

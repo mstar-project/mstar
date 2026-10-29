@@ -863,8 +863,8 @@ class MicroScheduler:
 
         if self.sched_type != SchedulingType.ROUND_ROBIN:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
-        # a targeted merge's pre-existing rows are of the target's own walk
-        pre_existing_walk = target[1] if target is not None and pre_existing_batch_size else None
+        # a targeted merge's pre-existing rows, and its rows mid-prefill, are of the target's own walk
+        pre_existing_walk = target[1] if target is not None and (pre_existing_batch_size or mid_prefill) else None
         # A chain merges and yields away within its own real walk, or its whole
         # combined walk under `speculation_mixes`.
         mixes = pre_existing_walk is not None and self.speculation_mixes(*target)

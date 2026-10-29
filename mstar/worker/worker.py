@@ -366,6 +366,8 @@ class _LazyPerRid:
         return self._dict().values()
 
 
+
+
 class Worker:
     """
     Real worker that integrates RequestStateManager, EngineManager,
@@ -523,7 +525,10 @@ class Worker:
             my_walks.update(
                 (node, walk) for node in wg_nodes for walk in wg.graph_walks
             )
-        self.chunk_loops = ChunkLoops.from_graphs(my_worker_graphs)
+        self.chunk_loops = ChunkLoops.from_graphs(
+            my_worker_graphs, (model_config or {}).get("speculate_mid_prefill"),
+            model.chunking_policy_of() if model is not None else {},
+        )
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
@@ -3033,17 +3038,19 @@ class Worker:
             new_request_to_worker_graph[r] = prep.wg_ids[i]
         laps.lap("continuing_inputs")
 
-        if not continuing:
-            return None
-        # fresh rows of another walk (a mixing chain): rid -> walk
-        other_walks: dict[int, str] = {}
-        fresh_final_edges: dict[int, set[str]] = {}
         # N's rows whose node needs another chunk take it in this step, not the
         # one after: their nodes stay off the ready queue until N's chunk lands
         mid_prefill = [
             MidPrefillRow(r, batch_N.request_to_worker_graph[r], batch_N.walk_of(r), batch_N.chunk_ranges[r][1])
-            for r in held if r in batch_N.request_to_worker_graph and not self._is_tearing_down(r)
+            for r in held
+            if r in batch_N.request_to_worker_graph and not self._is_tearing_down(r)
+            and (spec_node_name, batch_N.walk_of(r)) in self.chunk_loops.speculated
         ] if held and speculating_same_node else ()
+        if not continuing and not mid_prefill:
+            return None
+        # fresh rows of another walk (a mixing chain): rid -> walk
+        other_walks: dict[int, str] = {}
+        fresh_final_edges: dict[int, set[str]] = {}
 
         # Merge in fresh rids whose spec-target node is ready right now
         # Speculation only consumes work compatible with the spec target. In
@@ -3053,7 +3060,7 @@ class Worker:
             self.request_state,
             target=spec_target,
             pre_existing_batch_size=len(continuing),
-            capture_group_of=prep.ready_rids[0],
+            capture_group_of=prep.ready_rids[0] if prep.ready_rids else mid_prefill[0].request_id,
             # estimated from their spans in this step, if a token budget needs them
             pre_existing_seq_lens=lambda: self._continuing_seq_lens(
                 pending, spec_node_name, graph_walk, continuing,
@@ -4619,9 +4626,11 @@ class Worker:
                 (target.info.node_name, target.info.graph_walk) if target is not None
                 else (pending.node_name, pending.graph_walk)
             )
+            # A prompt chain yields from its first step: speculating its next
+            # chunk must not keep decode rows waiting a second prompt step.
             other_ready = (
                 fair.peek
-                and consecutive >= 1
+                and (consecutive >= 1 or chain_key in self.chunk_loops.speculated)
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
             must_yield_away = consecutive >= fair.max_consecutive or other_ready
@@ -4651,10 +4660,10 @@ class Worker:
                 if not must_yield_away and fair.peek and consecutive < 1:
                     # The chain could not continue, so there is no chain to
                     # keep going: other ready work goes first, as it would
-                    # after the chain's next step. A prompt-only chunk step is
-                    # one (its rows mid-prefill are not speculated), and
-                    # without this the step after it starts another prompt's
-                    # chunk while decode rows wait out both.
+                    # after the chain's next step. Without this, the step after
+                    # a prompt step whose prompts all finished (or whose rows
+                    # mid-prefill are not speculated, `speculate_mid_prefill`)
+                    # starts another prompt while decode rows wait out both.
                     must_yield_away = self.scheduler.has_ready_excluding(
                         self.request_state, chain_key,
                     )

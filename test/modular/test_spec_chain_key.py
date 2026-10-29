@@ -17,10 +17,11 @@ class _Span:
         return False
 
 
-def _worker(target, other_ready=True, speculation=None):
+def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozenset()):
     peeked, excluded = [], []
     fake = SimpleNamespace(
         _can_speculate=lambda batch: True,
+        chunk_loops=SimpleNamespace(speculated=mid_prefill_walks),
         _choose_spec_target=lambda batch: target,
         _try_speculate_next=lambda pending, target: speculation,
         maybe_send_zmq_to_tp_followers=lambda node_batch, **kw: -1,
@@ -91,6 +92,32 @@ def test_a_chains_first_step_that_continues_does_not_peek():
     speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
 
     assert speculation is not None and not peeked and not excluded
+
+
+def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_step():
+    """Speculating a row's next chunk must not hold decode rows behind a second
+    prompt step, so the peek runs before the chain's first speculation."""
+    chunk = SimpleNamespace(node_batch=None, tp_seq=-1)
+    worker, peeked, excluded = _worker(
+        _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}),
+    )
+
+    speculation, yielded_from = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert speculation is not chunk and peeked == [("LLM", "prefill")]
+    assert yielded_from == ("LLM", "prefill") and excluded == [("LLM", "prefill")]
+
+
+def test_a_prompt_chain_alone_speculates_its_next_chunk():
+    chunk = SimpleNamespace(node_batch=None, tp_seq=-1)
+    worker, _, excluded = _worker(
+        _PROMPT, other_ready=False, speculation=chunk,
+        mid_prefill_walks=frozenset({("LLM", "prefill")}),
+    )
+
+    speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert speculation is chunk and not excluded
 
 
 def test_without_the_peek_a_step_that_cannot_continue_does_not_yield():
