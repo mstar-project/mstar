@@ -872,11 +872,18 @@ class Qwen3_5DenseModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
         keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
-        return {
-            SAMPLER: SamplingReqConfig(
-                **{k: model_kwargs[k] for k in keys if k in model_kwargs}
+        sampling = SamplingReqConfig(**{k: model_kwargs[k] for k in keys if k in model_kwargs})
+        if self.num_draft_tokens and (
+            sampling.temperature or sampling.repetition_penalty not in (None, 1)
+        ):
+            # Verification here is greedy: accepting a draft against a sampled
+            # target needs rejection sampling on the device, not built yet.
+            raise ValueError(
+                "this deployment decodes speculatively and verifies greedily; send "
+                "temperature 0 and no repetition_penalty, or serve it without "
+                "num_draft_tokens"
             )
-        }
+        return {SAMPLER: sampling}
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
