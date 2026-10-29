@@ -1,6 +1,6 @@
 """LingBotWorldModel: LingBot-World-V2 causal-fast, camera-controlled image-to-world.
 
-Architecture (2 nodes, no engine resources):
+Architecture (2 nodes; the dit's attention is the one engine resource):
     text_encoder - UMT5-XXL prompt encoder (wan22's submodule, reused)
     dit          - the 1.3B causal DiT. One rollout iteration is one chunk of
                    4 latent frames: the chunk's I2V condition (a warm-cache
@@ -32,7 +32,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
@@ -44,10 +44,17 @@ from mstar.model.lingbot_world.config import (
     UMT5_DIFFUSERS_REPO,
     WAN21_VAE_DIFFUSERS_REPO,
 )
-from mstar.model.lingbot_world.submodules import ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
+from mstar.model.lingbot_world.submodules import DIT_ATTN, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
+
+# LingBotWorldConfig switches a deployment sets in model_kwargs
+_CONFIG_KWARGS = ("reference_numerics", "dit_compile_autotune")
+
+# The reference's numerics: FA2 attention, an eager DiT, the fp32 contiguous eager encode and decode, with which
+# the rollout is bit-identical to the reference's (test/lingbot_world/run_parity.py).
+REFERENCE_MODEL_KWARGS = {"reference_numerics": True}
 
 ENCODE_TEXT_WALK = "encode_text"
 _SCHEDULE = (ENCODE_TEXT_WALK, ROLLOUT_WALK)
@@ -66,6 +73,17 @@ class LingBotWorldModel(Model):
         if variant != LINGBOT_VARIANT_1_3B:
             raise NotImplementedError(f"LingBot-World variant {variant!r} is not implemented yet.")
         self.config = LINGBOT_CONFIGS[variant]()
+        for name in _CONFIG_KWARGS:
+            if name in kwargs:
+                value = kwargs.pop(name)
+                # a yaml "false" is a truthy string
+                if not isinstance(value, bool):
+                    raise ValueError(f"LingBot-World {name} must be true or false, got {value!r}.")
+                setattr(self.config, name, value)
+        if kwargs:
+            raise ValueError(
+                f"LingBot-World takes no model_kwargs {sorted(kwargs)}; its switches are {', '.join(_CONFIG_KWARGS)}."
+            )
         self.model_path_hf = model_path_hf or LINGBOT_HF_REPOS[variant]
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
@@ -77,7 +95,16 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        return []
+        if self.config.reference_numerics:
+            return []
+        cfg = self.config
+        return [RaggedCrossAttentionSpec(
+            resource_key=DIT_ATTN, nodes={"dit"},
+            config=RaggedAttentionConfig(
+                num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                dtype=torch.bfloat16,
+            ),
+        )]
 
     def kv_cache_bytes(self, lat_h: int, lat_w: int) -> int:
         """The rolling self-attention plus text K/V one request allocates at
@@ -377,17 +404,21 @@ class LingBotWorldModel(Model):
             from mstar.model.lingbot_world.components.dit import require_flash_attn
             from mstar.model.lingbot_world.weight_loader import build_lingbot_dit
 
-            require_flash_attn()
+            if self.config.reference_numerics:
+                require_flash_attn()
             dit = build_lingbot_dit(self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir)
+            cfg = self.config
             return LingBotDitSubmodule(
-                dit, self._load_vae().to(device), self.config, encoder_vae=self._load_vae().to(device),
+                dit, self._load_vae().to(device), cfg, encoder_vae=self._load_vae().to(device),
+                warmup_latent_sizes=[self.geometry((cfg.default_height, cfg.default_width),
+                                                   cfg.default_height, cfg.default_width)],
             )
         logger.warning("LingBot-World has no submodule for node %r; running it dummy.", node_name)
         return None
 
     def _load_vae(self) -> torch.nn.Module:
-        """A fresh fp32 Wan2.1 VAE per use: the decoder may switch its copy to
-        channels-last, which the encoder must not see."""
+        """A fresh fp32 Wan2.1 VAE per use: the decoder makes its copy bf16 and
+        channels-last unless ``reference_numerics``, which the encoder must not see."""
         from diffusers import AutoencoderKLWan
 
         return AutoencoderKLWan.from_pretrained(

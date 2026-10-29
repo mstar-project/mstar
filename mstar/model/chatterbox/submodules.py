@@ -41,6 +41,7 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.model.chatterbox.components.s3_tokenizer import AudioEncoderV2
 from mstar.model.chatterbox.components.s3gen import FlowRow
 from mstar.model.chatterbox.config import (
     CFG_LABEL,
@@ -111,6 +112,14 @@ class VoiceCache:
 # ===========================================================================
 
 
+def reference_tokens(samples: int, config: ChatterboxConfig) -> int:
+    """How many S3 prompt tokens `VoiceEncoderSubmodule.condition` makes of a ``samples``-long
+    reference clip. It asserts the same count."""
+    wav16 = min(-(-samples * S3_SR // config.sample_rate), round(config.enc_cond_seconds * S3_SR))
+    frames = min(wav16 // config.s3_tokenizer.hop_size, 4 * config.t3.speech_cond_prompt_len)
+    return AudioEncoderV2._conv_out_len(AudioEncoderV2._conv_out_len(frames, 2), 2)
+
+
 class VoiceEncoderSubmodule(NodeSubmodule):
     """Speaker embedding (LSTM voice encoder over the whole clip) and the S3
     prompt tokens (first ``enc_cond_seconds`` of the clip), as the reference
@@ -144,7 +153,12 @@ class VoiceEncoderSubmodule(NodeSubmodule):
         tokens, lens = self.s3_tokenizer(
             [prompt_wav], max_len=self.config.t3.speech_cond_prompt_len,
         )
-        return speaker_emb, tokens[0, : int(lens[0])]
+        count = int(lens[0])
+        assert count == reference_tokens(wav24.numel(), self.config), (
+            f"the S3 tokenizer made {count} prompt tokens of a {wav24.numel()}-sample clip, "
+            "not the count `reference_tokens` gives a layout to size it by"
+        )
+        return speaker_emb, tokens[0, :count]
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
@@ -433,7 +447,7 @@ class T3Submodule(ARNodeSubmodule):
             return set()
         token = int(outputs[SPEECH_TOKENS][0].reshape(-1)[0].item())
         generated = int(self.request_state(request_id).get("generated", 0))
-        max_new = int(request_info.step_metadata.get("max_new_tokens", request_info.max_tokens))
+        max_new = request_info.max_tokens
         sampling = request_info.resource_configs.get(T3_SAMPLER)
         ignore_eos = bool(getattr(sampling, "ignore_eos", False))
         if (not ignore_eos and token == self.t3.stop_speech_token) or generated >= max_new:

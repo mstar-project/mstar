@@ -17,8 +17,6 @@ is sent.
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import queue
 import threading
 import time
@@ -137,16 +135,12 @@ def test_generate_without_text_is_a_400(server, field):
 
 
 @pytest.mark.parametrize("field", TEXT_FIELDS.values(), ids=TEXT_FIELDS.keys())
-def test_a_streamed_generate_without_text_ends_with_a_400_error_line(server, field):
-    """A stream's status is committed before the data worker runs, so the
-    refusal is its one line, carrying the 400 as every preprocess refusal does."""
+def test_a_streamed_generate_without_text_is_a_400(server, field):
+    """A stream waits for its first chunk, so a preprocess refusal is the status, not a 200."""
     r = _post({**field, "output_modalities": "audio", "model_kwargs": '{"voice": "tara"}'})
 
-    assert r.status_code == 200, r.text
-    (line,) = [json.loads(raw) for raw in r.text.splitlines()]
-    assert line["modality"] == "error"
-    assert line["metadata"] == {"status": 400}
-    assert REFUSAL in base64.b64decode(line["data"]).decode()
+    assert r.status_code == 400, r.text
+    assert REFUSAL in r.json()["detail"]
     assert server.new_requests() == []
 
 
@@ -190,6 +184,6 @@ def test_rust_frontend_submit_without_text_is_a_400(server, text):
 
 
 def test_text_is_still_tokenized_with_its_voice():
-    (ids,) = _orpheus().process_prompt("hi", ["text"], ["audio"], voice="tara")["text_inputs"]
+    (ids,) = _orpheus().process_prompt("hi", ["text"], ["audio"], voice="tara").new_input_tensors["text_inputs"]
     config = OrpheusModelConfig()
     assert ids.tolist() == [config.start_token_id, *map(ord, "tara: hi"), *config.end_token_ids]

@@ -141,6 +141,7 @@ class _Producer:
             request_id=RID, partition="LLM", graph_walk="decode",
             partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0, 1], [[PRODUCER], [CONSUMER]]),
+            loop_caps={},
         )
 
     def step(self, uuid):
@@ -210,6 +211,7 @@ class _EndsLLM:
 def _conductor(passes=1):
     c = object.__new__(Conductor)
     c.model = _EndsLLM(passes)
+    c.producer_triggered_partitions = set()
     c.enable_prof = False
     c.communicator = _Capture()
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}, 1: {"snac_chunk"}}
@@ -260,6 +262,8 @@ def _conduct(c, wgds) -> InputSignals:
 def _consumer(policy):
     """A consumer worker holding one StreamBuffer; reads land at once."""
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     buf = StreamBuffer(1, EDGE, "LLM", policy)
     w.worker_id = CONSUMER
     w._draining_rids = set()

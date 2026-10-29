@@ -91,6 +91,7 @@ def drive(runtime, put, prefills: int, decode_steps: int, inline: bool = False) 
         request_id="r1", partition="default", graph_walk=PREFILL,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     uuid = 100
 
@@ -135,6 +136,7 @@ def expected_counts(reports: list[WorkerGraphsDone]) -> dict[str, int]:
     """What the conductor puts in ``request_complete``, from the real handler."""
     conductor = Conductor.__new__(Conductor)
     conductor.enable_prof = False
+    conductor.producer_triggered_partitions = set()
     request = RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: [WORKER], 1: [WORKER]}, all_worker_graph_ids={0, 1},
@@ -332,6 +334,7 @@ def test_every_rank_reports_the_chunks_it_sent():
     every rank's report rather than only rank 0's."""
     conductor = Conductor.__new__(Conductor)
     conductor.enable_prof = False
+    conductor.producer_triggered_partitions = set()
     request = RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: ["worker_0", "worker_1"]}, all_worker_graph_ids={0},

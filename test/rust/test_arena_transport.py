@@ -286,6 +286,85 @@ def test_orphan_sweep(tmp_path):
                 pass
 
 
+class _IpcCommunicator(_NullCommunicator):
+    """A deployment's communicator: over IPC, so its manager has a namespace."""
+
+    protocol = CommProtocol.IPC
+    ipc_socket_path_prefix = "/tmp/mstar/"
+
+    def _endpoint(self, entity_id):
+        return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
+
+
+def _deployment_manager(entity, shm_dir, token, monkeypatch):
+    monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", token)
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    return ArenaShmCommunicationManager(
+        my_entity_id=entity, hostname="localhost", device="cpu",
+        communicator=_IpcCommunicator(), shm_dir=str(shm_dir),
+    )
+
+
+def test_a_start_in_another_pid_namespace_keeps_live_segments(
+        monkeypatch, tmp_path):
+    """Containers sharing /dev/shm cannot see each other's pids: a second
+    deployment's startup used to unlink every live segment of the first."""
+    a = _deployment_manager("w0", tmp_path, "a" * 16, monkeypatch)
+    x = torch.arange(64, dtype=torch.uint8)
+    infos = a.store_and_return_tensor_info("r", {"x": [x]})
+    a.register_for_send("r", list(infos["x"]))
+    seg_path = a._own_segment_paths[0]
+
+    real_exists, hidden = os.path.exists, f"/proc/{os.getpid()}"
+    monkeypatch.setattr(
+        os.path, "exists", lambda p: p != hidden and real_exists(p))
+    _deployment_manager("w0", tmp_path, "b" * 16, monkeypatch)
+    monkeypatch.setattr(os.path, "exists", real_exists)
+
+    assert os.path.exists(seg_path), "a live neighbour's segment was swept"
+    cons = _deployment_manager("w1", tmp_path, "a" * 16, monkeypatch)
+    cons.start_read_tensors(
+        "r", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])])
+    assert torch.equal(cons.tensor_store.get_tensor(infos["x"][0].uuid), x)
+
+
+def test_a_dead_namespaces_segments_are_swept(monkeypatch, tmp_path):
+    dead = "d" * 12
+    lock = f"/dev/shm/mstar_{dead}.lock"
+    seg = f"/dev/shm/mstar_{dead}_arena_w0_deadbeef.seg0"
+    open(lock, "wb").close()
+    with open(seg, "wb") as f:
+        f.write(b"x" * 64)
+    try:
+        _deployment_manager("sweeper", tmp_path, "c" * 16, monkeypatch)
+        assert not os.path.exists(seg), "a dead namespace's segment was kept"
+        assert not os.path.exists(lock)
+    finally:
+        for p in (seg, lock):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_a_dead_process_in_another_shm_dir_keeps_live_segments(
+        monkeypatch, tmp_path):
+    """One deployment's processes can use different shm_dirs: the unheld lock
+    a dead one leaves in its shm_dir must not let a sweep take the live
+    segments in /dev/shm."""
+    live_dir, dead_dir = tmp_path / "live", tmp_path / "dead"
+    live_dir.mkdir()
+    dead_dir.mkdir()
+    a = _deployment_manager("w0", live_dir, "e" * 16, monkeypatch)
+    infos = a.store_and_return_tensor_info(
+        "r", {"x": [torch.arange(64, dtype=torch.uint8)]})
+    a.register_for_send("r", list(infos["x"]))
+    seg_path = a._own_segment_paths[0]
+    (dead_dir / f"mstar_{a._shm_namespace}.lock").touch()
+
+    _deployment_manager("w0", dead_dir, "f" * 16, monkeypatch)
+    assert os.path.exists(seg_path), "a live process's segment was swept"
+
+
 def test_dead_peer_segments_evicted(tmp_path):
     """A consumer must not accumulate mappings for peer segments whose
     backing file is gone (instance-unique names mean every producer restart
@@ -688,6 +767,119 @@ def test_a_peer_reads_its_own_half_of_a_sharded_edge(tmp_path):
         assert torch.equal(got, expected), f"rank {rank} read the wrong rows"
 
 
+@pytest.mark.parametrize("shape", [
+    pytest.param((4, 3), id="rows"),
+    # Zero-byte rows: both slices are offset 0, nbytes 0; only dims differ.
+    pytest.param((4, 0), id="empty-rows"),
+])
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_two_slices_of_one_tensor_on_one_worker_do_not_alias(tmp_path, backend, shape):
+    """``x`` goes from a TP=1 producer to a TP=2 ``B`` and a TP=4 ``C``, both
+    with rank 0 on worker_1, which so receives rows [0, 2) and row 0 under one
+    producer uuid. Keyed by the uuid alone, ``C`` got ``B``'s rows."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes=["A"], tp_size=1, graph_walks=["decode"], _tp_rank=0),
+            ShardingGroup(nodes=["B"], tp_size=2, graph_walks=["decode"]),
+            ShardingGroup(nodes=["C"], tp_size=4, graph_walks=["decode"]),
+        ],
+        tp_enabled_nodes={"A", "B", "C"},
+        shard_dim={"x": 0},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["worker_0"],
+        NodeAndGraphWalk("B", "decode"): ["worker_1", "worker_2"],
+        NodeAndGraphWalk("C", "decode"): [f"worker_{i}" for i in range(1, 5)],
+    })
+    prod = _manager("worker_0", tmp_path)
+    cons = _manager("worker_1", tmp_path)
+    cons.communicator = _RecordingCommunicator()
+    if backend == "rust":
+        cons.tensor_store = TensorStore(RustTensorBookkeeping())
+    for mgr in (prod, cons):
+        mgr.register_request(7, cfg)
+
+    x = torch.arange(shape[0] * shape[1], dtype=torch.float32).reshape(shape)
+    (info,) = prod.store_and_return_tensor_info(
+        7, {"x": [x]}, node_name="A", graph_walk="decode",
+    )["x"]
+    edges = [
+        cfg.fanout_graph_edges(
+            GraphEdge(next_node=node, name="x", tensor_info=[info]),
+            source_node="A", source_graph_walk="decode", dest_graph_walk="decode",
+        )["worker_1"]
+        for node in ("B", "C")
+    ]
+    prod.register_for_send_uuids(ParallelList([7], [[info.uuid]]))
+    prod.refresh_shm_placement(edges)
+
+    for fut in cons.start_read_tensors(7, edges, graph_walk="decode") or []:
+        fut.result()
+    ready = cons.get_ready_tensors(graph_walk="decode")[7]
+    got = {e.next_node: cons.get_tensor(e.tensor_info[0].uuid) for e in ready}
+    assert torch.equal(got["B"], x[:2])
+    assert torch.equal(got["C"], x[:1]), "C got the slice stored for B"
+    assert [msg.body.successful_tensors for _, msg in cons.communicator.sent] == [
+        {info.uuid: 2}
+    ]
+    for edge in ready:
+        cons.dereference(edge.tensor_info[0].uuid)
+    assert cons.tensor_store.get_all_uuids(7) == []
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_an_edge_mixing_a_reused_and_a_new_slice_is_read_in_full(tmp_path, backend):
+    """``x`` holds a tensor with rows and one with none. ``C``'s slice of the
+    empty one is ``B``'s, so it is reused while its other slice is new: the
+    new one still drops its transit ref."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes=["A"], tp_size=1, graph_walks=["decode"], _tp_rank=0),
+            ShardingGroup(nodes=["B"], tp_size=2, graph_walks=["decode"]),
+            ShardingGroup(nodes=["C"], tp_size=4, graph_walks=["decode"]),
+        ],
+        tp_enabled_nodes={"A", "B", "C"},
+        shard_dim={"x": 0},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["worker_0"],
+        NodeAndGraphWalk("B", "decode"): ["worker_1", "worker_2"],
+        NodeAndGraphWalk("C", "decode"): [f"worker_{i}" for i in range(1, 5)],
+    })
+    prod = _manager("worker_0", tmp_path)
+    cons = _manager("worker_1", tmp_path)
+    cons.communicator = _RecordingCommunicator()
+    if backend == "rust":
+        cons.tensor_store = TensorStore(RustTensorBookkeeping())
+    for mgr in (prod, cons):
+        mgr.register_request(7, cfg)
+
+    full = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    infos = prod.store_and_return_tensor_info(
+        7, {"x": [full, torch.zeros(0, 3)]}, node_name="A", graph_walk="decode",
+    )["x"]
+    edges = [
+        cfg.fanout_graph_edges(
+            GraphEdge(next_node=node, name="x", tensor_info=infos),
+            source_node="A", source_graph_walk="decode", dest_graph_walk="decode",
+        )["worker_1"]
+        for node in ("B", "C")
+    ]
+    prod.register_for_send_uuids(ParallelList([7], [[i.uuid for i in infos]]))
+    prod.refresh_shm_placement(edges)
+
+    for fut in cons.start_read_tensors(7, edges, graph_walk="decode") or []:
+        fut.result()
+    ready = cons.get_ready_tensors(graph_walk="decode")[7]
+    got = {e.next_node: cons.get_tensor(e.tensor_info[0].uuid) for e in ready}
+    assert torch.equal(got["B"], full[:2])
+    assert torch.equal(got["C"], full[:1])
+    for edge in ready:
+        for info in edge.tensor_info:
+            cons.dereference(info.uuid)
+    assert cons.tensor_store.get_all_uuids(7) == [], "a slice kept its transit ref"
+
+
 def test_arena_stages_the_stored_host_copy(tmp_path):
     """A stored host copy is what lands in the arena (a host memcpy, no D2H);
     it differs from the stored tensor only so the test can tell."""
@@ -705,6 +897,30 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
         "r1", [GraphEdge(next_node="B", name="tok", tensor_info=infos["tok"])],
     )
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.bool])
+def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, dtype):
+    """A CPU consumer's tensor is a copy: the producer reclaiming the slot and
+    staging another tensor into it must not change what was read."""
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path)
+    original = (torch.arange(3 * 16 * 24) % 7 == 3) if dtype == torch.bool else (
+        torch.arange(3 * 16 * 24) % 251).to(dtype)
+    original = original.reshape(1, 3, 16, 24)
+    infos = prod.store_and_return_tensor_info("r1", {"img": [original]})
+    prod.register_for_send("r1", infos["img"])
+    (info,) = infos["img"]
+    cons.start_read_tensors("r1", [GraphEdge(next_node="B", name="img", tensor_info=infos["img"])])
+    got = cons.tensor_store.get_tensor(info.uuid)
+    assert got.dtype == dtype and got.shape == original.shape and torch.equal(got, original)
+
+    location = prod._arena_locs[info.uuid]
+    prod._cleanup_by_uuid(info.uuid)
+    again = prod.store_and_return_tensor_info("r2", {"img": [torch.zeros_like(original)]})
+    prod.register_for_send("r2", again["img"])
+    assert prod._arena_locs[again["img"][0].uuid] == location, "the test needs the slot reused"
+    assert torch.equal(got, original), "the read aliased the producer's slot"
 
 
 def _is_mapped(ptr: int) -> bool:

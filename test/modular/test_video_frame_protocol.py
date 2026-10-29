@@ -205,6 +205,11 @@ class _ReadyTensorManager:
         self.dereferenced = []
         self.cleaned = []
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         ready, self.ready = self.ready, {}
         return {
@@ -397,8 +402,9 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.device = "cpu"
     worker.enable_prof = False
     worker.timing_requested = threading.Event()
-    worker._prefix_streams = {}
+    worker._keyed_labels = {}
     worker._live_requests = {}
+    worker._client_edges = frozenset()
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(

@@ -1,7 +1,7 @@
 """Graph, partition and node_groups declarations the conductor cannot serve
 are rejected when it starts, not served wrongly later.
 
-``Model.get_worker_graphs`` refuses: a walk in no partition or in two, a
+``validate_deployment`` refuses: a walk in no partition or in two, a
 partition naming an undefined walk, a node placed by no node_group or by two
 for one walk, a node_group naming an undefined walk, and the stream-driven
 shapes the runtime and conductor can't account for: a self-triggered consumer
@@ -15,7 +15,6 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -37,12 +36,13 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwargs
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mstar.utils.containers import ParallelList
+from mstar.validation import DeploymentError, validate_deployment
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -91,6 +91,10 @@ def _config(tmp_path, node_groups) -> str:
     return str(path)
 
 
+def _validate(model, config_path):
+    return validate_deployment(model, yaml.safe_load(Path(config_path).read_text()), config_path)
+
+
 def _start_conductor(model, config_path, tmp_path, monkeypatch) -> Conductor:
     monkeypatch.setattr(Conductor, "_launch_workers", lambda self: None)
     monkeypatch.setattr(conductor_mod, "make_communicator", lambda **kw: None)
@@ -128,7 +132,7 @@ def test_walk_in_two_partitions_is_rejected(tmp_path):
     ])
     cfg = _config(tmp_path, [{"node_names": ["llm"], "ranks": [0]}])
     with pytest.raises(ValueError, match=r"Graph walk 'decode' is in 2 partitions \['A', 'B'\]"):
-        model.get_worker_graphs(cfg)
+        _validate(model, cfg)
 
 
 def test_partition_naming_an_undefined_walk_is_rejected(tmp_path):
@@ -137,7 +141,7 @@ def test_partition_naming_an_undefined_walk_is_rejected(tmp_path):
     ])
     cfg = _config(tmp_path, [{"node_names": ["llm"], "ranks": [0]}])
     with pytest.raises(ValueError, match=r"Partition 'default' lists graph walks \['decod'\]"):
-        model.get_worker_graphs(cfg)
+        _validate(model, cfg)
 
 
 # -- node_groups --------------------------------------------------------------
@@ -158,7 +162,7 @@ def test_node_in_two_node_groups_is_rejected(tmp_path, monkeypatch):
 def test_node_in_no_node_group_is_rejected(tmp_path):
     cfg = _config(tmp_path, [{"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill"]}])
     with pytest.raises(ValueError, match=r"node 'llm' of graph walk 'decode' is placed by no node_groups entry"):
-        _ToyModel(_prefill_decode).get_worker_graphs(cfg)
+        _validate(_ToyModel(_prefill_decode), cfg)
 
 
 def test_node_group_naming_an_undefined_walk_is_rejected(tmp_path):
@@ -167,7 +171,7 @@ def test_node_group_naming_an_undefined_walk_is_rejected(tmp_path):
         {"node_names": ["llm"], "ranks": [1], "graph_walks": ["decode", "deocde"]},
     ])
     with pytest.raises(ValueError, match=r"node_groups\[1\] \(nodes \['llm'\]\) lists graph_walks \['deocde'\]"):
-        _ToyModel(_prefill_decode).get_worker_graphs(cfg)
+        _validate(_ToyModel(_prefill_decode), cfg)
 
 
 def test_one_node_on_different_ranks_per_walk_is_accepted(tmp_path, monkeypatch):
@@ -183,11 +187,11 @@ def test_one_node_on_different_ranks_per_walk_is_accepted(tmp_path, monkeypatch)
 # -- stream-driven walks ------------------------------------------------------
 
 
-def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=()):
+def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=(), producer=None):
     """Producer partition P streams ``codes`` into consumer partition C."""
     def walks():
         out = {
-            "gen": GraphNode(name="producer", input_names=["prompt"], outputs=[
+            "gen": producer() if producer else GraphNode(name="producer", input_names=["prompt"], outputs=[
                 StreamingGraphEdge(next_node="vocoder", name="codes", target_partition="C"),
             ]),
             "chunk": chunk_walk(),
@@ -242,7 +246,7 @@ def test_self_triggered_consumer_sharing_its_worker_graph_is_rejected(tmp_path):
         r"graph walk 'chunk' of consumer partition 'C' has self-triggered consumers \['vocoder'\] "
         r"\(every input streamed\) among 2 top-level entities \['post', 'vocoder'\] in one worker graph"
     )):
-        _stream_model(_vocoder_then_post).get_worker_graphs(cfg)
+        _validate(_stream_model(_vocoder_then_post), cfg)
 
 
 def _loop_then_post():
@@ -259,7 +263,7 @@ def test_self_triggered_consumer_loop_sharing_its_worker_graph_is_rejected(tmp_p
     input is streamed, so the Loop restarts on the next chunk."""
     cfg = _config(tmp_path, [{"node_names": ["producer", "vocoder", "post"], "ranks": [0]}])
     with pytest.raises(ValueError, match=r"has self-triggered consumers \['chunk_loop'\]"):
-        _stream_model(_loop_then_post).get_worker_graphs(cfg)
+        _validate(_stream_model(_loop_then_post), cfg)
 
 
 class _ChunkWalkRuntime:
@@ -285,6 +289,7 @@ class _ChunkWalkRuntime:
         self.rid = self.rt.add_request(
             request_id="r", partition="C", graph_walk="chunk", partition_worker_graph_ids=ids,
             worker_graph_to_workers=ParallelList(ids, [["worker_0"]] * len(ids)),
+            loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
 
@@ -365,11 +370,9 @@ _TP2 = {"ranks": [1, 2], "tp_size": 2}
     # on one worker the flag is shared, but self-triggered passes still overlap
     (_vocoder_then_post, _ONE, _ONE, False),
     (_gated_vocoder_then_post, _ONE, _ONE, True),
-    (_gated_vocoder_then_post, _TP2, _TP2, True),
     # each node_group picks its own replica, so a request can split across them
     (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, False),
-], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_colocated_tp",
-        "gated_dp_replicas"])
+], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_dp_replicas"])
 def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted, tmp_path, monkeypatch):
     cfg = _config(tmp_path, [
         {"node_names": ["producer"], "ranks": [0]},
@@ -388,6 +391,24 @@ def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted,
         _start_conductor(model, cfg, tmp_path, monkeypatch)
 
 
+def test_colocated_tp_consumer_walk_passes_the_stream_check_but_not_one_lockstep_node(tmp_path):
+    """One TP instance on the same ranks shares the final-stream flag, but two
+    TP node_groups on one worker are two lockstep nodes there, which every
+    worker refused at startup and the conductor now refuses first."""
+    cfg = _config(tmp_path, [
+        {"node_names": ["producer"], "ranks": [0]},
+        {"node_names": ["vocoder"], **_TP2},
+        {"node_names": ["post"], **_TP2},
+    ])
+    with pytest.raises(DeploymentError) as refusal:
+        _validate(_stream_model(_gated_vocoder_then_post, tp_enabled_nodes=["vocoder", "post"]), cfg)
+    assert refusal.value.problems == [
+        f"Multiple parallel nodes ['post', 'vocoder'] found in worker worker_{rank}; current "
+        "implementation requires at most one lockstep-parallel node per worker."
+        for rank in (1, 2)
+    ]
+
+
 def test_consumer_loop_spanning_worker_graphs_is_rejected(tmp_path):
     def looped():
         return Loop(name="chunk_loop", section=_vocoder_then_post(), max_iters=4, outputs=[])
@@ -396,7 +417,7 @@ def test_consumer_loop_spanning_worker_graphs_is_rejected(tmp_path):
         {"node_names": ["post"], "ranks": [1]},
     ])
     with pytest.raises(ValueError, match="consumes a stream and spans 2 worker graphs"):
-        _stream_model(looped).get_worker_graphs(cfg)
+        _validate(_stream_model(looped), cfg)
 
 
 def test_single_node_consumer_walks_are_accepted(tmp_path, monkeypatch):
@@ -417,6 +438,85 @@ def test_single_node_consumer_walks_are_accepted(tmp_path, monkeypatch):
     ])
     c = _start_conductor(_stream_model(_vocoder, tp_enabled_nodes=["vocoder"]), cfg, tmp_path, monkeypatch)
     assert c.node_walk_to_wg[("vocoder", "chunk")].ranks == [1, 2]
+
+
+@pytest.mark.parametrize("producer_tp,vocoder_tp,shard_dim,accepted", [
+    # a gathered stream: the consumer emits each chunk under a uuid its
+    # StreamBuffer never registered, and no chunk is ever released
+    (2, 1, {"codes": 0}, False),
+    # a sliced stream: local streaming hands over the whole tensor
+    (1, 2, {"codes": 0}, False),
+    (2, 2, {"codes": 0}, True),
+    (2, 1, {}, True),
+], ids=["gathered", "sliced", "same_tp", "replicated"])
+def test_sharded_stream_across_tp_sizes_is_rejected(
+    producer_tp, vocoder_tp, shard_dim, accepted, tmp_path, monkeypatch,
+):
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump({
+        "max_seq_len": 64,
+        "node_groups": [
+            {"node_names": ["producer"], "ranks": list(range(producer_tp)), "tp_size": producer_tp},
+            {"node_names": ["vocoder"], "ranks": list(range(producer_tp, producer_tp + vocoder_tp)),
+             "tp_size": vocoder_tp},
+        ],
+        "sharding_config": {"shard_dim": shard_dim},
+    }))
+    model = _stream_model(_vocoder, tp_enabled_nodes=["producer", "vocoder"])
+    if accepted:
+        _start_conductor(model, str(path), tmp_path, monkeypatch)
+        return
+    with pytest.raises(RuntimeError, match=(
+        rf"Streamed signal 'codes' has a shard_dim, but its producer 'producer' in graph walk 'gen' "
+        rf"\(TP {producer_tp}\) and consumer 'vocoder' \(TP {vocoder_tp}\) differ in TP size"
+    )):
+        _start_conductor(model, str(path), tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("accumulated", [False, True], ids=["outputs", "accumulated_outputs"])
+def test_a_loop_streaming_a_sharded_signal_across_tp_sizes_is_rejected(accumulated, tmp_path, monkeypatch):
+    """The stream leaves through the Loop's own outputs, not the inner node's edge."""
+    def generate():
+        stream = StreamingGraphEdge(next_node="vocoder", name="codes", target_partition="C")
+        return Loop(
+            name="generate", max_iters=2,
+            section=GraphNode(name="producer", input_names=["prompt"], outputs=[
+                GraphEdge(next_node=EMPTY_DESTINATION, name="codes"),
+            ]),
+            outputs=[] if accumulated else [stream],
+            accumulated_outputs=[stream] if accumulated else [],
+        )
+
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump({
+        "max_seq_len": 64,
+        "node_groups": [
+            {"node_names": ["producer"], "ranks": [0, 1], "tp_size": 2},
+            {"node_names": ["vocoder"], "ranks": [2]},
+        ],
+        "sharding_config": {"shard_dim": {"codes": 0}},
+    }))
+    model = _stream_model(_vocoder, producer=generate, tp_enabled_nodes=["producer", "vocoder"])
+    match = r"producer 'producer' in graph walk 'gen' \(TP 2\) and consumer 'vocoder' \(TP 1\)"
+    with pytest.raises(RuntimeError, match=match):
+        _start_conductor(model, str(path), tmp_path, monkeypatch)
+
+
+def test_sharded_stream_check_uses_the_walk_that_emits_it():
+    """A producer's TP group can be walk-specific: only the emitting walk's
+    size counts, whichever way the other walk's size would tip it."""
+    from mstar.distributed.base import ShardingGroup
+
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes={"producer"}, tp_size=2, graph_walks={"warmup"}),
+            ShardingGroup(nodes={"vocoder"}, tp_size=2),
+        ],
+        tp_enabled_nodes={"producer", "vocoder"}, shard_dim={"codes": 0},
+    )
+    with pytest.raises(RuntimeError, match=r"in graph walk 'gen' \(TP 1\) and consumer 'vocoder' \(TP 2\)"):
+        cfg.assert_streams_keep_tp_size([("codes", "producer", "gen", "vocoder")])
+    cfg.assert_streams_keep_tp_size([("codes", "producer", "warmup", "vocoder")])
 
 
 def test_conductor_driven_walk_of_a_consumer_partition_is_accepted(tmp_path, monkeypatch):
@@ -470,7 +570,7 @@ def test_loop_member_feeding_a_successor_in_its_worker_graph_is_rejected(tmp_pat
         r"graph walk 'w': node 'step' of Loop 'loop' sends 'y' to 'post', outside the Loop "
         r"in the same worker graph.*Loop.accumulated_outputs"
     )):
-        model.get_worker_graphs(cfg)
+        _validate(model, cfg)
 
 
 class _LoopWorker:
@@ -502,6 +602,7 @@ class _LoopWorker:
         self.rid = self.rt.add_request(
             request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+            loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
         _ingest(self.rt, self.rid, [GraphEdge(next_node="step", name="x")])
@@ -534,7 +635,7 @@ class _LoopWorker:
         ))
         if self.runtime == "rust":
             plan = rt._rust.take_send_plan(out.completion_id)
-            return node, any(r == rid and wgs for r, wgs, _ in plan.completed)
+            return node, any(r == rid and wgs for r, wgs, *_ in plan.completed)
         done = bool(rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids)
         rt.send_outputs(SendInput(
             completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
@@ -578,7 +679,11 @@ def _constructed(name, model_kwargs, **overrides):
 
 def _bagel(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.bagel.bagel_model import BagelModel
-    return _bare(BagelModel, config=SimpleNamespace(num_timesteps=50))
+    from mstar.model.bagel.config import BagelAutoEncoderConfig, BagelModelConfig, BagelViTConfig
+    config = BagelModelConfig(vae_config=BagelAutoEncoderConfig(), vit_config=BagelViTConfig())
+    # the placement flags as __init__ leaves them; get_worker_graphs sets them
+    return _bare(BagelModel, config=config, _has_cfg_parallel=False,
+                 _has_llm_disaggregation=False, _image_gen_remote_handoff=False)
 
 
 def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):
@@ -589,6 +694,13 @@ def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):
     config.max_new_tokens_limit = model_kwargs.get("max_new_tokens_limit", config.max_new_tokens_limit)
     return _bare(ChatterboxModel, config=config, _t3_dtype=torch.bfloat16,
                  voices_dir=None, local_dir="/nonexistent", _shared={})
+
+
+def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
+    # The tiny test config stands in for the pinned checkpoint metadata; the graph doesn't depend on its sizes.
+    fixture = ROOT / "mstar/model/command_a_plus/tests/fixtures/tiny_config.json"
+    (tmp_path / "config.json").write_text(fixture.read_text())
+    return _constructed(name, model_kwargs, checkpoint_dir=str(tmp_path), max_seq_len=64)
 
 
 def _cosmos3(name, model_kwargs, tmp_path, monkeypatch):
@@ -640,9 +752,27 @@ def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(OrpheusModel, config=OrpheusModelConfig())
 
 
+def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.ltx2_5.config import LTX25Config
+    model = _constructed(name, model_kwargs)
+    model.set_config(LTX25Config())
+    return model
+
+
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
+    """Small text-only shapes: the resource rules read the layer and head
+    counts, not their sizes."""
+    from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-    return _bare(Qwen3_5DenseModel, config=SimpleNamespace(max_position_embeddings=262144))
+    config = Qwen3_5Config(
+        num_hidden_layers=4, hidden_size=256, intermediate_size=512,
+        layer_types=[LINEAR_ATTENTION] * 3 + [FULL_ATTENTION],
+        num_attention_heads=8, num_key_value_heads=2, head_dim=128,
+        linear_num_key_heads=4, linear_num_value_heads=8, linear_key_head_dim=128,
+        linear_value_head_dim=128, linear_conv_kernel_dim=4,
+        vocab_size=1024, rms_norm_eps=1e-6, max_position_embeddings=262144,
+    )
+    return _bare(Qwen3_5DenseModel, config=config, vision_config=None)
 
 
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):
@@ -670,9 +800,43 @@ def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size))
 
 
+def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
+    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
+    return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
+
+
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
     return _bare(WhisperModel, config=WhisperModelConfig())
+
+
+def _canary(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary.canary_model import CanaryModel
+    from mstar.model.canary.config import CanaryModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    config = CanaryModelConfig(encoder=FastConformerConfig())
+    return _bare(CanaryModel, config=config)
+
+
+def _canary_qwen(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.canary_qwen.config import CanaryQwenModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    return _bare(CanaryQwenModel, config=CanaryQwenModelConfig(
+        encoder=FastConformerConfig(), llm=Qwen3LMConfig(), llm_repo="Qwen/Qwen3-1.7B",
+    ))
+
+
+def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.fastconformer import FastConformerConfig
+    from mstar.model.components.transducer import TransducerConfig
+    from mstar.model.parakeet.config import ParakeetModelConfig
+    from mstar.model.parakeet.parakeet_model import ParakeetModel
+    # Nemotron ASR conditions the transducer on a language prompt
+    transducer = TransducerConfig(num_prompts=128 if name == "nemotron_asr" else 0)
+    return _bare(ParakeetModel, config=ParakeetModelConfig(name, FastConformerConfig(), transducer))
 
 
 def _default(name, model_kwargs, tmp_path, monkeypatch):
@@ -681,17 +845,23 @@ def _default(name, model_kwargs, tmp_path, monkeypatch):
 
 _FACTORIES = {
     "BagelModel": _bagel,
+    "CanaryModel": _canary,
+    "CanaryQwenModel": _canary_qwen,
     "ChatterboxModel": _chatterbox,
+    "CommandAPlusModel": _command_a_plus,
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
     "Flux2KleinModel": _flux2,
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
+    "LTX25Model": _ltx2_5,
     "OrpheusModel": _orpheus,
+    "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
+    "Qwen3ASRModel": _qwen3_asr,
     "WhisperModel": _whisper,
     # constructed directly: NemotronDuplexModel, OmniVoiceModel, Pi05Model,
     # VJepa2Model, VJepa2ACModel, Wan22Model, WaypointModel

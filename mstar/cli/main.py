@@ -26,6 +26,7 @@ from mstar.utils.socket_prefix import per_port_socket_prefix
 DEFAULT_CONFIGS: dict[str, str] = {
     "bagel": "bagel_single_gpu.yaml",
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
+    "command_a_plus": "command_a_plus_tp4.yaml",
     "cosmos3": "cosmos3_nano.yaml",
     "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_edge": "cosmos3_edge.yaml",
@@ -48,13 +49,21 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
-    # ASR (Beta, un-optimized) — audio in, transcript out.
+    # ASR — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
+    "whisper_large_v3_turbo": "whisper_large_v3_turbo.yaml",
+    "qwen3_asr": "qwen3_asr.yaml",
+    "qwen3_asr_realtime": "qwen3_asr_realtime.yaml",
     "higgs_audio": "higgs_audio.yaml",
     "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m.yaml",
     "omnilingual_asr_ctc_1b": "omnilingual_asr_ctc_1b.yaml",
     "omnilingual_asr_ctc_3b": "omnilingual_asr_ctc_3b.yaml",
     "omnilingual_asr_ctc_7b": "omnilingual_asr_ctc_7b.yaml",
+    # ASR: NVIDIA's FastConformer models, batched and captured.
+    "canary": "canary.yaml",
+    "canary_qwen": "canary_qwen.yaml",
+    "parakeet": "parakeet.yaml",
+    "nemotron_asr": "nemotron_asr.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
     "lingbot_world_1_3b": "lingbot_world_1_3b.yaml",
@@ -64,6 +73,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "ltx2_5": "ltx2_5.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
+    "glm52": "glm52_tp8.yaml",
 }
 
 # qwen 3.5 series (dense)
@@ -134,7 +144,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         "    from mstar import MStarClient",
         f"    client = MStarClient(\"{base}\"{sdk_key})",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni"):
+    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus"):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
@@ -184,13 +194,17 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
-    if model in ("whisper_large", "higgs_audio") or model.startswith("omnilingual_asr_ctc_"):
+    if model in ("whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
+                 "canary", "canary_qwen", "parakeet", "nemotron_asr"):
+        lines.append("    print(client.transcribe(\"speech.wav\", language=\"en\"))")
+    if model.startswith("omnilingual_asr_ctc_"):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
                      "input_modalities=(\"audio\",\"text\"))")
         lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
+                 "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
                  "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
@@ -205,6 +219,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
             lines.append("    oai.images.generate(model=\"bagel\", prompt=\"a cat\")")
         if model in ("cosmos3", "cosmos3_super"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
+        if model in ("whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime"):
+            lines.append(f"    oai.audio.transcriptions.create(model=\"{model}\", "
+                         "file=open(\"speech.wav\", \"rb\"), language=\"en\")")
         if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
         if model == "ltx2_5":
@@ -223,6 +240,8 @@ def _serve(args: argparse.Namespace) -> None:
     config = _resolve_config(args.model, args.config)
     if args.gpus is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    if args.compile_level is not None:
+        os.environ["MSTAR_COMPILE_LEVEL"] = str(args.compile_level)
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
     socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
@@ -278,6 +297,12 @@ def build_parser() -> argparse.ArgumentParser:
              "and /metrics (default: MSTAR_API_KEY; unset means no check)",
     )
     serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
+    serve.add_argument(
+        # unset leaves MSTAR_COMPILE_LEVEL alone, whose own default is 1
+        "-O", "--compile-level", dest="compile_level", type=int, default=None, choices=[0, 1, 2],
+        help="how much captured forwards' compiles tune (sets MSTAR_COMPILE_LEVEL): -O0 no tuning, "
+             "fastest start; -O1 (default) coordinate descent; -O2 full max-autotune",
+    )
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
     serve.add_argument("--socket-path-prefix", default=None, help="ZMQ IPC socket prefix")
@@ -309,7 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--rust-frontend-bin", default=None,
         help="path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
-             "$PATH, then rust/server/target/release)",
+             "the environment's scripts dir, $PATH, then "
+             "rust/server/target/release)",
     )
     serve.set_defaults(func=_serve)
     return parser
