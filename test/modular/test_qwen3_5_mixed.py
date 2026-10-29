@@ -14,7 +14,8 @@ from mstar.model.submodule_base import ARNodeInputs
 
 
 def test_text_prefill_and_decode_share_the_mixed_walk():
-    assert Qwen3_5DenseModel.get_combined_graph_walks(None) == {
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    assert model.get_combined_graph_walks() == {
         "LLM": {LLM_MIXED: {"prefill_text", "decode"}},
     }
 
@@ -88,3 +89,17 @@ def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
     # decode rows count inside the budget, and a step over a bucket pads to the next one up
     assert LLMSubmodule.MAX_BATCH_TOKENS in LLMSubmodule.PREFILL_TOKEN_BUCKETS
 
+
+def test_a_speculative_node_chunks_its_prefill_and_names_no_mixed_walk():
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    model.config = SimpleNamespace(max_position_embeddings=4096)
+    model.vision_config = None
+    model.num_draft_tokens = 2
+    policies = model.chunking_policy_of()
+
+    assert policies[("LLM", "prefill_text")].chunkable
+    # a verify row is k + 1 tokens, so there is no mixed walk to carry a budget for
+    assert model.get_combined_graph_walks() == {}
+    assert ("LLM", LLM_MIXED) not in policies
