@@ -219,6 +219,9 @@ class AiterGDNKernels(GDNKernels):
             return FlyDSLDecode(self)
         return AiterSequentialDecode(self)
 
+    def verify(self) -> GDNPrefillKernel:
+        return AiterVerify(self)
+
     # Shared state
 
     def dt_bias_as(self, dt_bias: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -466,6 +469,43 @@ class AiterSequentialDecode(GDNDecodeKernel):
             cu_seqlens=self._kernels.row_offsets(n, q.device),
             # one token per row, so a 1-D map is each row's read and write slot
             ssm_state_indices=plan.slots,
+            use_qk_l2norm_in_kernel=self._kernels.qk_l2norm,
+            core_attn_out=out,
+        )
+        return out
+
+
+class AiterVerify(GDNPrefillKernel):
+    """The sequential kernel over a speculative verify step: each row's k + 1
+    tokens from the state its last step accepted (``num_accepted_tokens``
+    picks the column of the row's slot map), the state after every token kept
+    in its own slot (see ``GDNVerifyPlan``)."""
+
+    takes_strided_inputs = True
+
+    def __init__(self, kernels: AiterGDNKernels):
+        self._kernels = kernels
+        self.qk_l2norm_in_kernel = kernels.qk_l2norm
+
+    def run(self, plan, q, k, v, a, b, state, a_log, dt_bias):
+        from aiter.ops.triton.gated_delta_net import (
+            fused_rearrange_sigmoid_gated_delta_rule,
+        )
+
+        n = q.shape[0]
+        qkv = torch.cat((q.reshape(n, -1), k.reshape(n, -1), v.reshape(n, -1)), dim=-1)
+        # skipped (padding) rows are never written; zeros keep them finite
+        out = torch.zeros((n, v.shape[1], v.shape[2]), dtype=q.dtype, device=q.device)
+        fused_rearrange_sigmoid_gated_delta_rule(
+            A_log=a_log, a=a, b=b, dt_bias=dt_bias, qkv=qkv,
+            key_dim=q.shape[1] * q.shape[2], value_dim=v.shape[1] * v.shape[2],
+            head_k_dim=q.shape[2], head_v_dim=v.shape[2],
+            scale=self._kernels.scale,
+            initial_state=state,
+            inplace_final_state=True,
+            cu_seqlens=plan.cu_seqlens,
+            ssm_state_indices=plan.slot_map,
+            num_accepted_tokens=plan.num_accepted,
             use_qk_l2norm_in_kernel=self._kernels.qk_l2norm,
             core_attn_out=out,
         )

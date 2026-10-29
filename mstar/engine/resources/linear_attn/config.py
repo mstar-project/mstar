@@ -69,13 +69,20 @@ class LinearAttnConfig:
     # chunked prefill (FlashInfer's) has no bound and ignores this.
     max_captured_prefill_tokens: int | None = None
 
+    # GDN only: the speculative-decoding resource whose verify steps this one
+    # runs, k + 1 tokens a row from each request's last accepted state
+    spec_decode: str | None = None
+
 
 @dataclass
 class LinearAttnSpec(NodeResourceSpec):
     config: LinearAttnConfig
 
     def depends_on(self) -> set[str]:
-        return {self.config.recurrent_state}
+        keys = {self.config.recurrent_state}
+        if self.config.spec_decode is not None:
+            keys.add(self.config.spec_decode)
+        return keys
 
     @property
     def writes_prefix_snapshots(self) -> bool:
