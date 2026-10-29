@@ -163,6 +163,6 @@ def test_a_finished_consumer_is_not_told_its_producer_is_done():
     hand it empty chunks to run on."""
     c, req, rec = _conductor()
     req.partition_states["C"].is_done = True
-    c._process_done_forward("r", "B", partition_done_from_worker=True)
+    _done_forward(c, req, "B", partition_done=True)
     assert req.streaming_connections["B->C"].producer_done is True
     assert rec.producer_done == []

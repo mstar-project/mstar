@@ -69,8 +69,9 @@ class StopCheck(NamedTuple):
 
 
 class BatchedStopCheck(NamedTuple):
-    """``StopCheck`` for ``check_stop_batched``: rid -> loops to stop and
-    rid -> withheld outputs, rids with none left out of each."""
+    """``StopCheck`` for ``check_stop_batched``: rid -> what ``check_stop``
+    returns for it (loop names or ``END_PARTITION``) and rid -> withheld
+    outputs, rids with none left out of each."""
 
     stops: dict[str, set[str]]
     withheld: dict[str, tuple[str, ...]]
