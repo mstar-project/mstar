@@ -246,9 +246,10 @@ class SpanCursor:
 @dataclass
 class CacheStream:
     """(request, label) cache stream metadata"""
-    # an extent of the manager's `PageTable`, read like a list; replace it
-    # with `.assign`, never by assigning a list
-    page_indices: StreamPages = field(default_factory=StreamPages)
+    # an extent of the manager's `PageTable` (no default: a plan reads its
+    # offset against that pool), read like a list; replace it with
+    # `.assign`, never by assigning a list
+    page_indices: StreamPages
     stored_len: int = 0
     position: int = 0
     # tokens compacted out of the front by `release_oldest` so far; the
@@ -496,11 +497,11 @@ class _DecodePlanCache:
     """The last leased decode plan, as `_fast_decode_plan` continues it."""
 
     __slots__ = (
-        "step_segments", "real_segments", "n_real", "pad_layout", "combined_labels", "views", "epoch", "pending",
+        "step_segments", "real_segments", "n_real", "pad_layout", "combined_labels", "outputs", "epoch", "pending",
         "derived", "_rows",
     )
 
-    def __init__(self, step_segments, real_segments, n_real, pad_layout, combined_labels, views, epoch):
+    def __init__(self, step_segments, real_segments, n_real, pad_layout, combined_labels, outputs, epoch):
         # the planned step's own segments tuple: a commit of that object is the
         # one commit the next plan may assume
         self.step_segments = step_segments
@@ -511,8 +512,8 @@ class _DecodePlanCache:
         self.pad_layout = pad_layout
         # the plan labels the views were built for
         self.combined_labels = combined_labels
-        # the full plan's views per label, the source of `derived`
-        self.views = views
+        # the full plan's outputs per label: their views are the source of `derived`
+        self.outputs = outputs
         self.epoch = epoch
         self.pending = 0
         self.derived: dict | None = None
@@ -726,6 +727,16 @@ class KVManager(AttentionResource):
         # all at this one max length so they outlive any single bucket. Every
         # runner capturing against this node calls in, so keep the largest
         self._cg_max_seq_len = max(self._cg_max_seq_len, max_seq_len)
+        # sink rows' pages for any captured length, so a plan rarely grows them
+        self._extend_sink_pages(-(-max_seq_len // self.kv_cache.page_size))
+
+    def _extend_sink_pages(self, need: int) -> None:
+        # the sink run is an extent of the shared pool, which a plan on the
+        # plan thread must not grow while the main thread allocates from it
+        with self._lock:
+            sink_pages = self._sink_pages
+            if len(sink_pages) < need:
+                sink_pages.extend([SINK_PAGE] * (need - len(sink_pages)))
 
     def _static_plan_state(self, slot: int, label: str, capture_len: int) -> KVPlanState:
         """The captured write addressing of a slot's ``capture_len``-token
@@ -743,6 +754,12 @@ class KVManager(AttentionResource):
             if base is None:
                 base = self._static_plan_buffers[(slot, label)] = _SlotBuffer(
                     torch.zeros(2 * self._cg_max_seq_len, dtype=torch.long, device=self._device),
+                )
+            if 2 * capture_len > base.buffer.numel():
+                # sized by an earlier, shorter build_accelerator_graph_buffers
+                raise ValueError(
+                    f"a {capture_len}-token bucket is past slot {slot}'s "
+                    f"{base.buffer.numel() // 2}-token buffer"
                 )
             # no fill here: only the stager writes the buffer, and every
             # replay is staged first
@@ -2214,18 +2231,16 @@ class KVManager(AttentionResource):
         The packed path needs the indptrs on device and ~a dozen kernels to
         unpack them per token. A decode step's slot is just the end of each
         stream, so build it in the same CPU pass the views came from and send
-        it over as one H2D.
+        it over as one page-locked H2D, as an eager packed write's is.
         """
         if pages is None or offsets is None:
             pages, offsets = self._decode_locations(views)
-        locations = torch.tensor(
-            np.array([pages, offsets], np.int64)
-        ).to(self._device, non_blocking=True)
-        return KVPlanState(
-            token_to_page=locations[0],
-            token_to_cache=locations[1],
-            total_tokens=len(pages),
-        )
+        n = len(pages)
+        host = np.empty(2 * n, np.int64)
+        host[:n], host[n:] = pages, offsets
+        both = torch.empty(2 * n, dtype=torch.long, device=self._device)
+        self._plan_stager.copy_(both, host)
+        return KVPlanState(token_to_page=both[:n], token_to_cache=both[n:], total_tokens=n)
 
     def _decode_locations(
         self, views: list[SequenceView],
@@ -2417,7 +2432,7 @@ class KVManager(AttentionResource):
             sink_pages = self._sink_pages
             need = -(-max(spans[i] for i in sink_rows) // page_size)
             if len(sink_pages) < need:
-                sink_pages.extend([SINK_PAGE] * (need - len(sink_pages)))
+                self._extend_sink_pages(need)
             for i in sink_rows:
                 offs[i] = sink_pages.off
                 held[i] = need
@@ -2527,8 +2542,8 @@ class KVManager(AttentionResource):
     ) -> None:
         """Keep a leased decode step's plan so the next step of the same rows
         can be planned off it (`_fast_decode_plan`). O(1): the full plan's
-        views are kept as they are and the per-row arrays are derived at the
-        first hit. Any other plan leaves the cache alone; the epoch and the
+        outputs are kept, and their views and the per-row arrays are built at
+        the first hit. Any other plan leaves the cache alone; the epoch and the
         commit bookkeeping say whether it still describes the streams."""
         lease = ctx.slot_lease
         if lease is None or ctx.capture or step.pre_forks or step.post_forks or step.sink:
@@ -2543,17 +2558,19 @@ class KVManager(AttentionResource):
         self._decode_plan_cache = _DecodePlanCache(
             step_segments=step.segments, real_segments=step.segments[:n_real],
             n_real=n_real, pad_layout=pad_layout, combined_labels=dict(step.combined_labels),
-            views={label: out.views for label, out in res.items()},
+            outputs=dict(res.items()),
             epoch=self._plan_epoch,
         )
 
     def _derive_rows(self, cache: _DecodePlanCache, ctx: StepContext) -> dict | None:
         """The per-label row arrays of a cached plan, from its views (once,
-        at the first hit)."""
+        at the first hit: a plan's views are built from its own column
+        arrays, which nothing reuses)."""
         page_size = self.kv_cache.page_size
         real_rows = cache.rows
         derived: dict[str, _LabelRows] = {}
-        for label, views in cache.views.items():
+        for label, out in cache.outputs.items():
+            views = out.views
             n_real = 0
             for v in views:
                 if not ctx.is_real_row(v.request_id) and v.request_id not in self._streams:

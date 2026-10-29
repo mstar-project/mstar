@@ -48,7 +48,9 @@ class PageTable:
     Concurrency is the KV manager's, as it was for the lists: a stream is not
     mutated while a step that holds it is planned, so a gather never reads an
     extent being moved. Growing the pool swaps in a new array, and a gather
-    that took the old one still reads the same pages from it.
+    that took the old one still reads the same pages from it. Every caller
+    that allocates (or grows an extent) holds the manager's ``_lock``: the
+    plan thread and the main thread both do.
     """
 
     def __init__(self, capacity: int = 1024):
@@ -141,9 +143,8 @@ class StreamPages:
 
     __slots__ = ("_table", "off", "cap", "n")
 
-    def __init__(self, table: PageTable | None = None):
-        # a stream built outside a KV manager (tests) gets a table of its own
-        self._table = table if table is not None else PageTable(_MIN_CAPACITY)
+    def __init__(self, table: PageTable):
+        self._table = table
         self.off = 0
         self.cap = 0
         self.n = 0

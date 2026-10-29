@@ -289,6 +289,10 @@ class ExecutingBatch:
 
     # Populated on preplan
     preplan_event: Any | None = None
+    # A discarded pre-plan's event: its copies may still be in flight into
+    # buffers a re-plan skips as already holding those bytes, so the forward
+    # waits on it as on a kept pre-plan's
+    discarded_preplan_event: Any | None = None
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
@@ -1347,6 +1351,7 @@ class Engine:
             raise
         finally:
             batch.preplan_event = None
+            batch.discarded_preplan_event = None
             batch.release_waiters()
             if nvtx:
                 range_pop()
@@ -1782,7 +1787,8 @@ class Engine:
         graph_walk = batch.step_context.graph_walk
         if lease is not None:
             return cg_runner.run_forward(
-                lease, preprocessed, plan_done_event=batch.preplan_event,
+                lease, preprocessed,
+                plan_done_event=batch.preplan_event or batch.discarded_preplan_event,
                 launch_started_event=release_event,
             )
         if release_event is not None:
@@ -2556,6 +2562,8 @@ class Engine:
                 # a discarded pre-plan falls back to inline plan; mark it so the
                 # cost is visible next to the nvtx ranges
                 mark(f"engine.preplan_discarded.{batch.node_name}")
+            if batch.preplan_event is not None:
+                batch.discarded_preplan_event = batch.preplan_event
             batch.preplan_event = None
             batch.preplanned_rids = None
             # The step was declared over the rows the pre-plan saw: template

@@ -1915,7 +1915,9 @@ class ScalarRows:
         # per slot: a pre-plan may gather one slot while the gpu thread gathers the other
         self._host = [np.zeros(size, np.uint8) for _ in range(cg_slots)]
         self._mirrors = [H2DMirror() for _ in range(cg_slots)]
-        self._stager = PinnedStager(torch.uint8, numel=size)
+        # room for several rows a segment, so most gathers leave none (each
+        # segment left costs an event record)
+        self._stager = PinnedStager(torch.uint8, numel=8 * size)
 
     def gather(self, rows: np.ndarray, padded_bs: int, cg_slot: int) -> None:
         """Rows ``rows`` of every buffer's master into ``cg_slot``'s row. The
@@ -1925,7 +1927,7 @@ class ScalarRows:
         host = self._host[slot]
         for buf, (start, _) in zip(self.buffers, self.regions, strict=True):
             master = buf.master
-            host[start:start + padded_bs * master.itemsize].view(master.dtype)[:] = master[rows]
+            np.take(master, rows, out=host[start:start + padded_bs * master.itemsize].view(master.dtype))
         self._stager.copy_(self.rows[slot], host, mirror=self._mirrors[slot])
 
 

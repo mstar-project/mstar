@@ -13,7 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from functools import cached_property, partial
+from functools import cache, cached_property, partial
 from time import sleep
 from types import MappingProxyType
 from typing import NamedTuple
@@ -356,6 +356,7 @@ class _LazyPerRid:
 
 
 
+@cache  # (node, walk) pairs are few
 def _step_key(node_name: str, graph_walk: str) -> str:
     """``step.<node>.<walk>``, as a phase name (``benchmark/worker_phases``
     reads names of word characters and dots)."""
