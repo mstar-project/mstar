@@ -3,12 +3,15 @@
 Architecture (4 nodes; nothing here is cached across steps):
     text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
     vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
-    dit          - dense 5B video DiT; CFG as one batch-2 forward,
-                   UniPC (bh2, order 2, flow prediction) run inline; its
-                   attention runs on the engine's ragged (cacheless)
+    dit          - dense 5B video DiT; CFG as one forward over both guidance
+                   branches, UniPC (bh2, order 2, flow prediction) run inline;
+                   its attention runs on the engine's ragged (cacheless)
                    attention resources, one for the self-attention over each
                    guidance branch's video tokens and one for the
-                   cross-attention over the text
+                   cross-attention over the text. ``dit_loop`` picks the
+                   submodule: ``scaffold`` (default) is the DiT scaffold's loop,
+                   which batches equal shapes and replays a captured graph per
+                   served shape; ``legacy`` is the bit-exact one-request loop
     vae_decoder  - Wan2.2-VAE latent -> pixel decode
 
 Graph walks (4):
@@ -26,7 +29,7 @@ The walk sequence is fixed up front from the input modalities and stepped throug
     I2V: encode_text -> encode_image -> video_gen_i2v
 
 The denoise loop is dynamic: ``Loop.max_iters`` is the config ceiling, and the
-request's ``num_inference_steps`` stops it via ``Wan22DitSubmodule.check_stop``.
+request's ``num_inference_steps`` stops it via the dit submodule's ``check_stop``.
 """
 
 import html
@@ -34,6 +37,7 @@ import io
 import logging
 import os
 import re
+from collections.abc import Hashable
 from fractions import Fraction
 
 import torch
@@ -64,7 +68,11 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import DIT_ATTN, DIT_XATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
+    UNIPC_LAST_SAMPLE,
+    UNIPC_MODEL_OUTPUTS,
+    Wan22DenoiseSubmodule,
     Wan22DitSubmodule,
+    Wan22Shape,
     Wan22TextEncoderSubmodule,
     Wan22VaeDecoderSubmodule,
     Wan22VaeEncoderSubmodule,
@@ -75,6 +83,9 @@ logger = logging.getLogger(__name__)
 
 # libx264, which postprocess encodes with, refuses a frame wider or taller than this
 _MP4_MAX_SIDE = 16384
+
+# Values of the ``dit_loop`` serving knob (see the module docstring).
+DIT_LOOPS = ("scaffold", "legacy")
 
 
 class Wan22Model(Model):
@@ -100,6 +111,10 @@ class Wan22Model(Model):
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
         attention_backend: str = "auto",
+        dit_loop: str = "scaffold",
+        accelerator_graph: bool = True,
+        capture_batch_sizes: list[int] | None = None,
+        max_batch_size: int = 2,
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -118,6 +133,14 @@ class Wan22Model(Model):
         # the DiT's attention: the engine's ragged resources (the platform's kernel), or torch's SDPA inline
         self.use_ragged_attention = uses_ragged_attention(attention_backend)
         self.attention_backend = attention_backend
+        if dit_loop not in DIT_LOOPS:
+            raise ValueError(f"Wan2.2 dit_loop must be one of {DIT_LOOPS}, got {dit_loop!r}.")
+        self.dit_loop = dit_loop
+        # scaffold loop only: a captured graph per compiled shape (compile_dit_sizes), T2V and
+        # I2V with CFG, at each of these batch sizes; the batch never exceeds max_batch_size
+        self.accelerator_graph = bool(accelerator_graph)
+        self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2])]
+        self.max_batch_size = self._require_positive_int("max_batch_size", max_batch_size)
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
@@ -206,30 +229,21 @@ class Wan22Model(Model):
         dit_inputs = ["text_embeds_pos", "text_embeds_neg"]
         if i2v:
             dit_inputs.append("image_latent")
-        # Loop-carried state: see Wan22DitSubmodule's docstring for the
-        # definitive shape/dtype inventory (latents, 0-based step index, the
-        # order-2 UniPC ring buffer, and the corrector's last_sample).
-        dit_inputs += [
-            "latents",
-            "time_index",
-            "unipc_model_outputs",
-            "unipc_last_sample",
-        ]
+        # Loop-carried state: see the dit submodule's docstring for the shape/dtype
+        # inventory (latents, the order-2 UniPC ring buffer and the corrector's
+        # last_sample; the legacy loop also carries its step index).
+        loop_back = self.loop_back_names()
+        dit_inputs += loop_back
 
         denoise_loop = Loop(
             name=DENOISE_LOOP_NAME,
             section=GraphNode(
                 name="dit",
                 input_names=dit_inputs,
-                outputs=[
-                    GraphEdge(next_node="dit", name="latents"),
-                    GraphEdge(next_node="dit", name="time_index"),
-                    GraphEdge(next_node="dit", name="unipc_model_outputs"),
-                    GraphEdge(next_node="dit", name="unipc_last_sample"),
-                ],
+                outputs=[GraphEdge(next_node="dit", name=name) for name in loop_back],
                 # Async scheduling may dispatch an iteration past the stop
-                # check_stop registers; Wan22DitSubmodule.prepare_inputs vetoes
-                # the overshoot (None -> the engine skips that forward).
+                # check_stop registers; the dit's prepare_inputs vetoes the
+                # overshoot (None -> the engine skips that forward).
                 enable_async_scheduling=True,
             ),
             # Ceiling only; the request's step count stops the loop early.
@@ -653,13 +667,30 @@ class Wan22Model(Model):
             edge = GraphEdge(next_node="dit", name=name)
             edge.tensor_info = persist_signals.get(name, [])
             inputs.append(edge)
-        inputs += [
-            GraphEdge(next_node="dit", name="latents"),
-            GraphEdge(next_node="dit", name="time_index"),
-            GraphEdge(next_node="dit", name="unipc_model_outputs"),
-            GraphEdge(next_node="dit", name="unipc_last_sample"),
-        ]
+        inputs += [GraphEdge(next_node="dit", name=name) for name in self.loop_back_names()]
         return inputs
+
+    def loop_back_names(self) -> list[str]:
+        """The denoise loop's loop-back edges, the sample first."""
+        if self.dit_loop == "legacy":
+            return ["latents", "time_index", UNIPC_MODEL_OUTPUTS, UNIPC_LAST_SAMPLE]
+        return ["latents", UNIPC_MODEL_OUTPUTS, UNIPC_LAST_SAMPLE]
+
+    def capture_buckets(self) -> list[tuple[str, Hashable]]:
+        """``(walk, Wan22Shape)`` per compiled shape, for T2V and I2V with CFG on (the
+        default guidance): the scaffold loop's captured graphs."""
+        if self.dit_loop != "scaffold" or not self.accelerator_graph:
+            return []
+        cfg = self.config
+        p_t, p_h, p_w = cfg.patch_size
+        buckets = []
+        for grid in sorted(cfg.compile_dit_grids()):
+            tokens = (grid[0] // p_t) * (grid[1] // p_h) * (grid[2] // p_w)
+            for walk, i2v in ((self.VIDEO_GEN_WALK, False), (self.VIDEO_GEN_I2V_WALK, True)):
+                buckets.append((walk, Wan22Shape(
+                    grid=grid, text_len=cfg.text_max_seq_len, cfg=True, i2v=i2v, video_tokens=tokens,
+                )))
+        return buckets
 
     def get_partition_forward_pass_args(
         self,
@@ -763,7 +794,13 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config, use_ragged_attention=self.use_ragged_attention)
+            if self.dit_loop == "legacy":
+                return Wan22DitSubmodule(transformer, self.config, use_ragged_attention=self.use_ragged_attention)
+            return Wan22DenoiseSubmodule(
+                transformer, self.config, use_ragged_attention=self.use_ragged_attention,
+                max_batch_size=self.max_batch_size, capture_buckets=self.capture_buckets(),
+                capture_batch_sizes=self.capture_batch_sizes,
+            )
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 
