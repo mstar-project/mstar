@@ -186,9 +186,9 @@ class IncrementalDecoder(nn.Module):
                 y = _tconv_gemm(xs, c).unflatten(2, (2, stride))       # [B, 1 + T, 2, stride, C]
                 y = y[:, 1:, 0] + y[:, :-1, 1]
                 return y.flatten(1, 2) + c.bias
-            x4 = xs.transpose(1, 2).unsqueeze(2)   # [B, C, 1, T], a channels-last view
-            y = F.conv2d(x4, c.weight.unsqueeze(2), c.bias, dilation=(1, c.dilation[0]), groups=c.groups)
-            return y.squeeze(2).transpose(1, 2)
+            if c.dilation[0] > 1:
+                return _dilated_conv(xs, c)
+            return _conv(xs, c)
 
         next(convs)   # the pre-transformer conv, channels-first:
         pre = decoder.pre_conv.conv
@@ -225,6 +225,30 @@ def _snake(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """``FusedSnakeBeta`` over a time-major ``x [B, T, C]``, in fp32 as its kernel computes."""
     x32 = x.float()
     return (x32 + module.inv_beta * torch.sin(x32 * module.alpha).pow(2)).to(x.dtype)
+
+
+def _conv(xs: torch.Tensor, conv: nn.Module) -> torch.Tensor:
+    """An undilated conv over time-major ``xs [B, T, C]``, as a channels-last 2-D conv."""
+    x4 = xs.transpose(1, 2).unsqueeze(2)   # [B, C, 1, T], a channels-last view
+    y = F.conv2d(x4, conv.weight.unsqueeze(2), conv.bias, groups=conv.groups)
+    return y.squeeze(2).transpose(1, 2)
+
+
+def _dilated_conv(xs: torch.Tensor, conv: nn.Module) -> torch.Tensor:
+    """A dilation-``d`` conv over ``xs [B, T, C]`` as an undilated one over the
+    ``d`` interleaved subsequences of its input, batched: output ``t`` reads
+    inputs ``t, t + d, ...``, which all share ``t``'s residue mod ``d``. cuDNN
+    runs some bf16 dilated convs through a direct kernel (134 ms where this
+    takes 0.3, at 384 channels and dilation 9 on an H100), and this is faster
+    in fp32 too."""
+    d = conv.dilation[0]
+    batch, length, _ = xs.shape
+    width = length - (conv.weight.shape[-1] - 1) * d
+    if length % d:
+        xs = F.pad(xs, (0, 0, 0, -length % d))
+    sub = xs.unflatten(1, (-1, d)).transpose(1, 2).flatten(0, 1)   # [B * d, length / d, C]
+    y = _conv(sub, conv)
+    return y.unflatten(0, (batch, d)).transpose(1, 2).flatten(1, 2)[:, :width]
 
 
 def _tconv_gemm(x: torch.Tensor, conv: nn.Module) -> torch.Tensor:
