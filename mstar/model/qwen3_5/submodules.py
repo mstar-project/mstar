@@ -437,8 +437,13 @@ class LLMSubmodule(ARNodeSubmodule):
                     for i, inp in enumerate(inputs)
                 ])
             elif routed:
+                # From pinned memory: a pageable host-to-device copy ends in a
+                # stream sync, which here waits out the step still running.
+                rows = torch.tensor(routed, dtype=torch.long)
+                if ids.device.type != "cpu":
+                    rows = rows.pin_memory().to(ids.device, non_blocking=True)
                 ids.index_copy_(
-                    0, torch.tensor(routed, device=ids.device),
+                    0, rows,
                     torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
                 )
             out["input_ids"] = ids
