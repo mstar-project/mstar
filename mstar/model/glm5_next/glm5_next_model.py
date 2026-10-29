@@ -9,9 +9,12 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
+    DRAFT_VERIFY,
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
+    DraftPolicy,
+    DraftVerifySpec,
     KVLayout,
     KVSpec,
     NodeResourceSpec,
@@ -176,7 +179,7 @@ class Glm5NextModel(Model):
     # -------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The LLM node's five resources."""
+        """The LLM node's five resources, and with MTP its draft-verify resource."""
         num_kv_layers = len(self.config.full_attn_layer_indices) + (
             1 if self.config.mtp_num_draft_tokens > 0 else 0
         )
@@ -188,7 +191,8 @@ class Glm5NextModel(Model):
             conv_kernel_size=self.config.linear_conv_kernel_size,
         ).to_blocks(
             conv_dtype=self.kda_conv_dtype,
-            # an MTP decode step verifies k + 1 tokens per request
+            # an MTP decode step verifies k + 1 tokens per request, and the engine settles
+            # the KDA state by its verdict
             max_drafts=self.config.mtp_num_draft_tokens,
         )
         if self.config.mtp_num_draft_tokens > 0:
@@ -199,7 +203,8 @@ class Glm5NextModel(Model):
             kda_blocks[MTP_DRAFT] = RecurrentBlockConfig(
                 shape=(1,), dtype=torch.long, per_layer=False,
             )
-        return [
+        mtp = self.config.mtp_num_draft_tokens > 0
+        specs = [
             KVSpec(
                 resource_key=KV_CACHE,
                 nodes={"LLM"},
@@ -228,6 +233,9 @@ class Glm5NextModel(Model):
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
+                # MTP's drafts are verified by the sampler, by rejection sampling at a temperature
+                draft_verify=mtp,
+                enable_sampled_verify=mtp,
             ),
             RecurrentStateSpec(
                 resource_key=KDA_STATE,
@@ -249,6 +257,9 @@ class Glm5NextModel(Model):
                 ),
             ),
         ]
+        if mtp:
+            specs.append(DraftVerifySpec(resource_key=DRAFT_VERIFY, nodes={"LLM"}, sampler=SAMPLER))
+        return specs
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
@@ -266,11 +277,6 @@ class Glm5NextModel(Model):
         }
         if "top_k" in model_kwargs:
             params["top_k"] = int(model_kwargs["top_k"])
-        if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP drafting is greedy-only: greedy is the DECLARED default
-            # on MTP configs so a bare request serves coherently; an EXPLICIT
-            # temperature > 0 still reaches the refusal.
-            params["temperature"] = 0.0
         return {SAMPLER: SamplingReqConfig(**params)}
 
     # -------------------------------------------------------------------
@@ -415,17 +421,6 @@ class Glm5NextModel(Model):
             # the node's sampler is built without min-p, and the request configs do not pass it on
             raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
 
-        if self.config.mtp_num_draft_tokens > 0:
-            # MTP verifies by argmax. Refused here it is the client's 400; the worker's
-            # refusal was a 500, after the request had reached every rank
-            temperature = float(kwargs.get("temperature", 0.0))
-            penalty = float(kwargs.get("repetition_penalty", self.config.repetition_penalty))
-            if temperature > 0.0 or penalty != 1.0:
-                raise ValueError(
-                    f"MTP drafting is greedy only (temperature={temperature}, "
-                    f"repetition_penalty={penalty}); serve with mtp_num_draft_tokens: 0"
-                )
-
         if self._tokenizer_mode == "byte":
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
             vocab = self.config.vocab_size
@@ -446,7 +441,7 @@ class Glm5NextModel(Model):
 
         # Decode runs at least one step, and one more may already be scheduled
         # when it stops, so the prompt leaves two steps' tokens of index_topk
-        # free (an MTP step keeps k + 1). A ValueError here reaches the client
+        # free (an MTP step writes k + 1). A ValueError here reaches the client
         # as a 400.
         limit = self.config.index_topk - 2 * (self.config.mtp_num_draft_tokens + 1)
         if input_ids.numel() > limit:
@@ -455,20 +450,28 @@ class Glm5NextModel(Model):
                 f"with at most {limit}"
             )
         n = input_ids.numel()
-        # a decode step writes one row, or under MTP its whole verify block (the rejected
-        # drafts stay as holes), so the KV pool sizes a request at its worst case
-        block = self.config.mtp_num_draft_tokens + 1
-        layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", block),))
+        # a row per kept token; under MTP the verify rows written past them are the lookahead
+        layout = LabelLayout(
+            spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", 1),),
+            lookahead=self.mtp_kv_lookahead,
+        )
         return ProcessPromptOutput(
             {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_CACHE: {"main": layout}}},
         )
 
+    @property
+    def mtp_kv_lookahead(self) -> int:
+        """The KV rows an MTP request writes past the tokens it keeps, its layout's lookahead:
+        the draft-verify policy's (``DraftPolicy.lookahead``, 2k + 1)."""
+        k = self.config.mtp_num_draft_tokens
+        return DraftPolicy(max_drafts=k).lookahead if k else 0
+
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context
-        reaches index_topk or its cache rows reach kv_rows (an MTP step stores
-        k + 1); check_stop stops every request before either."""
+        reaches index_topk or its cache rows reach kv_rows; check_stop, or under
+        MTP the engine's stop at max_tokens, stops every request before either."""
         cfg = self.config
-        return min(cfg.index_topk - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
+        return min(cfg.index_topk - 1, cfg.kv_rows - 1)
 
     def get_max_output_tokens(self, **model_kwargs):
         # held to the window: a one-token prompt emits at most index_topk tokens. A request

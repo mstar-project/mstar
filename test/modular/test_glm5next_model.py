@@ -11,8 +11,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources import (  # noqa: E402
+    DRAFT_VERIFY,
     AttentionSpec,
     AttnBackend,
+    DraftVerifySpec,
     KVLayout,
     KVSpec,
     SamplerSpec,
@@ -528,8 +530,10 @@ def test_kda_layers_hold_no_per_slot_state():
 
 def _specs_by_key(model: Glm5NextModel) -> dict:
     specs = model.get_node_resources()
+    # with MTP the draft-verify resource too
     assert [type(s) for s in specs] == [
-        KVSpec, AttentionSpec, SamplerSpec, RecurrentStateSpec, LinearAttnSpec]
+        KVSpec, AttentionSpec, SamplerSpec, RecurrentStateSpec, LinearAttnSpec,
+        *([DraftVerifySpec] if model.config.mtp_num_draft_tokens > 0 else [])]
     assert all(s.nodes == {"LLM"} for s in specs)
     return {s.resource_key: s for s in specs}
 
@@ -537,7 +541,7 @@ def _specs_by_key(model: Glm5NextModel) -> dict:
 @pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml"])
 def test_serve_yaml_pages_cover_the_slot_pool(name):
     """Every slot can hold a full-length request without the KV pool refusing it (under MTP
-    a request's rejected drafts take cache rows too)."""
+    its verify rows written ahead of the engine's trim count among its rows)."""
     import yaml
 
     serve = yaml.safe_load((Path(__file__).parents[2] / "configs" / name).read_text())
@@ -601,9 +605,12 @@ def test_glm5next_model_constructs_from_config():
     assert kda.config.gate_lower_bound == -5.0
 
     model.config.mtp_num_draft_tokens = 2
-    kv_mtp = _specs_by_key(model)[KV_CACHE].config
+    specs_mtp = _specs_by_key(model)
+    kv_mtp = specs_mtp[KV_CACHE].config
     assert kv_mtp.num_layers == 12  # + draft plane 11
-    assert kv_mtp.head_dim == 576  # the rope slot masks rejected draft rows
+    # no rope slot: the engine rewinds rejected draft rows, so none stay in the cache to mask
+    assert kv_mtp.head_dim == kv.head_dim
+    assert specs_mtp[DRAFT_VERIFY].sampler == SAMPLER
 
     from mstar.graph.base import Loop
 
@@ -1150,7 +1157,7 @@ def test_submodule_engine_path_prefill_then_decode():
 
 
 @pytest.mark.parametrize("version,mtp,kpe", [
-    ("0.6.18", 0, 0), ("0.7.0", 0, 0), ("0.6.17", 0, 64), ("0.6.18", 3, 64), (None, 0, 0),
+    ("0.6.18", 0, 0), ("0.7.0", 0, 0), ("0.6.17", 0, 64), ("0.6.18", 3, 0), ("0.6.17", 3, 64), (None, 0, 0),
 ])
 def test_rope_slot_follows_what_flashinfer_can_plan(monkeypatch, version, mtp, kpe):
     # an older FlashInfer can't plan a cache without the slot; a box without one keeps none

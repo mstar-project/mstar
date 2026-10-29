@@ -42,8 +42,9 @@ def test_budget_and_loop_cap_are_held_to_the_window():
 def test_mtp_loop_cap_is_held_to_the_cache_rows():
     m = _model(mtp_num_draft_tokens=3)
     cfg = m.config
-    # every verify step stores k + 1 cache rows, accepted or not
-    assert _decode(m).max_iters == min(cfg.index_topk - 1, (cfg.kv_rows - 1) // 4)
+    # a verify step keeps a row per token it emits (the engine rewinds the rest), at least one
+    assert cfg.kv_rows == min(cfg.max_seq_len, cfg.index_topk)
+    assert _decode(m).max_iters == min(cfg.index_topk - 1, cfg.kv_rows - 1)
 
 
 def test_chat_template_returns_the_bare_ids():

@@ -1,7 +1,6 @@
-"""MTP is greedy only: a sampling request is refused as a 400 by process_prompt,
-not as a 500 by the worker after it reached every rank."""
-from types import SimpleNamespace
-
+"""MTP verifies its drafts through the sampler (the engine's draft-verify): a temperature is
+served, by rejection sampling; a repetition penalty, which the verify can't apply, is refused
+by the sampler spec at the conductor, as a 400, before the request reaches any rank."""
 import pytest
 
 from mstar.model.glm5_next.config import SAMPLER
@@ -13,27 +12,36 @@ def _mtp_model() -> Glm5NextModel:
     return Glm5NextModel("x", tokenizer_mode="byte", mtp_num_draft_tokens=3)
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"temperature": 0.7}, {"repetition_penalty": 1.1}, {"repetition_penalty": 0.9},
-])
-def test_process_prompt_refuses_sampling_under_mtp(kwargs):
-    with pytest.raises(ValueError, match="greedy only"):
-        _mtp_model().process_prompt("hi", ["text"], ["text"], **kwargs)
+def _validate(m: Glm5NextModel, kwargs: dict) -> None:
+    """What the conductor does with the request's sampling settings."""
+    spec = next(s for s in m.get_node_resources() if s.resource_key == SAMPLER)
+    m.get_request_resource_configs({}, kwargs)[SAMPLER].validate(spec)
 
 
-def test_process_prompt_takes_greedy_under_mtp():
+@pytest.mark.parametrize("kwargs", [{"repetition_penalty": 1.1}, {"repetition_penalty": 0.9},
+                                    {"temperature": 0.7, "repetition_penalty": 1.1}])
+def test_a_penalty_is_refused_under_mtp(kwargs):
+    with pytest.raises(ValueError, match="can't apply repetition_penalty"):
+        _validate(_mtp_model(), kwargs)
+    # without MTP the sampler applies it
+    _validate(Glm5NextModel("x", tokenizer_mode="byte"), kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"temperature": 0.0}, {"temperature": 0.7, "top_k": 20}])
+def test_sampling_is_served_under_mtp(kwargs):
     m = _mtp_model()
-    assert m.process_prompt("hi", ["text"], ["text"]).new_input_tensors["text_inputs"][0].tolist() == [104, 105]
-    m.process_prompt("hi", ["text"], ["text"], temperature=0.0, repetition_penalty=1.0)
+    ids = m.process_prompt("hi", ["text"], ["text"], **kwargs).new_input_tensors["text_inputs"][0]
+    assert ids.tolist() == [104, 105]
+    _validate(m, kwargs)
+    # the sampler verifies, at a temperature by rejection sampling
+    spec = next(s for s in m.get_node_resources() if s.resource_key == SAMPLER)
+    assert spec.draft_verify and spec.enable_sampled_verify
 
 
-def test_the_worker_refuses_an_explicit_zero_penalty():
+def test_an_explicit_zero_penalty_is_refused():
     # `penalty or 1.0` read 0 as unset, and the sampler divided by it
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    info = SimpleNamespace(request_id="r", resource_configs={
-        SAMPLER: SimpleNamespace(temperature=0.0, repetition_penalty=0.0)})
-    with pytest.raises(RuntimeError, match="greedy only"):
-        sub._check_mtp_sampling(info)
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        _validate(_mtp_model(), {"repetition_penalty": 0.0})
 
 
 @pytest.mark.parametrize("kernel", ["Triton", "fused", "auto "])

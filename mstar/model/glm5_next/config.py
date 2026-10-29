@@ -333,21 +333,20 @@ class Glm5NextModelConfig:
 
     @property
     def mla_cache_kpe(self) -> int:
-        """Rope-slot width of the MLA latent cache. NoPE needs none; MTP keeps
-        a 64-wide slot to mask rejected draft rows. FlashInfer plans a cache
-        without the slot from 0.6.18, so an older one gets it too (zeros):
-        otherwise MLA would run the uncapturable fallback."""
-        if self.mtp_num_draft_tokens > 0 or _flashinfer_before("0.6.18"):
-            return 64
-        return 0
+        """Rope-slot width of the MLA latent cache. NoPE needs none. FlashInfer
+        plans a cache without the slot from 0.6.18, so an older one gets it too
+        (zeros): otherwise MLA would run the uncapturable fallback."""
+        return 64 if _flashinfer_before("0.6.18") else 0
 
     @property
     def kv_rows(self) -> int:
-        """Cache rows a request may hold. Its real context is held to
-        max_seq_len; under MTP each verify step also leaves its rejected drafts
-        as holes, and twice the rows keeps those from binding first until
-        acceptance falls below about (k + 1) / 2 tokens per step."""
-        return self.max_seq_len * (2 if self.mtp_num_draft_tokens > 0 else 1)
+        """Cache rows a request may hold: its context, held to max_seq_len, and
+        under MTP to index_topk too, since the engine stops a verifying request
+        by max_tokens alone and the conductor fits max_tokens, with the verify
+        rows written ahead of a trim, to this many rows."""
+        if self.mtp_num_draft_tokens > 0 and not self.dsa_long_context:
+            return min(self.max_seq_len, self.index_topk)
+        return self.max_seq_len
 
     @property
     def padded_head_dim(self) -> int:

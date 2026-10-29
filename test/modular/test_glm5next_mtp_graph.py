@@ -1,6 +1,7 @@
-"""glm5_next MTP on CUDA (sm90, FlashInfer MLA, fused KDA): the captured verify step emits what
-the eager one does, and both emit what greedy decode without MTP does; the rejected rows' mask
-moves FlashInfer's MLA output by at most one bf16 ulp."""
+"""glm5_next MTP on CUDA (sm90, FlashInfer MLA, fused KDA), on the engine's draft-verify: the
+captured verify step emits what the eager one does, and both emit what greedy decode without
+MTP does. The harness steps the engine's resources as the engine does, the verdict's cut
+(``DraftVerifyResource.emitted_rows``) included."""
 import pytest
 import torch
 
@@ -9,6 +10,7 @@ from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.resources import SamplingReqConfig, StepRunner
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.draft_verify.startup import verify_walk
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next import fused_decode
@@ -23,7 +25,7 @@ from mstar.model.glm5_next.config import (
     build_mlp_layer_types,
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
-from mstar.model.glm5_next.submodules import HOLE_KPE, Glm5NextLLMSubmodule
+from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.glm5_next.weight_loader import restore_fp32_params
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
@@ -95,7 +97,9 @@ class _NoTransfer:
 
 class _Engine:
     """The submodule, its real resources and a AcceleratorGraphRunner, stepped like Engine
-    (prepare -> declare -> admit -> plan -> preprocess -> run -> commit -> unpack)."""
+    (prepare -> declare -> admit, whose runner rewinds the last verify step -> plan ->
+    preprocess -> run -> commit -> the verdict's cut). Requests ignore EOS, so every step
+    emits until MAX_TOKENS."""
 
     def __init__(self, k, seed=0):
         cfg = _config(k)
@@ -122,6 +126,8 @@ class _Engine:
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
+        # what the engine checks and binds when it loads a node that verifies drafts
+        self.walk = verify_walk("LLM", self.sub, self.resources, "decode")
         trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
@@ -134,7 +140,7 @@ class _Engine:
         return CurrentForwardPassInfo(
             request_id=f"wire-{rid}", rid_handle=rid, graph_walk=walk, fwd_index=0, random_seed=0,
             max_tokens=MAX_TOKENS,
-            resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0)},
+            resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=True)},
             dynamic_loop_iter_counts={"decode_loop": 0},
         )
 
@@ -160,7 +166,7 @@ class _Engine:
         rids = list(prompts)
         if walk == "prefill":
             for rid in rids:
-                self.runner.ingest_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+                self.runner.ingest_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=True)})
         lease = self.preplan(walk, rids, slot) if preplan else None
         infos = {rid: self.info(rid, walk) for rid in rids}
         inputs = [self.sub.prepare_inputs(walk, infos[rid], {"text_inputs": [ids]})
@@ -171,7 +177,6 @@ class _Engine:
             assert lease is not None, "no captured bucket fits"
         ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=slot, capture=False,
                           slot_lease=lease)
-        real_inputs = inputs
         if lease is not None:
             inputs = self.cg.pad_inputs(lease, inputs)
             infos = self.cg.step_metadata(lease, rids, infos)
@@ -191,17 +196,21 @@ class _Engine:
         self.runner.commit(step)
         raw = BatchedModelOutput.coerce(raw)
         out_ids = self.cg.slot_for(lease).dummy_rids if lease is not None else padded
-        unpacked = self.sub.unpack_packed_outputs(
-            raw.packed_outputs, rids, [i.input_seq_len for i in real_inputs], real_inputs,
-            {rid: infos[rid] for rid in rids})
+        cut = {}
+        if self.walk is not None and walk == "decode":
+            # Engine._emit_verified's cut of the verdict
+            rows = self.walk.resource.emitted_rows(
+                rids, [MAX_TOKENS] * len(rids), [True] * len(rids), self.walk.policy)
+            ends = rows.counts.cumsum().tolist()
+            cut = {rid: rows.tokens[end - n:end].tolist()
+                   for rid, n, end in zip(rows.request_ids, rows.counts.tolist(), ends, strict=True)}
         emitted, nxt = {}, {}
         for i, rid in enumerate(rids):
             # a prefill step hands its tokens over as rows, an MTP step per request
-            per_rid = raw.get(out_ids[i]) or {
+            out = raw.get(out_ids[i]) or {
                 name: [t[i : i + 1]] for name, t in (raw.row_outputs or {}).items()}
-            out = {**per_rid, **unpacked.get(rid, {})}
-            emitted[rid] = out["new_token"][0].tolist()
-            nxt[rid] = out.get("text_inputs", out["new_token"])[0].clone().to(DEV)
+            emitted[rid] = cut[rid] if rid in cut else out["new_token"][0].tolist()
+            nxt[rid] = out.get("text_inputs", out.get("new_token"))[0].clone().to(DEV)
         if lease is not None:
             self.cg.release(lease, len(rids))
         return emitted, nxt, lease
@@ -278,10 +287,9 @@ def test_captured_verify_matches_eager_and_greedy(greedy, k, batch):
     # capture must not change a single token
     assert graph == eager, ("graph", graph, "eager", eager)
     assert steps_g == steps_e
-    # The trunk sees k + 1 rows per request under MTP, one without (other GEMM shapes), and
-    # the cache keeps masked holes (other KV splits: FlashInfer MLA moves by <= 1 bf16 ulp),
-    # so a near-tie in this random model can flip a token after a few steps. The fp32 CPU
-    # test pins exact equality. A broken verify step splits at once.
+    # The trunk sees k + 1 rows per request under MTP, one without (other GEMM shapes and
+    # KV splits), so a near-tie in this random model can flip a token after a few steps. The
+    # fp32 CPU test pins exact equality. A broken verify step splits at once.
     for rid in eager:
         split = _split(eager[rid], greedy[batch][rid])
         print(f"k={k} {batch} {rid}: MTP vs greedy first split {split}")
@@ -294,65 +302,11 @@ def test_captured_verify_matches_eager_and_greedy(greedy, k, batch):
         split = _split(full[rid], eager[rid])
         print(f"k={k} {batch} {rid}: fully captured vs eager first split {split}")
         assert split is None or split >= 4, (rid, split, full[rid], eager[rid])
-    # TP async's order: each decode step planned before its prepare_inputs, which a verify
-    # step allows because nothing it plans waits on the last verdict.
+    # TP async's order: each decode step admitted and planned before its prepare_inputs; the
+    # admit's rewind waits for the last verdict.
     ahead, _ = eng.generate(_prompts(lengths), captured_decode=True, preplan=True)
     assert ahead == graph, ("preplanned", ahead, "graph", graph)
     kv, pool = eng.resources[KV_CACHE], eng.resources[KDA_STATE]
     # the graph runner's padding streams stay resident; the requests' are gone
     assert not any(rid in kv._streams for rid in _prompts(lengths))
     assert pool.num_free_slots == pool.config.usable_slots
-
-
-@torch.no_grad()
-def test_holes_move_flashinfer_mla_by_at_most_one_bf16_ulp():
-    """A verify block's queries over a cache whose rejected rows carry HOLE_KPE in the rope
-    slot, against the same cache without those rows: the query rope part of ones scores a
-    real key +0 and a hole about -6.4e5, so only the kernel's split of the keys moves. That
-    moves about half the outputs by one bf16 ulp of their row's largest value, as a second
-    request in the batch (another split) does too."""
-    from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAWrapper
-
-    torch.manual_seed(0)
-    heads, latent, rope, page, block = 8, 512, 64, 128, 4
-    real = 700
-    keep = torch.rand(real + 400) < real / (real + 400)  # holes spread through the context
-    keep[-block:] = True  # the query block's own rows are real
-    n_all = int(keep.numel())
-    ckv = torch.randn(n_all, latent, device=DEV, dtype=torch.bfloat16)
-    kpe = torch.zeros(n_all, rope, device=DEV, dtype=torch.bfloat16)
-    kpe[~keep.to(DEV)] = HOLE_KPE
-    q_nope = torch.randn(block, heads, latent, device=DEV, dtype=torch.bfloat16)
-    ones = torch.ones(block, heads, rope, device=DEV, dtype=torch.bfloat16)
-
-    def attend(rows, q_pe):
-        n = rows.shape[0]
-        pages = -(-n // page)
-        cache = torch.zeros(pages, page, latent + rope, device=DEV, dtype=torch.bfloat16)
-        cache.view(-1, latent + rope)[:n] = torch.cat([ckv, kpe], -1)[rows]
-        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEV)
-        wrapper = FlashInferMLAWrapper(
-            workspace, num_qo_heads=heads, kv_lora_rank=latent, qk_rope_head_dim=rope,
-            page_size=page, sm_scale=192 ** -0.5, device=DEV)
-        assert not wrapper.fallback
-        wrapper.plan(
-            qo_indptr=torch.tensor([0, block], dtype=torch.int32),
-            paged_kv_indptr=torch.tensor([0, pages], dtype=torch.int32),
-            paged_kv_indices=torch.arange(pages, dtype=torch.int32),
-            paged_kv_last_page_len=torch.tensor([n - (pages - 1) * page], dtype=torch.int32),
-            causal=True, dtype=torch.bfloat16,
-        )
-        return wrapper.run(q_nope, q_pe, cache).float()
-
-    everything = torch.arange(n_all, device=DEV)
-    only_real = everything[keep.to(DEV)]
-    base = attend(only_real, ones)
-    # a real key's rope slot is 0, so the rope part of the query is exact
-    assert torch.equal(attend(only_real, torch.zeros_like(ones)), base)
-    holes = attend(everything, ones)
-    # one bf16 ulp of each (query, head) row's largest output
-    ulp = torch.exp2(torch.floor(torch.log2(base.abs().amax(-1, keepdim=True))) - 7)
-    diff = (holes - base).abs()
-    print(f"holes vs none: max |diff| {diff.max().item():.3e}, "
-          f"{(diff > 0).float().mean().item():.4f} of outputs moved")
-    assert (diff <= ulp).all(), (diff / ulp).max()
