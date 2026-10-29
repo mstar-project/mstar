@@ -35,7 +35,7 @@ def _caches(root: Path) -> dict[str, Path]:
     _write(dirs["inductor"] / "wq" / "kernel.py", "code")
     _write(dirs["triton"] / "HASH" / "k.hsaco", "binary")
     _write(dirs["miopen"] / "gfx942130.ukdb", "kernels")
-    _write(dirs["miopen"] / "gfx942130.HIP.ufdb.txt", "find-db v1")
+    _write(dirs["miopen"] / "gfx942130.HIP.ufdb.txt", "conv-a=Solver1:0.5\n")
     return dirs
 
 
@@ -94,14 +94,54 @@ def test_a_second_pack_appends_only_new_and_changed_files(tmp_path):
     _, again = cb.pack(root, KEY, dirs, log=lambda _: None)
     assert all(r.added == 0 for r in again)
     _write(dirs["inductor"] / "fxgraph" / "cd" / "entry", "another graph")
-    _write(dirs["miopen"] / "gfx942130.HIP.ufdb.txt", "find-db v2", mtime=1_700_000_100)
+    _write(dirs["miopen"] / "gfx942130.HIP.ufdb.txt", "conv-a=Solver2:0.4\n", mtime=1_700_000_100)
     _, third = cb.pack(root, KEY, dirs, log=lambda _: None)
     assert {r.kind: (r.added, r.members) for r in third} == {"inductor": (1, 3), "triton": (0, 1), "miopen": (1, 2)}
     assert len(_names(bundle / "miopen.tar")) == 3  # appended, not rewritten
     out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t", "miopen": tmp_path / "o" / "m"}
     cb.unpack(bundle, KEY, out, log=lambda _: None)
-    assert (out["miopen"] / "gfx942130.HIP.ufdb.txt").read_text() == "find-db v2"  # the last copy wins
+    assert (out["miopen"] / "gfx942130.HIP.ufdb.txt").read_text() == "conv-a=Solver2:0.4\n"  # this host's record
     assert len(json.loads((bundle / "manifest.json").read_text())["history"]) == 3
+
+
+def _kernel_db(path: Path, rows: list[tuple[str, str]]) -> None:
+    """MIOpen's kernel DB schema: a row id and a unique (name, args)."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE IF NOT EXISTS `kern_db` (`id` INTEGER PRIMARY KEY ASC, `kernel_name` TEXT NOT NULL, "
+                "`kernel_args` TEXT NOT NULL, `kernel_blob` BLOB NOT NULL)")
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS `idx_kern_db` ON kern_db(kernel_name, kernel_args)")
+    con.executemany("INSERT INTO kern_db (kernel_name, kernel_args, kernel_blob) VALUES (?, ?, ?)",
+                    [(n, a, b"bin") for n, a in rows])
+    con.commit()
+    con.close()
+
+
+def test_miopen_databases_from_separate_warm_ups_are_merged(tmp_path):
+    """Two hosts warmed different models from empty caches: MIOpen's find DB and
+    kernel DB are one file each, so packing the second must keep the first's
+    records rather than replace the file."""
+    import sqlite3
+
+    first, second = tmp_path / "a" / "miopen", tmp_path / "b" / "miopen"
+    _write(first / "x.ufdb.txt", "conv-a=S1:0.5\nconv-b=S1:0.7\n")
+    _kernel_db(first / "x.ukdb", [("k1", "-O3"), ("k2", "-O3")])
+    _write(second / "x.ufdb.txt", "conv-b=S2:0.6\nconv-c=S1:0.2\n", mtime=1_700_000_100)
+    _kernel_db(second / "x.ukdb", [("k2", "-O3"), ("k3", "-O3")])
+    cb.pack(tmp_path / "bundles", KEY, {"miopen": first}, log=lambda _: None)
+    _, res = cb.pack(tmp_path / "bundles", KEY, {"miopen": second}, log=lambda _: None)
+    assert res[0].added == 2
+    out = {"inductor": tmp_path / "o" / "i", "miopen": tmp_path / "o" / "m"}
+    cb.unpack(tmp_path / "bundles", KEY, out, log=lambda _: None)
+    assert (out["miopen"] / "x.ufdb.txt").read_text() == "conv-a=S1:0.5\nconv-b=S2:0.6\nconv-c=S1:0.2\n"
+    con = sqlite3.connect(out["miopen"] / "x.ukdb")
+    assert sorted(r[0] for r in con.execute("SELECT kernel_name FROM kern_db")) == ["k1", "k2", "k3"]
+    con.close()
+    # packing the merged result again adds nothing
+    _, res = cb.pack(tmp_path / "bundles", KEY, {"miopen": out["miopen"]}, log=lambda _: None)
+    assert res[0].added == 0
 
 
 def test_a_bundle_for_another_stack_is_refused_unless_forced(tmp_path):
