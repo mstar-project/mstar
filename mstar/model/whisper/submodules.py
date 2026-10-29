@@ -169,15 +169,16 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
 
     Both cache streams belong to the step: ``main`` grows by the token
     count, ``context`` grows by the encoder output at prefill and is
-    declared zero-span (read-only) thereafter. Only decode is captured:
-    prefill is launch-bound too, but the context it writes (1500 tokens a
-    row) is larger than the KV capture buffers, which are sized by the
-    step's input tokens.
+    declared zero-span (read-only) thereafter. Both walks are captured per
+    batch size; prefill's capture config names the context it writes per
+    row, which the engine sizes the context cache's capture buffers by.
     """
 
     # Up to the requests the decoder caches hold
     # (`WhisperModel.MAX_CONCURRENT_REQUESTS`), so they all decode in one step.
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    # The encoder's batch sizes: a prefill batch is what one encoder step emitted.
+    PREFILL_CAPTURE_BATCH_SIZES = WhisperEncoderSubmodule.CAPTURE_BATCH_SIZES
 
     # the decode walk reads its input token off the sampler's slot masters
     reads_device_loopback = True
@@ -209,6 +210,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
+        prompt_len = self.config.decoder_prompt_len
+        context = self.config.max_source_positions
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
@@ -217,6 +220,21 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                     input_seq_len=1,
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            ),
+            BatchedAcceleratorGraphConfig(
+                capture_graph_walk="prefill",
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(prompt_len, dtype=torch.long, device=device),
+                    input_seq_len=prompt_len,
+                    # float32: the encoder's last layer norm leaves it so under autocast
+                    tensor_inputs={"encoder_states": torch.zeros(
+                        context, self.config.d_model, device=device,
+                    )},
+                ),
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                input_seq_dims={"input_ids": 0, "encoder_states": 0},
+                # every row writes its whole encoder context at prefill
+                resource_write_tokens={CROSS_KV_CACHE: context},
             ),
         ]
 
@@ -413,9 +431,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         return (context_kv.max_num_pages - 1) // per_request
 
     def max_batch_size(self, graph_walk: str) -> int | None:
-        # Decode is bounded by its captured sizes. Prefill isn't captured, so
-        # nothing else bounds it, and a batch past the contexts the cache holds
-        # could never be admitted.
+        # Both walks are bounded by their captured sizes too; this keeps a
+        # prefill batch within the contexts the cache holds should a
+        # deployment shrink it below the largest prefill bucket.
         if graph_walk != "prefill":
             return None
         return self.prefill_rows(self.node_resources[CROSS_KV_CACHE].config)

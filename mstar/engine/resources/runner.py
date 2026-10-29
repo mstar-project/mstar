@@ -699,13 +699,17 @@ class StepRunner:
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
         node_name: str | None = None,
+        write_tokens: Mapping[str, int] | None = None,
     ) -> None:
         """resources preallocate the static buffers captured replays will read
 
         Swept over ``node_name``'s own resources: another node's slot count and
         batch size say nothing about a resource this node's graphs never touch.
+        ``write_tokens`` raises a resource's length past ``max_seq_len`` where
+        a capture writes it more tokens than its inputs.
         """
+        write_tokens = write_tokens or {}
         for key in self._sweep(self._node_order, self._order, node_name):
             self._resources[key].build_accelerator_graph_buffers(
-                slots, max_bs, max_seq_len
+                slots, max_bs, max(max_seq_len, write_tokens.get(key, 0)),
             )

@@ -2129,6 +2129,15 @@ class KVManager(AttentionResource):
                 )
             if lease is not None:
                 static_state = self._static_plan_state(lease.slot, label)
+                held = static_state.token_to_page.shape[0]
+                if plan_state.total_tokens > held:
+                    raise RuntimeError(
+                        f"KV {self.name}: a step of {lease.bucket} writes "
+                        f"{plan_state.total_tokens} tokens under {label!r}, past the "
+                        f"{held} its capture buffers hold; a capture that writes more "
+                        "than its input tokens names the resource in its config's "
+                        "resource_write_tokens"
+                    )
                 static_state.copy_(plan_state, lease.bucket.num_tokens)
                 plan_state = static_state
             if ctx.is_preplan:

@@ -91,6 +91,11 @@ class WhisperModelConfig:
         }
         return cls(**values)
 
+    @property
+    def decoder_prompt_len(self) -> int:
+        """Tokens ``decoder_prompt_ids`` returns, whatever the language and task."""
+        return 4
+
     def decoder_prompt_ids(self, language: str = "en", task: str = "transcribe") -> list[int]:
         """``<|startoftranscript|><|{lang}|><|{task}|><|notimestamps|>``."""
         lang_token = f"<|{language}|>"

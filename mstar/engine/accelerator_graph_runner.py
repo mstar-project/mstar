@@ -823,10 +823,18 @@ class AcceleratorGraphRunner:
             max_seq_len = max((
                 spec.bucket.num_tokens for spec in slot_specs
             ), default=1)
+            # a resource a config writes more tokens into than its inputs
+            # (an encoder context) is sized by those writes instead
+            write_tokens: dict[str, int] = {}
+            for spec in slot_specs:
+                for key in spec.config.resource_write_tokens:
+                    write_tokens[key] = max(
+                        write_tokens.get(key, 0), spec.config.write_tokens(key, spec.bs),
+                    )
             if slot_specs:
                 self._step_runner.build_accelerator_graph_buffers(
                     slot_specs, max_bs=self.max_bs, max_seq_len=max_seq_len,
-                    node_name=self._submodule_name,
+                    node_name=self._submodule_name, write_tokens=write_tokens,
                 )
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs

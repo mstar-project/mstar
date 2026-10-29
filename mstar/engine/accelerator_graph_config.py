@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -67,6 +68,11 @@ class AcceleratorGraphConfig(ABC):
         # which can pick the wrong dim when an unrelated axis happens to
         # match the bucket's token count.
         input_seq_dims: dict[str, int] | None = None,
+        # Resource key -> tokens each row of this capture writes into that
+        # resource, where that is not the row's input tokens: an encoder
+        # context written whole at prefill. The engine sizes the resource's
+        # capture buffers by it instead of by the bucket's input tokens.
+        resource_write_tokens: Mapping[str, int] | None = None,
     ):
         self.capture_graph_walk = capture_graph_walk
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
@@ -83,6 +89,12 @@ class AcceleratorGraphConfig(ABC):
         # scales by this. Subclasses that support it set it.
         self.total_tokens_multiplier = 1
         self.input_seq_dims = input_seq_dims
+        self.resource_write_tokens = dict(resource_write_tokens or {})
+
+    def write_tokens(self, resource_key: str, bs: int) -> int:
+        """Tokens a bucket of ``bs`` rows writes into ``resource_key``; 0 for a
+        resource the config doesn't name, whose writes are the input tokens."""
+        return self.resource_write_tokens.get(resource_key, 0) * bs
 
     @abstractmethod
     def get_config_type(self) -> AcceleratorGraphConfigType:
@@ -111,6 +123,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         total_tokens_multiplier: int = 1,
         compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
+        resource_write_tokens: Mapping[str, int] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -122,6 +135,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
+            resource_write_tokens=resource_write_tokens,
         )
         self.single_request_inputs = single_request_inputs
         # ``single_request_inputs.input_seq_len`` is also read per-label by the
@@ -189,6 +203,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         # by default. A walk whose kernels split rows by span (a mixed step's
         # one-token rows beside a prompt) captures a layout it will replay.
         token_layout: Callable[[int, int], list[int]] | None = None,
+        resource_write_tokens: Mapping[str, int] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -200,6 +215,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
+            resource_write_tokens=resource_write_tokens,
         )
         if total_tokens_multiplier < 1:
             raise ValueError("total_tokens_multiplier must be at least 1")

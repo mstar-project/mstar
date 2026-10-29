@@ -90,3 +90,34 @@ def test_batch_caps_per_walk():
     smaller = dataclasses.replace(context, max_num_pages=1 + 12 * 10)
     sub.node_resources = {CROSS_KV_CACHE: SimpleNamespace(config=smaller)}
     assert sub.max_batch_size("prefill") == 10
+
+
+def test_prefill_capture_names_the_context_its_rows_declare():
+    """The prefill config sizes the context cache by what its template rows
+    declare, and a real batch declares that same step, so a pre-plan staged
+    over the template is the one the batch promotes."""
+    sub = _decoder()
+    configs = {c.capture_graph_walk: c for c in sub.get_accelerator_graph_configs(torch.device("cpu"))}
+    prefill = configs["prefill"]
+    assert prefill.capture_batch_sizes == WhisperDecoderSubmodule.PREFILL_CAPTURE_BATCH_SIZES
+    context = sub.config.max_source_positions
+    assert prefill.resource_write_tokens == {CROSS_KV_CACHE: context}
+
+    rids = [0, 1, 2, 3]
+    template = prefill.get_node_inputs(len(rids), 0)
+    step = sub.declare_step("prefill", rids, template)
+    assert [seg.span for seg in step.steps[CROSS_KV_CACHE].segments] == [context] * len(rids)
+    assert sum(seg.span for seg in step.steps[CROSS_KV_CACHE].segments) == prefill.write_tokens(
+        CROSS_KV_CACHE, len(rids),
+    )
+
+    prompt = torch.zeros(sub.config.decoder_prompt_len, dtype=torch.long)
+    real = [
+        ARNodeInputs(
+            input_ids=prompt, input_seq_len=len(prompt),
+            tensor_inputs={"encoder_states": torch.randn(context, sub.config.d_model)},
+        ) for _ in rids
+    ]
+    assert sub.declare_step("prefill", rids, real) == step
+    # the encoder hands over float32 (its last layer norm, under autocast)
+    assert template[0].tensor_inputs["encoder_states"].dtype == torch.float32

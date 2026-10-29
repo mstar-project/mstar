@@ -1308,6 +1308,14 @@ Both types share the base ``CudaGraphConfig`` fields:
 - ``required`` makes every bucket in the config mandatory. If capture fails locally or
   on another participating rank, warmup raises after rank-wide agreement instead of
   dropping the bucket and falling back to eager execution. The default is ``False``.
+- ``resource_write_tokens`` maps a resource key to the tokens each row of the capture
+  writes into that resource, where that is not the row's input tokens. An
+  encoder-decoder's prefill is the case: a row of a few prompt tokens writes its whole
+  encoder context into the context cache (Whisper's decoder names
+  ``{CROSS_KV_CACHE: max_source_positions}``). The engine sizes that resource's capture
+  buffers by the largest bucket's writes instead of its input tokens. A paged KV cache
+  whose captured step writes more than its buffers hold fails the capture with an error
+  naming this field.
 
 ``BatchedCudaGraphConfig`` also accepts ``total_tokens_multiplier``. Use it when one
 request's step commits KV across several labels that are combined into a single plan, as
