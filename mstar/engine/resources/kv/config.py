@@ -6,7 +6,7 @@ without pulling FlashInfer in behind it.
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -188,6 +188,19 @@ class PagedKVConfig(KVConfig):
     def _arena_page(self) -> int:
         # tokens of every layer in an arena page, a page of the first group's layers
         return self.tokens_per_page * len(self.groups[0].layers)
+
+    @property
+    def request_pages(self) -> int:
+        """Arena pages requests can hold: all but the sink page the KV manager takes at build."""
+        return self.num_units - 1
+
+    def stream_pages(self, layout: "StreamLayout", caps: Mapping[str, int]) -> int:
+        """The most arena pages a stream laid out as ``layout`` holds at ``caps``: its pages in
+        every group, each window group's under that group's retention."""
+        first, *later = self.groups
+        return layout.pages(caps, first.page_size) + sum(
+            layout.pages(caps, group.page_size, group.retention) for group in later
+        )
 
     @property
     def latent_dim(self) -> int:
@@ -385,12 +398,28 @@ class KVReqConfig(ResourceReqConfig):
             for loop, slots in layout.growth:
                 n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
                 room[loop] = min(n, room.get(loop, n))
+        pool = spec.config.request_pages
+        if self.pages(spec.nodes, caps, spec.config) > pool:
+            # each loop's room in pages, searched with the other loops at their caps
+            for loop, cap in caps.items():
+                low, high = 0, cap
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    if self.pages(spec.nodes, {**caps, loop: mid}, spec.config) <= pool:
+                        low = mid
+                    else:
+                        high = mid - 1
+                room[loop] = min(low, room.get(loop, low))
         return room
 
     def validate(self, spec: "KVSpec | None" = None) -> None:
         """``ValueError`` (a 400) when a label would hold more positions at the request's caps
         than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
-        the one model that declares one, computes its positions in each forward."""
+        the one model that declares one, computes its positions in each forward.
+
+        Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
+        has for requests. The pool admits on the prompt alone, so such a request would be admitted
+        and then could not finish even alone in an empty pool."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
@@ -400,6 +429,14 @@ class KVReqConfig(ResourceReqConfig):
                     f"this request needs {positions} positions of {label!r}, "
                     f"past the model's context of {spec.config.max_seq_len}"
                 )
+        pages = self.pages(spec.nodes, self.loop_caps or {}, spec.config)
+        if pages > spec.config.request_pages:
+            # counted in arena pages; the message counts pages of every layer, as max_num_pages does
+            raise ValueError(
+                f"this request needs {spec.config.pages_of(pages, round_up=True)} pages of "
+                f"{spec.resource_key!r} for labels {sorted(self.opened_labels(spec.nodes))}, and the pool "
+                f"has {spec.config.pages_of(spec.config.request_pages)}"
+            )
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -410,11 +447,21 @@ class KVReqConfig(ResourceReqConfig):
             return self.needed_labels
         return ["main"]
 
-    def opened_labels(self) -> set[str]:
+    def opened_labels(self, nodes: Collection[str] | None = None) -> set[str]:
+        """The labels the request opens on ``nodes``, or on every node when ``nodes`` is None."""
         labels = set(self.needed_labels or ["main"])
-        for named in (*self.needed_labels_per_node.values(), *self.needed_labels_per_node_walk.values()):
-            labels.update(named)
+        for node, named in self.needed_labels_per_node.items():
+            if nodes is None or node in nodes:
+                labels.update(named)
+        for (node, _), named in self.needed_labels_per_node_walk.items():
+            if nodes is None or node in nodes:
+                labels.update(named)
         return labels
+
+    def pages(self, nodes: Collection[str] | None, caps: Mapping[str, int], pool: PagedKVConfig) -> int:
+        """The most arena pages the request holds in ``pool``, shared by ``nodes``, at ``caps``."""
+        layouts = self.kv_layout or {}
+        return sum(pool.stream_pages(layouts[label], caps) for label in self.opened_labels(nodes) if label in layouts)
 
     def get_publish_labels(
         self,
@@ -464,6 +511,9 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
+    # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
+    # more pages per request than the leader's, as long as the leader offloads nothing.
+    leader: str | None = None
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -551,24 +601,29 @@ class StreamLayout:
             slots * caps[loop] for loop, slots in self.growth
         )
 
-    def pages(self, caps: Mapping[str, int], page_size: int) -> int:
+    def pages(
+        self, caps: Mapping[str, int], page_size: int, retention: "RetentionPolicy | None" = None,
+    ) -> int:
         """The most pages the stream can hold, where ``caps`` gives each growth loop's iterations;
-        under ``retention``, its window with the largest step past the prefix."""
+        under ``retention`` (the layout's own where None), its window with the largest step past
+        the prefix."""
+        if retention is None:
+            retention = self.retention
         peak, end = self.slots(caps) + self.scratch, 0
         for span in self.spans:
             peak = max(peak, end + span.scratch)
             end += span.length
         pages = -(-peak // page_size)
-        if self.retention is None:
+        if retention is None:
             return pages
-        prefix = self.retention.protected_prefix
+        prefix = retention.protected_prefix
         step, end = self.scratch, 0
         for span in self.spans:
             end += span.length
             if max(end, end - span.length + span.scratch) > prefix:
                 step = max(step, span.length, span.scratch)
         step = max([step, *(slots for _, slots in self.growth)])
-        return min(pages, self.retention.max_pages(page_size, step))
+        return min(pages, retention.max_pages(page_size, step))
 
 
 @dataclass(frozen=True)

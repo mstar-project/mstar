@@ -253,13 +253,11 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     timeout = communication.default_group_timeout(expected_backend)
     assert store_calls == [("test://world", 0, 4, timeout)]
 
-    expected_group_calls = []
-    for ranks in ((0, 1), (2, 3)):
-        expected_group_calls.append((ranks, {}))
-        if device_type != "xpu":
-            expected_group_calls.append((
-                ranks, {"backend": "gloo", "use_local_synchronization": True},
-            ))
+    # gloo twins first, then the device groups. Rank 0 isn't in (2, 3), so it
+    # makes a gloo group of just itself there.
+    gloo = {"backend": "gloo", "use_local_synchronization": True}
+    expected_group_calls = [] if device_type == "xpu" else [((0, 1), gloo), ((0,), gloo)]
+    expected_group_calls += [((0, 1), {}), ((2, 3), {})]
     assert calls == [
         {
             "backend": expected_backend, "store": store, "timeout": timeout,
