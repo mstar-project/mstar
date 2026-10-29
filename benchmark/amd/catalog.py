@@ -89,6 +89,8 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     _qwen("4B"),
     _qwen("9B"),
     _qwen("9B", gpus=2, tp=2, name="qwen3_5_9b_tp2"),
+    # speculative decoding with the checkpoint's MTP head drafting k tokens (configs/qwen3_5_<size>_mtp<k>.yaml)
+    *(_qwen(size, name=f"qwen3_5_{size.lower()}_mtp{k}") for size in ("0.8B", "9B") for k in (2, 3)),
     Row("kokoro", "tts", "hexgrad/Kokoro-82M", "kokoro"),
     Row("orpheus", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus", gpus=2),
     Row("orpheus_colocated", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus"),
