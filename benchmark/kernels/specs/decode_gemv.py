@@ -45,7 +45,7 @@ SKINNY_MAX_ROWS = 4
 # release makes each program write back its XCD's L2, which on MI325X cost
 # 25-30x the whole kernel at every point tried.
 FMA_SPACE = {
-    "block_n": (2, 4, 8, 16, 32), "block_k": (256, 512, 1024, 2048), "num_warps": (1, 2, 4, 8),
+    "block_n": (2, 4, 8, 16, 32), "block_k": (256, 512, 1024, 2048, 4096), "num_warps": (1, 2, 4, 8),
     "prefetch": (False, True), "xcd_remap": (False, True), "waves_per_eu": (0, 2),
 }
 DOT_SPACE = {
