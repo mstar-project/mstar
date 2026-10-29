@@ -14,7 +14,8 @@ MicroScheduler.{failed_rids, admit_errors, held_until, backlog, last_ran}
 streaming_buffers}, the engine's and tensor manager's per-request state,
 RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,
 _unkeyed, _admit_restores, _admit_snaps} (purged by
-remove_request), and WorkerProfileInfo.
+remove_request), and WorkerProfileInfo. MicroScheduler._found_ready is
+handle-keyed too, but only lasts one speculation build (`remember_ready`).
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it

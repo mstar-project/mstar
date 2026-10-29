@@ -9,6 +9,7 @@ API server's message thread (``test_serving_metrics``).
 """
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
 from types import SimpleNamespace
@@ -336,6 +337,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
     w.scheduler = SimpleNamespace(
         take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
+        remember_ready=contextlib.nullcontext,
     )
     for name in ("_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",

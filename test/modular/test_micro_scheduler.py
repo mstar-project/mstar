@@ -782,6 +782,53 @@ def test_clear_rid_forgets_when_the_rid_last_ran():
     assert sched.last_ran == {(NODE, WALK): {"r1": 1}, ("talker", "stream"): {}}
 
 
+def test_the_merge_takes_the_give_way_checks_answer():
+    """The chain's give-way check and its merge read the same queue; inside
+    one `remember_ready` block the engine is asked about the row once."""
+    engine = _Engine(max_bs=2)
+    sched = _scheduler(engine)
+    manager = _Manager(["w0"])
+
+    with sched.remember_ready():
+        room = _room(sched, manager, ["c0", "c1"])
+        batch = _next_batch(
+            sched, manager, target=(NODE, WALK), pre_existing_batch_size=room,
+        )
+
+    assert room == 1
+    assert list(batch.request_to_worker_graph) == ["w0"]
+    assert engine.checked == ["w0"]
+
+
+def test_a_row_found_offloaded_is_asked_again_and_can_reload():
+    """Only a ready answer is kept: the give-way check doesn't reload, and the
+    scan after it still may."""
+    engine = _Engine(max_bs=1, offloaded={"w0"})
+    sched = _scheduler(engine)
+    manager = _Manager(["w0"])
+
+    with sched.remember_ready():
+        assert _room(sched, manager, ["c0"]) == 1
+        batch = _next_batch(sched, manager)
+
+    assert list(batch.request_to_worker_graph) == ["w0"]
+    assert engine.checked == ["w0", "w0"]
+    assert engine.reloads == ["w0"]
+
+
+def test_ready_answers_are_forgotten_after_the_block():
+    engine = _Engine(max_bs=1)
+    sched = _scheduler(engine)
+    manager = _Manager(["w0"])
+
+    with sched.remember_ready():
+        _room(sched, manager, ["c0"])
+        _room(sched, manager, ["c0"])
+    _room(sched, manager, ["c0"])
+
+    assert engine.checked == ["w0", "w0"]
+
+
 def test_the_reserved_room_is_exactly_what_the_backlog_then_fills():
     """The two halves have to agree: whatever `room_for_continuing` holds
     back, the follow-up call must actually hand over."""

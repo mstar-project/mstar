@@ -21,6 +21,7 @@ a request is torn down, or a while.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import threading
 from pathlib import Path
@@ -100,6 +101,9 @@ class _Scheduler:
 
     def note_ran(self, batch):
         del batch
+
+    def remember_ready(self):
+        return contextlib.nullcontext()
 
     def clear_batch_limit(self, node_name, graph_walk, rows, walks=()):
         # an admitted step lifts its refusal limit; this stub has none

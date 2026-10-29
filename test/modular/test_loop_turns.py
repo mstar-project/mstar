@@ -43,6 +43,7 @@ class _Runtime:
     def __init__(self):
         self.ready: set[int] = set()
         self.requests: dict[int, None] = {}  # the worker's live requests
+        self.checked: list[int] = []  # rids the engine was asked about, in order
 
     def get_ready_nodes(self, exclude_rids, target=None, exclude_target=None):
         if (target is not None and target != KEY) or exclude_target == KEY:
@@ -76,7 +77,9 @@ def _scheduler(runtime: _Runtime) -> tuple[MicroScheduler, SimpleNamespace]:
         get_max_batch_size=lambda node, walk: 1,
         get_max_rows_in_combined=lambda node, walk: None,
         splits_by_capture_key=lambda node, walk: False,
-        check_ready=lambda node, rid, fwd_info, allow_reload=True: FULL_ADMIT_OK,
+        check_ready=lambda node, rid, fwd_info, allow_reload=True: (
+            runtime.checked.append(rid) or FULL_ADMIT_OK
+        ),
     )
     sched = MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine),
@@ -94,11 +97,12 @@ def _scheduler(runtime: _Runtime) -> tuple[MicroScheduler, SimpleNamespace]:
 
 def _run(
     steps: dict[int, int], arrive_at: dict[int, int] | None = None,
-    elsewhere: ScheduledBatch | None = None,
+    elsewhere: ScheduledBatch | None = None, checks: list[list[int]] | None = None,
 ) -> list[int]:
     """The rid each step served. ``steps``: rid -> loop length; ``arrive_at``:
     rid -> the step before which it turns ready (default 0); ``elsewhere``: a
-    step of another node on the same worker, run after each of this one's."""
+    step of another node on the same worker, run after each of this one's;
+    ``checks``: filled with the rids each step's build asked the engine about."""
     runtime = _Runtime()
     sched, state = _scheduler(runtime)
     arrive_at = arrive_at or {}
@@ -110,17 +114,21 @@ def _run(
         runtime.ready |= arrived
         runtime.requests.update(dict.fromkeys(arrived))
         nxt = None
-        if running is not None and left[running]:
-            room = sched.room_for_continuing(KEY, state, [running])
-            assert room is None or room >= 0, "the runtime takes the room unsigned"
-            if room is None or room >= 1:
-                nxt = running
-                # the speculative merge: no room left at a cap of one
-                assert sched.get_next_batch(state, target=KEY, pre_existing_batch_size=1) is None
-        if nxt is None:
-            batch = sched.get_next_batch(state)
-            if batch is not None:
-                (nxt,) = batch.request_to_worker_graph
+        runtime.checked.clear()
+        with sched.remember_ready():  # as the worker wraps one speculation build
+            if running is not None and left[running]:
+                room = sched.room_for_continuing(KEY, state, [running])
+                assert room is None or room >= 0, "the runtime takes the room unsigned"
+                if room is None or room >= 1:
+                    nxt = running
+                    # the speculative merge: no room left at a cap of one
+                    assert sched.get_next_batch(state, target=KEY, pre_existing_batch_size=1) is None
+            if nxt is None:
+                batch = sched.get_next_batch(state)
+                if batch is not None:
+                    (nxt,) = batch.request_to_worker_graph
+        if checks is not None:
+            checks.append(list(runtime.checked))
         # N lands: a row the chain did not continue goes back on the queue
         if running is not None and left[running] and nxt != running:
             runtime.ready.add(running)
@@ -177,6 +185,19 @@ def test_a_request_that_also_runs_another_node_keeps_its_turn_here():
     order = _run({rid: 6 for rid in range(3)}, elsewhere=other)
 
     assert order == [0, 1, 2] * 6
+
+
+def test_a_waiting_row_is_asked_about_once_a_step():
+    """At the cap, the chain's give-way check and the yield-away scan after
+    it read the same queue; the engine is asked about each row once."""
+    checks: list[list[int]] = []
+
+    order = _run({rid: 6 for rid in range(4)}, checks=checks)
+
+    assert order == [0, 1, 2, 3] * 6
+    assert any(checks)
+    for step in checks:
+        assert len(step) == len(set(step)), step
 
 
 def test_a_lone_request_keeps_its_chain_without_a_scan():

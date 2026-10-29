@@ -1,8 +1,9 @@
+import contextlib
 import functools
 import logging
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple
@@ -284,6 +285,8 @@ class MicroScheduler:
         # per key: a row that runs another node meanwhile has still waited here.
         self.last_ran: dict[tuple[str, str], dict[int, int]] = {}
         self._steps_run = 0
+        # node -> rows the engine found ready, inside `remember_ready` only
+        self._found_ready: dict[str, set[int]] | None = None
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
         # (node, graph walk) -> most rows a batch may take while its admits are
@@ -385,6 +388,23 @@ class MicroScheduler:
         never did, so a row new to the key takes its first step ahead."""
         stamps = self.last_ran.get(key, {})
         return lambda rid: stamps.get(rid, 0)
+
+    @contextlib.contextmanager
+    def remember_ready(self) -> Iterator[None]:
+        """Inside the block, a row the engine found ready at a node is taken
+        as ready again without asking.
+
+        Meant for one speculation build, whose give-way check and merge (or
+        yield-away) scan the same queue: within it nothing takes a waiting
+        row's resources away (offload and eviction run once the step lands),
+        and what a ready check found stays true. A not-ready answer is not
+        kept, since a row found offloaded without a reload may reload later.
+        """
+        self._found_ready = {}
+        try:
+            yield
+        finally:
+            self._found_ready = None
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -1549,6 +1569,9 @@ class MicroScheduler:
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
         fit) just comes back False; a ``terminal`` reason never will, so the
         rid is parked for the worker to fail instead of rescanned forever."""
+        found = self._found_ready
+        if found is not None and rid in found.get(node_name, ()):
+            return True
         engine = self.engine_manager.get_engine(node_name)
         outcome = engine.check_ready(node_name, rid, fwd_info, allow_reload=allow_reload)
         if outcome.reason is not None and outcome.reason.terminal:
@@ -1562,7 +1585,13 @@ class MicroScheduler:
             )
             self.fail_rids({rid})
             return False
-        return outcome.ok and outcome.ready
+        ready = outcome.ok and outcome.ready
+        if ready and found is not None:
+            rows = found.get(node_name)
+            if rows is None:
+                rows = found[node_name] = set()
+            rows.add(rid)
+        return ready
 
     def pending_rows(self) -> Counter[str]:
         """Per node this rank schedules, rows ready for a step but not in one:

@@ -5040,9 +5040,12 @@ class Worker:
                 # Only when (a) there's a pending step and (b) it's AR-engine.
                 # For non-AR or non-loop-body steps, falls through to the
                 # non-speculative path below (drain, then schedule).
-                speculation, yield_away_from_target = self._build_speculation(
-                    pending, consecutive_spec_steps, fair,
-                )
+                # The chain's give-way check and the merge or yield-away scan
+                # after it read the same queue: ask the engine once per row.
+                with self.scheduler.remember_ready():
+                    speculation, yield_away_from_target = self._build_speculation(
+                        pending, consecutive_spec_steps, fair,
+                    )
                 # inclusive of `speculate` and `worker.schedule_yield_away`
                 laps.lap("build_speculation")
                 if speculation is not None:
