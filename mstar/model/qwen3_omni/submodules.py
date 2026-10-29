@@ -1592,14 +1592,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         codec_embedding = cp.model.codec_embedding
         for group_idx in range(1, self.num_codes):
             if group_idx == 1:
-                hidden = cp.forward_depth_unrolled(
-                    torch.stack([last_hidden, embed], dim=1), self._get_cp_pair_positions()[:bs],
-                    kv_cache, cache_pos=0,
-                )[:, 1]
+                cp.depth.bind_step(kv_cache, self._get_cp_pair_positions()[:bs], cache_pos=0)
+                hidden = cp.forward_depth_unrolled(torch.stack([last_hidden, embed], dim=1))[:, 1]
             else:
-                hidden = cp.forward_depth_unrolled(
-                    embed.unsqueeze(1), positions[group_idx, :bs], kv_cache, cache_pos=group_idx,
-                ).squeeze(1)
+                cp.depth.bind_step(kv_cache, positions[group_idx, :bs], cache_pos=group_idx)
+                hidden = cp.forward_depth_unrolled(embed.unsqueeze(1)).squeeze(1)
 
             logits = torch.matmul(
                 hidden, cp.lm_head_weight[group_idx - 1].t()

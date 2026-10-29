@@ -13,7 +13,6 @@ into the next norm (``RMSNorm.forward_residual``).
 """
 from __future__ import annotations
 
-from functools import partial
 from typing import Callable
 
 import torch
@@ -70,25 +69,21 @@ class DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
 
-    def forward_residual(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor | None,
-        attend: Callable[[torch.Tensor], torch.Tensor] | None = None,
-        comm_group=None,
+    def forward_mlp_residual(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor,
+        next_norm: nn.Module, comm_group=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The layer with its residual adds left to the norms: returns the MLP
-        output and the stream it has not been added to yet. ``attend`` stands in
-        for ``self_attn`` on the normed input (a code predictor's own kernels).
-        Under TP the norms reduce the row-parallel partial sums over
-        ``comm_group``."""
-        h, residual = self.input_layernorm.forward_residual(hidden_states, residual, comm_group)
-        h = self.self_attn(h) if attend is None else attend(h)
-        h, residual = self.post_attention_layernorm.forward_residual(h, residual, comm_group)
-        return self.mlp(h), residual
+        """The layer after attention, through ``next_norm`` (the next layer's
+        input norm, or the stack's final norm): add+norm, MLP, add+norm. Returns
+        ``next_norm``'s output and the residual stream. One function, holding no
+        layer index, so a compiled stack runs one frame per layer here."""
+        h, residual = self.post_attention_layernorm.forward_residual(hidden_states, residual, comm_group)
+        return next_norm.forward_residual(self.mlp(h), residual, comm_group)
 
 
 def run_layers(
     layers: nn.ModuleList, hidden_states: torch.Tensor, norm: nn.Module,
-    attend: Callable[[int, nn.Module, torch.Tensor], torch.Tensor] | None = None,
+    set_cursor: Callable[[int, nn.Module], None] | None = None,
     comm_group=None,
 ) -> torch.Tensor:
     """``layers`` then the final ``norm``, each residual add fused into the next
@@ -97,20 +92,24 @@ def run_layers(
     a full tensor, and later norms update it in place, so pass a tensor the
     caller may overwrite.
 
-    By default layer ``i`` attends through its engine attention, its layer
-    cursor moved to ``i`` first; ``attend(i, self_attn, h)`` replaces that.
+    Layer ``i`` moves its attention's cursor to ``i`` (``self_attn.attend``'s,
+    or ``set_cursor(i, self_attn)`` in its place), then attends. The cursor
+    calls are eager, so this loop runs eager and no compiled frame specializes
+    on ``i``; ``set_cursor`` must be ``torch.compiler.disable``'d whole and do
+    no tensor work. Not ``recursive=False``: Dynamo calls back into such a frame
+    on every call, and the capture stance (``fail_on_recompile``) raises there.
     """
-    residual = None
+    first_norm = layers[0].input_layernorm if len(layers) else norm
+    h, residual = first_norm.forward_residual(hidden_states, None, comm_group)
     for i, layer in enumerate(layers):
-        if attend is None:
+        if set_cursor is None:
             layer.self_attn.attend.set_layer_idx(i)
-            hidden_states, residual = layer.forward_residual(hidden_states, residual, comm_group=comm_group)
         else:
-            hidden_states, residual = layer.forward_residual(
-                hidden_states, residual, partial(attend, i, layer.self_attn), comm_group,
-            )
-    normed, _ = norm.forward_residual(hidden_states, residual, comm_group)
-    return normed
+            set_cursor(i, layer.self_attn)
+        h = layer.self_attn(h)
+        next_norm = layers[i + 1].input_layernorm if i + 1 < len(layers) else norm
+        h, residual = layer.forward_mlp_residual(h, residual, next_norm, comm_group)
+    return h
 
 
 class GatedDecoderLayer(nn.Module):

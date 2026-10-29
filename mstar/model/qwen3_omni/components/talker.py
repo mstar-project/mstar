@@ -15,15 +15,13 @@ Weight prefix: ``talker.``
 
 from __future__ import annotations
 
-from functools import partial
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm, TopKRouter
-from mstar.model.components.code_predictor_kernels import cp_attend
+from mstar.model.components.code_predictor_kernels import DepthAttention, DepthKV
 from mstar.model.components.decoder_layer import DecoderLayer, run_layers
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
@@ -266,16 +264,16 @@ class Qwen3OmniCodePredictorLayer(DecoderLayer):
 
     def __init__(self, hidden_size: int, intermediate_size: int,
                  num_heads: int, num_kv_heads: int, head_dim: int,
-                 rms_norm_eps: float, rope_theta: float):
+                 rms_norm_eps: float, rope_theta: float, depth: DepthKV):
         super().__init__(
-            self_attn=Qwen3OmniAttention(
+            self_attn=DepthAttention(
+                depth,
                 hidden_size=hidden_size,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 rope_theta=rope_theta,
                 rms_norm_eps=rms_norm_eps,
-                use_mrope=False,
             ),
             mlp=ParallelGatedMLP(
                 hidden_size=hidden_size, intermediate_size=intermediate_size,
@@ -292,7 +290,7 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
     Contains layers, norm, and per-layer codec embeddings.
     """
 
-    def __init__(self, config: Qwen3OmniModelConfig):
+    def __init__(self, config: Qwen3OmniModelConfig, depth: DepthKV):
         super().__init__()
         cp = config.code_predictor
 
@@ -305,6 +303,7 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
                 head_dim=cp.head_dim,
                 rms_norm_eps=cp.rms_norm_eps,
                 rope_theta=cp.rope_theta,
+                depth=depth,
             )
             for _ in range(cp.num_hidden_layers)
         ])
@@ -336,15 +335,18 @@ class Qwen3OmniCodePredictor(nn.Module):
     The Code Predictor runs 15 autoregressive steps (for residual codebooks
     1..15).
 
-    ``forward_depth_unrolled(...)`` runs every layer with per-token position
-    IDs over a static dense KV cache tensor; the unrolled CUDA graph captures it.
+    ``forward_depth_unrolled(...)`` runs every layer over a static dense KV
+    cache, through the ``depth`` cursor that each depth step binds; the
+    unrolled CUDA graph captures it.
     """
 
     def __init__(self, config: Qwen3OmniModelConfig):
         super().__init__()
         cp = config.code_predictor
 
-        self.model = Qwen3OmniCodePredictorInnerModel(config)
+        # the frame-local KV cache its layers attend over; see forward_depth_unrolled
+        self.depth = DepthKV()
+        self.model = Qwen3OmniCodePredictorInnerModel(config, self.depth)
 
         # Per-layer output heads for residual layers 1..(G-1)
         num_residual = config.num_code_groups - 1
@@ -389,20 +391,15 @@ class Qwen3OmniCodePredictor(nn.Module):
     # ------------------------------------------------------------------
     # Dense-KV depth forward (for unrolled CUDA-graph capture)
     # ------------------------------------------------------------------
-    def forward_depth_unrolled(
-        self,
-        inputs_embeds: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache: torch.Tensor,
-        cache_pos: int,
-    ) -> torch.Tensor:
+    def forward_depth_unrolled(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         """Run one "slice" of the code-predictor AR loop over a dense KV cache,
-        attending through ``cp_attend``'s Triton kernels.
+        attending through ``DepthAttention``'s Triton kernels. Bind the slice
+        first with ``depth.bind_step``, once per call: the depth loop binds it,
+        not this frame, which would compile once per ``cache_pos``.
 
         It is safe to call repeatedly inside a single graph capture because:
 
           * The KV cache is a preallocated dense tensor (no plan() call).
-          * Position IDs come in directly (no PlanState bookkeeping).
           * Write/read slices use Python-static ``cache_pos`` / ``seq_len`` so
             the captured kernel sees identical shapes every replay.
 
@@ -410,20 +407,12 @@ class Qwen3OmniCodePredictor(nn.Module):
             inputs_embeds: ``[bs, seq_len, hidden_size]``. ``seq_len`` is 2 for
                 the initial "prefill" call (``[last_hidden, c0_embed]``) and 1
                 for every subsequent decode iteration.
-            position_ids: ``[bs, seq_len]`` int tensor with the absolute
-                position of each input token within the depth sequence.
-            kv_cache: ``[n_layers, bs, 2, max_seq_len, n_kv_heads, head_dim]``
-                dense tensor preallocated by the runner. It is not cleared between
-                steps: every position a step reads is written earlier in the same step.
-            cache_pos: write offset into ``kv_cache``'s seq-len axis. The new
-                K/V tokens land at ``[cache_pos : cache_pos + seq_len]``.
 
         Returns:
             ``[bs, seq_len, hidden_size]`` final hidden states after the code
             predictor's 5 layers + final RMSNorm. The caller is responsible
             for applying the per-codebook LM head.
         """
-        attend = partial(cp_attend, kv_cache, position_ids.reshape(-1), cache_pos)
         # the residual stream is updated in place, so it starts from a copy of
         # the input embeddings, which the caller owns
-        return run_layers(self.model.layers, inputs_embeds.clone(), self.model.norm, attend)
+        return run_layers(self.model.layers, inputs_embeds.clone(), self.model.norm)

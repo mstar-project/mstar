@@ -115,6 +115,9 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
     complex rotary tables for the image and caption spans.
     """
 
+    # the noise is a function of the latent grid and the seed alone
+    PREFETCH_SEEDS = True
+
     def __init__(
         self, transformer: nn.Module, config: ZImageConfig, *, loop_name: str, attn_resource_key: str | None,
         compile_transformer: bool = True, compile_eager_rounding: bool = True,

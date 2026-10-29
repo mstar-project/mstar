@@ -18,7 +18,7 @@ from types import MappingProxyType
 from typing import NamedTuple
 
 import torch
-import torch.distributed as dist
+from torch.distributed import ReduceOp
 
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
@@ -313,6 +313,7 @@ class SpeculationTarget(NamedTuple):
 
 # pinned host-row buffers in flight at once (see Worker._stage_host_rows)
 _HOST_ROWS_RING = 4
+_HOST_SPANS_PURPOSE = tuple(f"output_spans{slot}" for slot in range(_HOST_ROWS_RING))
 
 
 class _LazyPerRid:
@@ -846,7 +847,7 @@ class Worker:
         )
         try:
             self.engine_manager.add_request(
-                request_id, body.request_info.resource_configs,
+                request_id, body.request_info.resource_configs, body.request_info,
             )
         except Exception as err:
             # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
@@ -1558,14 +1559,13 @@ class Worker:
         failed the read reported it, and the others fail it here, so its outputs
         and its pages never exist on any rank.
 
-        One vote of a flag per row over the instance (a host-side ``MAX``), in
-        the leader's row order, on the GPU thread where every rank prepares
-        the step."""
+        One vote of a flag per row over the instance (``JointGroups.agree``
+        with MAX), in the leader's row order, on the GPU thread where every rank
+        prepares the step."""
         rids = node_batch.read_check_rids
         failed = self.scheduler.read_failed_rids
-        node = node_batch.node_name
-        votes = self.parallel_groups.get_joint_group_for_node(node).instance.host_all_reduce(
-            [int(r in failed) for r in rids], dist.ReduceOp.MAX,
+        votes = self.parallel_groups.get_joint_group_for_node(node_batch.node_name).agree(
+            [int(r in failed) for r in rids], ReduceOp.MAX,
         )
         flagged = {r for r, f in zip(rids, votes, strict=True) if f}
         if not flagged:
@@ -2671,12 +2671,13 @@ class Worker:
         """Refuse a per-rank flag mismatch at startup: a follower would wait for
         a decision the leader never sends, or get a head it cannot build."""
         for node in sorted(self.parallel_nodes):
-            group = self.parallel_groups.get_joint_group_for_node(node).instance
-            local = [int(self._tp_async_for(node))]
-            if group.host_all_reduce(local, dist.ReduceOp.MIN) != group.host_all_reduce(local, dist.ReduceOp.MAX):
+            on = int(self._tp_async_for(node))
+            joint = self.parallel_groups.get_joint_group_for_node(node)
+            lo, neg_hi = joint.agree([on, -on])
+            if lo != -neg_hi:
                 raise RuntimeError(
                     f"MSTAR_TP_ASYNC_SCHED disagrees across the ranks of {node!r} "
-                    f"(ranks {group.group_members}); set it identically on every "
+                    f"(async min {lo}, max {-neg_hi}); set it identically on every "
                     "rank of the instance."
                 )
 
@@ -3562,6 +3563,11 @@ class Worker:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
 
         _pp_stage("completion_event_sync")
+        # Waited on above, so the spans have landed; cut before anything reads
+        # the outputs: the stop check, the store, a streaming edge.
+        if outputs.output_spans and batch_N.batch.request_to_worker_graph:
+            self._crop_to_spans(outputs)
+            _pp_stage("crop_spans")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.check_stop", synchronize=False)
@@ -4097,11 +4103,28 @@ class Worker:
         A small ring of pinned buffers: step N's rows are read by the main
         thread while this thread already stages N+1's (the pipeline is one
         step deep, the ring leaves slack).
+
+        The step's output spans (``BatchedModelOutput.output_spans``) take the
+        same path, so cutting the outputs to them costs no wait of its own.
         """
         buffers = outputs.check_stop_buffers
-        if not buffers or outputs.row_request_ids is None:
+        rows = bool(buffers) and outputs.row_request_ids is not None
+        if not rows and not outputs.output_spans:
             return
         slot = self._host_rows_slot = (self._host_rows_slot + 1) % _HOST_ROWS_RING
+        if rows:
+            outputs.host_rows = HostRows(
+                tuple(outputs.row_request_ids),
+                self._copy_to_pinned(buffers, f"host_rows{slot}"),
+            )
+        if outputs.output_spans:
+            outputs.host_spans = self._copy_to_pinned(
+                outputs.output_spans, _HOST_SPANS_PURPOSE[slot],
+            )
+
+    def _copy_to_pinned(self, buffers: dict, purpose: str) -> dict:
+        """Queue a non-blocking copy of each device tensor in ``buffers`` into
+        a pinned buffer of ``purpose``; anything else passes through."""
         host: dict[str, torch.Tensor] = {}
         for index, (name, tensor) in enumerate(buffers.items()):
             if not (
@@ -4112,11 +4135,40 @@ class Worker:
                 host[name] = tensor
                 continue
             buf = self._get_pinned_d2h_buffer(
-                f"host_rows{slot}", tensor.shape, tensor.dtype, index,
+                purpose, tensor.shape, tensor.dtype, index,
             )
             buf.copy_(tensor, non_blocking=True)
             host[name] = buf
-        outputs.host_rows = HostRows(tuple(outputs.row_request_ids), host)
+        return host
+
+    @staticmethod
+    def _crop_to_spans(outputs: "BatchedModelOutput") -> None:
+        """Cut each row of a spanned output to its span along the last dim
+        (``NodeSubmodule.spanned_outputs``). Called once the step's completion
+        event has fired, so the spans staged behind the step are on the host.
+        The cut is a view, and it replaces the tensor in its list in place, so
+        a second name that ``postprocess`` or ``unpack_packed_outputs`` gave
+        the same list is cut with it. Two names the forward returned on its own
+        get their own lists from the engine and keep their own widths.
+        """
+        spans = outputs.host_spans or outputs.output_spans
+        per_rid = outputs.per_rid_outputs
+        cut = False
+        for name, span in spans.items():
+            # columns, not a [start, end] list per row
+            starts, ends = span.t().tolist()
+            for rid, start, end in zip(outputs.span_request_ids, starts, ends, strict=True):
+                row = per_rid.get(rid)
+                tensors = row.get(name) if row is not None else None
+                if not tensors:
+                    continue
+                for i, tensor in enumerate(tensors):
+                    if start > 0 or end < tensor.shape[-1]:
+                        tensors[i] = tensor[..., max(start, 0):max(end, 0)]
+                        cut = True
+        if cut:
+            # the views no longer describe the stored rows
+            outputs.row_views = None
 
     def _get_pinned_d2h_buffer(
         self,

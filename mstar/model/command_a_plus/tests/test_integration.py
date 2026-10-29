@@ -45,6 +45,23 @@ def info(walk="prefill", max_tokens=6, ignore_eos=False, index=0):
     )
 
 
+def engine_postprocess(submodule, request_id, request_info, outputs):
+    """``postprocess`` as ``Engine._postprocess_batch`` runs it, the engine's own
+    tail included (it drops the closing token of a reply that ended at prefill)."""
+    from mstar.engine.engine import Engine
+    from mstar.model.submodule_base import BatchedModelOutput
+
+    failures = {}
+    batch = SimpleNamespace(
+        node_name="llm", request_ids=[request_id], inputs=[None],
+        per_request_info_wrapped={request_id: request_info}, failed_requests=failures,
+        register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk=request_info.graph_walk),
+    )
+    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=submodule, piecewise_runners={})})
+    Engine._postprocess_batch(engine, batch, BatchedModelOutput(per_rid_outputs={request_id: outputs}))
+    assert not failures, failures
+
+
 class ToyLM(nn.Module):
     def __init__(self, vocab):
         super().__init__()
@@ -105,13 +122,11 @@ class NodeTests(unittest.TestCase):
                 self.assertEqual(self.node.check_stop("a", info(ignore_eos=ignore_eos), prefill), set())
                 request = info("decode", ignore_eos=ignore_eos)
                 decode = {"new_token": [torch.tensor([7])]}
-                self.node.postprocess("a", request, decode)
+                engine_postprocess(self.node, "a", request, decode)
                 self.assertEqual("new_token" not in decode, ends)
                 self.assertEqual(self.node.check_stop("a", request, decode), {"decode_loop"} if ends else set())
-        self.assertEqual(self.node._ended_at_prefill, set())
-        self.node.check_stop("a", info(), {"new_token": [torch.tensor([3])]})
-        self.node.cleanup_request("a")
-        self.assertEqual(self.node._ended_at_prefill, set())
+                self.node.cleanup_request("a")
+                self.assertNotIn("a", self.node.request_states)
 
     def test_decode_stop_counts_prefill_token_and_respects_ignore_eos(self):
         for token, maximum, index, ignore_eos, stops in (
