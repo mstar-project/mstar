@@ -216,6 +216,7 @@ class _Engine:
             {"node": OffloadDelta.new()} if role == "leader" else {}
         )
         self._tp_follower_nodes = {"node"} if role == "follower" else set()
+        self._rows = {}
         self._graph_runtime = _Rids()
 
 

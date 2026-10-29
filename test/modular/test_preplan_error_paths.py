@@ -190,7 +190,9 @@ def _exec_fake(runner, raise_with):
         _exec_single=_raiser(raise_with),
         _exec_per_request=_raiser(raise_with),
         _runner=runner,
+        _rows={},
     )
+    fake._enter_rows = Engine._enter_rows.__get__(fake)
     fake.exec = Engine.exec.__get__(fake)
     return fake
 
@@ -198,7 +200,7 @@ def _exec_fake(runner, raise_with):
 def _batch(preplanned) -> SimpleNamespace:
     return SimpleNamespace(
         request_ids=["a"], node_name="dit", running_batched=True,
-        step_context=SimpleNamespace(graph_walk="decode", slot_lease=None),
+        step_context=SimpleNamespace(graph_walk="decode", slot_lease=None, rows=None),
         preplanned_rids=preplanned, preplan_event=object(),
         outputs_ready=SimpleNamespace(set=lambda: None),
         release_waiters=lambda: None,
@@ -244,7 +246,7 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     batch = SimpleNamespace(
         request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
         preplanned_rids=("a", "b"), preplan_event=object(),
-        step_context=SimpleNamespace(slot_lease=None),
+        step_context=SimpleNamespace(slot_lease=None, rows=None),
     )
     assert fake.preplan_is_stale(batch)
     fake.reset_pre_plan_for_batch(batch)
