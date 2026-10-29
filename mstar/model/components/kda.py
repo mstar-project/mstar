@@ -1,0 +1,378 @@
+"""Kimi delta attention (KDA): the linear-attention layer of Kimi-Linear, Kimi K3 and GLM-5.3.
+
+Holds the weights; the recurrent state and the kernels belong to the engine's KDA resource
+(``engine/resources/linear_attn/kda.py``), reached through ``KDACallable``. ``forward`` runs a
+step through the resource; ``prefill`` / ``decode_step`` run the same math on state the caller
+holds (``kda_torch``, the resource's reference), the parity oracle.
+
+Head counts are whatever ``KDAConfig`` says; ``ParallelKimiDeltaAttention``
+(``components/distributed/kda.py``) builds one rank's share, so this module has no distributed
+import.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from mstar.engine.resources.convenience import KDACallable
+from mstar.engine.resources.linear_attn.kda import KDAParams
+from mstar.engine.resources.linear_attn.kda_torch import (
+    causal_conv1d_prefill,
+    causal_conv1d_update,
+    chunk_kda,
+    forget_gate,
+    gated_rms_norm,
+    recurrent_kda_step,
+)
+
+
+@dataclass
+class KDAConfig:
+    """One KDA layer's shape: ``num_heads`` heads of ``head_dim`` for q, k and v alike.
+
+    ``full_rank_output_gate``: the output gate is one ``hidden -> heads * head_dim`` projection
+    (``g_proj``, Kimi K3) rather than the low-rank ``g_a_proj`` / ``g_b_proj`` pair (GLM-5.3,
+    Kimi-Linear)."""
+
+    hidden_size: int
+    num_heads: int
+    head_dim: int
+    conv_kernel_size: int = 4
+    # the forget gate is lower_bound * sigmoid(...); Kimi's softplus form (None) is not ported
+    gate_lower_bound: float | None = -5.0
+    rms_norm_eps: float = 1e-5
+    full_rank_output_gate: bool = False
+
+    @property
+    def qkv_dim(self) -> int:
+        """Per-projection width: heads x head_dim."""
+        return self.num_heads * self.head_dim
+
+    @property
+    def conv_channels(self) -> int:
+        """The fused depthwise conv's channels over cat(q, k, v)."""
+        return 3 * self.qkv_dim
+
+
+def apply_mask_to_padding_states(
+    hidden_states: torch.Tensor, attention_mask: torch.Tensor | None
+) -> torch.Tensor:
+    """Zero padded positions BEFORE any projection (2D boolean ``(B, L)`` mask)."""
+    if attention_mask is not None:
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+    return hidden_states
+
+
+class KDAForgetGate(nn.Module):
+    """Per-head, per-key-channel log forget gate ``g (B, L, H, D)``, fp32."""
+
+    def __init__(self, config: KDAConfig, dtype: torch.dtype = torch.bfloat16) -> None:
+        super().__init__()
+        if config.gate_lower_bound is None:
+            raise ValueError(
+                "gate_lower_bound is None: the softplus forget gate is not implemented "
+                "(every KDA checkpoint served so far bounds it)"
+            )
+        self.head_dim = config.head_dim
+        self.num_heads = config.num_heads
+        self.gate_lower_bound = float(config.gate_lower_bound)
+
+        self.f_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
+        self.f_b_proj = nn.Linear(self.head_dim, config.qkv_dim, bias=False, dtype=dtype)
+        # fp32 params (HF _keep_in_fp32_modules_strict); stored fp32 in the
+        # checkpoint. Zero init keeps the fresh module runnable (loader
+        # overwrites): decay_rate = 1, g = lower_bound * sigmoid(f(x)).
+        self.dt_bias = nn.Parameter(torch.zeros(config.qkv_dim, dtype=torch.float32))
+        self.A_log = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``(B, L, hidden) -> (B, L, H, D)`` fp32 log-decay in (lower_bound, 0)."""
+        hidden_shape = (*hidden_states.shape[:2], -1, self.head_dim)
+        f = self.f_b_proj(self.f_a_proj(hidden_states)).view(hidden_shape)
+        return forget_gate(f, self.dt_bias, self.A_log, self.gate_lower_bound)
+
+
+class KDAGatedRMSNorm(nn.Module):
+    """Gated RMSNorm over head_dim, weight shared across heads, strict fp32."""
+
+    def __init__(self, head_dim: int, eps: float, dtype: torch.dtype = torch.bfloat16) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(head_dim, dtype=dtype))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        return gated_rms_norm(hidden_states, gate, self.weight, self.variance_epsilon)
+
+
+class KimiDeltaAttention(nn.Module):
+    """One KDA layer: projections + fused causal conv + delta rule + gated out.
+
+    ``kda_key`` / ``state_key``: the resource labels this layer binds (the KDA resource and the
+    recurrent pool holding its state), as ``GatedDeltaNet``'s."""
+
+    def __init__(
+        self,
+        config: KDAConfig,
+        dtype: torch.dtype = torch.bfloat16,
+        *,
+        kda_key: str = "kda",
+        state_key: str = "kda_state",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
+        self.qkv_dim = self.num_heads * self.head_dim
+        self.conv_dim = 3 * self.qkv_dim
+        self.conv_kernel_size = config.conv_kernel_size
+        self.full_rank_output_gate = config.full_rank_output_gate
+        # Kernel-internal chunking, not a config field; 64 is the reference
+        # default, which the parity tests are written against.
+        self.chunk_size = 64
+
+        self.q_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False, dtype=dtype)
+        self.k_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False, dtype=dtype)
+        self.v_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False, dtype=dtype)
+        # Fused depthwise conv over cat(q, k, v); fp32 weight, no bias (the loader fuses the
+        # checkpoint's three [qkv_dim, 1, K] taps and upcasts). padding is unused (both paths
+        # call F.conv1d directly)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            bias=False,
+            padding=self.conv_kernel_size - 1,
+            dtype=torch.float32,
+        )
+        self.forget_gate = KDAForgetGate(config, dtype=dtype)
+        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False, dtype=dtype)
+        if self.full_rank_output_gate:
+            self.g_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False, dtype=dtype)
+        else:
+            self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False, dtype=dtype)
+            self.g_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False, dtype=dtype)
+        self.o_norm = KDAGatedRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+        self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False, dtype=dtype)
+        # q | k | v | b | f_a | gate input, built by process_weights_after_loading.
+        self._in_proj_weight: torch.Tensor | None = None
+        # The KDA resource and its pool, bound once at load (NodeSubmodule.bind_node_resources).
+        self._kda_key, self._state_key = kda_key, state_key
+        self.mix: KDACallable | None = None
+        self._params: KDAParams | None = None
+
+    # -- the dense reference, on state the caller holds -----------------------
+
+    def _gate_input(self) -> nn.Linear:
+        """The output gate's first projection: all of it full-rank, ``g_a`` low-rank."""
+        return self.g_proj if self.full_rank_output_gate else self.g_a_proj
+
+    def _output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.full_rank_output_gate:
+            return self.g_proj(hidden_states)
+        return self.g_b_proj(self.g_a_proj(hidden_states))
+
+    def process_weights_after_loading(self, device) -> None:
+        """Concatenate the six input projections for the fused kernels, zero-padded to a
+        multiple of 16 rows: Triton only vectorizes loads from the projected activations when
+        their row stride is a multiple of 16 elements (3336 -> 3344 at one TP8 rank)."""
+        del device
+        weights = [
+            self.q_proj.weight, self.k_proj.weight, self.v_proj.weight, self.b_proj.weight,
+            self.forget_gate.f_a_proj.weight, self._gate_input().weight,
+        ]
+        pad = -sum(w.shape[0] for w in weights) % 16
+        weights.append(weights[0].new_zeros(pad, self.hidden_size))
+        self._in_proj_weight = torch.cat(weights).detach()
+        self._params = None
+
+    def init_state(
+        self, batch_size: int, device: torch.device | str | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Zero per-request state: ``(S (B, H, D, D) fp32, conv (B, 3HD, K-1))``."""
+        if device is None:
+            device = self.o_proj.weight.device
+        recurrent_state = torch.zeros(
+            batch_size, self.num_heads, self.head_dim, self.head_dim,
+            dtype=torch.float32, device=device,
+        )
+        conv_state = torch.zeros(
+            batch_size, self.conv_dim, self.conv_kernel_size - 1,
+            dtype=self.q_proj.weight.dtype, device=device,
+        )
+        return recurrent_state, conv_state
+
+    def _mixed_qkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Raw pre-conv, pre-SiLU projections: ``(B, 3*H*D, L)``, order q|k|v."""
+        return torch.cat(
+            [
+                self.q_proj(hidden_states),
+                self.k_proj(hidden_states),
+                self.v_proj(hidden_states),
+            ],
+            dim=-1,
+        ).transpose(1, 2)
+
+    def _split_heads(
+        self, conv_out: torch.Tensor, hidden_shape: tuple[int, ...]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query, key, value = torch.split(
+            conv_out.transpose(1, 2), [self.qkv_dim] * 3, dim=-1
+        )
+        return query.view(hidden_shape), key.view(hidden_shape), value.view(hidden_shape)
+
+    def _finalize(
+        self,
+        core_attn_out: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        """Output gate (from the PRE-conv input) + gated RMSNorm + o_proj."""
+        batch_size, seq_len = hidden_states.shape[:2]
+        gate = self._output_gate(hidden_states).view(hidden_shape)
+        output = self.o_norm(core_attn_out, gate).reshape(batch_size, seq_len, self.qkv_dim)
+        return self.o_proj(output)
+
+    def prefill(
+        self,
+        hidden_states: torch.Tensor,
+        recurrent_state: torch.Tensor | None = None,
+        conv_state: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full or continued prefill over ``(B, L, hidden)``; chunked kernel."""
+        if (recurrent_state is None) != (conv_state is None):
+            raise ValueError(
+                "pass both recurrent_state and conv_state (continue) or neither "
+                "(first prefill); got exactly one"
+            )
+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        batch_size, seq_len = hidden_states.shape[:2]
+        hidden_shape = (batch_size, seq_len, self.num_heads, self.head_dim)
+
+        mixed_qkv = self._mixed_qkv(hidden_states)
+        tail_len = self.conv_kernel_size - 1
+        if conv_state is None:
+            conv_out = causal_conv1d_prefill(mixed_qkv, self.conv1d.weight)
+            # Raw pre-SiLU tail; the left zero-pad covers L < kernel - 1.
+            conv_state = F.pad(mixed_qkv, (tail_len, 0))[:, :, -tail_len:].contiguous()
+        else:
+            extended = torch.cat([conv_state, mixed_qkv], dim=-1)
+            conv_out = causal_conv1d_prefill(extended, self.conv1d.weight)[:, :, -seq_len:]
+            conv_state.copy_(extended[:, :, -conv_state.shape[-1]:])
+
+        query, key, value = self._split_heads(conv_out, hidden_shape)
+
+        # Gates from the PRE-conv hidden states — never the conv output.
+        g = self.forget_gate(hidden_states)
+        beta = torch.sigmoid(self.b_proj(hidden_states))
+
+        core_attn_out, final_state = chunk_kda(
+            query, key, value, g, beta,
+            chunk_size=self.chunk_size, initial_state=recurrent_state,
+        )
+        if recurrent_state is None:
+            recurrent_state = final_state.to(torch.float32)
+        else:
+            recurrent_state.copy_(final_state)
+
+        output = self._finalize(core_attn_out, hidden_states, hidden_shape)
+        return output, recurrent_state, conv_state
+
+    def decode_step(
+        self,
+        hidden_states: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        conv_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """One decode token ``(B, 1, hidden)``; states mutated IN PLACE."""
+        batch_size, seq_len = hidden_states.shape[:2]
+        if seq_len != 1:
+            raise ValueError(
+                f"decode_step is single-token (got seq_len={seq_len}); "
+                "multi-token continue goes through prefill()"
+            )
+        hidden_shape = (batch_size, 1, self.num_heads, self.head_dim)
+
+        mixed_qkv = self._mixed_qkv(hidden_states)
+        conv_out = causal_conv1d_update(mixed_qkv, conv_state, self.conv1d.weight)
+        query, key, value = self._split_heads(conv_out, hidden_shape)
+
+        g = self.forget_gate(hidden_states)
+        beta = torch.sigmoid(self.b_proj(hidden_states))
+
+        core_attn_out = recurrent_kda_step(query, key, value, g, beta, recurrent_state)
+        return self._finalize(core_attn_out, hidden_states, hidden_shape)
+
+    # -- through the engine's KDA resource --------------------------------
+
+    def bind_resources(self, resources: dict) -> None:
+        """Resolve the resources this layer calls. See ``NodeSubmodule.bind_node_resources``."""
+        self.mix = KDACallable(resources[self._state_key], resources[self._kda_key])
+        # The conv tail is read alongside the projected activations, so the
+        # pool must hold them in the dtype the layer was loaded in.
+        pool_dtype = self.mix.conv_dtype
+        proj_dtype = self.q_proj.weight.dtype
+        if pool_dtype != proj_dtype:
+            raise RuntimeError(
+                f"KDA conv state is {pool_dtype} but the KDA projections are "
+                f"{proj_dtype}; declare the pool's conv block in the projections' dtype "
+                "(DeltaNetGeometry.to_blocks(conv_dtype=...))"
+            )
+
+    def params(self) -> KDAParams:
+        """What the KDA resource's kernels read besides the activations. A full-rank output
+        gate leaves the gate and the norm to this layer (``g_b`` None)."""
+        if self._params is None:
+            self._params = KDAParams(
+                conv_weight=self.conv1d.weight.view(self.conv_dim, -1),
+                A_log=self.forget_gate.A_log,
+                dt_bias=self.forget_gate.dt_bias,
+                lower_bound=self.forget_gate.gate_lower_bound,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                scale=self.head_dim ** -0.5,
+                f_b=self.forget_gate.f_b_proj.weight,
+                g_b=None if self.full_rank_output_gate else self.g_b_proj.weight,
+                norm_weight=self.o_norm.weight,
+                norm_eps=self.o_norm.variance_epsilon,
+            )
+        return self._params
+
+    def forward(self, hidden_states: torch.Tensor, layer_idx: int | None = None) -> torch.Tensor:
+        """``(T, hidden)`` through the KDA resource, state in the pool's ``layer_idx`` blocks
+        (this layer's index among the KDA layers; None: the ``mix`` cursor's)."""
+        if self.mix is None or self._in_proj_weight is None:
+            raise RuntimeError(
+                f"{type(self).__name__} needs its engine resources bound and "
+                "process_weights_after_loading run before a forward"
+            )
+        # One GEMM for q | k | v | beta | f_a | gate input; the kernels read the
+        # columns of each row where this puts them.
+        proj = F.linear(hidden_states, self._in_proj_weight)
+        p, h, d = self.qkv_dim, self.num_heads, self.head_dim
+        qkv, beta = proj[:, :3 * p], proj[:, 3 * p:3 * p + h]
+        f_a = proj[:, 3 * p + h:3 * p + h + d]
+        if self.full_rank_output_gate:
+            gate = proj[:, 3 * p + h + d:3 * p + h + d + p]
+            out = self.mix(qkv, f_a, beta, self.params(), layer_idx=layer_idx)
+            t = hidden_states.shape[0]
+            out = self.o_norm(out.view(t, h, d), gate.view(t, h, d)).reshape(t, p)
+        else:
+            g_a = proj[:, 3 * p + h + d:3 * p + h + 2 * d]
+            out = self.mix(qkv, f_a, beta, self.params(), gate=g_a, layer_idx=layer_idx)
+        return self._project_out(out, hidden_states)
+
+    def _project_out(self, out: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``o_proj``; the tensor-parallel layer sums the ranks' partials here."""
+        del hidden_states
+        return self.o_proj(out)
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._params = None
+        return result
