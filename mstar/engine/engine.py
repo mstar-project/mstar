@@ -54,6 +54,7 @@ from mstar.engine.resources.step import (
     PerReqSetting,
 )
 from mstar.graph.runtime.base import GraphRuntime
+from mstar.kernels import ops as kernel_registry
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
@@ -836,6 +837,9 @@ class Engine:
         return self._submodules[node_name].node_dtype
 
     def warmup(self) -> None:
+        if self.device_capability.is_available:
+            for op, selection in kernel_registry.warm_all().items():
+                logger.info("Engine: kernel op %s runs %s", op, selection)
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
