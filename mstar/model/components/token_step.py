@@ -108,6 +108,9 @@ class TokenStepNode:
         pairs = host_rows.first_values("new_token", request_ids)
         if pairs is None:
             return None
+        if step_walk == self.DECODE_WALK:
+            # the hot path: one call a row, and every stop is the loop's
+            return {rid: {self.DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}
         stops = {}
         for rid, token in pairs:
             if names := self._stop_names(token, request_infos[rid]):
