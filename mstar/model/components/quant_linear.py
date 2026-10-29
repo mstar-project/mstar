@@ -4,7 +4,7 @@ Three pieces, each declared once:
 
 - a format (``LinearFormat``) owns its weight quantization, its activation quantization and its GEMM, as one
   ``mstar::<format>_linear`` op with a fake implementation, so a compiled forward sees one opaque node per linear;
-  ``block_scaled.py`` declares ``mxfp8`` and ``nvfp4``;
+  ``fp8_rowwise.py`` declares ``fp8``, ``block_scaled.py`` ``mxfp8`` and ``nvfp4``;
 - a linear kind says whether it takes a format (``quant_capability``), as ``lora_capability`` does for LoRA:
   ``nn.Linear`` and ``FusedColumnLinear`` do, and a kind that can't says why, so a declared linear is never skipped
   silently;
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 BF16 = "bf16"
 # a format's name -> the module that declares it, imported on first use (it registers its ops)
 _FORMAT_MODULES = {
+    "fp8": "mstar.model.components.fp8_rowwise",
     "mxfp8": "mstar.model.components.block_scaled",
     "nvfp4": "mstar.model.components.block_scaled",
 }
