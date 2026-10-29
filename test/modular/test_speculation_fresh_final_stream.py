@@ -149,6 +149,7 @@ def _follower_speculation(final: bool):
     head = SimpleNamespace(
         speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK,
         walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
+        chunk_starts=[], chunk_ends=[], chunk_totals=[], chunk_strides=[],
     )
     scheduler = SimpleNamespace(
         peek_tp_follow=lambda: head,

@@ -394,3 +394,39 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
     assert Worker._plans_ahead(leader, spec(NODE, True)) is not cache_open, "only the cache reads page ids"
     assert Worker._plans_ahead(leader, spec(NODE, False)), "the head is pre-planned on every rank"
     assert Worker._plans_ahead(leader, spec("other", True)), "a node with no followers keeps its pre-plan"
+
+
+def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():
+    """Rank 0 leases the cached prefix a chunked row's chunks start past as it
+    sends the step. The lease goes out with the step, so a
+    follower's first chunk finds the same prefix; its own probe would find
+    none, and its chunk would not start where rank 0's does."""
+    from mstar.engine.chunking import ChunkingManagement, ChunkRange
+
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
+    prompt = shared[:5 * PAGE_SIZE] + _tokens(40, seed=1)
+    _cache(ranks, "b0", shared)
+    for kv in ranks:
+        _ingest(kv, "b", prompt)
+
+    head = _send(leader, "b")  # rank 0 leases the prefix as it sends the step
+    start = leader.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens
+    assert start == 5 * PAGE_SIZE
+    assert _follow(follower, head)
+
+    class _Prompt(_Submodule):
+        def prepare_inputs(self, **kwargs):
+            return ARNodeInputs(input_ids=torch.tensor(prompt), input_seq_len=len(prompt))
+
+    engine = _engine(follower)
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Prompt(), resources={})
+    engine._chunking = ChunkingManagement(engine._submodules)
+    batch = SimpleNamespace(
+        node_name=NODE, per_request_info_wrapped={"b": None}, per_request_input_tensors={},
+        final_stream_rids=set(), per_request_input_metadata={},
+    )
+    end = start + PAGE_SIZE
+    first = engine._prepare_chunk(batch, "b", WALK, ChunkRange(start, end, len(prompt), end))
+
+    assert (first.chunk_start, first.input_seq_len) == (start, PAGE_SIZE)

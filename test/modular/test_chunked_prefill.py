@@ -712,27 +712,28 @@ def _chunking_model():
     })
 
 
-def _groups(width):
-    return SimpleNamespace(get_instance_world_size_for_node=lambda node: width)
+def _groups(sp=1):
+    return SimpleNamespace(get_sp_config_for_node=lambda node: SimpleNamespace(world_size=sp))
 
 
-def test_a_node_wider_than_one_rank_has_its_chunking_turned_off(caplog):
-    """Chunked prefill is not supported under TP/SP yet. Refusing to start
-    would take TP away from every model that chunks, so the node runs its
+def test_a_node_under_sp_has_its_chunking_turned_off(caplog):
+    """Chunked prefill is not supported under SP yet. Refusing to start
+    would take SP away from every model that chunks, so the node runs its
     prefills whole and says so."""
     from mstar.worker.engine_manager import _unchunkable_nodes
 
     with caplog.at_level("WARNING"):
-        off = _unchunkable_nodes({"LLM": _Chunker()}, _chunking_model(), _groups(2))
+        off = _unchunkable_nodes({"LLM": _Chunker()}, _chunking_model(), _groups(sp=2))
 
     assert off == frozenset({"LLM"})
     assert "chunked prefill is off for ['LLM']" in caplog.text
 
 
-def test_a_node_on_one_rank_keeps_its_chunking():
+def test_a_node_on_one_rank_or_under_tp_keeps_its_chunking():
+    """Under TP the leader cuts the chunks and the followers run them."""
     from mstar.worker.engine_manager import _unchunkable_nodes
 
-    assert not _unchunkable_nodes({"LLM": _Chunker()}, _chunking_model(), _groups(1))
+    assert not _unchunkable_nodes({"LLM": _Chunker()}, _chunking_model(), _groups())
 
 
 def test_a_chunked_walk_that_reports_no_row_length_is_refused():
@@ -742,4 +743,4 @@ def test_a_chunked_walk_that_reports_no_row_length_is_refused():
     from mstar.worker.engine_manager import _unchunkable_nodes
 
     with pytest.raises(ValueError, match="get_input_sequence_len"):
-        _unchunkable_nodes({"LLM": _Unmeasured()}, _chunking_model(), _groups(1))
+        _unchunkable_nodes({"LLM": _Unmeasured()}, _chunking_model(), _groups())

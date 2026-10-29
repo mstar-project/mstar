@@ -247,6 +247,34 @@ def chunk_loop_stride(chunk: ChunkRange | None) -> int:
     return CHUNK_LOOP_END if chunk is None else chunk.stride
 
 
+def runs_first_chunk(chunk: ChunkRange) -> bool:
+    """Whether ``chunk`` is its prompt's first, which caps its chunk Loop. A
+    first chunk's stride runs from 0 even past a cached prefix; a later one's
+    is its own span, which starts past 0."""
+    return chunk.stride == chunk.end
+
+
+def tp_chunk_ranges(message: ScheduleTPNode, rids: list[int]) -> dict[int, ChunkRange]:
+    """The chunks the leader cut for ``message``'s rows, keyed by this rank's
+    handles for them (``rids``, from ``tp_rids``). Lists that do not match the
+    rows mean the ranks disagree on the step, so they raise."""
+    if not message.chunk_starts:
+        return {}
+    return {
+        rid: ChunkRange(start, end, total, stride)
+        for rid, start, end, total, stride in zip(
+            rids, message.chunk_starts, message.chunk_ends, message.chunk_totals,
+            message.chunk_strides, strict=True,
+        )
+        if start >= 0 and rid != REMOVED_RID
+    }
+
+
+def unfinished_chunk_rids(chunk_ranges: Mapping[int, ChunkRange]) -> set[int]:
+    """The rows of ``chunk_ranges`` whose prompt needs another chunk."""
+    return {rid for rid, chunk in chunk_ranges.items() if not runs_final_chunk(chunk)}
+
+
 def _pre_existing_tokens(seq_lens: Collection[int], n: int) -> int:
     """The tokens a speculation merge's own ``n`` rows will run, as the
     submodule estimates them (``speculative_input_seq_len``): their inputs do
@@ -699,6 +727,8 @@ class MicroScheduler:
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
         rids = self.tp_rids(first_tp_node)
+        # before anything is popped: lists that do not match the rows raise
+        chunk_ranges = tp_chunk_ranges(first_tp_node, rids)
         unread = self.unread_rows(first_tp_node, rids)
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name, first_tp_node.graph_walk,
@@ -719,7 +749,7 @@ class MicroScheduler:
 
         self.pop_tp_follow_head()
 
-        return ScheduledBatch(
+        batch = ScheduledBatch(
             node_name=first_tp_node.node_name,
             graph_walk=first_tp_node.graph_walk,
             request_to_worker_graph=request_to_worker_graph,
@@ -729,7 +759,12 @@ class MicroScheduler:
             request_walks=request_walks,
             walk_output_signals=walk_signals,
             read_check_rids=tuple(rids) if first_tp_node.read_check else None,
+            # the leader's chunks, so the chunk Loop ends on the same step here
+            chunk_ranges=chunk_ranges,
+            incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
         )
+        self.cap_chunk_loops(batch)
+        return batch
 
     def unread_rows(self, head: ScheduleTPNode, rids: list[int]) -> set[int]:
         """The rows of ``head`` whose input read failed on this rank, which a
@@ -1465,8 +1500,6 @@ class MicroScheduler:
         if not (chunk_tokens or resumed or self.cached_prefix):
             return
         node = batch.node_name
-        loop_walks = self.chunk_loop_walks.get(node, ())
-        capped: list[int] = []
         for rid in batch.request_to_worker_graph:
             at = resumed.get(rid)
             if at is not None:
@@ -1482,10 +1515,21 @@ class MicroScheduler:
                 end = cached + chunk_tokens[rid]
                 batch.chunk_ranges[rid] = ChunkRange(cached, end, total, end)
                 self.chunk_started[key] = next(self._chunk_starts)
-                if batch.walk_of(rid) in loop_walks:
-                    capped.append(rid)
             if end < total:
                 batch.incomplete_node_rids.add(rid)
+        self.cap_chunk_loops(batch)
+
+    def cap_chunk_loops(self, batch: ScheduledBatch) -> None:
+        """Cap the chunk Loop of each row of ``batch`` on its first chunk at
+        its whole input's length, which is what ends the Loop. A TP follower
+        caps from the leader's chunks: the cap decides on which step the Loop
+        ends, so every rank of the instance has to set the same one."""
+        node = batch.node_name
+        loop_walks = self.chunk_loop_walks.get(node, ())
+        capped = [
+            rid for rid, chunk in batch.chunk_ranges.items()
+            if runs_first_chunk(chunk) and batch.walk_of(rid) in loop_walks
+        ]
         if capped:
             walks = [batch.walk_of(rid) for rid in capped]
             self.runtime.set_loop_caps(

@@ -631,7 +631,7 @@ class _Leader:
 
 def _node_batch():
     return SimpleNamespace(
-        node_name="node", graph_walk="walk", request_ids=("r0",),
+        node_name="node", graph_walk="walk", request_ids=("r0",), chunk_ranges={},
         step_context=StepContext(
             request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
         ),
@@ -1108,6 +1108,7 @@ class _SpecParent:
 
         class _Batch:
             node_name = "node"
+            incomplete_node_rids = frozenset()
 
             @property
             def request_to_worker_graph(self):

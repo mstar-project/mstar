@@ -200,6 +200,15 @@ class ScheduleTPNode(MessageBody):
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step
     read_check: bool = False
+    # Per request_ids entry, the chunk the leader cut for the row: [start, end)
+    # of a measured total, -1 when the row is not chunked; all empty when no
+    # row is. A follower runs these rather than cutting its own, and caps a
+    # row's chunk Loop on its first chunk from them.
+    chunk_starts: list[int] = field(default_factory=list)
+    chunk_ends: list[int] = field(default_factory=list)
+    chunk_totals: list[int] = field(default_factory=list)
+    # how far each chunk moves its row's chunk Loop (``ChunkRange.stride``)
+    chunk_strides: list[int] = field(default_factory=list)
 
 
 @dataclass

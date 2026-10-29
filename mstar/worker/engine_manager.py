@@ -27,8 +27,9 @@ def _unchunkable_nodes(
     turns chunking off for.
 
     Reporting row lengths is the model's own declaration, so a walk that
-    chunks without ``get_input_sequence_len`` is refused anywhere. Chunking
-    under TP/SP is not supported yet; refusing there would take TP away from
+    chunks without ``get_input_sequence_len`` is refused anywhere. Under TP the
+    leader cuts the chunks and the followers run them off its head. Chunking
+    under SP is not supported yet; refusing there would take SP away from
     every model that chunks, so those nodes run their prefills whole instead.
     """
     off = set()
@@ -41,11 +42,11 @@ def _unchunkable_nodes(
                 f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
                 "report get_input_sequence_len"
             )
-        if parallel_groups.get_instance_world_size_for_node(node) > 1:
+        if parallel_groups.get_sp_config_for_node(node).world_size > 1:
             off.add(node)
     if off:
         logger.warning(
-            "chunked prefill is off for %s: not supported under TP/SP yet, so "
+            "chunked prefill is off for %s: not supported under SP yet, so "
             "their prefills run whole", sorted(off),
         )
     return frozenset(off)
