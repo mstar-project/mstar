@@ -77,10 +77,13 @@ Building a bundle
    is writing to the caches.
 
 ``pack`` adds to the bundle for this host's key under ``ROOT``, creating it if needed. It
-appends the files the bundle doesn't have and those whose size or modification time
-differ from its last copy (MIOpen rewrites its databases in place; Inductor and Triton
-entries never change once written). Each tar is copied, appended to and renamed into
-place, so a concurrent ``unpack`` never reads a partial tar, and the lock serializes
+appends the Inductor and Triton files the bundle doesn't have and those whose size or
+modification time differ from its last copy; their entries never change once written.
+MIOpen keeps each database in one file (the find and perf databases as ``key=value``
+text, compiled kernels in SQLite), so a changed one is merged with the bundle's copy,
+this host's record winning where both have one: caches warmed separately, each from
+empty, add up rather than replace each other. Each tar is copied, appended to and renamed
+into place, so a concurrent ``unpack`` never reads a partial tar, and the lock serializes
 packs, so several hosts with the same key can add to one bundle in turn.
 
 Unpacking
