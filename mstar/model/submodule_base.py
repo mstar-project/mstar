@@ -983,7 +983,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         precision; the node's resources are bound but nothing is admitted or
         planned, so it must not read or change resource state. On a lockstep
         node every rank calls it in the same order, so it may run the
-        collectives its forward runs. Default: nothing."""
+        collectives its forward runs. It runs outside a planned step, so a
+        node serving LoRA adapters runs no adapted linear here: their deltas
+        refuse the call. Default: nothing."""
 
     def can_use_accelerator_graphs(
         self,
