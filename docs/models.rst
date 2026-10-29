@@ -583,10 +583,13 @@ Qwen3-TTS notes
   ``mps: true`` in the YAML (see :doc:`serving`) the two workers' kernels also
   overlap, which raised c=32 throughput by about a fifth on an H100.
 - The codec decoder runs in float32 by default, reproducing the reference
-  decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
-  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
-  B300 that is slower, not faster: cuDNN's heuristics run several of its
-  convs on a kernel without tensor cores, so measure before switching.
+  decoder bit for bit; ``configs/qwen3tts_1p7b.yaml`` serves it in bfloat16
+  (``model_kwargs: {codec_dtype: bfloat16}``, RMSNorm and RoPE kept in
+  float32), about twice a float32 codec step's speed on an H100. Its dilated
+  convs run as undilated ones over their interleaved subsequences: cuDNN takes
+  some bfloat16 dilated convs (384 and 768 channels) through a direct kernel
+  without tensor cores, about 100x slower on an H100. On a B300 the bf16 codec
+  measured slower before this change, so measure there before switching.
   Its decode is compiled (Inductor) once for every capture.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::

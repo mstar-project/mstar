@@ -2,7 +2,9 @@
 # Both workers run on GPU 0 (rank_devices), so the Talker's decode steps no
 # longer alternate with codec windows on one worker loop: the Talker runs
 # back to back and the codec batches the windows that become ready while it
-# does. Same graph, resources and checkpoint as configs/qwen3tts_1p7b.yaml.
+# does. Same graph, resources and checkpoint as configs/qwen3tts_1p7b.yaml,
+# but the codec stays float32 here: the bf16 codec was only gated on the
+# single-worker deployment.
 model: "qwen3_tts_1p7b"
 max_seq_len: 32768
 resources:

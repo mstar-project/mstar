@@ -4,7 +4,10 @@
 # identical across sizes (28 layers, 8 KV heads, head_dim 128).
 model: "qwen3_tts_1p7b"
 max_seq_len: 32768
+# bf16 codec decoder (norms and RoPE stay fp32): about twice a float32 codec
+# step's speed on an H100, within the WER/speaker gate on this checkpoint
 model_kwargs:
+  codec_dtype: bfloat16
   # A 4-frame first chunk (320 ms of audio, three Talker steps later): with a
   # 1-frame one (80 ms) the next chunk arrived after the client had played it
   # under load, the one pause behind the misses near capacity. The 4/8/16
