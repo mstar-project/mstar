@@ -323,13 +323,7 @@ class FlashInferMLAManager(AttentionManager):
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
         plan_states.clear()
         for label, kv_out in plan_outputs.items():
-            indptrs = kv_out.cpu_indptrs
-            if step.context_only:
-                # the rows' query counts come from this step's own segments, the kv from the
-                # stored context (the cache's segments describe what the step appends)
-                spans = [int(seg.span) for seg in (step.segments or ()) if seg.label == label]
-                views = context_only_views(kv_out.views, spans, self._kv_config.page_size)
-                indptrs = build_paged_indptrs(views, self._kv_config.page_size)
+            indptrs = self._indptrs(step, label, kv_out)
             if lease is not None:
                 wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1)
             else:
@@ -337,6 +331,38 @@ class FlashInferMLAManager(AttentionManager):
             wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
+
+    def _indptrs(self, step: AttentionStep, label: str, kv_out):
+        indptrs = kv_out.cpu_indptrs
+        if step.context_only:
+            # the rows' query counts come from this step's own segments, the kv from the
+            # stored context (the cache's segments describe what the step appends)
+            spans = [int(seg.span) for seg in (step.segments or ()) if seg.label == label]
+            views = context_only_views(kv_out.views, spans, self._kv_config.page_size)
+            indptrs = build_paged_indptrs(views, self._kv_config.page_size)
+        return indptrs
+
+    corrects_preplan = True
+
+    def correct_preplan(self, verdicts, step: AttentionStep, ctx: StepContext) -> bool:
+        """Each staged wrapper with a rewound row, planned again from the corrected KV plan (KV,
+        which this resource depends on, corrects first). The wrapper is the pre-plan's slot's,
+        so the step in flight never reads it."""
+        if not self._preplanned:
+            return True
+        plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
+        rewound = set(zip(verdicts.request_ids, verdicts.labels, strict=True))
+        for label, wrapper in self._preplan_states.items():
+            kv_out = plan_outputs[label]
+            rows = kv_out.rows
+            if rows is None:
+                rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
+            if any((rid, lab) in rewound for rid, lab, _ in rows):
+                wrapper.plan(
+                    causal=step.causal, dtype=self._dtype,
+                    **self._indptrs(step, label, kv_out).to_kwargs_dict(),
+                )
+        return True
 
     def clear_preplan(self):
         self._preplanned = False
