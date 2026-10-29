@@ -393,6 +393,8 @@ def test_llm_check_stop():
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
     # a stop token first ends the request: there is no decode loop yet
     assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
+    # any other walk outside the loop may be followed by one the transition runs
+    assert sub.check_stop("r", info("detect_language", 0), im_end) == set()
     # a prompt walk ends only on a stop id; the budget is checked on decode rows, as on main
     assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}

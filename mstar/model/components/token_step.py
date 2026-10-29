@@ -21,6 +21,11 @@ class TokenStepNode:
 
     DECODE_WALK = "decode"
     DECODE_LOOP = "decode_loop"
+    # The walk that samples the first token, before DECODE_LOOP exists. A stop
+    # there ends the partition (END_PARTITION); a stop id on any other walk
+    # outside the loop stops nothing, since the model's transition may still
+    # have a walk to run.
+    PREFILL_WALK = "prefill"
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     SAMPLER: str
     MAX_PREFILL_BATCH_SIZE: int | None
@@ -60,18 +65,20 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        """A stop id, or on a decode row the token budget. A prompt walk
-        does not check the budget, so max_output_tokens=1 still runs one
-        decode step, as on main."""
+        """A stop id on a PREFILL_WALK or decode row, or on a decode row the
+        token budget."""
+        walk = request_info.graph_walk
+        if walk != self.DECODE_WALK and walk != self.PREFILL_WALK:
+            return False
         ignore_eos = request_info.resource_configs[self.SAMPLER].ignore_eos
         if not ignore_eos and token in self.stop_token_ids:
             return True
         decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
-        return request_info.graph_walk == self.DECODE_WALK and decoded >= request_info.max_tokens
+        return walk == self.DECODE_WALK and decoded >= request_info.max_tokens
 
     def _stop_names(self, token: int, request_info: CurrentForwardPassInfo) -> set[str]:
         """``check_stop``'s answer for one row: a decode row stops the loop,
-        and a prompt walk's row, which runs before the loop exists, ends the
+        and a PREFILL_WALK row, which runs before the loop exists, ends the
         partition."""
         if not self._stops(token, request_info):
             return set()
