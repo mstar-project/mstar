@@ -2,11 +2,43 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 
 import torch
 
 from mstar.platforms.ptxas import blackwell_ptxas_env
+
+logger = logging.getLogger(__name__)
+
+
+class WorkerColocation:
+    """What a platform does so that workers sharing one GPU (``rank_devices``)
+    run their kernels side by side, when the deployment asks with ``mps: true``.
+    The conductor calls ``start`` before it spawns the workers, puts
+    ``client_env`` into each worker's environment, and calls ``stop`` once the
+    workers have exited.
+    """
+
+    client_env: dict[str, str] = {}
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+class HardwareQueueColocation(WorkerColocation):
+    """AMD GPUs: nothing to start. Each process submits to its own hardware
+    queues, and the GPU's scheduler runs kernels from different processes
+    concurrently, so two workers on one device already overlap."""
+
+    def start(self) -> None:
+        logger.info(
+            "mps: true on ROCm: nothing to start, the hardware scheduler runs "
+            "the workers' queues side by side"
+        )
 
 
 class Platform:
@@ -84,6 +116,12 @@ class Platform:
         """
         return {} if devices is None else {"CUDA_VISIBLE_DEVICES": devices}
 
+    def colocated_workers(self) -> WorkerColocation:
+        """How workers sharing a GPU get their kernels to overlap, for a
+        deployment with ``mps: true`` (see ``WorkerColocation``). Raises
+        ValueError where this platform has no way."""
+        raise ValueError(f"mps: true needs an NVIDIA or AMD GPU, not {self!r}")
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
 
@@ -104,6 +142,13 @@ class CudaPlatform(Platform):
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
         return {"NCCL_GRAPH_REGISTER": "0", **blackwell_ptxas_env()}
+
+    def colocated_workers(self) -> WorkerColocation:
+        # a CUDA MPS control daemon of the conductor's own; processes on one
+        # GPU time-slice without it
+        from mstar.conductor.mps import MpsDaemon
+
+        return MpsDaemon()
 
 
 class RocmPlatform(Platform):
@@ -154,6 +199,9 @@ class RocmPlatform(Platform):
                 "disagree and HIP uses the first. Unset one or pass --gpus"
             )
         return {}
+
+    def colocated_workers(self) -> WorkerColocation:
+        return HardwareQueueColocation()
 
 
 class XpuPlatform(Platform):
