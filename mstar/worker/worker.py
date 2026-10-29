@@ -3055,8 +3055,8 @@ class Worker:
             spec_target, self.request_state, candidates,
         )
         if max_continuing is not None and max_continuing < len(candidates):
-            # prep keeps the first `max_continuing`; the rows that have run
-            # longest come first in the step, so they are the ones to give way
+            # prep keeps the first `max_continuing`; a speculated step lists its
+            # continuing rows in the order they joined, so the earliest give way
             displaced = len(candidates) - max_continuing
             candidates = candidates[displaced:] + candidates[:displaced]
         laps.lap("backlog_check")

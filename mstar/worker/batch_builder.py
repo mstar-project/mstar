@@ -113,8 +113,8 @@ class BaseBatchBuilder(ABC):
 
 
 class FIFOBatchBuilder(BaseBatchBuilder):
-    """Backlog first, then fresh rows, in arrival order, up to the cap; one
-    capture group per step.
+    """Backlog first, then fresh rows up to the cap (longest-waiting first
+    when they don't all fit); one capture group per step.
 
     Under a combined walk a step of one walk takes that walk's cap and a mixed
     step the combined walk's own, or with none the smallest of the caps of the
