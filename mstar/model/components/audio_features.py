@@ -9,7 +9,7 @@ natively served encoder sees the features its HF oracle was tested with,
 without ``transformers`` in the serving path. It runs wherever the waveform
 is, on the CPU of the API-server data worker or on the GPU inside an
 encoder's forward (every op is fixed-shape for a fixed clip length, so it
-captures into a CUDA graph).
+captures into an accelerator graph).
 
 NVIDIA's FastConformer models (Canary, Parakeet, Nemotron ASR) take NeMo's
 recipe instead, ``NemoLogMel``: preemphasis, natural log, and per-bin

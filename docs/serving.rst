@@ -249,9 +249,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue, except a live call (open client input), which is refused with
        a 503.
    * - ``gpu_memory_fraction``
-     - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
-       done, for workers that share a GPU (see below). Unset, capture plans against
-       whatever is free.
+     - *(optional)* The share of its GPU each worker may hold once accelerator graph
+       capture is done, for workers that share a GPU (see below). Unset, capture
+       plans against whatever is free.
    * - ``mps``
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
@@ -311,7 +311,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
        subgroups during weight load and warmup; serving keeps PyTorch's default.
        Unset keeps PyTorch's default throughout. Raise it only where weight load,
-       JIT or CUDA-graph capture can exceed that default.
+       JIT or accelerator graph capture can exceed that default.
    * - ``tp_allreduce``
      - *(optional)* Small-message all-reduce path of every TP and SP group:
        ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
@@ -418,9 +418,9 @@ never waits for a light node's steps on its worker loop (a TTS talker and its co
      - {node_names: [Codec], ranks: [1]}
    rank_devices: {1: 0}
 
-At start-up a worker sizes every CUDA-graph bucket of its nodes with a capture it throws
-away, then captures the cheapest buckets across all of them while its largest eager step
-still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU see each
+At start-up a worker sizes every accelerator graph bucket of its nodes with a capture
+it throws away, then captures the cheapest buckets across all of them while its largest
+eager step still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU see each
 other's memory only as used, so the first to capture can take the other's room. Set
 ``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
 counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
@@ -495,8 +495,8 @@ whole experts. Attention and dense MLPs stay TP-sharded:
      - Every N steps, log the per-rank and per-layer expert load. 0 (default) is off.
        Needs ``parallel: ep``.
    * - ``mask_padding``
-     - Skip CUDA-graph padding rows in the routed experts, TP or EP. Off by default;
-       it gave no throughput gain on Qwen3-Omni at 8 GPUs.
+     - Skip accelerator graph padding rows in the routed experts, TP or EP. Off by
+       default; it gave no throughput gain on Qwen3-Omni at 8 GPUs.
 
 The number of experts must divide evenly by the group size. A node must be declared
 EP-enabled by the model; an ``ep_config`` on any other node, an unknown key, or two
@@ -507,7 +507,7 @@ model_kwargs
 ------------
 
 ``model_kwargs`` are model parameters fixed at server start (not per request) — they are
-baked into the model's config dataclass and into CUDA-graph captures. For example, the
+baked into the model's config dataclass and into accelerator graph captures. For example, the
 Pi0.5 DROID variant fixes the action horizon:
 
 .. code-block:: yaml

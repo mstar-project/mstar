@@ -512,14 +512,14 @@ class ModelInputsFromEngine:
     per_request_info: dict[str, CurrentForwardPassInfo]
     resources: dict[str, Resource] = field(default_factory=dict)
 
-    # label -> warmed-up PiecewiseCudaGraphRunner for inner-loop capture. Owned
-    # by the engine, spread in at execute time (like ``cache_manager`` /
-    # ``sampler``). Empty when the submodule opts into no piecewise graphs or
-    # capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.
+    # label -> warmed-up PiecewiseAcceleratorGraphRunner for inner-loop capture. Owned
+    # by the engine, supplied at execute time alongside ``resources``.
+    # Empty when the submodule opts into no piecewise graphs or
+    # capture failed. See ``NodeSubmodule.get_piecewise_accelerator_graph_configs``.
     piecewise_runners: dict[str, "PiecewiseAcceleratorGraphRunner"] = field(default_factory=dict)
 
     # The batch's per-request states, injected by the engine (None on paths
-    # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
+    # that don't carry them, e.g. accelerator graph capture with synthetic requests).
     # Usually a ``LazyRequestStates`` view rather than a materialised dict.
     per_request_states: "Mapping[str, PerRequestState] | None" = None
 
@@ -531,7 +531,7 @@ class ModelInputsFromEngine:
     # submodule that declares no step.
     step: SubmoduleStep | None = None
 
-    # Whether this forward runs under a captured CUDA graph — either the
+    # Whether this forward runs under a captured accelerator graph — either the
     # capture itself or a replay. What ``cache_manager.is_captured`` used to
     # carry: a submodule whose ``preprocess`` packs differently for the
     # fixed-shape graph (cosmos3 stacks its denoise inputs on a leading batch
@@ -569,12 +569,12 @@ class ModelInputsFromEngine:
 
 class NodeSubmodule(torch.nn.Module, ABC):
     """Base class for a model's compute units: defines the prepare_inputs →
-    preprocess → forward(_batched) contract the engines drive."""
+    preprocess → forward(_batched) contract the engine drives."""
 
     # Set True on a submodule whose forward does not benefit from (or is broken
     # by) torch.compile — e.g. a data-dependent denoise loop, or a one-shot
-    # forward where the trace cost dwarfs the win. The KV-cache / stateless
-    # engines skip compiling such submodules (CUDA-graph capture is unaffected).
+    # forward where the trace cost dwarfs the win. The engine skips compiling
+    # such submodules (accelerator graph capture is unaffected).
     disable_torch_compile: bool = False
 
     # Set True on a submodule that must run in its own parameter dtype — e.g. a
@@ -778,8 +778,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> NameToTensorList | BatchedModelOutput:
         """
         Pure tensor → NameToTensorList computation.
-        Compilable + CUDA-graphable. A ``BatchedModelOutput`` keyed by the
-        request id, as ``forward_batched`` returns, can carry ``output_spans``.
+        Supports compilation and accelerator graph capture.
+        A ``BatchedModelOutput`` keyed by the request id, as ``forward_batched``
+        returns, can carry ``output_spans``.
         """
         pass
 
@@ -922,25 +923,26 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return None
 
-    # Note: do not import CudaGraphConfig; it causes a circular import situation
+    # Note: graph config types are imported only under TYPE_CHECKING to avoid a cycle.
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
+        """Return graph captures supported by the active accelerator."""
         return []
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
-        """Return the piecewise CUDA graph configs this submodule opts into.
+        """Return the piecewise accelerator graph configs this submodule opts into.
 
         ``autocast_dtype`` is the engine's autocast dtype — passed so a config's
         ``make_static_inputs`` can allocate the hidden-state buffer in the dtype
         the captured region runs under (avoids a copy-time upcast at replay).
 
-        A piecewise CUDA graph captures ONE inner callable of this submodule's
-        forward (e.g. a transformer block loop) as a CUDA graph while the
+        A piecewise accelerator graph captures ONE inner callable of this submodule's
+        forward (e.g. a transformer block loop) as an accelerator graph while the
         surrounding compute stays eager. The engine builds one
-        ``PiecewiseCudaGraphRunner`` per returned label and threads the runners
+        ``PiecewiseAcceleratorGraphRunner`` per returned label and threads the runners
         into ``ModelInputsFromEngine.piecewise_runners`` so the submodule's
         forward can look them up by label:
 
@@ -957,7 +959,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         runner admits, plans and commits it per replay.
 
         Default: no piecewise graphs. Override to return
-        ``{label: PiecewiseCudaGraphConfig}``; multiple labels capture multiple
+        ``{label: PiecewiseAcceleratorGraphConfig}``; multiple labels capture multiple
         independent graphs (i.e., one per outer function to be graphed).
         """
         return {}
@@ -976,10 +978,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
-        """Return True if this submodule supports CUDA graphs for ``batch``.
+        """Return True if this submodule supports accelerator graphs.
 
-        Default: derives from ``get_cuda_graph_configs`` — if any declared
-        config can replay for this batch's graph_walk, CUDA graphs are
+        Default: derives from ``get_accelerator_graph_configs`` — if any declared
+        config can replay for this batch's graph_walk, accelerator graphs are
         supported. We check ``cfg.replay_graph_walks`` (not just
         ``cfg.capture_graph_walk``) so aliased walks — e.g. Qwen3-Omni's
         ``prefill_audio`` reusing the ``prefill_text`` capture, or
@@ -989,7 +991,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         walks don't silently fall through to the eager path.
 
         ``replay_graph_walks`` is always a superset of ``{capture_graph_walk}``
-        (see ``CudaGraphConfig.__init__``), so this never narrows what the
+        (see ``AcceleratorGraphConfig.__init__``), so this never narrows what the
         previous code accepted — only widens it for configs that explicitly
         declared aliases.
 
@@ -1020,7 +1022,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Per-request postprocessing on the submodule outputs.
 
         Runs on the GPU thread inside ``execute_batch``, after the forward
-        (eager, batched, or CUDA-graph replay). ``inputs`` is the request's
+        (eager, batched, or accelerator graph replay). ``inputs`` is the request's
         ``prepare_inputs`` result for this step, so a submodule can finish a
         step the captured graph could not hold (e.g. combine guidance branches
         and run a Python multistep scheduler against the step's input latents).

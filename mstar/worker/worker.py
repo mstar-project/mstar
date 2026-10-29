@@ -442,7 +442,7 @@ class Worker:
         # record into it too; run() owns the periodic flush.
         self._phase_period = PHASE_PERIOD
         self._phase_buf = phase_buffer()
-        # (start, end) CUDA events per step, drained once they land
+        # (start, end) device events per step, drained once they land
         self._gpu_spans: deque = deque(maxlen=64)
 
         self.enable_prof = enable_prof
@@ -668,7 +668,7 @@ class Worker:
         # erase the overlap. The side stream waits on
         # ``output.completion_event`` (recorded after GPU(N)) and then runs
         # an isolated D→H, so the main thread only blocks on the copy.
-        # Lazy-initialized — workers without CUDA never touch it.
+        # Lazy-initialized — CPU workers never touch it.
         self._d2h_stream: torch.Stream | None = None
         self._pinned_d2h_buffers: dict[
             tuple[str, torch.dtype, int], list[torch.Tensor]
@@ -2368,8 +2368,8 @@ class Worker:
         drain the GPU on every iter and hide the overlap between
         post-processing and the next step's kernel execution.
 
-        Once the step's work is submitted we record a CUDA event on the
-        default stream; anything that reads the output VALUES waits on it.
+        Once the step's work is submitted we record a device event on the
+        execution stream; anything that reads the output values waits on it.
         """
         from mstar.utils.profiler import range_pop, range_push
 
@@ -4407,17 +4407,17 @@ class Worker:
         completion_event: torch.Event | None,
         request_ids: list[int] | None = None,
     ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
-        """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
+        """Side-stream D→H of every device tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
         GPU(N+1)'s kernels are already queued on default stream behind
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
-        Returns per-rid outputs with the CUDA tensors replaced by CPU
+        Returns per-rid outputs with the device tensors replaced by CPU
         copies, plus ``HostRows`` when the submodule handed over row-addressed
-        buffers, for a batched stop check. Skipped (returns ``outputs`` unchanged) when there's no completion
-        event (CPU execution) or when CUDA is unavailable.
+        buffers, for a batched stop check. Uses existing host buffers when
+        there's no completion event (CPU execution) or the device is unavailable.
 
         AR engines emit small per-rid output dicts (sampled token + maybe
         a code) so the cost is negligible. If a future engine emits large
@@ -4802,7 +4802,7 @@ class Worker:
                 )
 
         # Bound the load-time asymmetry between workers before any
-        # subgroup NCCL collective fires inside the per-bs CUDA-graph
+        # subgroup NCCL collective fires inside the per-bs accelerator graph
         # capture loop. Without this fence, a worker with a small model
         # (e.g. an 8B Talker) can finish loading, enter warmup, and hit
         # its first subgroup barrier while a worker with a 30B Thinker
@@ -4815,11 +4815,11 @@ class Worker:
         self.parallel_groups.barrier_all()
         self._verify_tp_async_sched_agrees()
 
-        # CUDA graph capture before entering the main loop
+        # accelerator graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
         # Sync every worker before the main loop opens. Per-batch-size
-        # captures inside CudaGraphRunner are already barriered on the
+        # captures inside AcceleratorGraphRunner are already barriered on the
         # node-local TP group, but that doesn't bound the time between
         # ``warmup_and_capture`` returning and ``run()`` starting to
         # schedule. Without this fence, a TP leader can finish warmup
@@ -4848,7 +4848,7 @@ class Worker:
         if self._phase_period:
             gc.callbacks.append(self._gc_phase_callback)
 
-        # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
+        # Setup (weight load + warmup + accelerator graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
         # loop until every worker reports in, so the API server only advertises
         # readiness once all workers can actually serve.

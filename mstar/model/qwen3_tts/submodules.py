@@ -2,8 +2,8 @@
 # NodeSubmodule wrappers for Qwen3-TTS
 # ---------------------------------------------------------------------------
 #
-# Two submodules cover the complete text-to-speech streaming pipeline:
-#   1. TalkerSubmodule (KV_CACHE engine)
+# Three submodules cover the complete text-to-speech streaming pipeline:
+#   1. TalkerSubmodule (paged KV, attention, positions, and samplers)
 #      - Builds the official prefill sequence for every 12 Hz variant:
 #        optional instruction turn, ChatML assistant role, codec language /
 #        speaker tags, then the text either whole (non-streaming layout) or
@@ -11,12 +11,12 @@
 #      - Maintains the Talker paged KV cache across 12 Hz decode steps.
 #      - Predicts codec group 0 with the Talker and groups 1-15 with the
 #        depth-wise CodePredictor.
-#      - Supports continuous batching and whole-forward decode CUDA Graphs
+#      - Supports continuous batching and whole-forward decode accelerator graphs
 #        (the CodePredictor depth loop is captured inside them), plus a
 #        piecewise graph covering that loop on eager paths like prefill.
-#   2. CodecSubmodule (STATELESS engine)
+#   2. CodecSubmodule (no resources)
 #      - Receives buffered codec frames from the Talker partition.
-#      - Pads each window of the chunk ramp to its CUDA Graph capture bucket.
+#      - Pads each window of the chunk ramp to its accelerator graph capture bucket.
 #      - Runs the official speech-tokenizer decoder and trims overlap (and, for
 #        voice clones, the reference frames) before emitting 24 kHz PCM.
 #   3. RefEncoderSubmodule (no resources; Base voice clone only)
@@ -134,7 +134,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     # residual-code control flow, and recurrent routing in addition to the
     # transformer. It introduces graph breaks and showed no steady-state win
     # for this path. The whole decode forward (CodePredictor loop included) is
-    # still CUDA-graph captured.
+    # still accelerator graph captured.
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -187,7 +187,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         """Pack the input-carried minimum-length EOS flags for this batch.
 
-        CUDA Graph replay calls ``preprocess`` with capture-slot dummy request
+        accelerator graph replay calls ``preprocess`` with capture-slot dummy request
         ids, so looking up request state here would permanently observe a new
         request at frame zero. ``prepare_inputs`` runs with the real request and
         carries the dynamic flag as a host bool, staged here in one copy.
@@ -521,7 +521,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             last_token_indices = torch.empty(len(inputs), dtype=torch.long, device=self.get_device())
             self._index_stager.copy_(last_token_indices, [end - 1 for end in itertools.accumulate(seq_lens)])
 
-        # Materialize the persistent base mask before CUDA Graph capture. Only
+        # Materialize the persistent base mask before accelerator graph capture. Only
         # the per-request EOS flags need to cross the replay input boundary.
         self._get_suppress_mask()
         return {
@@ -578,7 +578,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         0; the CodePredictor's unrolled depth loop fills groups 1..N-1 through
         the ``code_predictor`` aux sampler. Both read their params from
         engine-owned static buffers, so this single path serves eager execution
-        and CUDA-graph capture alike (mirrors the Qwen3-Omni Talker).
+        and accelerator graph capture alike (mirrors the Qwen3-Omni Talker).
         """
         hidden = self.model(input_embeds, label="main")
         last_hidden = hidden.index_select(0, last_token_indices)
@@ -889,10 +889,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         """Capture the CodePredictor depth loop, sampling included.
 
         The whole-walk decode graph already covers this loop; this runner serves
-        the paths it can't — chiefly ``talker_prefill``, which stays eager
-        because it is variable-length and runs once per request. It uses no
-        paged KV cache: its frame-local cache is the engine's fixed-shape
-        scratch pool.
+        the paths it can't — chiefly voice-clone prefill, which stays eager
+        because it also emits reference codec frames. The Talker submodule
+        owns the fixed-shape dense KV cache, reused and overwritten each frame.
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size
@@ -958,15 +957,15 @@ class TalkerSubmodule(ARNodeSubmodule):
 class CodecSubmodule(ARNodeSubmodule):
     """Convert streamed 16-code frames into overlap-trimmed PCM chunks.
 
-    The node runs on a stateless engine, but ``ARNodeInputs`` is reused as the
-    typed container for fixed-length codec tensors. Each pass carries its
+    The node declares no resources and uses ``ARNodeInputs`` as the typed
+    container for fixed-length codec tensors. Each pass carries its
     window's geometry (real frames, repeated context); the neural decoder
     itself has no cross-call state.
 
     Windows follow the model's ``ScheduledLeftContextChunkPolicy``: a ramp of
     small chunks, then ``chunk_frames`` new frames behind ``left_context_frames``
     of context (a voice clone's reference tail is the first window's context).
-    Each distinct window size is a CUDA-graph bucket; a shorter window is
+    Each distinct window size is an accelerator graph bucket; a shorter window is
     zero-padded up to the next bucket and trimmed after.
 
     The decoder's transformer needs the whole window, but the conv stack after
@@ -975,8 +974,7 @@ class CodecSubmodule(ARNodeSubmodule):
     of the window.
     """
 
-    # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
-    # stateless engine, stated directly now that the v1 engine reads these.
+    # Run the decoder in its parameter dtype without forward compilation.
     disable_torch_compile = True
     disable_autocast = True
 
@@ -1067,7 +1065,7 @@ class CodecSubmodule(ARNodeSubmodule):
         Input arrives as ``[frames, code_groups]``. The official decoder wants
         ``[quantizers, frames]``; every request is padded to the smallest
         captured window that fits so the ramp's windows and the terminal tail
-        all replay CUDA graphs. Every item is a frame: the Talker withholds
+        all replay accelerator graphs. Every item is a frame: the Talker withholds
         its EOS frame from the stream (``TalkerSubmodule.check_stop``).
         """
         del graph_walk, kwargs

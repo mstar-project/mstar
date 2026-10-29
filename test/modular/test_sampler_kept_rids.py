@@ -127,6 +127,7 @@ def test_dropped_steps_do_not_shift_the_kept_stream(graph, device):
     ids=["default", "all", "mixed", "none"],
 )
 def test_commit_keeps_only_selected_rows_and_ignores_padding(buffer_device, kept_rids):
+    """Commit staged draw results without depending on a sampling kernel."""
     res = _resource(True, buffer_device)
     step = SamplerStep(kept_rids=kept_rids)
     ctx = StepContext(

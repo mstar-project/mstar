@@ -14,9 +14,9 @@ Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources
                                                   PCM against the call's codec stream state
 
 Both autoregressive nodes keep their whole state in engine resources and capture
-their decode step as a CUDA graph (the talker's with its codec decode). The
+their decode step as an accelerator graph (the talker's with its codec decode). The
 encoder keeps a call's state in its bounded KV and two pools, and a live step
-(or its layer stack) replays a piecewise CUDA graph.
+(or its layer stack) replays a piecewise accelerator graph.
 """
 from __future__ import annotations
 
@@ -108,10 +108,10 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     """
 
     # No torch.compile: the per-layer resource cursors are compile-disabled
-    # and the decode step is a CUDA graph replay, which is where the time goes.
+    # and the decode step is an accelerator graph replay, which is where the time goes.
     disable_torch_compile = True
 
-    # Decode batch sizes captured as CUDA graphs: one row per live session per
+    # Decode batch sizes captured as accelerator graphs: one row per live session per
     # 80 ms tick. The recurrent pool holds a slot per session; padding rows
     # take none (they address the sink).
     DECODE_CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
@@ -764,7 +764,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     one token per label. The MoG / MaskGIT sampling is internal (not the
     engine's categorical sampler); its noise is drawn per row, with the row's
     own seeded generator, in ``preprocess`` -- so a session's speech does not
-    depend on its batch mates and the whole step is a CUDA graph replay for
+    depend on its batch mates and the whole step is an accelerator graph replay for
     all-decode batches.
 
     The same step decodes each session's new codes to its 80 ms of PCM
@@ -798,7 +798,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def warmup(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(cond [P, H], uncond [P, H], prev_codes [Q])`` of the speaker warm-up.
         Computed once per speaker, under the serving autocast (bf16 on CUDA) no
-        matter who asks first: the CUDA-graph capture's first preprocess runs
+        matter who asks first: the accelerator graph capture's first preprocess runs
         outside the engine's autocast scope, and a warm-up computed there
         differs in the last bits from one computed under it -- enough to move
         a session's first frame (the talker's frame-0 decision is a knife-edge)."""

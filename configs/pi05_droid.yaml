@@ -17,8 +17,8 @@ max_seq_len: 2048
 #      (openpi/src/openpi/policies/droid_policy.py:78). The slice is
 #      post-compute Python, so both systems do identical 32-dim work.
 #
-# CUDA-graph note: action_horizon and action_dim are both baked into the
-# graph captures (see Pi05LLMSubmodule.get_cuda_graph_configs in
+# Accelerator graph note: action_horizon and action_dim are both baked into the
+# graph captures (see Pi05LLMSubmodule.get_accelerator_graph_configs in
 # mstar/model/pi05/submodules.py:325-329). They MUST be set at server-init
 # time, never per-request — that's what this yaml override is for.
 model_kwargs:

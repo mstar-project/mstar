@@ -693,7 +693,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ]
 
         # Compute cos/sin for 3D MRoPE.  Returned as separate tensor keys
-        # (not a tuple) so the CUDA graph runner can detect them as static
+        # (not a tuple) so the accelerator graph runner can detect them as static
         # inputs and copy them into the captured buffers at replay.
         inv_freq = self._get_inv_freq(device)
         cos_3d, sin_3d = compute_3d_cos_sin(
@@ -997,7 +997,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         Decode path (1 token per request, ``hidden`` shape ``(bs, hidden)``):
         Always packs ``thinker_states`` + ``thinker_mask`` in every per-rid
-        output dict so the captured CUDA graph has a static output shape
+        output dict so the captured accelerator graph has a static output shape
         regardless of request metadata. Per-rid filtering happens in
         ``unpack_packed_output``.
         """
@@ -1181,7 +1181,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, list[torch.Tensor]]:
         """Drop ``thinker_states`` + ``thinker_mask`` for text-only requests.
 
-        ``forward_batched`` always emits these keys so the captured CUDA
+        ``forward_batched`` always emits these keys so the captured accelerator
         graph's output shape is static.  Here, outside the captured
         region, we gate them on the real request's ``audio_output`` flag
         so the Talker edge stays unrouted for text-only requests (matches

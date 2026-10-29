@@ -87,7 +87,7 @@ class FlashInferManager(AttentionManager):
         is just as persistent either way.
 
         ``num_rows`` is the qo_indptr row count this label actually plans —
-        the FlashInfer batch_size for CUDA-graph mode, which must stay fixed
+        the FlashInfer batch_size for accelerator graph mode, which must stay fixed
         for the wrapper's lifetime. It equals ``bucket.bs`` (one row per
         request) for an ordinary label, but a label that combines several
         source labels into one plan (e.g. cond+uncond batched CFG) always

@@ -2,7 +2,7 @@
 
 Structural behaviour only — no weights, no GPU: seeded noise at iteration 0, the step
 index from the engine's loop counter, the async-overshoot veto, equal-shape batching,
-stacked preprocess and per-row outputs, the stop boundary, the CUDA-graph bucket key
+stacked preprocess and per-row outputs, the stop boundary, the accelerator graph bucket key
 and the ragged-attention step declaration.
 """
 
@@ -425,8 +425,8 @@ def test_ragged_for_binds_the_label():
 def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
     """``Engine.reserve_replay_slot`` passes ``per_request_input_metadata`` by
     keyword. This override did not take it, so every scaffold model raised
-    TypeError on the first captured replay -- reachable only with cuda_graph on,
-    on a GPU, which no test covered. Bind against the BASE signature rather than
+    TypeError on the first captured replay -- reachable only with accelerator_graph
+    enabled on a GPU, which no test covered. Bind against the BASE signature rather than
     a hardcoded list, so a future parameter breaks this test and not serving."""
     import inspect
 

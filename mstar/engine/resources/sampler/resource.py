@@ -103,7 +103,7 @@ class SamplerResource(Resource):
         self._cg_max_bs = 0
         self._cg_slots = 1
 
-        # This is set during plan in the cuda graph case
+        # This is set during plan for a captured step
         self._cg_sampler: AcceleratorGraphableSampler | None = None
         # pre-planned a step ahead, promoted by the next non-preplan plan
         self._preplan_cg_sampler: AcceleratorGraphableSampler | None = None

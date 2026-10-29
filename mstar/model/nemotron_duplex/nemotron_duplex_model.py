@@ -37,7 +37,7 @@ the encoder's bounded KV (each call's attention window) and two recurrent-state
 pools (its conv tails, and its audio / mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
 conv + SSM slots), the Mamba-2 resource and the sampler, and the talker's paged
 KV cache, attention, positions and codec stream state. Both decode steps are
-CUDA graphs (the talker's with its codec decode), and so is the encoder's live
+accelerator graphs (the talker's with its codec decode), and so is the encoder's live
 step (piecewise).
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single

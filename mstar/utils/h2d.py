@@ -1,4 +1,4 @@
-"""Copy-only host-to-device staging, for work that runs beside a live CUDA graph.
+"""Copy-only host-to-device staging beside a live accelerator graph.
 
 Pre-planning builds step N+1's small tensors on the plan stream while step N's
 graph replays. Any SM work it issues (a kernel, a ``fill_``, a D2D copy) slows

@@ -1260,7 +1260,7 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
 
     configs = {c.capture_graph_walk: c for c in submodule.get_accelerator_graph_configs(torch.device("cpu"))}
     decode_config, prefill_config = configs["talker_decode"], configs["talker_prefill"]
-    # Replay pads with template rows (CudaGraphRunner.pad_inputs): EOS suppressed, zero-token prefills.
+    # Replay pads with template rows (AcceleratorGraphRunner.pad_inputs): EOS suppressed, zero-token prefills.
     padded = [rows[0], rows[1], *decode_config.get_node_inputs(2, 0)]
     packed = submodule.preprocess("talker_decode", engine_inputs, padded)
     _assert_same_tensor(packed["suppress_eos"], _old_flags([flags[0], flags[1], True, True]))

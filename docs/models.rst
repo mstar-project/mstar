@@ -7,6 +7,10 @@ representative Hugging Face identifier.
 
 Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MODELS``).
 
+Graph capture uses the accelerator graph API for CUDA and XPU. Each model's attention
+and sampling kernels determine which devices it can capture on; see
+:doc:`adding_models` and use a configuration for your device.
+
 .. list-table:: Registered model families
    :header-rows: 1
    :widths: 14 34 30
@@ -111,8 +115,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        repo's central square crop, not the HF processor's resize and crop.
    * - ``whisper_large_v3_turbo``
      - ``openai/whisper-large-v3-turbo``
-     - Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
-       decoder with write-once cross-attention; language detection, forced
+     - Whisper ASR: batched audio encoder with accelerator graph capture;
+       paged-KV decoder with write-once cross-attention; language detection, forced
        language/task, ``initial_prompt`` context, ``/v1/audio/transcriptions``.
        The 4-decoder-layer distillation of large-v3, same class as below.
    * - ``whisper_large``
@@ -213,6 +217,42 @@ Notes
   GPU, and default tiles otherwise. ``python -m mstar.utils.fused_moe.tune``
   writes a table for the local GPU.
 - To add a new family, see :doc:`adding_models`.
+
+Accelerator graph capture
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+BAGEL enables accelerator graph capture by default. Its XPU deployment configs
+disable capture with this option:
+
+.. code-block:: yaml
+
+   model_kwargs:
+     accelerator_graph: false
+
+BAGEL's LLM uses matching CUDA/XPU capture recipes for decode (CFG on/off)
+and text prefill (CFG off). Image-generation walks run eagerly.
+
+Waypoint and Cosmos3 enable their supported accelerator graph captures by
+default. To disable capture for these models, set this deployment option:
+
+.. code-block:: yaml
+
+   model_kwargs:
+     accelerator_graph: false
+
+Restart the server after changing this option. Model ``torch.compile`` settings
+are separate from the graph capture switch.
+
+For BAGEL, the switch also controls the optional ViT block loop capture. Optional
+ViT capture is enabled separately with ``MSTAR_VIT_ACCELERATOR_GRAPH=1`` and
+also requires ``accelerator_graph: true``.
+
+For Waypoint, this controls the VAE encoder and fused DiT/decoder captures.
+``capture_dit_prime`` controls prime capture when ``accelerator_graph`` is true.
+
+For Cosmos3, this disables denoise, understanding-tower prefill and reasoner
+decode captures. ``COSMOS3_DISABLE_ACCELERATOR_GRAPH`` and
+``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH`` provide environment controls.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~
@@ -333,8 +373,8 @@ transformers 5.22 turns on the per-frame pixel cap of qwen-vl-utils by
 default, which lowers the token count of short clips. Notes:
 
 - The vision encoder attends within each image and each video frame group
-  separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
-  segments per prompt. A prompt over either limit runs the encoder without the
+  separately, and its captured accelerator graphs hold up to 16384 patches and
+  64 such segments per prompt. A prompt over either limit runs the encoder without the
   graph: a long video at ordinary resolution exceeds the patches, and one over
   ~64 s with frames resized below ~256x256 pixels exceeds the segments.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
@@ -353,7 +393,7 @@ default, which lowers the token count of short clips. Notes:
 Most layers are gated DeltaNet, so a request holds a recurrent-state slot as
 well as a KV allocation. Set ``gdn_state.max_slots`` in
 ``configs/qwen3_5_*.yaml`` to the concurrency you want plus one for the sink;
-CUDA-graph capture and padded replays use the sink, not slots. A slot is
+Accelerator graph capture and padded replays use the sink, not slots. A slot is
 ~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
 not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints);
@@ -442,7 +482,7 @@ Kokoro notes
   ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
   fallback even when it is installed, ``chunk_target_phonemes`` and
   ``first_chunk_target_phonemes`` set the sentence packing, ``text_buckets``,
-  ``frame_buckets``, ``capture_batch_sizes`` and ``max_batch_frames`` shape the CUDA
+  ``frame_buckets``, ``capture_batch_sizes`` and ``max_batch_frames`` shape the accelerator
   graphs captured at start-up (fewer buckets on a smaller GPU), ``compile_decoder: false``
   skips the ``torch.compile`` of the vocoder (start-up in seconds instead of minutes, about
   half the throughput on an H100) and ``decoder_dtype: bfloat16`` runs the vocoder trunk
@@ -455,7 +495,7 @@ Kokoro notes
   synthesis.
 - Output is 24 kHz mono PCM16. The model runs in fp32 by default: its vocoder is
   phase-sensitive, so reduced precision is opt-in. On CUDA the text half and the
-  frame half of the forward are captured as CUDA graphs per length bucket and the
+  frame half of the forward are captured as accelerator graphs per length bucket and the
   frame half is compiled with dynamic shapes, so the first start-up on a GPU takes
   about two minutes; rows of one step are grouped by frame bucket
   (``frame_grouping: single`` pads them into one group instead, kept for comparison).
@@ -510,7 +550,7 @@ Qwen3-TTS notes
   left context, the decoder transformer's sliding window. The
   transformer stacks 8 such layers, so a window still differs slightly from a
   whole-utterance decode once an utterance outgrows the context; 25 frames of
-  context differed far more. Each window size is a CUDA-graph bucket captured
+  context differed far more. Each window size is an accelerator graph bucket captured
   for batch sizes 1 to 32; the stream buffer reports how many leading frames of
   a window are repeated context, and the codec trims their audio. A voice
   clone's reference tail (its last 72 frames) is the first window's context.
@@ -519,10 +559,10 @@ Qwen3-TTS notes
   stack's causal receptive field, derived from the decoder's modules at load
   (10 frames for the 12 Hz decoder; the new frames' audio equals the
   whole-window decode). It also fuses the SnakeBeta activations into one kernel.
-- Talker prefill replays a packed CUDA Graph for the smallest token bucket
+- Talker prefill replays a packed accelerator graph for the smallest token bucket
   (32 to 1024 tokens) that holds the batch; only the clone prefill, which also
   pushes the reference clip's frames into the codec stream, runs eager. Decode
-  always uses the whole-walk CUDA Graph, with the 15-step
+  always uses the whole-walk accelerator graph, with the 15-step
   CodePredictor loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
   request state. Residual ``subtalker_*`` sampling is per-request through the
@@ -651,7 +691,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   step decodes only the call's new frame against that state, and a fresh,
   zeroed slot is the decoder's causal padding, so a call's PCM equals the full
   decode of its frames from its first frame; at 32 sessions the decode is
-  ~100 GMAC per 80 ms tick, inside the talker's CUDA graph).
+  ~100 GMAC per 80 ms tick, inside the talker's accelerator graph).
   The decode loops are stream-terminated: they end when the upstream stream
   closes, not on EOS, which is an ordinary per-frame token in duplex speech.
 - ``nano_llm`` declares a paged KV cache over its four attention layers with
@@ -661,7 +701,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (``mamba_state``: 32 sessions by default, ~137 MB per slot in fp32, tunable
   with ``max_slots``), the Mamba-2 resource planned on it
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
-  captured as a CUDA graph for batch sizes 1 to 32.
+  captured as an accelerator graph for batch sizes 1 to 32.
 - Every per-session resource is sized for 32 sessions: a slot in each of
   ``mamba_state``, ``encoder_state``, ``encoder_front`` and ``codec_state`` (``max_slots``, one
   more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
@@ -673,7 +713,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   refuses to start with a cap one of them cannot hold, since a session past
   any of them would wait on admit, and its frames with it, until another ends.
   The nano, the talker and the encoder each run at most 32 sessions
-  a step, their widest CUDA graph; more are split over several steps rather
+  a step, their widest accelerator graph; more are split over several steps rather
   than run eagerly.
 - ``eartts_talker`` advances every live session in one backbone pass per frame
   through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
@@ -686,7 +726,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   from the positions the position resource planned. Sampling noise is drawn
   per row from the request's seeded generator before the step, so a session's
   speech does not depend on which other sessions share it. The per-frame step
-  is captured as a CUDA graph for 1 to 32 sessions; a session's first step
+  is captured as an accelerator graph for 1 to 32 sessions; a session's first step
   (its 38-token speaker warm-up) runs eager. The talker KV pool is 1025 pages
   of 128 positions (28 GiB): 32 sessions x 2 streams x 16 pages plus a sink
   page, enough for ``max_session_s`` (160 s) per session, with no
@@ -763,8 +803,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   distances; its conv inputs (``encoder_state``); and its newest audio and mel
   frames (``encoder_front``), the last two recurrent-state pools. A
   call that appends one frame of audio (1280 samples) on the frame grid, every
-  live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
-  the call's start: an opening clip or append that is not a multiple of 1280
+  live step of an 80 ms client, runs its whole step as an accelerator graph (the grid
+  is the call's start: an opening clip or append that is not a multiple of 1280
   samples keeps the call off it for good); other calls take the front end
   eagerly, then the layer stack as a graph when each got at most one frame (a
   live step, the call's end), or eagerly (a one-shot upload, a large append:
@@ -870,7 +910,7 @@ Chatterbox notes
   window stays as close to the whole-utterance decode as the full history
   does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
   are ready together share one padded flow solve (up to 8 per step).
-- S3Gen runs from CUDA graphs by default (``s3gen_graphs``): the flow solve
+- S3Gen runs from accelerator graphs by default (``s3gen_graphs``): the flow solve
   (one graph per rows x frames x steps; the estimator's hundreds of tiny
   kernels per Euler step make the eager solve launch-bound, 170 ms vs 45 ms
   for one row on an H100), the token encoder (per rows x token bucket) and
@@ -886,7 +926,7 @@ Chatterbox notes
   float32 (within 0.02-0.15 of the float32 log-mel; ``bfloat16`` is as fast
   and further off; ``float32`` is the reference path, bit-exact with the
   package at a fixed seed). ``t3_prefill_graphs`` (default on) captures T3
-  prefill as packed CUDA graphs by token bucket for batches of up to four
+  prefill as packed accelerator graphs by token bucket for batches of up to four
   requests; decode graphs are always captured. ``s3gen_graphs: false`` gives
   the eager path; ``s3gen_compile: true`` is the older alternative and turns
   the graphs off.
@@ -923,7 +963,7 @@ Cosmos3 environment requirements
 --------------------------------
 
 - ``flashinfer`` is required: it is the paged KV/attention backend used by the
-  prefill, the captured CUDA graphs, and multi-request batches.
+  prefill, the captured accelerator graphs, and multi-request batches.
 - The default denoise attention backend is ``dense_gen``
   (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
   attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel
@@ -988,7 +1028,7 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
-The decode step is captured into CUDA graphs per batch bucket and, by default,
+The decode step is captured into accelerator graphs per batch bucket and, by default,
 compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
 turns it off): the eager step is over a thousand tiny kernels, and the fused
 step runs at the weight-streaming floor (about twice the uncompiled rate at
@@ -1135,7 +1175,7 @@ The schedule is padded up to whole windows and the video trimmed back to
 ``num_frames``; a seeded request is deterministic end to end (later windows draw
 their noise from the same generator). Windowed requests batch with each other
 and with plain requests at the same walk. ``gen_capture_video`` lists (height,
-width, frames) tiers whose denoise steps replay a per-step CUDA graph (one graph per
+width, frames) tiers whose denoise steps replay a per-step accelerator graph (one graph per
 latent shape, the clean/noisy frame layout carried as a mask input; plain t2v/i2v and
 ``chained`` windows, never ``kv`` windows). It is empty by default: at 832x480 the
 graph, which captures the paged attention, measured 3-6% slower than the eager dense
@@ -1270,7 +1310,7 @@ has no such mode, and there two processes can differ by a few uint8 levels.
 The VAE decode
 tiles only when free VRAM at decode time is short of the untiled estimate
 (the ``auto`` policy; ``WAN22_VAE_DECODE_TILING`` forces a path), which keeps the untiled conv3d from OOMing a
-32 GiB card. No CUDA-graph capture, no continuous batching (one request per
+32 GiB card. No accelerator graph capture, no continuous batching (one request per
 step) and no component offload.
 
 LTX-2.5 (``ltx2_5``)
@@ -1352,7 +1392,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``attention_backend``
    ``sdpa`` (default) is the reference kernel, cuDNN on an H100 and measured as fast as
    FlashInfer in the served path. ``flashinfer`` runs the DiT's joint attention on the
-   engine's ragged FlashInfer resource; both are CUDA-graph replayable.
+   engine's ragged FlashInfer resource; both support accelerator graph replay.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
@@ -1377,7 +1417,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
      distilled sampler amplifies the last bit of inductor's own reductions and activation
      decompositions.
 
-``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
+``accelerator_graph``, ``capture_sizes``, ``capture_batch_sizes``
    The denoise step, Euler update included, is captured per listed ``[height, width]``
    and batch size. Other shapes run the eager batched path.
 

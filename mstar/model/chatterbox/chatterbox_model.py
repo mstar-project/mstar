@@ -20,7 +20,7 @@ Walks and partitions::
 Classifier-free guidance is two KV streams per request (``main`` with the
 text, ``uncond`` with the text embeddings zeroed) packed into one attention
 plan, so a CFG decode step is one forward over 2B rows; ``cfg_weight`` is a
-per-request tensor input, so decode replays a single captured CUDA graph per
+per-request tensor input, so decode replays a single captured accelerator graph per
 batch size and guidance mode. Turbo has no guidance.
 
 The reference implementation (``chatterbox/tts.py``, ``chatterbox/tts_turbo.py``)

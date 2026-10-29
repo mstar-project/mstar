@@ -606,11 +606,11 @@ def _run_concurrent_phase(
     save_videos_dir: Path | None = None,
 ) -> tuple[dict, list[str]]:
     """N-stream concurrent phase: a discarded warmup wave (compiles the
-    batch-``streams`` CUDA graph bucket), then a measured wave whose per-stream
+    batch-``streams`` accelerator graph bucket), then a measured wave whose per-stream
     metrics and server-side cadence decide whether every stream stayed realtime.
 
     ``save_videos_dir``, if given, saves only the measured wave's streams (the
-    warmup wave is throwaway CUDA graph compilation)."""
+    warmup wave is throwaway accelerator graph compilation)."""
     failures: list[str] = []
 
     warmup_ids = [f"{request_id_prefix}-concurrent-warmup-{i}" for i in range(streams)]

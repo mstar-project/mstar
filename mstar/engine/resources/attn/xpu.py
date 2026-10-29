@@ -138,6 +138,9 @@ class XPUPagedAttentionManager(AttentionManager):
         views = kv_out.views
         max_blocks = max((len(view.page_idxs) for view in views), default=1)
         if graph_mode:
+            # Multimodal prefixes can exceed the model's text max_seq_len.
+            # A graph must keep room for any context the resident cache can
+            # hold, rather than resize its table when an image edit arrives.
             max_blocks = self._kv_config.max_num_pages
         block_table = [
             view.page_idxs
@@ -194,10 +197,10 @@ class XPUPagedAttentionManager(AttentionManager):
 
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
-        """Return this eager step's query indptr.
+        """Return the current step's query indptr.
 
-        Unlike CUDA-graph FlashInfer buffers, this tensor is newly allocated
-        by every plan and therefore has no address-stability guarantee.
+        Eager plans allocate a new tensor; captured plans reuse the buffer
+        for their capture bucket, slot, and label.
         """
         plan = self._current_plans.get(label)
         return None if plan is None else plan.cu_q

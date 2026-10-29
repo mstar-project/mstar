@@ -198,7 +198,7 @@ def test_nano_declare_step_per_walk():
 
 
 def test_nano_captures_the_decode_step():
-    """The frame-synchronous decode step is a CUDA graph: one config, decode
+    """The frame-synchronous decode step is an accelerator graph: one config, decode
     only, whose dummy row is a fused frame (host-only prepare_inputs shape)
     and whose largest bucket fits the model's default recurrent-pool sizing
     (padding rows take a slot each during the step)."""

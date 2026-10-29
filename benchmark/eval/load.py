@@ -94,7 +94,7 @@ async def run_load(items: Sequence[Any], fn: RequestFn, spec: LoadSpec) -> tuple
 
 async def warmup(items: Sequence[Any], fn: RequestFn, spec: LoadSpec, count: int) -> None:
     """``count`` untimed requests at the measured concurrency, so the first measured
-    wave does not hit cold shapes (CUDA graphs, KV pages, scheduler queues)."""
+    wave does not hit cold shapes (accelerator graphs, KV pages, scheduler queues)."""
     if count <= 0 or not items:
         return
     warm = [items[i % len(items)] for i in range(count)]
