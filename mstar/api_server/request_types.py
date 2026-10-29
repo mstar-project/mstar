@@ -79,11 +79,25 @@ class ConductorStatus:
     metrics: list[MetricSnapshot]
 
 
+@dataclass
+class LoraAdapterResult:
+    """The conductor's answer to a LoRA adapter load or unload, once every worker hosting
+    the pool has acknowledged it: ``error_message`` is None on success, else ``status``
+    is the HTTP status the API server answers with."""
+    op_id: str
+    error_message: str | None = None
+    status: int = 200
+    # whether the conductor serves the name once the operation is over, so the API
+    # server's selection follows it whatever the outcome; None when it has no LoRA
+    served: bool | None = None
+
+
 # what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder
 # tries branches in order and takes the first whose required fields are all
 # present, so a body must lack a required field of every branch before it.
 APIServerMessageBody = (
-    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus | None
+    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus
+    | LoraAdapterResult | None
 )
 
 
@@ -91,7 +105,7 @@ APIServerMessageBody = (
 class APIServerMessage:
     """Envelope for messages received by the API server."""
     # "result_tensors" | "result_tokens" | "request_complete" | "request_failed"
-    # | "conductor_status" | "setup_done"
+    # | "conductor_status" | "lora_adapter_result" | "setup_done"
     message_type: str
     body: APIServerMessageBody = None
 

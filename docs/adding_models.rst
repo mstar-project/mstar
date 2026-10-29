@@ -1030,8 +1030,8 @@ placed exactly as weights are.
   ``link_lora_specs``: a module belongs to the spec whose ``adapter_roots`` claim it most
   specifically, and the others leave it alone (``ignored_modules``), so one adapter file
   serves both. The one ``lora:`` block sizes them all, the conductor opens every request
-  with the same adapter on each, and the startup check reads an adapter under every
-  spec.
+  with the same adapter on each, and the startup and runtime-load checks read an adapter
+  under every spec.
 - **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every placed module
   under ``root_path``, after checking it is the declared target and that the pool's
   shard is its rank-local shape (a module built whole on a TP node fails here, not in a
@@ -1078,7 +1078,8 @@ placed exactly as weights are.
   tokens and bias LoRA are refused by name. A YAML ``targets: [...]`` keeps a subset of
   the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
   touching a dropped target is refused, and its modules stay unbound. Without the list,
-  a deployment keeps the targets its configured adapters touch: the conductor reads them once at startup (``served_lora_targets``) and spawns
+  a deployment with ``runtime_updates`` off keeps the targets its configured adapters
+  touch: the conductor reads them once at startup (``served_lora_targets``) and spawns
   every worker with that list, so every process builds the same pools; an adapter it
   cannot read fails the deployment.
 - **Requests.** Nothing per model. The conductor opens every request with a
@@ -1154,6 +1155,17 @@ thread's ingests and removes go on meanwhile.
 A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
 out per request, while each SP rank holds a shard of the tokens, so building the pool
 refuses the deployment.
+
+Adapters loaded and unloaded at runtime (``/v1/load_lora_adapter``) reach each worker as
+a control message from the conductor, which each rank applies whenever it arrives rather
+than at a step the instance agrees on. ``LoraAdapterPool.load_adapter_async`` only reads the
+adapter into the host tier, on the reader thread (the worker acknowledges the load from its
+main loop once every pool has it), and ``unload_adapter`` only stops new requests from naming
+it; once no live request names it (immediately, or at the last one's teardown) the pool
+forgets its host copy and its name's slot entry, and leaves the slot's weights and LRU
+standing as they were. Neither touches what an admit decides from, and the next request
+that names the adapter is ingested after a reload, which reaches every rank after the
+unload did. Nothing per model is needed for either.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -2026,13 +2038,16 @@ that a misspelled setting is never silently ignored:
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``
        (adapters held in pinned host memory), ``adapters`` (adapter name to safetensors
        path: the names requests can ask for), ``targets`` (the subset of the model's
-       targets to allocate; by default the targets the configured adapters touch; a
-       secondary node's spec
+       targets to allocate; by default, with ``runtime_updates`` off, the targets the
+       configured adapters touch, and every target with it on; a secondary node's spec
        left with none builds no pool, while a YAML list leaving the model's first spec
        (its LLM's) none is an error),
        ``slot_wait_steps`` (default 256: how many of the pool's steps a request may
-       wait for a slot before a held slot is drained for it). One ``lora:`` block sizes
-       every LoRA spec of the model
+       wait for a slot before a held slot is drained for it), ``runtime_updates`` (default false: serve
+       ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``),
+       ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
+       worker to answer one before giving up on it). One ``lora:`` block sizes every
+       LoRA spec of the model
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,

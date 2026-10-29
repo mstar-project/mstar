@@ -41,6 +41,7 @@ from mstar.api_server.auth import (
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.request_types import (
     APIServerMessage,
     ClientAppend,
@@ -395,6 +396,9 @@ class DeadConductorError(RuntimeError):
 class APIServer:
     """Accept multimodal requests, forward to conductor, collect results."""
 
+    # set in __init__; None until then, which a server built without it (a test's) keeps
+    lora_admin: LoraAdmin | None = None
+
     def __init__(
         self,
         socket_path_prefix: str = "/tmp/mstar",
@@ -468,6 +472,16 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
             adapter_digests=self.lora_adapter_digests,
             is_pending=self.is_pending,
+        )
+
+        # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker
+        # thread, which owns this process's socket to the conductor
+        self.lora_admin = LoraAdmin(
+            lora_spec, self.served_models,
+            self.preprocess_worker.adapter_prefix_roots,
+            lambda message: self.preprocess_worker.send_to_conductor(message),  # noqa: PLW0108 - late-bound
+            timeout_s=timeout_seconds,
+            others=specs[1:],
         )
 
         self._init_request_state()
@@ -1023,6 +1037,11 @@ class APIServer:
                                     )
                         if queued:
                             self.preprocess_worker.wake()
+                        continue
+
+                    if message.message_type == "lora_adapter_result":
+                        if self.lora_admin is not None:
+                            self.lora_admin.on_result(message.body)
                         continue
 
                     if message.message_type == "conductor_status":
@@ -2676,7 +2695,8 @@ def main(argv: list[str] | None = None):
 
     if args.rust_frontend and lora_enabled(config):
         # The Rust frontend translates OpenAI requests itself: it does not map the `model`
-        # field onto an adapter, so it would serve every request on the base model.
+        # field onto an adapter, so it would serve every request on the base model, and it
+        # has no /v1/load_lora_adapter or /v1/unload_lora_adapter.
         raise SystemExit(
             "LoRA adapters (`resources: lora:` in the serving config) are served by the "
             "Python frontend only; drop --rust-frontend"
