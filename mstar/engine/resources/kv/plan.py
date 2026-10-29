@@ -233,7 +233,7 @@ class KVPlanOutput:
 
     __slots__ = (
         "cpu_indptrs", "_views", "_view_builder", "decode_pages", "decode_offsets",
-        "rows", "_decode", "columns",
+        "rows", "_decode", "columns", "write_state",
     )
 
     def __init__(
@@ -261,6 +261,9 @@ class KVPlanOutput:
         # columns. Unlike ``cpu_indptrs``, which may sit in a pinned ring a
         # later plan rewrites, they stay valid as long as the output does.
         self.columns = columns
+        # the device slots this step's writes go to (a `KVPlanState`), set by
+        # `KVManager.plan`; a speculative step rewrites them in-graph
+        self.write_state = None
 
     @property
     def views(self) -> "list[SequenceView]":
