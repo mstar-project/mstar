@@ -357,13 +357,14 @@ __device__ void gemm_phase(const Params& P, const Group& G, int ph_idx, const Ph
     const int tile = it.tile;
     f32x4 acc0 = {0.f, 0.f, 0.f, 0.f}, acc1 = {0.f, 0.f, 0.f, 0.f};
     for (int c = 0; c < d.chunks; ++c) {
-      // R.wnext holds this chunk (requested earlier); move it in and request the following one
-#pragma unroll
-      for (int i = 0; i < 8; ++i) R.wcur[i] = R.wnext[i];
+      // this chunk's activations are requested before waiting for its weights (R.wnext, requested a chunk
+      // earlier), so the two latencies overlap; then the following chunk's weights are requested
       if (!shared_a) {
         const bf16_t* a = d.kind == OPROJ ? P.attn : P.act;
         load_a_bf16(R.a, G, a, d.kind == OPROJ ? kQHeads * kHeadDim : kInter, c * kChunkK);
       }
+#pragma unroll
+      for (int i = 0; i < 8; ++i) R.wcur[i] = R.wnext[i];
       it = advance(P, G, it);
       R.requested = false;
       if (it.valid && it.ph == ph_idx) {
@@ -452,43 +453,34 @@ __device__ void attn_phase(const Params& P, const Group& G, const Phase& d) {
     *reinterpret_cast<unsigned*>(kvrow + p * pos_stride + kvh * kHeadDim + d0) = (unsigned)kb0 | ((unsigned)kb1 << 16);
     *reinterpret_cast<unsigned*>(kvrow + kind_stride + p * pos_stride + kvh * kHeadDim + d0) = (unsigned)vb0 | ((unsigned)vb1 << 16);
     if (!need_out) continue;
-    float sc[2][kPositions];
+    // every position's K and V requested at once (the scratch holds all of them; positions past p are masked),
+    // so the reads cost one latency rather than one per position
+    unsigned ku[kPositions], vu[kPositions];
 #pragma unroll
     for (int j = 0; j < kPositions; ++j) {
-      if (j > p) break;
-      float k0v, k1v;
-      if (j == p) {
-        k0v = bf2f(kb0);
-        k1v = bf2f(kb1);
-      } else {
-        const unsigned u = *reinterpret_cast<const unsigned*>(kvrow + j * pos_stride + kvh * kHeadDim + d0);
-        k0v = bf2f(u & 0xffffu);
-        k1v = bf2f(u >> 16);
-      }
-      sc[0][j] = wave_sum(x[0][0] * k0v + x[0][1] * k1v) * P.attn_scale;
-      sc[1][j] = wave_sum(x[1][0] * k0v + x[1][1] * k1v) * P.attn_scale;
+      ku[j] = *reinterpret_cast<const unsigned*>(kvrow + j * pos_stride + kvh * kHeadDim + d0);
+      vu[j] = *reinterpret_cast<const unsigned*>(kvrow + kind_stride + j * pos_stride + kvh * kHeadDim + d0);
     }
+    float sc[2][kPositions];
     float mx0 = -3.0e38f, mx1 = -3.0e38f;
 #pragma unroll
     for (int j = 0; j < kPositions; ++j) {
-      if (j > p) break;
+      const unsigned u = j == p ? ((unsigned)kb0 | ((unsigned)kb1 << 16)) : ku[j];
+      const float k0v = bf2f(u & 0xffffu), k1v = bf2f(u >> 16);
+      const float a0 = wave_sum(x[0][0] * k0v + x[0][1] * k1v) * P.attn_scale;
+      const float a1 = wave_sum(x[1][0] * k0v + x[1][1] * k1v) * P.attn_scale;
+      sc[0][j] = j <= p ? a0 : -3.0e38f;
+      sc[1][j] = j <= p ? a1 : -3.0e38f;
       mx0 = fmaxf(mx0, sc[0][j]);
       mx1 = fmaxf(mx1, sc[1][j]);
     }
     float z0 = 0.f, z1 = 0.f, o00 = 0.f, o01 = 0.f, o10 = 0.f, o11 = 0.f;
 #pragma unroll
     for (int j = 0; j < kPositions; ++j) {
-      if (j > p) break;
-      float v0, v1;
-      if (j == p) {
-        v0 = bf2f(vb0);
-        v1 = bf2f(vb1);
-      } else {
-        const unsigned u = *reinterpret_cast<const unsigned*>(kvrow + kind_stride + j * pos_stride + kvh * kHeadDim + d0);
-        v0 = bf2f(u & 0xffffu);
-        v1 = bf2f(u >> 16);
-      }
-      const float e0 = __expf(sc[0][j] - mx0), e1 = __expf(sc[1][j] - mx1);
+      const unsigned u = j == p ? ((unsigned)vb0 | ((unsigned)vb1 << 16)) : vu[j];
+      // masked positions contribute nothing even if the scratch there is not a number
+      const float v0 = j <= p ? bf2f(u & 0xffffu) : 0.f, v1 = j <= p ? bf2f(u >> 16) : 0.f;
+      const float e0 = j <= p ? __expf(sc[0][j] - mx0) : 0.f, e1 = j <= p ? __expf(sc[1][j] - mx1) : 0.f;
       z0 += e0;
       z1 += e1;
       o00 += e0 * v0;
