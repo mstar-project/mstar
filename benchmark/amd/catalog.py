@@ -206,7 +206,13 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         rows=("flux2_klein", "flux2_klein_9b", "z_image_turbo", "wan22"), model_kwargs={"linear_dtype": "fp8"},
         follows="mstar",
         recipe="as the mstar arm, with model_kwargs linear_dtype: fp8 (per-channel e4m3 weights, per-token "
-               "activations, hipBLASLt fp8 GEMMs; text encoder and VAE in bf16)"),
+               "activations, hipBLASLt fp8 GEMMs; text encoder and VAE in bf16; the config's fp8_keep_bf16 list, "
+               "if any, stays bf16)"),
+    # Every declared linear in fp8, whatever the config keeps in bf16.
+    Arm("mstar-fp8-all", "mstar", ("image", "video"), client="ours_openai", env={"MSTAR_SHM_ARENA": "1"},
+        rows=("flux2_klein", "flux2_klein_9b", "z_image_turbo", "wan22"),
+        model_kwargs={"linear_dtype": "fp8", "fp8_keep_bf16": []}, follows="mstar",
+        recipe="as the mstar-fp8 arm with fp8_keep_bf16: [] (every linear the model declares runs fp8)"),
     # The same arms on the base tree (--tree base=PATH), back to back with the head's on each row, so the head's
     # change is measured in the same session. Each serves its own tree's configs.
     Arm("mstar-base", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai", tree="base",
