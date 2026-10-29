@@ -177,9 +177,9 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
 # 16 kHz).
 MIN_REF_AUDIO_SAMPLE_RATE = 8000
 # Voice cloning needs seconds of speech. Twice the longest reference a model
-# takes (Qwen3-TTS refuses over 30 s, Chatterbox keeps 30 s), so this never
-# refuses a clip a model would use; without it a 66 MB FLAC probe-decodes to
-# about 23 GB.
+# uses (Qwen3-TTS refuses over 30 s, Chatterbox trims to 30 s), so this only
+# refuses a clip well past what any model would keep; without it a 66 MB FLAC
+# probe-decodes to about 23 GB.
 MAX_REF_AUDIO_SECONDS = 60.0
 # The probe decode runs in the request thread pool (32 threads); this bounds
 # how many decode at once.
@@ -217,60 +217,30 @@ def check_ref_audio(path: str, decoder: str) -> None:
     """Open the reference clip at ``path`` the way the model's ``load_audio``
     will; on failure delete it and raise ValueError.
 
-    ``decoder`` names what ``load_audio`` decodes with: ``"soundfile"``, or
-    ``"media"`` for ``mstar.model.components.media_io``, which is torchcodec
-    where it works (``"torchcodec"``) and PyAV with libsndfile elsewhere. The
-    media decoders decode the clip, not just its header: some FFmpeg builds
-    parse a container header (MAT4, MAT5) they cannot decode. A clip whose
-    header rate is below ``MIN_REF_AUDIO_SAMPLE_RATE``, or whose header
-    duration is over ``MAX_REF_AUDIO_SECONDS``, is refused before any decode;
-    the decode itself stops just past ``MAX_REF_AUDIO_SECONDS``, so a header
-    that hides or understates the length cannot make it unbounded.
+    ``decoder`` is the library that ``load_audio`` uses: ``"soundfile"``,
+    ``"torchcodec"``, or ``"soundfile+torchcodec"`` for a loader that tries
+    libsndfile first and FFmpeg for what it cannot open, as
+    ``Model.load_audio`` does. FFmpeg means ``mstar.model.components.media_io``:
+    torchcodec where it works, else PyAV. Both decode the clip, not just its
+    header: some FFmpeg builds parse a container header (MAT4, MAT5) they
+    cannot decode. A clip whose header rate is below
+    ``MIN_REF_AUDIO_SAMPLE_RATE``, or whose header duration is over
+    ``MAX_REF_AUDIO_SECONDS``, is refused before any decode; the decode itself
+    stops just past ``MAX_REF_AUDIO_SECONDS``, so a header that hides or
+    understates the length cannot make it unbounded.
     """
     try:
-        media = decoder == "media"
-        if media:
-            from mstar.model.components import media_io as model_media
-        if decoder == "torchcodec" or (media and model_media.uses_torchcodec()):
-            from torchcodec.decoders import AudioDecoder
-
-            header = AudioDecoder(path).metadata
-            _require_ref_audio_rate(header.sample_rate)
-            _require_ref_audio_seconds(header.duration_seconds_from_header)
-            with _ref_audio_decodes:
-                # Mono at a fixed rate: a small compressed upload can declare many
-                # channels at a high rate, and decoding it natively takes gigabytes.
-                samples = AudioDecoder(
-                    path, sample_rate=_REF_AUDIO_PROBE_RATE, num_channels=1
-                ).get_samples_played_in_range(0.0, MAX_REF_AUDIO_SECONDS + 1.0)
-            if samples.duration_seconds == 0:
-                raise ValueError("reference audio has no samples in its first seconds")
-            _require_ref_audio_seconds(samples.pts_seconds + samples.duration_seconds)
-        elif media:
-            # the same checks through PyAV and libsndfile
-            header = model_media.audio_header(path)
-            _require_ref_audio_rate(header.sample_rate)
-            _require_ref_audio_seconds(header.duration)
-            with _ref_audio_decodes:
-                samples = model_media.decode_audio(
-                    path, _REF_AUDIO_PROBE_RATE, 1, max_seconds=MAX_REF_AUDIO_SECONDS + 1.0,
-                )
-            if samples.data.shape[-1] == 0:
-                raise ValueError("reference audio has no samples in its first seconds")
-            _require_ref_audio_seconds(samples.data.shape[-1] / samples.sample_rate)
+        if decoder == "torchcodec":
+            _check_ref_audio_torchcodec(path)
+        elif decoder == "soundfile":
+            _check_ref_audio_soundfile(path)
         else:
-            import soundfile
-
-            from mstar.model.media_limits import count_sound_file_seconds, sound_file_seconds
-
-            info = soundfile.info(path)
-            _require_ref_audio_rate(info.samplerate)
-            seconds = sound_file_seconds(info.frames, info.samplerate)
-            if seconds is None:
-                # no sample count in the header (a FLAC written to a pipe)
-                with _ref_audio_decodes:
-                    seconds = count_sound_file_seconds(path, MAX_REF_AUDIO_SECONDS)
-            _require_ref_audio_seconds(seconds)
+            try:
+                _check_ref_audio_soundfile(path)
+            except RefAudioTooLongError:
+                raise
+            except Exception:  # noqa: BLE001 — not a libsndfile container; the loader tries FFmpeg
+                _check_ref_audio_media(path)
     except RefAudioTooLongError:
         Path(path).unlink(missing_ok=True)
         raise
@@ -279,6 +249,60 @@ def check_ref_audio(path: str, decoder: str) -> None:
         raise ValueError(
             f"ref_audio must be audio the model can decode, at {MIN_REF_AUDIO_SAMPLE_RATE} Hz or more"
         ) from exc
+
+
+def _check_ref_audio_torchcodec(path: str) -> None:
+    from torchcodec.decoders import AudioDecoder
+
+    header = AudioDecoder(path).metadata
+    _require_ref_audio_rate(header.sample_rate)
+    _require_ref_audio_seconds(header.duration_seconds_from_header)
+    with _ref_audio_decodes:
+        # Mono at a fixed rate: a small compressed upload can declare many
+        # channels at a high rate, and decoding it natively takes gigabytes.
+        samples = AudioDecoder(
+            path, sample_rate=_REF_AUDIO_PROBE_RATE, num_channels=1
+        ).get_samples_played_in_range(0.0, MAX_REF_AUDIO_SECONDS + 1.0)
+    if samples.duration_seconds == 0:
+        raise ValueError("reference audio has no samples in its first seconds")
+    _require_ref_audio_seconds(samples.pts_seconds + samples.duration_seconds)
+
+
+def _check_ref_audio_media(path: str) -> None:
+    """The torchcodec checks where torchcodec works, else the same ones
+    through PyAV (``mstar.model.components.media_io``)."""
+    from mstar.model.components import media_io as model_media
+
+    if model_media.uses_torchcodec():
+        _check_ref_audio_torchcodec(path)
+        return
+    header = model_media.audio_header(path)
+    _require_ref_audio_rate(header.sample_rate)
+    _require_ref_audio_seconds(header.duration)
+    with _ref_audio_decodes:
+        samples = model_media.decode_audio(
+            path, _REF_AUDIO_PROBE_RATE, 1, max_seconds=MAX_REF_AUDIO_SECONDS + 1.0,
+        )
+    if samples.data.shape[-1] == 0:
+        raise ValueError("reference audio has no samples in its first seconds")
+    _require_ref_audio_seconds(samples.data.shape[-1] / samples.sample_rate)
+
+
+def _check_ref_audio_soundfile(path: str) -> None:
+    import soundfile
+
+    from mstar.model.media_limits import count_sound_file_seconds, sound_file_seconds
+
+    info = soundfile.info(path)
+    _require_ref_audio_rate(info.samplerate)
+    seconds = sound_file_seconds(info.frames, info.samplerate)
+    if seconds is None:
+        # no sample count in the header (a FLAC written to a pipe)
+        with _ref_audio_decodes:
+            seconds = count_sound_file_seconds(path, MAX_REF_AUDIO_SECONDS)
+    if not seconds:
+        raise ValueError("reference audio has no samples")
+    _require_ref_audio_seconds(seconds)
 
 
 def _require_ref_audio_rate(rate: int | None) -> None:
@@ -446,7 +470,9 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             frames += len(data)
             if frames > limit:
                 raise AudioTooLongError(max_seconds)
-            parts.append(data.mean(axis=1))
+            # a mono block is its own mean, and numpy's reduction over the
+            # length-1 axis costs ~10x the copy
+            parts.append(data[:, 0] if data.shape[1] == 1 else data.mean(axis=1))
     return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
 
 
@@ -501,26 +527,13 @@ def decode_audio(path: str, sample_rate: int = 16000, max_seconds: float = MAX_A
     """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``,
     refused with :class:`AudioTooLongError` past ``max_seconds``.
 
-    libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
-    then the models' FFmpeg-backed decoders for the rest (m4a, webm, ...).
+    The same decode as a model's own uploads (``load_speech_file``): a file
+    neither libsndfile nor FFmpeg reads raises ``ValueError`` (HTTP 400), while a
+    missing FFmpeg stays the server's error.
     """
-    try:
-        audio, sr = read_soundfile_capped(path, max_seconds)
-    except AudioRefusedError:
-        raise
-    except Exception:  # noqa: BLE001 — not a libsndfile container
-        return decode_media_capped(path, sample_rate, max_seconds).numpy().astype(np.float32)
-    check_resample_rate(sr, sample_rate)
-    if sr != sample_rate:
-        try:
-            import torch
-            import torchaudio
+    from mstar.model.components.audio_features import load_speech_file
 
-            audio = torchaudio.functional.resample(torch.from_numpy(audio), sr, sample_rate).numpy()
-        except ImportError:
-            idx = np.linspace(0, len(audio) - 1, int(round(len(audio) * sample_rate / sr)))
-            audio = np.interp(idx, np.arange(len(audio)), audio).astype(np.float32)
-    return audio
+    return load_speech_file(path, sample_rate, max_seconds).numpy()
 
 
 def window_stop(start: int, total: int, step: int, balanced: bool) -> int:

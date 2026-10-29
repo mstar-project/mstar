@@ -68,17 +68,18 @@ def _rocm_paged_backend(page_size: int | None) -> AttnBackend:
     )
 
 
-def flashinfer_kwargs(kv_config: KVConfig, backend: str) -> dict:
-    """``FlashInferManager``'s platform arguments for a spec naming ``backend``.
+def flashinfer_kwargs(kv_config: KVConfig, backend: str, decode_tensor_cores: bool = True) -> dict:
+    """The FlashInfer managers' platform arguments for a spec naming ``backend``
+    and ``decode_tensor_cores`` (``AttentionConfig``'s choice of decode kernel).
 
     On ROCm only AMD's FlashInfer build runs. Its ``auto`` can't use an AITER
     kernel at page 128 (it falls back to fa2 after a failed attempt, or gathers
     per token for prefill), so ``auto`` is pinned to fa2 there. Decode skips
     tensor cores, the faster path on ROCm, for the GQA groups that kernel
-    dispatches.
+    dispatches, whatever the spec asked for.
     """
     if not current_platform.is_rocm():
-        return {"backend": backend}
+        return {"backend": backend, "decode_tensor_cores": decode_tensor_cores}
     from mstar.engine.resources.attn import aiter as rocm
 
     reason = rocm.flashinfer_rocm_unavailable_reason()
@@ -190,7 +191,9 @@ class AttentionManager(AttentionResource):
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
                 sliding_window=spec.config.sliding_window,
-                **flashinfer_kwargs(kv_config, spec.config.flashinfer_backend),
+                **flashinfer_kwargs(
+                    kv_config, spec.config.flashinfer_backend, spec.config.decode_tensor_cores,
+                ),
             )
 
         if backend == AttnBackend.AITER:
@@ -272,8 +275,7 @@ class EagerSlotKey(NamedTuple):
     same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""
     label: str
     slot: int
-    # decode and prefill take different wrapper classes; cross-attention plans
-    # one wrapper per label either way and leaves this False
+    # decode and prefill take different wrapper classes
     is_decode: bool = False
 
 

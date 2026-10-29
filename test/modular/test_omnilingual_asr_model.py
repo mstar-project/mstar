@@ -837,7 +837,8 @@ def test_transcription_route_end_to_end(route, tiny_model, tmp_path):
     expected = tiny_model.postprocess(_run_node(api.sub, [wave_in])["r0"], "text").decode()
     assert r.json() == {"text": expected.strip()}
     assert len(api.submits) == 1 and api.submits[0]["input_modalities"] == ["audio"]
-    # no timestamps: verbose_json has no segments, srt one cue spanning the clip
+    # no timestamps, and this fixture can't read the upload's duration (no
+    # soundfile/torchcodec), so the one window is untimed: no segments, one srt cue
     r = client.post(
         "/v1/audio/transcriptions",
         data={"model": KEYS[0], "response_format": "verbose_json"},

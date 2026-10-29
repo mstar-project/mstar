@@ -36,8 +36,8 @@ class FlashInferManager(AttentionManager):
         backend: str="auto",
         splits: tuple[CombinedSplit, ...] = (),
         max_rows_in_combined: Mapping[str, int | None] | None = None,
-        sliding_window: int | None = None,
         decode_tensor_cores: bool = True,
+        sliding_window: int | None = None,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}

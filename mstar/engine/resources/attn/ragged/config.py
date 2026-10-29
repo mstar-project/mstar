@@ -29,6 +29,8 @@ class RaggedAttnBackend(Enum):
     FLASHINFER = "flashinfer"
     # ROCm: AITER's varlen flash attention
     AITER = "aiter"
+    # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
+    DENSE = "dense"
 
 
 @dataclass(frozen=True)

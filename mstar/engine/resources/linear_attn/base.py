@@ -61,7 +61,7 @@ class LinearAttnManager(AttentionResource):
                 config=spec.config,
                 geometry=Mamba2Geometry.from_blocks(pool_config.blocks),
                 num_layers=pool_config.num_layers,
-                state_dtype=pool_config.blocks["ssm"].dtype,
+                state_dtype=pool_config.blocks["ssm"].resolved_dtype(info.kv_dtype),
                 has_sink=not pool_config.disable_sink_slot,
                 device=info.device,
             )
@@ -72,7 +72,7 @@ class LinearAttnManager(AttentionResource):
             from mstar.engine.resources.linear_attn.gdn import GDNManager
             from mstar.engine.resources.linear_attn.gdn_kernels import build_gdn_kernels
 
-            state_dtype = pool_config.blocks["state"].dtype
+            state_dtype = pool_config.blocks["state"].resolved_dtype(info.kv_dtype)
             has_sink = not pool_config.disable_sink_slot
             kernels = build_gdn_kernels(
                 backend,

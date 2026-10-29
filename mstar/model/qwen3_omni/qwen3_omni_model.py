@@ -95,7 +95,7 @@ from mstar.model.qwen3_omni.config import (
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import Operation, WeightConverter, drop_stop_tokens
+from mstar.model.utils import Operation, TextChunkDetokenizer, WeightConverter, drop_stop_tokens
 from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -183,6 +183,8 @@ class Qwen3OmniModel(Model):
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
 
     LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
+
+    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -1401,8 +1403,9 @@ class Qwen3OmniModel(Model):
     ) -> bytes:
         if modality == "text":
             ids = drop_stop_tokens(output, (self.config.im_end_token_id,), request_kwargs)
-            detok = self.tokenizer.decode(ids)
-            return detok.encode("utf-8")
+            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+            return self._text_detokenizer.to_bytes(ids)
         elif modality == "audio":
             if output.numel() == 0:
                 return b""

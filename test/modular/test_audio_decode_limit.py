@@ -67,7 +67,7 @@ class _FakeSoundfile(types.ModuleType):
         self.SoundFile = SoundFile
 
     def info(self, path):
-        return types.SimpleNamespace(frames=self.header_frames, samplerate=self.rate)
+        return types.SimpleNamespace(frames=self.header_frames, samplerate=self.rate, channels=self.channels)
 
     def read(self, path, dtype="float64", always_2d=False, **k):
         # the whole-file read main used: hands out every frame
@@ -311,18 +311,23 @@ def test_soundfile_loaders_are_capped(monkeypatch, clip):
     from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
     from mstar.model.components.audio_features import load_audio_file
     from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
 
-    for load in (
-        lambda: load_audio_file(clip),
-        lambda: ChatterboxModel._decode_audio(clip),
-        lambda: NemotronDuplexModel.load_audio(None, clip, "cpu"),
+    omnivoice = types.SimpleNamespace(config=types.SimpleNamespace(sample_rate=24000))
+    duplex = object.__new__(NemotronDuplexModel)
+    for load, error, match, seconds in (
+        (lambda: load_audio_file(clip), AudioTooLongError, None, MAX_AUDIO_SECONDS),
+        (lambda: ChatterboxModel._decode_audio(clip), AudioTooLongError, None, MAX_AUDIO_SECONDS),
+        # capped tighter, at its longest session, and refused with that error
+        (lambda: duplex.load_audio(clip, "cpu"), ValueError, "longest session", duplex.max_session_s),
+        (lambda: OmniVoiceModel.load_audio(omnivoice, clip, "cpu"), AudioTooLongError, None, MAX_AUDIO_SECONDS),
     ):
         sf = _use_soundfile(monkeypatch, _FakeSoundfile(TOO_LONG, header_seconds=10))
         # chatterbox falls back to torchcodec on a soundfile failure; the cap must not
         calls = _fake_torchcodec(monkeypatch, TOO_LONG)
-        with pytest.raises(AudioTooLongError):
+        with pytest.raises(error, match=match):
             load()
-        assert sf.frames_read <= MAX_AUDIO_SECONDS * 16000 + 1
+        assert sf.frames_read <= seconds * 16000 + 1
         assert calls["all"] == 0 and not calls["stops"]
 
 

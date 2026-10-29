@@ -35,6 +35,7 @@ from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers  # noqa: E402
+from mstar.streaming.topology import PartitionTopology  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessageType,
     EnableMetrics,
@@ -55,6 +56,13 @@ class _Sink:
 
     def send(self, entity_id, msg):
         self.sent.append((entity_id, msg))
+
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
 
     def get_all_new_messages(self):
         return []
@@ -263,8 +271,8 @@ class _FailSecondRead(_MemmoveEngine):
 
 
 def test_a_failed_read_does_not_count_the_reads_before_it_again():
-    """A read whose future raises leaves the poll's earlier entries pending,
-    so the next poll sees them again; they count once."""
+    """A read whose future raises is dropped and handed to take_failed_reads;
+    the read delivered before it counts once, the failed one not at all."""
     producer, consumer = _mooncake("worker_0"), _mooncake("worker_1")
     consumer._async_reader = AsyncMooncakeReader(_FailSecondRead(), device="cpu")
     try:
@@ -278,9 +286,11 @@ def test_a_failed_read_does_not_count_the_reads_before_it_again():
         for future in [ep.future for ep in consumer.pending]:
             with contextlib.suppress(RuntimeError):
                 future.result(timeout=5)
-        for _ in range(3):
-            with pytest.raises(RuntimeError, match="Mooncake read failed"):
-                consumer.get_ready_tensors()
+        assert [e.name for e in consumer.get_ready_tensors()["r1"]] == ["h"]
+        for _ in range(2):
+            assert consumer.get_ready_tensors() == {}
+        (failed,) = consumer.take_failed_reads()
+        assert failed.request_id == "r1" and [e.name for e in failed.graph_edges] == ["g"]
         assert _series(stats.snapshot())[("enc", "llm", "TCP")][:3] == (16, 1, 1)
     finally:
         producer._async_reader.shutdown()
@@ -353,6 +363,9 @@ def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path
 class _TextModel:
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
 
 def test_the_data_worker_loop_publishes_the_results_it_reads(tmp_path, monkeypatch):

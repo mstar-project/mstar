@@ -91,6 +91,15 @@ class ARFusion:
         scaled by ``weight + weight_bias``. Out of place."""
         raise NotImplementedError
 
+    def accepts_allreduce(self, x: torch.Tensor) -> bool:
+        """Whether ``allreduce`` takes ``x`` (sizes, dtype and layout only, so
+        all ranks agree). False where the kernel has no plain all-reduce."""
+        return False
+
+    def allreduce(self, x: torch.Tensor) -> torch.Tensor:
+        """``allreduce(x)`` with the same one-kernel collective, no norm."""
+        raise NotImplementedError
+
     def graph_capture(self) -> GraphCaptureScope:
         return GraphCaptureScope()
 
@@ -110,9 +119,10 @@ class FlashInferARFusion(ARFusion):
     # tried before giving up on fusion.
     BACKENDS = ("auto", "trtllm")
 
-    def __init__(self, workspace, max_tokens: int):
+    def __init__(self, workspace, max_tokens: int, world_size: int):
         self._workspace = workspace
         self.max_tokens = max_tokens
+        self._world_size = world_size
 
     @classmethod
     def create(
@@ -154,7 +164,7 @@ class FlashInferARFusion(ARFusion):
                 logger.info("all-reduce fusion workspace: %s (backend %r), up to "
                             "%d tokens x %d", type(ws).__name__, backend,
                             max_tokens, hidden)
-                return cls(ws, max_tokens)
+                return cls(ws, max_tokens, world_size)
             if ws is not None:
                 ws.destroy()
         logger.warning("no FlashInfer all-reduce fusion backend works here; "
@@ -182,6 +192,25 @@ class FlashInferARFusion(ARFusion):
             trigger_completion_at_end=True,
         )
         return norm_out, residual_out
+
+    def accepts_allreduce(self, x) -> bool:
+        # the workspace is sized in bytes, so any 2-D bf16 message that fits it
+        return (
+            x.dim() == 2 and x.dtype == torch.bfloat16 and x.is_cuda and x.is_contiguous()
+            and self._workspace.is_buffer_size_sufficient(self._world_size, *x.shape, x.dtype)
+        )
+
+    def allreduce(self, x):
+        import flashinfer.comm as fc
+
+        out = torch.empty_like(x)
+        fc.allreduce_fusion(
+            input=x, workspace=self._workspace,
+            pattern=fc.AllReduceFusionPattern.kAllReduce,
+            launch_with_pdl=True, output=out, fp32_acc=True,
+            trigger_completion_at_end=True,
+        )
+        return out
 
 
 # --- ROCm: AITER --------------------------------------------------------------
@@ -538,3 +567,14 @@ def allreduce_add_rmsnorm(
 @allreduce_add_rmsnorm.register_fake
 def _(x, residual, weight, eps, weight_bias, ws_id):
     return torch.empty_like(x), torch.empty_like(residual)
+
+
+@torch.library.custom_op("mstar::allreduce_oneshot", mutates_args=())
+def allreduce_oneshot(x: torch.Tensor, ws_id: int) -> torch.Tensor:
+    """``allreduce(x)`` with fusion ``ws_id``'s one-kernel collective, and no norm."""
+    return _FUSIONS[ws_id].allreduce(x)
+
+
+@allreduce_oneshot.register_fake
+def _(x, ws_id):
+    return torch.empty_like(x)

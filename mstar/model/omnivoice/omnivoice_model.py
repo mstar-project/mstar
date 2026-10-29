@@ -205,13 +205,15 @@ class OmniVoiceModel(Model):
         ``Model.load_audio`` decodes at 16 kHz, which is right for the ASR
         models in the tree and wrong here: the Higgs-Audio-v2 codec encodes at
         24 kHz, and feeding it 16 kHz samples would not error — it would encode
-        a reference pitched and paced wrong, and clone that.
+        a reference pitched and paced wrong, and clone that. Like the base
+        loader, libsndfile first: torchcodec needs an FFmpeg built with audio
+        decoders, which some deployment images lack (#639).
         """
-        from mstar.api_server.media_io import decode_media_capped
         from mstar.model.base import TensorAndMetadata
+        from mstar.model.components.audio_features import load_audio_file
 
         rate = self.config.sample_rate
-        audio = decode_media_capped(filepath, rate)
+        audio = load_audio_file(filepath, rate)
         return TensorAndMetadata(
             data=audio, metadata=dict(sample_rate=rate, num_channels=1)
         )
