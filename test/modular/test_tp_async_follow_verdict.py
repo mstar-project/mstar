@@ -25,7 +25,9 @@ forward) and then hangs in the collective. So:
 Drives the real ``Worker`` methods unbound on a minimal stub with a real
 ``MicroScheduler`` for the FIFO, the pattern ``test_worker_message_handling``
 uses. ``_try_follow_speculation`` is stubbed per test — its own build logic
-is exercised against the graph API elsewhere; here we pin the protocol.
+is exercised against the graph API elsewhere; here we pin the protocol. Every
+test runs without the ranks' vote on N's verdict and with a one-rank one,
+which leaves the verdict as this rank found it.
 """
 
 import sys
@@ -48,6 +50,19 @@ from mstar.worker.worker import (  # noqa: E402
 
 NODE = "LLM"
 WALK = "decode"
+# Set per test by ``_vote_switch``: whether ``_stub`` installs a one-rank vote.
+ONE_RANK_VOTE = False
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["no-vote", "one-rank-vote"])
+def _vote_switch(request, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "ONE_RANK_VOTE", request.param)
+
+
+def _one_rank_vote(pending):
+    """What ``Worker._agree_on_step`` makes of N over a one-rank instance."""
+    pending.voted = True
+    pending.failed_on_a_rank = bool(pending.node_batch.failed_requests)
 
 
 class _FakeEngineManager:
@@ -126,6 +141,16 @@ def _stub(cache_open: bool = False):
     )
     stub._step_voids_head = Worker._step_voids_head
     stub._prefix_cache_open = lambda node: Worker._prefix_cache_open(stub, node)
+    # The rank vote over N's verdict, off unless a test installs ``stub.vote``
+    # (the vote itself, over real ranks, is test_tp_step_vote.py's).
+    stub.vote = _one_rank_vote if ONE_RANK_VOTE else None
+
+    def _agree_on_step(pending):
+        stub.vote(pending)
+
+    stub._votes_on_step = lambda p: stub.vote is not None
+    stub._agree_on_step = _agree_on_step
+    stub._step_outputs = lambda p: Worker._step_outputs(stub, p)
     return stub
 
 
@@ -148,6 +173,7 @@ def _pending(tp_seq, future=None, admit_error=None, failed_requests=()):
     ``ExecutingBatch`` the way the GPU thread leaves them."""
     return types.SimpleNamespace(
         node_name=NODE, graph_walk=WALK, tp_seq=tp_seq, future=future,
+        voted=False, failed_on_a_rank=False,
         batch=types.SimpleNamespace(request_to_worker_graph={"r0": "wg0"}),
         node_batch=types.SimpleNamespace(
             admit_error=admit_error,
@@ -484,3 +510,85 @@ def test_await_never_returns_without_a_decision_once_N_finished():
     s = _stub()   # nothing ever arrives
     with pytest.raises(TimeoutError):
         _await(s, _pending(4, _future(s, _output())))
+
+
+# ---------------------------------------------------------------- the vote
+
+def _vote(log, *failed_elsewhere, failed_on_a_rank=False):
+    """A vote over N in which another rank failed ``failed_elsewhere`` after
+    the forward, or (``failed_on_a_rank``) a row only it held: the agreed
+    verdict lands on this rank's step."""
+    def vote(pending):
+        log.append(("vote", pending.tp_seq))
+        for rid in failed_elsewhere:
+            pending.node_batch.failed_requests.setdefault(rid, "failed on another rank")
+        pending.failed_on_a_rank = failed_on_a_rank or bool(failed_elsewhere)
+    return vote
+
+
+def _logged_builds(s, log):
+    build = s._try_follow_speculation
+
+    def _try(pending):
+        log.append(("build",))
+        return build(pending)
+    s._try_follow_speculation = _try
+
+
+def test_await_votes_once_N_is_done_before_the_head_can_be_built():
+    """The vote waits for every rank to finish N and for nothing else: a head
+    whose fresh rid has not landed here yet must not hold the leader in it."""
+    s = _stub()
+    log = []
+    s.vote = _vote(log)
+    _logged_builds(s, log)
+    spec = object()
+    s.build_results = [None, None, spec]
+    s.scheduler.register_tp_follow(_head(["r0", "f1"], seq=5, from_seq=4))
+    out = _output()
+    assert _await(s, _pending(4, _future(s, out))) == (out, spec)
+    assert log == [("vote", 4), ("build",), ("build",), ("build",)]
+
+
+def test_await_leaves_the_vote_to_the_caller_while_N_runs():
+    """A head built during N returns before N is done; the run loop votes once
+    it has N's outputs."""
+    s = _stub()
+    log = []
+    s.vote = _vote(log)
+    spec = object()
+    s.build_results = [spec]
+    s.communicator.deliveries = {1: [_head(["r0"], seq=5, from_seq=4)]}
+    assert _await(s, _pending(4, _future(s, _output(), done_after=10))) == (None, spec)
+    assert log == []
+
+
+def test_await_drops_a_head_the_agreed_verdict_voids_though_this_rank_ran_N_clean():
+    """Another rank failed r0 after the forward. Rank 0 clears its speculation
+    on the agreed verdict, so this rank must not run the head either."""
+    s = _stub()
+    log = []
+    s.vote = _vote(log, "r0")
+    s.build_results = [object()]
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    out = _output()
+    pending = _pending(4, _future(s, out))
+    assert _await(s, pending) == (out, None)
+    assert s.scheduler.peek_tp_follow() is None
+    assert s.build_results, "head must be dropped, not built"
+    assert pending.node_batch.failed_requests == {"r0": "failed on another rank"}
+
+
+def test_await_drops_a_head_another_rank_voided_on_a_row_only_it_held():
+    """Rank 0 failed a row before it sent N (its input was gone) and clears its
+    speculation on that; the row was never in this rank's N."""
+    s = _stub()
+    log = []
+    s.vote = _vote(log, failed_on_a_rank=True)
+    s.build_results = [object()]
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    out = _output()
+    pending = _pending(4, _future(s, out))
+    assert _await(s, pending) == (out, None)
+    assert s.build_results, "head must be dropped, not built"
+    assert pending.node_batch.failed_requests == {}
