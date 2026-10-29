@@ -1245,6 +1245,23 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    are rejected with a 400 before scheduling instead of occupying the worker for minutes
    (an 8192² request means 262k tokens of quadratic attention).
 
+``linear_dtype``
+   ``bf16`` (the default) or ``fp8``. With ``fp8`` the transformer blocks' linears over the
+   image and joint token streams run as fp8 GEMMs: weights quantised once at load with one
+   scale per output channel, activations per token inside the compiled forward (fused into
+   the modulated norm), the product on hipBLASLt or cuBLASLt. The text-stream, modulation,
+   embedding and output projections, the text encoder and the VAE stay bf16. It needs a GPU
+   with fp8 GEMMs (MI300X/MI325X, MI355X, NVIDIA Hopper and newer); elsewhere the linears
+   stay bf16 with a warning. On one MI325X (three server launches per setting) klein-9B
+   serves 1.34 times the images per second at one request and 1.39 times at 16 (0.71 to
+   0.53 s per 1024² image), klein-4B 1.19 and 1.21 times. The images move by e4m3 rounding:
+   against the diffusers reference over the 40 ``image_v1`` images, klein-9B goes from a
+   median 26.6 to 23.1 dB PSNR and klein-4B from 23.9 to 22.6 dB. Both stay far closer to
+   the reference than another seed is (normalized distance median 0.09 and 0.10, where 0 is
+   a kernel change and 1 another seed), but klein-9B falls under the ROCm floor of 3 dB
+   below the reference's own kernel spread, so it stays opt-in, a quality trade to make
+   per deployment. The same knob exists for ``z_image_turbo`` and ``wan22``.
+
 With the klein defaults every served image is within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
 images of the other engines are 10 to 16 dB from the diffusers reference for the same
