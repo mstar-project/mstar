@@ -781,11 +781,13 @@ per-request, and safe under CUDA graphs.
 
 Both models' code predictors subclass ``DepthDecoder``
 (``mstar/model/components/depth_decoder.py``), which runs the group loop:
-``run_depth_loop(last_hidden, layer0_codes, group0_embedding, sample, kv_cache)`` with the
-code predictor's sampler as ``sample``. A new code predictor with the same layer anatomy
-gets the loop, its frame-local KV scratch (``depth_kv_cache``) and, on AMD GPUs, the fused
-depth kernels of ``mstar/platforms/depth_decoder_ops.py`` by subclassing it and keeping a
-per-position ``forward_depth_unrolled`` for the other platforms.
+``run_depth_loop(last_hidden, layer0_codes, group0_embedding, sample, max_batch_size)`` with
+the code predictor's sampler as ``sample``. A new code predictor with the same layer anatomy
+gets the loop, its frame-local KV scratch and, on AMD GPUs, the fused depth kernels of
+``mstar/platforms/depth_decoder_ops.py`` by subclassing it and keeping a per-position
+``forward_depth_unrolled`` for the other platforms. Call ``run_depth_loop`` straight from
+the forward, not through a helper method: a helper between a compiled forward and the loop
+gets compiled around the sampler and recompiles on every step, which fails graph capture.
 
 .. _Cross-attention (encoder-decoder models):
 
