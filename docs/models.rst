@@ -1905,6 +1905,10 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
      prompts (measured with the earlier compiled VAE decode), because a 4- or 8-step
      distilled sampler amplifies the last bit of inductor's own reductions and
      activation decompositions.
+   * On AMD GPUs the setting is not applied unless the deployment asks for it
+     (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`). hipBLASLt picks
+     GEMM kernels per M, so the eager norms do not make the output match the reference
+     there either, and the bar is the reference's own cross-seed spread.
 
 ``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
    The denoise step, Euler update included, is captured per listed ``[height, width]``

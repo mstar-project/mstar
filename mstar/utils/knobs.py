@@ -25,6 +25,7 @@ KNOBS: dict[str, str] = {
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
     "idle_hold": "MSTAR_IDLE_HOLD",
     "resident_planning": "MSTAR_RESIDENT_PLANNING",
+    "dit_exact_ops": "MSTAR_DIT_EXACT_OPS",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -261,3 +262,12 @@ def resident_planning() -> str:
     resident-capable, and says why at startup when one is not; ``off`` keeps
     the host plan everywhere."""
     return _resident_planning_value(_setting("resident_planning", "auto"))
+
+
+def dit_exact_ops() -> bool:
+    """``dit_exact_ops`` / ``MSTAR_DIT_EXACT_OPS`` (default on, off for AMD
+    GPUs): whether a compiled DiT transformer keeps the op classes its model
+    config lists under ``compile_exact_ops`` on the eager kernels. Off
+    compiles them with the rest, so inductor can fuse each norm with its
+    modulation and residual."""
+    return _setting("dit_exact_ops", "1") == "1"
