@@ -51,6 +51,7 @@ ROUTES = {
 # /v1/audio/transcriptions and /v1/realtime have no route there at all.
 NOT_PORTED = {
     ("ChatterboxAdapter", "speech"),
+    ("CosyVoice3Adapter", "speech"),
     ("FishS2ProAdapter", "speech"),
     ("KokoroAdapter", "speech"),
     ("OmniVoiceAdapter", "speech"),
