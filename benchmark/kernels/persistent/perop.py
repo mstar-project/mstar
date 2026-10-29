@@ -196,7 +196,8 @@ def depth_frame(w: dict[str, torch.Tensor], shape: DepthDecoderShape, rope: torc
         torch.matmul(x, w["lm_head_weight"][p - 1].t(), out=state.logits[p - 1])
         if forced is not None:
             state.tokens.copy_(forced[:, p])
+            tokens = state.tokens
         else:
-            state.tokens.copy_(sampler(state, state.logits[p - 1]))
-        _embed_accumulate_kernel[(bs,)](state.tokens, codebook[p - 1], state.residual, emb_sum, codes, p,
+            tokens = sampler(state, state.logits[p - 1])
+        _embed_accumulate_kernel[(bs,)](tokens, codebook[p - 1], state.residual, emb_sum, codes, p,
                                         s.positions, s.hidden, BLOCK=triton.next_power_of_2(s.hidden))
