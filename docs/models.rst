@@ -1527,7 +1527,11 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the reference than another seed is (normalized distance median 0.09 and 0.10, where 0 is
    a kernel change and 1 another seed), but klein-9B falls under the ROCm floor of 3 dB
    below the reference's own kernel spread, so it stays opt-in, a quality trade to make
-   per deployment. The same knob exists for ``z_image_turbo`` and ``wan22``.
+   per deployment. The same knob exists for ``z_image_turbo`` and ``wan22``, where the
+   longer samplers carry the error further: Wan2.2 (20 steps, CFG) serves 1.1 to 1.2 times
+   the clips per minute at 18 dB instead of 22 dB per frame from diffusers (still within
+   the cross-seed bar), and Z-Image-Turbo moves too far (two of 40 images half-way or more
+   to another seed), so ``fp8`` is not recommended there.
 
 With the klein defaults every served image is within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
