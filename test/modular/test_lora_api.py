@@ -274,12 +274,13 @@ _ENDPOINTS = (("/v1/load_lora_adapter", {"lora_name": "a", "lora_path": "/p"}),
 @pytest.mark.parametrize("error,status,message", [
     (None, 200, None),
     (ValueError("why"), 400, "why"),
+    (ValueError("bad /srv/x/adapter.safetensors"), 400, "bad adapter.safetensors"),
     (HTTPException(status_code=409, detail="why"), 409, "why"),
-    (RuntimeError("/srv/secret"), 500, "the LoRA adapter request failed (the server log has the details)"),
+    (RuntimeError("/srv/secret"), 500, "internal error (error id"),
 ])
 def test_the_lora_endpoints(monkeypatch, error, status, message):
-    """vLLM's bodies; a ValueError is a 400 with its message, anything else a 500 that
-    does not quote the exception."""
+    """vLLM's bodies; errors take every route's envelope: a ValueError is a 400 with
+    server paths cut to base names, anything else a 500 naming only an error id."""
     client, stub = _client(monkeypatch, LORA_CONFIG)
     stub.lora_admin = _Admin(error)
     for (path, body), verb in zip(_ENDPOINTS, ("added", "removed"), strict=True):
@@ -287,13 +288,13 @@ def test_the_lora_endpoints(monkeypatch, error, status, message):
         if error is None:
             assert r.status_code == 200 and r.text == f"Success: LoRA adapter 'a' {verb} successfully."
         else:
-            assert r.status_code == status and r.json()["error"] == {
-                "message": message, "code": status,
-                "type": "invalid_request_error" if status < 500 else "server_error",
-            }
-    # a missing field is FastAPI's 422 and never reaches the admin
-    assert client.post("/v1/load_lora_adapter", json={"lora_name": "b"}).status_code == 422
-    assert client.post("/v1/unload_lora_adapter", json={}).status_code == 422
+            got = r.json()["error"]
+            assert r.status_code == status and got["code"] == status
+            assert got["type"] == ("invalid_request_error" if status < 500 else "server_error")
+            assert got["message"].startswith(message) and "/srv" not in got["message"]
+    # a missing field never reaches the admin
+    client.post("/v1/load_lora_adapter", json={"lora_name": "b"})
+    client.post("/v1/unload_lora_adapter", json={})
     assert stub.lora_admin.calls == [("load", "a", "/p"), ("unload", "a")]
 
 
