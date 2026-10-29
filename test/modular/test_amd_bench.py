@@ -232,6 +232,30 @@ def test_launch_commands_and_env(tmp_path, monkeypatch):
         gpu_list("1,1")
 
 
+def test_cell_config_overrides_the_mstar_arms_only(tmp_path, monkeypatch):
+    wt = tmp_path / "wt"
+    (wt / "configs").mkdir(parents=True)
+    for name in ("qwen3_5_9b", "qwen3_5_9b_mtp2"):
+        (wt / "configs" / f"{name}.yaml").write_text(f"model: {name}\n")
+    outside = tmp_path / "bf16state.yaml"
+    outside.write_text("model: qwen3_5_9b\n")
+    row = catalog.ROWS["qwen3_5_9b"]
+
+    def served(arm):
+        cmd = Launch(catalog.ARMS[arm], row, [2], 8400, tmp_path / arm, worktree=wt).command()
+        return cmd[cmd.index("--config") + 1] if "--config" in cmd else None
+
+    assert served("mstar") == str(wt / "configs" / "qwen3_5_9b.yaml")
+    monkeypatch.setenv("AMD_BENCH_MSTAR_CONFIG", "qwen3_5_9b_mtp2")
+    assert served("mstar") == str(wt / "configs" / "qwen3_5_9b_mtp2.yaml")
+    assert served("vllm-aiter") is None
+    monkeypatch.setenv("AMD_BENCH_MSTAR_CONFIG", str(outside))
+    assert served("mstar") == str(outside)
+    monkeypatch.setenv("AMD_BENCH_MSTAR_CONFIG", "qwen3_5_9b_mtp3")
+    with pytest.raises(FileNotFoundError):
+        served("mstar")
+
+
 def test_sglang_omni_launch(tmp_path):
     from benchmark.amd.launch import backends_in_log
 
