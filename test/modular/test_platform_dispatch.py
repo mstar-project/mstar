@@ -138,6 +138,71 @@ def test_reset_resolves_again(on_platform):
     assert (cuda.calls, rocm.calls) == (1, 1)
 
 
+class _OnArch(RocmPlatform):
+    """A ROCm process whose GPU is ``arch``; counts the times it is asked."""
+
+    def __init__(self, arch: str):
+        self._arch = arch
+        self.asked = 0
+
+    def arch(self, device=None) -> str:
+        self.asked += 1
+        return self._arch
+
+
+@pytest.mark.parametrize(("arch", "expected"), [("gfx950", "rocm:gfx950"), ("gfx942", "rocm")])
+def test_an_arch_factory_wins_on_its_arch_only(on_platform, arch, expected):
+    on_platform(_OnArch(arch))
+    factories = {"rocm": _Counting("rocm"), "rocm:gfx950": _Counting("rocm:gfx950")}
+    dispatch = PlatformDispatch(
+        "mstar::example", rocm=factories["rocm"], archs={"rocm:gfx950": factories["rocm:gfx950"]},
+    )
+    assert dispatch.selected_key() == expected
+    assert dispatch()[0] == expected
+    assert {key: f.calls for key, f in factories.items()} == {key: int(key == expected) for key in factories}
+
+
+def test_the_arch_is_asked_only_where_the_platform_has_arch_factories(on_platform):
+    platform = on_platform(_OnArch("gfx942"))
+    dispatch = PlatformDispatch("mstar::example", rocm=_Counting("rocm"), archs={"cuda:sm_100": _Counting("sm_100")})
+    assert dispatch()[0] == "rocm"
+    assert platform.asked == 0
+
+
+def test_an_arch_factory_without_a_platform_factory_falls_to_default(on_platform):
+    on_platform(_OnArch("gfx942"))
+    dispatch = PlatformDispatch(
+        "mstar::example", default=_Counting("default"), archs={"rocm:gfx950": _Counting("rocm:gfx950")},
+    )
+    assert dispatch.selected_key() == "default"
+    assert dispatch()[0] == "default"
+
+
+@pytest.mark.parametrize("key", ["gfx950", "rocm", "tpu:v5", "rocm:"])
+def test_a_malformed_arch_key_is_refused(key):
+    with pytest.raises(ValueError, match="'<platform>:<arch>'"):
+        PlatformDispatch("mstar::example", archs={key: _Counting(key)})
+
+
+def test_selecting_runs_no_factory_and_resolve_runs_it_once(on_platform):
+    on_platform(CudaPlatform())
+    cuda = _Counting("cuda")
+    dispatch = _dispatch(cuda=cuda)
+    assert dispatch.selected_key() == "cuda" and cuda.calls == 0
+    impl = dispatch.resolve()
+    assert dispatch.resolve() is impl and cuda.calls == 1
+    assert _dispatch().selected_key() is None
+
+
+def test_reset_all_resets_every_instance(on_platform):
+    on_platform(CudaPlatform())
+    dispatches = [_dispatch(cuda=_Counting("cuda"), rocm=_Counting("rocm")) for _ in range(2)]
+    assert [d()[0] for d in dispatches] == ["cuda", "cuda"]
+    on_platform(RocmPlatform())
+    PlatformDispatch.reset_all()
+    assert [d()[0] for d in dispatches] == ["rocm", "rocm"]
+
+
 # --- with_inductor_overrides ------------------------------------------------
 
 
