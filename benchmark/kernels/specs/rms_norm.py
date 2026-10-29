@@ -80,12 +80,18 @@ def _hip(knobs):
     return rms_norm
 
 
+@functools.cache
+def _library_stats(library: str, arch: str) -> dict:
+    # one library holds every variant: unbundle it once
+    return isa.hip_library_stats(library, arch)
+
+
 def _hip_isa(fn, args) -> dict:
     from mstar.platforms import current_platform
 
     if not current_platform.is_rocm():
         return {"error": "code-object statistics are read on ROCm only"}
-    stats = isa.hip_library_stats(_hip_extension().library_path(), current_platform.arch())
+    stats = _library_stats(str(_hip_extension().library_path()), current_platform.arch())
     if "kernels" not in stats:
         return stats
     # the mangled name carries the instantiation: rms_norm_kernel<T, THREADS, VEC>
