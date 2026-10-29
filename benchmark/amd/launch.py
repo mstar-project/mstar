@@ -169,14 +169,26 @@ def smi_index_map() -> dict[int, int]:
     if not entries or any(not isinstance(e.get("node_id"), int) for e in entries):
         return {}
     order = [e["gpu"] for e in sorted(entries, key=lambda e: e["node_id"])]
-    rocr = os.environ.get("ROCR_VISIBLE_DEVICES", "")
-    if re.fullmatch(r"\d+(,\d+)*", rocr) and all(int(i) < len(order) for i in rocr.split(",")):
-        order = [order[int(i)] for i in rocr.split(",")]
+    rocr = _rocr_indices()
+    if rocr and all(i < len(order) for i in rocr):
+        order = [order[i] for i in rocr]
     return dict(enumerate(order))
+
+
+def _rocr_indices() -> list[int]:
+    rocr = os.environ.get("ROCR_VISIBLE_DEVICES", "")
+    return [int(i) for i in rocr.split(",")] if re.fullmatch(r"\d+(,\d+)*", rocr) else []
 
 
 def smi_gpu(hip: int) -> int:
     return smi_index_map().get(hip, hip)
+
+
+def node_gpu(hip: int) -> int:
+    """The node-wide index of a HIP device (see smi_index_map), so that jobs sharing a node lock the same name for
+    the same GPU."""
+    rocr = _rocr_indices()
+    return rocr[hip] if hip < len(rocr) else hip
 
 
 def gpu_occupancy(gpus: list[int]) -> dict[int, dict]:
@@ -334,7 +346,7 @@ class Launch:
 
     # --- guards ------------------------------------------------------------------------------
     def _lock_path(self, gpu: int) -> Path:
-        return LOCK_DIR / f"gpu{gpu}"
+        return LOCK_DIR / f"gpu{node_gpu(gpu)}"
 
     def _lock_paths(self) -> list[Path]:
         return [self._lock_path(g) for g in self.gpus] + [LOCK_DIR / f"port{self.port}"]
