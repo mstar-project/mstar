@@ -333,6 +333,19 @@ class PythonGraphRuntime(GraphRuntime):
             if walk in self._all_wg_ids_to_graph_walks[wg_id]
         ]
 
+    def is_partition_idle(self, rid: int, partition: str) -> bool:
+        request_info = self._request_info.get(rid)
+        if request_info is None:
+            return False
+        part_info = request_info.partition_info.get(partition)
+        if part_info is None:
+            return False
+        for wg_id in part_info.graph_walk_worker_graph_ids:
+            wgio = self._queues[wg_id].per_request_queues.get(rid)
+            if wgio is not None and not wgio.is_idle():
+                return False
+        return True
+
     def set_in_flight(
         self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
@@ -1543,10 +1556,12 @@ class PythonGraphRuntime(GraphRuntime):
 
             if routing.completed_worker_graph_ids and info is not None:
                 part = info.partition_info.get(partition)
+                # The rid's own walk: a mixed step's combined label is no
+                # walk of the graph's, nor one the conductor can follow.
+                rid_walk = completion.rid_walk.get(rid, completion.graph_walk)
                 node = self._queues[
                     self.get_worker_graph_id_for_node(
-                        completion.node_name,
-                        completion.rid_walk.get(rid, completion.graph_walk),
+                        completion.node_name, rid_walk,
                     )
                 ].per_request_queues.get(rid)
                 speculative = node is not None and node.get_node(
@@ -1554,6 +1569,7 @@ class PythonGraphRuntime(GraphRuntime):
                 )._in_flight
                 self._send_worker_graphs_done(
                     rid, routing, info, fwd_info, partition,
+                    graph_walk=rid_walk,
                     resource_publish_info=publications.get(rid, {}),
                     stream_tokens_consumed=consumed.get(rid, {}),
                     # A speculatively-scheduled node has not really finished
@@ -1590,6 +1606,7 @@ class PythonGraphRuntime(GraphRuntime):
         info: GraphRuntimeRequestInfo,
         fwd_info: CurrentForwardPassInfo | None,
         partition: str,
+        graph_walk: str,
         resource_publish_info: dict[str, PublishedInfo],
         stream_tokens_consumed: dict[str, int],
         partition_done: bool,
@@ -1633,6 +1650,7 @@ class PythonGraphRuntime(GraphRuntime):
                 resource_publish_info=resource_publish_info,
                 partition_name=partition,
                 partition_done=partition_done,
+                graph_walk=graph_walk,
                 stream_tokens_consumed=stream_tokens_consumed,
                 stream_items_sent=stream_items_sent,
                 graph_timings=graph_timings,

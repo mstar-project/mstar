@@ -588,7 +588,9 @@ class LLMSubmodule(ARNodeSubmodule):
         # one per request.
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
-            check_stop_buffers={"new_token": new_tokens},
+            # The prefix cache keys a reply from this host copy, under `text_inputs`, the tensor the
+            # label's `PrefixKeys` names.
+            check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
         )
 
     # ------------------------------------------------------------------

@@ -61,6 +61,10 @@ class CurrentForwardPassInfo:
     # a per-stream dataclass if more per-request stream settings appear.
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
+    # producer-triggered consumer partition -> the walk this pass's streamed
+    # items run under; set by the producer worker as the pass emits
+    stream_consumer_walks: dict[str, str] = field(default_factory=dict)
+
     def update_publish_info(self, other: dict[str, PublishedInfo]):
         merge_publish_info(self.resource_publish_info, other)
 

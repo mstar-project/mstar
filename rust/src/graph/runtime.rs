@@ -307,7 +307,7 @@ pub struct GraphRuntime {
             return Ok(());
         }
         let comm = comm.clone();
-        py.allow_threads(move || -> Result<(), crate::communicator::CommError> {
+        py.detach(move || -> Result<(), crate::communicator::CommError> {
             for (peer, bytes) in &rest {
                 comm.send(peer, bytes)?;
             }
@@ -326,6 +326,7 @@ pub struct GraphRuntime {
         worker_graph_ids: &[u32],
         is_first_tp_rank: bool,
         partition_name: &str,
+        graph_walk: &str,
         stream_tokens_consumed: &[(String, i64)],
         publication_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
@@ -360,6 +361,7 @@ pub struct GraphRuntime {
             output_signal_names: output_signals,
             partition_name,
             partition_done,
+            graph_walk,
             stream_tokens_consumed,
             stream_items_sent: stream_items,
             resource_publish_info: frames::spliced_value(publication_encoded),
@@ -1162,8 +1164,9 @@ pub struct SendPlan {
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
     /// (rid, signal, modality, value): emitted inline, one frame per step.
     pub emit_inline: Vec<(u32, String, String, i64)>,
-    /// (rid, finished worker graph ids, is_first_tp_rank)
-    #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool)>,
+    /// (rid, finished worker graph ids, is_first_tp_rank, the walk the rid
+    /// ran -- its own, not a mixed step's combined label)
+    #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool, Option<Sym>)>,
     /// The pre-completion loop context, snapshotted at route time.
     pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
 }
@@ -1796,6 +1799,18 @@ impl GraphRuntime {
             return false;
         };
         info.set_walk(p, walk_sym, || live)
+    }
+
+    /// Python's `is_partition_idle`: whether the walk can change without
+    /// stranding state in the current walk's worker graphs.
+    fn is_partition_idle(&self, rid: u32, partition: &str) -> bool {
+        let Some(p) = self.interner.get(partition) else { return false };
+        let Some(part) = self.info(rid).and_then(|i| i.partitions.get(&p)) else {
+            return false;
+        };
+        part.walk_worker_graphs
+            .iter()
+            .all(|&wg| self.state(wg, rid).is_none_or(|s| s.is_idle()))
     }
 
     fn mark_partition_done(&mut self, rid: u32, partition: &str) {
@@ -3430,9 +3445,12 @@ impl GraphRuntime {
                 }
             }
 
-            for (rid, wg_ids, is_first_tp_rank) in plan.completed {
+            for (rid, wg_ids, is_first_tp_rank, walk) in plan.completed {
+                let graph_walk = walk
+                    .map(|w| self.interner.name(w).to_string())
+                    .unwrap_or_default();
                 let bytes = self.worker_graphs_done_frame(
-                    rid, &wg_ids, is_first_tp_rank, &partition,
+                    rid, &wg_ids, is_first_tp_rank, &partition, &graph_walk,
                     consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
                     publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
@@ -3632,6 +3650,7 @@ impl GraphRuntime {
                     rid,
                     wgs.clone(),
                     c.first_tp_rank.get(&rid).copied().unwrap_or(true),
+                    walk,
                 ));
             }
         }
