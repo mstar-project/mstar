@@ -256,6 +256,14 @@ There are two ``ResourceReqConfig`` subclasses:
 
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
+
+  A walk can also capture a second sampler for batches that filter nothing (greedy
+  rows, or temperature alone: no top-k, top-p, min-p, penalty or history). Wrap the
+  configs in ``with_unfiltered_sampling(configs, walks=("decode",))``, answer
+  ``cg_key_info`` for the walk from ``SamplerResource.unfiltered_key(walk, rids)``, and
+  put the leased bucket's key on the step. Such batches replay a graph whose draw is one
+  read of the logits (``mstar::sample_unfiltered``, Gumbel-max); mixed ones replay the
+  ordinary capture. AMD GPUs only so far; Qwen3.5's decode is the example.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
