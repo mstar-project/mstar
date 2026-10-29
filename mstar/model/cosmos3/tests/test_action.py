@@ -191,7 +191,7 @@ def test_action_denoise_step_matches_fused() -> None:
         )
         with torch.no_grad():
             dv, da = model.denoise_step(
-                latents, vts, s["position_ids"][:, und_len:],
+                latents, vts, model._rotary(s["gen_position_ids"], latents.device, latents.dtype),
                 s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
                 s["vision_mse_loss_indexes"] - und_len, "main", cache.attn,
                 action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
@@ -235,7 +235,7 @@ def test_action_batched_one_matches_single() -> None:
         cache.plan("main", [("main", n_gen)], causal=False)
         with torch.no_grad():
             dv, da = model.denoise_step(
-                latents, vts, s["position_ids"][:, und_len:],
+                latents, vts, model._rotary(s["gen_position_ids"], latents.device, latents.dtype),
                 s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
                 s["vision_mse_loss_indexes"] - und_len, "main", cache.attn,
                 action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
@@ -253,7 +253,7 @@ def test_action_batched_one_matches_single() -> None:
         req = {
             "latents": latents, "action_latents": action_lat,
             "vision_timesteps": vts, "action_timesteps": ats,
-            "position_ids_cond": s["position_ids"][:, und_len:],
+            "rotary_cond": model._rotary(s["gen_position_ids"], latents.device, latents.dtype),
             "vision_token_shapes": s["vision_token_shapes"],
             "vision_noisy_frame_indexes": s["vision_noisy_frame_indexes"],
             "vision_mse_loss_indexes": s["vision_mse_loss_indexes"] - und_len,

@@ -338,6 +338,9 @@ class RustGraphRuntime(GraphRuntime):
     def set_walk(self, rid: int, partition: str, walk: str):
         self._rust.set_walk(rid, partition, walk)
 
+    def is_partition_idle(self, rid: int, partition: str) -> bool:
+        return self._rust.is_partition_idle(rid, partition)
+
     def set_in_flight(
         self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
@@ -719,6 +722,7 @@ class RustGraphRuntime(GraphRuntime):
                     for value in input.resource_publish_info.values
                 ]
             ),
+            skip_rids=list(input.failed_rids),
         )
         if PHASE_PERIOD:
             _t1 = _time.perf_counter()

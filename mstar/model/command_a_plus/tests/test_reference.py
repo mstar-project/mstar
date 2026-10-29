@@ -154,7 +154,7 @@ class ReferenceTests(unittest.TestCase):
         )) for key, spec in specs.items()}
         runner = StepRunner(resources)
         self.addCleanup(lambda: [resource.cleanup() for resource in resources.values()])
-        node = CommandAPlusLLMSubmodule(actual, actual.config).eval()
+        node = CommandAPlusLLMSubmodule(actual, actual.config, raw["image_token_id"]).eval()
         node.bind_node_resources(resources)
         observed, handles = observe(actual)
         expected, ref_handles = observe(reference)

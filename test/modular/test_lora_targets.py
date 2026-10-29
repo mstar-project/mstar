@@ -479,7 +479,13 @@ REFUSED = {
     "forward_hooks": (lambda: _with(nn.Linear(HIDDEN, HIDDEN), lambda m: m.register_forward_hook(lambda *a: None)),
                       "forward hooks"),
     "depthwise_conv": (lambda: nn.Conv1d(HIDDEN, HIDDEN, 3, groups=HIDDEN), "groups 8"),
+    # a plain linear its parent declares it runs itself (``_ReadsBad``)
+    "read_outside_forward": (lambda: nn.Linear(HIDDEN, HIDDEN), "never its own forward"),
 }
+
+
+class _ReadsBad(nn.Module):  # reads ``bad``'s weight itself (folded at load, or F.linear over it)
+    lora_unservable = {"bad": "run through its weight, never its own forward"}
 
 
 @pytest.mark.parametrize("name", sorted(REFUSED))
@@ -487,7 +493,7 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
     make, reason = REFUSED[name]
     with torch.device("meta"):
         root = nn.Module()
-        root.layers = nn.ModuleList([nn.Module()])
+        root.layers = nn.ModuleList([_ReadsBad() if name == "read_outside_forward" else nn.Module()])
         root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
         root.layers[0].bad = make()
     spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")

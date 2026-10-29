@@ -232,7 +232,10 @@ def module_lora_spec(
       every call is in the step, or list the embedding in ``deferred``.
 
     Linear-like modules that cannot take a delta (a depthwise conv, MoE experts) are
-    recorded with the reason, which an adapter touching them is refused with.
+    recorded with the reason, which an adapter touching them is refused with, and so are
+    the children a module declares in ``lora_unservable`` (child name -> reason): ones it
+    runs through their weights itself, never through their forward (folded at load, an
+    ``F.linear`` over the weight).
     """
     own_rules = getattr(root, "checkpoint_rules", None)
     if rules is None:
@@ -247,6 +250,9 @@ def module_lora_spec(
     groups: dict[tuple[str | None, str], list[_Found]] = defaultdict(list)
     unservable: dict[str, str] = {}
     for path, module in root.named_modules():
+        # children the module runs through their weights itself (pre-order: before them)
+        prefix = f"{path}." if path else ""
+        excluded.update({prefix + c: r for c, r in getattr(module, "lora_unservable", {}).items()})
         if not path:
             continue
         capability = lora_capability(module)

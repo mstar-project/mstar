@@ -17,6 +17,7 @@ from mstar.engine.accelerator_graph_backend import (
     CapturedGraph,
 )
 from mstar.engine.accelerator_graph_config import (
+    DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
     PiecewiseAcceleratorGraphConfig,
@@ -77,6 +78,27 @@ def compile_level() -> int:
     return level
 
 
+@cache
+def _has_deterministic_mode() -> bool:
+    import torch._inductor.config as inductor_config
+
+    if hasattr(inductor_config, "deterministic"):
+        return True
+    logger.warning(
+        "torch %s has no Inductor deterministic mode; compiles that ask for it time "
+        "their kernels instead, so their output can differ between server processes",
+        torch.__version__,
+    )
+    return False
+
+
+def deterministic_inductor_options() -> dict[str, Any]:
+    """Inductor options for its deterministic mode (see
+    ``DETERMINISTIC_COMPILE_MODE``), for a compile that sets its own options;
+    empty, with a warning, on a torch without the mode."""
+    return {"deterministic": True} if _has_deterministic_mode() else {}
+
+
 def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
     """``torch.compile``'s arguments for a capture config whose ``compile_mode``
     is ``config_mode``, which the config checked when it was built. None takes
@@ -84,6 +106,9 @@ def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
     if config_mode is None:
         return {**kwargs, **COMPILE_LEVELS[compile_level()]}
+    if config_mode == DETERMINISTIC_COMPILE_MODE:
+        options = deterministic_inductor_options()
+        return {**kwargs, "options": options} if options else kwargs
     # "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning
     if config_mode != "default":
         kwargs["mode"] = config_mode

@@ -401,7 +401,8 @@ class Qwen3TTSModel(Model):
         self.cache_dir = cache_dir
         # Server-init knob (deployment YAML ``model_kwargs``): the speech
         # codec decoder's dtype. float32 reproduces the reference decoder
-        # bit for bit; bfloat16 roughly halves the codec's GPU time.
+        # bit for bit. bfloat16 is not faster on B300: cuDNN's heuristics run
+        # several of its convs on a kernel without tensor cores.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
         # Server-init knob: opt-in AudioSeal watermark on the codec's output
         # (``mstar.model.audio_watermark``). Checked here so a missing package
