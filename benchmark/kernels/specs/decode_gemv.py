@@ -41,16 +41,15 @@ SKINNY_MAX_ROWS = 4
 # Weight elements one thread loads per step along K stay between one 16-byte
 # vector and 64: fewer leaves loads too short to stream, more spills. Pipeline
 # stages only change the matrix-core loop; the FMA one carries its next tile's
-# loads itself with ``prefetch``. Split-K is left out: its arrival counter's
-# release makes each program write back its XCD's L2, which on MI325X cost
-# 25-30x the whole kernel at every point tried.
+# loads itself with ``prefetch``. Split-K costs a second kernel, so it pays
+# only where a narrow weight leaves CUs idle.
 FMA_SPACE = {
     "block_n": (2, 4, 8, 16, 32), "block_k": (256, 512, 1024, 2048, 4096), "num_warps": (1, 2, 4, 8),
-    "prefetch": (False, True), "xcd_remap": (False, True), "waves_per_eu": (0, 2),
+    "split_k": (1, 2, 4), "prefetch": (False, True), "xcd_remap": (False, True), "waves_per_eu": (0, 2),
 }
 DOT_SPACE = {
     "block_n": (16, 32, 64), "block_k": (64, 128, 256, 512), "num_warps": (2, 4, 8),
-    "xcd_remap": (False, True), "waves_per_eu": (0, 2), "num_stages": (1, 2),
+    "split_k": (1, 2, 4, 8), "xcd_remap": (False, True), "waves_per_eu": (0, 2), "num_stages": (1, 2),
 }
 
 
