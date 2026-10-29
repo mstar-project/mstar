@@ -12,8 +12,8 @@ With --ktrace-ms, each measured window is followed by a second client run of the
 measured: partway through it the worker's torch.profiler (benchmark/kernels/trace/proftrigger) records that
 many ms, and benchmark.kernels.trace.ktrace cuts the trace into steps (ktrace-c<N>/ktrace.txt). The tracer
 slows the host, which is why it stays out of the phase windows. --correctness sends the sweep's greedy text
-pass (benchmark.amd.correctness.text_pass) right after the server starts and scores it once the server is
-down (correctness/summary.json).
+pass (benchmark.amd.correctness.text_pass, one request at a time) right after the server starts and scores it
+once the server is down (correctness/summary.json).
 """
 
 from __future__ import annotations
@@ -102,7 +102,8 @@ def main(argv=None) -> int:
     plan = SimpleNamespace(correctness_src=correctness.prepare_source(out, None), worktree=launch.worktree)
     with long_prompt.phase_server(launch, out, args.period) as startup_s:
         if args.correctness:
-            res = correctness.text_pass(plan, row, arm, args.port, out / "correctness")
+            # one request at a time, so arms that should agree token for token can be compared
+            res = correctness.text_pass(plan, row, arm, args.port, out / "correctness", concurrency=1)
             print(f"correctness pass: {res}", flush=True)
             time.sleep(GAP_S)
         for c in conc:
