@@ -131,7 +131,6 @@ class Gr00tN17Model(Model):
         accelerator_graph: bool = False,
         capture_shapes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
-        **kwargs,
     ):
         self.model_path_hf = model_path_hf
         # `[text_rows, image_rows]` per denoise-step bucket to capture: the spans are
@@ -148,7 +147,6 @@ class Gr00tN17Model(Model):
         self.backbone_path_hf = backbone_path_hf or self.config_backbone_default
         self.cache_dir = cache_dir
         self._repo_dir: Path | None = None
-        self._yaml_config_overrides: dict = dict(kwargs)
         self.config: Gr00tN17Config = Gr00tN17Config.from_hf(
             self._model_dir(), self._backbone_config(),
         )
