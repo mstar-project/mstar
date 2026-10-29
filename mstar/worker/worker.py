@@ -4733,6 +4733,16 @@ class Worker:
             # without the fairness exclusion — it should be free to pick
             # up the batch ``_handle_admit_failure`` just pushed back.
             if speculation is None and not admit_refused:
+                if not must_yield_away and fair.peek and consecutive < 1:
+                    # The chain could not continue, so there is no chain to
+                    # keep going: other ready work goes first, as it would
+                    # after the chain's next step. A prompt-only chunk step is
+                    # one (its rows mid-prefill are not speculated), and
+                    # without this the step after it starts another prompt's
+                    # chunk while decode rows wait out both.
+                    must_yield_away = self.scheduler.has_ready_excluding(
+                        self.request_state, chain_key,
+                    )
                 yield_away_from_target = chain_key if must_yield_away else None
                 with self._span("worker.schedule_yield_away"):
                     batch = self.scheduler.get_next_batch(

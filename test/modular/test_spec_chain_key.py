@@ -17,19 +17,20 @@ class _Span:
         return False
 
 
-def _worker(target):
+def _worker(target, other_ready=True, speculation=None):
     peeked, excluded = [], []
     fake = SimpleNamespace(
         _can_speculate=lambda batch: True,
         _choose_spec_target=lambda batch: target,
-        _try_speculate_next=lambda pending, target: None,
+        _try_speculate_next=lambda pending, target: speculation,
+        maybe_send_zmq_to_tp_followers=lambda node_batch, **kw: -1,
         _tp_lead_needs_marker=lambda pending, speculation: False,
         _span=lambda name: _Span(),
         enable_nvtx=False,
         _phase_period=0,
         request_state=None,
         scheduler=SimpleNamespace(
-            has_ready_excluding=lambda state, key: peeked.append(key) or True,
+            has_ready_excluding=lambda state, key: peeked.append(key) or other_ready,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),
         ),
     )
@@ -40,7 +41,7 @@ def _worker(target):
 def _pending():
     return SimpleNamespace(
         batch=object(), node_name="LLM", graph_walk="mixed",
-        node_batch=SimpleNamespace(admit_error=None),
+        node_batch=SimpleNamespace(admit_error=None), tp_seq=-1,
     )
 
 
@@ -60,3 +61,41 @@ def test_with_no_target_the_chain_keys_on_the_step():
     worker._build_speculation(_pending(), 1, _SpecFairness(peek=True, max_consecutive=8))
 
     assert peeked == [("LLM", "mixed")]
+
+
+_PROMPT = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="prefill"), [0])
+
+
+def test_a_chains_first_step_that_cannot_continue_yields_to_ready_work():
+    """A prompt-only chunk step is never speculated; the step after it goes to
+    the decode rows waiting, not to another prompt's chunk."""
+    worker, peeked, excluded = _worker(_PROMPT)
+
+    _, yielded_from = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert peeked == [("LLM", "prefill")]
+    assert yielded_from == ("LLM", "prefill") and excluded == [("LLM", "prefill")]
+
+
+def test_a_chains_first_step_that_cannot_continue_keeps_the_worker_busy_alone():
+    worker, _, excluded = _worker(_PROMPT, other_ready=False)
+
+    _, yielded_from = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert yielded_from is None and excluded == [None]
+
+
+def test_a_chains_first_step_that_continues_does_not_peek():
+    worker, peeked, excluded = _worker(_PROMPT, speculation=SimpleNamespace(node_batch=None, tp_seq=-1))
+
+    speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert speculation is not None and not peeked and not excluded
+
+
+def test_without_the_peek_a_step_that_cannot_continue_does_not_yield():
+    worker, peeked, excluded = _worker(_PROMPT)
+
+    worker._build_speculation(_pending(), 0, _SpecFairness(peek=False, max_consecutive=8))
+
+    assert not peeked and excluded == [None]
