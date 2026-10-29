@@ -26,6 +26,7 @@ The float64 evaluation interprets the same ``StepProgram`` the kernel runs
 from __future__ import annotations
 
 import argparse
+import collections
 import functools
 import json
 import math
@@ -161,11 +162,11 @@ class Kernel:
         self.scratch = ds.DepthStepScratch.allocate(program.shape, bs, groups, program.ss_slots, device)
         self.top_k, self.top_p, self.temperature = top_k, top_p, temperature
 
-    def run(self, last_hidden, embed0, emb_sum, codes, *, seed=0, forced=None, stop_after=-1):
+    def run(self, last_hidden, embed0, emb_sum, codes, *, seed=0, forced=None, stop_after=-1, trace=None):
         ds.launch(self.table, self.rope, last_hidden, embed0, self.codebook, emb_sum, codes, self.scratch,
                   groups=self.groups, scope=self.scope, grid=self.grid, shape=self.program.shape, top_k=self.top_k,
                   top_p=self.top_p, temperature=self.temperature, seed=seed, forced=forced, stop_after=stop_after,
-                  sync_mode=self.sync_mode)
+                  sync_mode=self.sync_mode, trace=trace)
 
     def ctl(self) -> list[int]:
         return [int(v) for v in self.scratch.ctl.tolist()]
@@ -276,6 +277,34 @@ def time_graph(fn, replays: int = 30, warmup: int = 3, before=None) -> dict[str,
         times.append(a.elapsed_time(b))
     return {"ms": statistics.median(times), "ms_min": min(times), "ms_max": max(times), "replays": replays,
             "graph": graph}
+
+
+def phase_trace(kernel: Kernel, last_hidden, embed0, emb_sum, codes, runs: int = 5) -> dict[str, Any]:
+    """Where a frame's time goes, from group 0's first workgroup: per op kind, the time from the previous
+    barrier's exit to this one's arrival (work) and from arrival to exit (waiting for the group), in us per
+    frame summed over the kind's phases; medians over ``runs`` launches after one warm-up."""
+    program = kernel.program
+    n = len(program.ops)
+    khz = ds.wall_clock_khz()
+    trace = torch.zeros(2 * n, dtype=torch.int64, device=last_hidden.device)
+    per_run = []
+    for i in range(runs + 1):
+        kernel.run(last_hidden, embed0, emb_sum, codes, seed=11 + i, trace=trace)
+        torch.cuda.synchronize()
+        if i == 0:
+            continue
+        t = trace.view(n, 2).double().cpu() / (khz / 1e3)  # us
+        work, wait = {}, {}
+        for ph, op in enumerate(program.ops):
+            start = t[ph - 1, 1] if ph else t[0, 0]
+            work[op.kind.name] = work.get(op.kind.name, 0.0) + float(t[ph, 0] - start)
+            wait[op.kind.name] = wait.get(op.kind.name, 0.0) + float(t[ph, 1] - t[ph, 0])
+        per_run.append((work, wait, float(t[n - 1, 1] - t[0, 0])))
+    kinds = list(per_run[0][0])
+    return {"wall_clock_khz": khz, "frame_us": statistics.median(r[2] for r in per_run),
+            "work_us": {k: statistics.median(r[0][k] for r in per_run) for k in kinds},
+            "wait_us": {k: statistics.median(r[1][k] for r in per_run) for k in kinds},
+            "phases": dict(collections.Counter(op.kind.name for op in program.ops)), "ctl": kernel.ctl()}
 
 
 def topk_topp_probs(logits: torch.Tensor, top_k: int, top_p: float, temperature: float) -> torch.Tensor:
@@ -445,6 +474,10 @@ def run(args) -> dict[str, Any]:
         grid = ds.default_grid(cus, groups, per_cu)
         name = f"kernel_g{groups}_{'xcd' if scope else 'agent'}_grid{grid}"
         kk = Kernel(program, w, codebook, bs, groups, scope, grid, device, top_k, top_p, temperature)
+        try:
+            timings[f"{name}_trace"] = phase_trace(kk, last_hidden, embed0, emb_sum_t, codes_t)
+        except Exception as exc:  # noqa: BLE001  recorded
+            timings[f"{name}_trace"] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
         for mode, fc in (("sampled", None), ("forced", forced)):
             try:
                 t = time_graph(lambda kk=kk, fc=fc: kk.run(last_hidden, embed0, emb_sum_t, codes_t, seed=7,

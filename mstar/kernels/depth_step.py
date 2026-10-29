@@ -74,12 +74,19 @@ def launch(table: torch.Tensor, rope: torch.Tensor, last_hidden: torch.Tensor, e
            codebook: torch.Tensor, emb_sum: torch.Tensor, codes: torch.Tensor, scratch: DepthStepScratch, *,
            groups: int, scope: int, grid: int, shape: DepthDecoderShape, top_k: int, top_p: float,
            temperature: float, seed: int, forced: torch.Tensor | None = None, stop_after: int = -1,
-           sync_mode: int = 0) -> None:
-    """One frame: zero the scratch counters, run the kernel (both capturable)."""
+           sync_mode: int = 0, trace: torch.Tensor | None = None) -> None:
+    """One frame: zero the scratch counters, run the kernel (both capturable). ``trace`` (int64
+    [2 * phases]) receives group 0's wall clock at every barrier's arrival and exit."""
     scratch.reset()
     op()(table, rope, last_hidden, embed0, codebook, forced, emb_sum, codes, scratch.logits, scratch.h,
-         scratch.qkv, scratch.attn, scratch.act, scratch.kv, scratch.ss, scratch.sync, scratch.ctl, groups, scope,
-         sync_mode, grid, stop_after, top_k, top_p, temperature, shape.eps, seed)
+         scratch.qkv, scratch.attn, scratch.act, scratch.kv, scratch.ss, scratch.sync, scratch.ctl, trace, groups,
+         scope, sync_mode, grid, stop_after, top_k, top_p, temperature, shape.eps, seed)
+
+
+def wall_clock_khz() -> int:
+    """The rate of the clock the trace is in (the device's constant-rate wall clock)."""
+    extension().load()
+    return int(torch.ops.mstar_persistent.wall_clock_khz())
 
 
 def default_grid(compute_units: int, groups: int, per_cu: int = 1) -> int:

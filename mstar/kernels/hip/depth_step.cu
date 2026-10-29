@@ -75,6 +75,7 @@ struct Params {
   float* ss;                  // [slots][bs]
   unsigned* sync;             // [groups][64]
   unsigned* ctl;              // [0] abort, [1] XCC mismatches, [2] phases completed by group 0's member 0
+  uint64_t* trace;            // [n_phases][2] or null: group 0 member 0's wall clock at each barrier's arrival and exit
   int n_phases, bs, groups, scope, sync_mode, stop_after, top_k;
   float top_p, inv_temperature, eps, attn_scale;
   uint64_t seed;
@@ -696,7 +697,10 @@ __global__ void __launch_bounds__(kThreads, 2) depth_step_kernel(Params P) {
     // the first chunk of a later phase is requested between this barrier's arrival and its wait
     const bool prefetch = it.valid && !R.requested;
     if (prefetch) R.requested = true;
+    const bool tracer = P.trace != nullptr && G.g == 0 && G.member == 0 && threadIdx.x == 0;
+    if (tracer) P.trace[2 * ph] = now();
     if (!group_barrier(P, G, ++epoch, R.wnext, it, prefetch, &ok_flag)) return;
+    if (tracer) P.trace[2 * ph + 1] = now();
     if (G.g == 0 && G.member == 0 && threadIdx.x == 0) P.ctl[2] = (unsigned)(ph + 1);
   }
 }
@@ -715,8 +719,9 @@ void depth_step(const at::Tensor& program, const at::Tensor& rope, const at::Ten
                 const at::Tensor& embed0, const at::Tensor& codebook, const c10::optional<at::Tensor>& forced,
                 const at::Tensor& emb_sum, const at::Tensor& codes, const at::Tensor& logits, const at::Tensor& h,
                 const at::Tensor& qkv, const at::Tensor& attn, const at::Tensor& act, const at::Tensor& kv,
-                const at::Tensor& ss, const at::Tensor& sync, const at::Tensor& ctl, int64_t groups, int64_t scope,
-                int64_t sync_mode, int64_t grid, int64_t stop_after, int64_t top_k, double top_p, double temperature, double eps,
+                const at::Tensor& ss, const at::Tensor& sync, const at::Tensor& ctl,
+                const c10::optional<at::Tensor>& trace, int64_t groups, int64_t scope, int64_t sync_mode, int64_t grid,
+                int64_t stop_after, int64_t top_k, double top_p, double temperature, double eps,
                 int64_t seed) {
   TORCH_CHECK(program.scalar_type() == at::kLong && program.dim() == 2 && program.size(1) == kPhaseFields,
               "program int64[n, ", kPhaseFields, "]");
@@ -744,6 +749,8 @@ void depth_step(const at::Tensor& program, const at::Tensor& rope, const at::Ten
   P.ss = ptr<float>(ss);
   P.sync = ptr<unsigned>(sync);
   P.ctl = ptr<unsigned>(ctl);
+  P.trace = ptr_or_null<uint64_t>(trace);
+  TORCH_CHECK(!P.trace || trace->numel() >= 2 * program.size(0), "trace int64[2 * n_phases]");
   P.n_phases = (int)program.size(0);
   P.bs = bs;
   P.groups = (int)groups;
@@ -761,14 +768,24 @@ void depth_step(const at::Tensor& program, const at::Tensor& rope, const at::Ten
   TORCH_CHECK(e == hipSuccess, "depth_step launch: ", hipGetErrorString(e));
 }
 
+int64_t wall_clock_khz() {
+  int dev = 0, khz = 0;
+  TORCH_CHECK(hipGetDevice(&dev) == hipSuccess, "hipGetDevice");
+  TORCH_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) == hipSuccess,
+              "hipDeviceAttributeWallClockRate");
+  return khz;
+}
+
 }  // namespace
 
 TORCH_LIBRARY(mstar_persistent, m) {
   m.def("depth_step(Tensor program, Tensor rope, Tensor last_hidden, Tensor embed0, Tensor codebook, Tensor? forced, "
         "Tensor(a!) emb_sum, Tensor(b!) codes, Tensor(c!) logits, Tensor(d!) h, Tensor(e!) qkv, Tensor(f!) attn, "
-        "Tensor(g!) act, Tensor(h!) kv, Tensor(i!) ss, Tensor(j!) sync, Tensor(k!) ctl, int groups, int scope, "
+        "Tensor(g!) act, Tensor(h!) kv, Tensor(i!) ss, Tensor(j!) sync, Tensor(k!) ctl, Tensor(l!)? trace, "
+        "int groups, int scope, "
         "int sync_mode, int grid, "
         "int stop_after, int top_k, float top_p, float temperature, float eps, int seed) -> ()");
+  m.def("wall_clock_khz() -> int", &wall_clock_khz);
 }
 
 TORCH_LIBRARY_IMPL(mstar_persistent, CUDA, m) { m.impl("depth_step", &depth_step); }
