@@ -405,7 +405,9 @@ def test_a_request_on_an_adapter_being_loaded_or_unloaded_is_refused(paths):
     conductor._reject_request = lambda rid, error, status: rejected.append((rid, status))
 
     def admit(rid, adapter):
-        conductor._admit_request(SimpleNamespace(request_id=rid, model_kwargs={LORA_ADAPTER_KWARG: adapter}))
+        conductor._admit_request(SimpleNamespace(
+            request_id=rid, model_kwargs={LORA_ADAPTER_KWARG: adapter}, client_input=None,
+        ))
 
     ops.load(LoadLoraAdapter(op_id="l", lora_name="a1", lora_path=paths["a1"], lora_digest="ab" * 32))
     admit("on_a1", "a1")
