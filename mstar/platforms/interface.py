@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import torch
+
+from mstar.platforms.facts import DeviceFacts, device_facts
+from mstar.platforms.ptxas import blackwell_ptxas_env
 
 
 class Platform:
@@ -47,6 +50,13 @@ class Platform:
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
 
+    def device_facts(self, device=None) -> DeviceFacts:
+        """The GPU's architecture, product, compute units, caches and peak
+        bandwidth and throughput, for kernel heuristics and the kernel harness
+        (see ``mstar.platforms.facts``); never for model code. Unknown fields
+        are None."""
+        return device_facts(self, device)
+
     def inductor_overrides(
         self, num_tokens: int | None = None, rows: int | None = None,
     ) -> dict[str, object]:
@@ -60,10 +70,15 @@ class Platform:
         """
         return {}
 
-    def process_env_defaults(self) -> dict[str, str]:
+    def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         """Environment variables for settings a runtime or library reads once
         at init. Workers apply them with ``os.environ.setdefault`` before their
         first device call, so a value the user exported wins.
+
+        A callable adds to the user's value instead: it gets the current value
+        (None when unset) and returns the one to set. The conductor applies the
+        defaults and each worker again, so it must return a value that already
+        has its addition unchanged.
         """
         return {}
 
@@ -102,6 +117,10 @@ class CudaPlatform(Platform):
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
 
+    def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
+        # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
+        return {"NCCL_GRAPH_REGISTER": "0", **blackwell_ptxas_env()}
+
 
 class RocmPlatform(Platform):
     name = "rocm"
@@ -138,10 +157,11 @@ class RocmPlatform(Platform):
         if num_tokens > limit:
             return {}
         overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
-        from mstar.platforms.rocm_gemm import SKINNY_MAX_ROWS, skinny_gemm_passes
+        from mstar.platforms.rocm_gemm import DECODE_GEMV_MAX_ROWS, skinny_gemm_passes
 
-        if num_tokens <= SKINNY_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
-            # 1-2 row linears on AITER's skinny GEMM
+        if num_tokens <= DECODE_GEMV_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
+            # linears of up to 16 rows on AITER's skinny GEMM or the Triton
+            # weight stream, as the device's tuned config picks per shape
             overrides["pre_grad_custom_pass"], overrides["post_grad_custom_post_pass"] = passes
         return overrides
 

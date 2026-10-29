@@ -162,6 +162,12 @@ Communication
        the conductor sets ``lo`` for its workers and NCCL's bootstrap
        sockets listen on loopback only. A value you set, or a set
        ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``NCCL_GRAPH_REGISTER``
+     - ``0``
+     - NCCL's own variable. On, NCCL registers the buffers a CUDA graph
+       captures, which succeeds on ``expandable_segments`` memory, and
+       Cosmos3 SP4 with batched captures then gave wrong images (#897).
+       Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
      - PyTorch's variable for the Gloo groups next to each TP/SP group.
@@ -601,6 +607,21 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``TRITON_PTXAS_BLACKWELL_PATH``
+     - torch's ptxas, when needed
+     - Triton's own variable: the ptxas it runs for sm_100 and up. ptxas
+       before 13.1.115, including the 13.1.80 that Triton 3.7.1 bundles,
+       miscompiles some integer floor divisions on sm_103 (Inductor's fused
+       interleaved mRoPE table came out wrong on B300). Unset, the conductor
+       points its workers at torch's ``torch/bin/ptxas`` when a compute
+       capability 10.x GPU is present, Triton's bundled ptxas predates
+       13.1.115 and torch's does not; it then also sets
+       ``TORCH_COMPILE_CACHE_KEY_TAG``, since Inductor's graph cache would
+       otherwise reuse kernels compiled by the bundled ptxas (decided by
+       :func:`mstar.platforms.ptxas.blackwell_ptxas_env`). A value you set
+       is kept, and the cache tag then names the ptxas you chose, so a cache
+       another ptxas wrote is not reused. A ``TORCH_COMPILE_CACHE_KEY_TAG``
+       you set gets ``-ptxas-blackwell-<version>`` appended.
 
 Platform defaults
 -----------------

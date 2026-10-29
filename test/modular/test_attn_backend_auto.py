@@ -11,6 +11,7 @@ import dataclasses
 import inspect
 import logging
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -30,14 +31,18 @@ from mstar.engine.resources import (
     apply_yaml_overrides,
 )
 from mstar.engine.resources.attn import aiter as rocm_attn
+from mstar.engine.resources.attn import backends as attn_backends
+from mstar.engine.resources.attn import base as attn_base
 from mstar.engine.resources.attn import dense as dense_module
 from mstar.engine.resources.attn import flashinfer as flashinfer_module
 from mstar.engine.resources.attn.aiter import AiterCrossManager, AiterPagedAttentionManager
-from mstar.engine.resources.attn.base import (
-    AttentionManager,
+from mstar.engine.resources.attn.backends import (
+    ATTN_BACKENDS,
+    AttnBackendEntry,
+    AttnBackendRegistry,
     flashinfer_kwargs,
-    resolve_attn_backend,
 )
+from mstar.engine.resources.attn.base import AttentionManager, resolve_attn_backend
 from mstar.engine.resources.attn.cross import CrossAttentionManager, FlashInferCrossManager
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.attn.ragged import aiter as rocm_ragged
@@ -51,10 +56,10 @@ from mstar.engine.resources.attn.ragged.flashinfer import (
     FlashInferRaggedManager,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
-from mstar.engine.resources.kv.config import PagedKVConfig, RingKVConfig, RingKVLayerConfig
+from mstar.engine.resources.kv.config import KVConfig, PagedKVConfig, RingKVConfig, RingKVLayerConfig
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import BucketKey, SlotLease
-from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform
+from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, XpuPlatform
 
 CPU = torch.device("cpu")
 
@@ -354,7 +359,7 @@ def test_aiter_builds_for_a_split_walk(rocm):
 
 def test_aiter_is_refused_off_rocm(monkeypatch):
     monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
-    with pytest.raises(RuntimeError, match="runs on AMD GPUs"):
+    with pytest.raises(RuntimeError, match="'aiter' runs on rocm; this process runs on cuda"):
         AttentionManager.build(attention_spec(backend=AttnBackend.AITER), kv_info(paged(128)))
 
 
@@ -444,3 +449,169 @@ def test_yaml_names_the_aiter_backends():
     ragged = RaggedAttentionSpec(resource_key="ragged", nodes={"node"}, config=ragged_config())
     ragged.apply_yaml_overrides(backend="aiter")
     assert ragged.config.backend is RaggedAttnBackend.AITER
+
+
+# --- the backend table ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", [b for b in AttnBackend if b is not AttnBackend.AUTO], ids=str)
+def test_every_backend_has_an_entry_whose_builder_imports(backend):
+    entry = ATTN_BACKENDS.entry(backend)
+    assert entry.backend is backend and issubclass(entry.kv_config, KVConfig)
+    assert callable(attn_backends._load(entry.builder))
+    assert entry.probe is None or callable(attn_backends._load(entry.probe))
+
+
+@pytest.mark.parametrize("platform", [CudaPlatform, RocmPlatform, XpuPlatform, CpuPlatform], ids=str)
+def test_auto_resolves_to_a_registered_backend_on_every_platform(monkeypatch, rocm, platform):
+    if platform is RocmPlatform:
+        rocm()
+    monkeypatch.setattr(platforms, "resolve_platform", platform)
+    for page_size in (None, 16, 128):
+        resolved = ATTN_BACKENDS.resolve(AttnBackend.AUTO, page_size)
+        assert resolved is not AttnBackend.AUTO and resolved in ATTN_BACKENDS
+
+
+def test_where_each_backend_runs():
+    devices = {entry.backend: entry.devices for entry in ATTN_BACKENDS}
+    assert devices.pop(AttnBackend.XPU_PAGED) == ("xpu",)
+    assert set(devices.values()) == {()}
+    where = {entry.backend: entry.platforms for entry in ATTN_BACKENDS}
+    assert where.pop(AttnBackend.AITER) == ("rocm",)
+    assert set(where.values()) == {()}
+
+
+def test_options_name_the_backends_that_honour_them():
+    assert ATTN_BACKENDS.supporting("sliding_window") == ["flashinfer"]
+    assert ATTN_BACKENDS.supporting("sm_scale") == ["flashinfer_mla"]
+
+
+def test_sliding_window_elsewhere_is_refused_before_the_kv_dependency_is_read():
+    with pytest.raises(ValueError, match="sliding_window is unsupported .* use the flashinfer backend"):
+        AttentionManager.build(attention_spec(backend=AttnBackend.DENSE, sliding_window=64), kv_info(paged_config()))
+    no_kv = EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="sliding_window is unsupported .*FLEX"):
+        AttentionManager.build(attention_spec(backend=AttnBackend.FLEX, sliding_window=64), no_kv)
+
+
+def test_sm_scale_is_read_by_mla_only():
+    with pytest.raises(ValueError, match="'flashinfer' ignores sm_scale; only 'flashinfer_mla' reads it"):
+        AttentionManager.build(attention_spec(sm_scale=0.125), kv_info(paged_config()))
+
+
+def test_xpu_paged_needs_an_xpu_device():
+    with pytest.raises(RuntimeError, match="'xpu_paged' requires an XPU device; got cpu"):
+        AttentionManager.build(attention_spec(backend=AttnBackend.XPU_PAGED), kv_info(paged_config()))
+
+
+def test_the_attention_base_is_platform_neutral():
+    """Platform policy lives in the table and beside the kernels, not in base.py."""
+    source = Path(attn_base.__file__).read_text()
+    for word in ("current_platform", "is_rocm", "is_cuda", "torch.version.hip"):
+        assert word not in source, word
+
+
+# a registry of stubs, each named by "module:function" like the real entries
+_HERE = __name__
+_probe_reason: dict[str, str | None] = {"value": None}
+_fallbacks: list = []
+
+
+def _stub_build(spec, info, kv_config):
+    return ("built", spec.config.backend, type(kv_config).__name__)
+
+
+def _stub_build_on_rocm(spec, info, kv_config):
+    return ("built on rocm", spec.config.backend, type(kv_config).__name__)
+
+
+def _stub_probe(device):
+    return _probe_reason["value"]
+
+
+def _stub_fallback_warning(reason, backend):
+    _fallbacks.append((reason, backend))
+
+
+def _stub_rocm_policy(page_size):
+    return AttnBackend.FLASHINFER_MLA if page_size == 128 else AttnBackend.FLASHINFER
+
+
+@pytest.fixture
+def stub_registry():
+    registry = AttnBackendRegistry("stub attention", auto={"default": AttnBackend.FLASHINFER})
+    registry.register(AttnBackendEntry(
+        AttnBackend.FLASHINFER, builder={"default": f"{_HERE}:_stub_build", "rocm": f"{_HERE}:_stub_build_on_rocm"},
+        kv_config=PagedKVConfig,
+    ))
+    registry.register(AttnBackendEntry(
+        AttnBackend.FLASHINFER_MLA, builder=f"{_HERE}:_stub_build", kv_config=PagedKVConfig,
+    ))
+    registry.register(AttnBackendEntry(
+        AttnBackend.DENSE, builder=f"{_HERE}:_stub_build", kv_config=PagedKVConfig, probe=f"{_HERE}:_stub_probe",
+        falls_back_to_auto=True, on_fallback=f"{_HERE}:_stub_fallback_warning",
+    ))
+    registry.register(AttnBackendEntry(
+        AttnBackend.XPU_PAGED, builder=f"{_HERE}:_stub_build", kv_config=PagedKVConfig,
+        probe=f"{_HERE}:_stub_probe", needs="stub library",
+    ))
+    _probe_reason["value"] = None
+    _fallbacks.clear()
+    return registry
+
+
+def test_a_platform_policy_decides_auto_on_that_platform_only(stub_registry, monkeypatch):
+    def no_device():
+        raise AssertionError("resolved the platform")
+
+    monkeypatch.setattr(platforms, "resolve_platform", no_device)
+    assert stub_registry.resolve(AttnBackend.AUTO, 128) is AttnBackend.FLASHINFER, "one policy asks no platform"
+    stub_registry.set_auto("rocm", f"{_HERE}:_stub_rocm_policy")
+    monkeypatch.setattr(platforms, "resolve_platform", RocmPlatform)
+    assert stub_registry.resolve(AttnBackend.AUTO, 128) is AttnBackend.FLASHINFER_MLA
+    assert stub_registry.resolve(AttnBackend.AUTO, 16) is AttnBackend.FLASHINFER
+    assert stub_registry.resolve(AttnBackend.DENSE, 128) is AttnBackend.DENSE
+    monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
+    assert stub_registry.resolve(AttnBackend.AUTO, 128) is AttnBackend.FLASHINFER
+
+
+def test_a_builder_can_differ_per_platform(stub_registry, monkeypatch):
+    spec, info = attention_spec(), kv_info(paged_config())
+    assert stub_registry.build(spec, info)[0] == "built"
+    monkeypatch.setattr(platforms, "resolve_platform", RocmPlatform)
+    assert stub_registry.build(spec, info)[0] == "built on rocm"
+
+
+def test_a_failed_probe_falls_back_to_auto_or_raises(stub_registry):
+    info = kv_info(paged_config())
+    assert stub_registry.build(attention_spec(backend=AttnBackend.DENSE), info)[1] is AttnBackend.DENSE
+    _probe_reason["value"] = "ImportError: no kernel"
+    assert stub_registry.build(attention_spec(backend=AttnBackend.DENSE), info)[0] == "built"
+    assert _fallbacks == [("ImportError: no kernel", AttnBackend.FLASHINFER)]
+    xpu = kv_info(paged_config())
+    xpu = EngineResourceInfo(device=torch.device("xpu"), kv_dtype=torch.bfloat16, dependencies=xpu.dependencies)
+    with pytest.raises(RuntimeError, match=r"'xpu_paged' requires a working stub library \(ImportError: no kernel\)"):
+        stub_registry.build(attention_spec(backend=AttnBackend.XPU_PAGED), xpu)
+
+
+def test_an_entry_for_one_platform_is_refused_on_another(stub_registry, monkeypatch):
+    stub_registry.register(AttnBackendEntry(
+        AttnBackend.FLEX, builder=f"{_HERE}:_stub_build", kv_config=RingKVConfig, platforms=("rocm",),
+    ))
+    spec, info = attention_spec(backend=AttnBackend.FLEX), kv_info(ring_config())
+    monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
+    with pytest.raises(RuntimeError, match="'flex' runs on rocm; this process runs on cuda"):
+        stub_registry.build(spec, info)
+    monkeypatch.setattr(platforms, "resolve_platform", RocmPlatform)
+    assert stub_registry.build(spec, info)[1] is AttnBackend.FLEX
+
+
+def test_the_table_refuses_what_it_cannot_serve(stub_registry):
+    with pytest.raises(ValueError, match="Unknown stub attention backend"):
+        stub_registry.entry(AttnBackend.FLEX)
+    with pytest.raises(ValueError, match="cannot register"):
+        stub_registry.register(AttnBackendEntry(AttnBackend.DENSE, builder="x:y", kv_config=PagedKVConfig))
+    with pytest.raises(ValueError, match="cannot register"):
+        stub_registry.register(AttnBackendEntry(AttnBackend.AUTO, builder="x:y", kv_config=PagedKVConfig))
+    with pytest.raises(ValueError, match="needs a default policy"):
+        AttnBackendRegistry("stub", auto={"rocm": AttnBackend.FLASHINFER})

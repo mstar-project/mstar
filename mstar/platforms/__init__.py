@@ -79,7 +79,8 @@ def _built_for() -> Platform:
 
 
 def apply_process_env_defaults() -> None:
-    """Set the platform's ``process_env_defaults``, keeping any value already set.
+    """Set the platform's ``process_env_defaults``, keeping any value already set
+    unless the default adds to it.
 
     Call it before the first device call, since the HIP and CUDA runtimes read
     much of their environment at init. Resolving ``current_platform`` counts
@@ -87,7 +88,10 @@ def apply_process_env_defaults() -> None:
     built for instead.
     """
     for key, value in _built_for().process_env_defaults().items():
-        os.environ.setdefault(key, value)
+        if callable(value):
+            os.environ[key] = value(os.environ.get(key))
+        else:
+            os.environ.setdefault(key, value)
 
 
 def apply_visible_devices(devices: str | None) -> None:

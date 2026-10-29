@@ -44,7 +44,7 @@ jobs:
             args: >-
               -n 4 --dist worksteal
               --ignore=test/modular/test_tp_async_lockstep_sim.py
-              test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
+              test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases benchmark/kernels
           # Its three simulations take up to 3.5 minutes each on these runners
           # and would set the main shard's wall time, so they run beside it.
           - name: CPU Core (TP lockstep sim)
