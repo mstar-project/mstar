@@ -1,18 +1,22 @@
-"""A paged label the model leaves undeclared is refused, at load or at intake."""
+"""A paged label the model leaves undeclared is refused, at load or at intake, and so is a
+request bigger than the pool that would hold it. A request that asks for no length has its
+default cut to the pool instead."""
 
 from __future__ import annotations
 
 import re
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
 import pytest
 from test_kv_layout_intake import LAYOUT, _conduct, _Model, _preprocess
 
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.conductor.conductor import Conductor
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.graph.base import GraphNode, Loop
-from mstar.model.base import KVLabel, LabelLayout
+from mstar.model.base import KVLabel, LabelLayout, Span
 from mstar.validation.resources import _undeclared_pools, _unknown_prefix_walks
 
 
@@ -89,3 +93,55 @@ def test_a_request_laid_out_wrong_fails_with_a_500(tmp_path, monkeypatch, caplog
     assert not [msg for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"], (
         "a worker heard of a request the conductor refused"
     )
+
+
+def _one_loop() -> _Model:
+    """main takes 100 slots plus one per decode_loop iteration, and uncond takes 2 pages and grows
+    on no loop here. So only decode_loop decides whether a footprint fits the pool."""
+    uncond = LabelLayout(spans=(Span("rows", "prefill", 10, 10, "cond"),), scratch=7)
+    return _Model(layout={"kv": {"main": LAYOUT["kv"]["main"], "uncond": uncond}})
+
+
+def test_a_length_past_its_pool_is_a_400_before_dispatch(tmp_path, monkeypatch):
+    model = _one_loop()
+    kwargs = _preprocess(model, {"max_output_tokens": 30})
+
+    sent = _conduct(model, kwargs, tmp_path, monkeypatch, resources={"kv": {"max_num_pages": 11}}).sent
+
+    failures = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
+    assert [failure.status for failure in failures] == [400], "an asked length past the pool was not refused"
+    assert "11 pages of 'kv' for labels ['main', 'uncond'], and the pool has 10" in failures[0].error_message
+    assert not [msg for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"]
+
+
+def test_a_request_that_asks_for_no_length_is_cut_to_its_pool(tmp_path, monkeypatch):
+    model = _one_loop()
+    kwargs = _preprocess(model, {})
+
+    sent = _conduct(model, kwargs, tmp_path, monkeypatch, resources={"kv": {"max_num_pages": 11}}).sent
+
+    [new_request] = [msg.body for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"]
+    assert new_request.request_info.max_tokens == new_request.loop_caps["decode_loop"] == 28, (
+        "the default was not cut to the longest output the pool holds"
+    )
+
+
+def test_each_worker_counts_only_the_labels_its_nodes_open():
+    config = KVReqConfig(needed_labels_per_node_walk={("llm", "prefill"): ["cfg"], ("talker", "decode"): ["uncond"]})
+    config.apply_conductor_config(kv_layout={
+        label: [[[n, n, "prefill", 0]], [], 0, None, 0] for label, n in (("main", 144), ("cfg", 80), ("uncond", 112))
+    }, loop_caps={})
+    pool = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=17, page_size=16)
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = SimpleNamespace(get_node_resources=lambda: [
+        KVSpec(resource_key="kv", nodes={"llm", "talker"}, config=pool),
+    ])
+    conductor.model_config = {}
+    conductor._per_worker_graphs = {
+        node: [SimpleNamespace(section=GraphNode(name=node, input_names=[], outputs=[]))] for node in ("llm", "talker")
+    }
+
+    for specs in conductor._resource_specs():
+        config.validate(specs["kv"])
+    with pytest.raises(ValueError, match="21 pages"):
+        config.validate(KVSpec(resource_key="kv", nodes={"llm", "talker"}, config=pool))
