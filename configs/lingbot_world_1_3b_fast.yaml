@@ -1,0 +1,24 @@
+model: "lingbot_world_1_3b"
+
+# lingbot_world_1_3b.yaml with the DiT blocks compiled at the -O level's
+# options (autotuned kernels) instead of Inductor's deterministic defaults:
+# 35.4 -> 37.1 fps at 480x832 on a B300 with -O2. Each server process picks
+# its own kernels, so the same seed gives a different rollout per process
+# (chunks 0-1 land 40.7-41.8 dB from the reference's, 42.1 for the default).
+# A cold Inductor cache adds ~80 s of autotuning at load.
+model_kwargs:
+  dit_compile_autotune: true
+
+# No node holds an engine KV cache (the rolling K/V is per-request state in
+# the dit); max_seq_len only satisfies the conductor's config check and matches
+# the UMT5 text length.
+max_seq_len: 512
+
+# One rollout per GPU: the dense K/V and the VAE caches are per request, so the
+# model refuses any other value (LingBotWorldModel.validate_config_yaml).
+max_concurrent_requests: 1
+
+# Single-GPU colocated; the Wan VAE encode and decode are fused into the dit forward.
+node_groups:
+  - node_names: [text_encoder, dit]
+    ranks: [0]

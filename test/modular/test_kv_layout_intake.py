@@ -134,10 +134,10 @@ def _preprocess(model: _Model, model_kwargs: dict) -> dict:
     return worker.communicator.sent[-1].body.model_kwargs
 
 
-def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch) -> _Comm:
+def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, **config) -> _Comm:
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump({
-        "max_seq_len": 4096, "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}],
+        "max_seq_len": 4096, "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}], **config,
     }))
     comm = _Comm()
     monkeypatch.setattr(Conductor, "_launch_workers", lambda self: None)

@@ -67,6 +67,7 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.streaming.topology import Connection, ProducerWalkCtx
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.containers import ParallelList, RecentSet
@@ -747,6 +748,30 @@ class Worker:
                 if any(n in my_node_names for n in self._get_node_names_for_partition(conn.to_partition, model)):
                     self._my_consumer_connections.append(conn)
 
+        # producer-triggered partition -> the connection that decides its walk
+        self._walk_drivers: dict[str, Connection] = (
+            self.partition_topology.walk_drivers()
+            if self.partition_topology else {}
+        )
+        # consumer side: walk-driven edge here -> its consumer partition
+        self._walk_driven_edges = {
+            conn.edge_name: conn.to_partition
+            for conn in self._my_consumer_connections
+            if conn.to_partition in self._walk_drivers
+        }
+        # producer side: streamed signal -> its consumer partition, and
+        # (node, walk) -> the walk drivers it emits for
+        self._signal_consumer = {
+            conn.edge_name: conn.to_partition
+            for conn in (
+                self.partition_topology.connections
+                if self.partition_topology else []
+            )
+        }
+        self._emitted_walk_drivers: dict[tuple[str, str], list[Connection]] = {}
+        # refilled for every walk-hook call rather than built per request per step
+        self._walk_ctx = ProducerWalkCtx()
+
         # Set of edge names that arrive via streaming (used to distinguish
         # streaming inputs from conductor-triggered non-streaming inputs
         # when checking whether a target node is ready for ingestion).
@@ -928,6 +953,7 @@ class Worker:
                     edge_name=conn.edge_name,
                     from_partition=conn.from_partition,
                     policy=conn.chunk_policy_factory(),
+                    walk_tagged=conn.consumer_walk is not None,
                 )
                 req_info.stream_buffers[conn.edge_name] = sbuf
                 consumer = self._consumer_node_cache.get(conn.edge_name, "")
@@ -1397,8 +1423,11 @@ class Worker:
             self.wakeup_event.register_futures(futures)
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
+                walk = body.request_info.stream_consumer_walks.get(
+                    self._walk_driven_edges.get(edge.name)
+                )
                 for info in edge.tensor_info:
-                    stream_buf.pre_read_register(info.uuid)
+                    stream_buf.pre_read_register(info.uuid, walk)
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.process_inputs")
@@ -1503,14 +1532,97 @@ class Worker:
             [info.uuid for info in edge.tensor_info]
         )
 
+    def _partition_walk(self, request_id: int, partition: str) -> str | None:
+        req_info = self.request_state.per_request_info.get(request_id)
+        part_info = req_info and req_info.per_partition_info.get(partition)
+        return part_info.current_fwd_info.graph_walk if part_info else None
+
+    def _switch_partition_walk(
+        self, request_id: int, partition: str, walk: str,
+    ) -> None:
+        """Move a producer-triggered partition into ``walk``."""
+        self._graph_runtime.set_walk(request_id, partition, walk)
+        # Nothing of the partition is in flight to still read the old walk
+        self.request_state.get_fwd_info(request_id, partition).graph_walk = walk
+
+    def _assign_consumer_walks(self, batch_N: PendingBatch) -> None:
+        """Decide the consumer walk of this pass's streamed items, per rid and
+        producer-triggered consumer partition, and stamp it on the fwd_info
+        that rides with the remote sends. Asked per real walk: a mixed step's
+        combined label is no walk of the graph's. Runs on every emitting step,
+        so it allocates nothing per row."""
+        if not self._walk_drivers:
+            return
+        ctx = None
+        input_metadata = batch_N.node_batch.per_request_input_metadata
+        for walk, walk_rids in batch_N.batch.rids_by_walk().items():
+            key = (batch_N.node_name, walk)
+            drivers = self._emitted_walk_drivers.get(key)
+            if drivers is None:
+                consumers = {
+                    self._signal_consumer[signal]
+                    for signal in self._graph_runtime.get_output_signals(*key)
+                    if signal in self._signal_consumer
+                }
+                drivers = [
+                    self._walk_drivers[partition] for partition in consumers
+                    if partition in self._walk_drivers
+                ]
+                self._emitted_walk_drivers[key] = drivers
+            if not drivers:
+                continue
+            ctx = self._walk_ctx
+            ctx.producer_walk = walk
+            ctx.node = batch_N.node_name
+            for rid in walk_rids:
+                req_info = self.request_state.per_request_info.get(rid)
+                if req_info is None:
+                    continue
+                fwd_info = req_info.per_partition_info[batch_N.partition].current_fwd_info
+                meta = input_metadata.get(rid)
+                ctx.loop_iters = meta.dynamic_loop_iter_counts if meta else {}
+                ctx.fwd_info = fwd_info
+                for conn in drivers:
+                    fwd_info.stream_consumer_walks[conn.to_partition] = conn.consumer_walk(ctx)
+        if ctx is not None:
+            ctx.fwd_info = None
+            ctx.loop_iters = {}
+
+    def _enter_chunk_walk(
+        self, sbuf: StreamBuffer, edge_name: str, request_id: int,
+        allow_walk_change: bool,
+    ) -> bool:
+        """Put the consumer in the walk the next chunk runs under. False when
+        the chunk has to wait: the partition is mid-pass in its current walk,
+        or the caller cannot change walks (speculation)."""
+        walk = sbuf.peek_walk()
+        if walk is None:
+            return True
+        partition = self._walk_driven_edges[edge_name]
+        if walk == self._partition_walk(request_id, partition):
+            return True
+        if not allow_walk_change or not self._graph_runtime.is_partition_idle(
+            request_id, partition,
+        ):
+            return False
+        self._switch_partition_walk(request_id, partition, walk)
+        return True
+
     def _pop_streaming_edge(
-        self, sbuf: StreamBuffer, edge_name: str, request_id: int
+        self, sbuf: StreamBuffer, edge_name: str, request_id: int,
+        allow_walk_change: bool = True,
     ) -> StreamingEdge | None:
         consumer_node = self._consumer_node_cache.get(edge_name, "")
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
             return waiting
-        if sbuf.has_chunk_ready():
+        partition = self._walk_driven_edges.get(edge_name)
+        consumer_walk = (
+            self._partition_walk(request_id, partition) if partition else None
+        )
+        if sbuf.has_chunk_ready(consumer_walk) and self._enter_chunk_walk(
+            sbuf, edge_name, request_id, allow_walk_change,
+        ):
             chunk = sbuf.pop_chunk()
             chunk_tensor = chunk.data.get("data")
             if chunk_tensor is None:
@@ -1551,7 +1663,10 @@ class Worker:
         if req_info is None:
             return []
         for edge_name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items():
-            edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
+            # The speculated step was built for the current walk
+            edge = self._pop_streaming_edge(
+                sbuf, edge_name, request_id, allow_walk_change=False,
+            )
             if edge is not None:
                 result.append(edge)
         return result
@@ -3131,8 +3246,18 @@ class Worker:
         laps.lap("backlog_check")
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
-        # assumes that.
-        candidates = [r for r in walk_rids if not self._is_tearing_down(r)]
+        # assumes that. A rid is also filtered when the target node isn't ready
+        # to run it, since the target's admit would otherwise skip the readiness
+        # check. The teardown filter comes first, since the readiness check would
+        # queue a torn-down rid or reload its pages.
+        partition = None if speculating_same_node else self.request_state.get_partition_for_node(spec_node_name)
+        candidates = [
+            r for r in walk_rids
+            if not self._is_tearing_down(r)
+            and (speculating_same_node or self.scheduler._check_ready(
+                spec_node_name, r, self.request_state.get_fwd_info(r, partition),
+            ))
+        ]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
@@ -3778,8 +3903,9 @@ class Worker:
         _pp_stage("completion_event_sync")
         # Waited on above, so the spans have landed; cut before anything reads
         # the outputs: the stop check, the store, a streaming edge.
+        empty_spans: dict[int, list[str]] = {}
         if outputs.output_spans and batch_N.batch.request_to_worker_graph:
-            self._crop_to_spans(outputs)
+            empty_spans = self._crop_to_spans(outputs)
             _pp_stage("crop_spans")
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -3804,6 +3930,16 @@ class Worker:
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
         self._keep_samples(batch_N.node_batch, cpu_outputs, host_rows)
+        # What the stop check withheld (``StopCheck.withheld``), and an output
+        # cut to an empty span, is not stored, so not routed: a streaming edge
+        # then carries no item for the row, and the producer's item count
+        # leaves it out as well.
+        for withheld in (batch_N.node_batch.withheld_outputs, empty_spans):
+            for rid, names in withheld.items():
+                rid_outputs = outputs.get(rid)
+                if rid_outputs:
+                    for name in names:
+                        rid_outputs.pop(name, None)
 
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes the
@@ -4144,14 +4280,22 @@ class Worker:
             flat_rids, flat_uuids, signals, signal_idxs,
         )
 
+        # Before the sends below: remote consumers read the walks off the
+        # fwd_info that rides with the streamed edges.
+        self._assign_consumer_walks(batch_N)
+
         # Local streaming stays here: a StreamBuffer holds real tensors, so it
         # cannot move behind the runtime's contract.
         streamed: list[int] = []
         for signal, per_signal in route_output.local_streaming_by_signal.items():
+            consumer = self._walk_driven_edges.get(signal)
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
-                stream_buf.pre_read_register(uuid)
+                walks = req_info.per_partition_info[batch_N.partition].current_fwd_info.stream_consumer_walks
+                stream_buf.pre_read_register(
+                    uuid, walks.get(consumer) if consumer else None,
+                )
                 tensor = self.tensor_manager.get_tensor(uuid)
                 stream_buf.put(uuid, tensor.clone())
                 streamed.append(uuid)
@@ -4381,6 +4525,8 @@ class Worker:
         """Queue a non-blocking copy of each device tensor in ``buffers`` into
         a pinned buffer of ``purpose``; anything else passes through."""
         host: dict[str, torch.Tensor] = {}
+        # a tensor under two names is copied once
+        landed: dict[int, torch.Tensor] = {}
         for index, (name, tensor) in enumerate(buffers.items()):
             if not (
                 torch.is_tensor(tensor)
@@ -4389,15 +4535,18 @@ class Worker:
             ):
                 host[name] = tensor
                 continue
+            if id(tensor) in landed:
+                host[name] = landed[id(tensor)]
+                continue
             buf = self._get_pinned_d2h_buffer(
                 purpose, tensor.shape, tensor.dtype, index,
             )
             buf.copy_(tensor, non_blocking=True)
-            host[name] = buf
+            host[name] = landed[id(tensor)] = buf
         return host
 
     @staticmethod
-    def _crop_to_spans(outputs: "BatchedModelOutput") -> None:
+    def _crop_to_spans(outputs: "BatchedModelOutput") -> dict[int, list[str]]:
         """Cut each row of a spanned output to its span along the last dim
         (``NodeSubmodule.spanned_outputs``). Called once the step's completion
         event has fired, so the spans staged behind the step are on the host.
@@ -4405,10 +4554,14 @@ class Worker:
         a second name that ``postprocess`` or ``unpack_packed_outputs`` gave
         the same list is cut with it. Two names the forward returned on its own
         get their own lists from the engine and keep their own widths.
+
+        Returns rid -> the outputs whose span is empty, which the caller leaves
+        out of the store as it does a withheld output.
         """
         spans = outputs.host_spans or outputs.output_spans
         per_rid = outputs.per_rid_outputs
         cut = False
+        empty: dict[int, list[str]] = {}
         for name, span in spans.items():
             # columns, not a [start, end] list per row
             starts, ends = span.t().tolist()
@@ -4417,6 +4570,8 @@ class Worker:
                 tensors = row.get(name) if row is not None else None
                 if not tensors:
                     continue
+                if end <= start:
+                    empty.setdefault(rid, []).append(name)
                 for i, tensor in enumerate(tensors):
                     if start > 0 or end < tensor.shape[-1]:
                         tensors[i] = tensor[..., max(start, 0):max(end, 0)]
@@ -4424,6 +4579,7 @@ class Worker:
         if cut:
             # the views no longer describe the stored rows
             outputs.row_views = None
+        return empty
 
     def _get_pinned_d2h_buffer(
         self,
@@ -4459,6 +4615,8 @@ class Worker:
         reused by the next step.
         """
         host: dict[str, torch.Tensor] = {}
+        # a tensor under two names is copied once
+        landed: dict[int, torch.Tensor] = {}
         with side:
             for index, (name, tensor) in enumerate(buffers.items()):
                 if not (
@@ -4467,11 +4625,14 @@ class Worker:
                 ):
                     host[name] = tensor
                     continue
+                if id(tensor) in landed:
+                    host[name] = landed[id(tensor)]
+                    continue
                 buf = self._get_pinned_d2h_buffer(
                     "check_stop_batched", tensor.shape, tensor.dtype, index,
                 )
                 buf.copy_(tensor, non_blocking=True)
-                host[name] = buf
+                host[name] = landed[id(tensor)] = buf
         side.synchronize()
         return host
 
