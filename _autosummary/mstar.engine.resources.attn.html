@@ -681,7 +681,7 @@
 <td><p>Cross-attention over a context written once and never extended.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.dense.html#module-mstar.engine.resources.attn.dense" title="mstar.engine.resources.attn.dense"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dense</span></code></a></p></td>
-<td><p>Attention as one dense varlen pass: FlashAttention-3, or AITER on ROCm.</p></td>
+<td><p>Attention as one dense varlen pass: FlashAttention-3, AITER on ROCm, or FlashInfer's ragged prefill where neither has a kernel for the GPU.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.flashinfer.html#module-mstar.engine.resources.attn.flashinfer" title="mstar.engine.resources.attn.flashinfer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">flashinfer</span></code></a></p></td>
 <td><p>Paged attention through FlashInfer's prefill/decode wrappers.</p></td>

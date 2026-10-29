@@ -1241,7 +1241,14 @@ paged backend, FlashInfer for now), <code class="docutils literal notranslate"><
 <code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code>, <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLEX</span></code> or <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER_MLA</span></code>.
 Leave it at <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> unless the model needs a specific kernel. FlashInfer, dense
 and MLA attention require a <code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code>; FlexAttention requires a
-<code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code>.
+<code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code>. <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs one varlen pass over each stream’s frozen
+prefix (gathered from the pages once) and the step’s fresh K/V, eager only:
+FA3 (AITER on ROCm), or FlashInfer’s ragged prefill where FA3 has no kernel for
+the GPU, the same choice the ragged resources make (<code class="docutils literal notranslate"><span class="pre">dense_or_flashinfer</span></code>), with
+<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> picking its kernel. The engine plans and runs a tiny layout on
+that kernel when it builds the resource, so a backend the GPU or FlashInfer build
+cannot run stops the server with a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> naming it. Its wrappers share one
+workspace, taken at build.
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> selects a kernel generation: <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;fa2&quot;</span></code> or
 <code class="docutils literal notranslate"><span class="pre">&quot;fa3&quot;</span></code> when the FlashInfer backend is selected. <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code>
 (default <code class="docutils literal notranslate"><span class="pre">True</span></code>) runs one-token decode rows on FlashInfer’s tensor-core
@@ -2112,9 +2119,15 @@ batches beyond a captured size.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> is that <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’s mode. The default, <code class="docutils literal notranslate"><span class="pre">None</span></code>, takes the
 deployment’s compile level (<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">-O</span></code>, <code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code>); naming a
 mode takes the config out of that level. <code class="docutils literal notranslate"><span class="pre">default</span></code> keeps Inductor’s fusion but takes cuBLAS for
-every GEMM and skips autotuning. Building the config refuses an unknown mode, and one
-that turns on Inductor’s own CUDA graphs (<code class="docutils literal notranslate"><span class="pre">reduce-overhead</span></code>, <code class="docutils literal notranslate"><span class="pre">max-autotune</span></code>), which
-fail inside the runner’s capture.</p></li>
+every GEMM and skips autotuning. <code class="docutils literal notranslate"><span class="pre">deterministic</span></code> is the engine’s own: Inductor’s
+defaults in its deterministic mode, which picks kernel configs by rule rather than timing
+them on the device, so every process compiles the same kernels (a torch without the mode
+logs a warning and compiles with the defaults). A compile outside the runner takes the same
+options from <code class="docutils literal notranslate"><span class="pre">accelerator_graph_runner.compile_kwargs(&quot;deterministic&quot;)</span></code>, or
+<code class="docutils literal notranslate"><span class="pre">deterministic_inductor_options()</span></code> where it builds its own; the Wan VAE decode, the DiT
+scaffold’s <code class="docutils literal notranslate"><span class="pre">compile_blocks</span></code> and Cosmos3’s denoise step do. Building the config refuses
+an unknown mode, and one that turns on Inductor’s own CUDA graphs (<code class="docutils literal notranslate"><span class="pre">reduce-overhead</span></code>,
+<code class="docutils literal notranslate"><span class="pre">max-autotune</span></code>), which fail inside the runner’s capture.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">required</span></code> makes every bucket in the config mandatory. If capture fails locally or
 on another participating rank, warmup raises after rank-wide agreement instead of
 dropping the bucket and falling back to eager execution. The default is <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>

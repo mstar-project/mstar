@@ -683,6 +683,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttnManager.prefix_skip_safe</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.dense_or_flashinfer"><code class="docutils literal notranslate"><span class="pre">dense_or_flashinfer()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend"><code class="docutils literal notranslate"><span class="pre">resolve_ragged_attn_backend()</span></code></a></li>
 </ul>
             </nav>
@@ -706,7 +707,10 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend" title="mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_ragged_attn_backend</span></code></a>(backend, device)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.base.dense_or_flashinfer" title="mstar.engine.resources.attn.ragged.base.dense_or_flashinfer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dense_or_flashinfer</span></code></a>(device, dense, ...)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dense</span></code> where FA3 (AITER on ROCm) has a varlen kernel for <code class="docutils literal notranslate"><span class="pre">device</span></code>, else <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend" title="mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_ragged_attn_backend</span></code></a>(backend, device)</p></td>
 <td><p>Ragged counterpart of <code class="docutils literal notranslate"><span class="pre">attn.base.resolve_attn_backend</span></code>.</p></td>
 </tr>
 </tbody>
@@ -804,6 +808,23 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.base.dense_or_flashinfer">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.base.</span></span><span class="sig-name descname"><span class="pre">dense_or_flashinfer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dense</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flashinfer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">what</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/base.html#dense_or_flashinfer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.base.dense_or_flashinfer" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">dense</span></code> where FA3 (AITER on ROCm) has a varlen kernel for <code class="docutils literal notranslate"><span class="pre">device</span></code>,
+else <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>. The one place that choice is made, for the ragged
+managers and the KV-backed dense backend’s wrappers alike; <code class="docutils literal notranslate"><span class="pre">what</span></code> names
+the caller in the log line.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
+<li><p><strong>what</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.base.</span></span><span class="sig-name descname"><span class="pre">resolve_ragged_attn_backend</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">backend</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/base.html#resolve_ragged_attn_backend"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend" title="Link to this definition">#</a></dt>
 <dd><p>Ragged counterpart of <code class="docutils literal notranslate"><span class="pre">attn.base.resolve_attn_backend</span></code>.</p>
@@ -884,6 +905,7 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttnManager.prefix_skip_safe</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.dense_or_flashinfer"><code class="docutils literal notranslate"><span class="pre">dense_or_flashinfer()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend"><code class="docutils literal notranslate"><span class="pre">resolve_ragged_attn_backend()</span></code></a></li>
 </ul>
   </nav></div>

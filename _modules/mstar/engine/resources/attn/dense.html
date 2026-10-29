@@ -959,7 +959,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.engine.resources.attn.dense</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Attention as one dense varlen pass: FlashAttention-3, or AITER on ROCm."""</span>
+<span></span><span class="sd">"""Attention as one dense varlen pass: FlashAttention-3, AITER on ROCm, or</span>
+<span class="sd">FlashInfer's ragged prefill where neither has a kernel for the GPU."""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">functools</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
@@ -967,9 +968,11 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionManager</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionManager</span><span class="p">,</span> <span class="n">EagerSlotKey</span><span class="p">,</span> <span class="n">workspace_bytes</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">AttnBackend</span><span class="p">,</span> <span class="n">refuse_context_only</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PrefixedPrefillWrapper</span><span class="p">,</span> <span class="n">_FlashInferRaggedPrefillBase</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">PagedKVConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">KVPlanOutputs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">StepContext</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
@@ -1020,9 +1023,42 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">_warn_dense_fallback</span><span class="p">(</span><span class="n">reason</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">fallback</span><span class="p">:</span> <span class="n">AttnBackend</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
         <span class="s2">"Attention backend 'dense' requested but no varlen kernel is "</span>
-        <span class="s2">"available (</span><span class="si">%s</span><span class="s2">); using the paged </span><span class="si">%r</span><span class="s2"> backend instead."</span><span class="p">,</span>
+        <span class="s2">"available (</span><span class="si">%s</span><span class="s2">); using the paged </span><span class="si">%r</span><span class="s2"> backend instead, though it also "</span>
+        <span class="s2">"runs on FlashInfer and cannot run where FlashInfer is unusable."</span><span class="p">,</span>
         <span class="n">reason</span><span class="p">,</span> <span class="n">fallback</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
     <span class="p">)</span>
+
+
+<span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_flashinfer_ragged_unavailable_reason</span><span class="p">(</span><span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""why the dense pass cannot run on FlashInfer's ragged prefill on ``device``"""</span>
+    <span class="k">if</span> <span class="n">device</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"FlashInfer needs a CUDA device, not </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">type</span><span class="si">}</span><span class="s2">"</span>
+    <span class="k">if</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">is_rocm</span><span class="p">():</span>
+        <span class="k">return</span> <span class="s2">"FlashInfer is not built for ROCm"</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>  <span class="c1"># noqa: F401</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span>
+    <span class="k">return</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_flashinfer_version</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
+    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+        <span class="k">return</span> <span class="s2">"(not importable)"</span>
+    <span class="k">return</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">__version__</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_dense_unavailable_reason</span><span class="p">(</span><span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""why neither FA3 (AITER on ROCm) nor FlashInfer can run the dense pass on</span>
+<span class="sd">    ``device``; None if either can"""</span>
+    <span class="n">fa3</span> <span class="o">=</span> <span class="n">_fa3_unavailable_reason</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">fa3</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="n">flashinfer</span> <span class="o">=</span> <span class="n">_flashinfer_ragged_unavailable_reason</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">return</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">flashinfer</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">fa3</span><span class="si">}</span><span class="s2">; </span><span class="si">{</span><span class="n">flashinfer</span><span class="si">}</span><span class="s2">"</span>
 
 
 <div class="viewcode-block" id="DenseSegment">
@@ -1032,7 +1068,10 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""(request, label) of dense plan; frozen prefix and fresh tokens"""</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">label</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">pages</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>  <span class="c1"># the prefix's pages, in stream order</span>
+    <span class="c1"># the prefix's pages, in stream order; a host tuple, moved to the device</span>
+    <span class="c1"># only when the prefix is gathered (a per-step H2D from pageable memory</span>
+    <span class="c1"># would sync the stream)</span>
+    <span class="n">pages</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="n">prefix_len</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">q_len</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">generation</span><span class="p">:</span> <span class="nb">int</span>  <span class="c1"># of the stream, at plan time; see CacheStream.generation</span></div>
@@ -1045,11 +1084,13 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">DensePlan</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""dense plan layout. once per step and read by each layer `run`"""</span>
     <span class="n">segments</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">DenseSegment</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
-    <span class="n">cu_q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
-    <span class="n">cu_k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
+    <span class="n">cu_q</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">cu_k</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="n">max_q</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">max_k</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span></div>
+    <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span>
+    <span class="c1"># the wrapper this layout was planned into</span>
+    <span class="n">wrapper</span><span class="p">:</span> <span class="n">PrefixedPrefillWrapper</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1057,17 +1098,21 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">_GatheredPrefix</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""One stream's gathered prefix, per layer, tagged with what it was read</span>
 <span class="sd">    from so a stale gather cannot be served."""</span>
-<span class="w">    </span><span class="sd">"""gathered prefix of one stream per-layer. tagged with what read from so stale cannot serve"""</span>
     <span class="n">generation</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">length</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">layers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># the prefix's page index on the device: one H2D per gather, not per layer</span>
+    <span class="n">pages</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 
 <div class="viewcode-block" id="DenseAttentionManager">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DenseAttentionManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">DenseAttentionManager</span><span class="p">(</span><span class="n">AttentionManager</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous</span>
-<span class="sd">    [frozen prefix | fresh tokens] sequence.</span>
+<span class="w">    </span><span class="sd">"""Attention as one dense varlen pass over a contiguous</span>
+<span class="sd">    [frozen prefix | fresh tokens] sequence, through a prefixed ragged wrapper:</span>
+<span class="sd">    FA3's (AITER on ROCm), or FlashInfer's where FA3 has no kernel for the GPU</span>
+<span class="sd">    (``ragged.base.dense_or_flashinfer`` picks; ``AttentionManager.build``</span>
+<span class="sd">    passes the class).</span>
 
 <span class="sd">    For a workload that recomputes every one of its K/V every step and only</span>
 <span class="sd">    reuses a small frozen prefix — diffusion denoise, where the prefix is the</span>
@@ -1105,6 +1150,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
         <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
         <span class="n">kv_config</span><span class="p">:</span> <span class="n">PagedKVConfig</span><span class="p">,</span>
+        <span class="n">wrapper_class</span><span class="p">:</span> <span class="nb">type</span><span class="p">[</span><span class="n">PrefixedPrefillWrapper</span><span class="p">],</span>
+        <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span> <span class="o">=</span> <span class="n">kv_cache</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
@@ -1117,6 +1164,36 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># (request, label) -&gt; the prefix gathered out of the pages</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_cache</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="n">_GatheredPrefix</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_class</span> <span class="o">=</span> <span class="n">wrapper_class</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_wrappers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">EagerSlotKey</span><span class="p">,</span> <span class="n">PrefixedPrefillWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
+            <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
+            <span class="n">head_dim</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+            <span class="n">q_data_type</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_on_flashinfer</span> <span class="o">=</span> <span class="nb">issubclass</span><span class="p">(</span><span class="n">wrapper_class</span><span class="p">,</span> <span class="n">_FlashInferRaggedPrefillBase</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_flashinfer_backend</span> <span class="o">=</span> <span class="n">flashinfer_backend</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_flashinfer</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_flashinfer</span><span class="p">:</span>
+            <span class="c1"># One workspace for every wrapper, taken now rather than at the first</span>
+            <span class="c1"># plan: it is scratch during `run` only (a plan writes the wrapper's</span>
+            <span class="c1"># own buffers), and the runs are serialized on the node's stream.</span>
+            <span class="n">workspace</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">workspace_bytes</span><span class="p">(),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kwargs</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">workspace_buffer</span><span class="o">=</span><span class="n">workspace</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">flashinfer_backend</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_check_flashinfer_backend</span><span class="p">()</span>
+
+<div class="viewcode-block" id="DenseAttentionManager.fingerprint">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DenseAttentionManager.fingerprint">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+        <span class="c1"># the kernel, not just the class: FA3 and each FlashInfer backend</span>
+        <span class="c1"># differ in the last bits</span>
+        <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_class</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_flashinfer_backend</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="DenseAttentionManager.depends_on">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DenseAttentionManager.depends_on">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">depends_on</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1128,6 +1205,40 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">can_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="kc">False</span></div>
 
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">force_double_buffer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># FlashInfer's plan stages its schedule in a pinned buffer per wrapper</span>
+        <span class="c1"># and H2Ds it on the stream, so each slot keeps its own wrapper</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_flashinfer</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check_flashinfer_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Plan and run a tiny layout on the configured kernel, so a backend</span>
+<span class="sd">        this GPU or FlashInfer build cannot run stops the server at startup</span>
+<span class="sd">        instead of failing every request."""</span>
+        <span class="n">cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_class</span><span class="p">(</span><span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kwargs</span><span class="p">)</span>
+            <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">16</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">32</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">))</span>
+            <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
+            <span class="n">kv</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
+            <span class="n">wrapper</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">kv</span><span class="p">,</span> <span class="n">kv</span><span class="p">)</span>
+            <span class="c1"># a launch failure is reported asynchronously</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+            <span class="n">capability</span> <span class="o">=</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">cuda_capability</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cuda"</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"flashinfer_backend=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_flashinfer_backend</span><span class="si">!r}</span><span class="s2"> cannot run the dense attention "</span>
+                <span class="sa">f</span><span class="s2">"on this GPU (compute capability </span><span class="si">{</span><span class="s1">'.'</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="nb">map</span><span class="p">(</span><span class="nb">str</span><span class="p">,</span><span class="w"> </span><span class="n">capability</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="p">()))</span><span class="si">}</span><span class="s2">) with "</span>
+                <span class="sa">f</span><span class="s2">"FlashInfer </span><span class="si">{</span><span class="n">_flashinfer_version</span><span class="p">()</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PrefixedPrefillWrapper</span><span class="p">:</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="n">EagerSlotKey</span><span class="p">(</span><span class="n">label</span><span class="o">=</span><span class="n">label</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">)</span>
+        <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrappers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">wrapper</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrappers</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_class</span><span class="p">(</span><span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kwargs</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">wrapper</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">requires_kv_write</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1176,12 +1287,12 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_current_plans</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">plan_label</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_plan</span><span class="p">(</span><span class="n">kv_out</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">)</span>
+            <span class="n">plan_label</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_plan</span><span class="p">(</span><span class="n">kv_out</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">plan_label</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">))</span>
             <span class="k">for</span> <span class="n">plan_label</span><span class="p">,</span> <span class="n">kv_out</span> <span class="ow">in</span> <span class="n">plan_outputs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
         <span class="p">}</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_build_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv_out</span><span class="p">:</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">DensePlan</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_build_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv_out</span><span class="p">:</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">wrapper</span><span class="p">:</span> <span class="n">PrefixedPrefillWrapper</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">DensePlan</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The per-segment gather layout plus the cumulative lengths one varlen</span>
 <span class="sd">        kernel needs, in the packed order the KV plan defined."""</span>
         <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">page_size</span>
@@ -1200,9 +1311,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">segments</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">DenseSegment</span><span class="p">(</span>
                 <span class="n">request_id</span><span class="o">=</span><span class="n">view</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span>
                 <span class="n">label</span><span class="o">=</span><span class="n">view</span><span class="o">.</span><span class="n">label</span><span class="p">,</span>
-                <span class="n">pages</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
-                    <span class="n">view</span><span class="o">.</span><span class="n">page_idxs</span><span class="p">[:</span><span class="n">n_pages</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span>
-                <span class="p">),</span>
+                <span class="n">pages</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">view</span><span class="o">.</span><span class="n">page_idxs</span><span class="p">[:</span><span class="n">n_pages</span><span class="p">]),</span>
                 <span class="n">prefix_len</span><span class="o">=</span><span class="n">prefix_len</span><span class="p">,</span>
                 <span class="n">q_len</span><span class="o">=</span><span class="n">view</span><span class="o">.</span><span class="n">to_compute</span><span class="p">,</span>
                 <span class="n">generation</span><span class="o">=</span><span class="n">view</span><span class="o">.</span><span class="n">generation</span><span class="p">,</span>
@@ -1212,13 +1321,23 @@ window.runMermaid = runMermaid;</script>
             <span class="n">max_q</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_q</span><span class="p">,</span> <span class="n">view</span><span class="o">.</span><span class="n">to_compute</span><span class="p">)</span>
             <span class="n">max_k</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_k</span><span class="p">,</span> <span class="n">view</span><span class="o">.</span><span class="n">length</span><span class="p">)</span>
 
+        <span class="c1"># Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them</span>
+        <span class="c1"># non-blocking (from pageable memory that copy would sync the stream),</span>
+        <span class="c1"># FlashInfer's plan reads them on the host.</span>
+        <span class="n">pin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span>
+        <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_q</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">pin</span><span class="p">),</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_k</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">pin</span><span class="p">),</span>
+            <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span>
+        <span class="p">)</span>
         <span class="k">return</span> <span class="n">DensePlan</span><span class="p">(</span>
             <span class="n">segments</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">segments</span><span class="p">),</span>
-            <span class="n">cu_q</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_q</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">),</span>
-            <span class="n">cu_k</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_k</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">),</span>
+            <span class="n">cu_q</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">cu_q</span><span class="p">),</span>
+            <span class="n">cu_k</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">cu_k</span><span class="p">),</span>
             <span class="n">max_q</span><span class="o">=</span><span class="n">max_q</span><span class="p">,</span>
             <span class="n">max_k</span><span class="o">=</span><span class="n">max_k</span><span class="p">,</span>
             <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span>
+            <span class="n">wrapper</span><span class="o">=</span><span class="n">wrapper</span><span class="p">,</span>
         <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_prefix_kv</span><span class="p">(</span>
@@ -1242,8 +1361,10 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="n">cached</span>
 
         <span class="n">cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span>
+        <span class="k">if</span> <span class="n">entry</span><span class="o">.</span><span class="n">pages</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">entry</span><span class="o">.</span><span class="n">pages</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">pages</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">kv_cache_layer</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="c1"># [n_pages, 2, page_size, num_kv_heads, head_dim] -&gt; the prefix's rows</span>
-        <span class="n">pages</span> <span class="o">=</span> <span class="n">kv_cache_layer</span><span class="p">[</span><span class="n">segment</span><span class="o">.</span><span class="n">pages</span><span class="p">]</span>
+        <span class="n">pages</span> <span class="o">=</span> <span class="n">kv_cache_layer</span><span class="p">[</span><span class="n">entry</span><span class="o">.</span><span class="n">pages</span><span class="p">]</span>
         <span class="n">k_pref</span> <span class="o">=</span> <span class="n">pages</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
         <span class="n">v_pref</span> <span class="o">=</span> <span class="n">pages</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
         <span class="c1"># the gather already copied; the slice keeps the trailing slots of the</span>
@@ -1292,19 +1413,9 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">key</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">k_parts</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
         <span class="n">val</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">v_parts</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="n">key</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
-            <span class="n">q</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">key</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
-
-        <span class="n">out</span> <span class="o">=</span> <span class="n">flash_attn_varlen_func</span><span class="p">(</span>
-            <span class="n">q</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">val</span><span class="p">,</span>
-            <span class="n">plan</span><span class="o">.</span><span class="n">cu_q</span><span class="p">,</span> <span class="n">plan</span><span class="o">.</span><span class="n">cu_k</span><span class="p">,</span> <span class="n">plan</span><span class="o">.</span><span class="n">max_q</span><span class="p">,</span> <span class="n">plan</span><span class="o">.</span><span class="n">max_k</span><span class="p">,</span>
-            <span class="c1"># a causal plan aligns the query block to the end of the key</span>
-            <span class="c1"># sequence, so the fresh tokens see the whole prefix; only</span>
-            <span class="c1"># non-causal generation attention is exercised today</span>
-            <span class="n">causal</span><span class="o">=</span><span class="n">plan</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
-        <span class="p">)</span>
-        <span class="k">return</span> <span class="n">out</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">)</span> <span class="k">else</span> <span class="n">out</span></div>
+        <span class="k">return</span> <span class="n">plan</span><span class="o">.</span><span class="n">wrapper</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">val</span><span class="p">)</span></div>
 </div>
+
 
 </pre></div>
 

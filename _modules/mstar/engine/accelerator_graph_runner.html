@@ -978,6 +978,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">CapturedGraph</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">DETERMINISTIC_COMPILE_MODE</span><span class="p">,</span>
     <span class="n">AcceleratorGraphConfig</span><span class="p">,</span>
     <span class="n">AcceleratorGraphConfigType</span><span class="p">,</span>
     <span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">,</span>
@@ -1033,6 +1034,30 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="nd">@cache</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_has_deterministic_mode</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">torch._inductor.config</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">inductor_config</span>
+
+    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">inductor_config</span><span class="p">,</span> <span class="s2">"deterministic"</span><span class="p">):</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+        <span class="s2">"torch </span><span class="si">%s</span><span class="s2"> has no Inductor deterministic mode; compiles that ask for it time "</span>
+        <span class="s2">"their kernels instead, so their output can differ between server processes"</span><span class="p">,</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="kc">False</span>
+
+
+<div class="viewcode-block" id="deterministic_inductor_options">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.deterministic_inductor_options">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">deterministic_inductor_options</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Inductor options for its deterministic mode (see</span>
+<span class="sd">    ``DETERMINISTIC_COMPILE_MODE``), for a compile that sets its own options;</span>
+<span class="sd">    empty, with a warning, on a torch without the mode."""</span>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">"deterministic"</span><span class="p">:</span> <span class="kc">True</span><span class="p">}</span> <span class="k">if</span> <span class="n">_has_deterministic_mode</span><span class="p">()</span> <span class="k">else</span> <span class="p">{}</span></div>
+
+
+
 <div class="viewcode-block" id="compile_kwargs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.compile_kwargs">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">compile_kwargs</span><span class="p">(</span><span class="n">config_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
@@ -1042,6 +1067,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"fullgraph"</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">"dynamic"</span><span class="p">:</span> <span class="kc">False</span><span class="p">}</span>
     <span class="k">if</span> <span class="n">config_mode</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">{</span><span class="o">**</span><span class="n">kwargs</span><span class="p">,</span> <span class="o">**</span><span class="n">COMPILE_LEVELS</span><span class="p">[</span><span class="n">compile_level</span><span class="p">()]}</span>
+    <span class="k">if</span> <span class="n">config_mode</span> <span class="o">==</span> <span class="n">DETERMINISTIC_COMPILE_MODE</span><span class="p">:</span>
+        <span class="n">options</span> <span class="o">=</span> <span class="n">deterministic_inductor_options</span><span class="p">()</span>
+        <span class="k">return</span> <span class="p">{</span><span class="o">**</span><span class="n">kwargs</span><span class="p">,</span> <span class="s2">"options"</span><span class="p">:</span> <span class="n">options</span><span class="p">}</span> <span class="k">if</span> <span class="n">options</span> <span class="k">else</span> <span class="n">kwargs</span>
     <span class="c1"># "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning</span>
     <span class="k">if</span> <span class="n">config_mode</span> <span class="o">!=</span> <span class="s2">"default"</span><span class="p">:</span>
         <span class="n">kwargs</span><span class="p">[</span><span class="s2">"mode"</span><span class="p">]</span> <span class="o">=</span> <span class="n">config_mode</span>

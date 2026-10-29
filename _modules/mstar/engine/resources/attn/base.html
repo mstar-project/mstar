@@ -1019,8 +1019,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="AttentionManager.fingerprint">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager.fingerprint">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
-        <span class="c1"># the class, not the declared backend: `build` degrades dense to paged</span>
-        <span class="c1"># where the FA3 kernel is unusable, and the two do not agree bit for bit</span>
+        <span class="c1"># the class, not the declared backend: `build` moves dense to another</span>
+        <span class="c1"># kernel where the FA3 one is unusable, and they do not agree bit for bit</span>
         <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span></div>
 
 
@@ -1057,26 +1057,34 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">kv_config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">DENSE</span><span class="p">:</span>
-            <span class="c1"># A dense backend needs the FlashAttention-3 kernel; where the</span>
-            <span class="c1"># wheel does not match the installed torch/CUDA build or has no</span>
-            <span class="c1"># kernel for the GPU, degrade to the paged backend AUTO picks</span>
-            <span class="c1"># rather than failing to serve.</span>
-            <span class="c1"># The two are drop-in for each other: the step declaration is</span>
+            <span class="c1"># A dense backend runs on FlashAttention-3 (AITER on ROCm). Where</span>
+            <span class="c1"># that has no kernel for the GPU or does not import, the same pass</span>
+            <span class="c1"># runs on FlashInfer's ragged prefill, and where FlashInfer cannot</span>
+            <span class="c1"># run either it degrades to the paged backend AUTO picks rather</span>
+            <span class="c1"># than failing to serve.</span>
+            <span class="c1"># All three are drop-in for each other: the step declaration is</span>
             <span class="c1"># identical (see DenseAttentionManager) and `requires_kv_write`</span>
             <span class="c1"># tells the layer which one it is talking to.</span>
             <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.dense</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
                 <span class="n">DenseAttentionManager</span><span class="p">,</span>
-                <span class="n">_fa3_unavailable_reason</span><span class="p">,</span>
+                <span class="n">_dense_unavailable_reason</span><span class="p">,</span>
                 <span class="n">_warn_dense_fallback</span><span class="p">,</span>
             <span class="p">)</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">dense_or_flashinfer</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.dense_wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="n">DensePrefixedPrefillWrapper</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="n">FlashInferPrefixedPrefillWrapper</span>
 
-            <span class="n">reason</span> <span class="o">=</span> <span class="n">_fa3_unavailable_reason</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">reason</span> <span class="o">=</span> <span class="n">_dense_unavailable_reason</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">reason</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="n">DenseAttentionManager</span><span class="p">(</span>
                     <span class="n">kv_cache</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">,</span>
                     <span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
                     <span class="n">kv_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
+                    <span class="n">wrapper_class</span><span class="o">=</span><span class="n">dense_or_flashinfer</span><span class="p">(</span>
+                        <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">DensePrefixedPrefillWrapper</span><span class="p">,</span> <span class="n">FlashInferPrefixedPrefillWrapper</span><span class="p">,</span> <span class="s2">"Attention"</span><span class="p">,</span>
+                    <span class="p">),</span>
+                    <span class="n">flashinfer_backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
                 <span class="p">)</span>
             <span class="n">backend</span> <span class="o">=</span> <span class="n">resolve_attn_backend</span><span class="p">(</span><span class="n">AttnBackend</span><span class="o">.</span><span class="n">AUTO</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
             <span class="n">_warn_dense_fallback</span><span class="p">(</span><span class="n">reason</span><span class="p">,</span> <span class="n">backend</span><span class="p">)</span>
@@ -1203,6 +1211,14 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="workspace_bytes">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.workspace_bytes">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">workspace_bytes</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Size of one FlashInfer workspace buffer (``MSTAR_WORKSPACE_BUFFER_MB``)."""</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_WORKSPACE_BUFFER_MB"</span><span class="p">,</span> <span class="s2">"512"</span><span class="p">))</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span></div>
+
+
+
 <div class="viewcode-block" id="WorkspacePool">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.WorkspacePool">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">WorkspacePool</span><span class="p">:</span>
@@ -1214,9 +1230,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span>
-            <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_WORKSPACE_BUFFER_MB"</span><span class="p">,</span> <span class="s2">"512"</span><span class="p">)</span>
-        <span class="p">)</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_size</span> <span class="o">=</span> <span class="n">workspace_bytes</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_buffers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
 <div class="viewcode-block" id="WorkspacePool.get">

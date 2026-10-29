@@ -13,6 +13,7 @@ mstar.model.cosmos3.submodules
 
    .. autosummary::
    
+      denoise_compile_kwargs
       frame_tokens
       latent_frames
       native_flow_sigmas

@@ -693,6 +693,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.captured_page_capacity"><code class="docutils literal notranslate"><span class="pre">captured_page_capacity()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.resolve_attn_backend"><code class="docutils literal notranslate"><span class="pre">resolve_attn_backend()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.workspace_bytes"><code class="docutils literal notranslate"><span class="pre">workspace_bytes()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -719,6 +720,9 @@ naming a backend in a spec does not load the others.</p>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.resolve_attn_backend" title="mstar.engine.resources.attn.base.resolve_attn_backend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_attn_backend</span></code></a>(backend, device)</p></td>
 <td><p>The concrete backend for <code class="docutils literal notranslate"><span class="pre">backend</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.workspace_bytes" title="mstar.engine.resources.attn.base.workspace_bytes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">workspace_bytes</span></code></a>()</p></td>
+<td><p>Size of one FlashInfer workspace buffer (<code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -938,6 +942,17 @@ now. A backend named in the spec or YAML is returned as is.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.workspace_bytes">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.base.</span></span><span class="sig-name descname"><span class="pre">workspace_bytes</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#workspace_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.workspace_bytes" title="Link to this definition">#</a></dt>
+<dd><p>Size of one FlashInfer workspace buffer (<code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -1012,6 +1027,7 @@ now. A backend named in the spec or YAML is returned as is.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.captured_page_capacity"><code class="docutils literal notranslate"><span class="pre">captured_page_capacity()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.resolve_attn_backend"><code class="docutils literal notranslate"><span class="pre">resolve_attn_backend()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.workspace_bytes"><code class="docutils literal notranslate"><span class="pre">workspace_bytes()</span></code></a></li>
 </ul>
   </nav></div>
 

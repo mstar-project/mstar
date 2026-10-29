@@ -969,13 +969,20 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span>
 
+<span class="c1"># A compile mode of the engine's own rather than torch.compile's: Inductor's</span>
+<span class="c1"># defaults in its deterministic mode, which picks each kernel's config by rule</span>
+<span class="c1"># instead of timing candidates on the device, so every process compiles the</span>
+<span class="c1"># same kernels and one input gives one output from any server. See</span>
+<span class="c1"># ``accelerator_graph_runner.compile_kwargs``.</span>
+<span class="n">DETERMINISTIC_COMPILE_MODE</span> <span class="o">=</span> <span class="s2">"deterministic"</span>
+
 
 <div class="viewcode-block" id="check_compile_mode">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.check_compile_mode">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">check_compile_mode</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""A capture config's ``compile_mode``, refused at build rather than at capture,</span>
 <span class="sd">    where the per-capture fallback would serve the bucket eager."""</span>
-    <span class="k">if</span> <span class="n">mode</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">"default"</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">mode</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"default"</span><span class="p">,</span> <span class="n">DETERMINISTIC_COMPILE_MODE</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">mode</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">mode</span><span class="p">:</span>
         <span class="c1"># torch.compile takes a falsy mode for "default"</span>

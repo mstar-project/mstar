@@ -998,6 +998,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
 
+<span class="n">DENOISE_COMPILE_MODES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"deterministic"</span><span class="p">,</span> <span class="s2">"default"</span><span class="p">,</span> <span class="s2">"level"</span><span class="p">)</span>
+
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">:</span> <span class="nb">type</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Keep only the dict entries that name a field on the dataclass ``cls``."""</span>
@@ -1376,10 +1378,21 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Run the streaming decode on channels-last weights and activations,</span>
     <span class="c1"># cuDNN's native conv3d layout: no per-conv layout conversion kernels.</span>
     <span class="c1"># Same math; bf16 output differs from the default layout only by rounding.</span>
-    <span class="c1"># The streaming node then loads its own copy of the VAE decoder instead of</span>
-    <span class="c1"># sharing the whole-clip decoder's, which keeps the default layout: a fixed</span>
-    <span class="c1"># ~1.03 GiB of bf16 weights (Wan2.2 VAE) in a process hosting both nodes.</span>
+    <span class="c1"># The decoders that convert share one decoder-only copy of the VAE per</span>
+    <span class="c1"># device (~1.03 GiB of bf16 weights for Wan2.2): the streaming node and a</span>
+    <span class="c1"># chained window's head here, the whole-clip decoder under</span>
+    <span class="c1"># ``vae_decode_fast``. A node with its switch off shares the default-layout</span>
+    <span class="c1"># instance instead.</span>
     <span class="n">vae_decode_channels_last</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># Decode a video clip (the non-windowed video walks) with the shared Wan</span>
+    <span class="c1"># VAE decoder: the same per-latent decoder calls as ``vae.decode`` from an</span>
+    <span class="c1"># empty cache, channels-last, in the decode dtype (fp32 below cuDNN 9.16),</span>
+    <span class="c1"># on the decoder-only copy of the VAE (~1 GiB in bf16). The first two calls</span>
+    <span class="c1"># run eager, every later one compiled in Inductor's deterministic mode. An</span>
+    <span class="c1"># image (one latent) keeps the compiled stock ``vae.decode`` on the same</span>
+    <span class="c1"># copy, faster for a single frame. False decodes everything with the</span>
+    <span class="c1"># compiled stock ``vae.decode``.</span>
+    <span class="n">vae_decode_fast</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># Let cuDNN time its conv algorithms for each new streaming-decode shape</span>
     <span class="c1"># (once, then cached) instead of its heuristic pick. Same math, but the</span>
     <span class="c1"># timed pick can differ between server launches, and so can the frames</span>
@@ -1483,6 +1496,23 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># attention op). Always a win in serving; the parity tests set False to keep</span>
     <span class="c1"># their bit-exact bounds on the eager step.</span>
     <span class="n">compile_denoise</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># How the denoise step compiles, as the engine's compile modes of the same</span>
+    <span class="c1"># names (``accelerator_graph_runner.compile_kwargs``): "deterministic" is</span>
+    <span class="c1"># Inductor's defaults in its deterministic mode (kernel configs picked by</span>
+    <span class="c1"># rule, so every server process runs the same kernels and one seed gives</span>
+    <span class="c1"># one video); "default" is torch.compile's defaults, which time some kernel</span>
+    <span class="c1"># configs on first use; "level" takes the ``mstar serve -O`` level's</span>
+    <span class="c1"># options (-O2: max-autotune).</span>
+    <span class="n">denoise_compile_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"deterministic"</span>
+    <span class="c1"># Compile the cross-request denoise step (two or more requests in one</span>
+    <span class="c1"># forward) too, with the same mode: the video, image and sound steps; the</span>
+    <span class="c1"># action step (``denoise_step_action_batched``) runs eager. Eager, the</span>
+    <span class="c1"># norms, rotary and residuals cost about 80 ms of GPU per extra row at</span>
+    <span class="c1"># 832x480x121 on a B300. Only its layer stack compiles, once, at startup,</span>
+    <span class="c1"># with the pack length dynamic, so no batch size or mix of resolutions</span>
+    <span class="c1"># compiles mid-traffic; the per-request patchify, rotary tables and</span>
+    <span class="c1"># unpatchify run eager.</span>
+    <span class="n">compile_denoise_batched</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># torch.compile the reasoner's captured decode step before the CUDA-graph</span>
     <span class="c1"># capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the</span>
     <span class="c1"># norms', rotary's and residuals' pointwise pieces; fused, the step runs</span>
@@ -1533,7 +1563,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        reinterpret silently: a non-boolean switch (a yaml ``"false"`` is</span>
 <span class="sd">        truthy), a negative warm-stream cap (read as no cap), or more latents</span>
 <span class="sd">        per call than the default window holds (read as one call per window)."""</span>
-        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"windowed_decode_warm_cache"</span><span class="p">,</span> <span class="s2">"vae_decode_channels_last"</span><span class="p">,</span> <span class="s2">"vae_decode_cudnn_benchmark"</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"windowed_decode_warm_cache"</span><span class="p">,</span> <span class="s2">"vae_decode_channels_last"</span><span class="p">,</span> <span class="s2">"vae_decode_cudnn_benchmark"</span><span class="p">,</span>
+                     <span class="s2">"vae_decode_fast"</span><span class="p">):</span>
             <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cosmos3 </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be true or false, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
@@ -1549,6 +1580,22 @@ window.runMermaid = runMermaid;</script>
                 <span class="sa">f</span><span class="s2">"Cosmos3 windowed_decode_latents_per_call=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">windowed_decode_latents_per_call</span><span class="si">}</span><span class="s2"> is more "</span>
                 <span class="sa">f</span><span class="s2">"than the </span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2"> latent frames of the smaller default window (</span><span class="si">{</span><span class="n">default_frames</span><span class="si">}</span><span class="s2"> frames); "</span>
                 <span class="s2">"0 decodes each window's new latents in one call."</span>
+            <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="Cosmos3Config.check_compile">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3Config.check_compile">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_compile</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Reject compile settings that would be read as something else: a</span>
+<span class="sd">        non-boolean switch (a yaml ``"false"`` is truthy) or an unknown mode."""</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"compile_denoise"</span><span class="p">,</span> <span class="s2">"compile_denoise_batched"</span><span class="p">):</span>
+            <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cosmos3 </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be true or false, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">denoise_compile_mode</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">DENOISE_COMPILE_MODES</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Cosmos3 denoise_compile_mode must be one of </span><span class="si">{</span><span class="n">DENOISE_COMPILE_MODES</span><span class="si">}</span><span class="s2">, "</span>
+                <span class="sa">f</span><span class="s2">"got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">denoise_compile_mode</span><span class="si">!r}</span><span class="s2">."</span>
             <span class="p">)</span></div>
 
 

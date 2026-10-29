@@ -19,6 +19,7 @@ mstar.engine.accelerator\_graph\_runner
       capture_with_static_outputs
       compile_kwargs
       compile_level
+      deterministic_inductor_options
       dummy_metadata
       dummy_rid_handle
       dummy_rid_name

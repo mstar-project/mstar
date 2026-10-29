@@ -671,6 +671,8 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.can_capture"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.can_capture()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.depends_on"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.fingerprint()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.force_double_buffer"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.force_double_buffer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.ingest_request"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.plan"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.remove_request"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.remove_request()</span></code></a></li>
@@ -686,6 +688,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DensePlan.max_k"><code class="docutils literal notranslate"><span class="pre">DensePlan.max_k</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DensePlan.max_q"><code class="docutils literal notranslate"><span class="pre">DensePlan.max_q</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DensePlan.segments"><code class="docutils literal notranslate"><span class="pre">DensePlan.segments</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DensePlan.wrapper"><code class="docutils literal notranslate"><span class="pre">DensePlan.wrapper</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseSegment"><code class="docutils literal notranslate"><span class="pre">DenseSegment</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -710,12 +713,13 @@
                   
   <section id="module-mstar.engine.resources.attn.dense">
 <span id="mstar-engine-resources-attn-dense"></span><h1>mstar.engine.resources.attn.dense<a class="headerlink" href="#module-mstar.engine.resources.attn.dense" title="Link to this heading">#</a></h1>
-<p>Attention as one dense varlen pass: FlashAttention-3, or AITER on ROCm.</p>
+<p>Attention as one dense varlen pass: FlashAttention-3, AITER on ROCm, or
+FlashInfer’s ragged prefill where neither has a kernel for the GPU.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.dense.DenseAttentionManager" title="mstar.engine.resources.attn.dense.DenseAttentionManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DenseAttentionManager</span></code></a>(kv_cache, device, ...)</p></td>
-<td><p>Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous [frozen prefix | fresh tokens] sequence.</p></td>
+<td><p>Attention as one dense varlen pass over a contiguous [frozen prefix | fresh tokens] sequence, through a prefixed ragged wrapper: FA3's (AITER on ROCm), or FlashInfer's where FA3 has no kernel for the GPU (<code class="docutils literal notranslate"><span class="pre">ragged.base.dense_or_flashinfer</span></code> picks; <code class="docutils literal notranslate"><span class="pre">AttentionManager.build</span></code> passes the class).</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.dense.DensePlan" title="mstar.engine.resources.attn.dense.DensePlan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DensePlan</span></code></a>(segments, cu_q, cu_k, max_q, ...)</p></td>
 <td><p>dense plan layout.</p></td>
@@ -728,10 +732,13 @@
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DenseAttentionManager">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.dense.</span></span><span class="sig-name descname"><span class="pre">DenseAttentionManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/dense.html#DenseAttentionManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.dense.DenseAttentionManager" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.dense.</span></span><span class="sig-name descname"><span class="pre">DenseAttentionManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">wrapper_class</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flashinfer_backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/dense.html#DenseAttentionManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.dense.DenseAttentionManager" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager" title="mstar.engine.resources.attn.base.AttentionManager"><code class="xref py py-class docutils literal notranslate"><span class="pre">AttentionManager</span></code></a></p>
-<p>Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous
-[frozen prefix | fresh tokens] sequence.</p>
+<p>Attention as one dense varlen pass over a contiguous
+[frozen prefix | fresh tokens] sequence, through a prefixed ragged wrapper:
+FA3’s (AITER on ROCm), or FlashInfer’s where FA3 has no kernel for the GPU
+(<code class="docutils literal notranslate"><span class="pre">ragged.base.dense_or_flashinfer</span></code> picks; <code class="docutils literal notranslate"><span class="pre">AttentionManager.build</span></code>
+passes the class).</p>
 <p>For a workload that recomputes every one of its K/V every step and only
 reuses a small frozen prefix — diffusion denoise, where the prefix is the
 text conditioning — the paged path’s per-step full-buffer K/V write and
@@ -764,6 +771,8 @@ zero-span label yields no packing for any resource that derives from it
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
 <li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a>)</p></li>
 <li><p><strong>kv_config</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PagedKVConfig" title="mstar.engine.resources.kv.config.PagedKVConfig"><em>PagedKVConfig</em></a>)</p></li>
+<li><p><strong>wrapper_class</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><em>type</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper"><em>PrefixedPrefillWrapper</em></a><em>]</em>)</p></li>
+<li><p><strong>flashinfer_backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -781,6 +790,38 @@ zero-span label yields no packing for any resource that derives from it
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DenseAttentionManager.depends_on">
 <span class="sig-name descname"><span class="pre">depends_on</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/dense.html#DenseAttentionManager.depends_on"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.depends_on" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DenseAttentionManager.fingerprint">
+<span class="sig-name descname"><span class="pre">fingerprint</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/dense.html#DenseAttentionManager.fingerprint"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.fingerprint" title="Link to this definition">#</a></dt>
+<dd><p>What this resource contributes to the prefix cache’s root.</p>
+<p>Everything a stored page depends on beyond its own tokens. None leaves
+the resource out of the root, which is right only where it cannot
+change what a page holds.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DenseAttentionManager.force_double_buffer">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">force_double_buffer</span></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.force_double_buffer" title="Link to this definition">#</a></dt>
+<dd><p>Whether this resource needs double-buffering even off the pre-plan path.</p>
+<p>A resource that stages a step’s layout into a reused host buffer and
+issues a non-blocking H2D into a graph-read device buffer has a race the
+moment the CPU runs ahead of the GPU: plan(N+1) can overwrite the buffer
+before step N’s DMA has retired, and the replay attends with N+1’s data.
+The buffer need not be ours — FlashInfer’s <code class="docutils literal notranslate"><span class="pre">plan</span></code> holds one per
+wrapper, which is why the attention managers key theirs per slot.
+The main runner already double-buffers whenever a resource
+<code class="docutils literal notranslate"><span class="pre">supports_preplan</span></code>; this flag extends that to a runner that has no
+pre-plan path but still replays such a resource — notably the piecewise
+runner — and makes <code class="docutils literal notranslate"><span class="pre">_exec_per_request</span></code> fence before it reuses a slot,
+since its sub-steps all run inside one step. Off by default; a resource
+opts in only if it has this hazard.</p>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DenseAttentionManager.ingest_request">
@@ -877,18 +918,19 @@ written to the pages.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DensePlan">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.dense.</span></span><span class="sig-name descname"><span class="pre">DensePlan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">segments</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cu_q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cu_k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">causal</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/dense.html#DensePlan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.dense.DensePlan" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.dense.</span></span><span class="sig-name descname"><span class="pre">DensePlan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">segments</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cu_q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cu_k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">causal</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">wrapper</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/dense.html#DensePlan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.dense.DensePlan" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>dense plan layout. once per step and read by each layer <cite>run</cite></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>segments</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.attn.dense.DenseSegment" title="mstar.engine.resources.attn.dense.DenseSegment"><em>DenseSegment</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
-<li><p><strong>cu_q</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>cu_k</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>cu_q</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>cu_k</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
 <li><p><strong>max_q</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>max_k</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>causal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>wrapper</strong> (<a class="reference internal" href="mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper"><em>PrefixedPrefillWrapper</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -899,12 +941,12 @@ written to the pages.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DensePlan.cu_k">
-<span class="sig-name descname"><span class="pre">cu_k</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DensePlan.cu_k" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">cu_k</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DensePlan.cu_k" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DensePlan.cu_q">
-<span class="sig-name descname"><span class="pre">cu_q</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DensePlan.cu_q" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">cu_q</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DensePlan.cu_q" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -922,6 +964,11 @@ written to the pages.</p>
 <span class="sig-name descname"><span class="pre">segments</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.attn.dense.DenseSegment" title="mstar.engine.resources.attn.dense.DenseSegment"><span class="pre">DenseSegment</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DensePlan.segments" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DensePlan.wrapper">
+<span class="sig-name descname"><span class="pre">wrapper</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper"><span class="pre">PrefixedPrefillWrapper</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DensePlan.wrapper" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -934,7 +981,7 @@ written to the pages.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>pages</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
 <li><p><strong>prefix_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>q_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>generation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
@@ -953,7 +1000,7 @@ written to the pages.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DenseSegment.pages">
-<span class="sig-name descname"><span class="pre">pages</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DenseSegment.pages" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">pages</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.attn.dense.DenseSegment.pages" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1025,6 +1072,8 @@ written to the pages.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.can_capture"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.can_capture()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.depends_on"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.fingerprint()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.force_double_buffer"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.force_double_buffer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.ingest_request"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.plan"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseAttentionManager.remove_request"><code class="docutils literal notranslate"><span class="pre">DenseAttentionManager.remove_request()</span></code></a></li>
@@ -1040,6 +1089,7 @@ written to the pages.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DensePlan.max_k"><code class="docutils literal notranslate"><span class="pre">DensePlan.max_k</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DensePlan.max_q"><code class="docutils literal notranslate"><span class="pre">DensePlan.max_q</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DensePlan.segments"><code class="docutils literal notranslate"><span class="pre">DensePlan.segments</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DensePlan.wrapper"><code class="docutils literal notranslate"><span class="pre">DensePlan.wrapper</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.dense.DenseSegment"><code class="docutils literal notranslate"><span class="pre">DenseSegment</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

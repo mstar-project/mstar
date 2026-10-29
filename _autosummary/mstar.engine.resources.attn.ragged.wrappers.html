@@ -668,8 +668,13 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferPrefixedPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefixedPrefillWrapper</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedCrossPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedCrossPrefillWrapper</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedPrefillWrapper</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">PrefixedPrefillWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper.plan"><code class="docutils literal notranslate"><span class="pre">PrefixedPrefillWrapper.plan()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.RaggedCrossPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">RaggedCrossPrefillWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.RaggedCrossPrefillWrapper.plan"><code class="docutils literal notranslate"><span class="pre">RaggedCrossPrefillWrapper.plan()</span></code></a></li>
 </ul>
@@ -707,11 +712,17 @@
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedCrossPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedCrossPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedCrossPrefillWrapper</span></code></a>(...[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferPrefixedPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.FlashInferPrefixedPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferPrefixedPrefillWrapper</span></code></a>(...[, ...])</p></td>
+<td><p>Prefixed attention through FlashInfer.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedCrossPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedCrossPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedCrossPrefillWrapper</span></code></a>(...[, ...])</p></td>
 <td><p>Ragged cross-attention through FlashInfer.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedPrefillWrapper</span></code></a>(...[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferRaggedPrefillWrapper</span></code></a>(...[, ...])</p></td>
 <td><p>Ragged self-attention through FlashInfer.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PrefixedPrefillWrapper</span></code></a>(num_qo_heads, ...[, ...])</p></td>
+<td><p>Query segment <code class="docutils literal notranslate"><span class="pre">i</span></code> attends key segment <code class="docutils literal notranslate"><span class="pre">i</span></code>, which holds a frozen prefix followed by the query's own tokens (the KV-backed dense attention backend's layout).</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.wrappers.RaggedCrossPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.RaggedCrossPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedCrossPrefillWrapper</span></code></a>(num_qo_heads, ...)</p></td>
 <td><p>Varlen cross-attention between two packed layouts: query segment <code class="docutils literal notranslate"><span class="pre">i</span></code> attends key segment <code class="docutils literal notranslate"><span class="pre">i</span></code> (one pair per request).</p></td>
@@ -722,6 +733,25 @@
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.wrappers.FlashInferPrefixedPrefillWrapper">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.wrappers.</span></span><span class="sig-name descname"><span class="pre">FlashInferPrefixedPrefillWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">workspace_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_layout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'NHD'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/wrappers.html#FlashInferPrefixedPrefillWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferPrefixedPrefillWrapper" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">_FlashInferRaggedPrefillBase</span></code>, <a class="reference internal" href="#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper" title="mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper"><code class="xref py py-class docutils literal notranslate"><span class="pre">PrefixedPrefillWrapper</span></code></a></p>
+<p>Prefixed attention through FlashInfer.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>kv_layout</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedCrossPrefillWrapper">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.wrappers.</span></span><span class="sig-name descname"><span class="pre">FlashInferRaggedCrossPrefillWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">workspace_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_layout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'NHD'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/wrappers.html#FlashInferRaggedCrossPrefillWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedCrossPrefillWrapper" title="Link to this definition">#</a></dt>
@@ -758,6 +788,49 @@
 </ul>
 </dd>
 </dl>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.wrappers.</span></span><span class="sig-name descname"><span class="pre">PrefixedPrefillWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_segments</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_total_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_total_kv_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.device('cuda')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">accelerator_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sm_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">q_data_type</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.bfloat16</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/wrappers.html#PrefixedPrefillWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">_RaggedPrefillBase</span></code></p>
+<p>Query segment <code class="docutils literal notranslate"><span class="pre">i</span></code> attends key segment <code class="docutils literal notranslate"><span class="pre">i</span></code>, which holds a frozen
+prefix followed by the query’s own tokens (the KV-backed dense attention
+backend’s layout). Causal aligns each query block to the end of its keys.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>max_num_segments</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>max_total_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>max_total_kv_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
+<li><p><strong>accelerator_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>sm_scale</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>q_data_type</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper.plan">
+<span class="sig-name descname"><span class="pre">plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q_cu_seqlens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cu_seqlens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">causal</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/wrappers.html#PrefixedPrefillWrapper.plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper.plan" title="Link to this definition">#</a></dt>
+<dd><p>Each <code class="docutils literal notranslate"><span class="pre">[num_segments</span> <span class="pre">+</span> <span class="pre">1]</span></code> with [0] == 0; CPU tensors preferred.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>q_cu_seqlens</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>kv_cu_seqlens</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>causal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -910,8 +983,13 @@ replay — values are copied through the static buffers, not rebound.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferPrefixedPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefixedPrefillWrapper</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedCrossPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedCrossPrefillWrapper</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.FlashInferRaggedPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferRaggedPrefillWrapper</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">PrefixedPrefillWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.PrefixedPrefillWrapper.plan"><code class="docutils literal notranslate"><span class="pre">PrefixedPrefillWrapper.plan()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.RaggedCrossPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">RaggedCrossPrefillWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.wrappers.RaggedCrossPrefillWrapper.plan"><code class="docutils literal notranslate"><span class="pre">RaggedCrossPrefillWrapper.plan()</span></code></a></li>
 </ul>

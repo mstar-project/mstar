@@ -697,6 +697,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.preprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.to"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.to()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.warmup_compiles"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.warmup_compiles()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule"><code class="docutils literal notranslate"><span class="pre">Cosmos3ReasonerSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -744,6 +745,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.GenStepInfo.retention"><code class="docutils literal notranslate"><span class="pre">GenStepInfo.retention</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.denoise_compile_kwargs"><code class="docutils literal notranslate"><span class="pre">denoise_compile_kwargs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.frame_tokens"><code class="docutils literal notranslate"><span class="pre">frame_tokens()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.latent_frames"><code class="docutils literal notranslate"><span class="pre">latent_frames()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.native_flow_sigmas"><code class="docutils literal notranslate"><span class="pre">native_flow_sigmas()</span></code></a></li>
@@ -807,16 +809,19 @@ matches running the whole transformer each step.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.frame_tokens" title="mstar.model.cosmos3.submodules.frame_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">frame_tokens</span></code></a>(height, width, config)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.denoise_compile_kwargs" title="mstar.model.cosmos3.submodules.denoise_compile_kwargs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">denoise_compile_kwargs</span></code></a>(mode)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> arguments for the denoise step; see <code class="docutils literal notranslate"><span class="pre">Cosmos3Config.denoise_compile_mode</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.frame_tokens" title="mstar.model.cosmos3.submodules.frame_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">frame_tokens</span></code></a>(height, width, config)</p></td>
 <td><p>Generation tokens per latent frame of a <code class="docutils literal notranslate"><span class="pre">height</span></code> x <code class="docutils literal notranslate"><span class="pre">width</span></code> request.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.latent_frames" title="mstar.model.cosmos3.submodules.latent_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">latent_frames</span></code></a>(num_frames, config)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.latent_frames" title="mstar.model.cosmos3.submodules.latent_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">latent_frames</span></code></a>(num_frames, config)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.native_flow_sigmas" title="mstar.model.cosmos3.submodules.native_flow_sigmas"><code class="xref py py-obj docutils literal notranslate"><span class="pre">native_flow_sigmas</span></code></a>(num_inference_steps, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.native_flow_sigmas" title="mstar.model.cosmos3.submodules.native_flow_sigmas"><code class="xref py py-obj docutils literal notranslate"><span class="pre">native_flow_sigmas</span></code></a>(num_inference_steps, ...)</p></td>
 <td><p>The native flow-matching sigma grid: <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code> values linearly spaced from <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">-</span> <span class="pre">1/T</span></code> toward 0, the endpoint dropped.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.sound_frames" title="mstar.model.cosmos3.submodules.sound_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sound_frames</span></code></a>(md, config)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.submodules.sound_frames" title="mstar.model.cosmos3.submodules.sound_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sound_frames</span></code></a>(md, config)</p></td>
 <td><p>Resolve a sound request's target sample count and latent frame count.</p></td>
 </tr>
 </tbody>
@@ -1290,6 +1295,22 @@ only argument)</p></li>
 </div>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.warmup_compiles">
+<span class="sig-name descname"><span class="pre">warmup_compiles</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3DiTSubmodule.warmup_compiles"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.warmup_compiles" title="Link to this definition">#</a></dt>
+<dd><p>Build the compiled cross-request layer stack before the first
+request: one two-request step at the default size, through
+<code class="docutils literal notranslate"><span class="pre">denoise_step_batched</span></code> with a stand-in attention, since no request
+has planned one yet. The attention call is a graph break, so what the
+stand-in returns never enters a compiled graph, and the graph does not
+depend on the size it was built at.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -1520,14 +1541,17 @@ request id, as <code class="docutils literal notranslate"><span class="pre">forw
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">Cosmos3VAEDecoderSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vae</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">channels_last</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">Cosmos3VAEDecoderSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vae</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">channels_last</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fast</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule" title="mstar.model.submodule_base.NodeSubmodule"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a></p>
 <p>Wan VAE decode node: final denoised latents -&gt; pixel frames.</p>
 <p>Applies the pipeline-side latent normalization (the VAE itself returns raw
 latents) before decoding, matching the fused t2i pipeline’s decode.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>channels_last</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>channels_last</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>fast</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
 </dd>
 </dl>
 <dl class="py attribute">
@@ -1716,6 +1740,22 @@ deliberately not part of <code class="docutils literal notranslate"><span class=
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.denoise_compile_kwargs">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">denoise_compile_kwargs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mode</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#denoise_compile_kwargs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.denoise_compile_kwargs" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> arguments for the denoise step; see
+<code class="docutils literal notranslate"><span class="pre">Cosmos3Config.denoise_compile_mode</span></code>. “deterministic” and “default” are
+the engine’s compile modes of those names, “level” its -O level.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>mode</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.frame_tokens">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">frame_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">height</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#frame_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.frame_tokens" title="Link to this definition">#</a></dt>
 <dd><p>Generation tokens per latent frame of a <code class="docutils literal notranslate"><span class="pre">height</span></code> x <code class="docutils literal notranslate"><span class="pre">width</span></code> request. <cite>_build_static</cite> asserts the count.</p>
@@ -1859,6 +1899,7 @@ trimmed by the audio decode node).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.preprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.to"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.to()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.warmup_compiles"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.warmup_compiles()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3ReasonerSubmodule"><code class="docutils literal notranslate"><span class="pre">Cosmos3ReasonerSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1906,6 +1947,7 @@ trimmed by the audio decode node).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.GenStepInfo.retention"><code class="docutils literal notranslate"><span class="pre">GenStepInfo.retention</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.denoise_compile_kwargs"><code class="docutils literal notranslate"><span class="pre">denoise_compile_kwargs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.frame_tokens"><code class="docutils literal notranslate"><span class="pre">frame_tokens()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.latent_frames"><code class="docutils literal notranslate"><span class="pre">latent_frames()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.native_flow_sigmas"><code class="docutils literal notranslate"><span class="pre">native_flow_sigmas()</span></code></a></li>

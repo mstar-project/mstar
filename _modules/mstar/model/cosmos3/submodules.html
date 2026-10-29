@@ -1007,6 +1007,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 
@@ -1126,6 +1127,18 @@ window.runMermaid = runMermaid;</script>
 <span class="n">REASONER_DECODE_LOOP</span> <span class="o">=</span> <span class="s2">"reasoner_decode_loop"</span>
 <span class="c1"># The reasoner keeps every request's text under one cache label.</span>
 <span class="n">REASONER_LABEL</span> <span class="o">=</span> <span class="s2">"main"</span>
+
+
+<div class="viewcode-block" id="denoise_compile_kwargs">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.denoise_compile_kwargs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">denoise_compile_kwargs</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``torch.compile`` arguments for the denoise step; see</span>
+<span class="sd">    ``Cosmos3Config.denoise_compile_mode``. "deterministic" and "default" are</span>
+<span class="sd">    the engine's compile modes of those names, "level" its -O level."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">compile_kwargs</span>
+
+    <span class="k">return</span> <span class="n">compile_kwargs</span><span class="p">(</span><span class="kc">None</span> <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">"level"</span> <span class="k">else</span> <span class="n">mode</span><span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="latent_frames">
@@ -1251,6 +1264,23 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">_WarmupAttention</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""What ``Cosmos3DiTSubmodule.warmup_compiles`` binds in place of the</span>
+<span class="sd">    attention resource: no plan to read, a zero output of the query's size."""</span>
+
+    <span class="n">requires_kv_write</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_default_label</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">del</span> <span class="n">label</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_default_layer_idx</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">del</span> <span class="n">layer_idx</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">del</span> <span class="n">kwargs</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">q</span><span class="p">)</span>
+
+
 <div class="viewcode-block" id="Cosmos3DiTSubmodule">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3DiTSubmodule</span><span class="p">(</span><span class="n">ARNodeSubmodule</span><span class="p">):</span>
@@ -1311,13 +1341,61 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># attention; ``config.compile_denoise=False`` keeps the eager step for</span>
         <span class="c1"># the bit-exact parity tests.</span>
         <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">compile_denoise</span> <span class="ow">and</span> <span class="n">transformer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="p">)</span>
+            <span class="n">kwargs</span> <span class="o">=</span> <span class="n">denoise_compile_kwargs</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">denoise_compile_mode</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step_batched_cfg</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step_batched_cfg</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step_batched_cfg</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
             <span class="p">)</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Cosmos3 denoise compute torch.compile enabled"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">compile_denoise_batched</span><span class="p">:</span>
+                <span class="c1"># Only the cross-request step's layer stack, with the pack</span>
+                <span class="c1"># length dynamic: one compile, built by `warmup_compiles`</span>
+                <span class="c1"># before the first request, serves every batch size and mix of</span>
+                <span class="c1"># resolutions. The per-request patchify, rotary and unpatchify</span>
+                <span class="c1"># around it run eager.</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">gen_layers_batched</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">gen_layers_batched</span><span class="p">,</span> <span class="o">**</span><span class="p">{</span><span class="o">**</span><span class="n">kwargs</span><span class="p">,</span> <span class="s2">"dynamic"</span><span class="p">:</span> <span class="kc">True</span><span class="p">},</span>
+                <span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Cosmos3 denoise compute torch.compile enabled (</span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">denoise_compile_mode</span><span class="p">)</span>
+
+<div class="viewcode-block" id="Cosmos3DiTSubmodule.warmup_compiles">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.warmup_compiles">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">warmup_compiles</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Build the compiled cross-request layer stack before the first</span>
+<span class="sd">        request: one two-request step at the default size, through</span>
+<span class="sd">        ``denoise_step_batched`` with a stand-in attention, since no request</span>
+<span class="sd">        has planned one yet. The attention call is a graph break, so what the</span>
+<span class="sd">        stand-in returns never enters a compiled graph, and the graph does not</span>
+<span class="sd">        depend on the size it was built at."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">compile_denoise</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">compile_denoise_batched</span><span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span>
+        <span class="n">frames</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_frames_video</span> <span class="k">if</span> <span class="n">cfg</span><span class="o">.</span><span class="n">video_size_default</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">1</span>
+        <span class="n">width</span><span class="p">,</span> <span class="n">height</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">(</span><span class="n">cfg</span><span class="o">.</span><span class="n">video_size_default</span> <span class="ow">or</span> <span class="n">cfg</span><span class="o">.</span><span class="n">image_size_default</span><span class="p">))</span>
+        <span class="n">device</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_device</span><span class="p">()</span>
+        <span class="n">static</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_static</span><span class="p">(</span>
+            <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="mi">8</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">num_frames</span><span class="o">=</span><span class="n">frames</span><span class="p">,</span> <span class="n">fps</span><span class="o">=</span><span class="mf">24.0</span><span class="p">,</span> <span class="n">has_image_condition</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">row</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">"latents"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_latent_shape</span><span class="p">(</span><span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">frames</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">proj_in</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="p">),</span>
+            <span class="s2">"vision_timesteps"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">static</span><span class="p">[</span><span class="s2">"num_noisy_vision_tokens"</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+            <span class="s2">"position_ids_cond"</span><span class="p">:</span> <span class="n">static</span><span class="p">[</span><span class="s2">"vision_mrope_ids"</span><span class="p">],</span>
+            <span class="s2">"position_ids_uncond"</span><span class="p">:</span> <span class="n">static</span><span class="p">[</span><span class="s2">"vision_mrope_ids"</span><span class="p">],</span>
+            <span class="s2">"vision_token_shapes"</span><span class="p">:</span> <span class="n">static</span><span class="p">[</span><span class="s2">"vision_token_shapes"</span><span class="p">],</span>
+            <span class="s2">"vision_noisy_frame_indexes"</span><span class="p">:</span> <span class="n">static</span><span class="p">[</span><span class="s2">"vision_noisy_frame_indexes"</span><span class="p">],</span>
+            <span class="s2">"vision_mse_loss_indexes"</span><span class="p">:</span> <span class="n">static</span><span class="p">[</span><span class="s2">"mse_gen_indexes"</span><span class="p">],</span>
+        <span class="p">}</span>
+        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+        <span class="c1"># as `forward_batched` runs it: native dtype, no autocast</span>
+        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span><span class="n">device_type</span><span class="o">=</span><span class="n">device</span><span class="o">.</span><span class="n">type</span><span class="p">,</span> <span class="n">enabled</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step_batched</span><span class="p">([</span><span class="n">row</span><span class="p">,</span> <span class="n">row</span><span class="p">],</span> <span class="n">CFG_BATCHED_LABEL</span><span class="p">,</span> <span class="n">_WarmupAttention</span><span class="p">())</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="s2">"Cosmos3 cross-request layer stack compiled in </span><span class="si">%.1f</span><span class="s2"> s (</span><span class="si">%d</span><span class="s2">x</span><span class="si">%d</span><span class="s2">x</span><span class="si">%d</span><span class="s2">, two requests)"</span><span class="p">,</span>
+            <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">frames</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
 
 <div class="viewcode-block" id="Cosmos3DiTSubmodule.to">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.to">[docs]</a>
@@ -3813,16 +3891,22 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># One-shot decode per request; CUDA-graph capture (not torch.compile) is the</span>
     <span class="c1"># speedup path.</span>
     <span class="n">disable_torch_compile</span> <span class="o">=</span> <span class="kc">True</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">vae</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">channels_last</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">vae</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">channels_last</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="n">fast</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">vae</span> <span class="o">=</span> <span class="n">vae</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype_cached</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># ``fast`` (config.vae_decode_fast, whole-clip node only): clips decode</span>
+        <span class="c1"># through the shared Wan VAE decoder, always channels-last.</span>
+        <span class="n">fast</span> <span class="o">=</span> <span class="n">vae</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">fast</span>
+        <span class="k">if</span> <span class="n">fast</span><span class="p">:</span>
+            <span class="c1"># Cast before the layout switch and the compile trace, so both see</span>
+            <span class="c1"># the weights the decode runs with.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">vae</span> <span class="o">=</span> <span class="n">vae</span> <span class="o">=</span> <span class="n">vae</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype</span><span class="p">())</span>
         <span class="c1"># Channels-last weights and activations (cuDNN's native conv3d layout),</span>
         <span class="c1"># converted in place before any compile traces the decode; only the</span>
         <span class="c1"># instance given here is converted (see Cosmos3Model).</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_channels_last</span> <span class="o">=</span> <span class="n">vae</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">channels_last</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_channels_last</span> <span class="o">=</span> <span class="n">vae</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="n">channels_last</span> <span class="ow">or</span> <span class="n">fast</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_channels_last</span><span class="p">:</span>
             <span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">to_channels_last</span><span class="p">(</span><span class="n">vae</span><span class="p">)</span>
         <span class="c1"># The decode is 3D-conv bound, one-shot per request at request-specific</span>
@@ -3837,12 +3921,18 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">vae</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_COMPILE_VAE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span>
             <span class="s2">"0"</span><span class="p">,</span> <span class="s2">"false"</span><span class="p">,</span> <span class="s2">"no"</span><span class="p">,</span> <span class="s2">"off"</span><span class="p">,</span>
         <span class="p">):</span>
+            <span class="c1"># with ``fast``, only images (one latent) decode through this</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span> <span class="o">=</span> <span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">compile_decode</span><span class="p">(</span><span class="n">vae</span><span class="o">.</span><span class="n">decode</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_decode_compiled</span> <span class="o">=</span> <span class="kc">True</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Cosmos3 VAE decode torch.compile enabled"</span><span class="p">)</span>
         <span class="c1"># Resolve + log the decode dtype now (a cheap cuDNN-version read) so the</span>
         <span class="c1"># choice is fixed at startup, not on the first request.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_fast_step</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">fast</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_fast_step</span> <span class="o">=</span> <span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">DecoderStep</span><span class="p">(</span><span class="n">vae</span><span class="p">,</span> <span class="nb">compile</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_decode_compiled</span><span class="p">,</span> <span class="n">deterministic</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Cosmos3 VAE decode: video clips on the shared Wan VAE decoder (channels-last), "</span>
+                        <span class="s2">"images through the stock decode"</span><span class="p">)</span>
 
 <div class="viewcode-block" id="Cosmos3VAEDecoderSubmodule.prepare_inputs">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule.prepare_inputs">[docs]</a>
@@ -3887,6 +3977,14 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Latents -&gt; uint8 pixel frames ``[1, 3, T, H, W]``."""</span>
         <span class="n">vae_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype</span><span class="p">()</span>
         <span class="n">z</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_vae_input</span><span class="p">(</span><span class="n">latents</span><span class="p">)</span>
+        <span class="c1"># one latent (an image) is faster through the stock decode (24 vs 36 ms on an H200)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_fast_step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">z</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">wan_vae</span> <span class="o">=</span> <span class="n">_wan_vae</span><span class="p">()</span>
+            <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span><span class="n">device_type</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">enabled</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+                <span class="n">decoded</span> <span class="o">=</span> <span class="n">wan_vae</span><span class="o">.</span><span class="n">decode_causal</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="p">,</span> <span class="n">z</span><span class="p">,</span> <span class="n">wan_vae</span><span class="o">.</span><span class="n">new_feat_cache</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_fast_step</span><span class="p">,</span> <span class="n">clip_start</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_to_uint8</span><span class="p">(</span><span class="n">decoded</span><span class="p">)</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span><span class="n">device_type</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">enabled</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
             <span class="k">if</span> <span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_decode_compiled</span>

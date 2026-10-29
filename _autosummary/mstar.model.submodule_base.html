@@ -784,6 +784,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_is_input_free()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.uniform_row_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.warmup_compiles"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.warmup_compiles()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState"><code class="docutils literal notranslate"><span class="pre">PerRequestState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -2150,6 +2151,23 @@ no-ops; override and key off <code class="docutils literal notranslate"><span cl
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.warmup_compiles">
+<span class="sig-name descname"><span class="pre">warmup_compiles</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.warmup_compiles"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.warmup_compiles" title="Link to this definition">#</a></dt>
+<dd><p>Compile what a forward would otherwise compile on its first request,
+outside the accelerator graph runner. Called once, at the end of the
+engine’s warmup, after capture, under <code class="docutils literal notranslate"><span class="pre">no_grad</span></code> and the node’s fp32
+precision; the node’s resources are bound but nothing is admitted or
+planned, so it must not read or change resource state. On a lockstep
+node every rank calls it in the same order, so it may run the
+collectives its forward runs. Default: nothing.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -2455,6 +2473,7 @@ it. A plain <code class="docutils literal notranslate"><span class="pre">set</sp
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_is_input_free()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.uniform_row_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.warmup_compiles"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.warmup_compiles()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState"><code class="docutils literal notranslate"><span class="pre">PerRequestState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

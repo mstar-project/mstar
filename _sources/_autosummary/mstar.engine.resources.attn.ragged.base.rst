@@ -13,6 +13,7 @@ mstar.engine.resources.attn.ragged.base
 
    .. autosummary::
    
+      dense_or_flashinfer
       resolve_ragged_attn_backend
    
    
