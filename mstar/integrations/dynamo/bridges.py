@@ -50,6 +50,7 @@ from mstar.api_server.openai.protocol import (
     VideoGenerationRequest,
 )
 from mstar.api_server.openai.serving_images import image_count
+from mstar.utils.generation_kwargs import offset_seed
 from mstar.utils.utf8_stream import Utf8Stream
 
 if TYPE_CHECKING:
@@ -282,7 +283,7 @@ class RequestBridge:
             for i in range(1, n):
                 kwargs = dict(args.model_kwargs)
                 if seed is not None:
-                    kwargs["seed"] = int(seed) + i
+                    kwargs["seed"] = offset_seed(int(seed), i)
                 submits.append(dataclasses.replace(args, model_kwargs=kwargs))
 
         rids = [self._submit(args, prefix="img") for args in submits]

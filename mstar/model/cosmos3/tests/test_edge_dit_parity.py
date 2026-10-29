@@ -103,8 +103,9 @@ def test_edge_dit_cached_path_matches_diffusers() -> None:
         model.prefill_und(static["input_ids"], static["text_mrope_ids"], "main")
         res.commit()
         res.causal = False
+        rotary = model._rotary(static["gen_position_ids"], latents.device, model.proj_in.weight.dtype)
         velocity = model.denoise_step(
-            latents, ts, static["vision_mrope_ids"], static["vision_token_shapes"],
+            latents, ts, rotary, static["vision_token_shapes"],
             static["vision_noisy_frame_indexes"], static["vision_mse_loss_indexes"] - static["und_len"],
             "main", res,
         )
