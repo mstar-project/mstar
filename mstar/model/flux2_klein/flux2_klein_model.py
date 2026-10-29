@@ -48,6 +48,7 @@ from mstar.model.components.diffusion.attention import uses_ragged_attention
 from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 from mstar.model.components.diffusion.image_io import encode_image
 from mstar.model.components.diffusion.lora import LoraSpec
+from mstar.model.components.fp8_linear import apply_linear_dtype, check_linear_dtype
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -101,6 +102,7 @@ class Flux2KleinModel(Model):
         vae_compile: bool = False,
         async_scheduling: bool = True,
         lora: list | None = None,
+        linear_dtype: str = "bf16",
         **kwargs,
     ):
         # the DiT's attention: the engine's ragged resource (the platform's kernel), or torch's SDPA inline
@@ -141,6 +143,8 @@ class Flux2KleinModel(Model):
         self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
         self.loras = [LoraSpec.parse(item) for item in (lora or [])]
+        # fp8: the DiT blocks' linears (Flux2DiT.FP8_LINEARS) run as fp8 GEMMs where the GPU has them
+        self.linear_dtype = check_linear_dtype(linear_dtype)
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None
@@ -487,6 +491,7 @@ class Flux2KleinModel(Model):
                 from mstar.model.flux2_klein.weight_loader import apply_transformer_loras
 
                 apply_transformer_loras(transformer, self.loras)
+            apply_linear_dtype(transformer, self.linear_dtype, transformer.FP8_LINEARS, "FLUX.2 transformer")
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.use_ragged_attention else None,
