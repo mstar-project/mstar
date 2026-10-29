@@ -4,8 +4,8 @@ The fused MoE kernel expects tokens sorted by expert index and padded to
 multiples of ``BLOCK_SIZE_M`` per expert.  The sort / pad is produced by
 vLLM's ``moe_align_block_size`` CUDA op, vendored (Apache-2.0) as
 ``csrc/moe_align_block_size.cu`` and JIT-compiled on first use against the
-local CUDA toolkit, or hipified and built with hipcc on ROCm -- no
-``sgl_kernel`` / ``vllm`` dependency.
+local CUDA toolkit, or hipified and built with hipcc on ROCm, through
+``mstar.kernels.hip.build`` -- no ``sgl_kernel`` / ``vllm`` dependency.
 
 If the CUDA op cannot be built (no ``nvcc`` / no CUDA device) we fall back
 to a vectorized PyTorch implementation with identical output semantics.
@@ -16,111 +16,33 @@ it exists so the path is always *available*, not fast.
 from __future__ import annotations
 
 import functools
-import hashlib
 import logging
 import os
-import time
 
 import torch
 import triton
+
+from mstar.kernels.hip.build import JitExtension
 
 logger = logging.getLogger(__name__)
 
 _CSRC = os.path.join(os.path.dirname(__file__), "csrc", "moe_align_block_size.cu")
 
 
-def _clear_stale_build_lock(name: str) -> None:
-    """Remove a ``FileBaton`` lock left behind by a killed build process.
+def _touch_op(_library) -> None:
+    # a registration failure surfaces at build time rather than at the first call
+    _ = torch.ops._mstar_moe_C.moe_align_block_size
 
-    ``torch.utils.cpp_extension.load`` serialises concurrent builds with a lock
-    file and waits on it in an UNTIMED ``while os.path.exists(...)`` loop. Kill
-    a process while it holds that lock (SIGKILL, OOM, a scheduler preemption)
-    and every later process on the machine hangs in warmup forever, with no
-    error and no log line.
 
-    The baton holds the fd open for the build's duration, so a lock nobody has
-    open is by definition abandoned. Scanning /proc for holders distinguishes
-    that from a genuine build in progress, which mtime alone cannot.
-    """
-    from torch.utils.cpp_extension import _get_build_directory
-
-    try:
-        build_dir = _get_build_directory(name, verbose=False)
-    except Exception:
-        return
-    lock_path = os.path.join(build_dir, "lock")
-    if not os.path.exists(lock_path):
-        return
-    try:
-        target = os.path.realpath(lock_path)
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
-            fd_dir = f"/proc/{pid}/fd"
-            try:
-                for fd in os.listdir(fd_dir):
-                    if os.path.realpath(os.path.join(fd_dir, fd)) == target:
-                        return  # a live build owns it; wait normally
-            except OSError:
-                continue  # process exited, or not ours to read
-    except OSError:
-        return
-    logger.warning(
-        "fused MoE: removing abandoned JIT build lock %s (no process holds it). "
-        "A build process was almost certainly killed mid-compile; without this "
-        "every future load would wait on it forever.",
-        lock_path,
-    )
-    for stale in (lock_path, os.path.join(build_dir, ".ninja_lock")):
-        try:
-            os.remove(stale)
-        except OSError:
-            pass
+def _extension() -> JitExtension:
+    return JitExtension("_mstar_moe_C", [_CSRC], check=_touch_op)
 
 
 def _jit_source() -> tuple[str, str]:
-    """(extension name, source path), both keyed by the .cu's content.
-
-    ``cpp_extension``'s ninja file names the source by absolute path, so the same source in
-    another checkout (a worktree, a staged copy) rebuilds the op, and two checkouts booting
-    in turn rebuild it every time. A copy under the extensions root named by its hash gives
-    every checkout of one source the same build, and each version its own.
-    """
-    from torch.utils.cpp_extension import _get_build_directory
-
-    with open(_CSRC, "rb") as f:
-        data = f.read()
-    digest = hashlib.sha256(data).hexdigest()[:12]
-    name = f"_mstar_moe_C_{digest}"
-    src_dir = os.path.join(
-        os.path.dirname(_get_build_directory(name, verbose=False)), "_mstar_moe_C_src")
-    path = os.path.join(src_dir, f"{digest}.cu")
-    if not os.path.exists(path):
-        os.makedirs(src_dir, exist_ok=True)
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)  # atomic: a racing rank sees the whole file or none
-    return name, path
-
-
-def _hip_runtime_ldflags() -> list[str]:
-    """Link flags pointing at the libamdhip64 this process already loaded.
-
-    torch links -lamdhip64 from ROCM_HOME. If that isn't torch's own runtime
-    (a different ROCm, or pip ROCm) the link fails or a second HIP runtime gets
-    loaded, which breaks device state.
-    """
-    try:
-        with open("/proc/self/maps") as maps:
-            for line in maps:
-                path = line.rsplit(None, 1)[-1]
-                if os.path.basename(path).startswith("libamdhip64.so"):
-                    lib_dir = os.path.dirname(path)
-                    return [f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"]
-    except OSError:
-        pass
-    return []
+    """(extension name, staged source path), both keyed by the .cu's content,
+    so every checkout of one source shares one build (see ``JitExtension``)."""
+    extension = _extension()
+    return extension.build_name(), extension.stage()[0]
 
 
 @torch.compiler.assume_constant_result
@@ -144,42 +66,18 @@ def _build_cuda_op() -> bool:
     """
     if not torch.cuda.is_available():
         return False
-    from torch.utils.cpp_extension import load
-
-    from mstar.platforms import current_platform
-
-    # On ROCm torch hipifies the source. There are no warp-level
-    # intrinsics, and cub::BlockScan becomes hipcub's.
-    ldflags = _hip_runtime_ldflags() if current_platform.is_rocm() else []
-    # TP workers building together can race on the stale-lock
-    # sweep and fail a build that did write the .so. The fallback is not
-    # graph-capturable, so one losing rank would run the whole group eager.
-    last_error: Exception | None = None
-    for attempt in range(2):
-        try:
-            name, source = _jit_source()
-            if attempt == 0:
-                _clear_stale_build_lock(name)
-            else:
-                time.sleep(2.0)
-            load(
-                name=name,
-                sources=[source],
-                extra_ldflags=ldflags,
-                is_python_module=False,
-                verbose=False,
-            )
-            # Touch the op so a registration failure surfaces here, not at call time.
-            _ = torch.ops._mstar_moe_C.moe_align_block_size
-            return True
-        except Exception as e:  # pragma: no cover -- depends on the build toolchain
-            last_error = e
-    logger.warning(
-        "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
-        "using the slower torch fallback (NOT CUDA-graph capturable).",
-        last_error,
-    )
-    return False
+    # TP workers building together can race on the stale-lock sweep, which the
+    # build retries: the fallback is not graph-capturable, so one losing rank
+    # would run the whole group eager.
+    reason = _extension().unavailable_reason()
+    if reason is not None:
+        logger.warning(
+            "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
+            "using the slower torch fallback (NOT CUDA-graph capturable).",
+            reason,
+        )
+        return False
+    return True
 
 
 def moe_align_block_size(
