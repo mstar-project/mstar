@@ -369,7 +369,7 @@ def _engine_manager(**pools: KVManager) -> SimpleNamespace:
     from mstar.engine.chunking import ChunkingManagement
 
     engine = SimpleNamespace(
-        _loopback_steps={}, _resources=pools, _submodules={},
+        _loopback_steps={}, _resources=pools, _submodules={}, _rows={},
         # the real remove_request purges chunk state too (rid_table.py)
         _chunking=ChunkingManagement({}),
         _runner=SimpleNamespace(
