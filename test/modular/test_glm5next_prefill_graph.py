@@ -17,6 +17,7 @@ from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.recurrent.pool import SINK_SLOT
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import StepContext
+from mstar.model.components.kda import KDAConfig, KimiDeltaAttention
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import (
@@ -28,7 +29,6 @@ from mstar.model.glm5_next.config import (
     build_mlp_layer_types,
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
-from mstar.model.glm5_next.kda import Glm5NextKdaConfig, Glm5NextLinearAttention
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.glm5_next.weight_loader import restore_fp32_params
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
@@ -48,8 +48,8 @@ DEV = torch.device("cuda", 0)
 
 def _kda_inputs(total, heads=2, head_dim=128, slots=6, seed=0):
     torch.manual_seed(seed)
-    kda = Glm5NextLinearAttention(Glm5NextKdaConfig(
-        hidden_size=256, linear_num_heads=heads, linear_head_dim=head_dim)).to(DEV)
+    kda = KimiDeltaAttention(KDAConfig(
+        hidden_size=256, num_heads=heads, head_dim=head_dim)).to(DEV)
     with torch.no_grad():
         for name, p in kda.named_parameters():
             if name.endswith("A_log"):

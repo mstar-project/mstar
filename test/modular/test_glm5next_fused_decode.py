@@ -7,13 +7,13 @@ from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn.kda import KDAPlan
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
+from mstar.model.components.distributed import ParallelKimiDeltaAttention
+from mstar.model.components.kda import KDAConfig
 from mstar.model.components.norm import RMSNorm
 from mstar.model.glm5_next import fused_decode
-from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
 from mstar.model.glm5_next.components.decoder_layer import Glm5NextDecoderLayer
 from mstar.model.glm5_next.components.moe import Glm5NextMoEGate
 from mstar.model.glm5_next.config import Glm5NextModelConfig
-from mstar.model.glm5_next.kda import Glm5NextKdaConfig
 from mstar.model.glm5_next.mhc import Glm5NextHyperConnection, update_streams
 
 pytestmark = pytest.mark.skipif(
@@ -95,8 +95,8 @@ def _bind(kda, rec, conv, plan, kernels):
 @pytest.mark.parametrize("batch", [1, 5, 32])
 def test_kda_decode_matches_reference(batch):
     heads, head_dim, hidden, slots = 8, 128, 4096, 40
-    kda = Glm5NextKdaAttention(Glm5NextKdaConfig(
-        hidden_size=hidden, linear_num_heads=heads, linear_head_dim=head_dim),
+    kda = ParallelKimiDeltaAttention(KDAConfig(
+        hidden_size=hidden, num_heads=heads, head_dim=head_dim),
         dtype=torch.bfloat16).cuda()
     _randomize(kda, 0)
     kda.process_weights_after_loading("cuda")
@@ -112,7 +112,7 @@ def test_kda_decode_matches_reference(batch):
             r, c = rec_ref[slot_index].transpose(-1, -2), conv_ref[slot_index]
             ref = kda.decode_step(x.unsqueeze(1), r, c).squeeze(1)
             rec_ref[slot_index], conv_ref[slot_index] = r.transpose(-1, -2), c
-            out = kda.forward_paged(x, 0)
+            out = kda(x, 0)
             # The merged in-projection rounds like the three separate ones up to 1 bf16 ulp.
             torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2, msg=f"step {step}")
     torch.testing.assert_close(conv, conv_ref, rtol=1e-2, atol=1e-2)
