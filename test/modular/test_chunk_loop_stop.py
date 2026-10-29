@@ -83,6 +83,29 @@ def test_a_node_that_chunks_nowhere_does_no_work_at_all():
     assert stops == {} and not mid
 
 
+def test_a_decode_step_beside_a_chunk_loop_does_no_work_per_row():
+    """A node with a chunk Loop on its prefill walk still runs decode steps
+    every pass; those must cost one lookup, not one per row."""
+
+    class _CountingBatch(ScheduledBatch):
+        looked_up = 0
+
+        def walk_of(self, rid):
+            type(self).looked_up += 1
+            return super().walk_of(rid)
+
+    batch = _CountingBatch(
+        node_name=NODE, graph_walk="decode",
+        request_to_worker_graph=dict.fromkeys(range(1, 21), 0),
+    )
+    stops = {rid: {"decode_loop"} for rid in (3, 7)}
+
+    mid = ChunkLoops({(NODE, "prefill")}).end_finished(batch, stops)
+
+    assert not mid and stops == {rid: {"decode_loop"} for rid in (3, 7)}
+    assert _CountingBatch.looked_up == 0
+
+
 def test_a_mid_prefill_row_keys_no_prefix():
     """Postprocess must hand the rows it names mid-prefill to the prefix
     chain as skips: a non-final chunk's sampled token is not a real sample,

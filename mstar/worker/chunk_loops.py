@@ -65,11 +65,13 @@ class ChunkLoops:
         """
         node = batch.node_name
         mid_prefill: set[int] = set()
-        if not self.walks:
+        walks = self.walks_by_node.get(node)
+        # one lookup for a single-walk step outside a chunk Loop (decode)
+        if not walks or (not batch.request_walks and batch.graph_walk not in walks):
             return mid_prefill
         for rid in batch.request_to_worker_graph:
             walk = batch.walk_of(rid)
-            if (node, walk) not in self.walks:
+            if walk not in walks:
                 continue
             loop_name = chunk_loop_name(node, walk)
             if runs_final_chunk(batch.chunk_ranges.get(rid)):
