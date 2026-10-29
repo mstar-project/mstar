@@ -605,6 +605,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -971,6 +972,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Every caller holds the manager's lock, so none of this takes one of its own.</span>
 <span class="sd">"""</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">heapq</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
@@ -989,9 +991,17 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_pages</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_parent</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_pages</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_children</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_pages</span>
+        <span class="c1"># how many of a page's children are held, or have a held page below them</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_held_below</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_pages</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stamp</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_pages</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_leaves</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_clock</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="c1"># Pages ever inserted, and pages ever taken out of the evictable set by a request that holds</span>
+        <span class="c1"># them: both can lower what a request waiting for room needs, and a waiting request is measured</span>
+        <span class="c1"># against them.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">filed</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">taken</span> <span class="o">=</span> <span class="mi">0</span>
 
 <div class="viewcode-block" id="PrefixIndex.lookup">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup">[docs]</a>
@@ -1016,7 +1026,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="PrefixIndex.insert">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">insert</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">page</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">parent</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Name ``page`` by ``key`` under ``parent``; the first writer wins."""</span>
+<span class="w">        </span><span class="sd">"""Name ``page`` by ``key`` under ``parent``; the first writer wins. When the arena reports to this</span>
+<span class="sd">        index and the index alone holds ``parent``, ``page`` is filed with no parent. Filed under ``parent``,</span>
+<span class="sd">        a held ``page`` would keep `evict` from freeing ``parent``, which the pool counts as evictable."""</span>
         <span class="k">assert</span> <span class="n">parent</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
             <span class="sa">f</span><span class="s2">"page </span><span class="si">{</span><span class="n">page</span><span class="si">}</span><span class="s2"> indexed under parent page </span><span class="si">{</span><span class="n">parent</span><span class="si">}</span><span class="s2">, which the index "</span>
             <span class="s2">"does not hold; a parent must outlive its children"</span>
@@ -1028,14 +1040,22 @@ window.runMermaid = runMermaid;</script>
             <span class="sa">f</span><span class="s2">"indexed under </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">page</span><span class="p">]</span><span class="o">.</span><span class="n">hex</span><span class="p">()[:</span><span class="mi">16</span><span class="p">]</span><span class="si">}</span><span class="s2">; evicting one entry "</span>
             <span class="s2">"would free a page the other still names"</span>
         <span class="p">)</span>
+        <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">index</span> <span class="ow">is</span> <span class="bp">self</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">parent</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_clock</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">filed</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">page</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="n">key</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_parent</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="n">parent</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_children</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_held_below</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stamp</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_clock</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">seal</span><span class="p">([</span><span class="n">page</span><span class="p">])</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">retain</span><span class="p">([</span><span class="n">page</span><span class="p">])</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">index</span> <span class="ow">is</span> <span class="bp">self</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="c1"># `PageArena.retain` calls `set_shared` only when a page goes from one owner to two, so a page</span>
+            <span class="c1"># that was already shared before the index named it is marked here</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">set_shared</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_children</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="n">heapq</span><span class="o">.</span><span class="n">heappush</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_leaves</span><span class="p">,</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_clock</span><span class="p">,</span> <span class="n">page</span><span class="p">))</span>
@@ -1084,6 +1104,69 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="PrefixIndex.evictable">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.evictable">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">evictable</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Return the live set of pages `evict` could free.</span>
+<span class="sd">        Callers read it and don't keep it.</span>
+
+<span class="sd">        A page only the index holds is out of reach while a page below it is held,</span>
+<span class="sd">        since eviction takes leaves only.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span></div>
+
+
+<div class="viewcode-block" id="PrefixIndex.set_shared">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.set_shared">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_shared</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">page</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">shared</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Called when ``page`` gains or loses its one owner besides the index."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_held_below</span><span class="p">[</span><span class="n">page</span><span class="p">]:</span>
+            <span class="c1"># nothing changes for a page that isn't indexed or is pinned from below</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="n">shared</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">taken</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">page</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pin_above</span><span class="p">(</span><span class="n">page</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">page</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_unpin_above</span><span class="p">(</span><span class="n">page</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_pin_above</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">page</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Mark the pages above a newly held ``page`` as not evictable."""</span>
+        <span class="n">parent</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_parent</span><span class="p">[</span><span class="n">page</span><span class="p">]</span>
+        <span class="k">while</span> <span class="n">parent</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_held_below</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_held_below</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">parent</span><span class="p">)</span>
+            <span class="n">parent</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_parent</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_unpin_above</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">page</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Mark the pages above ``page`` evictable again once nothing below them is held."""</span>
+        <span class="n">parent</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_parent</span><span class="p">[</span><span class="n">page</span><span class="p">]</span>
+        <span class="k">while</span> <span class="n">parent</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_held_below</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="o">-=</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_held_below</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">parent</span><span class="p">)</span>
+            <span class="n">parent</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_parent</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span>
+
+<div class="viewcode-block" id="PrefixIndex.assert_evictable">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.assert_evictable">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">assert_evictable</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Check that `evict`, run on a copy of the index and the owner counts, frees every page</span>
+<span class="sd">        in the evictable set."""</span>
+        <span class="n">index</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"_by_key"</span><span class="p">,</span> <span class="s2">"_key"</span><span class="p">,</span> <span class="s2">"_parent"</span><span class="p">,</span> <span class="s2">"_children"</span><span class="p">,</span> <span class="s2">"_stamp"</span><span class="p">,</span> <span class="s2">"_leaves"</span><span class="p">,</span> <span class="s2">"_evictable"</span><span class="p">):</span>
+            <span class="nb">setattr</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">copy</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)))</span>
+        <span class="n">index</span><span class="o">.</span><span class="n">_arena</span> <span class="o">=</span> <span class="n">_Owners</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">)</span>
+        <span class="n">freed</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">index</span><span class="o">.</span><span class="n">evict</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="p">)))</span>
+        <span class="k">assert</span> <span class="n">freed</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="p">),</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"eviction reaches </span><span class="si">{</span><span class="n">freed</span><span class="si">}</span><span class="s2"> of the </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="p">)</span><span class="si">}</span><span class="s2"> pages the evictable set counts"</span>
+        <span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="PrefixIndex.pages">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">pages</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
@@ -1096,15 +1179,6 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_pages</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""How many pages the index holds a reference to (``len(pages())``)."""</span>
         <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_by_key</span><span class="p">)</span></div>
-
-
-<div class="viewcode-block" id="PrefixIndex.num_sole_owned">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">num_sole_owned</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Indexed pages nothing else holds: an upper bound on what ``evict`` can free."""</span>
-        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span>
-            <span class="mi">1</span> <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_by_key</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span>
-        <span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PrefixIndex.evict">
@@ -1145,6 +1219,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_remove</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">page</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_evictable</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">page</span><span class="p">)</span>
         <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_by_key</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">page</span><span class="p">]]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">parent</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_parent</span><span class="p">[</span><span class="n">page</span><span class="p">]</span>
@@ -1155,6 +1230,17 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_children</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">heapq</span><span class="o">.</span><span class="n">heappush</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_leaves</span><span class="p">,</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_stamp</span><span class="p">[</span><span class="n">parent</span><span class="p">],</span> <span class="n">parent</span><span class="p">))</span></div>
 
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_Owners</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A copy of the arena's owner counts, which `evict` on a copied index releases."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_owners</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_owners</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">num_owners</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">pages</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">-=</span> <span class="mi">1</span>
 </pre></div>
 
                 </article>

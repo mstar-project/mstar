@@ -252,6 +252,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -671,6 +672,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner"><code class="docutils literal notranslate"><span class="pre">StepRunner</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.admit"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_retrieve()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.admit_waiting"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_waiting()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.adopt_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.build_accelerator_graph_buffers"><code class="docutils literal notranslate"><span class="pre">StepRunner.build_accelerator_graph_buffers()</span></code></a></li>
@@ -768,7 +770,7 @@ the step reserved.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.runner.StepRunner.admit_retrieve">
 <span class="sig-name descname"><span class="pre">admit_retrieve</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">published</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.admit_retrieve"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.admit_retrieve" title="Link to this definition">#</a></dt>
-<dd><p>bring published state in</p>
+<dd><p>bring published state in, once <cite>node_name</cite>’s resources have admitted the request</p>
 <p>gives <cite>ready=False</cite> when still has inflights; shortcircuit on failure</p>
 <p>Swept over <cite>node_name</cite>’s own resources. Asking a node about resources
 it does not own is not just wasted work: <cite>KVManager.get_labels</cite>
@@ -786,6 +788,19 @@ cache.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.FullAdmitOutcome" title="mstar.engine.resources.step.FullAdmitOutcome"><em>FullAdmitOutcome</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.runner.StepRunner.admit_waiting">
+<span class="sig-name descname"><span class="pre">admit_waiting</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">published_of</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.admit_waiting"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.admit_waiting" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>published_of</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a><em>] </em><em>| </em><em>None</em><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1300,6 +1315,7 @@ conductor validates a deployment.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner"><code class="docutils literal notranslate"><span class="pre">StepRunner</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.admit"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_retrieve()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.admit_waiting"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_waiting()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.adopt_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.runner.StepRunner.build_accelerator_graph_buffers"><code class="docutils literal notranslate"><span class="pre">StepRunner.build_accelerator_graph_buffers()</span></code></a></li>

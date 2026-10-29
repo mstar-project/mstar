@@ -252,6 +252,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -704,6 +705,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.failed_resource"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.failed_resource</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.ok"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.ok</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.outcome"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.outcome</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.queued"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.queued</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.ready"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.ready</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.reason"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.reason</span></code></a></li>
 </ul>
@@ -788,7 +790,7 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BucketKey</span></code></a>(graph_walk, bs, num_tokens[, ...])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.step.FullAdmitOutcome" title="mstar.engine.resources.step.FullAdmitOutcome"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FullAdmitOutcome</span></code></a>(outcome[, failed_resource])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.step.FullAdmitOutcome" title="mstar.engine.resources.step.FullAdmitOutcome"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FullAdmitOutcome</span></code></a>(outcome[, failed_resource, ...])</p></td>
 <td><p>What the runner answers with: one resource's outcome, plus which resource gave it.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.step.RequestOffloading" title="mstar.engine.resources.step.RequestOffloading"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RequestOffloading</span></code></a>(message, label, request_id)</p></td>
@@ -982,7 +984,7 @@ about the step as a whole.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.step.FullAdmitOutcome">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.step.</span></span><span class="sig-name descname"><span class="pre">FullAdmitOutcome</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">outcome</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">failed_resource</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#FullAdmitOutcome"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.FullAdmitOutcome" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.step.</span></span><span class="sig-name descname"><span class="pre">FullAdmitOutcome</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">outcome</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">failed_resource</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">queued</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#FullAdmitOutcome"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.FullAdmitOutcome" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
 <p>What the runner answers with: one resource’s outcome, plus which
 resource gave it.</p>
@@ -994,6 +996,7 @@ eviction to the resource that actually ran out.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>outcome</strong> (<a class="reference internal" href="#mstar.engine.resources.step.AdmitOutcome" title="mstar.engine.resources.step.AdmitOutcome"><em>AdmitOutcome</em></a>)</p></li>
 <li><p><strong>failed_resource</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>queued</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1012,6 +1015,12 @@ eviction to the resource that actually ran out.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.step.FullAdmitOutcome.outcome">
 <span class="sig-name descname"><span class="pre">outcome</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.step.AdmitOutcome" title="mstar.engine.resources.step.AdmitOutcome"><span class="pre">AdmitOutcome</span></a></span><a class="headerlink" href="#mstar.engine.resources.step.FullAdmitOutcome.outcome" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.FullAdmitOutcome.queued">
+<span class="sig-name descname"><span class="pre">queued</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.step.FullAdmitOutcome.queued" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
 </dd></dl>
 
 <dl class="py property">
@@ -1428,6 +1437,7 @@ should reserve, address and commit nothing on its behalf.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.failed_resource"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.failed_resource</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.ok"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.ok</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.outcome"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.outcome</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.queued"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.queued</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.ready"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.ready</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.reason"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.reason</span></code></a></li>
 </ul>

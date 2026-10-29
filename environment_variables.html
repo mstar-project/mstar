@@ -252,6 +252,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -1416,11 +1417,12 @@ worker main loop (speculate, await_gpu, submit_spec, …).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code>: after every <code class="docutils literal notranslate"><span class="pre">admit</span></code>, <code class="docutils literal notranslate"><span class="pre">commit</span></code>, <code class="docutils literal notranslate"><span class="pre">reset_request</span></code> and
-<code class="docutils literal notranslate"><span class="pre">remove_request</span></code>, check the KV page bookkeeping against the streams
-holding the pages, and each commit against its request’s layout. A recurrent
-snapshot’s key is checked against the KV chain’s key at its boundary. Logs a
-label left under its footprint at removal. Tests and debugging only.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code>: after every <code class="docutils literal notranslate"><span class="pre">admit</span></code>, <code class="docutils literal notranslate"><span class="pre">commit</span></code>, <code class="docutils literal notranslate"><span class="pre">reset_request</span></code>, <code class="docutils literal notranslate"><span class="pre">remove_request</span></code>
+and change to an admitted request’s pages, check the KV page bookkeeping against
+the streams holding the pages, the reservations against the free and evictable
+pages, and each commit against its request’s layout. A recurrent snapshot’s key is
+checked against the KV chain’s key at its boundary. Logs a label left under its
+footprint at removal. Tests and debugging only.</p></td>
 </tr>
 </tbody>
 </table>

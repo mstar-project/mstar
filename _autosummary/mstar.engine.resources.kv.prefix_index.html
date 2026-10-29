@@ -252,6 +252,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -669,16 +670,18 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex"><code class="docutils literal notranslate"><span class="pre">PrefixIndex</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.assert_evictable"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.assert_evictable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evict"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.evict()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evictable"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.evictable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.holds"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.holds()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.insert()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert_run"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.insert_run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.lookup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_pages()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_sole_owned()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.page_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages_for"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.pages_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.set_shared"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.set_shared()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.touch"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.touch()</span></code></a></li>
 </ul>
 </li>
@@ -722,6 +725,18 @@ is pushed back under the page’s own.</p>
 </dd>
 </dl>
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.assert_evictable">
+<span class="sig-name descname"><span class="pre">assert_evictable</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.assert_evictable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.assert_evictable" title="Link to this definition">#</a></dt>
+<dd><p>Check that <cite>evict</cite>, run on a copy of the index and the owner counts, frees every page
+in the evictable set.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.evict">
 <span class="sig-name descname"><span class="pre">evict</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">n</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.evict"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evict" title="Link to this definition">#</a></dt>
 <dd><p>Drop the oldest leaves the index alone holds, until <code class="docutils literal notranslate"><span class="pre">n</span></code> are free.</p>
@@ -734,6 +749,20 @@ Returns the keys of the pages that reached the free list.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.evictable">
+<span class="sig-name descname"><span class="pre">evictable</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.evictable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evictable" title="Link to this definition">#</a></dt>
+<dd><p>Return the live set of pages <cite>evict</cite> could free.
+Callers read it and don’t keep it.</p>
+<p>A page only the index holds is out of reach while a page below it is held,
+since eviction takes leaves only.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -754,7 +783,9 @@ Returns the keys of the pages that reached the free list.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.insert">
 <span class="sig-name descname"><span class="pre">insert</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">parent</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.insert"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert" title="Link to this definition">#</a></dt>
-<dd><p>Name <code class="docutils literal notranslate"><span class="pre">page</span></code> by <code class="docutils literal notranslate"><span class="pre">key</span></code> under <code class="docutils literal notranslate"><span class="pre">parent</span></code>; the first writer wins.</p>
+<dd><p>Name <code class="docutils literal notranslate"><span class="pre">page</span></code> by <code class="docutils literal notranslate"><span class="pre">key</span></code> under <code class="docutils literal notranslate"><span class="pre">parent</span></code>; the first writer wins. When the arena reports to this
+index and the index alone holds <code class="docutils literal notranslate"><span class="pre">parent</span></code>, <code class="docutils literal notranslate"><span class="pre">page</span></code> is filed with no parent. Filed under <code class="docutils literal notranslate"><span class="pre">parent</span></code>,
+a held <code class="docutils literal notranslate"><span class="pre">page</span></code> would keep <cite>evict</cite> from freeing <code class="docutils literal notranslate"><span class="pre">parent</span></code>, which the pool counts as evictable.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -815,17 +846,6 @@ goes under that page. Returns how many pages were inserted.</p>
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned">
-<span class="sig-name descname"><span class="pre">num_sole_owned</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.num_sole_owned"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned" title="Link to this definition">#</a></dt>
-<dd><p>Indexed pages nothing else holds: an upper bound on what <code class="docutils literal notranslate"><span class="pre">evict</span></code> can free.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for">
 <span class="sig-name descname"><span class="pre">page_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.page_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -859,6 +879,23 @@ goes under that page. Returns how many pages were inserted.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.set_shared">
+<span class="sig-name descname"><span class="pre">set_shared</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">page</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shared</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.set_shared"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.set_shared" title="Link to this definition">#</a></dt>
+<dd><p>Called when <code class="docutils literal notranslate"><span class="pre">page</span></code> gains or loses its one owner besides the index.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>page</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>shared</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -928,16 +965,18 @@ goes under that page. Returns how many pages were inserted.</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex"><code class="docutils literal notranslate"><span class="pre">PrefixIndex</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.assert_evictable"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.assert_evictable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evict"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.evict()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evictable"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.evictable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.holds"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.holds()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.insert()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert_run"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.insert_run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.lookup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_pages()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_sole_owned()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.page_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages_for"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.pages_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.set_shared"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.set_shared()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.touch"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.touch()</span></code></a></li>
 </ul>
 </li>

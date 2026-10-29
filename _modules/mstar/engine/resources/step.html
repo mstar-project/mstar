@@ -605,6 +605,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -1228,6 +1229,8 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># Every resource's admit returns this on the common path, several times a</span>
 <span class="c1"># step; nothing reads identity, so hand back one instance rather than build it.</span>
 <span class="n">ADMIT_OK</span> <span class="o">=</span> <span class="n">AdmitOutcome</span><span class="p">(</span><span class="n">ok</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">ready</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="c1"># `Resource.ask`'s answer for a request that waits for the resource's capacity</span>
+<span class="n">ASKS</span> <span class="o">=</span> <span class="n">AdmitOutcome</span><span class="p">(</span><span class="n">ok</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">ready</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="FullAdmitOutcome">
@@ -1242,6 +1245,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    """</span>
     <span class="n">outcome</span><span class="p">:</span> <span class="n">AdmitOutcome</span>
     <span class="n">failed_resource</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># waits for capacity on its node, until `StepRunner.admit_waiting` admits it</span>
+    <span class="n">queued</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">ok</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1260,6 +1265,7 @@ window.runMermaid = runMermaid;</script>
 <span class="n">FULL_ADMIT_OK</span> <span class="o">=</span> <span class="n">FullAdmitOutcome</span><span class="p">(</span><span class="n">ADMIT_OK</span><span class="p">)</span>
 <span class="c1"># admitted, but something it needs has not landed yet: retry, don't fail</span>
 <span class="n">FULL_ADMIT_NOT_READY</span> <span class="o">=</span> <span class="n">FullAdmitOutcome</span><span class="p">(</span><span class="n">AdmitOutcome</span><span class="p">(</span><span class="n">ok</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">ready</span><span class="o">=</span><span class="kc">False</span><span class="p">))</span>
+<span class="n">FULL_ADMIT_QUEUED</span> <span class="o">=</span> <span class="n">FullAdmitOutcome</span><span class="p">(</span><span class="n">AdmitOutcome</span><span class="p">(</span><span class="n">ok</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">ready</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span> <span class="n">queued</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 </pre></div>
 
                 </article>

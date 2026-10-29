@@ -252,6 +252,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -697,7 +698,7 @@ string goes back on the wire at each send site.</p>
 be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless – the string never recurred – but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
-MicroScheduler.{failed_rids, admit_errors, held_until, backlog} (purged by
+MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog} (purged by
 clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
 streaming_buffers}, the engine’s and tensor manager’s per-request state,
 RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,

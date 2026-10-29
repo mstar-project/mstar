@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -1034,7 +1035,10 @@ before the first <code class="docutils literal notranslate"><span class="pre">ro
 <p>The footprint adds the spans, the growth at each loop’s iterations and the scratch, and
 rounds up to whole pages per label. A span’s own scratch counts only with the spans before
 it, so a window’s denoise steps and its commit count once. Under a <code class="docutils literal notranslate"><span class="pre">RetentionPolicy</span></code> it
-takes the window’s peak instead.</p>
+takes the window’s peak instead. <code class="docutils literal notranslate"><span class="pre">KVReqConfig.validate</span></code> refuses a request whose footprint
+is bigger than its pool with a 400 at intake, and <code class="docutils literal notranslate"><span class="pre">KVReqConfig.loop_room</span></code> cuts the default
+length of a request that asks for none until it fits. With every loop at 0 iterations, the
+same sum is the prompt a request reserves when its pool admits it.</p>
 <p><code class="docutils literal notranslate"><span class="pre">prompt_spans(plan,</span> <span class="pre">texts,</span> <span class="pre">text_walk,</span> <span class="pre">item_spans)</span></code> builds the common case: a prompt’s
 text and attachments in <code class="docutils literal notranslate"><span class="pre">prefill_plan</span></code> order. Qwen3.5 lays out its one label with it:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">layout</span> <span class="o">=</span> <span class="n">LabelLayout</span><span class="p">(</span>
@@ -1216,7 +1220,10 @@ a deployment can tune: <code class="docutils literal notranslate"><span class="p
 Multi-head Latent Attention latent per token in place of K and V. It needs
 <code class="docutils literal notranslate"><span class="pre">kv_lora_rank</span></code> and <code class="docutils literal notranslate"><span class="pre">qk_rope_head_dim</span></code>, and sets <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> to 1 and
 <code class="docutils literal notranslate"><span class="pre">head_dim</span></code> to their sum. Every rank holds the whole latent; only
-<code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code> shards, and MLA attention needs it set to the model’s query heads.</p></td>
+<code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code> shards, and MLA attention needs it set to the model’s query heads.
+A spec whose nodes can run on several workers, as Bagel’s LLM nodes do under CFG
+parallel, sets <code class="docutils literal notranslate"><span class="pre">leader</span></code> to the node whose pool admits each request. Left unset, each
+worker’s pool admits requests on its own.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec(config=RingKVConfig(...))</span></code></p></td>
 <td><p>A fixed-capacity frame ring. It adds <code class="docutils literal notranslate"><span class="pre">tokens_per_frame</span></code>, one
@@ -1336,8 +1343,10 @@ decode loop keeps on the device beside its last sampled token. See
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec(config=RecurrentStateConfig(...))</span></code></p></td>
 <td><p>Fixed-size per-request state that carries between steps (an LSTM’s <code class="docutils literal notranslate"><span class="pre">h</span></code> and
 <code class="docutils literal notranslate"><span class="pre">c</span></code>, a cursor, a conv tail, a Mamba or gated-DeltaNet layer’s conv window and SSM
-state, a streaming encoder’s caches): one slot per request and label, <code class="docutils literal notranslate"><span class="pre">blocks</span></code>
-naming a shape and dtype for each piece (dtype None: the engine’s compute dtype,
+state, a streaming encoder’s caches): one slot per request and label, <code class="docutils literal notranslate"><span class="pre">labels</span></code>
+naming every label a request’s steps address or fork into (<code class="docutils literal notranslate"><span class="pre">(&quot;main&quot;,)</span></code> by default)
+so that admission reserves a slot for each, <code class="docutils literal notranslate"><span class="pre">blocks</span></code> naming a shape and dtype for
+each piece (dtype None: the engine’s compute dtype,
 what its KV caches store), <code class="docutils literal notranslate"><span class="pre">num_layers</span></code> copies of each, <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> slots
 (deployment-tunable) with slot 0 the sink that padding rows address. A recurrent
 kernel reads the step’s <code class="docutils literal notranslate"><span class="pre">addressing</span></code>. <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> gives each row a
@@ -2637,7 +2646,7 @@ that its block loop can be CUDA-graph captured:</p>
     <span class="k">return</span> <span class="p">[</span>
         <span class="n">RaggedAttentionSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="n">VIT_ATTN</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"vit_encoder"</span><span class="p">},</span>
                             <span class="n">config</span><span class="o">=</span><span class="n">RaggedAttentionConfig</span><span class="p">(</span><span class="o">...</span><span class="p">)),</span>
-        <span class="n">KVSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="s2">"kv"</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="n">nodes</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="p">()),</span>
+        <span class="n">KVSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="s2">"kv"</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="n">nodes</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="p">(),</span> <span class="n">leader</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">),</span>
         <span class="n">AttentionSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="s2">"attn"</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="n">nodes</span><span class="p">,</span>
                       <span class="n">config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span><span class="n">kv_cache</span><span class="o">=</span><span class="s2">"kv"</span><span class="p">)),</span>
         <span class="n">PositionSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="s2">"rope"</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="n">nodes</span><span class="p">,</span>

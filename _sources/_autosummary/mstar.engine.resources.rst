@@ -27,6 +27,7 @@ mstar.engine.resources
    :toctree:
    :recursive:
 
+   admission
    attn
    base
    convenience

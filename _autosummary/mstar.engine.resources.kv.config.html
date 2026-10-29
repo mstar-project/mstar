@@ -252,6 +252,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -694,6 +695,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.needed_labels_per_node"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels_per_node</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.needed_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels_per_node_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.opened_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.opened_labels()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.pages"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.prefix_cache"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.prefix_decode"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_decode</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.prefix_keys"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_keys</span></code></a></li>
@@ -705,6 +707,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec"><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">KVSpec.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.config"><code class="docutils literal notranslate"><span class="pre">KVSpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.leader"><code class="docutils literal notranslate"><span class="pre">KVSpec.leader</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">KVSpec.resource_class</span></code></a></li>
 </ul>
 </li>
@@ -733,6 +736,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_tp"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_tp</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.qk_rope_head_dim"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.qk_rope_head_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.qo_heads_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.qo_heads_given</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.request_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.request_pages</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan"><code class="docutils literal notranslate"><span class="pre">PrefixSpan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -820,7 +824,7 @@ without pulling FlashInfer in behind it.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVReqConfig" title="mstar.engine.resources.kv.config.KVReqConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVReqConfig</span></code></a>(needed_labels, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVSpec" title="mstar.engine.resources.kv.config.KVSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVSpec</span></code></a>(resource_key, nodes, config)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVSpec" title="mstar.engine.resources.kv.config.KVSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVSpec</span></code></a>(resource_key, nodes, config[, leader])</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVStep" title="mstar.engine.resources.kv.config.KVStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVStep</span></code></a>(segments, ...] | None = None, commit, ...)</p></td>
@@ -1057,10 +1061,32 @@ resource built from <code class="docutils literal notranslate"><span class="pre"
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVReqConfig.opened_labels">
-<span class="sig-name descname"><span class="pre">opened_labels</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.opened_labels"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVReqConfig.opened_labels" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+<span class="sig-name descname"><span class="pre">opened_labels</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">nodes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.opened_labels"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVReqConfig.opened_labels" title="Link to this definition">#</a></dt>
+<dd><p>The labels the request opens on <code class="docutils literal notranslate"><span class="pre">nodes</span></code>, or on every node when <code class="docutils literal notranslate"><span class="pre">nodes</span></code> is None.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVReqConfig.pages">
+<span class="sig-name descname"><span class="pre">pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">caps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVReqConfig.pages" title="Link to this definition">#</a></dt>
+<dd><p>The most pages the request holds in a pool shared by <code class="docutils literal notranslate"><span class="pre">nodes</span></code>, at <code class="docutils literal notranslate"><span class="pre">caps</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1096,6 +1122,9 @@ resource built from <code class="docutils literal notranslate"><span class="pre"
 <dd><p><code class="docutils literal notranslate"><span class="pre">ValueError</span></code> (a 400) when a label would hold more positions at the request’s caps
 than its pool’s <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>. A label under retention is left out, since Cosmos3,
 the one model that declares one, computes its positions in each forward.</p>
+<p>Also when the labels <code class="docutils literal notranslate"><span class="pre">spec.nodes</span></code> open would hold more pages at the caps than the pool
+has for requests. The pool admits on the prompt alone, so such a request would be admitted
+and then could not finish even alone in an empty pool.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>spec</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.config.KVSpec" title="mstar.engine.resources.kv.config.KVSpec"><em>KVSpec</em></a><em> | </em><em>None</em>)</p>
@@ -1110,7 +1139,7 @@ the one model that declares one, computes its positions in each forward.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">KVSpec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resource_key</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#mstar.engine.resources.kv.config.KVConfig" title="mstar.engine.resources.kv.config.KVConfig"><span class="pre">mstar.engine.resources.kv.config.KVConfig</span></a></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVSpec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">KVSpec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resource_key</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#mstar.engine.resources.kv.config.KVConfig" title="mstar.engine.resources.kv.config.KVConfig"><span class="pre">mstar.engine.resources.kv.config.KVConfig</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">leader</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVSpec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1118,6 +1147,7 @@ the one model that declares one, computes its positions in each forward.</p>
 <li><p><strong>resource_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>config</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.config.KVConfig" title="mstar.engine.resources.kv.config.KVConfig"><em>KVConfig</em></a>)</p></li>
+<li><p><strong>leader</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1131,6 +1161,11 @@ storage strategy, so the config answers for them.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.config">
 <span class="sig-name descname"><span class="pre">config</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.kv.config.KVConfig" title="mstar.engine.resources.kv.config.KVConfig"><span class="pre">KVConfig</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.config" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.leader">
+<span class="sig-name descname"><span class="pre">leader</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.leader" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
@@ -1312,6 +1347,17 @@ resource stays free of the manager and its kernels.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.qo_heads_given">
 <span class="sig-name descname"><span class="pre">qo_heads_given</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.qo_heads_given" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.request_pages">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">request_pages</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.request_pages" title="Link to this definition">#</a></dt>
+<dd><p>all but the sink page the KV manager takes at build.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Pages requests can hold</p>
+</dd>
+</dl>
+</dd></dl>
 
 </dd></dl>
 
@@ -1715,6 +1761,7 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.needed_labels_per_node"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels_per_node</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.needed_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels_per_node_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.opened_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.opened_labels()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.pages"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.prefix_cache"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.prefix_decode"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_decode</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.prefix_keys"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_keys</span></code></a></li>
@@ -1726,6 +1773,7 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec"><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">KVSpec.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.config"><code class="docutils literal notranslate"><span class="pre">KVSpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.leader"><code class="docutils literal notranslate"><span class="pre">KVSpec.leader</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">KVSpec.resource_class</span></code></a></li>
 </ul>
 </li>
@@ -1754,6 +1802,7 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_tp"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_tp</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.qk_rope_head_dim"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.qk_rope_head_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.qo_heads_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.qo_heads_given</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.request_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.request_pages</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan"><code class="docutils literal notranslate"><span class="pre">PrefixSpan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

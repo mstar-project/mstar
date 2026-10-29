@@ -252,6 +252,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -1135,9 +1136,14 @@ travels with its other <code class="docutils literal notranslate"><span class="p
 ranks adopt it. <code class="docutils literal notranslate"><span class="pre">prefix_cache_tp</span></code> can’t be combined with <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>, and the
 cache’s nodes must run on one TP group, with no replicas and no walks placed on other
 ranks. Loading fails otherwise.</p>
-<p>A cached prompt no longer reserves its pages, so the pool no longer limits how many
-requests are admitted. It has to hold the decode of every request allowed to run at once,
-and a decode step that finds no free page holds its requests until they time out.
+<p>On a single rank, a request waits at the head of its pool’s queue until its prompt fits
+beside the prompts already admitted, and no request behind it starts first. A cache hit on
+a page only the prefix index holds counts as a page the request takes. A request that
+can’t fit in its pool at its full output length gets a 400 if it asked for that length,
+and otherwise has the model’s default length cut until it fits. The pool
+reserves only prompts, so it still has to hold the decode of every request allowed to run
+at once, and a decode step that finds no page outside the admitted prompts holds its
+requests until they time out.
 <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> prevents that. It caps how many requests run at once, and the
 pool’s pages divided by the pages one request needs, prompt and output together, is a
 safe value. <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> lets a full pool move a request to the host. An offload

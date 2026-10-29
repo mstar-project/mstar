@@ -605,6 +605,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -966,7 +967,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
@@ -1082,6 +1083,11 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="mi">1</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">request_pages</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Pages requests can hold: all but the sink page the KV manager takes at build."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_pages</span> <span class="o">-</span> <span class="mi">1</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">latent_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1299,6 +1305,18 @@ window.runMermaid = runMermaid;</script>
             <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="n">layout</span><span class="o">.</span><span class="n">growth</span><span class="p">:</span>
                 <span class="n">n</span> <span class="o">=</span> <span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">-</span> <span class="n">layout</span><span class="o">.</span><span class="n">positions</span><span class="p">(</span><span class="n">caps</span><span class="p">)</span> <span class="o">+</span> <span class="n">slots</span> <span class="o">*</span> <span class="n">caps</span><span class="p">[</span><span class="n">loop</span><span class="p">])</span> <span class="o">//</span> <span class="n">slots</span>
                 <span class="n">room</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">room</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">loop</span><span class="p">,</span> <span class="n">n</span><span class="p">))</span>
+        <span class="n">pool</span><span class="p">,</span> <span class="n">page_size</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">request_pages</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="n">caps</span><span class="p">,</span> <span class="n">page_size</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">pool</span><span class="p">:</span>
+            <span class="c1"># each loop's room in pages, searched with the other loops at their caps</span>
+            <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">cap</span> <span class="ow">in</span> <span class="n">caps</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="n">low</span><span class="p">,</span> <span class="n">high</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">cap</span>
+                <span class="k">while</span> <span class="n">low</span> <span class="o">&lt;</span> <span class="n">high</span><span class="p">:</span>
+                    <span class="n">mid</span> <span class="o">=</span> <span class="p">(</span><span class="n">low</span> <span class="o">+</span> <span class="n">high</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="p">{</span><span class="o">**</span><span class="n">caps</span><span class="p">,</span> <span class="n">loop</span><span class="p">:</span> <span class="n">mid</span><span class="p">},</span> <span class="n">page_size</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">pool</span><span class="p">:</span>
+                        <span class="n">low</span> <span class="o">=</span> <span class="n">mid</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">high</span> <span class="o">=</span> <span class="n">mid</span> <span class="o">-</span> <span class="mi">1</span>
+                <span class="n">room</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">low</span><span class="p">,</span> <span class="n">room</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">loop</span><span class="p">,</span> <span class="n">low</span><span class="p">))</span>
         <span class="k">return</span> <span class="n">room</span></div>
 
 
@@ -1307,7 +1325,11 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="s2">"KVSpec | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""``ValueError`` (a 400) when a label would hold more positions at the request's caps</span>
 <span class="sd">        than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,</span>
-<span class="sd">        the one model that declares one, computes its positions in each forward."""</span>
+<span class="sd">        the one model that declares one, computes its positions in each forward.</span>
+
+<span class="sd">        Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool</span>
+<span class="sd">        has for requests. The pool admits on the prompt alone, so such a request would be admitted</span>
+<span class="sd">        and then could not finish even alone in an empty pool."""</span>
         <span class="k">if</span> <span class="n">spec</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">):</span>
             <span class="k">return</span>
         <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">layout</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
@@ -1316,7 +1338,13 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">"this request needs </span><span class="si">{</span><span class="n">positions</span><span class="si">}</span><span class="s2"> positions of </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">, "</span>
                     <span class="sa">f</span><span class="s2">"past the model's context of </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="si">}</span><span class="s2">"</span>
-                <span class="p">)</span></div>
+                <span class="p">)</span>
+        <span class="n">pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop_caps</span> <span class="ow">or</span> <span class="p">{},</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">pages</span> <span class="o">&gt;</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">request_pages</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"this request needs </span><span class="si">{</span><span class="n">pages</span><span class="si">}</span><span class="s2"> pages of </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> for labels "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">))</span><span class="si">}</span><span class="s2">, and the pool has </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">request_pages</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KVReqConfig.get_labels">
@@ -1333,11 +1361,24 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="KVReqConfig.opened_labels">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.opened_labels">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">opened_labels</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">opened_labels</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">nodes</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The labels the request opens on ``nodes``, or on every node when ``nodes`` is None."""</span>
         <span class="n">labels</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">needed_labels</span> <span class="ow">or</span> <span class="p">[</span><span class="s2">"main"</span><span class="p">])</span>
-        <span class="k">for</span> <span class="n">named</span> <span class="ow">in</span> <span class="p">(</span><span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">needed_labels_per_node</span><span class="o">.</span><span class="n">values</span><span class="p">(),</span> <span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">needed_labels_per_node_walk</span><span class="o">.</span><span class="n">values</span><span class="p">()):</span>
-            <span class="n">labels</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">named</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">node</span><span class="p">,</span> <span class="n">named</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">needed_labels_per_node</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">nodes</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">nodes</span><span class="p">:</span>
+                <span class="n">labels</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">named</span><span class="p">)</span>
+        <span class="k">for</span> <span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">_</span><span class="p">),</span> <span class="n">named</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">needed_labels_per_node_walk</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">nodes</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">nodes</span><span class="p">:</span>
+                <span class="n">labels</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">named</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">labels</span></div>
+
+
+<div class="viewcode-block" id="KVReqConfig.pages">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.pages">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">nodes</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The most pages the request holds in a pool shared by ``nodes``, at ``caps``."""</span>
+        <span class="n">layouts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">layouts</span><span class="p">[</span><span class="n">label</span><span class="p">]</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">caps</span><span class="p">,</span> <span class="n">page_size</span><span class="p">)</span> <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">(</span><span class="n">nodes</span><span class="p">)</span> <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">layouts</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KVReqConfig.get_publish_labels">
@@ -1400,6 +1441,9 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">KVSpec</span><span class="p">(</span><span class="n">NodeResourceSpec</span><span class="p">):</span>
     <span class="n">config</span><span class="p">:</span> <span class="n">KVConfig</span>
+    <span class="c1"># Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no</span>
+    <span class="c1"># more pages per request than the leader's, as long as the leader offloads nothing.</span>
+    <span class="n">leader</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>

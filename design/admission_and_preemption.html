@@ -1,0 +1,1234 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Preemption under KV pressure &#8212; M* v0.2.1 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../_static/documentation_options.js?v=c480a563"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'design/admission_and_preemption';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.1" />
+    <meta name="docbuild:last-update" content="Oct 29, 2026"/>
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.2.1 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../metrics.html">Metrics reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../clients.html">Using a Server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../evaluation.html">Evaluation and Benchmarks</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models.html">Supported Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../asr.html">Speech recognition: Whisper and Qwen3-ASR</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.realtime_vad.html">mstar.api_server.openai.realtime_vad</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.canary.html">mstar.model.canary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.canary_qwen.html">mstar.model.canary_qwen</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.html">mstar.model.command_a_plus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.assets.html">mstar.model.command_a_plus.assets</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.components.html">mstar.model.command_a_plus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.config.html">mstar.model.command_a_plus.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.tests.html">mstar.model.command_a_plus.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.glm52.html">mstar.model.glm52</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm52.components.html">mstar.model.glm52.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm52.config.html">mstar.model.glm52.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm52.weight_loader.html">mstar.model.glm52.weight_loader</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.lingbot_world.html">mstar.model.lingbot_world</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.lingbot_world.components.html">mstar.model.lingbot_world.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.lingbot_world.config.html">mstar.model.lingbot_world.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.ltx2_5.html">mstar.model.ltx2_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.ltx2_5.components.html">mstar.model.ltx2_5.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.media_limits.html">mstar.model.media_limits</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.audio.html">mstar.model.omnilingual_asr.audio</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.components.html">mstar.model.omnilingual_asr.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.config.html">mstar.model.omnilingual_asr.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.tokenizer.html">mstar.model.omnilingual_asr.tokenizer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.weight_loader.html">mstar.model.omnilingual_asr.weight_loader</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_asr.html">mstar.model.qwen3_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_asr.constants.html">mstar.model.qwen3_asr.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.observability.html">mstar.observability</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.observability.catalog.html">mstar.observability.catalog</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.observability.recorders.html">mstar.observability.recorders</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.cache_home.html">mstar.utils.cache_home</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.cpus.html">mstar.utils.cpus</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.fp8_block.html">mstar.utils.fp8_block</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.generation_kwargs.html">mstar.utils.generation_kwargs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../environment_variables.html">Environment variables</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/design/admission_and_preemption.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2Fdesign/admission_and_preemption.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/design/admission_and_preemption.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Preemption under KV pressure</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#classes">1. Classes</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reservations">2. Reservations</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#preemption">3. Preemption</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#arrival-numbers">3.1 Arrival numbers</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#choosing-the-victims">3.2 Choosing the victims</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#earmarks">3.3 Earmarks</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-drop">4. The drop</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#return-and-rebuild">5. Return and rebuild</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#states">5.1 States</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-return-check">5.2 The return check</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-rebuild-row">5.3 The rebuild row</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tokens-after-a-rebuild">5.4 Tokens after a rebuild</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-every-request-finishes">5.5 Why every request finishes</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tp-followers">6. TP followers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checks">7. Checks</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#trade-offs">8. Trade-offs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps-out-of-scope-here">9. Next steps (Out of Scope here)</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="preemption-under-kv-pressure">
+<h1>Preemption under KV pressure<a class="headerlink" href="#preemption-under-kv-pressure" title="Link to this heading">#</a></h1>
+<p>Since M* has no admission control today, requests take pages as they prefill and decode, and free them only when they finish. Once every running request in a full pool needs another page, none can finish, and all wait until clients time out (#307).</p>
+<p>Earlier PR (#400) proposed admission control that reserves each request’s worst case — its prompt plus <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>. It removes the stall completely, but induces severe HoL blocking (e.g. chats queue behind image requests): their TTFT p50 rose from 0.45 s to 17.7 s. Whether this fragments the pool was never measured, but it is nonetheless based on a banker check which felt too strict.</p>
+<p>This design adds slim version of admission control by default (A1). A request reserves only its prompt’s pages and waits in a queue until they fit. On top of it, the requests are classified as either:</p>
+<ol class="arabic simple">
+<li><p><strong>Guaranteed.</strong> A request that streams audio, or whose KV can’t be rebuilt from token ids, also reserves pages for the most it can generate, and is never preempted.</p></li>
+<li><p><strong>Preemptible.</strong> When a request runs out of pages, newer preemptible requests are dropped to free pages for it, and later rebuild their KV from token ids.</p></li>
+</ol>
+<p>A host tier for the prefix cache, which was on the roadmap regardless, is built alongside, and aims to cut that recompute by copying pages between host and device asynchronously, hiding the offload and reload cost.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Part</p></th>
+<th class="head"><p>PR</p></th>
+<th class="head"><p>Section</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Reservations and a queue per pool</p></td>
+<td><p>A1</p></td>
+<td><p>§2</p></td>
+</tr>
+<tr class="row-odd"><td><p>The rebuild row</p></td>
+<td><p>R1</p></td>
+<td><p>§5</p></td>
+</tr>
+<tr class="row-even"><td><p>Preemption on a failed grant</p></td>
+<td><p>R2</p></td>
+<td><p>§3, §4</p></td>
+</tr>
+<tr class="row-odd"><td><p>Guaranteed and preemptible requests</p></td>
+<td><p>R3</p></td>
+<td><p>§1</p></td>
+</tr>
+<tr class="row-even"><td><p>TP followers</p></td>
+<td><p>R4</p></td>
+<td><p>§6</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<hr class="docutils" />
+<section id="classes">
+<h2>1. Classes<a class="headerlink" href="#classes" title="Link to this heading">#</a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">KVReqConfig</span><span class="p">(</span><span class="n">ResourceReqConfig</span><span class="p">):</span>
+    <span class="o">...</span>
+    <span class="n">guaranteed</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># reserves its whole footprint and is never dropped</span>
+</pre></div>
+</div>
+<p>A dropped request keeps only its token ids, so a request can be preempted only if its node can rebuild all of its KV from them.</p>
+<p>A request that can’t be rebuilt must never run short. It reserves its whole footprint up front, its prompt plus its growth bound, and is never preempted. That is what guaranteed means.</p>
+<p>The model declares the footprint as KV spans (#832). A span’s kind says what its KV is made from:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">ids</span></code>: token ids</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">digest</span></code>: an encoder’s output</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rows</span></code>: another node’s outputs</p></li>
+</ul>
+<p>The conductor sets the class once, at ingest, and the same class holds in every pool.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>#</p></th>
+<th class="head"><p>A request with</p></th>
+<th class="head"><p>Class</p></th>
+<th class="head"><p>Why</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>1</p></td>
+<td><p>Audio it streams out</p></td>
+<td><p>guaranteed</p></td>
+<td><p>a pause is a gap in playback</p></td>
+</tr>
+<tr class="row-odd"><td><p>2</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">rows</span></code> span</p></td>
+<td><p>guaranteed</p></td>
+<td><p>its KV comes from another node’s outputs, such as the Thinker’s hidden states the Qwen3-Omni Talker reads</p></td>
+</tr>
+<tr class="row-even"><td><p>3</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">digest</span></code> span</p></td>
+<td><p>guaranteed</p></td>
+<td><p>its KV comes from an encoder’s output, freed after prefill</p></td>
+</tr>
+<tr class="row-odd"><td><p>4</p></td>
+<td><p>No kept ids on its node</p></td>
+<td><p>guaranteed there</p></td>
+<td><p>the node has no ids to rebuild from, as when its decode reads embeddings</p></td>
+</tr>
+<tr class="row-even"><td><p>5</p></td>
+<td><p>Only <code class="docutils literal notranslate"><span class="pre">ids</span></code> spans</p></td>
+<td><p>preemptible</p></td>
+<td><p>its token ids reproduce all of its KV</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Row 3 becomes preemptible with a followup, R5, which keeps a host copy of the encoder’s output for the rebuild. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Until then, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker.</p>
+<p>On initial tests, I measured that keeping row 3 guaranteed costs about 9% of TTFT under pressure. On a 48-page pool at c16, Qwen3.5 image requests’ TTFT p50 fell from 3.48 s to 3.18 s once R5a made them preemptible.</p>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>The class comes from the request.</strong> A priority or a per-request flag would be one more input to tune, when the footprint and the output can be used to make the decision.</p></li>
+<li><p><strong>The conductor sets it.</strong> It is the one place that sees every resource’s layout. A Qwen3-Omni request with audio out has <code class="docutils literal notranslate"><span class="pre">rows</span></code> only on the Talker’s worker, so a class each worker set from its own pools would let the Thinker’s worker drop a request whose Talker is speaking.</p></li>
+<li><p><strong>Only streamed audio.</strong> A streamed text reply that pauses is late, not broken, and an unstreamed audio reply is played after it arrives.</p></li>
+<li><p><strong>Not the worst case for every request.</strong> With 32 Bagel text chats beside 16 image chats on 64 pages, chat TTFT p50 was 559 ms with every request guaranteed and 69.7 ms with two classes.</p></li>
+<li><p><strong>Seeded requests stay preemptible.</strong> Guaranteeing them would charge the worst case to every request that sets a seed. A rebuilt seeded request may not repeat its output (§5.4).</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="reservations">
+<h2>2. Reservations<a class="headerlink" href="#reservations" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">KVManager._alloc</span></code> (<a class="reference download internal" download="" href="../_downloads/80b0b8624f2e11368fbec0c403b15d87/manager.py"><span class="xref download myst">manager.py</span></a>) checks every one of the grants against the reservations, under the KV lock which it already holds. A grant is <code class="docutils literal notranslate"><span class="pre">_alloc</span></code> giving a request the next page to write into. Each pool gains:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># per pool, under the KV lock</span>
+<span class="n">_allotments</span>   <span class="c1"># each admitted request's Allotment, its reservation</span>
+<span class="n">_unused</span>       <span class="c1"># pages reserved but not yet used, summed over requests</span>
+<span class="n">_waiting</span>      <span class="c1"># the queue, in arrival order (§3.1)</span>
+</pre></div>
+</div>
+<p>The code calls a reservation an <code class="docutils literal notranslate"><span class="pre">Allotment</span></code>, since <code class="docutils literal notranslate"><span class="pre">manager.py</span></code> already uses “reservation” for an admit’s unwind record.</p>
+<p>Rules:</p>
+<ul class="simple">
+<li><p><strong>Ingest.</strong> A request whose footprint is bigger than its pool gets a 400 at ingest. A request that asks for no length has its default cut to fit the pool (#808).</p></li>
+<li><p><strong>Queue.</strong> A request joins the runner’s waiting list at its first readiness check, in the order requests first ask. It is admitted when it is first among the waiting requests of every pool it asks, and its reservation fits in each, in the free and evictable pages no admitted request has reserved.</p></li>
+<li><p><strong>Size.</strong> A preemptible request reserves its prompt. A guaranteed one also reserves its growth.</p></li>
+<li><p><strong>Inside a reservation.</strong> A grant always succeeds. A failure there is an accounting bug, and the manager raises.</p></li>
+<li><p><strong>Past a reservation.</strong> A grant takes only from the room, and fails with <code class="docutils literal notranslate"><span class="pre">AllocationFailed(pages_short=...)</span></code> when the room is short.</p></li>
+<li><p><strong>Across pools.</strong> A request takes its reservation in every pool its node asks, the recurrent pool’s slot included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.</p></li>
+</ul>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">room</span> <span class="o">=</span> <span class="n">free</span> <span class="o">+</span> <span class="n">evictable</span> <span class="o">-</span> <span class="n">_unused</span>
+
+<span class="n">invariant</span><span class="p">,</span> <span class="n">after</span> <span class="n">every</span> <span class="n">grant</span><span class="p">,</span> <span class="n">reservation</span><span class="p">,</span> <span class="n">lease</span> <span class="ow">and</span> <span class="n">release</span><span class="p">:</span>
+    <span class="n">_unused</span> <span class="o">&lt;=</span> <span class="n">free</span> <span class="o">+</span> <span class="n">evictable</span>
+</pre></div>
+</div>
+<p>What a cache hit costs:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>A hit on</p></th>
+<th class="head"><p>Costs</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>a page only the index holds</p></td>
+<td><p>a fresh page</p></td>
+</tr>
+<tr class="row-odd"><td><p>a page another request holds</p></td>
+<td><p>nothing, lent to a preemptible request</p></td>
+</tr>
+<tr class="row-even"><td><p>a cached prefix copied from the host at readiness</p></td>
+<td><p>a grant within the request’s reservation</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>The rule lives in <code class="docutils literal notranslate"><span class="pre">_alloc</span></code>.</strong> Today it grants any free page, so a growing request could take a page a guaranteed request reserved, and that request’s next grant would fail.</p></li>
+<li><p><strong>Only the head is admitted.</strong> Nothing newer passes the oldest request, so it can’t wait forever behind a stream of small ones (§5.5).</p></li>
+<li><p><strong>Evictable hits are charged as fresh.</strong> Eviction could hand such a page to another request before the probe leases it.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="preemption">
+<h2>3. Preemption<a class="headerlink" href="#preemption" title="Link to this heading">#</a></h2>
+<p>Preemption starts when a grant past a reservation fails, in <code class="docutils literal notranslate"><span class="pre">Worker._handle_allocation_failure</span></code> (<a class="reference download internal" download="" href="../_downloads/de1b1ad2a070cfcbefb1feab5cce8263/worker.py"><span class="xref download myst">worker.py</span></a>), which calls <code class="docutils literal notranslate"><span class="pre">Worker._preempt</span></code>. In place of today’s 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads the least recently active request first, as it does today, since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.</p>
+<p>Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can’t use.</p>
+<section id="arrival-numbers">
+<h3>3.1 Arrival numbers<a class="headerlink" href="#arrival-numbers" title="Link to this heading">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">KVReqConfig</span><span class="p">(</span><span class="n">ResourceReqConfig</span><span class="p">):</span>
+    <span class="o">...</span>
+    <span class="n">arrival</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>   <span class="c1"># set by the conductor when it takes the request</span>
+</pre></div>
+</div>
+<p>The conductor numbers each request from a single counter, in the order it takes them, and sets it on every pool’s config. A dropped request keeps its number. Each pool’s queue and its victim choice go by it.</p>
+<p>A number set by each worker won’t work, since requests reach workers on separate sockets, and so two workers can see the same two requests in different orders. Each will drop a different one, and neither makes progress.</p>
+</section>
+<section id="choosing-the-victims">
+<h3>3.2 Choosing the victims<a class="headerlink" href="#choosing-the-victims" title="Link to this heading">#</a></h3>
+<p>Say request R’s grant is short by <code class="docutils literal notranslate"><span class="pre">pages_short</span></code> pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.</p>
+<ul class="simple">
+<li><p><strong>Candidates.</strong> The preemptible requests that arrived after R, newest first, minus any whose drop is refused for a lasting reason (§4).</p></li>
+<li><p><strong>Victims.</strong> The fewest leading candidates that together free at least <code class="docutils literal notranslate"><span class="pre">pages_short</span></code>, minus any whose drop wouldn’t change what the set frees.</p></li>
+</ul>
+<p>Then:</p>
+<ol class="arabic simple">
+<li><p>If the victims free enough, the worker earmarks <code class="docutils literal notranslate"><span class="pre">pages_short</span></code> for R (§3.3) and drops each victim (§4).</p></li>
+<li><p>Otherwise, if R can be dropped and that frees any page, R drops itself and is requeued.</p></li>
+<li><p>Otherwise, R waits until the pool’s room grows past what its failed grant saw.</p></li>
+</ol>
+<p>The choice is one <code class="docutils literal notranslate"><span class="pre">KVManager.preempt</span></code> call under the pool’s lock.</p>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>Newest first.</strong> No request is dropped for a newer one’s page. vLLM’s FCFS policy preempts the last entry in <code class="docutils literal notranslate"><span class="pre">running</span></code>, which is where a resumed request sits.</p></li>
+<li><p><strong>R is its own victim only as a last resort.</strong> If even that frees nothing, every page is held by older or guaranteed requests, and those finish.</p></li>
+<li><p><strong>A waiting request watches the room.</strong> The pool records the room each failed grant saw, so no timer decides when to retry.</p></li>
+<li><p><strong>Not the least recently active request.</strong> Today’s offload picks it, but it can be the oldest request in the pool, so nothing guarantees progress.</p></li>
+<li><p><strong>Not the largest request.</strong> A long request would be dropped every time it grows.</p></li>
+</ul>
+</section>
+<section id="earmarks">
+<h3>3.3 Earmarks<a class="headerlink" href="#earmarks" title="Link to this heading">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Earmark</span><span class="p">:</span>
+    <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span>            <span class="c1"># R, the request whose grant failed</span>
+    <span class="n">pages</span><span class="p">:</span> <span class="nb">int</span>          <span class="c1"># what R was short</span>
+    <span class="n">victims</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>   <span class="c1"># the victims whose drops cover it</span>
+</pre></div>
+</div>
+<p>When the victims’ drops land, the earmark joins R’s reservation, so R’s next grant can’t fail again. Without it, the head of the queue could be admitted into the freed pages before R’s next step, and R would fail again, as it does today.</p>
+<p>A victim with a step or a KV read in flight is dropped once that lands, and the worker composes it into no further step until then.</p>
+<p>Lifecycle:</p>
+<ol class="arabic simple">
+<li><p>Created with its victims when the worker handles R’s failed grant.</p></li>
+<li><p>Joins R’s reservation when its victims’ drops land.</p></li>
+<li><p>Removed with R.</p></li>
+</ol>
+</section>
+</section>
+<hr class="docutils" />
+<section id="the-drop">
+<h2>4. The drop<a class="headerlink" href="#the-drop" title="Link to this heading">#</a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">KVManager</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Take rid's KV off the GPU without copying it, and return the number</span>
+<span class="sd">        of pages that reach the free list. Keyed pages stay in the index as</span>
+<span class="sd">        evictable pages. Needs no host pool."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_resident</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""False while rid is offloaded, and from its drop until its rebuild</span>
+<span class="sd">        step lands."""</span>
+</pre></div>
+</div>
+<p>A drop releases the request’s whole reservation. <code class="docutils literal notranslate"><span class="pre">KVManager.check_drop</span></code> refuses:</p>
+<ul class="simple">
+<li><p>a guaranteed request</p></li>
+<li><p>one with no kept ids</p></li>
+<li><p>one not yet decoding</p></li>
+<li><p>one with a host copy</p></li>
+<li><p>one with a step, a KV read or a sample in flight, until that lands</p></li>
+</ul>
+<p>At a drop, the other resources:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Resource</p></th>
+<th class="head"><p>At a drop</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Sampler</p></td>
+<td><p>kept, since its RNG offset and repetition mask can’t be recomputed</p></td>
+</tr>
+<tr class="row-odd"><td><p>Position counter</p></td>
+<td><p>reset, and the rebuild moves it back to the end of the history</p></td>
+</tr>
+<tr class="row-even"><td><p>Qwen3.5’s recurrent state</p></td>
+<td><p>zeroed in place, and the request keeps its slot, so its rebuild never waits for one</p></td>
+</tr>
+<tr class="row-odd"><td><p>Everything else</p></td>
+<td><p>kept, as an offload keeps it</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>A drop needs no host pool.</strong> <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> is 0 by default, and a full host pool would stall preemption as it stalls offload today.</p></li>
+<li><p><strong>The whole reservation goes.</strong> Keeping its unused part, as an offload does, would leave pages counted that nothing can use until the victim returns.</p></li>
+</ul>
+<blockquote>
+<div><p>Note: a dropped request’s keyed pages stay in the index as evictable cache. With write-ahead (H1b) and a host pool, they reach the host once no request holds them, so a later request with that prefix copies them back. A rebuild row doesn’t read the host index, though, so it recomputes what only the host holds.</p>
+</div></blockquote>
+</section>
+<hr class="docutils" />
+<section id="return-and-rebuild">
+<h2>5. Return and rebuild<a class="headerlink" href="#return-and-rebuild" title="Link to this heading">#</a></h2>
+<section id="states">
+<h3>5.1 States<a class="headerlink" href="#states" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>State</p></th>
+<th class="head"><p>Held as</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>running</p></td>
+<td><p>resident, out of the queue</p></td>
+</tr>
+<tr class="row-odd"><td><p>dropped</p></td>
+<td><p>not resident, in the queue at its arrival position, no reservation</p></td>
+</tr>
+<tr class="row-even"><td><p>rebuilding</p></td>
+<td><p>not resident, out of the queue, holding its return reservation, its rebuild row queued or in a step</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>No field holds the state: residency, the queue and the rebuild queue tell the three apart.</p>
+<p>Lifecycle:</p>
+<ul class="simple">
+<li><p>A rebuilding request can be chosen again. Its queued row leaves the queue, and it gives up its return reservation and waits in the queue again.</p></li>
+<li><p>Removing a request in any state releases its earmark, its place in the queue, its return reservation, its queued rebuild row and its kept ids. A removal during a rebuild step waits for the step.</p></li>
+</ul>
+</section>
+<section id="the-return-check">
+<h3>5.2 The return check<a class="headerlink" href="#the-return-check" title="Link to this heading">#</a></h3>
+<p>Once per scheduling pass, the worker offers each dropped request at the head of its pool’s queue to this check, in place of the fit check:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">need</span><span class="p">(</span><span class="n">V</span><span class="p">)</span> <span class="o">=</span> <span class="k">for</span> <span class="n">each</span> <span class="n">label</span><span class="p">,</span> <span class="n">the</span> <span class="n">pages</span> <span class="n">V</span><span class="s1">'s kept history fills, plus 1,</span>
+          <span class="n">capped</span> <span class="n">at</span> <span class="n">V</span><span class="s1">'s footprint</span>
+
+<span class="k">return</span> <span class="n">when</span> <span class="n">_unused</span> <span class="o">+</span> <span class="n">need</span><span class="p">(</span><span class="n">V</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">free</span> <span class="o">+</span> <span class="n">evictable</span><span class="p">,</span>
+       <span class="k">with</span> <span class="n">every</span> <span class="n">hit</span> <span class="n">charged</span> <span class="k">as</span> <span class="n">fresh</span>
+</pre></div>
+</div>
+<p>When it passes, V reserves <code class="docutils literal notranslate"><span class="pre">need(V)</span></code> and its rebuild row is queued.</p>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>A whole history and a page, not the prompt.</strong> A victim readmitted once its prompt fit would take back its own pages, and R would fail again.</p></li>
+<li><p><strong>Capped at the footprint.</strong> The ingest 400 bounds the footprint, not the history plus a page.</p></li>
+<li><p><strong>Outside <code class="docutils literal notranslate"><span class="pre">check_ready</span></code>.</strong> After a partial cache hit, <code class="docutils literal notranslate"><span class="pre">admit_retrieve</span></code> would move the position counter past what the rebuild restores, so no <code class="docutils literal notranslate"><span class="pre">admit_retrieve</span></code> runs on a request between its drop and the end of its rebuild.</p></li>
+</ul>
+</section>
+<section id="the-rebuild-row">
+<h3>5.3 The rebuild row<a class="headerlink" href="#the-rebuild-row" title="Link to this heading">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">KeptIds</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A request's token ids as its model consumed them, kept for a rebuild."""</span>
+    <span class="n">prompt</span><span class="p">:</span> <span class="nb">bytes</span>    <span class="c1"># the prompt's ids as int32, from the data worker</span>
+    <span class="n">sampled</span><span class="p">:</span> <span class="n">array</span>   <span class="c1"># array('i'), each kept sample, appended at the stop check</span>
+</pre></div>
+</div>
+<p>The rebuild is one row of the engine’s batch over the kept ids minus the last, under the node’s prefill walk, in a step of its own. Its sample is discarded, it sends nothing, and its decode loop doesn’t advance. Decoding resumes from the last kept id once the step lands.</p>
+<p>The data worker already reads the prompt’s ids on the host to key the prefix cache, so it sends them with the request’s first frame. They are the ids after templating. The worker keeps them per node and per handle, and lists them in <code class="docutils literal notranslate"><span class="pre">rid_table.py</span></code>. It keeps them only where one prefill row can rebuild the node’s KV. Elsewhere the request is guaranteed (§1).</p>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>The graph runtime never sees the row.</strong> Switching the request’s runtime walk for one step would touch both runtimes, the output edges, <code class="docutils literal notranslate"><span class="pre">WORKER_GRAPHS_DONE</span></code> and the loop-back.</p></li>
+<li><p><strong>The prefill walk.</strong> Each model’s decode walk breaks a multi-token row in its own way. Bagel’s declares a span of 1, the Qwen3-Omni Thinker’s embeds every id at one position, and Qwen3.5’s with device loop-back reads one token off the sampler.</p></li>
+<li><p><strong>The prompt’s ids from the data worker.</strong> A drop can come at any token, after the prompt tensor is freed. Keeping the ids any other way means a device-to-host copy of every prefill’s input.</p></li>
+<li><p><strong>Not a remove and re-ingest.</strong> The sampler’s RNG offset and repetition mask would be lost.</p></li>
+</ul>
+<blockquote>
+<div><p>Note: the row’s cache probe serves the kept ids’ cached prefix first, so a rebuild recomputes only what the GPU index doesn’t hold. Qwen3.5 rebuilds its whole history until its prefix caching (P2) lands.</p>
+</div></blockquote>
+</section>
+<section id="tokens-after-a-rebuild">
+<h3>5.4 Tokens after a rebuild<a class="headerlink" href="#tokens-after-a-rebuild" title="Link to this heading">#</a></h3>
+<p>A rebuild’s prefill rounds differently from the decode steps that first wrote the KV. So a rebuilt request continues like a fresh prefill of its context, not like the run it was dropped from, and a seeded request rebuilt under load may not repeat its output.</p>
+<p>In 24 cases on Qwen3.5, Bagel, Orpheus and the Qwen3-Omni Thinker, greedy and seeded, captured and eager, the tokens after every rebuild equal a prefill of the kept ids with the same step shape and cached length. 7 of the 24 also match the run without the drop for 64 tokens.</p>
+</section>
+<section id="why-every-request-finishes">
+<h3>5.5 Why every request finishes<a class="headerlink" href="#why-every-request-finishes" title="Link to this heading">#</a></h3>
+<p>A guaranteed request reserves its whole footprint and is never dropped, so it finishes.</p>
+<p>Take the oldest preemptible request:</p>
+<ol class="arabic simple">
+<li><p>When it runs short, newer requests are dropped first, and it drops itself only when none of them can free a page for it.</p></li>
+<li><p>It then waits at the head of its queue, where nothing newer is admitted past it.</p></li>
+<li><p>It returns with its whole history and one more page reserved, so each time it is dropped again it has grown by at least a page.</p></li>
+<li><p>Its footprint fits the pool, so it finishes after a bounded number of returns.</p></li>
+</ol>
+<p>The next oldest request then takes its place in the argument.</p>
+<p>For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs 6 pages to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="tp-followers">
+<h2>6. TP followers<a class="headerlink" href="#tp-followers" title="Link to this heading">#</a></h2>
+<p>Rank 0 decides every reservation and its undo, each earmark, drop and return, and records it in the <code class="docutils literal notranslate"><span class="pre">OffloadDelta</span></code> (<a class="reference download internal" download="" href="../_downloads/6f23d3360ef0e39c2e20a12ef5c0f306/ipc_format.py"><span class="xref download myst">ipc_format.py</span></a>) it sends with the next <code class="docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code>, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">OffloadDelta</span><span class="p">:</span>
+    <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">kinds</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">MoveKind</span><span class="p">]</span>   <span class="c1"># offload, reload, reserve, unreserve, earmark, drop or rebuild</span>
+    <span class="o">...</span>                     <span class="c1"># the page counts and victims the kinds carry</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Every rank checks each grant against the reservations. Only rank 0 queues, runs the fit check, chooses victims and makes a request wait.</p></li>
+<li><p>Rank 0 drops a victim as it sends the next step of the victim’s node.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code> carries the step’s rebuild rows. Each rank builds them from its own kept ids, which match, since every rank samples rank 0’s token.</p></li>
+<li><p>A follower whose counts can’t take a move exits.</p></li>
+</ul>
+<p>With speculation on, rank 0 decides only where pages already move today, after the admit fence or after a refused step, so a speculative step never carries a move made after it was sent.</p>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>Rank 0 decides.</strong> Victims chosen from per-rank state could differ between ranks, which <a class="reference external" href="http://AGENTS.md">AGENTS.md</a> invariant 11 rules out.</p></li>
+<li><p><strong>The drop goes out with the next step.</strong> Applied on rank 0 the moment its step lands, a drop would free pages before removals a follower applies ahead of the delta, and the ranks’ free lists would hand out different pages.</p></li>
+<li><p><strong>No kept ids on the wire.</strong> Every rank already holds them.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="checks">
+<h2>7. Checks<a class="headerlink" href="#checks" title="Link to this heading">#</a></h2>
+<p>Always on:</p>
+<ul class="simple">
+<li><p>A victim is preemptible, droppable and never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.</p></li>
+<li><p>A grant that a reservation covers and that can’t take its pages raises.</p></li>
+<li><p>Counters per node: preemptions, drops, tokens rebuilt, and requests dropped more than once.</p></li>
+</ul>
+<p>Under <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code>:</p>
+<ul class="simple">
+<li><p>The invariant of §2, on each grant.</p></li>
+<li><p>After a drop, the victim holds no page in the pool, and the pool’s pages are conserved.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="trade-offs">
+<h2>8. Trade-offs<a class="headerlink" href="#trade-offs" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Drops cost a rebuild.</strong> Once nothing can be offloaded, every victim is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307’s workload one request was dropped four times, although that was a contrived test.</p></li>
+<li><p><strong>Rebuild steps.</strong> A rebuild runs in a step of its own, so the node’s decode rows wait one step. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.</p></li>
+<li><p><strong>Kept ids.</strong> Every request’s prompt ids ride its first frame to each worker, which keeps them at 4 B per token, 128 KB for a 32K-token request. Carrying them adds 0.5 to 1.8 ms of TTFT per request at Bagel c16 and Qwen3.5 c32. Keeping the ids any other way would mean a d2h copy of every prefill.</p></li>
+<li><p><strong>Shared prefixes with host offload.</strong> A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.</p></li>
+<li><p><strong>Guaranteed requests queue.</strong> On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="next-steps-out-of-scope-here">
+<h2>9. Next steps (Out of Scope here)<a class="headerlink" href="#next-steps-out-of-scope-here" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Pool sizing.</strong> Fixed, hand-set pool sizes can also cause thrashing, which this work surfaced. Each cache’s <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> comes from the config, 2048 pages by default, so a pool can fill and preempt long before memory runs out: Command A+’s TP8 config gets about 4 GB of KV per GPU where, by my estimate, about 20 GB is free after weights. Except for M*, every other engine sizes the pool from free memory instead.</p></li>
+<li><p><strong>One pool per GPU.</strong> SGLang has moved from a fixed pool per cache type to one physical pool, where full-attention KV and window or recurrent state grow from opposite ends and compaction remaps pages, since agent contexts vary too much in length for fixed ratios. M*’s caches on a worker could share one pool the same way, but the effects would need to be measured.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#classes">1. Classes</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reservations">2. Reservations</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#preemption">3. Preemption</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#arrival-numbers">3.1 Arrival numbers</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#choosing-the-victims">3.2 Choosing the victims</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#earmarks">3.3 Earmarks</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-drop">4. The drop</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#return-and-rebuild">5. Return and rebuild</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#states">5.1 States</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-return-check">5.2 The return check</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-rebuild-row">5.3 The rebuild row</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tokens-after-a-rebuild">5.4 Tokens after a rebuild</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-every-request-finishes">5.5 Why every request finishes</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tp-followers">6. TP followers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checks">7. Checks</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#trade-offs">8. Trade-offs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps-out-of-scope-here">9. Next steps (Out of Scope here)</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Oct 29, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

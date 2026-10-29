@@ -605,6 +605,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
@@ -972,6 +973,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.admission</span><span class="w"> </span><span class="kn">import</span> <span class="n">Admission</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CachedPrefix</span><span class="p">,</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">,</span> <span class="n">Resource</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
@@ -1066,6 +1068,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># name every node, including one that owns nothing — an absent node</span>
         <span class="c1"># falls back to the full sweep, which is the un-scoped behaviour.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_retrieve_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_retrieve_order</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_ask_order</span> <span class="o">=</span> <span class="p">[</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span> <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">])</span><span class="o">.</span><span class="n">ask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">Resource</span><span class="o">.</span><span class="n">ask</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_node_ask_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ask_order</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_admission</span> <span class="o">=</span> <span class="n">Admission</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ask_order</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_trail_order</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">page_trail</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
@@ -1346,6 +1351,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="StepRunner.remove_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.remove_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">remove_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_admission</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span></div>
 
@@ -1356,7 +1362,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">published</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">FullAdmitOutcome</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""bring published state in</span>
+<span class="w">        </span><span class="sd">"""bring published state in, once `node_name`'s resources have admitted the request</span>
 
 <span class="sd">        gives `ready=False` when still has inflights; shortcircuit on failure</span>
 
@@ -1366,6 +1372,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        node ends up gated on — and able to allocate against — another node's</span>
 <span class="sd">        cache.</span>
 <span class="sd">        """</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admission</span><span class="o">.</span><span class="n">admitted</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">):</span>
+            <span class="n">waits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admission</span><span class="o">.</span><span class="n">admit</span><span class="p">(</span>
+                <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">published</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_ask_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ask_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">),</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">waits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">waits</span>
         <span class="n">ready</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_node_retrieve_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_retrieve_order</span><span class="p">,</span> <span class="n">node_name</span>
@@ -1384,6 +1397,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">FULL_ADMIT_OK</span> <span class="k">if</span> <span class="n">ready</span> <span class="k">else</span> <span class="n">FULL_ADMIT_NOT_READY</span></div>
 
 
+<div class="viewcode-block" id="StepRunner.admit_waiting">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.admit_waiting">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">admit_waiting</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">published_of</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admission</span><span class="o">.</span><span class="n">admit_waiting</span><span class="p">(</span><span class="n">published_of</span><span class="p">)</span></div>
 
 
     <span class="c1"># ── Pre-plan bookkeeping ─────────────────────────────────────────────</span>
