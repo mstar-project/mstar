@@ -577,6 +577,7 @@ def test_hip_devices_map_to_amd_smi_numbers(monkeypatch):
         return {"gpu_data": [{"gpu": g, "process_list": procs(g)} for g in nodes]}
 
     monkeypatch.setattr(launch, "amd_smi_json", fake)
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
     launch.smi_index_map.cache_clear()
     try:
         assert launch.smi_index_map() == {0: 3, 1: 0, 2: 2, 3: 1, 4: 7, 5: 4, 6: 6, 7: 5}
@@ -595,6 +596,22 @@ def test_hip_devices_map_to_amd_smi_numbers(monkeypatch):
                              "GPU5   FAIL  occupancy   procs=[python3.12:2] vram_used=9635/262128 MB gfx_activity=0%\n")
     assert health.interpret_check(rows, [3, 0]).status == "PASS"
     assert health.interpret_check(rows, [3, 5]).status == "FAIL"
+
+
+def test_hip_devices_of_a_job_given_some_gpus(monkeypatch):
+    from benchmark.amd import launch
+
+    # SLURM hands a job node-wide indices (KFD order) in ROCR_VISIBLE_DEVICES; amd-smi still lists all eight.
+    nodes = {0: 3, 1: 5, 2: 4, 3: 2, 4: 7, 5: 9, 6: 8, 7: 6}
+    monkeypatch.setattr(launch, "amd_smi_json", lambda *a: [{"gpu": g, "node_id": n} for g, n in nodes.items()])
+    try:
+        for rocr, want in (("5", {0: 4}), ("4,5", {0: 7, 1: 4}), ("0,1,2,3,4,5,6,7", None), ("9", None),
+                           ("GPU-1234", None)):
+            monkeypatch.setenv("ROCR_VISIBLE_DEVICES", rocr)
+            launch.smi_index_map.cache_clear()
+            assert launch.smi_index_map() == (want or {0: 3, 1: 0, 2: 2, 3: 1, 4: 7, 5: 4, 6: 6, 7: 5}), rocr
+    finally:
+        launch.smi_index_map.cache_clear()
 
 
 def test_allreduce_fallback_marks_the_row(tmp_path):
