@@ -305,7 +305,8 @@ series.
    Histogram, seconds, one observation per edge read. The reader's time to read the
    edge's tensors: the SHM file read and copy, the copy out of the SHM arena, or the
    RDMA or TCP read. A GPU reader of the arena only issues its host-to-device copies in
-   that time. The producer's own work (serializing, staging, registering memory) is not
+   that time; a worker issues those of one message pass together and charges each edge
+   read an equal share. The producer's own work (serializing, staging, registering memory) is not
    included; it is the ``tx`` time of :ref:`request-profiling`. Buckets:
    :ref:`transfer <metrics-buckets>`.
 

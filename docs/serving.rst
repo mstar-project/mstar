@@ -721,7 +721,8 @@ API server adds the results its data worker read:
   per edge read: the reader's time to read that edge's tensors, which is the SHM file
   read and copy, the copy out of the SHM arena, or the RDMA or TCP read. A GPU reader of
   the arena only issues its host-to-device copies in that time; they finish
-  asynchronously. The producer's own work (serializing, staging into the arena,
+  asynchronously. A worker issues those of one message pass together and charges each
+  edge read an equal share. The producer's own work (serializing, staging into the arena,
   registering memory) is not included; it is the ``tx`` time of
   :ref:`request profiling <request-profiling>`.
 
