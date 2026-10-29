@@ -1886,7 +1886,8 @@ def _qwen35_llm():
 def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch, knob):
     submodules, llm = _qwen35_llm()
     monkeypatch.setattr(submodules, "ingraph_decode_rope", lambda: knob)
-    assert llm.resident_walks(None) == {"decode"}
+    # a plain (non-speculative) node; a drafting one keeps its k + 1-token rows off the tables
+    assert llm.resident_walks(SimpleNamespace(_speculative=False)) == {"decode"}
     assert llm._rope_in_graph(SimpleNamespace(captured=True), "decode")
     assert not llm._rope_in_graph(SimpleNamespace(captured=False), "decode")
 
@@ -1903,8 +1904,10 @@ def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     ]
     stub = SimpleNamespace(
         _rope_in_graph=llm._rope_in_graph, _position_ids_3d=lambda inputs: pytest.fail("read positions"),
+        _speculative=False,
     )
-    sampler = SimpleNamespace(loopback_tokens=lambda: token)
+    # the masters move (no in-graph scatter here), so the step stages its input ids
+    sampler = SimpleNamespace(loopback_tokens=lambda: token, loopback_in_graph=False)
     engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={submodules.SAMPLER: sampler})
     out = llm.preprocess(stub, "decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}
