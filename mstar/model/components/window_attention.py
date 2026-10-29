@@ -71,8 +71,12 @@ def _warn_sdpa(dtype: torch.dtype, head_dim: int) -> None:
 _window_attention = PlatformDispatch("mstar::window_attention", rocm=_rocm, default=lambda: _sdpa)
 
 
-def window_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Unmasked attention within each window: ``q``, ``k``, ``v`` and the result
-    are ``[batch, seq, heads, head_dim]`` (views with a unit last stride are
-    fine), scaled by ``head_dim ** -0.5``."""
-    return _window_attention(q, k, v)
+def window_attention_kernel() -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    """This platform's unmasked attention within each window: ``q``, ``k``,
+    ``v`` and the result are ``[batch, seq, heads, head_dim]`` (views with a
+    unit last stride are fine), scaled by ``head_dim ** -0.5``.
+
+    A layer binds it when it is built: picking it from inside a compiled
+    forward would break the graph (the pick takes a lock dynamo can't trace).
+    """
+    return _window_attention.resolve()
