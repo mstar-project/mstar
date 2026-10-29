@@ -36,7 +36,8 @@ HOPS = (
     "api.http_in",    # chat handler entered (body parsed)
     "api.submit",     # submission key made, handed to the data worker
     "dw.start",       # data worker took it
-    "dw.tokenized",   # process_prompt done
+    "dw.prompt",      # process_prompt done
+    "dw.tokenized",   # prefix-cache keys and layouts done
     "dw.sent",        # NEW_REQUEST handed to the conductor's socket
     "cond.arrival",   # conductor read it
     "cond.dispatch",  # NEW_REQUEST sent to the worker
