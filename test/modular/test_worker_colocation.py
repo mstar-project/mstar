@@ -29,7 +29,7 @@ def test_rocm_starts_nothing_and_says_so(caplog):
     assert isinstance(colocation, HardwareQueueColocation)
     with caplog.at_level(logging.INFO, logger="mstar.platforms.interface"):
         colocation.start()
-    assert "hardware scheduler" in caplog.text
+    assert "nothing to start" in caplog.text
     assert colocation.client_env == {}
     colocation.stop()
 

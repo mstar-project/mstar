@@ -428,9 +428,11 @@ for the other's. ``mps: true`` makes the conductor start a CUDA MPS control daem
 its own before it spawns the workers, run every worker as its client so their kernels
 overlap, and quit the daemon at shutdown. The daemon uses a private pipe directory, so
 other processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the
-NVIDIA driver) must be on ``PATH``. On AMD GPUs there is nothing to start: the hardware
-scheduler runs the queues of different processes concurrently, so ``mps: true`` only
-logs that, and the same configs serve unchanged (``Platform.colocated_workers``).
+NVIDIA driver) must be on ``PATH``. On AMD GPUs there is nothing to start: each process
+submits to hardware queues of its own, which the GPU schedules without a daemon, so
+``mps: true`` only logs that and the same configs serve unchanged
+(``Platform.colocated_workers``). Whether a split gains there is per deployment: Qwen3-TTS's
+did on an MI300X (see :doc:`models`), Whisper's did not on a one-GPU slice.
 The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
