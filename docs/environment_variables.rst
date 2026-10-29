@@ -618,7 +618,8 @@ Worker scheduling
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
        ``remove_request``, check the KV page bookkeeping against the streams
-       holding the pages, and each commit against its request's layout. Logs a
+       holding the pages, and each commit against its request's layout. A recurrent
+       snapshot's key is checked against the KV chain's key at its boundary. Logs a
        label left under its footprint at removal. Tests and debugging only.
 
 Compilation

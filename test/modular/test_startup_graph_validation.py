@@ -620,7 +620,7 @@ class _LoopWorker:
         ))
         if self.runtime == "rust":
             plan = rt._rust.take_send_plan(out.completion_id)
-            return node, any(r == rid and wgs for r, wgs, _ in plan.completed)
+            return node, any(r == rid and wgs for r, wgs, *_ in plan.completed)
         done = bool(rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids)
         rt.send_outputs(SendInput(
             completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
