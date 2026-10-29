@@ -187,21 +187,45 @@ struct ChunkIt {
   bool valid;
 };
 
-__device__ __forceinline__ int tile_chunks(const Phase& ph) { return (int)ph.chunks; }
+// mode bit 3: the O and down GEMMs as one task per (tile, K chunk), each adding its partial product into the
+// residual with an fp32 atomic, so their few tiles spread over more workgroups; every RMSNorm then sums its
+// row's squares from the residual itself (the per-tile partial sums need the whole tile).
+constexpr int kSplitK = 8;
 
-// First chunk at or after phase `ph` (task slot from the start of that phase).
+__device__ __forceinline__ bool split_k(const Params& P, const Phase& d) {
+  return (P.sync_mode & kSplitK) != 0 && (d.kind == OPROJ || d.kind == DOWN);
+}
+
+// tasks a GEMM phase is cut into, and the chunks of each
+__device__ __forceinline__ int phase_tasks(const Params& P, const Phase& d) {
+  return split_k(P, d) ? (int)(d.n_tasks * d.chunks) : (int)d.n_tasks;
+}
+
+__device__ __forceinline__ int task_chunks(const Params& P, const Phase& d) {
+  return split_k(P, d) ? 1 : (int)d.chunks;
+}
+
+// output tile and K chunk of a task's c-th chunk
+__device__ __forceinline__ int2 tile_chunk(const Params& P, const Phase& d, int task, int c) {
+  if (split_k(P, d)) return make_int2(task % (int)d.n_tasks, task / (int)d.n_tasks);
+  return make_int2(task, c);
+}
+
+// First chunk at or after phase `ph` (`tile` holds the task index).
 __device__ ChunkIt first_chunk_from(const Params& P, const Group& G, int ph) {
   for (; ph < P.n_phases && ph < P.stop_after; ++ph) {
     const Phase d = load_phase(P, ph);
-    if (is_gemm(d.kind) && G.member < d.n_tasks - d.task_begin) return {ph, (int)d.task_begin + G.member, 0, true};
+    if (is_gemm(d.kind) && G.member < phase_tasks(P, d) - d.task_begin) {
+      return {ph, (int)d.task_begin + G.member, 0, true};
+    }
   }
   return {0, 0, 0, false};
 }
 
 __device__ ChunkIt advance(const Params& P, const Group& G, ChunkIt it) {
   const Phase d = load_phase(P, it.ph);
-  if (it.chunk + 1 < tile_chunks(d)) return {it.ph, it.tile, it.chunk + 1, true};
-  if (it.tile + G.members < d.n_tasks) return {it.ph, it.tile + G.members, 0, true};
+  if (it.chunk + 1 < task_chunks(P, d)) return {it.ph, it.tile, it.chunk + 1, true};
+  if (it.tile + G.members < phase_tasks(P, d)) return {it.ph, it.tile + G.members, 0, true};
   return first_chunk_from(P, G, it.ph + 1);
 }
 
@@ -223,29 +247,50 @@ __device__ __forceinline__ const uint4* chunk_src(const Phase& d, int tile, int 
 __device__ __forceinline__ void load_chunk(uint4 (&wb)[8], const Params& P, const ChunkIt& it) {
   if (!it.valid) return;
   const Phase d = load_phase(P, it.ph);
-  const uint4* src = chunk_src(d, it.tile, it.chunk);
+  const int2 tc = tile_chunk(P, d, it.tile, it.chunk);
+  const uint4* src = chunk_src(d, tc.x, tc.y);
 #pragma unroll
   for (int i = 0; i < 8; ++i) wb[i] = src[i];
 }
 
 // A operand of a K = 1024 GEMM from the fp32 residual: bf16(h * rsqrt(ss / 1024 + eps) * norm_w), for this
 // lane's row (lane % 16) and its 64 K elements; zeros past the group's rows.
-__device__ void load_a_normed(uint4 (&ab)[8], const Params& P, const Group& G, const Phase& d) {
+__device__ void load_a_normed(uint4 (&ab)[8], const Params& P, const Group& G, const Phase& d, float* scratch) {
   const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
   const int m = lane & 15;
   const int kb = 256 * wave + 64 * (lane >> 4);
-  if (m >= G.nrows) {
+  const bool live = m < G.nrows;
+  const int row = G.row0 + (live ? m : 0);
+  const float4* hp = reinterpret_cast<const float4*>(P.h + (int64_t)row * kHidden + kb);
+  float4 x[16];
+#pragma unroll
+  for (int i = 0; i < 16; ++i) x[i] = live ? hp[i] : make_float4(0.f, 0.f, 0.f, 0.f);
+  float rs;
+  if ((P.sync_mode & kSplitK) != 0) {
+    // the row's sum of squares from the residual: this lane's 64 elements, the wave's four lanes with this row,
+    // then the four waves
+    float sq = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) sq += x[i].x * x[i].x + x[i].y * x[i].y + x[i].z * x[i].z + x[i].w * x[i].w;
+    sq += __shfl_xor(sq, 16, 64);
+    sq += __shfl_xor(sq, 32, 64);
+    __syncthreads();
+    if (lane < 16) scratch[wave * 16 + lane] = sq;
+    __syncthreads();
+    const float total = scratch[m] + scratch[16 + m] + scratch[32 + m] + scratch[48 + m];
+    rs = rsqrtf(total * (1.f / kHidden) + P.eps);
+  } else {
+    rs = live ? rsqrtf(P.ss[d.ss_in * P.bs + row] * (1.f / kHidden) + P.eps) : 0.f;
+  }
+  if (!live) {
 #pragma unroll
     for (int i = 0; i < 8; ++i) ab[i] = make_uint4(0, 0, 0, 0);
     return;
   }
-  const int row = G.row0 + m;
-  const float rs = rsqrtf(P.ss[d.ss_in * P.bs + row] * (1.f / kHidden) + P.eps);
-  const float4* hp = reinterpret_cast<const float4*>(P.h + (int64_t)row * kHidden + kb);
   const uint4* wp = reinterpret_cast<const uint4*>(reinterpret_cast<const bf16_t*>(d.norm_w) + kb);
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    const float4 x0 = hp[2 * i], x1 = hp[2 * i + 1];
+    const float4 x0 = x[2 * i], x1 = x[2 * i + 1];
     const uint4 w = wp[i];
     ab[i].x = pack2(x0.x * rs * bf2f(w.x & 0xffffu), x0.y * rs * bf2f(w.x >> 16));
     ab[i].y = pack2(x0.z * rs * bf2f(w.y & 0xffffu), x0.w * rs * bf2f(w.y >> 16));
@@ -466,16 +511,20 @@ __device__ void gemm_phase(const Params& P, const Group& G, int ph_idx, const Ph
   const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
   const bool shared_a = d.kind == QKV || d.kind == GATEUP || d.kind == LMHEAD;  // one A for the whole phase
   if (!(it.valid && it.ph == ph_idx)) return;
-  if (shared_a) load_a_normed(R.a, P, G, d);
+  if (shared_a) load_a_normed(R.a, P, G, d, reinterpret_cast<float*>(red));
+  const bool atomic_residual = split_k(P, d);
+  const int nch = task_chunks(P, d);
   while (it.valid && it.ph == ph_idx) {
-    const int tile = it.tile;
+    const int task = it.tile;
+    const int tile = tile_chunk(P, d, task, 0).x;
     f32x4 acc0 = {0.f, 0.f, 0.f, 0.f}, acc1 = {0.f, 0.f, 0.f, 0.f};
-    for (int c = 0; c < d.chunks; ++c) {
+    for (int c = 0; c < nch; ++c) {
       // this chunk's activations are requested before waiting for its weights (R.wnext, requested a chunk
       // earlier), so the two latencies overlap; then the following chunk's weights are requested
       if (!shared_a) {
         const bf16_t* a = d.kind == OPROJ ? P.attn : P.act;
-        load_a_bf16(R.a, G, a, d.kind == OPROJ ? kQHeads * kHeadDim : kInter, c * kChunkK);
+        load_a_bf16(R.a, G, a, d.kind == OPROJ ? kQHeads * kHeadDim : kInter,
+                    tile_chunk(P, d, task, c).y * kChunkK);
       }
 #pragma unroll
       for (int i = 0; i < 8; ++i) R.wcur[i] = R.wnext[i];
@@ -509,6 +558,8 @@ __device__ void gemm_phase(const Params& P, const Group& G, int ph_idx, const Ph
           P.act[(int64_t)row * kInter + n] = f2bf(silu(v) * acc1[i]);
         } else if (d.kind == LMHEAD) {
           P.logits[((int64_t)d.aux * P.bs + row) * kVocab + n] = v;
+        } else if (atomic_residual) {  // one K chunk's share of the residual add
+          atomic_add_f32(P.h + (int64_t)row * kHidden + n, v, P.scope);
         } else {  // OPROJ, DOWN: residual add; sum of squares of the new row for the next norm
           float* hp = P.h + (int64_t)row * kHidden + n;
           const float hn = *hp + v;
@@ -516,7 +567,7 @@ __device__ void gemm_phase(const Params& P, const Group& G, int ph_idx, const Ph
           sq[i] = hn * hn;
         }
       }
-      if (d.kind == OPROJ || d.kind == DOWN) {
+      if ((d.kind == OPROJ || d.kind == DOWN) && !atomic_residual) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
           const float s = sum16(sq[i]);

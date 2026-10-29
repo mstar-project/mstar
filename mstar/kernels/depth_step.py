@@ -23,6 +23,8 @@ SCOPE_AGENT, SCOPE_XCD = 0, 1
 # one XCD, polls by load instead of compare-and-swap; for a group over several XCDs, a counter per XCD and one
 # agent-scope exchange among the XCDs' first members
 SYNC_GATHER, SYNC_LOAD_POLL, SYNC_HIER = 1, 2, 4
+# the O and down GEMMs split by K chunk, each chunk adding into the residual atomically
+SPLIT_K = 8
 SYNC_WORDS = 1024  # per group
 
 
