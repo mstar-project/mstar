@@ -532,12 +532,6 @@ class Worker:
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
-        # Before the runtime: which (node, walk) pairs chunk, and so must never
-        # be speculated into, is the submodules' to say.
-        loaded = EngineManager.load_submodules(
-            node_names, device, model_config, self.parallel_groups, model,
-        ) if model is not None else None
-
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
@@ -568,7 +562,6 @@ class Worker:
             enable_nvtx=self.enable_nvtx,
             enable_prof=self.enable_prof,
             device_capability=self.device_capability,
-            loaded=loaded,
         )
 
         self.request_state = RequestStateManager(

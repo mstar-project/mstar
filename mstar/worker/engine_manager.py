@@ -93,18 +93,6 @@ def refuse_combined_walks_across_tp_groups(
 
 
 @dataclass
-class LoadedSubmodules:
-    """A worker's submodules before its engine exists."""
-    submodules: dict[str, NodeSubmodule]
-    specs: list
-    autocast_dtype: torch.dtype
-    # nodes this worker chunks nowhere whatever the model says
-    # (`_unchunkable_nodes`): no token budget, and still speculable
-    no_chunking: frozenset[str] = frozenset()
-
-
-
-@dataclass
 class EngineManager:
     """Owns the worker's engine.
 
@@ -114,16 +102,21 @@ class EngineManager:
     engine: Engine
     node_names: set[str] = field(default_factory=set)
 
-    @staticmethod
-    def load_submodules(
+    @classmethod
+    def build(
+        cls,
         node_names: set[str],
         device: torch.device,
         model_config: dict,
         parallel_groups: WorkerParallelGroups,
+        transfer_engine_info: TransferEngineInfo,
         model: Model,
-    ) -> LoadedSubmodules:
-        """This worker's nodes' submodules and resource specs, checked; the
-        engine is built from them by ``build``.
+        graph_runtime: GraphRuntime,
+        enable_nvtx: bool = False,
+        enable_prof: bool=False,
+        device_capability: DeviceCapability | None = None,
+    ) -> "EngineManager":
+        """Build the engine and load this worker's nodes into it.
 
         The model supplies each node's submodule via ``get_submodule`` and its
         resources via ``get_node_resources``; the KV cache's shape rides on
@@ -177,28 +170,6 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
-        return LoadedSubmodules(submodules, specs, autocast_dtype, no_chunking)
-
-    @classmethod
-    def build(
-        cls,
-        node_names: set[str],
-        device: torch.device,
-        model_config: dict,
-        parallel_groups: WorkerParallelGroups,
-        transfer_engine_info: TransferEngineInfo,
-        model: Model,
-        graph_runtime: GraphRuntime,
-        enable_nvtx: bool = False,
-        enable_prof: bool=False,
-        device_capability: DeviceCapability | None = None,
-        loaded: LoadedSubmodules | None = None,
-    ) -> "EngineManager":
-        """Build the engine and load this worker's nodes into it, from
-        ``loaded`` when the caller needed the submodules first."""
-        if loaded is None:
-            loaded = cls.load_submodules(node_names, device, model_config, parallel_groups, model)
-        submodules, specs, autocast_dtype = loaded.submodules, loaded.specs, loaded.autocast_dtype
 
         engine = Engine(
             graph_runtime=graph_runtime,
@@ -231,7 +202,7 @@ class EngineManager:
             budgets, set(model.get_graph_walk_graphs()),
             combined_walk_of=model.combined_walk_of(),
             override_mixed={node for node, flag in override_mixed.items() if flag},
-            no_chunking=loaded.no_chunking,
+            no_chunking=no_chunking,
             min_chunk_tokens=model_config.get("min_chunk_tokens", DEFAULT_MIN_CHUNK_TOKENS),
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
