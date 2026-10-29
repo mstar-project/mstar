@@ -427,12 +427,15 @@ other's memory only as used, so the first to capture can take the other's room. 
 ``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
 counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
 
-Workers that share a GPU time-slice it by default: one process's kernels wait for the
-other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of its own
-before it spawns the workers, run every worker as its client so their kernels overlap,
-and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
-processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
-driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
+Workers that share an NVIDIA GPU time-slice it by default: one process's kernels wait
+for the other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of
+its own before it spawns the workers, run every worker as its client so their kernels
+overlap, and quit the daemon at shutdown. The daemon uses a private pipe directory, so
+other processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the
+NVIDIA driver) must be on ``PATH``. On AMD GPUs there is nothing to start: the hardware
+scheduler runs the queues of different processes concurrently, so ``mps: true`` only
+logs that, and the same configs serve unchanged (``Platform.colocated_workers``).
+The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
