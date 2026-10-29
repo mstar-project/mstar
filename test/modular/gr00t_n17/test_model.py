@@ -1193,6 +1193,13 @@ def test_with_capture_off_the_dt_declares_no_graphs(tmp_path, model_kwargs):
     assert model.get_submodule(DENOISE_STEP).get_accelerator_graph_configs(torch.device("cpu")) == []
 
 
+def test_a_misspelt_model_kwarg_stops_the_server_naming_it(tmp_path):
+    """Every kwarg this model reads is a named parameter; a typo would otherwise serve the
+    default silently (`capture_batch_size` for `capture_batch_sizes`)."""
+    with pytest.raises(TypeError, match="capture_batch_size"):
+        _constructed(tmp_path, capture_batch_size=[1])
+
+
 def test_capture_without_shapes_is_refused(tmp_path):
     """No shapes would silently mean no graphs: the spans are inputs, so there is no
     default bucket."""
