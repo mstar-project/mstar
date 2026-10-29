@@ -35,6 +35,9 @@ def _fake(x, x_scale, weight, weight_scale, bias, out_dtype):
 def _scaled_mm():
     if current_platform.fp8_dtype() is None:
         raise RuntimeError(f"{current_platform.name} {current_platform.arch()} has no fp8 GEMM")
+    if current_platform.is_cuda() and not current_platform.has_cuda_capability(9, 0):
+        # Ada has fp8 tensor cores, but torch's rowwise-scaled fp8 GEMM starts at Hopper
+        raise RuntimeError(f"rowwise-scaled fp8 GEMMs need sm_90 or newer, not {current_platform.arch()}")
 
     def fp8_rowwise_mm(x, x_scale, weight, weight_scale, bias, out_dtype):
         return torch._scaled_mm(x, weight.T, scale_a=x_scale, scale_b=weight_scale, bias=bias, out_dtype=out_dtype)
