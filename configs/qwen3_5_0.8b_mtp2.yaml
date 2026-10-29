@@ -1,0 +1,16 @@
+model: "qwen3_5_0.8b"
+max_seq_len: 32768
+node_groups:
+  # Speculative decoding is checked on text prompts; images still prefill
+  # through the encoder, unwarmed.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+model_kwargs:
+  # Speculative decoding: the checkpoint's MTP head drafts 2 tokens a step
+  # and each decode step verifies them (see SpecDecodeResource).
+  num_draft_tokens: 2
+resources:
+  gdn_state:
+    # A request holds num_draft_tokens + 1 state slots: 64 requests, plus the sink.
+    max_slots: 193
+    # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)
