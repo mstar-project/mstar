@@ -22,7 +22,10 @@ model_kwargs:
   # keeps the output off the reference bit for bit either way.
   compile_exact_ops: [norms]
   accelerator_graph: true
-  capture_sizes: [[1024, 1024]]
+  # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles
+  # per batch size inside its first requests and decodes on the eager VAE. Edits keep the one bucket.
+  capture_sizes: [[1024, 1024], [768, 1344]]
+  capture_edit_sizes: [[1024, 1024]]
   capture_batch_sizes: [1, 2, 3, 4]
   max_batch_size: 4
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
