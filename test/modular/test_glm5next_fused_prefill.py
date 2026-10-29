@@ -1,6 +1,6 @@
 """Fused KDA prefill (kda_triton) vs the torch chunk_kda reference — parity on CUDA.
 
-The oracle is ``Glm5NextLinearAttention.prefill`` run per span in fp32 against in-place slot
+The oracle is ``KimiDeltaAttention.prefill`` run per span in fp32 against in-place slot
 views, as the reference bundle does. The fused path must be no less accurate than that
 reference under the engine's bf16 autocast.
 """
@@ -13,9 +13,9 @@ from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.kda import KDAPlan
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
+from mstar.model.components.distributed import ParallelKimiDeltaAttention
+from mstar.model.components.kda import KDAConfig
 from mstar.model.glm5_next import fused_decode
-from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
-from mstar.model.glm5_next.kda import Glm5NextKdaConfig
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and fused_decode._HAS_TRITON),
@@ -81,8 +81,8 @@ def _kda(seed=0, head_dim=HEAD_DIM):
     """One TP8 rank's KDA layer with gates spread like a trained model's: per-channel decay
     from ~0 (long memory) to the lower bound (forgets within a token)."""
     torch.manual_seed(seed)
-    kda = Glm5NextKdaAttention(Glm5NextKdaConfig(
-        hidden_size=HIDDEN, linear_num_heads=HEADS, linear_head_dim=head_dim),
+    kda = ParallelKimiDeltaAttention(KDAConfig(
+        hidden_size=HIDDEN, num_heads=HEADS, head_dim=head_dim),
         dtype=torch.bfloat16).cuda()
     with torch.no_grad():
         for name, p in kda.named_parameters():
@@ -135,7 +135,7 @@ def _paged(kda, x, spans, rec, conv, kernels=None):
     """``x`` through the layer's paged path, the pool's blocks being ``rec`` and ``conv``."""
     kda.mix = KDACallable(_Pool(rec, conv), _Kda(_plan(spans), kernels or kda_triton.TritonKDAKernels()))
     with torch.no_grad():
-        return kda.forward_paged(x, 0)
+        return kda(x, 0)
 
 
 def _fused(kda, x, spans, rec, conv):
@@ -230,7 +230,7 @@ def test_kda_prefill_continue_then_decode(fp32_matmul):
     kda.mix.attn.plan = KDAPlan(slot_ids=slots, has_state=torch.ones_like(slots, dtype=torch.bool),
                                 spans=(1,), num_tokens=1, is_decode=True)
     with torch.no_grad():
-        step = kda.forward_paged(x[300:], 0)
+        step = kda(x[300:], 0)
 
     assert _rel(out, oracle) < 1e-2
     assert _rel(step, oracle_step) < 2e-2

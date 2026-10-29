@@ -1,4 +1,5 @@
-"""Fused NoPE-MLA latent glue: both latent RMSNorms and the zero-kpe cache row in one kernel."""
+"""MLA without decoupled dims (GLM-5.3): both latent RMSNorms and the zero-kpe cache row in one
+kernel, for ``components/mla.py``."""
 from __future__ import annotations
 
 import torch
@@ -8,7 +9,7 @@ try:
     import triton.language as tl
 
     _HAS_TRITON = True
-except ModuleNotFoundError:  # no triton: Glm5NextMLAAttention keeps its torch path
+except ModuleNotFoundError:  # no triton: MLAAttention keeps its torch path
     _HAS_TRITON = False
 
 

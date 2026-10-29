@@ -1,11 +1,13 @@
-"""Fused MLA latent norms (Triton) vs an fp32 reference and the torch path — parity."""
+"""Fused MLA latent norms (Triton) vs an fp32 reference and the torch path — parity. The kernel
+is the shared MLA's (``mstar/utils/mla_latent_norm.py``) for a latent with no decoupled dims, run
+here through GLM-5.3's layer."""
 import pytest
 import torch
 
-from mstar.model.glm5_next.components import attention
+from mstar.model.components import mla
 from mstar.model.glm5_next.components.attention import Glm5NextMLAAttention
 from mstar.model.glm5_next.config import Glm5NextModelConfig
-from mstar.model.glm5_next.mla_kernels import (
+from mstar.utils.mla_latent_norm import (
     _HAS_TRITON,
     mla_latent_norm,
     mla_latent_norm_available,
@@ -67,7 +69,7 @@ def test_kernel_reads_a_strided_row():
 @pytest.mark.parametrize("reduced", [False, True])
 @pytest.mark.parametrize("T", [1, 32, 300])
 def test_module_fused_path_matches_torch_path(monkeypatch, reduced, T):
-    """``_latent_norm`` through the kernel vs through FlashInfer rmsnorm + split/clone/cat."""
+    """``_latent_rows`` through the kernel vs through FlashInfer rmsnorm + split/clone/cat."""
     cfg = Glm5NextModelConfig.reduced() if reduced else Glm5NextModelConfig()
     with torch.device("cuda"):
         attn = Glm5NextMLAAttention(cfg, layer_idx=3, kv_plane=0).to(torch.bfloat16)
@@ -77,9 +79,9 @@ def test_module_fused_path_matches_torch_path(monkeypatch, reduced, T):
     fused, _, _ = _inputs(T, cfg.q_lora_rank, cfg.kv_lora_rank, 2.0, "cuda")
     fused = fused.contiguous()
 
-    q_fused, latent_fused = attn._latent_norm(fused)
-    monkeypatch.setattr(attention, "mla_latent_norm_available", lambda *a: False)
-    q_ref, latent_ref = attn._latent_norm(fused)
+    q_fused, latent_fused = attn._latent_rows(fused)
+    monkeypatch.setattr(mla, "mla_latent_norm_available", lambda *a: False)
+    q_ref, latent_ref = attn._latent_rows(fused)
 
     _assert_bf16_parity(q_fused, q_ref)
     _assert_bf16_parity(latent_fused, latent_ref)
@@ -92,7 +94,7 @@ def test_torch_path_on_cpu():
     fused = torch.randn(4, cfg.q_lora_rank + cfg.kv_lora_rank)
     assert not mla_latent_norm_available(
         fused, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight)
-    q_c, latent = attn._latent_norm(fused)
+    q_c, latent = attn._latent_rows(fused)
     L = cfg.kv_lora_rank
     assert q_c.shape == (4, cfg.q_lora_rank) and latent.shape == (4, L + cfg.mla_cache_kpe)
     torch.testing.assert_close(q_c, attn.q_a_layernorm(fused[:, : cfg.q_lora_rank]))
