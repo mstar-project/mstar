@@ -385,6 +385,8 @@ class Worker:
     # instance.
     _lockstep_led: frozenset[str] = frozenset()
     _lockstep_unread: Mapping[int, dict[str, set[str]]] = MappingProxyType({})
+    # (producer, walk) -> {signal: the led nodes it is routed to}; structural
+    _lockstep_consumers: Mapping[tuple[str, str], dict[str, tuple[str, ...]]] = MappingProxyType({})
 
     @cached_property
     def device_capability(self) -> DeviceCapability:
@@ -1612,8 +1614,7 @@ class Worker:
         any rank (``_drop_rows_whose_read_failed``)."""
         self._lockstep_led = frozenset(self.parallel_nodes & self.parallel_leader_nodes)
         self._lockstep_unread = {}
-        # (producer, walk) -> {signal: the led nodes it is routed to}; structural
-        self._lockstep_consumers: dict[tuple[str, str], dict[str, tuple[str, ...]]] = {}
+        self._lockstep_consumers = {}
 
     def _note_lockstep_reads(self, ready: dict[int, list[GraphEdge]]) -> None:
         """Rank 0: the inputs of a lockstep node it leads that landed here by a
@@ -1633,18 +1634,26 @@ class Worker:
                 self._lockstep_unread.setdefault(rid, {}).setdefault(edge.next_node, set()).add(edge.name)
 
     def _note_local_lockstep_inputs(
-        self, stored: StoredOutputs, signals: list[str], producer: str, walk_of: Callable[[int], str],
+        self, stored: StoredOutputs, signals: list[str], producer: str,
+        rids: list[int], walks: list[str], rid_walk_idx: list[int] | None,
     ) -> None:
         """Rank 0: outputs of a node outside the instance (an encoder beside
         rank 0), which the lockstep nodes they are routed to take without a
         read and each follower reads. Noted under each of those nodes, since a
-        step of one spends only its own."""
+        step of one spends only its own. ``rids[i]`` ran
+        ``walks[rid_walk_idx[i]]``, or ``walks[0]`` when ``rid_walk_idx`` is None."""
         unread, consumers = self._lockstep_unread, self._lockstep_consumers
-        for rid, sig in zip(stored.flat_rids, stored.signal_idxs, strict=True):
-            walk = walk_of(rid)
+        per_walk = []
+        for walk in walks:
             routes = consumers.get((producer, walk))
             if routes is None:
                 routes = consumers[(producer, walk)] = self._led_consumers(producer, walk)
+            per_walk.append(routes)
+        routes_of = None if rid_walk_idx is None else {
+            rid: per_walk[w] for rid, w in zip(rids, rid_walk_idx, strict=True)
+        }
+        for rid, sig in zip(stored.flat_rids, stored.signal_idxs, strict=True):
+            routes = per_walk[0] if routes_of is None else routes_of[rid]
             signal = signals[sig]
             for node in routes.get(signal, ()):
                 unread.setdefault(rid, {}).setdefault(node, set()).add(signal)
@@ -3988,7 +3997,9 @@ class Worker:
         else:
             stored = store(rids)
         if self._lockstep_led and batch_N.node_name not in self.parallel_nodes:
-            self._note_local_lockstep_inputs(stored, signals, batch_N.node_name, batch.walk_of)
+            self._note_local_lockstep_inputs(
+                stored, signals, batch_N.node_name, rids, walks, rid_walk_idx,
+            )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs

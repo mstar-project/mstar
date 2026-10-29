@@ -623,7 +623,7 @@ def test_a_colocated_encoders_output_is_a_followers_read(tmp_path):
     w = _leader(tmp_path, nodes=(NODE, "Talker"), consumed={("vision_encoder", NODE): {"vision_embeds"}})
     w._note_local_lockstep_inputs(
         StoredOutputs(flat_uuids=[21], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
-        ["vision_embeds"], "vision_encoder", lambda rid: WALK,
+        ["vision_embeds"], "vision_encoder", ["r1"], [WALK], None,
     )
 
     ran = _step({"r0": [], "r1": ["vision_embeds"]})
@@ -642,7 +642,7 @@ def test_one_lockstep_node_taking_an_input_leaves_another_nodes_copy_checked(tmp
     })
     w._note_local_lockstep_inputs(
         StoredOutputs(flat_uuids=[22], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
-        ["latents"], "producer", lambda rid: WALK,
+        ["latents"], "producer", ["r1"], [WALK], None,
     )
     ran = _step({"r1": ["latents"]})
     assert _broadcast(w, ran) == (True, ("r1",))
