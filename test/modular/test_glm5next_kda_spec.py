@@ -12,14 +12,14 @@ from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
+from mstar.model.components.distributed import ParallelKimiDeltaAttention
+from mstar.model.components.kda import KDAConfig
 from mstar.model.glm5_next import fused_decode
-from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
-from mstar.model.glm5_next.kda import Glm5NextKdaConfig
 
 
 def _layer(cfg, device, dtype, seed=0):
     torch.manual_seed(seed)
-    layer = Glm5NextKdaAttention(cfg, dtype=dtype).to(device)
+    layer = ParallelKimiDeltaAttention(cfg, dtype=dtype).to(device)
     with torch.no_grad():
         for name, p in layer.named_parameters():
             if "conv1d" in name:
@@ -86,7 +86,7 @@ def _after_verdict(pool, slots, accepted):
 def test_reference_matches_sequential_decode_over_accepted_tokens(block):
     """Each block's outputs equal sequential decode from the state after every accepted token
     so far; the pool's state and the cached conv window lag one step behind it."""
-    layer = _layer(Glm5NextKdaConfig.reduced(), "cpu", torch.float64)
+    layer = _layer(KDAConfig(hidden_size=64, num_heads=4, head_dim=32), "cpu", torch.float64)
     pool = _pool(layer, 6, 3, "cpu", torch.float64)
     spec = SpecBlocks.of(pool, 0)
     slots = torch.tensor([4, 1, 2])
@@ -116,7 +116,7 @@ def test_reference_matches_sequential_decode_over_accepted_tokens(block):
 
 @torch.no_grad()
 def test_padding_rows_on_the_sink_clamp_a_garbage_count():
-    layer = _layer(Glm5NextKdaConfig.reduced(), "cpu", torch.float64, seed=2)
+    layer = _layer(KDAConfig(hidden_size=64, num_heads=4, head_dim=32), "cpu", torch.float64, seed=2)
     pool = _pool(layer, 4, 1, "cpu", torch.float64)
     SpecBlocks.of(pool, 0).prefix_len[SINK_SLOT] = 1_000_000
     x = torch.randn(2 * 2, layer.hidden_size, dtype=torch.float64)
@@ -131,7 +131,7 @@ def test_padding_rows_on_the_sink_clamp_a_garbage_count():
 @pytest.mark.parametrize("batch", [1, 7, 64])
 def test_kernel_matches_reference(block, batch):
     """One TP8 rank's KDA layer (8 heads of 128) over four verify steps with random verdicts."""
-    cfg = Glm5NextKdaConfig(hidden_size=4096, linear_num_heads=8, linear_head_dim=128)
+    cfg = KDAConfig(hidden_size=4096, num_heads=8, head_dim=128)
     layer = _layer(cfg, "cuda", torch.bfloat16)
     ker = _pool(layer, 70, 3, "cuda", torch.bfloat16)
     ref = _clone(ker)
@@ -159,7 +159,7 @@ def test_kernel_matches_reference(block, batch):
 def test_reference_replays_under_a_cuda_graph():
     """The reference reads nothing on the host, so a captured decode can replay it with the
     next step's slots, counts and inputs."""
-    cfg = Glm5NextKdaConfig(hidden_size=256, linear_num_heads=2, linear_head_dim=128)
+    cfg = KDAConfig(hidden_size=256, num_heads=2, head_dim=128)
     layer = _layer(cfg, "cuda", torch.bfloat16)
     graph_pool = _pool(layer, 8, 3, "cuda", torch.bfloat16)
     eager_pool = _clone(graph_pool)

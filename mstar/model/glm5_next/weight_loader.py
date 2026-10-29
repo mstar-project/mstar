@@ -43,7 +43,7 @@ _KDA_FORGET_RE = re.compile(
     r"\.self_attn\.(f_a_proj\.weight|f_b_proj\.weight|dt_bias|A_log)$"
 )
 
-# KDA tensors head-sharded across TP (Glm5NextKdaAttention): the read plan
+# KDA tensors head-sharded across TP (ParallelKimiDeltaAttention): the read plan
 # slices these so each rank reads only its head block. Row-sharded by
 # heads x head_dim, by heads, or column-sharded (o_proj's contraction dim).
 _KDA_ROW_QKV_RE = re.compile(

@@ -31,10 +31,8 @@ from mstar.engine.resources.linear_attn.config import (  # noqa: E402
 from mstar.engine.resources.recurrent.config import RecurrentStateSpec  # noqa: E402
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.model.glm5_next.components.attention import (  # noqa: E402
-    Glm5NextKdaAttention,
-    Glm5NextMLAAttention,
-)
+from mstar.model.components.distributed import ParallelKimiDeltaAttention  # noqa: E402
+from mstar.model.glm5_next.components.attention import Glm5NextMLAAttention  # noqa: E402
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM  # noqa: E402
 from mstar.model.glm5_next.components.moe import Glm5NextGatedMLP, Glm5NextSparseMoeBlock  # noqa: E402
 from mstar.model.glm5_next.config import (  # noqa: E402
@@ -124,7 +122,7 @@ def _cpu_flashinfer(monkeypatch):
     monkeypatch.setattr(kv_mod, "KVTransferManager", _StubTransfer)
 
 
-def _randomize(model: Glm5NextForCausalLM, dtype: torch.dtype) -> None:
+def _randomize(model: Glm5NextForCausalLM, dtype: torch.dtype, process: bool = True) -> None:
     with torch.no_grad():
         for param in model.parameters():
             if param.is_floating_point() and param.ndim >= 2:
@@ -132,20 +130,24 @@ def _randomize(model: Glm5NextForCausalLM, dtype: torch.dtype) -> None:
     if dtype != torch.float32:
         model.to(dtype)
     # The real load sequence: load -> process_weights_after_loading -> eval.
-    process_weights_after_loading(model, torch.device("cpu"))
+    if process:
+        process_weights_after_loading(model, torch.device("cpu"))
     model.eval()
     model.requires_grad_(False)
 
 
 def _build_model(
-    seed: int, mtp_num_draft_tokens: int = 0, dtype: torch.dtype = torch.float32
+    seed: int, mtp_num_draft_tokens: int = 0, dtype: torch.dtype = torch.float32,
+    process: bool = True,
 ) -> tuple[Glm5NextForCausalLM, Glm5NextModelConfig]:
-    """Reduced-config model with small random weights, no engine attached."""
+    """Reduced-config model with small random weights, no engine attached. ``process=False``
+    keeps it as loaded, to read a checkpoint from or load one into: processing releases the
+    MLA's absorbed source projections."""
     torch.manual_seed(seed)
     cfg = Glm5NextModelConfig.reduced()
     cfg.mtp_num_draft_tokens = mtp_num_draft_tokens
     model = Glm5NextForCausalLM(cfg)
-    _randomize(model, dtype)
+    _randomize(model, dtype, process)
     return model, cfg
 
 
@@ -465,9 +467,9 @@ def test_layer_schedule_honored():
             assert layer.kv_plane == cfg.full_attn_layer_indices.index(idx)
             assert layer.self_attn.kv_plane == layer.kv_plane
             assert layer.self_attn.indexer is not None  # every FULL owns one
-            assert layer.self_attn.kv is h.kv and layer.self_attn.attn is h.attn
+            assert layer.self_attn._kv is h.kv and layer.self_attn._attn is h.attn
         else:
-            assert isinstance(layer.self_attn, Glm5NextKdaAttention)
+            assert isinstance(layer.self_attn, ParallelKimiDeltaAttention)
             assert layer.kda_pos == cfg.kda_layer_indices.index(idx)
             assert layer.self_attn.mix.pool is h.pool and layer.self_attn.mix.attn is h.kda
         if idx < cfg.first_k_dense_replace:
@@ -687,7 +689,7 @@ def test_mtp_off_and_on_both_construct():
     assert not hasattr(mtp.transformer_layer, "attn_hc")
     assert isinstance(mtp.transformer_layer.self_attn, Glm5NextMLAAttention)
     assert mtp.transformer_layer.self_attn.indexer is not None  # own FULL indexer
-    assert mtp.transformer_layer.self_attn.kv is h.kv  # bound like the trunk
+    assert mtp.transformer_layer.self_attn._kv is h.kv  # bound like the trunk
 
     # Draft-loop call contract: (embeds, prev_hidden) -> the shared-head norm
     # output, which is both the caller-owned lm_head's input and the next
@@ -784,11 +786,11 @@ def _raw_checkpoint_stream(model, cfg):
 @torch.no_grad()
 def test_loader_roundtrip_through_real_pipeline():
     """Raw HF-named stream -> load_weights -> every parameter lands."""
-    model_a, cfg = _build_model(seed=20, mtp_num_draft_tokens=2)
+    model_a, cfg = _build_model(seed=20, mtp_num_draft_tokens=2, process=False)
     stream = list(_raw_checkpoint_stream(model_a, cfg))
     stream.append(("model.visual.patch_embed.proj.weight", torch.zeros(4, 4)))
 
-    model_b, _ = _build_model(seed=21, mtp_num_draft_tokens=2)
+    model_b, _ = _build_model(seed=21, mtp_num_draft_tokens=2, process=False)
     loaded = model_b.load_weights(iter(stream))
     all_params = {name for name, _ in model_b.named_parameters()}
     assert loaded == all_params  # everything hit, nothing stray
@@ -814,7 +816,7 @@ def test_loader_roundtrip_through_real_pipeline():
         raw["model.language_model.layers.0.self_attn.dt_bias"])
 
     # Drafting off: the same stream loads the trunk and drops layer 45.
-    model_c, _ = _build_model(seed=22, mtp_num_draft_tokens=0)
+    model_c, _ = _build_model(seed=22, mtp_num_draft_tokens=0, process=False)
     loaded_c = model_c.load_weights(iter(stream))
     assert loaded_c == {name for name, _ in model_c.named_parameters()}
     assert not any(name.startswith("mtp.") for name in loaded_c)
@@ -828,7 +830,7 @@ def test_checkpoint_load_refuses_a_missing_trunk_weight(tmp_path):
 
     from safetensors.torch import save_file
 
-    source, cfg = _build_model(seed=23)
+    source, cfg = _build_model(seed=23, process=False)
     stream = dict(_raw_checkpoint_stream(source, cfg))
     dropped = "model.language_model.layers.1.self_attn.b_proj.weight"
     assert dropped in stream
@@ -845,12 +847,12 @@ def test_checkpoint_load_refuses_a_missing_trunk_weight(tmp_path):
     for sharded in (True, False):
         full = tmp_path / f"full-{sharded}"
         write(full, stream, sharded)
-        model._load_checkpoint(_build_model(seed=24)[0], str(full), "cpu", None)
+        model._load_checkpoint(_build_model(seed=24, process=False)[0], str(full), "cpu", None)
 
         partial = tmp_path / f"partial-{sharded}"
         write(partial, {k: v for k, v in stream.items() if k != dropped}, sharded)
         with pytest.raises(RuntimeError, match="layers.1.self_attn.b_proj.weight"):
-            model._load_checkpoint(_build_model(seed=24)[0], str(partial), "cpu", None)
+            model._load_checkpoint(_build_model(seed=24, process=False)[0], str(partial), "cpu", None)
 
 
 def _safe_open_shards(repo_dir, device="cpu", prefix=None, keys=None, slice_spec=None):
@@ -903,7 +905,7 @@ def test_fp8_checkpoint_loads_bit_identical_to_the_mmap_reader(tmp_path, monkeyp
     from mstar.distributed.communication import CommGroup
     from mstar.utils.fp8_block import FP8_DTYPE
 
-    source, cfg = _build_model(seed=25)
+    source, cfg = _build_model(seed=25, process=False)
     torch.manual_seed(25)
     stream = {}
     for key, tensor in _raw_checkpoint_stream(source, cfg):

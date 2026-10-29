@@ -336,7 +336,7 @@ def test_full_to_shared_threading_order(monkeypatch):
 
     trace = []
 
-    def spy(self, selection, q_nope, q_pe, kv_c, k_pe, dsa_selection=None):
+    def spy(self, selection, q_nope, q_pe, latent, dsa_selection=None):
         trace.append((self.layer_idx, selection))
         return torch.zeros_like(q_nope)
 

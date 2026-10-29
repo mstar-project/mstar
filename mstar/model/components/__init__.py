@@ -11,6 +11,7 @@ room for that.
 """
 from mstar.model.components.attention import Attention, CrossAttention
 from mstar.model.components.decoder_layer import DecoderLayer, GatedDecoderLayer
+from mstar.model.components.kda import KDAConfig, KimiDeltaAttention
 from mstar.model.components.linear import FusedColumnLinear
 from mstar.model.components.linear_attn import GatedDeltaNet, GDNProjLayout
 from mstar.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
@@ -52,6 +53,8 @@ __all__ = [
     "AdaRMSNorm",
     "GDNProjLayout",
     "GatedDeltaNet",
+    "KDAConfig",
+    "KimiDeltaAttention",
     "RMSNormGated",
     "RMSNorm",
 ]

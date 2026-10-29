@@ -154,9 +154,9 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
             selected.append(n)
         return selection
 
-    def checked_attend(self, slots, q_nope, q_pe, kv_c, k_pe, dsa_selection=None):
+    def checked_attend(self, slots, q_nope, q_pe, latent, dsa_selection=None):
         ctx = self._dsa.ctx
-        out = attend(self, slots, q_nope, q_pe, kv_c, k_pe)
+        out = attend(self, slots, q_nope, q_pe, latent)
         n, page = ctx.host_pos[0] + 1, ctx.page_size
         picked = _positions(slots[0, :ctx.topk], ctx.pages, page)
         assert len(picked) == ctx.topk < n  # a strict subset of the keys the row sees

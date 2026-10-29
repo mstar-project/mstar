@@ -5,11 +5,9 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed import ParallelKimiDeltaAttention
 from mstar.model.glm5_next import fused_decode
-from mstar.model.glm5_next.components.attention import (
-    Glm5NextKdaAttention,
-    Glm5NextMLAAttention,
-)
+from mstar.model.glm5_next.components.attention import Glm5NextMLAAttention
 from mstar.model.glm5_next.components.language_model import (
     build_mlp_for_layer,
     build_rmsnorm,
@@ -41,7 +39,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.is_linear_attention = config.layer_types[layer_idx] == LINEAR_ATTENTION
         if self.is_linear_attention:
-            self.self_attn = Glm5NextKdaAttention(config, comm_group=comm_group)
+            self.self_attn = ParallelKimiDeltaAttention(config.kda_config(), comm_group=comm_group)
             # This layer's index among the KDA layers: its blocks in the pool.
             self.kda_pos = config.kda_layer_indices.index(layer_idx)
             self.kv_plane = None
@@ -68,7 +66,7 @@ class Glm5NextDecoderLayer(nn.Module):
         post, comb, hidden = self.attn_hc(hidden_streams)
         hidden = self.input_layernorm(hidden.squeeze(0))
         if self.is_linear_attention:
-            hidden = self.self_attn.forward_paged(hidden, self.kda_pos)
+            hidden = self.self_attn(hidden, self.kda_pos)
         else:
             hidden = self.self_attn(hidden)
         hidden_streams = update_streams(residual, hidden.unsqueeze(0), post, comb)
@@ -97,7 +95,7 @@ class Glm5NextDecoderLayer(nn.Module):
         post, comb, hidden, hidden_streams = self.attn_hc.forward_fused(
             hidden_streams, self.input_layernorm, update=pending)
         if self.is_linear_attention:
-            hidden = self.self_attn.forward_paged(hidden, self.kda_pos)
+            hidden = self.self_attn(hidden, self.kda_pos)
         else:
             hidden = self.self_attn(hidden)
         if rows is not None:
