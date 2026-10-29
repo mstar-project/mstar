@@ -167,7 +167,8 @@ class Qwen3_5DenseModel(Model):
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
     INTERNAL_KWARGS = (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)
-    # drafts a decode step verifies (`model_kwargs: {num_draft_tokens: k}`); 0 decodes a token a step
+    # drafts a speculative decode step verifies (see `__init__`); 0 decodes one
+    # token a step
     num_draft_tokens: int = 0
 
     def __init__(
