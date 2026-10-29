@@ -69,10 +69,10 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
 
 
 def _build_dense_or_flashinfer(spec, info: EngineResourceInfo, dense_cls, flashinfer_cls):
-    from mstar.engine.resources.attn.dense import _fa3_unavailable_reason
+    from mstar.engine.resources.attn.dense import _varlen_unavailable_reason
     from mstar.engine.resources.attn.ragged.dense import _warn_ragged_dense_fallback
 
-    reason = _fa3_unavailable_reason()
+    reason = _varlen_unavailable_reason()
     if reason is None:
         return _build_ragged(spec, info, dense_cls)
     _warn_ragged_dense_fallback(f"no varlen kernel is available ({reason})", RaggedAttnBackend.FLASHINFER)

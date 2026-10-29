@@ -168,7 +168,7 @@ def test_accepts_only_what_the_kernel_was_sized_for():
 
 
 def test_flashinfer_accepts_what_it_did_before():
-    f = FlashInferARFusion(workspace=None, max_tokens=4)
+    f = FlashInferARFusion(workspace=None, max_tokens=4, world_size=2)
     x = torch.zeros(4, 16)
     assert f.accepts(x, x, 0.5)
     assert not f.accepts(torch.zeros(5, 16), torch.zeros(5, 16), 0.0)
