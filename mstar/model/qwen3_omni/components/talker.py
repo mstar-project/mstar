@@ -21,6 +21,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm
+from mstar.model.components.depth_decoder import DepthDecoder
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
 from mstar.model.qwen3_omni.config import TALKER_ATTN, TALKER_KV, TALKER_POS, Qwen3OmniModelConfig, TalkerTextConfig
@@ -343,7 +344,7 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
         return self.codec_embedding
 
 
-class Qwen3OmniCodePredictor(nn.Module):
+class Qwen3OmniCodePredictor(DepthDecoder):
     """Code Predictor: lightweight transformer for residual codebook layers.
 
     HF weight layout::
@@ -353,15 +354,12 @@ class Qwen3OmniCodePredictor(nn.Module):
         talker.code_predictor.model.codec_embedding.{0-30}.weight
         talker.code_predictor.lm_head.{0-30}.weight
 
-    The Code Predictor runs 15 autoregressive steps (for residual codebooks
-    1..15) in float32 for precision.
+    The Code Predictor runs 15 autoregressive steps, for residual codebooks
+    1..15.
 
-    Two forward paths:
-      * ``forward(embed, cache_manager)``  -- paged-FlashInfer eager path,
-        used as a fallback when CUDA graphs are disabled.
-      * ``forward_depth_unrolled(...)``   -- SDPA + dense-KV path that runs
-        every layer with per-token position IDs and a static KV cache tensor.
-        This is what the unrolled CUDA graph captures.
+    ``DepthDecoder.run_depth_loop`` walks the groups; on platforms without the
+    fused depth kernels it runs ``forward_depth_unrolled``, a dense-KV forward of
+    one depth position through every layer, per group.
     """
 
     def __init__(self, config: Qwen3OmniModelConfig):
