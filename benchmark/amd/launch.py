@@ -39,6 +39,9 @@ CTR_SH = Path(catalog.CONTAINERS) / "scripts/ctr.sh"
 IMAGES_JSON = Path(catalog.CONTAINERS) / "versions.json"
 USER = os.environ.get("USER", "user")
 LOCK_DIR = Path("/tmp") / USER / "wsj-gpu-locks"
+# The serving config of every mstar arm a process launches, in place of the row's: a config name in the arm's
+# tree (configs/<name>.yaml) or a YAML path. window-driver.sh sets it from a cell's config=, so it is per arm.
+MSTAR_CONFIG_ENV = "AMD_BENCH_MSTAR_CONFIG"
 # Host variables a container launch keeps; ctr.sh drops everything else anyway.
 CTR_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "SLURM_JOB_ID", "HF_HOME", "HF_TOKEN")
 # Prefixes ctr.sh forwards into the container. Anything else has to go through CTR_ENV.
@@ -265,8 +268,13 @@ class Launch:
         return ",".join(str(g) for g in self.server_gpus)
 
     def mstar_base_config(self) -> Path:
-        name = catalog.mstar_config_name(self.row, self.arm.name)
-        cfg = Path(self.config) if self.config else self.worktree / "configs" / f"{name}.yaml"
+        name = os.environ.get(MSTAR_CONFIG_ENV) or catalog.mstar_config_name(self.row, self.arm.name)
+        if self.config:
+            cfg = Path(self.config)
+        elif "/" in name:
+            cfg = Path(name)
+        else:
+            cfg = self.worktree / "configs" / f"{name}.yaml"
         if not cfg.is_file():
             raise FileNotFoundError(cfg)
         return cfg
