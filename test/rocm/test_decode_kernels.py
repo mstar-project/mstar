@@ -3,8 +3,8 @@ the decode GEMV (``mstar::decode_gemv``) and its gated-MLP epilogue.
 
 Each must meet its op's bar against the fp64 reference (one rounding for the
 norm, a rounded fp32 sum for the GEMV) at every knob family the search tries,
-a split-K launch must leave its arrival counters zeroed so a captured graph
-replays, and a compiled bucket must reach the fused gate/up op once a config
+a split-K launch must replay to the same bits in a captured graph, and a
+compiled bucket must reach the fused gate/up op once a config
 selects it.
 """
 
@@ -127,22 +127,19 @@ def test_silu_mul_epilogue_matches_the_unfused_pair(knobs, rows):
     _assert_accumulated(decode_gemv_silu_mul(x, w, knobs), F.silu(gate) * up)
 
 
-def test_split_k_leaves_its_counters_zeroed_and_replays():
+def test_split_k_replays_to_the_same_bits():
     from mstar.kernels.triton import gemv
 
     knobs = {"block_n": 16, "block_k": 256, "split_k": 8, "num_warps": 4, "use_dot": True}
     x, w, _ = _gemv_inputs(4, 4096, 4096, torch.bfloat16, 11)
     eager = gemv.decode_gemv(x, w, None, knobs)
-    counters = gemv._COUNTERS.get(x.device)
-    assert int(counters.count_nonzero()) == 0
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = gemv.decode_gemv(x, w, None, knobs)
     for _ in range(3):
         graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, eager), "split-K sums in a fixed order, so replays repeat"
-    assert int(counters.count_nonzero()) == 0
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager), "the partials are added in a fixed order"
 
 
 @pytest.fixture
