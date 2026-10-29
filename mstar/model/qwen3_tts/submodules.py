@@ -646,13 +646,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         pos = torch.zeros(batch_size, 1, dtype=torch.int32, device=device)
         # Position 0 conditions the depth decoder on the Talker hidden state.
         # Each following position consumes the previous group's embedding.
-        self.code_predictor.forward_depth_unrolled(
-            last_hidden.unsqueeze(1), pos, cp_cache, cache_pos=0
-        )
+        depth = self.code_predictor.depth
+        depth.bind_step(cp_cache, pos, cache_pos=0)
+        self.code_predictor.forward_depth_unrolled(last_hidden.unsqueeze(1))
         for group_idx in range(1, self.num_codes):
             pos.fill_(group_idx)
+            depth.bind_step(cp_cache, pos, cache_pos=group_idx)
             cp_hidden = self.code_predictor.forward_depth_unrolled(
-                codec_embed.unsqueeze(1), pos, cp_cache, cache_pos=group_idx
+                codec_embed.unsqueeze(1)
             ).squeeze(1)
             cp_logits = torch.matmul(
                 cp_hidden,

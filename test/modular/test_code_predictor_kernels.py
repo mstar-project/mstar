@@ -134,7 +134,8 @@ def test_qwen3_tts_depth_loop_matches_its_layers_unfused():
     with torch.no_grad():
         for s in range(depth):
             pos.fill_(s)
-            got.append(predictor.forward_depth_unrolled(x[:, s:s + 1], pos, cache, cache_pos=s))
+            predictor.depth.bind_step(cache, pos, cache_pos=s)
+            got.append(predictor.forward_depth_unrolled(x[:, s:s + 1]))
 
         # the projection is the identity at these widths; linears run in bf16
         h = x.float()

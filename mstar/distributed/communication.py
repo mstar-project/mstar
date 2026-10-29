@@ -62,7 +62,7 @@ class CommGroup:
     An axis group runs the model's collectives: tensor parallelism
     (all-reduce / all-gather of row-parallel projections) or Ulysses sequence
     parallelism (all-to-all around attention). An instance group only agrees
-    on the host (``barrier``, ``host_all_reduce``), so it has a gloo group and
+    on the host (``barrier``, ``agree``), so it has a gloo group and
     no device group. ``rank`` / ``world_size``
     are relative to this group; ``global_rank`` is the worker's rank in
     the world.
@@ -79,8 +79,10 @@ class CommGroup:
         self.group_members = group_members
         self.world_size = len(group_members)
         self.device_group = None
-        # gloo group: object collectives and host-side agreement (``barrier``,
-        # ``host_all_reduce``); a lockstep instance's only group
+        # host channel, for rank votes (``agree``), ``barrier`` and object
+        # collectives (workspace rendezvous) that should not go through NCCL:
+        # a gloo twin of ``device_group``, or on XPU the mixed group's gloo
+        # side; a lockstep instance's only group
         self.cpu_group = None
         self.initialized = False
         # see ``init_allreduce_fusion``
@@ -105,6 +107,20 @@ class CommGroup:
                 "group, or one init_dist has not set up"
             )
         return self.device_group
+
+    def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
+        """Reduce each of ``values`` over the group's ranks with ``op``: ``MIN`` ANDs
+        flags, ``MAX`` takes the largest. Collective: every member calls it at the
+        same point. Over ``cpu_group``, so the answer costs no device sync."""
+        if self.world_size == 1 or not values:
+            return list(values)
+        if self.cpu_group is None:
+            raise ValueError(
+                f"agree over ranks {self.group_members} before init_dist set up their cpu_group"
+            )
+        t = torch.tensor(values, dtype=torch.int64)
+        dist.all_reduce(t, op=op, group=self.cpu_group)
+        return t.tolist()
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -143,16 +159,6 @@ class CommGroup:
             return
         dist.barrier(group=self.cpu_group)
 
-    def host_all_reduce(self, values: Sequence[int], op: dist.ReduceOp) -> list[int]:
-        """Reduce each of ``values`` across the group with ``op`` (``MIN`` ANDs
-        flags, ``MAX`` ORs them), on the host: one gloo all-reduce, none on a
-        group of one rank. Every rank passes the same number of values."""
-        if self.world_size == 1:
-            return list(values)
-        t = torch.tensor(list(values), dtype=torch.int64)
-        dist.all_reduce(t, op=op, group=self.cpu_group)
-        return t.tolist()
-
     def all_reduce_buffer(
         self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
@@ -178,7 +184,7 @@ class CommGroup:
         from mstar.distributed.ar_fusion import create_workspace
 
         self._ar_fusion_ws = create_workspace(
-            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
+            self, max_tokens, hidden, dtype,
         )
         self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
         return self._ar_fusion_ws is not None
@@ -373,6 +379,11 @@ class JointGroups:
         for axis in reversed(PARALLEL_AXES):
             tensor = getattr(self, f"{axis}_group").broadcast(tensor)
         return tensor
+
+    def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
+        """``CommGroup.agree`` over the whole lockstep instance: one host
+        all-reduce on ``instance``."""
+        return self.instance.agree(values, op)
 
 
 @dataclass

@@ -61,6 +61,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
        encoder + Nemotron-H hybrid Mamba-2/attention backbone + EarTTS talker +
        RVQ codec; user speech in, agent text and 22.05 kHz speech out.
+   * - ``glm52``
+     - ``zai-org/GLM-5.2-FP8``
+     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -104,7 +107,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - V-JEPA 2 video encoder + masked predictor.
    * - ``vjepa2_ac``
      - ``vjepa2-ac-vitg``
-     - V-JEPA 2-AC encoder + action-conditioned predictor.
+     - V-JEPA 2-AC encoder + action-conditioned predictor. Video frames take the official
+       repo's central square crop, not the HF processor's resize and crop.
    * - ``whisper_large_v3_turbo``
      - ``openai/whisper-large-v3-turbo``
      - Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV

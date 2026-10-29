@@ -264,13 +264,13 @@ class Qwen3_5LanguageModel(nn.Module):
         # bind the label once per resource kind, advance the index per layer
         for attr, idx in self._bind_through.items():
             getattr(self.layers[idx].self_attn, attr).bind_step(label)
-        return run_layers(self.layers, query_sequence, self.norm, self._attend, self.comm_group)
+        return run_layers(self.layers, query_sequence, self.norm, self._set_cursor, self.comm_group)
 
-    def _attend(self, i: int, mixer: nn.Module, h: torch.Tensor) -> torch.Tensor:
-        """Layer ``i``'s mixer, its cursor (``attend`` or ``mix``) moved to the
-        layer's index in its resource first."""
+    @torch.compiler.disable
+    def _set_cursor(self, i: int, mixer: nn.Module) -> None:
+        """Move layer ``i``'s cursor (``attend`` or ``mix``) to the layer's index
+        in its resource."""
         getattr(mixer, self._cursor_attr[i]).set_layer_idx(self._resource_idx[i])
-        return mixer(h)
 
 
 class Qwen3_5ForCausalLM(nn.Module):

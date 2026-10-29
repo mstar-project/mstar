@@ -1,0 +1,369 @@
+"""GLM-5.2 on the DSA resource: guard states, the declared step, IndexShare threading and
+decode across ``index_topk`` — over the real ``KVManager`` (MLA latent layout), MLA attention
+resource and DSA resource on CPU. The resource's own math is test_dsa_resource.py's.
+"""
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+def _cpu_rmsnorm(x, weight, eps=1e-6):
+    x32 = x.float()
+    normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
+    return (normed * weight.float()).to(x.dtype)
+
+
+def _cpu_flashinfer() -> types.ModuleType:
+    fi = types.ModuleType("flashinfer")
+    fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
+    return fi
+
+
+@pytest.fixture(autouse=True)
+def _force_cpu_flashinfer(monkeypatch):
+    monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
+
+
+from mstar.engine.resources import StepContext  # noqa: E402
+from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
+from mstar.engine.resources.dsa.manager import DSAManager  # noqa: E402
+from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
+from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
+from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
+from mstar.model.glm52.config import (  # noqa: E402
+    ATTN_RESOURCE,
+    DSA_RESOURCE,
+    KV_RESOURCE,
+    POS_RESOURCE,
+    SAMPLER_RESOURCE,
+    Glm52ModelConfig,
+)
+from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
+from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
+from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
+from mstar.model.utils import process_weights_after_loading  # noqa: E402
+
+
+def test_cleanup_request_drops_the_request_state():
+    """Retirement leaves NO per-request growth: the engine's request removal calls
+    cleanup_request on every managed submodule, which drops the prefill's stop (the index
+    keys are the DSA resource's, which remove_request drops)."""
+    sub = object.__new__(Glm52LLMSubmodule)
+    sub.config = Glm52ModelConfig.reduced()
+    sub.request_states = {}
+
+    sub.request_state("r0").add("ended_at_prefill", True)
+    sub.cleanup_request("r0")
+    assert sub.request_states == {}
+    sub.cleanup_request("r0")  # idempotent, like the base hook
+
+
+# ---------------------------------------------------------------------------
+# preprocess guard, both flag states
+# ---------------------------------------------------------------------------
+
+class _FakePositions:
+    def __init__(self, starts):
+        self._starts = starts
+
+    def position(self, rid, label):
+        return self._starts[rid]
+
+
+def _make_submodule(config) -> Glm52LLMSubmodule:
+    sub = object.__new__(Glm52LLMSubmodule)
+    sub.config = config
+    return sub
+
+
+def _preprocess(sub, starts, seq_len):
+    sub.get_device = lambda: torch.device("cpu")
+    inputs = [
+        ARNodeInputs(
+            input_ids=torch.zeros(seq_len, dtype=torch.long),
+            input_seq_len=seq_len,
+        )
+        for _ in starts
+    ]
+    engine_inputs = SimpleNamespace(
+        request_ids=list(starts),
+        resources={POS_RESOURCE: _FakePositions(starts)},
+    )
+    return sub.preprocess("prefill", engine_inputs, inputs)
+
+
+def test_guard_flag_off_holds_context_to_topk():
+    cfg = Glm52ModelConfig()
+    assert cfg.dsa_long_context is False
+    sub = _make_submodule(cfg)
+    _preprocess(sub, {"r0": 2032}, seq_len=16)  # exactly topk: allowed
+    with pytest.raises(RuntimeError, match="dsa_long_context"):
+        _preprocess(sub, {"r0": 2040}, seq_len=16)
+
+
+def test_guard_flag_on_lifts_cap_to_max_seq_len():
+    cfg = Glm52ModelConfig()
+    cfg.dsa_long_context = True
+    cfg.max_seq_len = 4096
+    sub = _make_submodule(cfg)
+
+    # Decode one past topk: allowed (the DSA resource selects for it).
+    _preprocess(sub, {"r0": cfg.index_topk}, seq_len=1)
+
+    # The new cap is max_seq_len, not topk.
+    with pytest.raises(RuntimeError, match="max_seq_len"):
+        _preprocess(sub, {"r0": 4096}, seq_len=1)
+
+
+def test_guard_flag_on_prefill_beyond_topk_is_refused_decode_first():
+    cfg = Glm52ModelConfig()
+    cfg.dsa_long_context = True
+    cfg.max_seq_len = 4096  # inside the lifted cap: the topk rule must fire
+    sub = _make_submodule(cfg)
+    with pytest.raises(RuntimeError, match="decode-only"):
+        _preprocess(sub, {"r0": cfg.index_topk}, seq_len=16)
+
+
+# ---------------------------------------------------------------------------
+# Model kwarg plumbing + CUDA-graph gate
+# ---------------------------------------------------------------------------
+
+def test_model_kwarg_dsa_long_context():
+    m = Glm52Model(model_path_hf="", dsa_long_context=True, max_seq_len=4096)
+    assert m.config.dsa_long_context is True
+    assert m.config.max_seq_len == 4096
+
+    default = Glm52Model(model_path_hf="", dsa_long_context=True)
+    assert default.config.max_seq_len == 8192  # checkpoint generation default
+
+    off = Glm52Model(model_path_hf="")
+    assert off.config.dsa_long_context is False
+    assert off.config.max_seq_len == off.config.index_topk == 2048
+
+    with pytest.raises(ValueError, match="mla_absorb"):
+        Glm52Model(model_path_hf="", config_variant="reduced", dsa_long_context=True)
+
+
+def test_no_cuda_graphs_when_long_context():
+    cfg = Glm52ModelConfig.reduced()  # would otherwise register 2 configs
+    cfg.dsa_long_context = True
+    sub = _make_submodule(cfg)
+    assert sub.get_accelerator_graph_configs(torch.device("cpu")) == []
+    assert sub.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
+
+
+# ---------------------------------------------------------------------------
+# The real resources: reduced absorbed model driven a step at a time
+# ---------------------------------------------------------------------------
+
+def _build_absorbed_model(cfg, seed):
+    """Randomize EVERY parameter (MoE expert containers are raw
+    ``torch.empty`` at construction — garbage in them NaNs the logits)."""
+    from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
+
+    torch.manual_seed(seed)
+    model = Glm52ForCausalLM(cfg)
+    model.model.embed_tokens.weight.data.normal_(0, 0.05)
+    model.model.norm.weight.data.normal_(1.0, 0.02)
+    model.lm_head.weight.data.normal_(0, 0.02)
+    for layer in model.model.layers:
+        a = layer.self_attn
+        for lin in (a.q_a_proj, a.q_b_proj, a.kv_a_proj_with_mqa,
+                    a.kv_b_proj, a.o_proj):
+            lin.weight.data.normal_(0, 0.03)
+        for norm in (a.q_a_layernorm, a.kv_a_layernorm):
+            norm.weight.data.normal_(1.0, 0.02)
+        if a.indexer is not None:
+            a.indexer.wq_b.weight.data.normal_(0, 0.05)
+            a.indexer.wk.weight.data.normal_(0, 0.05)
+            a.indexer.weights_proj.weight.data.normal_(0, 0.05)
+            a.indexer.k_norm.weight.data.normal_(1.0, 0.02)
+            a.indexer.k_norm.bias.data.normal_(0, 0.02)
+        layer.input_layernorm.weight.data.normal_(1.0, 0.02)
+        layer.post_attention_layernorm.weight.data.normal_(1.0, 0.02)
+        mlp = layer.mlp
+        if isinstance(mlp, Glm52SparseMoeBlock):
+            mlp.gate.weight.data.normal_(0, 1)
+            mlp.gate.e_score_correction_bias.data = torch.randn(
+                cfg.n_routed_experts, dtype=torch.float32)
+            mlp.experts.gate_up_proj.data.normal_(0, 0.05)
+            mlp.experts.down_proj.data.normal_(0, 0.05)
+            mlp.shared_expert.gate_up_proj.weight.data.normal_(0, 0.05)
+            mlp.shared_expert.down_proj.weight.data.normal_(0, 0.05)
+        else:
+            mlp.gate_up_proj.weight.data.normal_(0, 0.05)
+            mlp.down_proj.weight.data.normal_(0, 0.05)
+    process_weights_after_loading(model, torch.device("cpu"))
+    return model.eval()
+
+
+class _Driver:
+    """The engine's per-step cycle for one request over the real resources:
+    declare -> admit -> plan (the DSA resource plans its rows off the live KV
+    plan, as serving would) -> preprocess -> forward -> commit."""
+
+    def __init__(self, sub: Glm52LLMSubmodule, cfg: Glm52ModelConfig, rid="r0", page_size=8):
+        self.sub, self.rid = sub, rid
+        self.resources, self.runner = build_cpu_resources(cfg, [rid], page_size=page_size)
+        sub.bind_node_resources(self.resources)
+
+    def step(self, walk: str, ids: torch.Tensor) -> torch.Tensor:
+        ar = ARNodeInputs(input_ids=ids, input_seq_len=ids.shape[0])
+        step = self.sub.declare_step(walk, [self.rid], [ar])
+        step.set_ctx(StepContext(request_ids=(self.rid,), graph_walk=walk, slot=0, capture=False))
+        assert self.runner.admit(step).ok
+        self.runner.plan(step)
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=[self.rid], per_request_info={}, resources=self.resources, step=step)
+        packed = self.sub.preprocess(walk, engine_inputs, [ar])
+        with torch.no_grad():
+            logits = self.sub.forward(walk, engine_inputs, **packed)["logits"][0]
+        self.runner.commit(step)
+        return logits
+
+
+def _serve_steps(driver: _Driver, prompt, decode_tokens):
+    """Prefill + teacher-forced decode. Returns the per-step logits."""
+    logits_per_step = []
+    for i, ids in enumerate([prompt, *[t.view(1) for t in decode_tokens]]):
+        logits_per_step.append(driver.step("prefill" if i == 0 else "decode", ids))
+    return logits_per_step
+
+
+def _longctx_reduced_cfg(topk):
+    cfg = Glm52ModelConfig.reduced()
+    cfg.mla_absorb = True
+    cfg.dsa_long_context = True
+    cfg.index_topk = topk
+    return cfg
+
+
+def test_declared_step_under_dsa_adds_the_dsa_step():
+    cfg = _longctx_reduced_cfg(topk=4)
+    sub = Glm52LLMSubmodule(language_model=_build_absorbed_model(cfg, seed=0), config=cfg)
+    ar = ARNodeInputs(input_ids=torch.tensor([1, 2, 3]), input_seq_len=3)
+    step = sub.declare_step("prefill", ["r0"], [ar])
+    assert set(step.keys()) == {
+        KV_RESOURCE, ATTN_RESOURCE, POS_RESOURCE, SAMPLER_RESOURCE, DSA_RESOURCE}
+    assert step.segments[0].span == 3
+
+
+def test_full_to_shared_threading_order(monkeypatch):
+    """Layer 1 (SHARED, no indexer weights) must consume the selection layer
+    0 (FULL) published THIS forward — the IndexShare reuse window."""
+    cfg = _longctx_reduced_cfg(topk=4)
+    model = _build_absorbed_model(cfg, seed=0)
+    sub = Glm52LLMSubmodule(language_model=model, config=cfg)
+    driver = _Driver(sub, cfg)
+    dsa = driver.resources[DSA_RESOURCE]
+
+    trace = []
+    layer = {}
+
+    def spy(self, selection, q_nope, q_pe, latent_layer, sm_scale, label="main"):
+        trace.append((layer["idx"], selection))
+        return torch.zeros_like(q_nope)
+
+    monkeypatch.setattr(DSAManager, "attend", spy)
+    attend_selected = Glm52MLAAttention._attend_selected
+
+    def tagged(self, *args, **kwargs):
+        layer["idx"] = self.layer_idx
+        return attend_selected(self, *args, **kwargs)
+
+    monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", tagged)
+
+    picks = []
+    select = DSAManager.select
+
+    def counting(self, *args, **kwargs):
+        result = select(self, *args, **kwargs)
+        picks.append(result)
+        return result
+
+    monkeypatch.setattr(DSAManager, "select", counting)
+
+    prompt = torch.randint(0, cfg.vocab_size, (4,))  # ctx 4 == topk: identity
+    decode = [torch.tensor(5)]  # ctx 5 > topk: selection engages
+    _serve_steps(driver, prompt, decode)
+
+    # One FULL computation, consumed IN ORDER by layer 0 then layer 1, and
+    # both consumed the very tensor the FULL layer produced.
+    assert len(picks) == 1
+    assert [idx for idx, _ in trace] == [0, 1]
+    assert trace[0][1] is picks[0]
+    assert trace[1][1] is picks[0]
+
+    # FULL layer stored prompt + decode token; SHARED layer stored nothing.
+    assert dsa.keys.tokens("r0", 0) == 5
+    assert dsa.keys.tokens("r0", 1) == 0
+    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == 5
+
+    driver.runner.remove_request("r0")
+    assert dsa.keys.tracked_requests() == set()
+
+
+def test_a_layer_built_flag_off_refuses_the_dsa_resource():
+    """Flag-off, no indexer was built or loaded: a FULL layer would pass for SHARED."""
+    cfg = _longctx_reduced_cfg(topk=4)
+    resources, _ = build_cpu_resources(cfg)
+    cfg.dsa_long_context = False
+    attn = Glm52MLAAttention(cfg, layer_idx=0)
+    with pytest.raises(RuntimeError, match="dsa_long_context off"):
+        attn.bind_resources(resources)
+
+
+def test_the_naive_path_refuses_the_dsa_resource():
+    cfg = _longctx_reduced_cfg(topk=4)
+    resources, _ = build_cpu_resources(cfg)
+    cfg.mla_absorb = False
+    attn = Glm52MLAAttention(cfg, layer_idx=0)
+    with pytest.raises(RuntimeError, match="mla_absorb"):
+        attn.bind_resources(resources)
+
+
+# ---------------------------------------------------------------------------
+# CPU decode across the topk boundary: prefix property + real divergence
+# ---------------------------------------------------------------------------
+
+def test_decode_across_topk_prefix_property_and_divergence():
+    """Teacher-forced decode with topk=6 vs a dense comparator (topk lifted so selection
+    never engages).
+    """
+    topk = 6
+    cfg = _longctx_reduced_cfg(topk)
+    model = _build_absorbed_model(cfg, seed=3)
+    sub = Glm52LLMSubmodule(language_model=model, config=cfg)
+
+    torch.manual_seed(7)
+    prompt = torch.randint(0, cfg.vocab_size, (3,))
+    decode = list(torch.randint(0, cfg.vocab_size, (6,)))
+    # Step i covers context 3 + 1 + i tokens after it: steps 0..2 end at
+    # ctx 4, 5, 6 (identity); steps 3..5 end at 7, 8, 9 (sparse).
+
+    driver = _Driver(sub, cfg, page_size=4)  # the sparse steps span 3 pages
+    assert not flashinfer_mla_supports(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
+    sparse_logits = _serve_steps(driver, prompt, decode)
+    dsa = driver.resources[DSA_RESOURCE]
+    assert dsa.keys.tokens("r0", 0) == 3 + len(decode)
+    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == 3 + len(decode)
+    driver.runner.remove_request("r0")
+    assert dsa.keys.tracked_requests() == set()
+
+    cfg.index_topk = 512  # dense comparator: identity regime end to end
+    driver2 = _Driver(sub, cfg, page_size=4)  # fresh cache, same weights
+    dense_logits = _serve_steps(driver2, prompt, decode)
+    driver2.runner.remove_request("r0")
+
+    for i in range(4):  # prefill + decode steps 0..2
+        assert torch.equal(sparse_logits[i], dense_logits[i]), f"step {i}"
+    for i in range(4, 7):  # decode steps 3..5: beyond topk
+        assert not torch.equal(sparse_logits[i], dense_logits[i]), f"step {i}"
+        assert torch.isfinite(sparse_logits[i]).all()

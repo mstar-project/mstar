@@ -10,7 +10,6 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import (
@@ -3611,20 +3610,18 @@ class KVManager(AttentionResource):
         Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
         but not another), allocator-init bugs, and any future code path
         that adds requests asymmetrically before ``warmup`` returns. The
-        all-reduces themselves are synchronizing, so no extra barrier is
-        needed on the success path.
+        vote itself is synchronizing, so no extra barrier is needed on the
+        success path.
         """
         if self._comm_group.world_size == 1:
             return
-        local = [self._arena.num_free]
-        instance = self._comm_group.instance
-        low = instance.host_all_reduce(local, dist.ReduceOp.MIN)
-        high = instance.host_all_reduce(local, dist.ReduceOp.MAX)
-        if low != high:
+        free = self._arena.num_free
+        lo, neg_hi = self._comm_group.agree([free, -free])
+        if lo != -neg_hi:
             raise RuntimeError(
                 f"KV cache {self.name!r} has asymmetric num_free_pages "
-                f"across the ranks of its instance (from {low[0]} to {high[0]}). v1 requires "
-                "symmetric allocator state; check the YAML for per-rank-divergent "
+                f"across the ranks of its instance: min {lo}, max {-neg_hi}. v1 requires symmetric "
+                "allocator state; check the YAML for per-rank-divergent "
                 "max_num_pages / cpu_offload_pages, and any model code "
                 "that calls add_request before warmup completes."
             )

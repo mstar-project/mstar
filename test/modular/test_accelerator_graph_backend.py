@@ -289,13 +289,20 @@ def _pinnable(monkeypatch, pin: bool):
 @pytest.mark.parametrize(("device", "pin"), [("xpu:0", True), ("cuda:0", False)])
 def test_to_device_nonblocking_pins_where_the_device_capability_says(monkeypatch, device, pin):
     to_device_nonblocking = _pinnable(monkeypatch, pin)
+    pinned = Mock(spec=torch.Tensor)
+    empty = Mock(return_value=pinned)
+    monkeypatch.setattr(torch, "empty", empty)
     host = Mock(spec=torch.Tensor)
     host.device = torch.device("cpu")
+    host.is_pinned.return_value = False
+    host.is_contiguous.return_value = True
+    host.numel.return_value = 0
     to_device_nonblocking(host, device)
     if pin:
-        host.pin_memory.return_value.to.assert_called_once_with(torch.device(device), non_blocking=True)
+        assert empty.call_args.kwargs["pin_memory"] is True
+        pinned.to.assert_called_once_with(torch.device(device), non_blocking=True)
     else:
-        host.pin_memory.assert_not_called()
+        empty.assert_not_called()
         host.to.assert_called_once_with(torch.device(device))
 
 

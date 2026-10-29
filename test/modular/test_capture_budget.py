@@ -21,9 +21,9 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-import torch.distributed as dist
+from torch.distributed import ReduceOp
 
-from mstar.distributed.communication import JointGroups
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine import accelerator_graph_runner
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_runner import (
@@ -76,8 +76,8 @@ class _StubMeasuredRunner:
         self._capture_costs = {}
         self._lent = set()
         self._executables = {}
-        group = SimpleNamespace(world_size=1, barrier=lambda: None)
-        self._comm_group = JointGroups(tp_group=group, sp_group=group, instance=group)
+        trivial = CommGroup.trivial()
+        self._comm_group = JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial)
         self.warmed: list[tuple[BucketKey, int]] = []
         self.forwards: list[int] = []
 
@@ -747,9 +747,9 @@ class _PeerGroup:
     def barrier(self):
         pass
 
-    def host_all_reduce(self, values, op):
-        reduce = min if op == dist.ReduceOp.MIN else max
-        return [reduce(int(mine), int(peer)) for mine, peer in zip(values, self._peer, strict=True)]
+    def agree(self, values, op):
+        pick = min if op == ReduceOp.MIN else max
+        return [int(pick(a, b)) for a, b in zip(values, self._peer, strict=True)]
 
 
 class _StubPlannedRunner:
@@ -769,9 +769,7 @@ class _StubPlannedRunner:
         self._num_slots = 1
         self._buckets = {}
         peer_group = _PeerGroup(peer)
-        self._comm_group = JointGroups(
-            tp_group=peer_group, sp_group=SimpleNamespace(world_size=1), instance=peer_group,
-        )
+        self._comm_group = JointGroups(tp_group=peer_group, sp_group=CommGroup.trivial(), instance=peer_group)
         self._dummy_rows = SimpleNamespace(release_all=lambda: None)
         self._graph_backend = SimpleNamespace(
             is_available=lambda: True, graph_pool_handle=lambda: AcceleratorGraphPool(object()),

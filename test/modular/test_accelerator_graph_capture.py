@@ -21,7 +21,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-import torch.distributed as dist
+from torch.distributed import ReduceOp
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
@@ -50,9 +50,11 @@ class _Group:
     def barrier(self):
         self.count += 1
 
-    def host_all_reduce(self, values, op):
-        reduce = min if op == dist.ReduceOp.MIN else max
-        return [reduce(int(mine), int(peer)) for mine, peer in zip(values, self._peer, strict=True)]
+    def agree(self, values, op):
+        if self._peer is None:
+            return list(values)
+        pick = min if op == ReduceOp.MIN else max
+        return [int(pick(a, b)) for a, b in zip(values, self._peer, strict=True)]
 
 
 class _FakeRunner:

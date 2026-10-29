@@ -191,7 +191,7 @@ python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
     test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
                                       # the CPU Core CI job (CI adds -p xdist -n 4), no GPU or weights
 pytest test/integration/              # needs GPU + weights
-cd rust && cargo test --release --no-default-features && pytest ../test/rust/
+cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
 
 The CPU Core job runs every test module under the directories in `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)), including `test/modular/`, `test/distributed/` and `mstar/model/*/tests/`; there is no list of test files to add to. A new module there runs in CI as soon as it exists, so it must pass or skip on a CPU-only machine: guard CUDA, weights and optional packages with a `skipif` or `pytest.importorskip("<module>")` (import names: `flashinfer`, `misaki`, `qwen_tts`, `mstar_rust`), and give a test that is broken on `main` an in-file `pytest.mark.skip` whose reason says why and names the fixing PR or issue when one exists. A test module outside those directories goes in `NOT_CPU_CORE` there with where it runs instead; `test/ci/test_cpu_selection.py` fails on one in neither, and on two selected modules outside a package with the same basename. A guard on a reference package named like an mstar model (`kokoro`, `chatterbox`, `omnivoice`) imports a submodule only the reference has: once pytest puts `mstar/model` on `sys.path` for `mstar/model/*/tests`, the bare name finds mstar's own package (see [CONTRIBUTING.md](CONTRIBUTING.md)).

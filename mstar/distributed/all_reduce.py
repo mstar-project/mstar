@@ -34,13 +34,6 @@ SYMM_DTYPES = (torch.bfloat16, torch.float32)
 MULTIMEM_ONESHOT_MAX_BYTES = 32 * 1024
 
 
-def _all_ranks_agree(flag: bool, cpu_group) -> bool:
-    """AND ``flag`` across the ranks of ``cpu_group``."""
-    t = torch.tensor([int(flag)])
-    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=cpu_group)
-    return bool(t.item())
-
-
 class AllReduce:
     """NCCL for every message, and the fallback of the backends below."""
 
@@ -84,7 +77,7 @@ class AllReduce:
             )
         # every rank or none: one rank on NCCL while its peers wait in the symmetric
         # kernel for its signal deadlocks the first all-reduce
-        if not _all_ranks_agree(backend is not None, group.cpu_group):
+        if not group.agree([int(backend is not None)])[0]:
             if backend is not None:
                 logger.warning("all-reduce %s: another rank could not set it up; using NCCL", mode)
             return AllReduce(group)
@@ -233,7 +226,7 @@ class FlashInferAllReduce(AllReduce):
         super().__init__(group)
         self.world_size = group.world_size
         self.ws_id = create_workspace(
-            group.rank, group.world_size, group.cpu_group, 1, max_bytes // 2, torch.bfloat16,
+            group, 1, max_bytes // 2, torch.bfloat16,
         )
         if self.ws_id is None:
             raise RuntimeError("no FlashInfer all-reduce workspace")

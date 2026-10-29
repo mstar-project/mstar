@@ -7,12 +7,14 @@ and depth step, q and k normed and roped and k and v copied into the cache had
 been six launches of a few microseconds around a ~1 us job.
 ``cp_attention`` attends over the depth positions so far, and
 ``cp_embed_accumulate`` records a depth step's codes and sums their embeddings.
-``cp_attend`` is a layer's attention built from the first two, the ``attend``
-both code predictors hand ``run_layers``.
+``DepthAttention`` is a code predictor layer's attention built from the first
+two, over the frame-local KV cache its ``DepthKV`` holds.
 
-The launchers are opaque to Dynamo, as the ops they replace were: a captured
-forward compiles with static ints, so a traced launcher would recompile for
-every depth position and batch bucket.
+A captured forward compiles with static ints, so any compiled frame that holds a
+depth step's ``cache_pos`` or a layer index recompiles at every depth position
+or layer. Both live on the ``DepthKV``, which the depth loop binds per step and
+``run_layers`` moves per layer, and are read only in its eager methods: the
+layers' frames, the projections included, compile once per shape.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.model.components.distributed.attention import ParallelAttention
 from mstar.utils.attention import rms_norm_rope
 
 
@@ -164,25 +167,73 @@ def cp_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, 
     return out
 
 
-def cp_attend(
-    kv_cache: torch.Tensor, pos: torch.Tensor, cache_pos: int,
-    layer_idx: int, attn: torch.nn.Module, h: torch.Tensor,
-) -> torch.Tensor:
-    """Layer ``layer_idx``'s attention for the normed ``h (bs, S, hidden)`` over the
-    frame-local ``kv_cache (layers, bs, 2, max_depth, Hkv, D)``: k and v written at
-    depth positions ``cache_pos .. cache_pos + S - 1``, each token attending over
-    the positions so far. ``pos`` holds one position per token. Bind the cache
-    arguments with ``functools.partial`` to get ``run_layers``' ``attend(i,
-    self_attn, h)``. Plain Python: the projections compile, the launchers do not."""
-    bs, seq_len, _ = h.shape
-    qkv = attn.qkv_proj(h)
-    # q normed and roped in place; k (normed, roped) and v into the cache
-    cp_qk_norm_rope_kv_write(
-        qkv.view(bs * seq_len, -1), attn.q_norm.weight, attn.k_norm.weight,
-        pos, kv_cache[layer_idx], cache_pos, seq_len,
-        attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
-        float(attn.rope_theta), attn.num_heads, attn.num_kv_heads, attn.head_dim,
-    )
-    q = qkv[..., :attn.num_heads * attn.head_dim].view(bs, seq_len, attn.num_heads, attn.head_dim)
-    out = cp_attention(q, kv_cache[layer_idx, :, 0], kv_cache[layer_idx, :, 1], cache_pos)
-    return attn.o_proj(out.reshape(bs, seq_len, -1))
+class DepthKV:
+    """A code predictor's frame-local KV cache and the depth step attending
+    over it, as its layers' attention cursor: the depth loop calls
+    ``bind_step`` per step, and ``run_layers`` calls ``set_layer_idx`` per
+    layer. Its methods are all eager, so the ints stay out of compiled frames
+    (and none is ``recursive=False``; see ``run_layers``). A binding serves
+    one pass over the layers: the pass's first layer consumes it, so a step
+    that was not bound fails instead of reusing the previous step's slots."""
+
+    def __init__(self) -> None:
+        self._fresh = False
+
+    @torch.compiler.disable
+    def bind_step(self, kv_cache: torch.Tensor, pos: torch.Tensor, cache_pos: int) -> None:
+        """Bind the next pass over the layers.
+
+        Args:
+            kv_cache: ``[n_layers, bs, 2, max_seq_len, n_kv_heads, head_dim]``
+                dense tensor preallocated by the submodule. It is not cleared between
+                frames: every position a depth step reads was written earlier in the
+                same frame.
+            pos: ``[bs, seq_len]`` int tensor with the absolute position of each
+                input token within the depth sequence.
+            cache_pos: write offset into ``kv_cache``'s seq-len axis. The new
+                K/V tokens land at ``[cache_pos : cache_pos + seq_len]``.
+        """
+        self.kv_cache, self.pos, self.cache_pos = kv_cache, pos.reshape(-1), cache_pos
+        self._fresh = True
+
+    @torch.compiler.disable
+    def set_layer_idx(self, layer_idx: int) -> None:
+        if layer_idx == 0:
+            if not self._fresh:
+                raise ValueError("DepthKV: bind_step before each pass over the code predictor's layers")
+            self._fresh = False
+        self.layer_idx = layer_idx
+
+    @torch.compiler.disable
+    def __call__(self, attn: "DepthAttention", qkv: torch.Tensor) -> torch.Tensor:
+        """The current layer's attention for ``qkv (bs, S, (Hq + 2 Hkv) * D)``:
+        k and v written at the step's depth positions, each token attending
+        over the positions so far. Returns ``(bs, S, Hq * D)``."""
+        bs, seq_len, _ = qkv.shape
+        kv = self.kv_cache[self.layer_idx]
+        # q normed and roped in place; k (normed, roped) and v into the cache
+        cp_qk_norm_rope_kv_write(
+            qkv.view(bs * seq_len, -1), attn.q_norm.weight, attn.k_norm.weight,
+            self.pos, kv, self.cache_pos, seq_len,
+            attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
+            float(attn.rope_theta), attn.num_heads, attn.num_kv_heads, attn.head_dim,
+        )
+        q = qkv[..., :attn.num_heads * attn.head_dim].view(bs, seq_len, attn.num_heads, attn.head_dim)
+        return cp_attention(q, kv[:, 0], kv[:, 1], self.cache_pos).reshape(bs, seq_len, -1)
+
+
+class DepthAttention(ParallelAttention):
+    """A code predictor layer's attention, ``(bs, S, hidden)`` in and out:
+    the qkv and o projections around its ``DepthKV``. The projections compile
+    (at -O1 a one-row GEMM becomes a fused Triton reduction); the kernels
+    between them run eager."""
+
+    def __init__(self, depth: DepthKV, **kwargs):
+        super().__init__(qk_norm=True, **kwargs)
+        self.attend = depth
+
+    def bind_resources(self, resources: dict) -> None:
+        """It attends through its ``DepthKV``, not the node's resources."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.o_proj(self.attend(self, self.qkv_proj(hidden_states)))

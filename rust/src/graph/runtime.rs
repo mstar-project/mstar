@@ -307,7 +307,7 @@ pub struct GraphRuntime {
             return Ok(());
         }
         let comm = comm.clone();
-        py.allow_threads(move || -> Result<(), crate::communicator::CommError> {
+        py.detach(move || -> Result<(), crate::communicator::CommError> {
             for (peer, bytes) in &rest {
                 comm.send(peer, bytes)?;
             }

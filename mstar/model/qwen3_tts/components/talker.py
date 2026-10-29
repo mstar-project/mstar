@@ -17,15 +17,13 @@ rewrite beyond the standard fused Q/K/V and gate/up rules.
 
 from __future__ import annotations
 
-from functools import partial
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
-from mstar.model.components.code_predictor_kernels import cp_attend
+from mstar.model.components.code_predictor_kernels import DepthAttention, DepthKV
 from mstar.model.components.decoder_layer import DecoderLayer, run_layers
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mstar.model.qwen3_tts.config import (
@@ -156,23 +154,23 @@ class Qwen3TTSTalkerModel(nn.Module):
 # CodePredictor: autoregression across codec groups within one frame
 # ---------------------------------------------------------------------------
 # Qwen3-Omni's code predictor runs the same layers through the same kernels
-# (``run_layers`` with ``cp_attend``); its checkpoint namespace, sampling and
+# (``run_layers`` over ``DepthAttention``); its checkpoint namespace, sampling and
 # capture differ.
 
 
 class Qwen3TTSCodePredictorLayer(DecoderLayer):
     """Parameter container for one replicated residual-code decoder block."""
 
-    def __init__(self, config: Qwen3TTSModelConfig) -> None:
+    def __init__(self, config: Qwen3TTSModelConfig, depth: DepthKV) -> None:
         cp = config.code_predictor
         super().__init__(
-            self_attn=ParallelAttention(
+            self_attn=DepthAttention(
+                depth,
                 hidden_size=cp.hidden_size,
                 num_heads=cp.num_attention_heads,
                 num_kv_heads=cp.num_key_value_heads,
                 head_dim=cp.head_dim,
                 rope_theta=cp.rope_theta,
-                qk_norm=True,
                 rms_norm_eps=cp.rms_norm_eps,
             ),
             mlp=ParallelGatedMLP(
@@ -188,11 +186,11 @@ class Qwen3TTSCodePredictorLayer(DecoderLayer):
 class Qwen3TTSCodePredictorInnerModel(nn.Module):
     """Depth decoder and one embedding table per residual codec group."""
 
-    def __init__(self, config: Qwen3TTSModelConfig) -> None:
+    def __init__(self, config: Qwen3TTSModelConfig, depth: DepthKV) -> None:
         super().__init__()
         cp = config.code_predictor
         self.layers = nn.ModuleList([
-            Qwen3TTSCodePredictorLayer(config)
+            Qwen3TTSCodePredictorLayer(config, depth)
             for _ in range(cp.num_hidden_layers)
         ])
         self.norm = RMSNorm(cp.hidden_size, cp.rms_norm_eps)
@@ -221,7 +219,9 @@ class Qwen3TTSCodePredictor(nn.Module):
         super().__init__()
         cp = config.code_predictor
         self.config = cp
-        self.model = Qwen3TTSCodePredictorInnerModel(config)
+        # the frame-local KV cache its layers attend over; see forward_depth_unrolled
+        self.depth = DepthKV()
+        self.model = Qwen3TTSCodePredictorInnerModel(config, self.depth)
         self.small_to_mtp_projection: nn.Module = (
             nn.Linear(config.talker.hidden_size, cp.hidden_size, bias=True)
             if cp.hidden_size != config.talker.hidden_size
@@ -250,18 +250,12 @@ class Qwen3TTSCodePredictor(nn.Module):
             head.weight.data for head in self.lm_head
         ]).contiguous()
 
-    def forward_depth_unrolled(
-        self,
-        inputs_embeds: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache: torch.Tensor,
-        cache_pos: int,
-    ) -> torch.Tensor:
-        """Run all CodePredictor layers for one depth token.
-
-        ``kv_cache`` layout is ``[layers, batch, K/V, groups, kv_heads,
-        head_dim]``. Unlike Talker cache, it is frame-local scratch space:
-        every generated frame starts at ``cache_pos=0`` and overwrites it.
+    def forward_depth_unrolled(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        """Run all CodePredictor layers for one depth token, the step bound
+        first with ``depth.bind_step``, once per call. Unlike the Talker's,
+        the cache it binds is frame-local scratch space: every generated frame
+        starts at ``cache_pos=0`` and overwrites it. The depth loop binds the
+        step, not this frame, which would compile once per ``cache_pos``.
 
         ``inputs_embeds`` is ``[batch, 1, talker_hidden]``; the returned
         hidden state is ``[batch, 1, predictor_hidden]``.
@@ -269,7 +263,6 @@ class Qwen3TTSCodePredictor(nn.Module):
         hidden_states = self.small_to_mtp_projection(inputs_embeds)
         if hidden_states.shape[1] != 1:
             raise ValueError("CodePredictor decode expects exactly one token")
-        attend = partial(cp_attend, kv_cache, position_ids.reshape(-1), cache_pos)
         # the stream starts from a copy, since the projection is the identity
         # on 0.6B and its input is the caller's
-        return run_layers(self.model.layers, hidden_states.clone(), self.model.norm, attend)
+        return run_layers(self.model.layers, hidden_states.clone(), self.model.norm)
