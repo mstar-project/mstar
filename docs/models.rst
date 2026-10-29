@@ -1973,6 +1973,14 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    producing norm, and the product on ``mstar::fp8_rowwise_mm`` (hipBLASLt / cuBLASLt). It
    needs N and K multiples of 16. The text stream's linears (512 rows, where fp8 is no faster
    on MI325X) are worth keeping bf16 with ``linear_keep_bf16``; the shipped AMD configs do.
+   On one MI325X (three server launches per setting) klein-9B serves 1.34 times the images
+   per second at one request and 1.39 times at 16 (0.71 to 0.53 s per 1024² image), klein-4B
+   1.19 and 1.21 times. The images move by e4m3 rounding: against the diffusers reference over
+   the 40 ``image_v1`` images, klein-9B goes from a median 26.6 to 23.1 dB PSNR and klein-4B
+   from 23.9 to 22.6 dB. Both stay far closer to the reference than another seed is
+   (normalized distance median 0.09 and 0.10, where 0 is a kernel change and 1 another seed),
+   but klein-9B falls under the ROCm floor of 3 dB below the reference's own kernel spread, so
+   it stays opt-in, a quality trade to make per deployment.
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one
