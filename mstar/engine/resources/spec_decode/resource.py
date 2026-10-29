@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 # The register row padding rows read and write; never handed to a request.
 SINK_ROW = 0
 # Fields of the per-step image staged in one H2D copy, each `rows` long.
-_FIELDS = ("rows", "real", "base", "budget", "stop_on")
+_FIELDS = ("rows", "real", "base", "budget", "stop_on", "top_k")
 
 
 class _StepImage(NamedTuple):
@@ -79,6 +79,9 @@ class _StepImage(NamedTuple):
     base: torch.Tensor           # seed steps: the stream's length after the prompt
     budget: torch.Tensor         # seed steps: decode tokens the request may emit
     stop_on: torch.Tensor        # seed steps: 0 where the request ignores stop ids
+    top_k: torch.Tensor          # seed steps: the request's top_k (0: off)
+    # seed steps: [temperature | top_p] per row, float32, its own copy
+    params: torch.Tensor
     num_accepted: torch.Tensor   # verify steps: the row's last accepted count, for the recurrent kernels
 
 
@@ -114,6 +117,7 @@ class SpecDecodeResource(Resource):
         return cls(
             device=info.device,
             num_draft_tokens=spec.config.num_draft_tokens,
+            sampling=spec.config.sampling,
             max_requests=spec.config.max_requests,
             page_size=page_size,
             kv_key=spec.kv_cache,
@@ -130,6 +134,7 @@ class SpecDecodeResource(Resource):
         kv_key: str,
         attn_key: str,
         stop_token_ids: Sequence[int] = (),
+        sampling: bool = False,
     ):
         self._device = device
         self.num_draft_tokens = num_draft_tokens
@@ -147,6 +152,11 @@ class SpecDecodeResource(Resource):
         self._emitted = torch.zeros(rows, **i32)
         self._budget = torch.zeros(rows, **i32)
         self._stop_on = torch.zeros(rows, **i32)
+        # per request, for a sampling node: temperature (0 greedy), top-p, top-k
+        self.sampling = sampling
+        self._temperature = torch.zeros(rows, dtype=torch.float32, device=device)
+        self._top_p = torch.ones(rows, dtype=torch.float32, device=device)
+        self._top_k = torch.zeros(rows, **i32)
         self._stop_ids = torch.tensor(
             sorted(set(stop_token_ids)) or [-2], dtype=torch.long, device=device,
         )
@@ -161,6 +171,7 @@ class SpecDecodeResource(Resource):
         self._retract: dict[int, int] = {}
 
         self._stager = PinnedStager(torch.int32)
+        self._param_stager = PinnedStager(torch.float32)
         self._cg_max_bs = 0
         self._cg_images: dict[CGSlotKey, tuple[_StepImage, H2DMirror]] = {}
         self._eager_images: dict[int, _StepImage] = {}
@@ -264,9 +275,11 @@ class SpecDecodeResource(Resource):
         segments = step.segments or ()
         num_rows = len(segments)
         image, mirror = self._image_for(ctx, num_rows)
-        rows, real, base, budget, stop_on = (
+        rows, real, base, budget, stop_on, top_k = (
             np.zeros(num_rows, dtype=np.int32) for _ in _FIELDS
         )
+        temperature = np.zeros(num_rows, dtype=np.float32)
+        top_p = np.ones(num_rows, dtype=np.float32)
         views = None
         if step.phase is SpecPhase.SEED:
             kv_plan = ctx.plan_results[self._kv_key].get("main")
@@ -281,11 +294,18 @@ class SpecDecodeResource(Resource):
                 base[i] = views[i].length
                 budget[i] = step.budgets.get(rid, 0)
                 stop_on[i] = rid not in step.ignore_stop
+                if rid in step.sampling:
+                    temperature[i], top_p[i], top_k[i] = step.sampling[rid]
         width = image.rows.numel()
         packed = np.zeros(len(_FIELDS) * width, dtype=np.int32)
-        for f, values in enumerate((rows, real, base, budget, stop_on)):
+        for f, values in enumerate((rows, real, base, budget, stop_on, top_k)):
             packed[f * width: f * width + num_rows] = values
         self._stager.copy_(image.image, packed, mirror=mirror)
+        if self.sampling and step.phase is SpecPhase.SEED:
+            params = np.ones(2 * width, dtype=np.float32)
+            params[:num_rows] = temperature
+            params[width: width + num_rows] = top_p
+            self._param_stager.copy_(image.params, params)
 
         plan = SpecDecodePlan(phase=step.phase, num_rows=num_rows, image=image)
         if step.phase is SpecPhase.VERIFY:
@@ -347,7 +367,8 @@ class SpecDecodeResource(Resource):
         views = image.view(len(_FIELDS), rows)
         return _StepImage(
             image=image, rows=views[0], real=views[1], base=views[2],
-            budget=views[3], stop_on=views[4],
+            budget=views[3], stop_on=views[4], top_k=views[5],
+            params=torch.ones(2 * rows, dtype=torch.float32, device=self._device),
             num_accepted=torch.ones(rows, dtype=torch.int32, device=self._device),
         )
 
@@ -397,6 +418,11 @@ class SpecDecodeResource(Resource):
         self._emitted.index_fill_(0, rows, 0)
         self._budget.index_copy_(0, rows, image.budget[:b])
         self._stop_on.index_copy_(0, rows, image.stop_on[:b])
+        if self.sampling:
+            width = image.rows.numel()
+            self._temperature.index_copy_(0, rows, image.params[:b])
+            self._top_p.index_copy_(0, rows, image.params[width: width + b])
+            self._top_k.index_copy_(0, rows, image.top_k[:b])
 
     @torch.compiler.disable
     def verify_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -414,10 +440,48 @@ class SpecDecodeResource(Resource):
         return self._ids, positions.reshape(-1)
 
     @torch.compiler.disable
-    def accept(self, logits: torch.Tensor) -> AcceptedTokens:
-        """Greedy verification of this step's drafts against ``logits``
-        (``[rows * (k + 1), vocab]``, the target's at each verify position)."""
-        return self.accept_tokens(logits.argmax(dim=-1))
+    def accept(self, logits: torch.Tensor, sample: bool = False) -> AcceptedTokens:
+        """Verification of this step's drafts against ``logits`` (``[rows *
+        (k + 1), vocab]``, the target's at each verify position): its argmax,
+        or with ``sample`` a draw from each row's filtered distribution
+        (greedy where the row's temperature is 0).
+
+        The drafts are the draft head's argmax, a point mass, for which
+        rejection sampling is: draw the target's token at every position
+        independently and accept while it equals the next draft. A rejected
+        position then holds a draw from the target's distribution with the
+        draft taken out, which is the residual the rule prescribes, so the
+        emitted tokens follow the target exactly. The draws come from the
+        device's default generator, not the request's seed.
+        """
+        if not sample:
+            return self.accept_tokens(logits.argmax(dim=-1))
+        if not self.sampling:
+            raise RuntimeError("this speculative node was declared without sampling")
+        return self.accept_tokens(self._sample(logits))
+
+    def _sample(self, logits: torch.Tensor) -> torch.Tensor:
+        """One draw per row of ``logits``: top-k, then top-p over what is
+        left (FlashInfer's order, the sampler's), at the row's temperature,
+        by the Gumbel-max trick over the vocabulary sorted once."""
+        plan = self._plan_now(SpecPhase.VERIFY)
+        rows, _ = self._rows(plan)
+        t = self.tokens_per_row
+        temperature = self._temperature[rows].repeat_interleave(t)
+        top_p = self._top_p[rows].repeat_interleave(t)[:, None]
+        top_k = self._top_k[rows].repeat_interleave(t)[:, None]
+        scaled = logits.float() / temperature.clamp_min(1e-5)[:, None]
+        values, order = scaled.sort(dim=-1, descending=True)
+        rank = torch.arange(values.shape[-1], device=values.device)[None, :]
+        keep = (top_k <= 0) | (rank < top_k)
+        values = values.masked_fill(~keep, float("-inf"))
+        probs = values.softmax(dim=-1)
+        # a token stays while the mass before it is under top_p: the first always does
+        keep &= (probs.cumsum(dim=-1) - probs) < top_p
+        noise = -torch.empty_like(values).exponential_().log()
+        choice = (values.masked_fill(~keep, float("-inf")) + noise).argmax(dim=-1)
+        sampled = order.gather(1, choice[:, None]).squeeze(1)
+        return torch.where(temperature > 0, sampled, logits.argmax(dim=-1))
 
     @torch.compiler.disable
     def accept_tokens(self, target: torch.Tensor) -> AcceptedTokens:
