@@ -12,6 +12,7 @@ from collections.abc import Callable, Collection, Mapping
 from contextlib import nullcontext
 from typing import Any
 
+from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
@@ -128,6 +129,9 @@ class StepRunner:
         # name every node, including one that owns nothing — an absent node
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
+        self._ask_order = [key for key in self._order if type(self._resources[key]).ask is not Resource.ask]
+        self._node_ask_order = self._per_node(node_resources, self._ask_order)
+        self._admission = Admission(self._resources, self._ask_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
         self._trail_order = [
             key for key in self._order if self._resources[key].page_trail() is not None
@@ -370,6 +374,7 @@ class StepRunner:
             self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
+        self._admission.remove_request(rid)
         for key in self._order:
             self._resources[key].remove_request(rid)
 
@@ -377,7 +382,7 @@ class StepRunner:
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
     ) -> FullAdmitOutcome:
-        """bring published state in
+        """bring published state in, once `node_name`'s resources have admitted the request
 
         gives `ready=False` when still has inflights; shortcircuit on failure
 
@@ -387,6 +392,13 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
+        if not self._admission.admitted(rid, node_name):
+            waits = self._admission.admit(
+                rid, node_name, graph_walk, published,
+                self._sweep(self._node_ask_order, self._ask_order, node_name),
+            )
+            if waits is not None:
+                return waits
         ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
@@ -404,7 +416,10 @@ class StepRunner:
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
-
+    def admit_waiting(
+        self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
+    ) -> list[tuple[str, str]]:
+        return self._admission.admit_waiting(published_of)
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
     #
