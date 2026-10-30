@@ -14,9 +14,11 @@ import torch
 import yaml
 from test_kv_prefix_request_keys import _StubTensorManager
 
+import mstar.communication.wire_types  # noqa: F401  (registers the wire tags)
 import mstar.conductor.conductor as conductor_mod
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication import wire
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
@@ -25,6 +27,7 @@ from mstar.engine.resources.kv.config import (
     KVSpec,
     PagedKVConfig,
     PrefixSpan,
+    SpanKind,
     StreamLayout,
     mark_guaranteed,
 )
@@ -39,10 +42,10 @@ PS = 16
 PROMPT = 100
 LAYOUT = {"kv": {
     "main": LabelLayout(
-        spans=(Span("ids", "prefill", PROMPT, PROMPT, "text_inputs"),), growth=(("decode_loop", 1),),
+        spans=(Span(SpanKind.IDS, "prefill", PROMPT, PROMPT, "text_inputs"),), growth=(("decode_loop", 1),),
     ),
     "uncond": LabelLayout(
-        spans=(Span("rows", "prefill", 10, 10, "cond"),), growth=(("talk_loop", 2),), scratch=7,
+        spans=(Span(SpanKind.ROWS, "prefill", 10, 10, "cond"),), growth=(("talk_loop", 2),), scratch=7,
     ),
 }}
 
@@ -54,7 +57,8 @@ class _Comm:
         self.batches = deque()
 
     def send(self, entity_id, msg):
-        self.sent.append(msg)
+        # through the wire codec, as the data worker's and the conductor's messages travel
+        self.sent.append(wire.decode(wire.encode(msg)))
 
     def get_all_new_messages(self):
         return self.batches.popleft() if self.batches else []
