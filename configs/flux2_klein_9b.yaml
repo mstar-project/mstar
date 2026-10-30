@@ -37,6 +37,8 @@ model_kwargs:
   # Under linear_dtype: fp8 these stay bf16: the linears with the most image error per ms of fp8 saving on MI325X,
   # about 40% of the saving (ignored under bf16). One-GPU MI325X A/B: median 26.5 dB from diffusers, over the ROCm
   # floor, at ~1.18x bf16 images/s; lists giving back 20-30% fell under the floor (25.2 dB)
+  # On AMD GPUs fp8 needs `knobs: dit_exact_ops: true` (top level): the list was picked with the norms eager. MI325X:
+  # 26.5 dB with the knob on, 25.4-25.8 with it off. The knob costs 8% of fp8 images/s at c=1, leaving 1.1x bf16
   fp8_keep_bf16:
     - double_blocks.*.attn.*
     - double_blocks.*.img_ff.*
