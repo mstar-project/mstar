@@ -113,18 +113,22 @@ class _DeferredReads(NamedTuple):
     copy up. ``extra_refs`` counts, per such uuid, the batch's later reads of
     the same tensor, which take a reference once it is stored. ``reads`` is
     every edge read in the batch, each waiting for the batch's future.
+    ``slices`` is each such uuid's descriptor: the store can't yet tell which
+    slice of a TP-sharded tensor a uuid holds.
     """
 
     request_ids: list[Rid]
     infos: list[TensorPointerInfo]
     extra_refs: dict[int, int]
     reads: list[FutureAndPointers]
+    slices: dict[int, TensorPointerInfo]
 
     def clear(self) -> None:
         self.request_ids.clear()
         self.infos.clear()
         self.extra_refs.clear()
         self.reads.clear()
+        self.slices.clear()
 
 
 class _Placements(NamedTuple):
@@ -424,7 +428,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # Read batch (begin_read_batch .. end_read_batch): worker main thread
         # only. Futures of flushes the batch's end has not returned yet.
         self._read_batch_open = False
-        self._deferred = _DeferredReads([], [], {}, [])
+        self._deferred = _DeferredReads([], [], {}, [], {})
         self._deferred_h2d = False
         self._flushed_futures: list[Future] = []
         # Unregister before the arenas unmap (close(), or when the manager
@@ -1030,13 +1034,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     producer_uuid = info.uuid
                     if self._take_cached_read(request_id, info):
                         continue
-                    if deferring and info.uuid in deferred.extra_refs:
-                        # read earlier in this batch, not stored yet
-                        deferred.extra_refs[info.uuid] += 1
+                    if deferring and self._take_deferred_read(request_id, info):
                         continue
                     if deferring and info.shm_segment is not None and info.nbytes:
                         deferred.request_ids.append(request_id)
                         deferred.infos.append(info)
+                        deferred.slices[info.uuid] = info
                         deferred.extra_refs[info.uuid] = 0
                         if stats is not None:
                             fp.count_read(info)
@@ -1090,6 +1093,27 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # re-checks get_ready_tensors immediately instead of on its next
         # poll tick.
         return [self._wake_when_done(future)]
+
+    def _take_deferred_read(self, request_id: Rid, info: TensorPointerInfo) -> bool:
+        """``_take_cached_read`` for what this batch deferred and so hasn't stored
+        yet: whether a read earlier in the batch is copying the bytes ``info``
+        names. Another slice of a tensor it is copying gets a uuid of its own."""
+        deferred = self._deferred
+        first = deferred.slices.get(info.uuid)
+        if first is None:
+            return False
+        dims = tuple(info.dims)
+        if first.offset == info.offset and first.nbytes == info.nbytes and tuple(first.dims) == dims:
+            deferred.extra_refs[info.uuid] += 1
+            return True
+        key = (info.uuid, info.offset, info.nbytes, dims)
+        local = self.slice_uuids.setdefault(request_id, {}).get(key)
+        if local in deferred.slices:
+            info.uuid = local
+            deferred.extra_refs[local] += 1
+            return True
+        self._repoint_slice(request_id, info, key)
+        return False
 
     def begin_read_batch(self) -> None:
         self._read_batch_open = True
