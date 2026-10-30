@@ -63,8 +63,19 @@ class ChannelsLastUpsample(WanUpsample):
 def to_channels_last(vae: nn.Module) -> None:
     """Channels-last weights and activations for ``vae``'s decode path
     (``post_quant_conv`` and ``decoder``), in place; idempotent. The encoder
-    is left alone."""
-    for root in (getattr(vae, "post_quant_conv", None), getattr(vae, "decoder", None)):
+    is left alone (``encoder_to_channels_last``)."""
+    _to_channels_last(getattr(vae, "post_quant_conv", None), getattr(vae, "decoder", None))
+
+
+def encoder_to_channels_last(vae: nn.Module) -> None:
+    """``to_channels_last`` for the encode path (``encoder`` and
+    ``quant_conv``), in place; idempotent. Not ``is_channels_last``: that
+    describes the decode path."""
+    _to_channels_last(getattr(vae, "encoder", None), getattr(vae, "quant_conv", None))
+
+
+def _to_channels_last(*roots: nn.Module | None) -> None:
+    for root in roots:
         if root is None:
             continue
         for module in root.modules():
@@ -171,12 +182,6 @@ def feat_cache_bytes(feat_cache: list) -> int:
     return sum(t.numel() * t.element_size() for t in feat_cache if torch.is_tensor(t))
 
 
-def _has_deterministic_mode() -> bool:
-    import torch._inductor.config as inductor_config
-
-    return hasattr(inductor_config, "deterministic")
-
-
 def compile_decode(fn, deterministic: bool = False):
     """``torch.compile`` a Wan VAE decode callable; every compiled Wan VAE
     decode goes through here.
@@ -191,16 +196,19 @@ def compile_decode(fn, deterministic: bool = False):
     stateless whole-clip decode does form it there: the option moves its
     output by up to 2 uint8 levels, at the same speed.
 
-    ``deterministic`` turns on Inductor's deterministic mode where this
-    torch has it (2.9.1 does not); see ``DecoderStep``.
+    ``deterministic`` adds the engine's deterministic compile option
+    (``accelerator_graph_runner.deterministic_inductor_options``); see
+    ``DecoderStep``.
     """
     import torch._inductor.config as inductor_config
 
     options = {}
     if hasattr(inductor_config, "comprehensive_padding"):
         options["comprehensive_padding"] = False
-    if deterministic and _has_deterministic_mode():
-        options["deterministic"] = True
+    if deterministic:
+        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+
+        options.update(deterministic_inductor_options())
     return torch.compile(fn, fullgraph=False, dynamic=False, options=options or None)
 
 
@@ -227,10 +235,10 @@ class DecoderStep:
     the input's shape and strides plus the cache's slot shapes, so the warm-up
     sees the real layout.
 
-    ``deterministic`` compiles in Inductor's deterministic mode where this
-    torch has it (2.9.1 does not): each reduction kernel's config is then
-    picked by a fixed rule. Otherwise it is benchmarked on first use with a
-    cold cache, and processes that pick differently decode the same latents
+    ``deterministic`` compiles in Inductor's deterministic mode (the engine's
+    option, logged where torch has none): each reduction kernel's config is
+    then picked by a fixed rule. Otherwise it is benchmarked on first use with
+    a cold cache, and processes that pick differently decode the same latents
     a few uint8 levels apart.
     """
 

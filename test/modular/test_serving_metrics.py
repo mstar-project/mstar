@@ -411,14 +411,14 @@ def _in_flight_id(served, client):
                          headers={**_KEY, "content-type": "application/json"}), 413, "/v1/chat/completions"),
     (lambda s, c: c.post("/generate", content=_chunked(2**21),
                          headers={**_KEY, "content-type": "multipart/form-data; boundary=b"}), 413, "/generate"),
-    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 422, "/v1/chat/completions"),
+    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 400, "/v1/chat/completions"),
     (lambda s, c: c.post("/generate", data={"text": "hi", "model_kwargs": "{"}, headers=_KEY), 400, "/generate"),
     (_in_flight_id, 409, "/generate"),
     (lambda s, c: c.get("/no/such/route", headers=_KEY), 404, "unmatched"),
     # The served model has no OpenAI adapter.
     (lambda s, c: c.post("/v1/chat/completions", json=_CHAT, headers=_KEY), 404, "/v1/chat/completions"),
     (lambda s, c: c.get("/generate", headers=_KEY), 405, "/generate"),
-], ids=["401", "401-unmatched", "413-declared", "413-chunked", "422", "400", "409", "404-unmatched",
+], ids=["401", "401-unmatched", "413-declared", "413-chunked", "400-schema", "400", "409", "404-unmatched",
         "404-no-adapter", "405"])
 def test_a_request_refused_before_the_api_server_counts_by_route_template_and_status(
         served, refusing, send, status, route):
@@ -1304,6 +1304,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     cfg.write_text(text)
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
+    # sizing torch's pool would outlive the test in this process
+    monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
     return str(cfg)
 
 

@@ -503,9 +503,8 @@ def build_static_inputs(
 
 
 def _gen_band(position_ids: torch.Tensor, und_len: int) -> torch.Tensor:
-    """The generation band's position ids as their own tensor. A slice of
-    ``position_ids`` has the prompt length in its stride, which the compiled
-    denoise step guards on, so every new prompt length would recompile it."""
+    """The generation band's position ids as their own tensor; the DiT
+    submodule builds the band's rotary table from them."""
     return position_ids[:, und_len:].contiguous()
 
 
