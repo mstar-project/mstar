@@ -21,10 +21,10 @@ import torch
 pytest.importorskip("safetensors")
 
 try:
-    from .test_lora_pool import ctx, ingest, make_spec, step, write_adapter
+    from .test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, step, write_adapter
 except ImportError:  # collected without package context
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from test_lora_pool import ctx, ingest, make_spec, step, write_adapter
+    from test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, step, write_adapter
 
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
@@ -82,7 +82,7 @@ def _settle_reads(pool: LoraAdapterPool, timeout: float = 10.0) -> None:
 class _Rank:
     def __init__(self, paths, rank: int, agree, seed: int):
         self.pool = LoraAdapterPool(make_spec(paths, max_slots=2, cpu_capacity=1), "cpu", rank=rank,
-                                    world_size=2, agree=agree, screens=rank == 0)
+                                    world_size=2, agree=agree, decides=rank == 0)
         self.rng = random.Random(seed * 2 + rank)
         self.log: list = []  # (seq, rows, verdict, slot table) per admit
         self.pending: list = []
@@ -106,15 +106,21 @@ class _Rank:
             self.pool.commit(*self.pending.pop())
 
 
-def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int = 60, timeout: float = 5.0):
+def _simulate(paths, seed: int, admits: bool, fenced: bool = True, steps: int = 60, timeout: float = 5.0):
     """A leader sending ingests, steps, stamped removes and an unload to a follower in FIFO
-    order. ``screened`` picks rows as the scheduler does; ``fenced=False`` lands some removes
-    on the leader before the admit of the step they are stamped behind."""
+    order. ``admits`` picks rows through the leader's admission, as the scheduler does;
+    ``fenced=False`` lands some removes on the leader before the admit of the step they are
+    stamped behind."""
     barrier = _Barrier(2, timeout)
     leader, follower = (_Rank(paths, r, barrier.for_rank(r), seed) for r in (0, 1))
     wire: queue.Queue = queue.Queue()
     errors: list = []
     rng = random.Random(seed)
+    runner = lora_runner(leader.pool)
+
+    def remove(rid):
+        runner.remove_request(rid)
+        wire.put(("remove", rid))
 
     def run_leader():
         active: dict[str, int] = {}
@@ -130,14 +136,10 @@ def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int 
                     wire.put(("ingest", rid, adapter))
                     waiting.append(rid)
                 fresh = waiting[:3]
-                if screened:
+                if admits:
                     _settle_reads(leader.pool)  # a step outlasts a small adapter's read
-                    fresh = []
-                    for rid in waiting:
-                        if len(fresh) == 3:
-                            break  # a step's worth; the screen claims slots for what it passes
-                        if leader.pool.admit_retrieve(rid, "LLM", "decode", None).ready:
-                            fresh.append(rid)
+                    runner.admit_waiting(lambda rid, node: None)
+                    fresh = [rid for rid in waiting if admitted(runner, rid)][:3]
                 rows = list(active) + fresh
                 if not rows:
                     continue
@@ -148,8 +150,7 @@ def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int 
                     leader.pool.unload_adapter("a4")
                     wire.put(("unload", "a4"))
                 for rid in late:
-                    leader.pool.remove_request(rid)
-                    wire.put(("remove", rid))
+                    remove(rid)
                 late = []
                 outcome = leader.admit(seq, rows)
                 done: list[str] = []
@@ -170,8 +171,7 @@ def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int 
                     if not fenced and rng.random() < 0.5:
                         late.append(rid)
                         continue
-                    leader.pool.remove_request(rid)
-                    wire.put(("remove", rid))
+                    remove(rid)
                 leader.land_commit(maybe=True)
             leader.land_commit()
         except Exception as exc:  # noqa: BLE001
@@ -205,15 +205,15 @@ def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int 
     return leader, follower, barrier, errors
 
 
-@pytest.mark.parametrize("screened", [False, True])
-def test_ranks_agree_step_by_step_under_adapter_churn(tmp_path, screened):
+@pytest.mark.parametrize("admits", [False, True])
+def test_ranks_agree_step_by_step_under_adapter_churn(tmp_path, admits):
     """Four adapters through two slots, one unloaded, each rank landing commits and the
     unload at its own moment: every admit has the same verdict and slot table on both ranks.
-    Screened, no step is refused for want of a slot."""
+    With the leader's admission, no step is refused for want of a slot."""
     paths = _write_adapters(tmp_path, ADAPTERS)
     full = evict = 0
     for seed in range(12):
-        leader, follower, barrier, errors = _simulate(paths, seed, screened)
+        leader, follower, barrier, errors = _simulate(paths, seed, admits)
         assert not errors, (seed, errors)
         assert leader.log == follower.log, seed
         assert barrier.calls[0] == barrier.calls[1]
@@ -222,16 +222,16 @@ def test_ranks_agree_step_by_step_under_adapter_churn(tmp_path, screened):
                      for t0, t1 in zip(tables, tables[1:], strict=False) for a, b in zip(t0, t1, strict=True))
         refused = sum(entry[2] != "ok" for entry in leader.log)
         full += refused
-        if screened:
+        if admits:
             assert refused == 0, seed
-            assert not follower.pool._claims and not follower.pool._waiting_since
-    assert evict > 0 and (screened or full > 0), (evict, full)  # not vacuous
+            assert not follower.pool._reserved
+    assert evict > 0 and (admits or full > 0), (evict, full)  # not vacuous
 
 
 def test_the_churn_run_diverges_without_the_fence(tmp_path):
     paths = _write_adapters(tmp_path, ADAPTERS)
     for seed in range(12):
-        leader, follower, _, errors = _simulate(paths, seed, screened=False, fenced=False, timeout=0.5)
+        leader, follower, _, errors = _simulate(paths, seed, admits=False, fenced=False, timeout=0.5)
         if errors or leader.log != follower.log:
             return
     pytest.fail("no seed diverged with the leader's teardowns unfenced")
@@ -310,7 +310,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
 
     leader, follower = ranks = [
         pool_cls(make_spec(paths, max_slots=2, cpu_capacity=1), "cpu", rank=r, world_size=2,
-                 agree=agree, screens=r == 0)
+                 agree=agree, decides=r == 0)
         for r, agree in ((0, leader_agree), (1, barrier.for_rank(1)))
     ]
 

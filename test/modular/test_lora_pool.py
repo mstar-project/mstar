@@ -1,5 +1,5 @@
 """The per-request LoRA adapter pool on CPU: lifecycle, addressing, the host store,
-numerics, build, and the readiness screen with aging.
+numerics, build, and admission for a slot.
 
 A two-layer stack with a fused column-parallel ``qkv`` target (GQA-sized k/v) and a
 row-parallel ``o`` target. Other LoRA test modules import the helpers defined here.
@@ -15,12 +15,19 @@ import torch
 pytest.importorskip("safetensors")
 from safetensors.torch import save_file  # noqa: E402
 
-from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
+from mstar.engine.resources.base import EngineResourceInfo, Resource  # noqa: E402
 from mstar.engine.resources.lora import LoraModuleRef, LoraReqConfig, LoraSpec, LoraStep, LoraTarget  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
-from mstar.engine.resources.step import AllocationFailed, BucketKey, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.engine.resources.step import (  # noqa: E402
+    ASKS,
+    AllocationFailed,
+    BucketKey,
+    Segment,
+    SlotLease,
+    StepContext,
+)
 
 HIDDEN, Q_OUT, KV_OUT, LAYERS = 16, 16, 8, 2
 QKV = LoraTarget(
@@ -127,10 +134,18 @@ def token_slots_of(addr) -> list[int]:
     return slots
 
 
-def ready(pool, rid) -> bool:
-    outcome = pool.admit_retrieve(rid, "LLM", "decode", None)
+def lora_runner(*pools: Resource, keys=("lora",)) -> StepRunner:
+    return StepRunner(dict(zip(keys, pools, strict=True)), {"LLM": list(keys), "vision": []})
+
+
+def admitted(runner, rid, node="LLM") -> bool:
+    outcome = runner.admit_retrieve(rid, node, "decode")
     assert outcome.ok
     return outcome.ready
+
+
+def _nothing_published(rid, node):
+    return None
 
 
 # --- lifecycle and addressing ------------------------------------------------------------------
@@ -184,7 +199,7 @@ def test_an_adapter_with_nothing_for_the_pools_targets_takes_no_slot(adapters, t
     # the one slot fills; later rows on the empty adapter are ready and admitted beside it
     for rid, name in [("r1", "a1"), ("e2", "mlp")]:
         ingest(pool, rid, name)
-    assert run_step(pool, ["r1"]).ok and ready(pool, "e2")
+    assert run_step(pool, ["r1"]).ok and admitted(lora_runner(pool), "e2")
     assert run_step(pool, ["r1", "e2"]).ok and pool.slot_of("e2") == ZERO_SLOT
     assert pool.slot_state(1).refcount == 1 and pool.resident_slot("mlp") is None
 
@@ -478,14 +493,14 @@ def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
     assert set(llm.targets) == {"qkv", "o"}
 
 
-# --- readiness: a full pool is backpressure, not a refused step ----------------------------------
+# --- admission: a full pool is backpressure, not a refused step ----------------------------------
 
 class _Sim:
-    """Each step runs every running row plus the waiting rows the pool calls ready, as the
+    """Each step runs every running row plus the waiting rows the runner admits, as the
     micro-scheduler's readiness scan does; running rows end after their length."""
 
     def __init__(self, pool):
-        self.pool, self.t = pool, 0
+        self.pool, self.runner, self.t = pool, lora_runner(pool), 0
         self.running: dict[str, int] = {}
         self.waiting: list[tuple[str, int]] = []
         self.served_at: dict[str, int] = {}
@@ -496,7 +511,8 @@ class _Sim:
         self.waiting.append((rid, length))
 
     def step(self):
-        fresh = [(r, n) for r, n in self.waiting if ready(self.pool, r)]
+        self.runner.admit_waiting(_nothing_published)
+        fresh = [(r, n) for r, n in self.waiting if admitted(self.runner, r)]
         rows = list(self.running) + [r for r, _ in fresh]
         if rows and not run_step(self.pool, rows).ok:
             self.refused.append(self.t)  # every row in it lost the step
@@ -509,7 +525,7 @@ class _Sim:
                 self.running[r] -= 1
                 if not self.running[r]:
                     del self.running[r]
-                    self.pool.remove_request(r)
+                    self.runner.remove_request(r)
         self.t += 1
 
 
@@ -523,64 +539,111 @@ def test_a_refused_override_leaves_the_spec_as_declared(override):
     assert spec == make_spec({})
 
 
-@pytest.mark.parametrize("screens,wait_steps", [(True, 10), (True, 10**9), (False, 10)])
-def test_a_cold_adapter_waits_without_refusing_steps_and_is_served_within_the_aging_bound(
-    adapters, screens, wait_steps,
-):
+@pytest.mark.parametrize("decides", [True, False])
+def test_a_cold_adapter_waits_without_refusing_steps_and_is_served_once_the_slot_drains(adapters, decides):
     """A new request on a1 every step keeps the one slot held; one on a2 arrives at step 5.
-    Controls: an unreachable aging bound (the slot never drains for a2), and no screen (a
-    follower's setting: a2's row rides in every step, whose admit is refused whole)."""
+    Requests after it wait behind it, so the slot drains for it. Control: a rank that does
+    not decide (a follower's setting) lets a2's row ride in every step, whose admit is
+    refused whole."""
     _, paths = adapters
-    pool = LoraAdapterPool(make_spec(paths, max_slots=1, slot_wait_steps=wait_steps), "cpu", screens=screens)
+    pool = LoraAdapterPool(make_spec(paths, max_slots=1), "cpu", decides=decides)
     sim = _Sim(pool)
-    for t in range(120):
+    for t in range(40):
         sim.arrive(f"hot{t}", "a1", 3)
         if t == 5:
             sim.arrive("cold", "a2", 2)
         sim.step()
-    if not screens:
-        assert sim.refused == list(range(5, 120))
+    if not decides:
+        assert sim.refused == list(range(5, 40))
         return
     assert sim.refused == []
-    if wait_steps == 10:
-        # held back `wait_steps` admits, then the running hot rows drain (3 steps)
-        assert sim.served_at["cold"] - 5 <= wait_steps + 3 + 1
-        assert max(sim.served_at.values()) > sim.served_at["cold"]
-    else:
-        assert "cold" not in sim.served_at
+    # the hot rows admitted before it drain (3 steps)
+    assert sim.served_at["cold"] - 5 <= 3 + 1
+    assert max(sim.served_at.values()) > sim.served_at["cold"]
 
 
-def test_the_screen_holds_back_only_rows_that_need_a_slot_and_only_on_the_leader(adapters):
+def test_admission_holds_back_only_rows_that_need_a_slot_and_only_on_the_leader(adapters):
     _, paths = adapters
     pool = make_pool(paths, max_slots=1)
+    runner = lora_runner(pool)
     for rid, name in [("r1", "a1"), ("base", None), ("r2", "a2")]:
         ingest(pool, rid, name)
-    assert ready(pool, "r1") and run_step(pool, ["r1", "base"]).ok
-    outcome = pool.admit_retrieve("r2", "LLM", "decode", None)
-    assert outcome.ok and not outcome.ready and outcome.reason is None
-    assert ready(pool, "r1") and ready(pool, "base")
-    runner = StepRunner({"lora": pool}, {"LLM": ["lora"], "vision": []})
-    assert runner.admit_retrieve("r2", "LLM", "decode").ready is False
-    assert runner.admit_retrieve("r2", "vision", "encode").ready is True
-    # the admit refusal stays as a backstop for a row the screen did not see
+    assert admitted(runner, "r1") and run_step(pool, ["r1", "base"]).ok
+    assert runner.admit_retrieve("r2", "LLM", "decode").queued
+    assert admitted(runner, "r1") and admitted(runner, "base")
+    assert admitted(runner, "r2", node="vision")
+    # the admit refusal stays as a backstop for a row admission did not see
     assert isinstance(run_step(pool, ["r2"]).reason, AllocationFailed)
-    pool.remove_request("r1")
-    assert ready(pool, "r2")
-    # a lockstep follower does not screen and keeps no screening state
-    follower = LoraAdapterPool(make_spec(paths, max_slots=1), "cpu", screens=False)
+    runner.remove_request("r1")
+    assert runner.admit_waiting(_nothing_published) == [("LLM", "r2")]
+    # a lockstep follower does not decide and keeps no reservations
+    follower = LoraAdapterPool(make_spec(paths, max_slots=1), "cpu", decides=False)
     for rid, name in [("r1", "a1"), ("r2", "a2")]:
         ingest(follower, rid, name)
-    assert run_step(follower, ["r1"]).ok and ready(follower, "r2")
-    assert not follower._claims and not follower._waiting_since
+    assert run_step(follower, ["r1"]).ok and admitted(lora_runner(follower), "r2")
+    assert not follower._reserved
 
 
 def test_two_missing_adapters_cannot_both_take_the_last_slot(adapters):
     _, paths = adapters
     pool = make_pool(paths, max_slots=2)
+    runner = lora_runner(pool)
     for rid, name in [("r1", "a1"), ("r2", "a2"), ("r3", "a3"), ("r4", "a2")]:
         ingest(pool, rid, name)
-    assert run_step(pool, ["r1"]).ok
-    # r2's claim reserves the last slot for a2, which r4 shares; r3 waits
-    assert {rid: ready(pool, rid) for rid in ("r2", "r3", "r4")} == {"r2": True, "r3": False, "r4": True}
-    assert run_step(pool, ["r1", "r2", "r4"]).ok and pool.slot_of("r2") == pool.slot_of("r4")
+    assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
+    # r2 reserves the last slot for a2; r3 waits, and r4 behind it
+    assert {rid: admitted(runner, rid) for rid in ("r2", "r3", "r4")} == {"r2": True, "r3": False, "r4": False}
+    assert run_step(pool, ["r1", "r2"]).ok
+    runner.remove_request("r1")
+    assert runner.admit_waiting(_nothing_published) == [("LLM", "r3"), ("LLM", "r4")]
+    assert run_step(pool, ["r2", "r3", "r4"]).ok and pool.slot_of("r2") == pool.slot_of("r4")
 
+
+class _Pages(Resource):
+    """KV-like capacity: a unit per request, reserved at admission."""
+
+    def __init__(self, units: int):
+        self.free, self.held = units, set()
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+    def ask(self, rid, node_name, graph_walk):
+        return None if rid in self.held else ASKS
+
+    def reserve(self, rid, node_name, graph_walk, published):
+        if not self.free:
+            return self.free
+        self.free -= 1
+        self.held.add(rid)
+        return None
+
+    def unreserve(self, rid):
+        self.free += 1
+        self.held.discard(rid)
+
+    def grew_since(self, mark):
+        return self.free > mark
+
+    def remove_request(self, rid):
+        if rid in self.held:
+            self.unreserve(rid)
+
+
+def test_a_request_waiting_for_a_slot_holds_no_kv(adapters):
+    """A request on a cold adapter waits in the same admission as KV, so it keeps no KV
+    reservation while it waits, and a base request takes the room instead."""
+    _, paths = adapters
+    pool, kv = make_pool(paths, max_slots=1), _Pages(2)
+    runner = lora_runner(kv, pool, keys=("kv", "lora"))
+    for rid, name in [("r1", "a1"), ("r2", "a2"), ("base", None)]:
+        ingest(pool, rid, name)
+    assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
+    waits = runner.admit_retrieve("r2", "LLM", "decode")
+    assert kv.held == {"r1"}, "a request waiting for a LoRA slot kept its KV reservation"
+    assert waits.queued
+    assert admitted(runner, "base")
+    runner.remove_request("r1")
+    assert runner.admit_waiting(_nothing_published) == [("LLM", "r2")]
+    assert kv.held == {"base", "r2"} and run_step(pool, ["r2", "base"]).ok

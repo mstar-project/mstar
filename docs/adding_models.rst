@@ -1047,20 +1047,18 @@ A request takes its adapter's slot on its first admit and holds it until it is r
 Slot 0 is a zero adapter (rank 0) that base-model rows and capture padding rows address,
 and the kernels skip it. A miss loads the adapter from the host tier into a free slot, or
 into the unheld slot released longest ago. A request whose adapter cannot get a slot (every
-slot held by running requests, or promised to requests already let through) is not ready
-(``LoraAdapterPool.admit_retrieve``), so the scheduler leaves it out of the steps it builds
-and the rows already running keep stepping; the admit's ``AllocationFailed`` stays only as
-a backstop. Once a request has waited ``slot_wait_steps`` of the pool's steps for a slot,
-no other adapter may take one, and new requests on one held slot (the one with the fewest
-holders) are held back until it drains and the cold adapter takes it, so a cold adapter is
-not starved by steady traffic on resident ones; requests on the other held slots keep
-running meanwhile. Only a request held for want of a slot ages, and a waiting request the
-scheduler no longer screens (failed, in a backoff) holds no one back. An adapter with
-nothing for a pool's targets (a text-only adapter on a vision tower's pool) takes no slot
-there once an admit has read it: its rows address the zero adapter. Only the rank that
-chooses batches screens:
-on a lockstep instance the leader, whose choice the followers run as sent, so the
-screening needs no agreement across ranks.
+slot held by running requests, or reserved for requests admitted ahead of it) waits at the
+runner's admission (``LoraAdapterPool.ask`` / ``reserve``), in arrival order with every
+other resource that asks, so it holds no KV pages meanwhile and the rows already running
+keep stepping; the admit's ``AllocationFailed`` stays only as a backstop. Only the first
+waiting request is admitted, so a cold adapter is not starved by steady traffic on resident
+ones: requests behind it wait too, and the held slots drain. A slot is reserved for a request
+only once its adapter's host copy is in, so its admit never waits on a read. A reservation
+counts slots and pins none: which slot an admit takes follows from the slot table alone. An
+adapter with nothing for a pool's targets (a text-only adapter on a vision tower's pool)
+takes no slot there once an admit has read it: its rows address the zero adapter. Only the
+rank that chooses batches admits: on a lockstep instance the leader, whose choice the
+followers run as sent, so its reservations need no agreement across ranks.
 The plan writes each step's addressing (for each row grouping its targets read, per token,
 per segment or per fold, the rows grouped by slot: the only thing the kernels read) into
 one fixed buffer per capture slot, sized to its bucket, so a captured replay
@@ -1084,8 +1082,8 @@ adapter from disk is the one step that can fail on one rank only, so the pool AN
 outcome across the instance (one gloo all-reduce per adapter installed, none in steady
 state) and every rank installs it or refuses the request. Files are read on the pool's own
 reader thread: every rank starts reading an adapter into the host tier when it ingests a
-request that names it, the leader's screen keeps the request out of steps until its copy
-is in, and an admit never reads a file itself (a follower whose read is still in flight
+request that names it, the leader reserves a slot for the request only once its copy is
+in, and an admit never reads a file itself (a follower whose read is still in flight
 waits for it). Neither that wait nor the agreement holds the pool's lock, so the main
 thread's ingests and removes go on meanwhile.
 
@@ -1967,10 +1965,8 @@ that a misspelled setting is never silently ignored:
        targets to allocate; by default the targets the configured adapters touch; a
        secondary node's spec
        left with none builds no pool, while a YAML list leaving the model's first spec
-       (its LLM's) none is an error),
-       ``slot_wait_steps`` (default 256: how many of the pool's steps a request may
-       wait for a slot before a held slot is drained for it). One ``lora:`` block sizes
-       every LoRA spec of the model
+       (its LLM's) none is an error). One ``lora:`` block sizes every LoRA spec of the
+       model
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,

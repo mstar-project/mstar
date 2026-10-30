@@ -13,7 +13,7 @@ from __future__ import annotations
 import ctypes
 import inspect
 import sys
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from functools import partial
 from types import SimpleNamespace
 
@@ -361,7 +361,6 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
     runner._step_runner = SimpleNamespace(
         admit=lambda step: kv.admit(step.get("kv"), step.ctx),
         plan=lambda step: kv.plan(step.get("kv"), step.ctx),
-        compute_scope=lambda step: nullcontext(),
     )
     config = SimpleNamespace(
         get_node_inputs=lambda bs, tokens: None, get_config_type=lambda: None,
