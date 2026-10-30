@@ -7,9 +7,11 @@ row-parallel ``o`` target. Other LoRA test modules import the helpers defined he
 
 from __future__ import annotations
 
+import gc
 import re
 import threading
 import time
+import weakref
 
 import pytest
 import torch
@@ -318,6 +320,27 @@ def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
     store.load("a3", paths["a3"])
     assert "a1" in store and "a3" in store and "a2" not in store
     assert store.get("a3").digest != whole.digest == store.get("a1").digest
+
+
+def test_a_runtime_load_keeps_no_copy_until_a_request_names_it(adapters):
+    """Loads past ``cpu_capacity`` pin nothing outside the host tier's bound: a load's read
+    checks the file and is dropped, and the first request on the adapter reads it again."""
+    _, paths = adapters
+    pool = make_pool({}, cpu_capacity=1)
+    copies, read = [], pool.store.read
+
+    def tracked(*args):
+        adapter = read(*args)
+        copies.append(weakref.ref(adapter))
+        return adapter
+    pool.store.read = tracked
+    for name in ("a1", "a2", "a3"):
+        pool.load_adapter(name, paths[name])
+    gc.collect()
+    assert len(copies) == 3 and not any(ref() for ref in copies)
+    ingest(pool, "r", "a2")
+    settle_reads(pool)
+    assert "a2" in pool.store and len(copies) == 4
 
 
 # --- numerics and compile ------------------------------------------------------------------------

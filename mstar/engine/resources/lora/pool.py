@@ -364,8 +364,6 @@ class LoraAdapterPool(Resource):
         self._reads: dict[str, tuple[Future, _Served]] = {}  # adapter -> read in flight
         # adapter -> why its last background read failed; a new request on it retries
         self._read_errors: dict[str, str] = {}
-        # adapter -> the copy its runtime load read, until its first request holds it
-        self._loaded: dict[str, LoadedAdapter] = {}
         # admit runs on the GPU thread, remove on the main thread, a read's completion on
         # the reader (or inline, if it completed before its callback was added: reentrant)
         self._lock = threading.RLock()
@@ -493,12 +491,12 @@ class LoraAdapterPool(Resource):
 
     def load_adapter_async(self, name: str, path: str, digest: bytes | None = None) -> Future:
         """Serve ``name`` from ``path``: read it on the reader thread, check it against the
-        spec (and against ``digest``, the weights the API server checked), shard it for
-        this rank, and only then make it servable; its first request holds that copy in
-        the host tier. The future fails if
-        it is served already, is still retiring from an unload, or cannot be read; a
-        refusal visible now raises here. A request that names it takes a slot on its
-        first admit, as for an adapter configured at startup."""
+        spec (and against ``digest``, the weights the API server checked), and only then
+        make it servable. The read is not kept, since the host tier holds only what
+        requests name: the first request on it reads it again as it is ingested. The
+        future fails if it is served already, is still retiring from an unload, or cannot
+        be read; a refusal visible now raises here. A request that names it takes a slot
+        on its first admit, as for an adapter configured at startup."""
         with self._lock:
             self._refuse_reload(name)
             return self._executor().submit(self._load, name, path, digest)
@@ -510,9 +508,6 @@ class LoraAdapterPool(Resource):
             if adapter.rank == 0:
                 # no request can name it before it is served, below
                 self._empty.add(name)
-            else:
-                # its first request holds it in the host tier (`_hold`), with this copy
-                self._loaded[name] = adapter
             self._serving[name] = _Served(path, adapter.digest)
         logger.info("LoRA pool: loaded %s from %s", name, path)
 
@@ -547,7 +542,6 @@ class LoraAdapterPool(Resource):
         admit decides from is unchanged; ``_install`` reuses the slot like any other."""
         self._retiring.pop(name, None)
         self._store.drop(name)
-        self._loaded.pop(name, None)
         self._empty.discard(name)
         slot = self._resident.pop(name, None)
         logger.info(
@@ -826,14 +820,8 @@ class LoraAdapterPool(Resource):
         A failed read is retried, except while a row reserved on that failure waits for
         the admit that fails it, which would otherwise wait for the retry."""
         retry = name not in self._reserved_count and self._read_errors.pop(name, None) is not None
-        if self._store.hold(name, keep=self._live):
-            loaded = self._loaded.pop(name, None)
-            if loaded is not None:
-                self._store.put(loaded)
-                return
-        elif not retry:
-            return
-        self._read_in(name)
+        if self._store.hold(name, keep=self._live) or retry:
+            self._read_in(name)
 
     def _read_in(self, name: str) -> Future:
         """Caller holds the lock. Read ``name`` on the reader thread, unless that read is
