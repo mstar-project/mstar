@@ -30,7 +30,6 @@ def _worker(target):
         _phase_period=0,
         request_state=None,
         _rebuilds=Rebuilds({}, {}),
-        _rebuild_rows={},
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or True,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),

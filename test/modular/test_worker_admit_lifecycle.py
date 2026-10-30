@@ -99,7 +99,7 @@ def _worker():
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._last_active = {}
-    w._rebuilds, w._rebuild_rows = Rebuilds({}, {}), {}
+    w._rebuilds = Rebuilds({}, {})
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)

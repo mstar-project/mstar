@@ -111,7 +111,7 @@ def _worker(is_tp_follower=False) -> Worker:
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
-    w._rebuilds, w._rebuild_rows = Rebuilds({}, {}), {}
+    w._rebuilds = Rebuilds({}, {})
     w.enable_nvtx = False
     return w
 

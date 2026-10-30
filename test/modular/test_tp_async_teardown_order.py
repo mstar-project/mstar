@@ -131,7 +131,7 @@ def _rank(
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
-    w._rebuilds, w._rebuild_rows = Rebuilds({}, {}), {}
+    w._rebuilds = Rebuilds({}, {})
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
