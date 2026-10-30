@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.utils.utf8_stream import Utf8Stream
 
 
@@ -36,9 +37,11 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             request_id=request_id,
             model=req.model,
         )
-        if req.model in api.served_models.adapters:
-            # the response names the adapter that served it, as vLLM's does
-            model_name = req.model
+        served = (api.served_models.select(req.model, args.model_kwargs) or {}).get(LORA_ADAPTER_KWARG)
+        if served is not None:
+            # the response names the adapter that served it, as vLLM's does, whether the
+            # model field or the lora_adapter kwarg picked it
+            model_name = served
         if req.stream:
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)

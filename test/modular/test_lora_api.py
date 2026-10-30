@@ -147,8 +147,10 @@ def test_every_route_maps_the_model_field_to_an_adapter(monkeypatch, route):
         assert response.json()["model"] == "sql"
     refused = [{"model": "nope"}]
     if route in ("chat", "speech"):  # an extra-body adapter is checked like the model field
-        post(client, {LORA_ADAPTER_KWARG: "sql"})
+        response = post(client, {LORA_ADAPTER_KWARG: "sql"})
         assert stub.last_submit["model_kwargs"][LORA_ADAPTER_KWARG] == "sql"
+        if route == "chat":
+            assert response.json()["model"] == "sql"
         refused += [{LORA_ADAPTER_KWARG: "nope"}, {"model": "sql", LORA_ADAPTER_KWARG: "other"}]
     for body in refused:
         stub.last_submit = None
