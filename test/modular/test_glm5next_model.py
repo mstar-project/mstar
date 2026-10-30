@@ -1067,6 +1067,26 @@ def test_moe_quant_kernel_resolution_and_clamp_guard(monkeypatch):
     assert blk_bf16.fp8_experts is False and blk_bf16._use_fused is False
 
 
+def test_the_fused_moe_asks_the_platform_for_fp8_dots(monkeypatch):
+    """An AMD GPU reports a CUDA-style capability (an MI300X is 9.4), which a raw check took for
+    sm89+: 'auto' resolves to the reference dispatch where the platform has no NVIDIA fp8 dots."""
+    from types import SimpleNamespace
+
+    from mstar.model.glm5_next.components import moe as moe_mod
+
+    fake = types.ModuleType("mstar.utils.fused_moe")
+    fake.fused_experts_fp8 = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "mstar.utils.fused_moe", fake)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 4))
+    monkeypatch.setattr(moe_mod, "current_platform", SimpleNamespace(
+        has_cuda_capability=lambda major, minor=0, device=None: False))
+    cfg = Glm5NextModelConfig.reduced_fp8()
+    cfg.moe_quant_kernel = "auto"
+    block = Glm5NextSparseMoeBlock(cfg)
+    block.process_weights_after_loading("cuda")
+    assert block._use_fused is False
+
+
 def test_module_tree_matches_loader_expectations():
     """The assembled tree == the loader's expected target set, name for name — the loader
     <-> model integration seam, pinned without a checkpoint.
