@@ -75,6 +75,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+       ``configs/pi05_droid.yaml`` serves the DROID fine-tune (``lerobot/pi05_droid``) with
+       openpi's DROID normalization: raw joint state in, joint velocities out.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear

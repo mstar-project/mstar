@@ -207,15 +207,14 @@ def main():
     from transformers import AutoTokenizer
 
     from mstar.model.pi05.components.flow_matching import discretize_state
+    from mstar.model.pi05.components.tokenization import pi05_prompt
     tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224", use_fast=True)
     state_t = torch.tensor(
         [float(x) for x in args.state.split(",") if x.strip()] + [0.0] * 32,
-        dtype=torch.float32,
+        dtype=torch.float64,
     )[:32]
     bins = discretize_state(state_t, num_bins=256).tolist()
-    state_str = " ".join(str(b) for b in bins)
-    cleaned = args.text.strip().replace("_", " ").replace("\n", " ")
-    full_prompt = f"Task: {cleaned}, State: {state_str};\nAction: ".strip().lower()
+    full_prompt = pi05_prompt(args.text, bins)
     ids = tokenizer(full_prompt, add_special_tokens=True).input_ids[:200]
     tokens = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
     masks_lerobot = torch.ones(tokens.shape, dtype=torch.bool, device=device)

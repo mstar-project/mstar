@@ -1,28 +1,34 @@
 model: "pi05"
 max_seq_len: 2048
 
-# DROID benchmark variant of pi05.yaml.
+# pi0.5 fine-tuned on DROID (openpi's pi05_droid, ported by lerobot), served like
+# openpi's pi05_droid policy (openpi/src/openpi/training/config.py, droid_policy.py).
 #
-# Overrides action_horizon to match openpi's pi05_droid TrainConfig
-# (openpi/src/openpi/training/config.py: Pi0Config(action_horizon=15, pi05=True)),
-# which is what we benchmark against. With this override mstar and openpi
-# both run 15-step flow-matching rollouts internally so JCT is comparable.
+# A request carries two images, exterior_image_1_left then wrist_image_left (openpi
+# masks out the third camera slot for DROID), the task, and robot_state = the raw 7
+# joint positions plus the gripper position. The reply is [15, 32]: the first 8 dims
+# are joint velocities and the gripper position in robot units (openpi keeps [:, :8]),
+# the rest is padding. action_dim stays 32, the checkpoint's projection width.
 #
-# Why action_dim is NOT overridden (stays 32):
-#   1. Weight shape constraint — lerobot/pi05_base weights for action_in_proj
-#      and action_out_proj are baked at action_dim=32. Changing it would fail
-#      `nn.Linear(...).load_state_dict` with a shape mismatch.
-#   2. openpi parity — openpi's pi05_droid also runs 32-dim flow matching
-#      internally and only slices `[:, :8]` at the very end via DroidOutputs
-#      (openpi/src/openpi/policies/droid_policy.py:78). The slice is
-#      post-compute Python, so both systems do identical 32-dim work.
-#
-# CUDA-graph note: action_horizon and action_dim are both baked into the
-# graph captures (see Pi05LLMSubmodule.get_cuda_graph_configs in
-# mstar/model/pi05/submodules.py:325-329). They MUST be set at server-init
-# time, never per-request — that's what this yaml override is for.
+# These are fixed at server start, and action_horizon and num_cameras are baked into
+# the CUDA-graph captures.
 model_kwargs:
+  model_path_hf: "lerobot/pi05_droid"
   action_horizon: 15
+  num_cameras: 2
+  # openpi's DROID stats, gs://openpi-assets/checkpoints/pi05_droid/assets/droid/norm_stats.json
+  # (its first 8 dims, the rest is zero padding). Neither lerobot checkpoint ships them.
+  norm_stats:
+    state:
+      q01: [-0.8279732212066653, -0.8398311847686768, -0.8425482082366944, -2.773015278291702,
+            -1.8426181347846986, 1.1716566389799117, -2.047264838027954, 0.0]
+      q99: [0.8996522880554196, 1.385467470359802, 0.6920277433395388, -0.4542043057203293,
+            1.732314240932464, 3.4672964780330657, 2.1984972072601314, 0.991]
+    actions:
+      q01: [-0.45799999999999996, -0.8076, -0.44719999999999993, -0.9268, -0.6456, -0.6459999999999999,
+            -0.7616, 0.0]
+      q99: [0.4476, 0.7652000000000001, 0.4480000000000002, 0.7944, 0.6484000000000001, 0.6628000000000001,
+            0.7344000000000002, 0.9998]
 
 node_groups:
   - node_names:

@@ -24,7 +24,7 @@ from mstar.model.pi05.components.flow_matching import (
     euler_step,
     sincos_timestep_embedding,
 )
-from mstar.model.pi05.config import Pi05Config
+from mstar.model.pi05.config import LLM_KV, Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
 from mstar.model.pi05.submodules import Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
@@ -41,6 +41,7 @@ def _make_model() -> Pi05Model:
     model.cache_dir = None
     model.skip_weight_loading = True
     model.config = Pi05Config()
+    model.norm_stats = None
     model.tokenizer = None
     model._repo_dir = None
     model._submodule_cache = {}
@@ -361,6 +362,157 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
     assert stub.last_prompt == "hello world"
 
 
+def test_discretize_state_matches_openpi_digitize():
+    """openpi's PaligemmaTokenizer: np.digitize(state, linspace(-1, 1, 257)[:-1]) - 1,
+    so -1 below the range, 255 at or above 1, and each bin edge starts its bin."""
+    import numpy as np
+
+    edges = np.linspace(-1, 1, 257)[:-1]
+    values = np.concatenate([
+        np.random.default_rng(0).uniform(-1.5, 1.5, 4096), edges, edges - 1e-12,
+        [-1.0, 1.0, -1.0000001, 0.99999, 2.0],
+    ])
+    got = discretize_state(torch.from_numpy(values), num_bins=256)
+    assert got.dtype == torch.long
+    np.testing.assert_array_equal(got.numpy(), np.digitize(values, bins=edges) - 1)
+
+
+def test_pi05_process_prompt_tokenizes_openpi_text():
+    """The task keeps its case and the space after "Action:" stays, as openpi
+    tokenizes the string it builds."""
+    from types import SimpleNamespace
+
+    from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+
+    seen = []
+
+    def hf_tokenizer(text, add_special_tokens):
+        seen.append(text)
+        return SimpleNamespace(input_ids=[2, 7, 9])
+
+    model = _make_model()
+    model.tokenizer = Pi05Tokenizer(hf_tokenizer, model.config)
+    result = model.process_prompt(
+        "Put_the Cup\naway", ["image", "text"], ["action"], robot_state=[0.5, -1.2, 1.0],
+    )
+    assert seen == ["Task: Put the Cup away, State: 192 -1 255;\nAction: "]
+    assert result.new_input_tensors["text_inputs"][0].tolist() == [2, 7, 9]
+    # the KV layout's text span counts the tokens of that text
+    assert result.metadata["kv_layout"][LLM_KV]["main"].spans[1].length == 3
+
+
+# ----------------------------------------------------------------------
+# Deployment norm stats (openpi's quantile normalization)
+# ----------------------------------------------------------------------
+
+# A 3-dim robot in openpi's norm_stats.json layout; mean/std are there but unused.
+_TINY_STATS = {
+    "norm_stats": {
+        "state": {"mean": [0.0, 0.0, 0.5], "std": [1.0, 1.0, 0.5],
+                  "q01": [-0.8, -2.7, 0.0], "q99": [0.9, -0.45, 0.99]},
+        "actions": {"mean": [0.0, 0.0], "std": [0.3, 0.3], "q01": [-0.45, 0.0], "q99": [0.44, 1.0]},
+    }
+}
+
+
+def _openpi_state_bins(raw, q01, q99):
+    """openpi: transforms.Normalize(use_quantiles=True), then PaligemmaTokenizer's np.digitize."""
+    import numpy as np
+
+    raw = np.asarray(raw, dtype=np.float64)
+    q01, q99 = np.asarray(q01)[: raw.shape[-1]], np.asarray(q99)[: raw.shape[-1]]
+    x = (raw - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+    return (np.digitize(x, bins=np.linspace(-1, 1, 257)[:-1]) - 1).tolist()
+
+
+def _model_with_stats(norm_stats):
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    model = _make_model()
+    model.norm_stats = load_norm_stats(norm_stats)
+    model.tokenizer = _StubTokenizer()
+    return model
+
+
+def test_norm_stats_file_and_inline_mapping_agree(tmp_path):
+    import json
+
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps(_TINY_STATS))
+    from_file = load_norm_stats(str(path))
+    inline = load_norm_stats({k: {"q01": v["q01"], "q99": v["q99"]} for k, v in _TINY_STATS["norm_stats"].items()})
+    for a, b in ((from_file.state, inline.state), (from_file.actions, inline.actions)):
+        assert torch.equal(a.q01, b.q01) and torch.equal(a.q99, b.q99)
+    assert from_file.state.q01.dtype == torch.float64
+    assert load_norm_stats(None) is None
+    assert load_norm_stats({"state": _TINY_STATS["norm_stats"]["state"]}).actions is None
+
+
+@pytest.mark.parametrize("bad", [
+    {}, {"states": {"q01": [0.0], "q99": [1.0]}}, {"state": {"mean": [0.0], "std": [1.0]}},
+    {"state": {"q01": [0.0, 1.0], "q99": [1.0]}}, {"actions": {"q01": [], "q99": []}},
+])
+def test_norm_stats_rejects_specs_it_cannot_apply(bad):
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    with pytest.raises(ValueError):
+        load_norm_stats(bad)
+
+
+def test_pi05_process_prompt_normalizes_raw_state_like_openpi():
+    import numpy as np
+
+    model = _model_with_stats(_TINY_STATS)
+    stats = _TINY_STATS["norm_stats"]["state"]
+    rng = np.random.default_rng(0)
+    for raw in ([0.1, -1.0, 0.5], [0.95, -2.9, 0.0], *rng.uniform(-3, 3, size=(32, 3)).tolist(), [0.3, -1.2]):
+        model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=raw)
+        bins = model.tokenizer.last_prompt.split("State: ", 1)[1].split(";", 1)[0].split()
+        assert [int(b) for b in bins] == _openpi_state_bins(raw, stats["q01"], stats["q99"])
+
+
+def test_pi05_process_prompt_rejects_state_wider_than_norm_stats():
+    model = _model_with_stats(_TINY_STATS)
+    with pytest.raises(ValueError, match="robot_state has 4 values"):
+        model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=[0.0] * 4)
+
+
+def test_pi05_postprocess_unnormalizes_the_dims_the_action_stats_cover():
+    import numpy as np
+
+    model = _model_with_stats(_TINY_STATS)
+    actions = torch.rand(model.config.action_horizon, model.config.action_dim) * 2 - 1
+    out = np.frombuffer(model.postprocess(actions, modality="action"), dtype=np.float32).reshape(actions.shape)
+    q01 = np.asarray(_TINY_STATS["norm_stats"]["actions"]["q01"])
+    q99 = np.asarray(_TINY_STATS["norm_stats"]["actions"]["q99"])
+    a = actions.numpy().astype(np.float64)
+    np.testing.assert_allclose(out[:, :2], (a[:, :2] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, rtol=1e-6, atol=1e-7)
+    np.testing.assert_array_equal(out[:, 2:], actions.numpy()[:, 2:])
+
+
+def test_pi05_without_norm_stats_bins_state_and_returns_actions_as_given():
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=[0.5, -0.25])
+    assert model.tokenizer.last_prompt == "Task: pick up the cup, State: 192 96;\nAction: "
+    actions = torch.rand(model.config.action_horizon, model.config.action_dim)
+    assert model.postprocess(actions, modality="action") == actions.numpy().tobytes()
+
+
+def test_pi05_norm_stats_come_from_model_kwargs(tmp_path):
+    """The serving config's model_kwargs reach Pi05Config and are parsed at startup."""
+    import json
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps(_TINY_STATS))
+    model = Pi05Model("unused", skip_weight_loading=True, norm_stats=str(path))
+    assert model.norm_stats.state.q01.tolist() == [-0.8, -2.7, 0.0]
+    with pytest.raises(FileNotFoundError):
+        Pi05Model("unused", skip_weight_loading=True, norm_stats=str(tmp_path / "missing.json"))
+
+
 # ----------------------------------------------------------------------
 # Lerobot -> mstar weight remap (pure-function unit tests)
 # ----------------------------------------------------------------------
@@ -416,3 +568,48 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
 
     # Unknown keys are dropped
     assert remap("totally.unknown.key") is None
+
+
+@pytest.mark.parametrize("policy_saved", [False, True])
+def test_lerobot_checkpoint_keys_with_and_without_policy_prefix(tmp_path, policy_saved):
+    """lerobot/pi05_droid is a saved PI05Policy: every key sits under ``model.`` and
+    PaliGemma's input embedding is stored next to the lm_head it is tied to.
+    It must load the same way as lerobot/pi05_base, which has neither."""
+    from safetensors.torch import save_file
+
+    lm_head = torch.randn(8, 4)
+    base = {
+        "paligemma_with_expert.paligemma.lm_head.weight": lm_head,
+        "paligemma_with_expert.paligemma.model.language_model.layers.0.mlp.up_proj.weight": torch.randn(4, 4),
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.post_layernorm.weight": torch.randn(4),
+        "paligemma_with_expert.gemma_expert.model.norm.dense.weight": torch.randn(4),
+        "action_in_proj.weight": torch.randn(4, 2),
+        "time_mlp_in.bias": torch.randn(4),
+    }
+    saved = dict(base)
+    if policy_saved:
+        saved = {"model." + k: v for k, v in base.items()}
+        saved["model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"] = lm_head.clone()
+    save_file(saved, str(tmp_path / "model.safetensors"))
+
+    model = Pi05Model.__new__(Pi05Model)  # bypass __init__: no config or tokenizer download
+    model._repo_dir = tmp_path
+    model._lerobot_flat = None
+    flat = model._ensure_lerobot_flat()
+
+    assert flat.keys() == base.keys()
+    assert all(torch.equal(flat[k], v) for k, v in base.items())
+    assert model._lerobot_remap("paligemma_with_expert.paligemma.lm_head.weight") == "embed_tokens.weight"
+    assert model._lerobot_remap("time_mlp_in.bias") == "time_mlp.linear_in.bias"
+
+
+def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
+    import yaml
+
+    cfg = yaml.safe_load(Path(CONFIG_PATH).with_name("pi05_droid.yaml").read_text())
+    model = Pi05Model(skip_weight_loading=True, **cfg["model_kwargs"])
+    assert model.model_path_hf == "lerobot/pi05_droid"
+    assert (model.config.action_horizon, model.config.num_cameras) == (15, 2)
+    # 7 joint positions + gripper for the state, 7 joint velocities + gripper for the actions
+    assert model.norm_stats.state.q01.numel() == model.norm_stats.state.q99.numel() == 8
+    assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8
