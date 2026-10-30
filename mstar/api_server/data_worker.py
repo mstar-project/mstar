@@ -210,10 +210,12 @@ class ResultQueue(queue.Queue):
     profile updates.
 
     A put doesn't wake that thread: ``flush`` signals ``wakeup`` once for
-    everything put since the last flush. The data worker thread flushes the
-    chunks after each item it takes, and an item is one step's output (a
-    RESULT_TOKENS frame, or a result tensor), so a step costs the message
-    thread one wake and one pass however many rows it had."""
+    everything put since the last flush. The data worker thread flushes after
+    each item it takes and after its reads. A RESULT_TOKENS frame is one item
+    whose chunks are put as it is taken, so a token step costs the message
+    thread two passes however many rows it had, one for the frame's arrival and
+    one for its chunks. A result tensor is one request's edge, and taking it
+    only starts a read, whose chunks go out with the flush after the reads."""
 
     def __init__(self, wakeup: EventWakeup):
         super().__init__()
