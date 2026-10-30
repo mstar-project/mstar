@@ -132,7 +132,8 @@ def _p(stats: dict | None, key: str):
 def repeat_stats(results: dict, family: str, input_seconds: list[float] | None = None,
                  output_len: int | None = None) -> dict:
     """The numbers one runner invocation contributes to a cell. With a fixed output length, tok/s
-    counts at most that many tokens per request (mstar sends one token past max_tokens)."""
+    counts at most that many tokens per request (mstar sends one token past max_tokens). ITL is there
+    only for streams with one token per chunk; a multi-token chunk's cost per token is TPOT."""
     agg = results.get("aggregate") or {}
     out = {"completed": results.get("completed"), "failed": results.get("failed"),
            "wall_s": results.get("wall_time_s"), "req_s": results.get("request_throughput"),
@@ -150,11 +151,16 @@ def repeat_stats(results: dict, family: str, input_seconds: list[float] | None =
         wall = results.get("wall_time_s")
         if output_len and per and wall:
             tok_s = sum(min(r.get("output_text_tokens") or 0, output_len) for r in per) / wall
+        chunks = sum((r.get("response_chunks") or {}).get("text", 0) for r in per)
         out.update(ttft_p50_s=_p(ttft, "p50"), ttft_p95_s=_p(ttft, "p95"), itl_p50_s=_p(itl, "p50"),
                    itl_p95_s=_p(itl, "p95"), tpot_p50_s=statistics.median(tpots) if tpots else None,
+                   chunk_gap_p50_s=_p(agg.get("text_chunk_gap_s"), "p50"),
+                   chunks_s=chunks / wall if chunks and wall else None,
+                   tokens_per_chunk=(agg.get("total_text_tokens") or 0) / chunks if chunks else None,
                    tok_s=tok_s, tok_s_raw=agg.get("text_token_throughput"), out_tokens=agg.get("total_text_tokens"),
                    out_tokens_per_req=(agg.get("total_text_tokens") or 0) / max(len(per), 1),
-                   in_tokens_per_req=(agg.get("total_input_tokens") or 0) / max(len(per), 1))
+                   in_tokens_per_req=(agg.get("total_input_tokens") or 0) / max(len(per), 1),
+                   tokens_unchecked=(agg.get("text_token_sources") or {}).get("unchecked", 0))
     elif family == "tts":
         ttfa = (agg.get("ttft_s") or {}).get("audio")
         out.update(ttfa_p50_s=_p(ttfa, "p50"), ttfa_p95_s=_p(ttfa, "p95"), rtf_p50=_p(agg.get("rtf"), "p50"),
@@ -399,6 +405,8 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
     flags = []
     if any((r.get("client_loop_frac") or 0) > CLIENT_BOUND_FRAC for r in last["repeats"]):
         flags.append("client-bound")
+    if any(r.get("tokens_unchecked") for r in last["repeats"]):
+        flags.append("tokens-unchecked")  # no usage from the server and no tokenizer: counted one per chunk
     if len(attempts) > 1:
         flags.append("rerun")
         if last["spread"] is not None and last["spread"] > plan.table.spread_limit:
