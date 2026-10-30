@@ -39,12 +39,12 @@ class RecurrentRows(RowState):
             index = [s.index if (s := h.get(label)) is not None else pad for h in held]
             rows.write(buf, d.join_slots, np.array(index, dtype=np.int32))
 
-    def write_taken(self, rows: StepRows, taken: Mapping[tuple, int]) -> None:
+    def write_taken(self, rows: StepRows, taken: Mapping[tuple, tuple[int, bool]]) -> None:
         """Slots admit took fresh for rows already held: ``taken`` is the pool's
-        (rid, label) -> slot record of them."""
+        (rid, label) -> (slot, kept) record of them."""
         joined = set(rows.diff.join_rids)
         order = set(rows.order)
-        for (rid, label), index in taken.items():
+        for (rid, label), (index, _kept) in taken.items():
             buf = self.slots.get(label)
             if buf is None or rid in joined or rid not in order:
                 continue
