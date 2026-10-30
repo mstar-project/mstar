@@ -790,7 +790,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.generation_kwargs.html">mstar.utils.generation_kwargs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.host_copy.html">mstar.utils.host_copy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
@@ -1031,7 +1030,6 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">TensorPointerInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.containers</span><span class="w"> </span><span class="kn">import</span> <span class="n">ParallelList</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.host_copy</span><span class="w"> </span><span class="kn">import</span> <span class="n">HostCopier</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1206,7 +1204,6 @@ window.runMermaid = runMermaid;</script>
         <span class="n">communicator</span><span class="p">:</span> <span class="n">BaseCommunicator</span><span class="p">,</span>
         <span class="n">shm_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">enable_prof</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-        <span class="n">copy_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
             <span class="n">my_entity_id</span><span class="o">=</span><span class="n">my_entity_id</span><span class="p">,</span> <span class="n">hostname</span><span class="o">=</span><span class="n">hostname</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
@@ -1214,9 +1211,6 @@ window.runMermaid = runMermaid;</script>
             <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar_rust</span><span class="w"> </span><span class="kn">import</span> <span class="n">SegmentedShmArena</span><span class="p">,</span> <span class="n">ShmArena</span>
-
-        <span class="c1"># A CPU consumer's reads (the API server's outputs) copy on these.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_host_copier</span> <span class="o">=</span> <span class="n">HostCopier</span><span class="p">(</span><span class="n">copy_workers</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_ShmArena</span> <span class="o">=</span> <span class="n">ShmArena</span>
         <span class="n">segment_mb</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SEGMENT_MB"</span><span class="p">,</span> <span class="s2">"256"</span><span class="p">))</span>
@@ -1968,11 +1962,10 @@ window.runMermaid = runMermaid;</script>
         <span class="n">view</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_view</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">shm_segment</span><span class="p">)</span>
         <span class="n">start</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">shm_offset</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span>  <span class="c1"># offset = TP-shard read offset</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">==</span> <span class="s2">"cpu"</span><span class="p">:</span>
-            <span class="c1"># A CPU consumer owns a copy past reclaim. clone() would split it</span>
-            <span class="c1"># over torch's intra-op pool, sized for small ops; the copier keeps</span>
-            <span class="c1"># an image one memcpy and slices a video over threads of its own.</span>
-            <span class="n">flat</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_host_copier</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span>
-                <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">view</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span> <span class="n">count</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">offset</span><span class="o">=</span><span class="n">start</span><span class="p">))</span>
+            <span class="c1"># A CPU consumer owns a copy past reclaim. numpy copies with one</span>
+            <span class="c1"># memcpy; clone() would split it over torch's intra-op pool.</span>
+            <span class="n">flat</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
+                <span class="n">view</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span> <span class="n">count</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">offset</span><span class="o">=</span><span class="n">start</span><span class="p">)</span><span class="o">.</span><span class="n">copy</span><span class="p">())</span>
             <span class="k">return</span> <span class="n">flat</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>
         <span class="n">flat</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
             <span class="n">view</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">start</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>

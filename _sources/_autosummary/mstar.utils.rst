@@ -44,7 +44,6 @@
    generation_kwargs
    h2d
    hf_snapshot
-   host_copy
    ipc_format
    knobs
    logging_config

@@ -790,7 +790,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.generation_kwargs.html">mstar.utils.generation_kwargs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.host_copy.html">mstar.utils.host_copy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
@@ -4031,8 +4030,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">metadata_server</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"P2PHANDSHAKE"</span><span class="p">,</span>
     <span class="n">tcp_transfer_device</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
     <span class="n">shm_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="n">enable_prof</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-    <span class="n">copy_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="n">enable_prof</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TensorCommunicationManager</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Select tensor transport backend based on protocol.</span>
 
@@ -4042,8 +4040,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``mstar_rust`` extension is missing); ``AUTO`` — the arena when the</span>
 <span class="sd">    extension imports, files otherwise. The flag must match across the</span>
 <span class="sd">    deployment: the arena location rides in the tensor descriptors, so a</span>
-<span class="sd">    file-transport consumer cannot read an arena producer. ``copy_workers``</span>
-<span class="sd">    is the width of the arena's CPU reads (``host_copy.HostCopier``).</span>
+<span class="sd">    file-transport consumer cannot read an arena producer.</span>
 <span class="sd">    """</span>
     <span class="k">if</span> <span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">SHM</span><span class="p">:</span>
         <span class="n">choice</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
@@ -4067,8 +4064,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
                     <span class="n">communicator</span><span class="o">=</span><span class="n">communicator</span><span class="p">,</span>
                     <span class="n">shm_dir</span><span class="o">=</span><span class="n">shm_dir</span><span class="p">,</span>
-                    <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span><span class="p">,</span>
-                    <span class="n">copy_workers</span><span class="o">=</span><span class="n">copy_workers</span><span class="p">,</span>
+                    <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span>
                 <span class="p">)</span>
         <span class="k">return</span> <span class="n">SharedMemoryCommunicationManager</span><span class="p">(</span>
             <span class="n">my_entity_id</span><span class="o">=</span><span class="n">my_entity_id</span><span class="p">,</span>
