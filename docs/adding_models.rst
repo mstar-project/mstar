@@ -1839,8 +1839,8 @@ node_name, graph_walk)``, called once at startup before capture:
 
 The engine refuses the walk at startup if any resource returns None (the
 default), if the walk has no batch cap to size the rows, or if the node is
-tensor- or sequence-parallel. A request holding a row can't be offloaded
-until it sits out a step of its walk.
+tensor- or sequence-parallel. Evicting a request that holds a row checks
+the row in first, so its resources offload the state the row held.
 
 Step 6 — Write a config YAML
 ----------------------------

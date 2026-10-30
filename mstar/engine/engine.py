@@ -2709,9 +2709,12 @@ class Engine:
             return 0
         node_rows = self._rows.get(node_name)
         if node_rows is not None and node_rows.holds_any((request_id,)):
-            # its state is in a row its walk's next step reads; a request
-            # that sits that step out is checked in, and evictable after
-            return 0
+            # Its state is in its row: check it in first, as a step of another
+            # walk does, so the resources offload what the row held. The
+            # worker evicts only after a refused admit, with no step of this
+            # node in flight on the gpu or plan thread, and on the stream the
+            # steps run on.
+            node_rows.check_in((request_id,))
         freed = sum(
             resource.offload(request_id)
             for resource in self._submodules[node_name].resources.values()
