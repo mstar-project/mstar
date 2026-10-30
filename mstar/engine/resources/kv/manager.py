@@ -2826,6 +2826,8 @@ class KVManager(AttentionResource):
                 return
             stream.stored_len = max(0, stream.stored_len + delta)
             stream.generation += 1
+            # the plan caches assume the stream moved by a commit
+            self._touch_plan_cache(rid)
             if delta < 0:
                 self._drop_sealed_tail(rid, label, stream)
             if _DEBUG_ASSERTS:
@@ -2834,7 +2836,9 @@ class KVManager(AttentionResource):
     def _drop_sealed_tail(self, rid: str, label: str, stream: CacheStream) -> None:
         """#279's rule for a rewind: the next write must not land on a sealed
         page its other owners still read. Pages from the write position on are
-        dropped, and the one the length ends inside is replaced by a copy."""
+        dropped, and the one the length ends inside is replaced by a copy. The
+        dropped pages leave through `_release` and the request is recounted, as
+        for any page a stream gives up."""
         page_size = self.config.page_size
         first = stream.stored_len // page_size
         tail = stream.page_indices[first:]
@@ -2849,10 +2853,11 @@ class KVManager(AttentionResource):
                     f"{rid}/{label} rewound into"
                 )
             self._arena.copy_pages(tail[:1], keep)
-        self._arena.release(tail)
         stream.page_indices[first:] = keep
+        self._release(rid, stream, tail)
         # its keys and cursor name pages this stream no longer holds
         stream.chain = None
+        self._recount(rid)
 
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams
