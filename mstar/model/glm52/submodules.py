@@ -200,15 +200,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             steps=steps,
         )
 
-    def max_step_tokens(self, graph_walk: str) -> int | None:
-        cap = self.config.prefill_max_step_tokens
-        if graph_walk != "prefill" or cap is None:
-            return None
-        if cap == "auto":
-            return max(self.config.prefill_batched_token_buckets
-                       or self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS)
-        return cap
-
     # ── capture configs ──
 
     def _moe_resolved_fused(self) -> bool:
