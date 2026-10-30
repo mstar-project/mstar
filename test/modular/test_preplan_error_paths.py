@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import sys
 from collections import defaultdict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures.thread import BrokenThreadPool
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -149,6 +150,33 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     with pytest.raises(RuntimeError):
         Worker._execute_on_gpu_thread(w, batch, node_batch, None)
     assert resets == []
+
+    # A plan that raised fails the step before prepare_inputs. It still releases
+    # the plan thread, and its launch event is set when it ends, or the admit
+    # fence on it would never lift.
+    released.clear()
+    failed_plan: Future = Future()
+    failed_plan.set_exception(RuntimeError("plan failed"))
+    with ThreadPoolExecutor(max_workers=1) as gpu:
+        future = Worker._submit_gpu_step(w, gpu, batch, node_batch, failed_plan)
+        with pytest.raises(RuntimeError, match="plan failed"):
+            future.result()
+    assert node_batch.launch_started_event.is_set()
+    assert released == [True]
+
+
+def test_a_step_the_executor_never_runs_still_lifts_the_fence() -> None:
+    """The admit fence waits on the launch event without a limit, so a step whose
+    future fails without ever running (a GPU thread whose initializer raised) must
+    still set it, or the main loop never reaches the ``future.result()`` that
+    raises the real error."""
+    w = _fake_worker()
+    node_batch = SimpleNamespace(node_name="dit", launch_started_event=None)
+    batch = SimpleNamespace(node_name="dit", graph_walk="decode")
+    with ThreadPoolExecutor(max_workers=1, initializer=_raiser(RuntimeError("init"))) as gpu:
+        future = Worker._submit_gpu_step(w, gpu, batch, node_batch, None)
+        assert isinstance(future.exception(), BrokenThreadPool)
+    assert node_batch.launch_started_event.is_set()
 
 
 def _exec_fake(runner, raise_with):
