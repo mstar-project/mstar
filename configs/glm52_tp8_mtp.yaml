@@ -13,8 +13,8 @@ model: "glm52"
 # CUDA graph.
 #
 # Limits: greedy only (requests asking for temperature > 0 or a repetition
-# penalty are refused per request), and short context, since MTP and
-# dsa_long_context are mutually exclusive.
+# penalty are refused per request), and contexts to index_topk (2048);
+# glm52_tp8_longctx_mtp.yaml serves MTP past it.
 max_seq_len: 2048
 dist_timeout_s: 7200
 tp_allreduce: "symm_multimem"

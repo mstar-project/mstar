@@ -18,11 +18,12 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, MTP_LEN, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -85,12 +86,17 @@ def _stubs(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-def _build_engine(k: int, seed: int = 0):
+def _build_engine(k: int, seed: int = 0, long_context: bool = False, max_seq_len: int | None = None,
+                  page_size: int | None = None):
     torch.manual_seed(seed)
-    cfg = Glm5NextModelConfig.reduced()
+    cfg = (Glm5NextModelConfig.reduced_long_context(**({"max_seq_len": max_seq_len} if max_seq_len else {}))
+           if long_context else Glm5NextModelConfig.reduced())
     cfg.mtp_num_draft_tokens = k
+    if long_context:
+        cfg.prefill_window_tokens = 48  # long prompts run in several windows
     model = Glm5NextModel("x", config_variant="reduced", kda_conv_dtype=torch.float32,
                           kda_max_requests=4, mtp_num_draft_tokens=k)
+    model.config = cfg
     lm = Glm5NextForCausalLM(cfg)
     # the trunk's parameters come first, so both engines draw the same trunk (building
     # the MTP layer draws from the generator too, hence the reseed)
@@ -102,8 +108,13 @@ def _build_engine(k: int, seed: int = 0):
     lm.eval()
     sub = Glm5NextLLMSubmodule(lm, cfg)
     engine = Engine(None)  # no offload, so no runtime
+    specs = model.get_node_resources()
+    if page_size is not None:
+        for spec in specs:
+            if spec.resource_key == KV_CACHE:
+                spec.config.page_size = page_size
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, specs,
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -238,7 +249,14 @@ def _oracle(sub, reference, wrong_every: int | None):
             nxt.append(at(rid, done[rid] + accepted + 1))
         return emit(rids, nxt, fresh=True)
 
+    real_windows = sub._prefill_windows
+
+    def windows(engine_inputs, *args):  # dsa_long_context's eager prefill
+        where.update(rids=list(engine_inputs.request_ids), row=None)
+        return real_windows(engine_inputs, *args)
+
     sub._mtp_prefill, sub._mtp_decode, sub._draft_tokens = prefill, decode, draft
+    sub._prefill_windows = windows
 
 
 def test_reference_depends_on_context(reference):
@@ -313,7 +331,8 @@ def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=
     state.add("prompt_len", prompt_len)
     sub = types.SimpleNamespace(
         request_state=lambda rid: state, mtp_block=k + 1,
-        config=types.SimpleNamespace(eos_token_ids=(), index_topk=index_topk, kv_rows=kv_rows),
+        config=types.SimpleNamespace(eos_token_ids=(), context_limit=index_topk, kv_rows=kv_rows,
+                                     mtp_trims=False),
     )
     sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
 
@@ -452,7 +471,8 @@ def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
     state.add("prompt_len", 16)
     sub = types.SimpleNamespace(
         request_state=lambda rid: state, mtp_block=4,
-        config=types.SimpleNamespace(eos_token_ids=(), index_topk=2048, kv_rows=4096),
+        config=types.SimpleNamespace(eos_token_ids=(), context_limit=2048, kv_rows=4096,
+                                     mtp_trims=False),
     )
     sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
 
@@ -467,6 +487,132 @@ def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
     state.add("mtp_generated", 9)  # and the second
     assert not check("decode", 0, 4)
     assert check("decode", 1, 4)
+
+
+# -- dsa_long_context: verify steps trim their rejected rows ---------------------------------
+
+LONG_PROMPTS = {"a": (torch.arange(100) * 37 + 11) % 240, "b": (torch.arange(75) * 53 + 5) % 240}
+LONG_MAX_TOKENS = 30
+
+
+def _generate_long(engine, sub, prompts, max_tokens):
+    """``_generate`` with the cache checked after each step: the host's cache counts every
+    verify step's whole block, whatever it accepted (so it moves the same on every rank), and
+    the device's length is the rows of the input and the accepted drafts, nothing else (the
+    token after them is the next input)."""
+    kv, pool = engine._resources[KV_CACHE], engine._resources[KDA_STATE]
+    rows = {rid: len(ids) for rid, ids in prompts.items()}
+    host = dict(rows)
+    for rid in prompts:
+        engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, stops = _step(engine, "prefill", prompts, max_tokens)
+    seqs = {rid: out[rid]["new_token"][0].tolist() for rid in prompts}
+    nxt = {rid: out[rid]["text_inputs"][0] for rid in prompts}
+    live = [rid for rid in prompts if not stops.get(rid)]
+    step = 0
+    while live:
+        out, stops = _step(engine, "decode", {rid: nxt[rid] for rid in live}, max_tokens, step)
+        step += 1
+        for rid in live:
+            seqs[rid] += out[rid]["new_token"][0].tolist()
+            nxt[rid] = out[rid]["text_inputs"][0]
+            if sub.mtp_k:
+                rows[rid] += sub._read_verdicts([rid])[0][1] + 1
+                host[rid] += sub.mtp_block
+                assert kv._streams[rid]["main"].stored_len == host[rid], (rid, step)
+                assert sub.request_state(rid).get("context") == host[rid], (rid, step)
+                slot = pool._slots[rid]["main"].index
+                assert int(pool.block(MTP_LEN)[slot, 0]) == rows[rid], (rid, step)
+        live = [rid for rid in live if not stops.get(rid)]
+    for rid in prompts:
+        engine.remove_request(rid)
+    return seqs
+
+
+@pytest.fixture
+def long_reference():
+    engine, sub, _ = _build_engine(0, long_context=True)
+    return _generate_long(engine, sub, dict(LONG_PROMPTS), LONG_MAX_TOKENS)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
+def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, drafts):
+    """Prompts past index_topk, prefilled in windows: drafting on gives greedy's tokens,
+    whatever the drafts, and each verify step's rejected rows leave the cache."""
+    assert all(len(v) == LONG_MAX_TOKENS for v in long_reference.values()), long_reference
+    engine, sub, cfg = _build_engine(k, long_context=True)
+    assert cfg.mtp_trims and min(map(len, LONG_PROMPTS.values())) > cfg.index_topk
+    if drafts != "mtp":
+        _oracle(sub, long_reference, wrong_every=3 if drafts == "oracle_partial" else None)
+    got = _generate_long(engine, sub, dict(LONG_PROMPTS), LONG_MAX_TOKENS)
+    assert got == long_reference
+
+
+# hundreds of index pools against the 16 a query selects, on 16-token pages
+REAL_PROMPTS = {"a": (torch.arange(700) * 37 + 11) % 240, "b": (torch.arange(450) * 53 + 5) % 240}
+REAL_MAX_TOKENS = 120
+
+
+@pytest.mark.parametrize("drafts", ["mtp", "oracle_partial"])
+def test_long_context_mtp_at_a_real_geometry(drafts):
+    """The same parity where the trims bookkeeping can drift: ~175 pools against the 16
+    selected, 16-token pages, and after 120 tokens the host's rows several pages past the
+    device's. Greedy's tokens, and every step's host rows, context and MTP_LEN checked."""
+    geometry = {"long_context": True, "max_seq_len": 2048, "page_size": 16}
+    engine, sub, _ = _build_engine(0, **geometry)
+    reference = _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS)
+    assert all(len(v) == REAL_MAX_TOKENS for v in reference.values()), reference
+    engine, sub, cfg = _build_engine(3, **geometry)
+    assert cfg.mtp_trims and min(map(len, REAL_PROMPTS.values())) > 4 * cfg.index_topk
+    if drafts != "mtp":
+        _oracle(sub, reference, wrong_every=2)
+    assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference
+
+
+def test_long_context_mtp_layer_selects_with_its_own_indexer():
+    """Under dsa_long_context the MTP layer keeps an index plane, as a trunk layer does, and
+    the prompt's MTP pass writes every prompt row's key there: its drafts select over the whole
+    context, not over its last index_topk tokens."""
+    engine, sub, cfg = _build_engine(2, long_context=True)
+    attn = sub.language_model.mtp.transformer_layer.self_attn
+    assert attn.index_plane == attn.kv_plane
+    assert cfg.index_planes.num_layers == cfg.num_kv_planes
+    prompt = {"a": LONG_PROMPTS["a"]}
+    engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    _step(engine, "prefill", prompt, LONG_MAX_TOKENS)
+    kv = engine._resources[KV_CACHE]
+    pages, size = kv._streams["a"]["main"].page_indices, kv.kv_cache.page_size
+    plane, d = kv.aux_view(INDEX_PLANES, attn.index_plane), cfg.index_head_dim
+    keys = torch.stack([plane[pages[p // size], p % size, :d] for p in range(len(prompt["a"]))])
+    assert bool(keys.abs().sum(-1).gt(0).all())
+    engine.remove_request("a")
+
+
+def test_long_context_decode_stops_while_the_next_block_fits():
+    """Under trims the host counts every verify step's whole block against kv_rows (here
+    max_seq_len): decode stops while the step that may already be scheduled still fits, and
+    that step runs."""
+    k = 3
+    engine, sub, cfg = _build_engine(k, long_context=True)
+    block, limit = k + 1, cfg.max_seq_len
+    assert cfg.mtp_trims and cfg.kv_rows == cfg.context_limit == limit
+    prompt = (torch.arange(limit - 2 * block - 9) * 37 + 11) % 240
+    engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, stops = _step(engine, "prefill", {"r": prompt}, 10 * limit, ignore_eos=True)
+    step = 0
+    while not stops.get("r"):
+        out, stops = _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit,
+                           step, ignore_eos=True)
+        step += 1
+    rows = len(prompt) + step * block
+    assert rows + block <= limit < rows + 2 * block
+    _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit, step,
+          ignore_eos=True)
+    assert sub.request_state("r").get("context") <= limit
+    pool = engine._resources[KDA_STATE]
+    assert int(pool.block(MTP_LEN)[pool._slots["r"]["main"].index, 0]) <= limit
+    engine.remove_request("r")
 
 
 # -- a stop on the prefill walk -----------------------------------------------

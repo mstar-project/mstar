@@ -46,6 +46,7 @@ from mstar.model.glm5_next.config import (
     KV_CACHE,
     MTP_DRAFT,
     MTP_HIDDEN,
+    MTP_LEN,
     SAMPLER,
     Glm5NextModelConfig,
 )
@@ -201,6 +202,11 @@ class Glm5NextModel(Model):
                 shape=(self.config.hidden_size,), dtype=self.kda_conv_dtype, per_layer=False,
             )
             kda_blocks[MTP_DRAFT] = RecurrentBlockConfig(
+                shape=(1,), dtype=torch.long, per_layer=False,
+            )
+        if self.config.mtp_trims:
+            # each request's tokens in cache, which every verify step advances on device
+            kda_blocks[MTP_LEN] = RecurrentBlockConfig(
                 shape=(1,), dtype=torch.long, per_layer=False,
             )
         specs = [

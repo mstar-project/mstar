@@ -284,6 +284,8 @@ class MLAAttention(nn.Module):
         ``position_ids (N,)``. The step plans ``block`` causal queries per request; the other
         rows attend with zero queries and write back ``rows``, this step's cache rows so far
         (rows past ``row`` are overwritten before a query reads them). Returns ``(N, hidden)``.
+        A model's sparse attention selects the block's rows in ``_select_block`` and attends them
+        through ``_attend_selected``.
         """
         n, h = hidden_states.shape[0], self.num_heads
         if not self.mla_absorb:
@@ -301,7 +303,8 @@ class MLAAttention(nn.Module):
         else:
             q_c, kv_a, k_pe = fused.split(
                 [self.q_a_proj.out_features, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            q = self.q_b_proj(self.q_a_layernorm(q_c.contiguous())).view(n, h, self.qk_head_dim)
+            q_c = self.q_a_layernorm(q_c.contiguous())
+            q = self.q_b_proj(q_c).view(n, h, self.qk_head_dim)
             q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             kv_c = self.kv_a_layernorm(kv_a.clone(memory_format=torch.contiguous_format))
             q_pe, k_pe = self._rope(position_ids, q_pe, k_pe.reshape(n, 1, self.qk_rope_head_dim))
@@ -312,9 +315,13 @@ class MLAAttention(nn.Module):
         latents[:, row] = latent
         q_nope_all = q_nope.new_zeros(n, block, h, self.kv_lora_rank)
         q_nope_all[:, row] = torch.einsum("thd,hdl->thl", q_nope, self.w_kc)
-        attn = self._write_and_attend(
-            q_nope_all.view(n * block, h, -1), latents.view(n * block, -1), None,
-            q_pe=q_pe_all.view(n * block, h, -1))
+        q_nope_all, q_pe_all = q_nope_all.view(n * block, h, -1), q_pe_all.view(n * block, h, -1)
+        selection = self._select_block(hidden_states, q_c, position_ids, row, rows)
+        if selection is None:
+            attn = self._write_and_attend(
+                q_nope_all, latents.view(n * block, -1), None, q_pe=q_pe_all)
+        else:
+            attn = self._attend_selected(selection, q_nope_all, q_pe_all, latents.view(n * block, -1))
         out = self._out(attn.view(n, block, h, -1)[:, row])
         return self.o_proj(out)
 
@@ -441,6 +448,11 @@ class MLAAttention(nn.Module):
         ``_attends_written`` either way)."""
         del sparse
         return False
+
+    def _select_block(self, hidden_states, q_c, position_ids, row, rows) -> torch.Tensor | None:
+        """``_select`` for ``forward_block_row``'s block (``rows`` its rows so far), or None."""
+        del hidden_states, q_c, position_ids, row, rows
+        return None
 
     def _select(self, hidden_states, q_c, position_ids, **sparse) -> torch.Tensor | None:
         """The rows each query attends, or None for every cached row (the default)."""

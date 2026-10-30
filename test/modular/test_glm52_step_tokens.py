@@ -17,15 +17,17 @@ def _submodule(config) -> Glm52LLMSubmodule:
     return sub
 
 
-def test_longctx_config_window_fits_its_pages():
-    """The long-context yaml builds the DSA path, and its cache (the latents and, on the same
+@pytest.mark.parametrize("name", ["glm52_tp8_longctx.yaml", "glm52_tp8_longctx_mtp.yaml"])
+def test_longctx_config_window_fits_its_pages(name):
+    """The long-context yamls build the DSA path, and their cache (the latents and, on the same
     pages, the index keys) holds a full window."""
     import yaml
 
-    path = Path(__file__).resolve().parents[2] / "configs" / "glm52_tp8_longctx.yaml"
+    path = Path(__file__).resolve().parents[2] / "configs" / name
     cfg = yaml.safe_load(path.read_text())
     model = Glm52Model("", tokenizer_mode="byte", config_variant="full", **cfg["model_kwargs"])
     assert model.config.dsa_long_context
+    assert model.config.mtp_num_draft_tokens == (3 if "mtp" in name else 0)
     assert model.config.dsa_shard_prefill
     # every captured prefill bucket runs in one pass, never in row chunks
     assert max(cfg["model_kwargs"]["prefill_batched_token_buckets"]) <= model.config.prefill_chunk_tokens

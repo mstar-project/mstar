@@ -120,8 +120,14 @@ class SparseGraphPlan:
         self._planned = torch.cuda.Event()
         self._planned.record()
 
-    def attend(self, q_nope, q_pe, latent, slots) -> torch.Tensor:
+    def attend(self, q_nope, q_pe, latent, slots, valid: torch.Tensor | None = None,
+               pad_slot: int | None = None) -> torch.Tensor:
+        """``valid`` (device, per row): a plan made for longer rows than the step has; each
+        row's slots past its own length go to ``pad_slot``, a row the caller masks."""
         # the plan's offsets and lengths are in the wrapper's device buffers by now
+        if valid is not None:
+            j = torch.arange(slots.shape[1], dtype=valid.dtype, device=slots.device)
+            slots = torch.where(j < valid[:, None], slots, pad_slot)
         _pack(self.indices, slots, self._kv, self._lens)
         return self.wrapper.run(*_split(q_nope, q_pe, latent))
 
