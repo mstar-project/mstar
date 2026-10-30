@@ -172,10 +172,10 @@ class CommGroup:
         Collective: every member calls it at load, in the same order with the
         same arguments. The lockstep nodes of an instance share its group, so
         it keeps one workspace per ``(dtype, hidden)``; a larger ``max_tokens``
-        builds a larger one, and the smaller stays alive for any forward that
-        holds its id. Each is a few ``max_tokens x hidden`` buffers per rank,
-        allocated outside torch's allocator. Other inputs take NCCL all-reduce
-        and a separate norm.
+        replaces it with a larger one, leaving the smaller allocated but unused.
+        Each is a few ``max_tokens x hidden`` buffers per rank, allocated
+        outside torch's allocator. Other inputs take NCCL all-reduce and a
+        separate norm.
         """
         if self.world_size == 1:
             return False

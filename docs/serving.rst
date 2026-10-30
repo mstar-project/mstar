@@ -467,7 +467,7 @@ details.
 Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
 groups, each listed in the model's ``tp_enabled_nodes`` (or ``sp_enabled_nodes``). The ranks
 then run every node's steps in one order. The conductor refuses lockstep nodes on one worker
-in different TP or SP groups, and two lockstep nodes on one worker that share a KV resource:
+in different TP or SP groups, and two lockstep nodes on one worker that share a paged KV cache:
 rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
 per node, riding on one node's next step, so two nodes on one pool could admit out of step on
 a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on

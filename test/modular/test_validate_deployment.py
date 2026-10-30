@@ -25,7 +25,7 @@ from test_startup_graph_validation import (
 
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.resources.base import EngineResourceInfo, Resource, build_resource
+from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
@@ -373,26 +373,8 @@ def test_lockstep_nodes_sharing_one_instance_are_accepted(groups, tmp_path, monk
     _start_conductor(model, _cfg(tmp_path, groups), tmp_path, monkeypatch)
 
 
-@pytest.mark.parametrize("offload", [0, 4])
-def test_lockstep_nodes_sharing_a_kv_resource_are_refused(offload, tmp_path):
-    """Rank 0's page moves on a pool reach the followers per node, riding on
-    one node's next step, so two lockstep nodes over one pool could admit out
-    of step. The layout is refused at any offload setting until rank 0
-    journals a shared pool in one stream."""
-    model = _Model(
-        _a_then_b, specs=[_kv("kv", ["a", "b"])], kv_labels={"kv": {"main": KVLabel()}}, tp_enabled_nodes=["a", "b"],
-    )
-    cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources={"kv": {"cpu_offload_pages": offload}})
-    [problem] = _problems(model, cfg)
-    assert problem.startswith("Resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_0, worker_1;")
-
-
 class _Trail(_Stub):
-    """A resource whose page trail the followers check against rank 0's."""
-
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
+    """Keeps a page trail the followers check against rank 0's, and nothing else."""
 
     def page_trail(self):
         return (0, 0)
@@ -404,12 +386,21 @@ class _TrailSpec(_Spec):
         return _Trail
 
 
-def test_a_resource_rank_0_decides_for_followers_needs_a_spec_that_says_so():
-    """Validation refuses lockstep nodes sharing a resource only by its spec's
-    journals_resident_moves, so a resource rank 0 decides for its followers
-    can't be built from a spec that leaves it False."""
-    with pytest.raises(ValueError, match="_TrailSpec.journals_resident_moves is False"):
-        build_resource(_TrailSpec("trail", {"a"}), EngineResourceInfo(device="cpu"))
+@pytest.mark.parametrize("spec, resources", [
+    (_kv("kv", ["a", "b"]), {"kv": {"cpu_offload_pages": 0}}),
+    (_kv("kv", ["a", "b"]), {"kv": {"cpu_offload_pages": 4}}),
+    (_TrailSpec("kv", {"a", "b"}), {}),
+], ids=["kv_offload_off", "kv_offload_on", "page_trail_only"])
+def test_lockstep_nodes_sharing_a_journaled_resource_are_refused(spec, resources, tmp_path):
+    """Rank 0's decisions on a resource (page moves, prefix leases, page
+    trails) reach the followers per node, riding on one node's next step, so
+    two lockstep nodes over one resource could admit out of step. Refused at
+    any offload setting until rank 0 journals a shared resource in one stream."""
+    labels = {"kv": {"main": KVLabel()}} if isinstance(spec, KVSpec) else None
+    model = _Model(_a_then_b, specs=[spec], kv_labels=labels, tp_enabled_nodes=["a", "b"])
+    cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources=resources)
+    [problem] = _problems(model, cfg)
+    assert problem.startswith("Resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_0, worker_1;")
 
 
 @pytest.mark.parametrize("b, placed", [

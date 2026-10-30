@@ -203,6 +203,15 @@ class Resource(ABC):
         order, for a TP follower to check against rank 0's. None where it keeps no trail."""
         return None
 
+    @classmethod
+    def journals_resident_moves(cls) -> bool:
+        """Whether rank 0 decides this resource's state for the other ranks of a lockstep
+        instance outside the step that uses it (eviction, prefix leases, page trails). They
+        replay each decision with the next step of the node it was journaled under, so
+        validation refuses lockstep nodes on one worker sharing such a resource."""
+        return any(getattr(cls, hook) is not getattr(Resource, hook)
+                   for hook in ("supports_eviction", "lease_cached_prefix", "page_trail"))
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 
@@ -517,19 +526,5 @@ class PublishedInfo(ABC):
         ...
 
 
-# State rank 0 decides for its lockstep followers outside the step that uses it
-_JOURNALED = ("supports_eviction", "lease_cached_prefix", "page_trail")
-
-
 def build_resource(spec: NodeResourceSpec, info: EngineResourceInfo) -> Resource:
-    resource = spec.resource_class.build(spec, info)
-    if not spec.journals_resident_moves:
-        hooks = [h for h in _JOURNALED if getattr(type(resource), h) is not getattr(Resource, h)]
-        if hooks:
-            raise ValueError(
-                f"{type(resource).__name__} ({spec.resource_key}) implements {hooks}, which the "
-                f"other ranks of a lockstep instance replay from rank 0, but "
-                f"{type(spec).__name__}.journals_resident_moves is False. Set it, so that "
-                "validation refuses lockstep nodes sharing the resource."
-            )
-    return resource
+    return spec.resource_class.build(spec, info)

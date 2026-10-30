@@ -404,7 +404,7 @@ def _worker_parallelism(
                 node for node in local
                 if per_worker[wid].get_instance_world_size_for_node(node) > 1
             ))
-            if spec.journals_resident_moves and len(lockstep) > 1:
+            if len(lockstep) > 1 and spec.resource_class.journals_resident_moves():
                 shared.setdefault(lockstep, []).append(wid)
         # Rank 0's resident journal is per node, so a move on a shared pool reaches a
         # follower only with one node's next step. Separate pools are safe: each
