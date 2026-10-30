@@ -27,7 +27,9 @@ VARIANTS = {
 # talker.* minus code_predictor.*  |  code_predictor.*  |  speech_tokenizer decoder.*
 TALKER_PARAMS = 1_741_550_592
 CODE_PREDICTOR_PARAMS = 175_125_760
-CODEC_PARAMS = 114_323_137
+# the checkpoint's 114,323,137 less the SnakeBeta alpha/beta (23,232), which load
+# into FusedSnakeBeta's buffers
+CODEC_PARAMS = 114_299_905
 
 
 def _find_cached_snapshot(repo: str) -> Path | None:
