@@ -51,7 +51,7 @@ class _Model:
     def get_node_resources(self):
         return []
 
-    def prefix_key_streams(self):
+    def kv_labels(self):
         return {}
 
     def get_graph_walk_graphs(self):
@@ -71,7 +71,7 @@ def _build(model) -> EngineManager:
     return EngineManager.build(
         node_names=set(_NODES),
         device=torch.device("cpu"),
-        model_config={},
+        model_config={"node_groups": [{"node_names": sorted(_NODES), "ranks": [0]}]},
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         transfer_engine_info=TransferEngineInfo(
             my_entity_id="test", my_session_id="test", transfer_engine=None,
