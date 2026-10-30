@@ -34,6 +34,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -99,7 +100,7 @@ def _worker(is_tp_follower=False) -> Worker:
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w._my_consumer_connections = []
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._draining_rids = set()
     w._pending_drains = set()
     w._reads_done_sent = set()

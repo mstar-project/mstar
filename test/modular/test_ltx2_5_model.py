@@ -320,7 +320,7 @@ def test_postprocess_audio_is_interleaved_pcm16():
 
 
 def test_postprocess_video_is_an_mp4():
-    frames = torch.randint(0, 255, (3, 9, 64, 64), dtype=torch.uint8)
+    frames = torch.randint(0, 255, (9, 64, 64, 3), dtype=torch.uint8)
     data = _make_model().postprocess(frames, "video", {"fps": 24})
     assert data[4:8] == b"ftyp"
 
