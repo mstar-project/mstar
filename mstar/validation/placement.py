@@ -408,12 +408,13 @@ def _worker_parallelism(
                 shared.setdefault(lockstep, []).append(wid)
         # Rank 0's resident journal is per node, so a move on a shared pool reaches a
         # follower only with one node's next step. Separate pools are safe: each
-        # node's moves ride on its own next step. Refused at any offload setting
-        # until rank 0 journals a shared pool's moves in one stream.
+        # node's moves ride on its own next step. Refused with offload off too, since
+        # prefix hits and page trails also ride a node's own head, until rank 0
+        # journals a shared pool's moves in one stream.
         for lockstep, wids in shared.items():
             yield (
                 f"Resource {spec.resource_key} is shared by lockstep-parallel nodes "
-                f"{list(lockstep)} on {', '.join(wids)}; rank 0 replays its moves on the pool "
-                "to the other ranks per node, so a shared pool can admit out of step. "
+                f"{list(lockstep)} on {', '.join(wids)}; the other ranks replay rank 0's moves on the pool "
+                "per node, so a shared pool can admit out of step. "
                 "Place these nodes on different workers."
             )

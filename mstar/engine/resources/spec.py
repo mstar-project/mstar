@@ -58,9 +58,11 @@ class NodeResourceSpec(ABC):
 
     @property
     def journals_resident_moves(self) -> bool:
-        """Under TP, rank 0 moves this resource's state outside a step (a host
-        offload or reload) and the followers replay the move with the next step
-        of the node it was journaled under, so lockstep nodes must not share it."""
+        """Under TP, rank 0 decides this resource's state for its followers
+        outside the step that uses it (offload, reload, prefix leases), and they
+        replay each decision with the next step of the node it was journaled
+        under, so lockstep nodes must not share it. Set it on the spec of any
+        resource with ``supports_eviction``."""
         return False
 
     @property
