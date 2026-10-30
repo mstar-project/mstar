@@ -68,6 +68,7 @@ def check_placement(model: Model, config: Mapping[str, Any]) -> list[str]:
         *_walk_partitions(model, walk_graphs),
         *_node_placement(walk_graphs, node_groups),
         *_chunkable_nodes_are_looped(model, walk_graphs),
+        *_chunked_streams(model, walk_graphs),
     ]
 
 
@@ -117,6 +118,63 @@ def _chunkable_nodes_are_looped(
                 f"walk's graph has no Loop {name!r} around it; return "
                 "apply_chunking(...) from get_graph_walk_graphs()"
             )
+
+
+def _chunked_streams(
+    model: Model, walk_graphs: Mapping[str, GraphSection],
+) -> Iterator[str]:
+    """A chunked node's stream that its consumer would misread.
+
+    A ``per_chunk_outputs`` edge sends each chunk's piece as an item of its
+    own, so its consumer has to allow partial input. A gathered stream sends
+    every piece at once, which the consumer reads as one item only if the
+    connection joins them (``join_dim``) or it takes pieces anyway. A
+    consumer's ChunkPolicy counts items, so either mistake hands it the first
+    chunk as the whole input rather than failing.
+    """
+    from mstar.model.submodule_base import chunk_loop_name
+
+    connections = {
+        (conn.edge_name, conn.to_partition): conn
+        for conn in model.get_partition_topology().connections
+    }
+    for (node, walk), policy in model.chunking_policy_of().items():
+        if not policy.chunkable:
+            continue
+        loop = walk_graphs[walk].get_loops().get(chunk_loop_name(node, walk))
+        if loop is None:
+            continue  # _chunkable_nodes_are_looped reports it
+        where = f"node {node!r} in walk {walk!r}"
+        per_chunk = {e.name: e for e in loop.section.outputs if e.name in policy.per_chunk_outputs}
+        for name in sorted(policy.per_chunk_outputs - per_chunk.keys()):
+            yield f"{where} names per-chunk output {name!r}, which is not one of its outputs"
+        for edge in per_chunk.values():
+            if not edge.is_streaming:
+                yield (
+                    f"{where} sends {edge.name!r} per chunk, but it is not a streaming edge; "
+                    "only a streaming consumer can take a prompt's chunks one at a time"
+                )
+                continue
+            conn = connections.get((edge.name, getattr(edge, "target_partition", "")))
+            if conn is not None and not conn.chunk_policy_factory().allow_partial_input():
+                yield (
+                    f"{where} sends {edge.name!r} per chunk, but its consumer in partition "
+                    f"{conn.to_partition!r} does not allow partial input; set it "
+                    "(FixedChunkPolicy(allow_partial=True)), or gather the edge "
+                    "(accumulated_outputs) and join it (Connection.join_dim)"
+                )
+        for edge in loop.accumulated_outputs:
+            if not edge.is_streaming:
+                continue
+            conn = connections.get((edge.name, getattr(edge, "target_partition", "")))
+            if conn is not None and conn.join_dim is None \
+                    and not conn.chunk_policy_factory().allow_partial_input():
+                yield (
+                    f"{where} gathers stream {edge.name!r}, whose consumer in partition "
+                    f"{conn.to_partition!r} would read each chunk's piece as an item of "
+                    "its own; join them (Connection.join_dim), or send it per chunk "
+                    "(per_chunk_outputs) into a consumer that allows partial input"
+                )
 
 
 def _describe(wg: WorkerGraph) -> str:

@@ -1142,7 +1142,10 @@ chunk is one iteration of a Loop around the node. To opt a walk in:
   - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries
     chunked rows sets one too, since its steps run under it.
   - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
-    one item per chunk. Any other edge carries the final chunk's output alone.
+    one item per chunk, all when the prompt finishes.
+  - ``per_chunk_outputs``: streaming edges sent on every chunk as it runs, for a consumer
+    that can start on a prefix. Any edge in neither set carries the final chunk's output
+    alone.
   - ``reuses_cached_prefix``: a callable saying whether a row may start past its cached
     prefix; ``None`` (the default) is always. Set it where a row may have to write its
     prefix again.
@@ -1153,8 +1156,11 @@ chunk is one iteration of a Loop around the node. To opt a walk in:
 
   A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
   (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
-  joins the pieces into that item. Leave it unset for a consumer that can take the
-  pieces as they come.
+  joins the pieces into that item. A consumer that can take the pieces as they come says
+  so with ``ChunkPolicy.allow_partial_input`` (``FixedChunkPolicy(allow_partial=True)``),
+  and the producer then sends the edge per chunk, as Qwen3-Omni's Thinker does into its
+  Talker. A chunked stream its consumer would misread, each piece taken for the whole
+  input, is refused at startup.
 - ``get_input_sequence_len(graph_walk, fwd_info, inputs)`` gives a row's length from its
   input shapes, before ``prepare_inputs`` runs. The scheduler cuts the row by it, and a
   row whose prepared input turns out another length fails.

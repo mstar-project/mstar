@@ -1191,8 +1191,15 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 selected = torch.where(
                     multimodal_mask.unsqueeze(-1), layer_n, layer_0,
                 )                              # (seq_len, hidden)
-                outputs["thinker_states"] = [selected[inclusion_mask]]
-                outputs["thinker_mask"] = [multimodal_mask[inclusion_mask]]
+                kept = selected[inclusion_mask]
+                if kept.shape[0]:
+                    outputs["thinker_states"] = [kept]
+                    outputs["thinker_mask"] = [multimodal_mask[inclusion_mask]]
+                else:
+                    # A chunk of only system prompt or earlier turns gives the
+                    # Talker nothing to write; unsent, it runs no empty prefill.
+                    outputs.pop("thinker_states")
+                    outputs.pop("thinker_mask")
 
         if "new_token" not in outputs:
             return
@@ -1415,9 +1422,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
 
         if graph_walk == "talker_prefill":
-            # One item, whether or not the Thinker's prefill was chunked: its
-            # per-chunk pieces are joined on arrival by the StreamBuffer
-            # (Connection.join_dim), so the Talker sees what it always did.
+            # The Thinker's walk, or one chunk of it when its prefill is chunked
             selected_hidden = inputs["thinker_states"][0].to(device)
             multimodal_mask = inputs["thinker_mask"][0]
             input_embeds = self._get_talker_embeds(
