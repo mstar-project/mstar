@@ -237,6 +237,8 @@ class MicroScheduler:
         )
         self._max_bs: dict[tuple[str, str], int | None] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
+        # (node, walk) -> whether its cap can move between passes
+        self._cap_varies: dict[tuple[str, str], bool] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
         self.batch_builder = make_batch_builder(batch_builder_type)
         self.batch_number = 0
@@ -1240,14 +1242,16 @@ class MicroScheduler:
     def _walk_caps(self, key: tuple[str, str]) -> dict[str, int | None]:
         """``BatchBuildRequest.walk_caps`` for ``key``: its walk's cap, or a
         combined key's walks' caps and its own under its label, each lowered
-        by any limit from a refused admit. The engine's caps are cached; the
-        limits come and go, so they are applied on every call."""
+        by any limit from a refused admit. The engine's caps are cached unless
+        one varies (see `_engine_cap`); the limits come and go, so they are
+        applied on every call."""
         caps = self._walk_caps_of_key.get(key)
         if caps is None:
             walks = self._walks_of_key.get(key, ())
             caps = {walk: self._engine_cap(key[0], walk) for walk in walks}
             caps[key[1]] = self._engine_cap(*key)
-            self._walk_caps_of_key[key] = caps
+            if not any(self._varies(key[0], walk) for walk in caps):
+                self._walk_caps_of_key[key] = caps
         if not self.batch_limits and not self.batch_ceilings:
             return caps
         return {walk: self._limited(key[0], walk, cap) for walk, cap in caps.items()}
@@ -1274,13 +1278,24 @@ class MicroScheduler:
     def _engine_cap(self, node_name: str, graph_walk: str) -> int | None:
         """The engine's cap for this (node, walk), if it has one. A combined
         walk's cap is the model's to declare, via its captures or max_batch_size.
-        Fixed once the graphs are captured, so asked once."""
+        Fixed once the graphs are captured, so asked once, unless the submodule
+        says it follows free state (``NodeSubmodule.batch_cap_varies``): that one
+        is asked every pass, since a stale cap overfills the step."""
         key = (node_name, graph_walk)
-        if key not in self._max_bs:
-            self._max_bs[key] = self.engine_manager.get_engine(node_name).get_max_batch_size(
-                node_name, graph_walk
-            )
-        return self._max_bs[key]
+        if key in self._max_bs:
+            return self._max_bs[key]
+        cap = self.engine_manager.get_engine(node_name).get_max_batch_size(node_name, graph_walk)
+        if not self._varies(node_name, graph_walk):
+            self._max_bs[key] = cap
+        return cap
+
+    def _varies(self, node_name: str, graph_walk: str) -> bool:
+        key = (node_name, graph_walk)
+        varies = self._cap_varies.get(key)
+        if varies is None:
+            engine = self.engine_manager.get_engine(node_name)
+            varies = self._cap_varies[key] = engine.batch_cap_varies(node_name, graph_walk)
+        return varies
 
     def _limited(self, node_name: str, graph_walk: str, cap: int | None) -> int | None:
         """``cap`` lowered by any limit or cap from a refused admit (see

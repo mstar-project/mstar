@@ -56,6 +56,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Zero-shot voice-cloning TTS: Qwen2-0.5B speech-token LM with RAS sampling,
        DiT flow-matching decoder and causal HiFT vocoder, streamed in chunks.
        Clones from a preset or an uploaded clip. 24 kHz.
+   * - ``glm5_next``
+     - ``zai-org/GLM-5.3-Flash``
+     - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
+       LM, text in / text out, fp8 checkpoint, TP8.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet

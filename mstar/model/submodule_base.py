@@ -902,6 +902,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def batch_cap_varies(self, graph_walk: str) -> bool:
+        """Whether ``max_batch_size(graph_walk)`` follows state that changes while
+        serving (free slots, say). The scheduler asks such a cap every pass and
+        caches every other one, so a cap that moves must say so here."""
+        del graph_walk
+        return False
+
     def max_rows_in_combined(self, graph_walk: str) -> int | None:
         """How many rows of this real walk a step mixing it with another walk
         of its combined walk may hold; None is uncapped. For a backend whose
