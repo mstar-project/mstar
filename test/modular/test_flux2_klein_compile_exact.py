@@ -112,6 +112,13 @@ def no_knob_overrides(monkeypatch):
 
 
 def test_dit_exact_ops_knob_on_keeps_the_configured_modules_eager(no_knob_overrides):
+    from mstar import platforms
+    from mstar.platforms import CudaPlatform
+
+    # on by default everywhere but AMD GPUs; the host's own platform would decide it otherwise
+    cuda = CudaPlatform()
+    no_knob_overrides.setattr(platforms, "resolve_platform", lambda: cuda)
+    knobs.configure(None)
     dit = Flux2DiT(TINY)
     norms = exclude_from_compile(Flux2DiT(TINY), exact_op_types(["norms"]))
     compile_transformer_forward(dit, exact_ops=["norms"])  # lazy: nothing is traced until a call
