@@ -491,7 +491,7 @@ Step 2a — Declare your resources
 --------------------------------
 
 ``get_node_resources`` returns a flat list of ``NodeResourceSpec`` objects. Every spec has
-three common fields:
+these common members:
 
 - ``resource_key`` is the name of this resource. Three places use this name, and all three
   must agree: the layers bind to it, ``declare_step`` uses it as the key of its
@@ -1435,12 +1435,12 @@ holds, so a small prefill cap never limits a decode-only step.
 ``max_rows_in_combined(self, graph_walk)`` also bounds how many rows of one walk a mixed
 step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``). To run a
 combined walk on such split kernels, pass a ``CombinedSplit`` in the ``splits`` of each
-resource config that supports one (``AttentionConfig`` and ``LinearAttnConfig``); their
-specs return it from ``combined_splits()``, which is what the engine reads, and resources
-of one node must agree on a walk's ``prefill_walks``. The engine then orders that walk's
-steps with the ``prefill_walks`` rows last, so the kernels read the decode rows as the
-step's first tokens, in place. Every other walk of the combined walk must be one token
-per row.
+resource config that supports one (``AttentionConfig`` on FlashInfer, ``LinearAttnConfig``
+on GDN); their specs return it from ``combined_splits()``, which is what the engine reads,
+and resources of one node must agree on a walk's ``prefill_walks``. The engine then orders
+that walk's steps with the ``prefill_walks`` rows last, so the kernels read the decode
+rows as the step's first tokens, in place. Every other walk of the combined walk must be
+one token per row.
 
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific

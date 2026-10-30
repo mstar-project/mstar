@@ -39,7 +39,7 @@ class AttentionConfig:
     # FlashInfer only: combined walks whose captured steps run their leading
     # one-token rows on a decode half and their prompt rows on a prefill
     # wrapper sized to them (`FlashInferMixedWrapper`); the engine orders
-    # those steps decode first
+    # every step of those walks decode first
     splits: tuple[CombinedSplit, ...] = ()
     # FlashInfer only: run one-token decode rows on the tensor-core kernel.
     # False picks the CUDA-core decode kernel, which can win for MHA and

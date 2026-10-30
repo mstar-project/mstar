@@ -31,7 +31,8 @@ class CombinedSplit:
     the rows after it (under capture every token, the run as one leading
     sequence). Every walk of ``combined_walk`` outside ``prefill_walks`` must
     be one token per row: its rows go first, and a multi-token one there
-    ends the run, so each decode row after it counts as a prompt row."""
+    ends the run, so it and every decode row after it count as prompt rows,
+    and plan raises once they exceed ``max_prefill_rows``."""
     combined_walk: str
     prefill_walks: tuple[str, ...]
 
