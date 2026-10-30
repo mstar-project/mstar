@@ -1,9 +1,8 @@
 """GR00T N1.7's backbone on the GPU, one stage at a time: ``vision_encoder``, ``LLM`` and
 ``vl_bridge``, each our served node in bf16 against NVIDIA's reference run in fp32.
 
-The recordings are NVIDIA's reference run: its stage outputs at seed 7 on 20 DROID requests, in
-fp32 (``~/gr00t-runs/oracle_fp32_seed7``) and bf16 (``oracle_bf16_seed7``), plus the requests'
-inputs (``~/gr00t-runs/dump``). The floor is the bf16 run against the fp32 one, measured per
+The recordings are NVIDIA's reference run's stage outputs at seed 7 on 20 DROID requests, in fp32
+and bf16, plus the requests' inputs (``dump``). The floor is the bf16 run against the fp32 one, per
 request; the bar is **mean abs error within 1.2x of it**. Never max abs (a handful of elements
 dominates it), never a picked constant. Each pass has a control that must land past the bar.
 
@@ -20,11 +19,11 @@ Traps that would give a test that passes and says nothing:
    host first, so it briefly needs several GB of host RAM.
 
 A stage whose tensors the recordings lack skips and names them. Besides ``vl_embeds`` (the
-bridge's output) it reads ``backbone_features``, the LLM's output and the input of the action
-head's ``vlln`` (``gr00t_n1d7.py:175``), ``[1, n, 2048]``; and ``vision_embeds`` and
-``deepstack_embeds``, Qwen3-VL's ``visual`` output ``pooler_output`` ``[448, 2048]`` and its three
-``deepstack_features`` stacked to ``[3, 448, 2048]``, read in a forward hook on ``visual`` because
-``get_image_features`` replaces both with per-image splits once the call returns.
+bridge's output) it reads ``backbone_features`` ``[1, n, 2048]``, the LLM's output and the input of
+the action head's ``vlln``; and ``vision_embeds`` ``[448, 2048]`` and ``deepstack_embeds``
+``[3, 448, 2048]``, Qwen3-VL's ``visual`` ``pooler_output`` and its three ``deepstack_features``,
+read in a forward hook on ``visual`` because ``get_image_features`` replaces both with per-image
+splits once the call returns.
 """
 
 from __future__ import annotations
@@ -285,8 +284,8 @@ class TestVisionEncoder:
     def test_the_embeds_and_every_deepstack_feature_match_the_oracle(self, built: _Built):
         """The merged embeddings and the three DeepStack features, each at its own floor.
 
-        The floors differ (measured 0.0199 for the embeds, 0.0026 / 0.0058 / 0.0120 for the
-        features), so a pooled mean would let the embeds' floor cover a broken feature.
+        The floors differ several-fold, so a pooled mean would let the embeds' floor cover a
+        broken feature.
         """
         for index in range(_REQUESTS):
             request = _load(index, _VISION_KEYS)
@@ -398,8 +397,8 @@ class TestVLBridge:
 
         The bridge is the reference's one unmasked attention, so per-request segments are all that
         keeps a prompt from attending to its neighbour. The same packed rows run twice: in two
-        segments each request must pass the bar, in one each must fail it (measured once at ~30x
-        the floor). Only the segment layout differs.
+        segments each request must pass the bar, in one each must fail it. Only the segment layout
+        differs.
         """
         a, b = (_load(index, (_LLM_KEY, _BRIDGE_KEY)) for index in _CONTROL_REQUESTS)
         inputs = [_bridge_inputs(request, built.config) for request in (a, b)]

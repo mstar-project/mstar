@@ -1,8 +1,5 @@
-"""GR00T N1.7's model class: the four walks and the edges joining them, the five resource
-specs, the walk schedule and request routing, ``get_submodule`` and loading, capture
-settings, and ``postprocess``. Walks and specs are checked on a config alone; loading on a
-synthetic checkpoint; the real widths on ``meta``.
-"""
+"""GR00T N1.7's model class: walks, resource specs, request routing, loading, capture settings
+and ``postprocess``. Walks and specs run on a config alone, loading on a synthetic checkpoint."""
 
 from __future__ import annotations
 
@@ -80,22 +77,18 @@ _PREFILL, _BACKBONE_WALK, _STATE, _ACTION_GEN = "prefill", "backbone", "state", 
 
 # What `prefill`'s nodes park for the request, and what `action_gen` reads back.
 _PERSISTED = {"vl_text", "vl_image", "state_features"}
-# The loop-carried edge, spelled out: importing `DenoiseLoopSubmodule.LATENTS` would make
-# the test that it is that name compare the scaffold with itself.
+# Spelled out: importing `DenoiseLoopSubmodule.LATENTS` would make that test compare the scaffold with itself.
 _CARRIED = "latents"
 
-# Each node's contract, spelled out from `submodules.py` (the cite is the
-# `prepare_inputs` that reads the name, or the `forward` that returns it).
+# Each node's contract, spelled out from `submodules.py`; each cite is where the name is read or returned.
 _NODE_INPUTS = {
     # `Gr00tN17VisionEncoderSubmodule.prepare_inputs`
     VISION_ENCODER: {"pixel_values", "image_grid_thw"},
-    # `Gr00tN17LLMSubmodule.prepare_inputs`. NOT `position_ids` or `image_rows`: it
-    # derives both there and emits `image_rows`.
+    # `Gr00tN17LLMSubmodule.prepare_inputs`, which derives `position_ids` and `image_rows` itself
     LLM: {"vision_embeds", "deepstack_embeds", "input_ids", "image_grid_thw"},
     VL_BRIDGE: {"backbone_features", "image_rows"},  # `Gr00tN17VLBridgeSubmodule.prepare_inputs`
     STATE_ENCODER: {"state", "embodiment_id"},  # `Gr00tN17StateEncoderSubmodule.prepare_inputs`
-    # the carried sample (`DenoiseLoopSubmodule._carried_inputs`), the conditioning
-    # (`Gr00tN17DenoiseStepSubmodule.request_inputs`)
+    # the carried sample (`DenoiseLoopSubmodule._carried_inputs`) and the conditioning (`request_inputs`)
     DENOISE_STEP: {_CARRIED, "vl_text", "vl_image", "state_features", "embodiment_id"},
 }
 _NODE_OUTPUTS = {
@@ -105,8 +98,7 @@ _NODE_OUTPUTS = {
     STATE_ENCODER: {"state_features"},  # `Gr00tN17StateEncoderSubmodule.forward`
     DENOISE_STEP: {_CARRIED},  # `DenoiseLoopSubmodule._run`
 }
-# What a request carries into `prefill`, and where each one goes; `image_grid_thw`
-# goes to two nodes.
+# What a request carries into `prefill`, and where each goes (`image_grid_thw` to two nodes).
 _ROUTES = (
     ("pixel_values", VISION_ENCODER), ("image_grid_thw", VISION_ENCODER),
     ("image_grid_thw", LLM), ("input_ids", LLM),
@@ -115,8 +107,7 @@ _ROUTES = (
 # the distinct signal names, in first-seen order
 _ROUTED = tuple(dict.fromkeys(name for name, _ in _ROUTES))
 
-# The checkpoint's (qo heads, kv heads, head dim) per resource, checked against the real
-# config at the end.
+# The checkpoint's (qo heads, kv heads, head dim) per resource, checked against the real config at the end.
 _REAL = {
     VISION_ATTN: (16, 16, 64),
     LLM_ATTN: (16, 8, 128),
@@ -130,8 +121,7 @@ _REAL = {
 # A config with no two widths alike, and a model built around it
 # ----------------------------------------------------------------------------
 
-# Every head count and head dim differs, and none is the checkpoint's (16, 8, 32, 48,
-# 64, 128), so a hardcoded geometry cannot match by accident.
+# Every head count and head dim differs, and none is the checkpoint's, so a hardcoded geometry cannot match.
 _VISION_HEADS, _VISION_WIDTH = 5, 20
 _TEXT_QO, _TEXT_KV, _TEXT_HEAD_DIM = 6, 3, 4
 _BRIDGE_HEADS, _BRIDGE_HEAD_DIM = 7, 9
@@ -191,9 +181,8 @@ def _config(scale: int = 1) -> Gr00tN17Config:
 
 
 def _model(config: Gr00tN17Config | None = None, video_keys=None) -> Gr00tN17Model:
-    """The model without its ``__init__``: the walks, resources and walk schedule are
-    functions of the config alone. ``object.__new__`` because the class has no
-    ``skip_weight_loading`` flag, and adding one for a test would be a new mechanism."""
+    """The model without its ``__init__``: walks, resources and walk schedule are functions of
+    the config alone. ``object.__new__`` rather than a skip-loading flag added for a test."""
     model = object.__new__(Gr00tN17Model)
     model.config = config if config is not None else _config()
     model.processor = _Processor(_VIDEO_KEYS if video_keys is None else video_keys)
@@ -213,9 +202,8 @@ def _info(dims: list[int], uuid: int = 0) -> TensorPointerInfo:
 
 
 def _metadata(model: Gr00tN17Model, walk: str | None = None) -> CurrentForwardConductorMetadata:
-    """The request's metadata as the model builds it: the transition hook reads the
-    walk schedule the entry point parks in ``kwargs``, so a hand-rolled ``kwargs={}``
-    would test a state no request can be in."""
+    """The request's metadata as the model builds it, with the walk schedule the entry point
+    parks in ``kwargs``: a hand-rolled ``kwargs={}`` is a state no request can be in."""
     args = model.get_initial_forward_pass_args(
         "default", ["text", "image"], ["action"], {},
         model_kwargs=None if walk is None else {"walk": walk},
@@ -249,10 +237,8 @@ def test_the_walks_are_four_over_five_nodes():
 
 
 def test_prefill_is_a_parallel_whose_two_branches_never_wait_on_each_other():
-    """The state encoder reads only the request's state, so it must not wait on the
-    backbone. A ``Sequential`` over the same branches derives the same I/O signature,
-    so the type is the only declaration of independence; the independence itself is
-    pinned beside it."""
+    """The state encoder reads only the request's state, so it must not wait on the backbone.
+    A ``Sequential`` derives the same I/O signature, so the type is the only declaration."""
     prefill = _model().get_graph_walk_graphs()[_PREFILL]
 
     assert isinstance(prefill, Parallel)
@@ -284,11 +270,8 @@ def test_prefill_is_a_parallel_whose_two_branches_never_wait_on_each_other():
 
 
 def test_prefills_persist_edges_park_rather_than_point_at_a_node():
-    """Regression: a persist edge once pointed at ``denoise_step``, which is not in
-    ``prefill``, and nothing raised: the tensor is parked either way and the destination is
-    read only when routed. ``persist`` and a real destination are compatible in general
-    (``PythonGraphRuntime._process_node_outputs``); ``EMPTY_DESTINATION`` is the idiom
-    flux2_klein uses (``Flux2KleinModel.get_graph_walk_graphs``)."""
+    """A persist edge pointing at ``denoise_step``, which is not in ``prefill``, raises nothing:
+    the tensor is parked either way. ``EMPTY_DESTINATION`` is flux2_klein's idiom."""
     prefill = _model().get_graph_walk_graphs()[_PREFILL]
     persisted = [edge for edge in _edges(prefill) if edge.persist]
 
@@ -302,20 +285,12 @@ def test_prefills_persist_edges_park_rather_than_point_at_a_node():
 
 
 def test_a_persisted_request_input_keeps_its_destination():
-    """``embodiment_id`` must reach ``state_encoder`` and survive ``prefill``, because
-    the denoise step reads it every iteration, so its edge has both a destination and
-    ``persist``. The flag is the model's own marker: the conductor parks every initial
-    signal (``Conductor._do_ingest_request``) and the runtime reads ``persist`` only on
-    outputs (``PythonGraphRuntime._process_node_outputs``).
-
-    The release list is per signal, not per edge. Per edge, ``image_grid_thw`` (routed
-    twice) would be released twice and ``action_mask`` (routed nowhere,
-    ``Gr00tN17Preprocessor.__call__``) never, held for the request's life since
-    ``PreprocessWorkerThread._store_persisted`` persists every initial signal. Regression
-    for that leak."""
+    """``embodiment_id`` must reach ``state_encoder`` and survive ``prefill`` (the denoise step
+    reads it every iteration), so its edge has both a destination and ``persist``. The release
+    list is per signal, not per edge: per edge, ``image_grid_thw`` (routed twice) would be
+    released twice and ``action_mask`` (routed nowhere) never, held for the request's life."""
     model = _model()
-    # `action_mask` rides along unrouted: it is the one input the full path
-    # receives and no node reads.
+    # `action_mask` rides along unrouted: the one input the full path receives and no node reads
     signals = {name: [_info([1], uuid=i)] for i, name in enumerate((*_ROUTED, "action_mask"))}
     args = model.get_initial_forward_pass_args("default", ["text", "image"], ["action"], signals)
     by_name = {edge.name: edge for edge in args.inputs}
@@ -328,8 +303,7 @@ def test_a_persisted_request_input_keeps_its_destination():
         info for name, infos in signals.items() if name != "embodiment_id" for info in infos
     ]
     assert signals["embodiment_id"][0] not in args.unpersist_tensors
-    # the two halves the per-edge formula got wrong, stated on the tensors
-    # themselves: routed twice, released once; routed never, released once
+    # on the tensors themselves: routed twice, released once; routed never, released once
     assert len([edge for edge in args.inputs if edge.name == "image_grid_thw"]) == 2
     assert args.unpersist_tensors.count(signals["image_grid_thw"][0]) == 1
     assert args.unpersist_tensors.count(signals["action_mask"][0]) == 1
@@ -364,14 +338,10 @@ def test_the_loops_terminal_output_is_named_for_the_sections_loop_back_edge():
 
 
 def test_each_node_declares_the_contract_its_submodule_reads():
-    """Each node's declared inputs and outputs against what ``submodules.py`` reads and
-    returns; nothing else checks the two, and an output key matching no edge is dropped
-    silently (``PythonGraphRuntime.get_output_signals``). Inputs are ``==``; outputs are
-    ``<=`` per walk (reuse walks emit less) and ``==`` over the union.
-
-    No walk may gain a loop-back by accident: declaring ``image_rows`` (an LLM output)
-    as an LLM input turns the walk's own edge into a loop-back on a node that already
-    ran (``Sequential.get_inputs_outputs``, ``graph/base.py``)."""
+    """Each node's declared inputs and outputs against what ``submodules.py`` reads and returns;
+    an output key matching no edge is dropped silently. Outputs are ``<=`` per walk (reuse walks
+    emit less) and ``==`` over the union. No walk may gain a loop-back by accident: declaring an
+    LLM output as an LLM input turns the walk's own edge into one, on a node that already ran."""
     walks = _model().get_graph_walk_graphs()
     emitted: dict[str, set[str]] = {name: set() for name in _NODE_OUTPUTS}
 
@@ -419,10 +389,9 @@ def test_every_internal_edge_lands_on_an_input_its_destination_declares():
 
 
 def test_action_gens_conditioning_inputs_are_exactly_what_prefill_persists():
-    """The cross-walk join: ``prefill`` parks three tensors, the request a fourth, and
-    ``action_gen`` asks for them by name. A one-sided rename leaves a ``denoise_step``
-    whose inputs never complete, with no node to blame. Both suppliers are derived,
-    and spelled as a partition so a new input with no supplier is caught too."""
+    """``prefill`` parks three tensors, the request a fourth, and ``action_gen`` asks for them by
+    name: a one-sided rename leaves a ``denoise_step`` whose inputs never complete. Spelled as a
+    partition so a new input with no supplier is caught too."""
     model = _model()
     walks = model.get_graph_walk_graphs()
     node_persisted = {edge.name for edge in _edges(walks[_PREFILL]) if edge.persist}
@@ -442,12 +411,9 @@ def test_action_gens_conditioning_inputs_are_exactly_what_prefill_persists():
 
 
 def test_the_loops_carried_edge_is_the_scaffolds_own_latents_name():
-    """The carried sample is the scaffold's: ``DenoiseLoopSubmodule._carried_inputs``
-    reads ``loop_back_names`` and ``DenoiseLoopSubmodule._run`` returns ``LATENTS``,
-    while the worker routes by the graph's edge names.
-    Regression: with the walk naming it ``actions``, iteration 1 raised "loop-back
-    edge(s) ['latents'] missing". ``denoise``'s parameter must match too, since the
-    scaffold passes it by keyword (``DenoiseLoopSubmodule.LATENTS``)."""
+    """The scaffold reads and returns the carried sample as ``LATENTS`` while the worker routes
+    by the graph's edge names, so the walk must use that name. ``denoise``'s parameter must
+    match too, since the scaffold passes it by keyword."""
     loop = _model().get_graph_walk_graphs()[_ACTION_GEN]
     carried = {name for name, _ in loop._loop_back_inputs}
 
@@ -463,11 +429,9 @@ def test_the_loops_carried_edge_is_the_scaffolds_own_latents_name():
 
 
 def test_every_input_the_loop_needs_is_delivered_to_it():
-    """The conductor parks tensors but does not route them into the next walk; this hook
-    must build an edge for every ``denoise_step`` input
-    (``Conductor._process_done_forward``, flux2_klein's shape,
-    ``Flux2KleinModel.get_partition_forward_pass_args``). Regression: it once emitted only
-    the carried edge, and the loop never became ready."""
+    """The conductor parks tensors but does not route them into the next walk
+    (``Conductor._process_done_forward``), so this hook must build an edge for every
+    ``denoise_step`` input, or the loop never becomes ready."""
     model = _model()
     walks = model.get_graph_walk_graphs()
     metadata = _metadata(model)
@@ -498,11 +462,10 @@ def test_every_input_the_loop_needs_is_delivered_to_it():
 
 
 def test_the_reuse_walks_expose_the_nodes_prefill_already_contains():
-    """Each reuse walk is ``prefill``'s own nodes stopping early (same names, inputs and
-    internal edge), not a second description that can disagree. ``vl_bridge`` stays out of
-    ``backbone``: its weights are GR00T's ``action_head.*``. The emitted modality is
-    ``tensor`` because "embedding" is not in ``entrypoint.py``'s
-    ``SUPPORTED_MODALITIES``, and the server would reject the response after the work."""
+    """Each reuse walk is ``prefill``'s own nodes stopping early, not a second description that
+    can disagree. ``vl_bridge`` stays out of ``backbone``: its weights are ``action_head.*``.
+    The modality is ``tensor``: "embedding" is not in ``entrypoint.py``'s
+    ``SUPPORTED_MODALITIES``, so the server would reject the response after the work."""
     walks = _model().get_graph_walk_graphs()
     prefill = _nodes(walks[_PREFILL])
     backbone, state = _nodes(walks[_BACKBONE_WALK]), _nodes(walks[_STATE])
@@ -536,11 +499,9 @@ _REUSE_WALKS = {"the backbone walk": _BACKBONE_WALK, "the state walk": _STATE}
 
 @pytest.mark.parametrize("walk", list(_REUSE_WALKS.values()), ids=list(_REUSE_WALKS))
 def test_a_reuse_walk_is_selected_by_name_and_schedules_only_itself(walk):
-    """The schedule is decided once and parked in ``metadata.kwargs`` (flux2_klein's
-    idiom, ``Flux2KleinModel.get_initial_forward_pass_args``). Its first entry picks the
-    worker graphs (``Conductor._do_ingest_request``), so a schedule starting at ``prefill``
-    serves an action; a second entry sends the request to ``action_gen``, whose inputs
-    never complete. ``walk`` must be in ``request_kwargs`` (``Model.request_kwargs``) or
+    """The schedule is parked in ``metadata.kwargs``, and its first entry picks the worker
+    graphs: one starting at ``prefill`` serves an action, and a second entry sends the request
+    to ``action_gen``, whose inputs never complete. ``walk`` must be in ``request_kwargs`` or
     the client is told it was ignored."""
     model = _model()
     metadata = _metadata(model, walk=walk)
@@ -556,10 +517,8 @@ def test_a_reuse_walk_is_selected_by_name_and_schedules_only_itself(walk):
 
 @pytest.mark.parametrize("walk", list(_REUSE_WALKS.values()), ids=list(_REUSE_WALKS))
 def test_a_reuse_walk_is_done_at_its_first_transition(walk):
-    """A hang, not an error: re-emitting the current walk with no inputs reads to the
-    conductor as "partition self-triggers via StreamBuffer" (``Conductor._process_done_forward``)
-    and it sends nothing, so the request holds its worker graphs until killed. A reuse
-    walk parks nothing, so ``persist_signals`` is empty."""
+    """A hang, not an error: re-emitting the current walk with no inputs reads to the conductor
+    as a self-triggering partition, so the request holds its worker graphs until killed."""
     model = _model()
     metadata = _metadata(model, walk=walk)
 
@@ -575,10 +534,9 @@ def test_a_reuse_walk_is_done_at_its_first_transition(walk):
 
 
 def test_an_unknown_walk_is_refused_and_the_message_names_all_four_walks():
-    """A typo'd ``walk`` raises at admission: falling back serves an action to a caller
-    who asked for features. ``prefill`` and ``action_gen`` are refused too: a schedule
-    of ``[prefill]`` runs, parks its tensors and returns nothing. The message names all
-    four, since this is the only place a caller learns them."""
+    """A typo'd ``walk`` raises at admission rather than serve an action to a caller who asked
+    for features. ``[prefill]`` alone would park its tensors and return nothing. The message
+    names all four, since this is the only place a caller learns them."""
     model = _model()
 
     with pytest.raises(ValueError) as refused:
@@ -602,13 +560,9 @@ _UNREACHABLE = {
 
 @pytest.mark.parametrize("walk, name, node", list(_UNREACHABLE.values()), ids=list(_UNREACHABLE))
 def test_a_reuse_walk_drops_an_input_it_has_no_node_for(walk, name, node):
-    """A reuse request always carries the whole observation
-    (``Gr00tN17Preprocessor.__call__``, ``PreprocessWorkerThread._process_input``,
-    ``Conductor._do_ingest_request``), so refusing would refuse every real reuse request;
-    regression for that. The input must not be routed (an edge to a node outside the walk is
-    shipped and never consumed) and must still be released
-    (``PreprocessWorkerThread._store_persisted``), with no later hop to release it on. The
-    full path routing the same input is the positive control."""
+    """A reuse request always carries the whole observation, so refusing would refuse every real
+    one. The input must not be routed (an edge to a node outside the walk is shipped and never
+    consumed) and must still be released, with no later hop to release it on."""
     model = _model()
     signals = {signal: [_info([1], uuid=i)] for i, signal in enumerate(_ROUTED)}
     args = model.get_initial_forward_pass_args(
@@ -634,10 +588,8 @@ def test_a_reuse_walk_drops_an_input_it_has_no_node_for(walk, name, node):
 
 
 def test_the_embodiment_id_is_parked_only_where_a_loop_reads_it_back():
-    """Parked only on the full path, where the denoise step reads it every iteration;
-    on a reuse walk nothing ever unpersists it, so a parked copy leaks for the request's
-    life. Both directions, since the flag (``Gr00tN17Model.get_initial_forward_pass_args``)
-    can be wrong either way, and the leak is asserted on the release list itself."""
+    """Parked only on the full path, where the denoise step reads it every iteration; on a
+    reuse walk nothing unpersists it, so a parked copy leaks for the request's life."""
     model = _model()
     signals = {"state": [_info([1, 8], uuid=1)], "embodiment_id": [_info([1], uuid=2)]}
 
@@ -661,11 +613,9 @@ def test_the_embodiment_id_is_parked_only_where_a_loop_reads_it_back():
 
 
 def test_the_reuse_walk_node_sets_match_the_graphs():
-    """``Gr00tN17Model.REUSE_WALK_NODES`` is a hand copy of graph structure and goes stale
-    both ways: a stale node lets an input through to nothing, a missing one refuses a valid
-    request. A selectable walk missing from it gets ``reachable=None``
-    (``Gr00tN17Model.get_initial_forward_pass_args``), "route everything", so selectable
-    and listed must be the same walks."""
+    """``REUSE_WALK_NODES`` is a hand copy of graph structure and goes stale both ways: a stale
+    node lets an input through to nothing, a missing one refuses a valid request. A selectable
+    walk missing from it routes everything, so selectable and listed must be the same walks."""
     model = _model()
     walks = model.get_graph_walk_graphs()
 
@@ -759,11 +709,9 @@ def test_every_head_geometry_is_read_off_the_config(scale):
 
 
 def test_the_vision_bound_is_the_only_one_that_is_not_one_per_request():
-    """``max_segments_per_request`` is per span label (``_RaggedManagerBase._cg_wrapper``),
-    and the cross resource plans one wrapper per pair
-    (``_RaggedCrossManagerBase._plan_layouts``). Only the ViT, one segment per frame,
-    exceeds 1. The DT's cross bound looks like it should be ``len(DT_XATTN_PAIRS)``, but
-    each pair sees one segment per request per label."""
+    """``max_segments_per_request`` is per span label, and the cross resource plans one wrapper
+    per pair, so only the ViT (one segment per frame) exceeds 1. The DT's cross bound is not
+    ``len(DT_XATTN_PAIRS)``: each pair sees one segment per request per label."""
     specs = _specs(_model())
 
     assert {key: spec.config.max_segments_per_request for key, spec in specs.items()} == {
@@ -776,9 +724,8 @@ def test_the_vision_bound_is_the_only_one_that_is_not_one_per_request():
 
 
 def test_every_spec_pins_its_activation_dtype():
-    """A cacheless ragged resource with ``dtype=None`` takes the engine's KV dtype
-    (``RaggedAttentionConfig.dtype``), so the parity bar's bf16 would track something
-    unrelated to this model (z_image pins too, ``ZImageModel.get_node_resources``)."""
+    """A cacheless ragged resource with ``dtype=None`` takes the engine's KV dtype, so the
+    parity bar's bf16 would track something unrelated to this model (z_image pins too)."""
     specs = _specs(_model())
 
     assert {spec.config.dtype for spec in specs.values()} == {torch.bfloat16}
@@ -873,9 +820,7 @@ _SPANS = {
 @pytest.mark.parametrize("text_rows, image_rows", list(_SPANS.values()), ids=list(_SPANS))
 def test_the_bucket_keys_span_counts_come_off_the_persisted_tensors_own_dims(text_rows, image_rows):
     """``denoise_step`` needs the span lengths before their tensors arrive, so they ride on
-    ``step_metadata`` under the names the node reads
-    (``Gr00tN17DenoiseStepSubmodule.bucket_key_for``). Derived from the persisted tensors'
-    own ``dims``, because the node's check (``Gr00tN17DenoiseStepSubmodule.request_inputs``)
+    ``step_metadata``. Read off the persisted tensors' own ``dims``, because the node's check
     only catches a disagreement inside a batch."""
     model = _model()
     metadata = _metadata(model)
@@ -997,9 +942,8 @@ def test_get_submodule_builds_each_node_once_and_hands_back_the_same_object(tmp_
 
 
 def test_every_submodule_comes_back_in_eval_mode(tmp_path):
-    """Every parity number is an eval-mode claim; a dropout or norm added later would make
-    the served model a different function. ``nn.Module`` starts in training mode, so
-    somebody has to set the flag."""
+    """Every parity number is an eval-mode claim, and ``nn.Module`` starts in training mode; a
+    dropout or norm added later would make the served model a different function."""
     model, _ = _served(tmp_path)
     for name in _SUBMODULES:
         submodule = model.get_submodule(name)
@@ -1030,9 +974,8 @@ def test_an_unknown_node_is_none_and_is_not_cached(tmp_path):
 
 
 def test_every_served_parameter_is_the_checkpoint_tensor_it_maps_from(tmp_path):
-    """Regression: the served path once never called the loader, so a live server ran on
-    random init and still returned plausible actions. Values, not shapes; fused LLM
-    parameters are the checkpoint's parts stacked in row order."""
+    """A server on random init still returns plausible actions, so values, not shapes; fused
+    LLM parameters are the checkpoint's parts stacked in row order."""
     model, weights = _served(tmp_path)
     used = set()
     for node in _SUBMODULES:
@@ -1061,8 +1004,8 @@ def test_a_tensor_missing_from_the_checkpoint_fails_its_node_by_name(tmp_path, n
 
 @pytest.mark.parametrize("part", ["layers.1.self_attn.k_proj.weight", "layers.1.mlp.up_proj.weight"])
 def test_one_part_missing_from_a_fused_llm_parameter_fails_the_llm_by_name(tmp_path, part):
-    """A fused parameter once counted as loaded when any part landed, serving the missing
-    rows at random init. The part is named, since the fused name is not the checkpoint's."""
+    """A fused parameter with any part missing would serve those rows at random init. The part
+    is named, since the fused name is not the checkpoint's."""
     model, _ = _served(tmp_path, drop=_ROOTS[LLM] + part)
     with pytest.raises(ValueError, match=rf"^LLM: 1 parameter.*{re.escape(part)}"):
         model.get_submodule(LLM)
@@ -1070,9 +1013,8 @@ def test_one_part_missing_from_a_fused_llm_parameter_fails_the_llm_by_name(tmp_p
 
 
 def test_the_served_vision_node_holds_the_vision_config_and_prepares_a_grid(tmp_path):
-    """Regression: handed the whole ``Gr00tN17Config``, the vision node built and loaded,
-    then raised ``AttributeError`` in ``prepare_inputs`` on the first frame (a 500 on
-    every live request)."""
+    """Handed the whole ``Gr00tN17Config``, the vision node would build and load, then
+    raise in ``prepare_inputs`` on the first frame."""
     model, _ = _served(tmp_path)
     node = model.get_submodule(VISION_ENCODER)
     assert node.config is model.config.vision
@@ -1093,7 +1035,7 @@ def test_only_the_bridge_opts_out_of_autocast_and_it_is_built_in_the_engines_dty
     for name in _SUBMODULES:
         node = model.get_submodule(name, autocast_dtype=torch.bfloat16)
         assert node.disable_autocast is (name == VL_BRIDGE), name
-        # compiled, the bridge's answer moved once a prompt of another length was served
+        # compiled, a recompile for a new prompt length would round the bridge differently
         assert node.disable_torch_compile is (name in (VL_BRIDGE, DENOISE_STEP)), name
         expected = torch.bfloat16 if name == VL_BRIDGE else torch.float32
         assert {p.dtype for p in node.parameters()} == {expected}, name
@@ -1101,9 +1043,8 @@ def test_only_the_bridge_opts_out_of_autocast_and_it_is_built_in_the_engines_dty
 
 def test_the_opted_out_bridge_hands_the_loop_bf16_spans(tmp_path):
     """Run as the engine runs an opted-out node, both spans come out bf16 as NVIDIA's do.
-    Control: under CUDA autocast ``vlln`` runs fp32 and its output is the residual, so
-    both spans came out fp32. CPU autocast leaves LayerNorm alone (torch 2.12), so the
-    control applies CUDA's fp32 LayerNorm policy by hand."""
+    Control: under CUDA autocast ``vlln`` runs fp32, so the spans come out fp32; CPU autocast
+    leaves LayerNorm alone, so the control applies CUDA's policy by hand."""
     model, _ = _served(tmp_path)
     node = model.get_submodule(VL_BRIDGE, autocast_dtype=torch.bfloat16).to("cpu")
     rows, image = 10, [2, 3, 4, 5]
@@ -1219,8 +1160,7 @@ def _xattn_ceiling_and_widest_span(serving: dict, path: Path) -> tuple[int, int]
 
 def test_the_shipped_yaml_sizes_the_dt_cross_attention_for_its_widest_capture_span(tmp_path):
     """A captured cross wrapper is sized by ``max_tokens_per_request`` but its keys are a
-    request's text or image rows; below the widest span capture fails ("3584 key tokens
-    exceeds the 328"). The shapes must also parse into buckets."""
+    request's text or image rows, so below the widest span capture fails."""
     serving = yaml.safe_load(_SERVING.read_text(encoding="utf-8"))
     kwargs = serving["model_kwargs"]
     assert kwargs["accelerator_graph"] is True
@@ -1297,9 +1237,8 @@ class _BytesProcessor:
 
 
 def test_no_instruction_is_served_as_the_empty_instruction():
-    """FastAPI turns an empty ``text`` field into ``None``, and 8 of the 20 recorded DROID
-    requests carry one; refusing it answered real robot data with a 400. A real
-    instruction is the control."""
+    """An empty instruction, which some real robot requests carry, arrives as ``None``
+    (FastAPI); refusing it answers them with a 400. A real instruction is the control."""
     model = _model()
     model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
     frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
@@ -1370,9 +1309,8 @@ def test_a_lossless_frame_loads_as_its_exact_pixels_in_uint8_hwc(tmp_path, fmt):
 
 @pytest.mark.parametrize("fmt", ["JPEG", "GIF", "BMP", "TIFF"], ids=str.lower)
 def test_any_other_frame_format_is_refused_before_it_is_decoded(tmp_path, fmt):
-    """A JPEG passes every count, dtype and shape check and still moves the pixels 167x
-    further than a lossless frame: the actions look fine and the robot moves wrong. GIF is
-    a 256-colour palette; BMP and TIFF the engine's reader does not decode."""
+    """A JPEG passes every count, dtype and shape check and still moves the pixels: the actions
+    look fine and the robot moves wrong. GIF is a palette; BMP and TIFF the reader cannot decode."""
     from PIL import Image
 
     path = tmp_path / f"frame.{fmt.lower()}"
@@ -1531,9 +1469,8 @@ def test_postprocess_adds_the_batch_axis_the_engine_hands_back_without():
 
 
 def test_postprocess_finds_the_tag_and_the_state_in_the_kwargs_the_data_worker_kept():
-    """The decode needs the tag and the raw state at the end of the request; the conductor's
-    kwargs are stripped of ``PREPROCESS_ONLY_KWARGS`` but the data worker's are not
-    (``PreprocessWorkerThread._process_input``). Moving the state shifts the relative group,
+    """The decode needs the tag and raw state, which the data worker's kwargs keep (the
+    conductor's drop ``PREPROCESS_ONLY_KWARGS``). Moving the state shifts the relative group,
     so a dropped state cannot pass as an absolute chunk."""
     assert {"embodiment_tag", "state"} <= set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS)
     moved = {"arm": _RAW_STATE["arm"] + 100.0}
@@ -1557,16 +1494,15 @@ def test_postprocess_without_the_requests_embodiment_tag_is_refused(kwargs):
 
 @pytest.mark.parametrize("modality", ["text", ""])
 def test_postprocess_refuses_a_modality_this_model_does_not_emit(modality):
-    """A request asking for another modality is refused before the tag is read. One
-    ``modality != "action"`` check serves every value, so "text" and the falsy "" are
-    enough."""
+    """Another modality is refused before the tag is read; "text" and the falsy "" cover the
+    one ``modality != "action"`` check."""
     with pytest.raises(ValueError, match="emits actions"):
         _decoding_model().postprocess(_CHUNK, modality, {"embodiment_tag": "bot", "state": _RAW_STATE})
 
 
 def test_every_output_a_walk_sends_the_client_is_one_postprocess_encodes():
     """The data worker hands every client output to ``postprocess``; an edge whose modality it
-    refuses runs the whole walk and then answers 400. The reuse walks did that once."""
+    refuses runs the whole walk and then answers 400."""
     model = _decoding_model()
     walks = model.get_graph_walk_graphs()
     kwargs = {"embodiment_tag": "bot", "state": _RAW_STATE}
@@ -1687,10 +1623,9 @@ def test_the_denoise_steps_checkpoint_pieces_and_widths():
 
 @needs_checkpoint
 def test_the_model_constructs_from_its_two_checkpoints():
-    """``__init__`` is otherwise routed around, and its processor call was once wrong.
-    Two repos: the action head is ``nvidia/GR00T-N1.7-3B``, the Qwen3-VL dims are
-    ``nvidia/Cosmos-Reason2-2B``. ``max_action_horizon`` must be the config's: the
-    processor refuses a too-long embodiment against it (``Gr00tN17Preprocessor.__init__``)."""
+    """``__init__`` is otherwise routed around. Two repos: the action head is
+    ``nvidia/GR00T-N1.7-3B``, the Qwen3-VL dims ``nvidia/Cosmos-Reason2-2B``.
+    ``max_action_horizon`` must be the config's: the processor refuses a too-long embodiment."""
     model = Gr00tN17Model(model_path_hf=str(GR00T), backbone_path_hf=BACKBONE)
 
     assert model.config == Gr00tN17Config.from_hf(GR00T, BACKBONE)

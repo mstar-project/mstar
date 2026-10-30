@@ -62,12 +62,10 @@ def mrope_position_ids(
             )
         grid = grids[image]
         t, h, w = (int(v) for v in grid.tolist())
-        # Refused, not implemented: the two transformers versions disagree on
-        # what a t > 1 image does to the cursor (4.57 advances by
-        # max(t, h', w'), 5.19 ignores t), so there is no one answer to match.
-        # Videos are the only t > 1 source and both versions split them to one
-        # grid per frame before any position is computed, so a t > 1 image
-        # grid means the caller built it wrong.
+        # Refused, not implemented: transformers 4.57 and 5.19 disagree on what
+        # a t > 1 image does to the cursor, so there is no one answer to match.
+        # Both split videos to one grid per frame first, so t > 1 means the
+        # caller built the grid wrong.
         if t != 1:
             raise ValueError(f"image grid {t, h, w} has t != 1")
         merged = (h // spatial_merge_size) * (w // spatial_merge_size)

@@ -1,11 +1,9 @@
 """Per-embodiment MLPs: one set of weights per robot, picked by its id.
 
-GR00T serves 32 embodiments from one checkpoint by giving several small MLPs a
-leading category axis and indexing it per request. The state encoder is the
-first user; the action encoder and decoder are the others.
-
-Class and parameter names are the reference's (``CategorySpecificLinear.W`` /
-``.b``, ``layer1`` / ``layer2``), so the checkpoint's keys map straight on.
+GR00T serves 32 embodiments from one checkpoint by giving its state encoder,
+action encoder and action decoder a leading category axis, indexed per
+request. Class and parameter names are the reference's, so the checkpoint's
+keys map straight on.
 """
 from __future__ import annotations
 
@@ -17,25 +15,17 @@ class SinusoidalPositionalEncoding(nn.Module):
     """``[B, T]`` timesteps to ``[B, T, embedding_dim]``, the action encoder's
     own encoding of the denoising time.
 
-    This is **not** the convention the DT's ``timestep_encoder`` uses, and the
-    two live in one model: that one is diffusers' ``Timesteps`` with
-    ``flip_sin_to_cos=True``, this one is sin then cos with no flip, and the
-    frequency spacing here is ``log(10000) / half_dim`` where the usual form
-    divides by ``half_dim - 1``. The module has no parameters, so nothing in
-    the checkpoint would reveal a wrong convention -- only a comparison
-    against the reference's own class does.
+    **Not** the DT's ``TimestepEncoder`` convention, though both live in one
+    model: this is sin then cos with no flip, spaced by ``log(10000) /
+    half_dim`` where the usual form divides by ``half_dim - 1``. It has no
+    parameters, so the checkpoint cannot reveal a wrong convention; only the
+    reference's own class can.
 
-    The exponent is built in **fp32 throughout**, as the reference does.
-    Computing it in fp64 and casting at the end diverges by ~1e-6 (measured);
-    ``math.log`` in place of ``torch.log`` does not -- the two are bit-identical
-    at every width here, so that is a style choice and the dtype is not.
-
-    One more reason the arithmetic is spelled out rather than delegated to
-    diffusers' ``Timesteps(flip_sin_to_cos=False, downscale_freq_shift=0)``,
-    which is the same maths by a different route: at a width whose ``half_dim``
-    is a power of two the two agree bit for bit, but at the checkpoint's 1536
-    (``half_dim`` 768) they part by ~6e-05 -- too large to call rounding, too
-    small for any bar that would still reject a wrong convention.
+    The exponent is fp32 throughout, as the reference builds it; fp64 then a
+    cast diverges. Spelled out rather than delegated to diffusers'
+    ``Timesteps(flip_sin_to_cos=False, downscale_freq_shift=0)``, the same
+    maths by another route, because at the checkpoint's width (``half_dim``
+    768, not a power of two) the two part by more than rounding.
     """
 
     def __init__(self, embedding_dim: int):
@@ -43,12 +33,9 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.embedding_dim = embedding_dim
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        # The reference takes rank 2 and nothing else (`B, T = timesteps.shape`).
-        # Keeping that is the one thing stopping this module from being fed a
-        # `[B]` tensor meant for the DT's `TimestepEncoder`: that returns
-        # `[B, dim]` too, so a crossed call site would change no shape, raise
-        # nothing, and produce plausible magnitudes under a different sinusoid
-        # convention.
+        # Rank 2 only, as the reference. A `[B]` tensor meant for the DT's
+        # `TimestepEncoder` would otherwise pass silently under the wrong
+        # sinusoid.
         if timesteps.dim() != 2:
             raise ValueError(
                 f"the action encoder's timesteps are [B, T], got "
@@ -114,8 +101,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
     ) -> torch.Tensor:
         """``[B, T, action_dim]`` and one timestep per request to ``[B, T, hidden]``."""
         batch, horizon, _ = actions.shape
-        # the reference takes one scalar time per request and spreads it over
-        # the horizon itself, and refuses any other shape
+        # one time per request, spread over the horizon, as the reference does
         if timesteps.dim() != 1 or timesteps.shape[0] != batch:
             raise ValueError(
                 f"one timestep per request, so [{batch}], got {list(timesteps.shape)}"
@@ -125,9 +111,8 @@ class MultiEmbodimentActionEncoder(nn.Module):
         action = self.W1(actions, cat_ids)
         tau = self.pos_encoding(timesteps).to(dtype=action.dtype)
         mixed = torch.cat([action, tau], dim=-1)
-        # `x * sigmoid(x)`, as the reference writes it, not `F.silu`: the two
-        # differ on a quarter of elements by up to 5e-07 (measured), which is
-        # the difference between bit-exact against the reference and not
+        # `x * sigmoid(x)`, as the reference writes it: `F.silu` is not
+        # bit-identical to it
         mixed = self.W2(mixed, cat_ids)
         return self.W3(mixed * torch.sigmoid(mixed), cat_ids)
 
@@ -157,9 +142,8 @@ def build_action_decoder(config) -> CategorySpecificMLP:
 def build_state_encoder(config) -> CategorySpecificMLP:
     """Raw state in, one conditioning token out (``[B, 1, input_embedding_dim]``).
 
-    The node that owns this names it ``state_encoder``, because every
-    action-head node strips ``action_head.`` and keeps the reference's own
-    attribute names below it (``weight_loader.NODE_PREFIXES``).
+    Its node names it ``state_encoder``, the reference's attribute name under
+    ``action_head.`` (``weight_loader.NODE_PREFIXES``).
     """
     return CategorySpecificMLP(
         num_categories=config.max_num_embodiments,

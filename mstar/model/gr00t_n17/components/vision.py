@@ -82,9 +82,9 @@ class Gr00tN17VisionEncoder(nn.Module):
         hidden, _, _ = self.tower.embed(
             pixel_values, indices, weights, position_ids,
         )
-        # `embed` rounds the rope to the hidden dtype; transformers' Qwen3-VL, which
-        # GR00T runs, keeps it fp32 into the blocks. In bf16 the rounding alone put
-        # vision_embeds at 1.25x the bf16-vs-fp32 floor, so the blocks get the fp32 table.
+        # `embed` rounds the rope to the hidden dtype, but transformers' Qwen3-VL,
+        # which GR00T runs, keeps it fp32 into the blocks; in bf16 that rounding
+        # alone costs parity, so the blocks get the fp32 table
         cos, sin = self.tower.rotary_pos_emb(position_ids)
         features = []
         for layer, block in enumerate(self.tower.blocks):

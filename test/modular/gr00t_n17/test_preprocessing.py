@@ -11,7 +11,7 @@ from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
 
 from .helpers import BACKBONE, GR00T, needs_checkpoint
 
-# The 20 recorded DROID requests the decode's parity bar is measured on (~10 MB each).
+# The 20 recorded DROID requests the decode's parity bar is measured on.
 _DUMPS = sorted((Path.home() / "gr00t-runs/dump").glob("req_*.pt"))
 
 # Tiny three-embodiment checkpoint. "grip" is constant under q01/q99 but not under min/max.
@@ -319,7 +319,7 @@ def test_a_relative_group_unnormalises_against_the_relative_action_bounds(x, rel
     """A relative group's bounds are ``relative_action``'s min/max, not the ``action``
     q01/q99 ``use_percentiles`` picks for the rest: the reference's override replaces the
     group's stats (``state_action_processor.py:195-204``). The wrong read raises nothing and
-    on DROID rescales each command by 0.03x-3.8x. Zero state, so only the bounds are in it."""
+    rescales each command. Zero state, so only the bounds are in it."""
     out = _pre().unapply("bot", np.full((1, 3, 3), x, np.float32), {"arm": np.zeros((1, 1, 2), np.float32)})
     assert out["arm"][0, 0].tolist() == relative
     # `percentile` is the same unnormalise off `action`'s q01/q99, derived here so
@@ -467,8 +467,8 @@ def test_the_eef_reference_frame_is_the_states_last_timestep():
 
 def test_an_eef_decode_is_the_same_whether_the_state_came_over_json_or_not():
     """JSON delivers the state as float64; the reference's frame Gram-Schmidt runs in
-    float32 (``gr00t_policy.py:319-321``). On this non-orthonormal frame a float64 frame
-    moves ``eef_9d`` by 1.5e-8, with no error."""
+    float32 (``gr00t_policy.py:319-321``). On a non-orthonormal frame a float64 frame moves
+    ``eef_9d`` with no error."""
     pose = {"pose": np.array([[[0.1, 0.2, 0.3, 0.3, 0.7, 0.1, -0.7, 0.3, 0.2]]], np.float32)}
     wire = json.loads(json.dumps({k: v.tolist() for k, v in pose.items()}))
     chunk = _pose_chunk([0.1, 0.2, 0.3], [0.9, 0.1, 0.1, 0.1, 0.9, 0.1])
@@ -512,10 +512,9 @@ def test_the_decode_matches_the_reference_on_the_twenty_recorded_droid_requests(
 
     * ``gripper_position`` and ``joint_position``: **bitwise equal**. Neither path has a
       float the reference's lacks, so anything less is a defect.
-    * ``eef_9d``: within one float32 ulp of the reference frame. numpy 1.26 and 2.5 disagree
-      on a float32 3-vector ``np.dot`` (0.0 vs 3.7e-9), which moves one request by 3.3e-9;
-      The 3.3e-9 asserted is this checkpoint's instance of that bound and stays the bar;
-      the median bar (1e-15) keeps a regression on the typical request from hiding behind it.
+    * ``eef_9d``: within one float32 ulp of the reference frame, since numpy 1.26 and 2.5
+      disagree on a float32 3-vector ``np.dot``; 3.3e-9 is that bound on this checkpoint. The
+      median bar (1e-15) keeps a regression on the typical request from hiding behind it.
     """
     pre = Gr00tN17Preprocessor.from_pretrained(GR00T, max_state_dim=132, max_action_horizon=40)
     eef = []
