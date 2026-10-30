@@ -1814,13 +1814,15 @@ class PreprocessWorkerThread:
                     # sees it set, so the conductor gets ENABLE_METRICS first
                     self._send_enable_metrics_if_requested()
                     # Releases queued before this request was submitted belong
-                    # to an earlier request under its id: apply them first. And
-                    # a call's route, so its items wait behind no other input.
+                    # to an earlier request under its id: apply them first.
                     self._process_releases()
-                    try:
-                        self._process_messages()
-                    except Exception:  # noqa: BLE001 — the pass's inputs still go
-                        logger.exception("PreprocessWorkerThread message handling failed")
+                    if self._client_edges:
+                        # Routes too, so a call's held items go out before this
+                        # input, which may be a multi-second media preprocess.
+                        try:
+                            self._process_messages()
+                        except Exception:  # noqa: BLE001 — the pass's inputs still go
+                            logger.exception("PreprocessWorkerThread message handling failed")
                     try:
                         self._process_waiting_input(pre_input)
                     except Exception:  # noqa: BLE001 — the pass's other input still goes
