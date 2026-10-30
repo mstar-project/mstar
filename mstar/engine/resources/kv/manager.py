@@ -2297,7 +2297,16 @@ class KVManager(AttentionResource):
         total = int(qo[-1])
         seg = np.repeat(np.arange(len(spans)), spans)
         # each token's position in its stream, after the append
-        kv_after = (np.diff(kvp) - 1) * page_size + indptrs.paged_kv_last_page_len.numpy()
+        last = indptrs.paged_kv_last_page_len.numpy()
+        kv_after = (np.diff(kvp) - 1) * page_size + last
+        # a writing row must hold its tokens in its own pages: a negative page
+        # would wrap in numpy and address another row's page
+        live = spans > 0
+        if not ((kv_after[live] >= spans[live]) & (last[live] <= page_size)).all():
+            raise RuntimeError(
+                "KV packed plan: a row writes past its own pages "
+                f"(spans {spans.tolist()}, kv indptr {kvp.tolist()}, last page lens {last.tolist()})"
+            )
         pos = (kv_after - spans - qo[:-1])[seg] + np.arange(total)
         page, offset = np.divmod(pos, page_size)
         pages = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
