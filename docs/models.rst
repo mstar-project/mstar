@@ -509,6 +509,11 @@ CosyVoice3 notes
   float64).
   ``model_kwargs: {flow_estimator_dtype: float32}`` in the deployment YAML runs
   the estimator at the reference's precision instead, at lower throughput.
+- The flow's Euler solve is captured at startup as CUDA graphs, one per frame
+  bucket and batch size (``flow_capture_frame_buckets``,
+  ``flow_capture_batch_sizes``, ``flow_capture_batch_frames``), which takes GPU
+  memory and startup time. ``model_kwargs: {flow_capture_frame_buckets: []}``
+  captures none, and every solve runs eagerly.
 
 Qwen3-TTS notes
 ---------------
