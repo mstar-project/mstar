@@ -1888,6 +1888,16 @@ default:
 The setting applies only to the API server process. The conductor and workers keep
 torch's default.
 
+A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
+video decoder should therefore emit its clip in the layout the encoder takes, transposed
+on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to the
+encoder: ``[T, C, H, W]`` for torchcodec's ``VideoEncoder`` (Cosmos3) and ``[T, H, W, 3]``
+rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
+A permute in ``postprocess`` costs a host copy of the whole clip, or a slower copy of each
+frame inside PyAV. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
+copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
+the CPUs.
+
 .. _tensor-parallelism:
 
 Tensor parallelism (sharding)
