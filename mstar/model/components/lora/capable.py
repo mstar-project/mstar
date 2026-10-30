@@ -102,8 +102,8 @@ class _LoraPatchConvMixin(LoraBound, LoraCapable):
         kernel = self.kernel_size
         # the patches the conv read ([N, C, G1, K1, G2, K2, ...], less any remainder it
         # dropped), each flattened as the weight is: [N * G1 * G2 ..., C * K1 * K2 ...]
-        x = x[(..., *(slice(0, g * k) for g, k in zip(grid, kernel)))]
-        x = x.reshape(n, self.in_channels, *(d for g, k in zip(grid, kernel) for d in (g, k)))
+        x = x[(..., *(slice(0, g * k) for g, k in zip(grid, kernel, strict=True)))]
+        x = x.reshape(n, self.in_channels, *(d for g, k in zip(grid, kernel, strict=True) for d in (g, k)))
         dims = range(len(grid))
         x = x.permute(0, *(2 + 2 * i for i in dims), 1, *(3 + 2 * i for i in dims))
         rows = y.movedim(1, -1).reshape(-1, out)

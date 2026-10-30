@@ -490,7 +490,8 @@ def test_linked_specs_leave_a_module_to_the_spec_that_places_it():
     def spec(stack: str, node: str, rules: CheckpointRules):
         with torch.device("meta"):
             root = nn.Module()
-            setattr(root, stack, nn.ModuleList([_with(nn.Module(), lambda m: setattr(m, "q", nn.Linear(HIDDEN, HIDDEN)))]))
+            layer = _with(nn.Module(), lambda m: setattr(m, "q", nn.Linear(HIDDEN, HIDDEN)))
+            setattr(root, stack, nn.ModuleList([layer]))
         return module_lora_spec(root, resource_key=node, nodes={node}, root_path="", rules=rules)
 
     text, vision = link_lora_specs([

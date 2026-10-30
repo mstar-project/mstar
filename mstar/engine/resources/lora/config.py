@@ -294,8 +294,8 @@ class LoraSpec(NodeResourceSpec):
     places each checkpoint module on a target; a node's spec comes from
     ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
     ``ModuleLoraMap`` is what binds the node's modules (a spec with any other resolver
-    is refused as the deployment's specs are declared, ``declared_lora_specs``). ``convert_keys`` rewrites a model-native checkpoint
-    layout first.
+    is refused as the deployment's specs are declared, ``declared_lora_specs``).
+    ``convert_keys`` rewrites a model-native checkpoint layout first.
     """
 
     num_layers: int
