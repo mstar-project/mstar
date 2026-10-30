@@ -214,7 +214,7 @@ def make_lora_capable(module: nn.Module) -> LoraBound:
     place (nothing else about it changes). Raises for a module that cannot be."""
     found = lora_capability(module)
     if found is None or found.capable is None:
-        raise TypeError(found.reason if found else f"{type(module).__name__} holds no weights to adapt")
+        raise ValueError(found.reason if found else f"{type(module).__name__} holds no weights to adapt")
     if type(module) is not found.capable:
         module.__class__ = found.capable
     return module
