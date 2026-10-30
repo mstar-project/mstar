@@ -117,25 +117,27 @@ def _admitted(sched: MicroScheduler, batch: ScheduledBatch, refused: bool = Fals
 def _run(
     steps: dict[int, int], order: StepOrder, arrive_at: dict[int, int] | None = None,
     elsewhere: ScheduledBatch | None = None, checks: list[tuple[bool, list[int]]] | None = None,
-    refuse: frozenset[int] = frozenset(),
+    refuse: frozenset[int] = frozenset(), ready_at: dict[int, int] | None = None,
 ) -> list[int]:
     """The rid each step served. ``steps``: rid -> loop length; ``arrive_at``:
     rid -> the step before which it arrives (default 0, in rid order);
     ``elsewhere``: a step of another node on the same worker, run after each
     of this one's; ``checks``: filled with whether a chain built each step
     and the rids its build asked the engine about; ``refuse``: the builds
-    whose step the admit refuses."""
+    whose step the admit refuses; ``ready_at``: rid -> the step before which
+    its row reaches the node, when that is after it arrived."""
     runtime = _Runtime()
     sched, state = _scheduler(runtime, order)
     arrive_at = arrive_at or {}
+    ready_at = {rid: (ready_at or {}).get(rid, arrive_at.get(rid, 0)) for rid in steps}
     left = dict(steps)
     served: list[int] = []
     running = None  # the row step N serves, in flight while N+1 is chosen
     for n in range(2 * sum(steps.values()) + 2):
         for rid in sorted(rid for rid in steps if arrive_at.get(rid, 0) == n):
-            runtime.ready.add(rid)
             runtime.requests[rid] = None
             sched.note_arrival(rid)
+        runtime.ready |= {rid for rid in steps if ready_at[rid] == n}
         runtime.checked.clear()
         step = None
         chained = running is not None and bool(left[running])
@@ -219,10 +221,13 @@ def test_a_request_with_a_recycled_low_handle_does_not_jump_the_others():
 
 def test_under_arrival_the_request_holding_the_step_keeps_it():
     """Request 0 came first but reaches the node after 1 has started there:
-    1 runs to the end of its loop before 0 gets the node."""
-    order = _run({0: 3, 1: 3}, ARRIVAL, arrive_at={0: 0, 1: 0})
+    1 runs to the end of its loop before 0 gets the node. Under TURNS 0 goes
+    as soon as it is ready, being new to the node."""
+    arrival = _run({0: 3, 1: 3}, ARRIVAL, ready_at={0: 2})
+    turns = _run({0: 3, 1: 3}, TURNS, ready_at={0: 2})
 
-    assert order == [0] * 3 + [1] * 3
+    assert arrival == [1] * 3 + [0] * 3
+    assert turns == [1, 1, 0, 1, 0, 0]
 
 
 def test_a_request_that_also_runs_another_node_keeps_its_turn_here():
