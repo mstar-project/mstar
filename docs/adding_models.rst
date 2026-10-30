@@ -1903,6 +1903,14 @@ context can only change through a step of another walk, which checks the row
 in first. Such a walk's KV steps take no forks, sink rows, combined labels or
 eager writes, and its attention needs a plain decode wrapper.
 
+The recurrent state pool keeps each declared label's slot in the rows
+(``mstar/engine/resources/recurrent/rows.py``), and the step addresses the
+pool through them, so a steady step uploads no addressing; the host writes a
+joining row, or a slot a held row's admit took. Every row reports state:
+the pool zeroes each slot it frees or resets, so a fresh slot reads as the
+zeros a new request starts from. Such a walk's recurrent steps take no forks.
+The linear attention resource keeps nothing per row.
+
 The engine refuses the walk at startup if any resource returns None (the
 default), if the walk has no batch cap to size the rows, if the node is
 tensor- or sequence-parallel, or if it shares a resource with another node.
