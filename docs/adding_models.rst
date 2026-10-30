@@ -1997,7 +1997,9 @@ Two separate mechanisms split work across the TP group. Keep them distinct:
   the tensor is replicated to every rank. You need an entry only for edges where the
   producer and the consumer both keep the data sharded. The common case is replicated
   activations, which needs no entry. You can also set ``shard_dim`` per run, under a
-  ``sharding_config`` block in the YAML.
+  ``sharding_config`` block in the YAML. A sharded signal is split over the node's whole
+  lockstep instance, so placement refuses one on a node group with ``sp_size`` or
+  ``cfg_size`` above 1.
 
 If a node group has ``tp_size > 1`` and names a node that is not in ``tp_enabled_nodes``,
 loading fails. See ``configs/qwen3omni_thinker_tp2.yaml`` for an example with several node

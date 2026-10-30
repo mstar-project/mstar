@@ -298,6 +298,25 @@ def test_a_paged_kv_cache_on_a_cfg_parallel_node_is_refused(tmp_path):
     _refused(model, cfg, r"KV kv: a node with cfg_size > 1 can't hold a paged KV cache")
 
 
+class _WideModel(_Model):
+    """A model whose ``llm`` takes TP beside SP or CFG."""
+
+    def get_default_sharding_config(self):
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes={"llm"}, shard_dim={},
+            sp_enabled_nodes={"llm"}, cfg_enabled_nodes={"llm": 2},
+        )
+
+
+@pytest.mark.parametrize("axis", ["sp", "cfg"])
+def test_a_sharded_signal_into_an_instance_wider_than_tp_is_refused(axis, tmp_path):
+    """The fanout splits a shard_dim signal over every instance rank, while
+    only the TP ranks split the weights."""
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1, 2, 3], "tp_size": 2, f"{axis}_size": 2}],
+               sharding_config={"shard_dim": {"x": 1}})
+    _refused(_WideModel(), cfg, r"node 'llm' takes or emits \['x'\], which have a shard_dim")
+
+
 def test_model_yaml_hook_refusal_is_reported(tmp_path):
     _refused(_Model(refuse_yaml="max_concurrent_requests too high"), _cfg(tmp_path),
              r"max_concurrent_requests too high")

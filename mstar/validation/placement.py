@@ -295,8 +295,9 @@ def _sharding_groups(
     worker_graphs: Sequence[WorkerGraph], sharding_config: ShardingConfig,
 ) -> Iterator[str]:
     """v1: one sharding group per worker graph, with the worker graph's
-    tp_size, and no custom graph_walks on a group holding a streaming
-    consumer."""
+    tp_size, no custom graph_walks on a group holding a streaming consumer,
+    and no shard_dim signal on a node whose instance is wider than its TP
+    group: the fanout splits by instance rank, the weights by TP rank."""
     streaming_consumers: set[str] = set()
     node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
     for wg in worker_graphs:
@@ -337,6 +338,24 @@ def _sharding_groups(
                         f"{_describe(wg)} has instance size {wg.instance_size}, but its sharding "
                         f"group has tp_size {group.tp_size}. node_groups and sharding_config disagree."
                     )
+
+    refused: set[str] = set()
+    for wg in worker_graphs:
+        if wg.instance_size == wg.tp_size:
+            continue
+        for name, node in sorted(wg.section.get_nodes().items()):
+            sharded = sorted(
+                signal for signal in node.input_names | {edge.name for edge in node.outputs}
+                if sharding_config.shard_dim.get(signal) is not None
+            )
+            if sharded and name not in refused:
+                refused.add(name)
+                yield (
+                    f"node {name!r} takes or emits {sharded}, which have a shard_dim, but "
+                    f"{_describe(wg)} spans {wg.axis_sizes}: a sharded signal is split over "
+                    "the whole lockstep instance, not the TP group. Drop their "
+                    "sharding_config.shard_dim entries, or set sp_size and cfg_size to 1."
+                )
 
 
 def _paged_kv_on_cfg_ranks(
