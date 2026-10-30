@@ -30,12 +30,13 @@ import asyncio
 from collections.abc import Callable
 
 from fastapi import HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import release_unread, rid
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.utils.generation_kwargs import offset_seed
 
 
@@ -49,7 +50,8 @@ def _plan_chunks(req, adapter, text: str) -> list[str]:
     min_chars = getattr(adapter, "speech_chunk_min_chars", None)
     if requested is False or (requested is None and (min_chars is None or len(text) < min_chars)):
         return [text]
-    chunks = split_sentences(text, max_chars=getattr(adapter, "speech_chunk_max_chars", 400))
+    split = getattr(adapter, "split_speech_text", None)
+    chunks = split(text) if split else split_sentences(text, max_chars=getattr(adapter, "speech_chunk_max_chars", 400))
     max_pieces = getattr(adapter, "speech_chunk_max_pieces", 32)
     if len(chunks) > max_pieces:
         raise HTTPException(
@@ -124,10 +126,17 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
                 # The first piece released itself; release the ones submitted ahead.
                 release_unread(api, pending, 1)
                 raise
+
+            def release_unstarted() -> None:
+                # What _stream_pcm's finally does, for a body that never ran it.
+                release_unread(api, pending, 0)
+                media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
+
             stream_owns_uploads = True
-            return StreamingResponse(
+            return ReleasingStreamingResponse(
                 _stream_pcm(api, submit, len(chunks), pending, first_iter, sample_rate,
                             with_wav_header=not raw_pcm, file_paths=args.file_paths),
+                release=release_unstarted,
                 media_type="audio/pcm" if raw_pcm else "audio/wav",
                 headers={"Cache-Control": "no-cache"},
             )

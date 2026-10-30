@@ -760,7 +760,7 @@ def test_wan22_i2v_declared_without_image_tensor_raises():
 
 
 def _uint8_video(frames=4, height=64, width=96):
-    return torch.randint(0, 256, (1, 3, frames, height, width), dtype=torch.uint8)
+    return torch.randint(0, 256, (frames, height, width, 3), dtype=torch.uint8)
 
 
 def test_wan22_postprocess_video_encodes_decodable_mp4():
