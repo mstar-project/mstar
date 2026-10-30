@@ -1,5 +1,5 @@
-"""GLM-5.2 small-batch MoE decode kernels (moe_decode): the config flag and block wiring on
-CPU; accuracy vs an fp32 dequantized oracle, routing and graph replay on CUDA, at one TP8
+"""GLM-5.2 small-batch MoE decode kernels (moe_decode): what kernels picks and the block
+wiring on CPU; accuracy vs an fp32 dequantized oracle, routing and graph replay on CUDA, at one TP8
 rank's shapes (H 6144, 256 experts, top-8, 256 intermediate per rank)."""
 import importlib.util
 import sys
@@ -38,21 +38,28 @@ BLOCK = (128, 128)
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="moe_decode kernels need CUDA")
 
 
-def test_decode_kernel_flag_defaults_off_and_reaches_the_block():
+def test_kernels_pick_the_decode_and_router_kernels():
+    """kernels: auto (the default) takes the decode chain and the router kernel on the fused
+    path, the reference neither; the prefill kernels, the runner's bits, serve both."""
     from mstar.model.glm52.glm52_model import Glm52Model
 
-    assert Glm52ModelConfig().moe_decode_kernel is False
-    model = Glm52Model("unused", config_variant="reduced_fp8", moe_decode_kernel=True)
-    assert model.config.moe_decode_kernel is True
+    assert Glm52ModelConfig().kernels == "auto"
+    assert Glm52Model("unused", config_variant="reduced_fp8", kernels="reference").config.kernels == "reference"
+    for retired in ("moe_decode_kernel", "moe_quant_kernel", "moe_prefill_kernel"):
+        with pytest.raises(ValueError, match=retired):
+            Glm52Model("unused", config_variant="reduced_fp8", **{retired: True})
+    with pytest.raises(ValueError, match="kernels"):
+        Glm52Model("unused", config_variant="reduced_fp8", kernels="triton")
     cfg = Glm52ModelConfig.reduced_fp8(block=(16, 16))
-    assert Glm52SparseMoeBlock(cfg)._decode_kernel is False
-    cfg.moe_decode_kernel = True
-    assert Glm52SparseMoeBlock(cfg)._decode_kernel is True
+    block = Glm52SparseMoeBlock(cfg)
+    assert block._decode_kernel and block._router_kernel and block._prefill_kernel
+    cfg.kernels = "reference"
+    block = Glm52SparseMoeBlock(cfg)
+    assert not block._decode_kernel and not block._router_kernel and block._prefill_kernel
 
 
 def test_use_decode_needs_the_fused_path_and_a_cuda_batch():
     cfg = Glm52ModelConfig.reduced_fp8(block=(16, 16))
-    cfg.moe_decode_kernel = True
     block = Glm52SparseMoeBlock(cfg)
     for p in block.parameters():
         if p.dtype == torch.uint8:
@@ -67,15 +74,7 @@ def test_use_decode_needs_the_fused_path_and_a_cuda_batch():
     assert not block._use_decode(x.bfloat16())  # host tensor
 
 
-def test_prefill_kernel_flag_defaults_off_and_reaches_the_block():
-    from mstar.model.glm52.glm52_model import Glm52Model
-
-    assert Glm52ModelConfig().moe_prefill_kernel is False
-    model = Glm52Model("unused", config_variant="reduced_fp8", moe_prefill_kernel=True)
-    assert model.config.moe_prefill_kernel is True
-    cfg = Glm52ModelConfig.reduced_fp8(block=(16, 16))
-    cfg.moe_prefill_kernel = True
-    assert Glm52SparseMoeBlock(cfg)._prefill_kernel is True
+def test_dispatch_prefill_is_compiler_disabled():
     fn = Glm52SparseMoeBlock._dispatch_prefill
     assert hasattr(fn, "_torchdynamo_disable") or hasattr(fn, "_torchdynamo_orig_callable")
 
@@ -138,8 +137,6 @@ def _block(*, hidden=6144, inter=256, experts=256, top_k=8, bias_std=0.02, seed=
     cfg.hidden_size, cfg.moe_intermediate_size = hidden, inter
     cfg.n_routed_experts, cfg.num_experts_per_tok = experts, top_k
     cfg.quantization_config = Fp8BlockQuantConfig(weight_block_size=BLOCK)
-    cfg.moe_quant_kernel = "triton"
-    cfg.moe_decode_kernel = True
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("cuda"):
@@ -198,7 +195,8 @@ def _pair_max():
 
 
 def _current(block, x):
-    """The block's path without the flag: fp32 router, W8A8 runner, bf16 shared expert."""
+    """The block's path without the decode chain: fp32 router, W8A8 runner, bf16 shared
+    expert."""
     block._decode_kernel = False
     try:
         return block(x)
@@ -419,15 +417,16 @@ def test_graph_replay_matches_unchained_path(rank_block, tokens):
 @pytest.mark.parametrize("tokens", [65, 300, 2048])
 def test_prefill_kernel_keeps_the_runner_bits(rank_block, tokens):
     """moe_prefill keeps fused_experts_fp8's tile rows and K order: the block's output is
-    the same with and without it."""
+    the same with and without it, so every fused block takes it."""
     block = rank_block
     torch.manual_seed(tokens)
     x = torch.randn(tokens, block.hidden_size, device="cuda", dtype=torch.bfloat16)
+    assert block._prefill_kernel
     with torch.no_grad():
-        old = block(x)
-        block._prefill_kernel = True
+        new = block(x)
+        block._prefill_kernel = False
         try:
-            new = block(x)
+            old = block(x)
         finally:
-            block._prefill_kernel = False
+            block._prefill_kernel = True
     torch.testing.assert_close(new, old, rtol=0, atol=0)

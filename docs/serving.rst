@@ -393,7 +393,10 @@ pool's pages divided by the pages one request needs, prompt and output together,
 safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload
 frees only the device pages no other running request reads, though, so a request that
 shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap.
+It doesn't replace the cap. With a host pool and the prefix cache on, a cached page is
+copied to the host once no request holds it, and a later request whose prefix the device
+evicted copies it back from there. So the host pool should hold more pages than the device's
+prefix cache.
 
 **Single GPU.** Everything on rank 0:
 

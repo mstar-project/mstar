@@ -34,6 +34,7 @@ from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
+    KERNELS,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
@@ -46,8 +47,14 @@ from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
-# fused_add_rmsnorm fuses all-reduces up to this size; larger ones reduce, add and norm apart
+# kernels: auto fuses all-reduces up to this size into the next add + RMSNorm; larger ones
+# reduce, add and norm apart
 AR_FUSION_MAX_BYTES = 1 << 20
+# the switches kernels and the checkpoint's quantization replaced
+_RETIRED_KWARGS = (
+    "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
+    "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
+    "prefill_last_layer_rows")
 
 
 class Glm52Model(Model):
@@ -94,24 +101,16 @@ class Glm52Model(Model):
             self.config.dsa_shard_prefill = bool(kwargs.get("dsa_shard_prefill", False))
             # Guard + KV sizing move from index_topk to the serving window.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
-        if "moe_quant_kernel" in kwargs:
-            self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
-        if "moe_fused_allreduce" in kwargs:
-            self.config.moe_fused_allreduce = bool(kwargs["moe_fused_allreduce"])
-        if "moe_decode_kernel" in kwargs:
-            self.config.moe_decode_kernel = bool(kwargs["moe_decode_kernel"])
-        if "moe_prefill_kernel" in kwargs:
-            self.config.moe_prefill_kernel = bool(kwargs["moe_prefill_kernel"])
-        if "moe_router_kernel" in kwargs:
-            self.config.moe_router_kernel = bool(kwargs["moe_router_kernel"])
-        if "prefill_last_layer_rows" in kwargs:
-            self.config.prefill_last_layer_rows = bool(kwargs["prefill_last_layer_rows"])
-        if "dense_fp8" in kwargs:
-            self.config.dense_fp8 = bool(kwargs["dense_fp8"])
-        if "mla_fused_prep" in kwargs:
-            self.config.mla_fused_prep = bool(kwargs["mla_fused_prep"])
-        if "fused_add_rmsnorm" in kwargs:
-            self.config.fused_add_rmsnorm = bool(kwargs["fused_add_rmsnorm"])
+        retired = sorted(k for k in _RETIRED_KWARGS if k in kwargs)
+        if retired:
+            # a config that still names one would otherwise serve without what it asks for
+            raise ValueError(
+                f"{retired}: GLM-5.2 has no such switch; model_kwargs.kernels picks its kernels "
+                f"({' or '.join(KERNELS)}) and the checkpoint its fp8 linears")
+        if "kernels" in kwargs:
+            if kwargs["kernels"] not in KERNELS:
+                raise ValueError(f"kernels must be one of {KERNELS}, got {kwargs['kernels']!r}")
+            self.config.kernels = kwargs["kernels"]
         if "graph_compile" in kwargs:
             self.config.graph_compile = bool(kwargs["graph_compile"])
         for key in ("prefill_token_buckets", "prefill_batched_token_buckets",
@@ -610,7 +609,7 @@ class Glm52Model(Model):
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
-        if self.config.fused_add_rmsnorm and tp_group is not None and tp_group.world_size > 1:
+        if self.config.tuned_kernels and tp_group is not None and tp_group.world_size > 1:
             # collective over the TP group; every rank builds the LLM here
             dtype = language_model.model.norm.weight.dtype
             tp_group.init_allreduce_fusion(
@@ -676,10 +675,10 @@ class Glm52Model(Model):
             raw.get("quantization_config"),
         )
         if quant is not None:
+            self.config.quantization_config = quant
             logger.info(
                 "Glm52Model: fp8 %s checkpoint (block %s) — non-expert linears "
-                "fp8=%s, routed experts fp8-resident=%s.",
+                "fp8=%s, routed experts fp8-resident=%s, kernels=%s.",
                 quant.fmt, quant.weight_block_size, self.config.dense_fp8,
-                self.config.moe_fp8_resident,
+                self.config.moe_fp8_resident, self.config.kernels,
             )
-            self.config.quantization_config = quant

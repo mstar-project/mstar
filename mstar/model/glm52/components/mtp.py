@@ -1,8 +1,6 @@
 """GLM-5.2 MTP (multi-token-prediction) draft module."""
 from __future__ import annotations
 
-import dataclasses
-
 import torch
 from torch import nn
 
@@ -56,8 +54,8 @@ class Glm52MTPModule(nn.Module):
         )
         # the draft layer has no next norm to take its partials: it reduces its own
         self.transformer_layer = Glm52DecoderLayer(
-            dataclasses.replace(config, fused_add_rmsnorm=False),
-            layer_idx=config.num_hidden_layers, comm_group=comm_group,
+            config, layer_idx=config.num_hidden_layers, comm_group=comm_group,
+            fused_add_rmsnorm=False,
         )
         self.shared_head = Glm52SharedHead(config)
 
