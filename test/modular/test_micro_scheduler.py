@@ -605,22 +605,38 @@ def test_a_chain_filled_by_its_backlog_checks_no_queued_row():
     assert not {"f0", "f1"} & set(engine.checked), "the ready queue was scanned"
 
 
-def test_a_backlog_that_fills_the_step_runs_without_a_scan():
-    """The worker's own scheduling pass too: fresh rows could not join, so
-    checking and popping them only to park them again is wasted."""
-    engine = _Engine(max_bs=4)
+def test_a_row_holding_the_step_keeps_it_over_a_backlog_that_fills_it():
+    """Under ARRIVAL: the holder's step landed and its row is back on its
+    queue, while a later request parked in the backlog fills the step on its
+    own. The holder goes first; skipping the scan would hand it the step."""
+    engine = _Engine(max_bs=1, order=StepOrder.ARRIVAL)
     sched = _scheduler(engine)
+    sched.note_arrival("h")
+    sched.note_arrival("b")
+    _turns(sched, ["h"])
+    sched.backlog[(NODE, WALK)] = _batch(["b"])
+    manager = _Manager(["h"])
+
+    batch = _next_batch(sched, manager)
+
+    assert list(batch.request_to_worker_graph) == ["h"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b"]
+
+
+def test_a_backlog_that_waited_still_drains_first_under_turns():
+    """The split set ran before the queued rows did, so it is first in line."""
+    sched = _scheduler(_Engine(max_bs=4, order=StepOrder.TURNS))
+    _turns(sched, [f"b{i}" for i in range(4)], ["f0", "f1"])
     sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(4)])
     manager = _Manager(["f0", "f1"])
 
     batch = _next_batch(sched, manager)
 
     assert set(batch.request_to_worker_graph) == {f"b{i}" for i in range(4)}
-    assert not {"f0", "f1"} & set(engine.checked), "the ready queue was scanned"
+    # popped by the scan, pushed out by the cap: back to their queue
     assert set(manager.queues["wg0"].get_ready_node_names()) == {"f0", "f1"}
 
-
-def test_a_held_backlog_row_does_not_count_toward_skipping_the_scan():
+def test_a_held_backlog_row_waits_out_of_the_chains_pick():
     engine = _Engine(max_bs=16)
     sched = _scheduler(engine)
     sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(8)])

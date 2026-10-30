@@ -897,8 +897,9 @@ class MicroScheduler:
         scan_exclude = exclude_target if skip_walk else None
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
         scan_exclude = scan_exclude or exclude_target
-        # scanned only once a step could take fresh rows
-        ready: dict[tuple[str, str], list[ReadyNodeEntry]] | None = None
+        # A queued row can be first in line even where a backlog fills the
+        # step on its own (a row holding the step, back on its queue).
+        ready = self._scan_ready(request_state, None, scan_exclude)
 
         def schedule(key, entries):
             # a yield-away runs the other walks: the chain's own rows parked
@@ -914,18 +915,9 @@ class MicroScheduler:
         # yield-away from the chain running it leaves that backlog to it.
         keys = [k for k in self.backlog if not self._left_to_its_chain(k, exclude_target, skip_walk)]
         for key in keys:
-            # no fresh row could join a step its backlog fills, unless every backlogged row is blocked
-            if self._backlog_fills(key):
-                scheduled = schedule(key, [])
-                if scheduled is not None:
-                    return scheduled
-            if ready is None:
-                ready = self._scan_ready(request_state, None, scan_exclude)
             scheduled = schedule(key, ready.get(key, []))
             if scheduled is not None:
                 return scheduled
-        if ready is None:
-            ready = self._scan_ready(request_state, None, scan_exclude)
         # A walk with no room (a cap of 0) takes nothing, so it stays the least
         # recent; picked anyway, it would starve the walk that frees the room.
         rr_key = self._select_node_rr({
@@ -1191,13 +1183,6 @@ class MicroScheduler:
             self.backlog[target], live, rid,
             functools.partial(self._capture_group, request_state, *target),
         )
-
-    def _backlog_fills(self, key: tuple[str, str]) -> bool:
-        """Whether ``key``'s live backlog alone fills any step it could run,
-        so a scan for fresh rows is wasted."""
-        caps = self._walk_caps(key).values()
-        room = None if None in caps else max(caps)
-        return room is not None and len(self._live_backlog(key)) >= room
 
     def _live_backlog(self, node_walk: tuple[str, str]) -> set[int]:
         """``node_walk``'s backlogged rids that are not failed, removed or held."""
