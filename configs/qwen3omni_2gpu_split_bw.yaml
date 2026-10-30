@@ -1,0 +1,21 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+# qwen3omni_2gpu_split.yaml with Code2Wav windows waiting up to 50 ms for
+# others to join their step (a request's first window never waits). Code2Wav
+# pads every window to one shape, so fewer, larger steps leave more of GPU 0 to
+# the Talker.
+resources:
+  thinker_kv:
+    max_num_pages: 1024
+    cpu_offload_pages: 1024
+node_groups:
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [1]
+  - node_names: [Thinker]
+    ranks: [1]
+  - node_names: [Talker]
+    ranks: [0]
+  - node_names: [Code2Wav]
+    ranks: [2]
+rank_devices: {2: 0}
+batch_wait_ms: {Code2Wav: 50}
