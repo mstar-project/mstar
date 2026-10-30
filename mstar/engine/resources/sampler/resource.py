@@ -123,7 +123,7 @@ class SamplerResource(Resource):
         # rid -> the prompt tokens a cache hit kept out of each walk's inputs. Keyed by the
         # position after them, so a repeated probe replaces its own entry.
         self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
-        # this step's `SamplerStep.kept_rids`, for the eager draw
+        # this step's `SamplerStep.kept_rids`, for the eager draw and the in-graph scatter index
         self._kept_rids: frozenset[int] | None = None
         # row indices for `overwrite_rows`, H2D from a ring of pinned buffers
         self._row_stager: PinnedStager | None = None
@@ -474,7 +474,7 @@ class SamplerResource(Resource):
             )
         self._cg_buffers.gather_dynamic(
             ctx.request_ids, padded_bs, cg_slot,
-            gather_seen_tokens=self._penalty_needed_this_step,
+            gather_seen_tokens=self._penalty_needed_this_step, kept=self._kept_rids,
         )
         if self._history is not None:
             self._history.gather_step(ctx.request_ids, padded_bs)
@@ -497,7 +497,7 @@ class SamplerResource(Resource):
                 keep_gpu = self._cg_buffers.keep_mask(keep)
             self._history.scatter_step(keep_gpu)
         if self._cg_buffers.ingraph_scatter:
-            # the captured sample scattered both rows itself
+            # the captured sample scattered both rows itself, a dropped row's to the trash row
             if self._penalty_needed_this_step:
                 self._cg_sampler.sync_seen_token_masks(
                     [self._sampler.get_token_mask(rid) for rid in ctx.request_ids],

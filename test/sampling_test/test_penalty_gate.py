@@ -63,7 +63,7 @@ class _RecordingBuffers:
     def stage_seen_token_masks(self, request_ids, seen_masks):
         self.staged += 1
 
-    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True):
+    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True, kept=None):
         self.gathered_seen.append(gather_seen_tokens)
 
     def sampler_for(self, padded_bs, cg_slot):

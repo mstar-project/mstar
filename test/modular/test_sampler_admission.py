@@ -18,8 +18,9 @@ sys.path.insert(0, ".")
 import torch
 
 from mstar.engine.resources import StepRunner
+from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import ASKS
+from mstar.engine.resources.step import ASKS, SlotLease, StepContext
 
 CPU = torch.device("cpu")
 NODE, WALK = "llm", "decode"
@@ -80,3 +81,33 @@ def test_without_fixed_rows_the_sampler_admits_every_request(monkeypatch):
             assert res.ask(rid, NODE, WALK) is None and bufs.has_slot(rid), kwargs
         assert bufs._master_capacity >= 3, "the growing masters didn't grow"
 
+
+def test_a_dropped_rows_offset_stays_uncommitted_through_plan_and_commit(monkeypatch):
+    """``SamplerStep.kept_rids`` on a captured step with the in-graph scatter: plan stages
+    the dropped row's scatter index at the trash row, so the replay leaves its offset."""
+    res = _resource(monkeypatch, slots=8, max_bs=4)
+    runner = StepRunner({"sampler": res}, node_resources={NODE: ["sampler"]})
+    for rid in (1, 2):
+        res.ingest_request(rid)
+        assert runner.admit_retrieve(rid, NODE, WALK).ready
+    bufs = res._cg_buffers
+    slots = [bufs._rid_to_slot[rid] for rid in (1, 2)]
+
+    def step(kept):
+        sampler_step = SamplerStep(kept_rids=kept)
+        ctx = StepContext(
+            request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False,
+            slot_lease=SlotLease(slot=1, bucket=SimpleNamespace(bs=4)),
+        )
+        res.plan(sampler_step, ctx)
+        # what the captured sample does around its draw
+        s = res._cg_sampler
+        s.gather_in_graph()
+        s.offset_buf += 1
+        s.scatter_in_graph(torch.tensor([5, 6, 0, 0]))
+        res.commit(sampler_step, ctx)
+
+    step(frozenset({1}))
+    assert bufs.offset.master[slots].tolist() == [1, 0], "the dropped row's offset was committed"
+    step(None)
+    assert bufs.offset.master[slots].tolist() == [2, 1]

@@ -601,7 +601,8 @@ Worker scheduling
        and scatters the advanced offsets and the sampled tokens back inside
        the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
-       postprocess wins). Padding rows then address a trash master row. The offset and
+       postprocess wins). Padding rows, and the rows a step drops
+       (``SamplerStep.kept_rids``), write a trash master row. The offset and
        last-token masters, which the captured graphs index, are allocated
        once for ``MSTAR_SAMPLER_SLOTS`` requests, and a request takes its row
        when the runner admits it (``SamplerResource.reserve``): past them it

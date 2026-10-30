@@ -195,3 +195,27 @@ def test_capture_padding_rows_take_no_slot():
         bufs.last_token.master[0].item(), 5,
     ]
 
+
+def test_a_dropped_row_keeps_its_offset_and_token_in_graph():
+    """``SamplerStep.kept_rids``: a dropped row still draws at its own offset,
+    but the captured scatter sends its offset and token to the trash row."""
+    bufs = _ingraph()
+    for rid in ("a", "b"):
+        bufs.register_request(rid)
+    bufs.write_last_tokens(["a", "b"], torch.tensor([1, 2]))
+    slot_a, slot_b = bufs._rid_to_slot["a"], bufs._rid_to_slot["b"]
+    bufs.gather_static(["a", "b"], 4, 1)
+    bufs.gather_dynamic(["a", "b"], 4, 1, kept=frozenset({"a"}))
+    bufs.offset.master[slot_a], bufs.offset.master[slot_b] = 10, 20
+    s = bufs.sampler_for(4, 1)
+    assert s.slot_idx_view.tolist() == [slot_a, slot_b, 0, 0]
+    assert s.scatter_idx_view.tolist() == [slot_a, 0, 0, 0]
+    s.gather_in_graph()
+    assert s.offset_buf.tolist()[:2] == [10, 20]
+    s.offset_buf += 1
+    s.scatter_in_graph(torch.tensor([21, 22, 99, 98]))
+    assert bufs.offset.master[[slot_a, slot_b]].tolist() == [11, 20]
+    assert bufs.last_tokens_for(["a", "b"]).tolist() == [21, 2]
+    # the next step keeps every row, and stages that into the same views
+    bufs.gather_dynamic(["a", "b"], 4, 1)
+    assert s.scatter_idx_view.tolist() == [slot_a, slot_b, 0, 0]

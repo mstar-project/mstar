@@ -1622,12 +1622,15 @@ class AcceleratorGraphableSampler(BaseSampler):
     last_token_buf: torch.Tensor | None = None
     tp_group: "CommGroup | None" = None  # noqa: F821
     # In-graph gather/scatter (``MSTAR_SAMPLER_INGRAPH_SCATTER``): the slot
-    # masters and this slot's padded index row, all static, so the captured
+    # masters and this slot's padded index rows, all static, so the captured
     # sample reads its offsets from the masters and writes the advanced
     # offsets and the sampled tokens back without a launch after the replay.
+    # The scatter row is the gather row with the step's dropped rows
+    # (``SamplerStep.kept_rids``) sent to the trash row, as padding rows are.
     offset_master: torch.Tensor | None = None
     last_token_master: torch.Tensor | None = None
     slot_idx_view: torch.Tensor | None = None
+    scatter_idx_view: torch.Tensor | None = None
     ingraph_scatter: bool = False
 
     # Set during graph capture, and used by the cuda graph runner to determine
@@ -1642,10 +1645,10 @@ class AcceleratorGraphableSampler(BaseSampler):
 
     def scatter_in_graph(self, codes: torch.Tensor) -> None:
         """Advanced offsets and sampled tokens back to the masters, inside the
-        graph: every row, padding rows into the trash row."""
-        self.offset_master.index_copy_(0, self.slot_idx_view, self.offset_buf)
+        graph: every row, padding and dropped rows into the trash row."""
+        self.offset_master.index_copy_(0, self.scatter_idx_view, self.offset_buf)
         self.last_token_master.index_copy_(
-            0, self.slot_idx_view, codes.to(self.last_token_master.dtype),
+            0, self.scatter_idx_view, codes.to(self.last_token_master.dtype),
         )
 
     @torch.compiler.disable
@@ -2025,7 +2028,10 @@ class SamplerBuffers:
     cg_slots: int = 1
     # Per-step slot-index staging, per cg slot. ``_slot_idx_cpu`` is pinned so
     # the H2D copy can be issued non-blocking; ``_slot_idx_gpu`` is the
-    # device-side index tensor that ``index_select`` reads from.
+    # device-side index tensor that ``index_select`` reads from. A step of
+    # ``padded_bs`` rows uses ``[:padded_bs]`` as its gather index and, with
+    # ``ingraph_scatter``, ``[padded_bs:2 * padded_bs]`` as its scatter index,
+    # so one copy uploads both.
     _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
     _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
     # Zero-copy numpy view of ``_slot_idx_cpu``, so staging is one slice write
@@ -2037,6 +2043,8 @@ class SamplerBuffers:
     _last_real_bs: list[int] = field(default_factory=list, repr=False)
     # memoized per (slot, real rows): see ``_scatter_idx``
     _scatter_idx_views: dict = field(default_factory=dict, repr=False)
+    # (cg slot, padded_bs) -> (device dst, pinned src, gather view) of ``_upload_slot_idx``
+    _upload_views: dict = field(default_factory=dict, repr=False)
     # cg slot -> the (rids, padded_bs) its pinned index row currently holds, so
     # gather_dynamic can re-issue the H2D without redoing the O(bs) CPU fill
     _staged_rids: dict[int, tuple[tuple[str, ...], int]] = field(
@@ -2129,6 +2137,8 @@ class SamplerBuffers:
         # row 0 is the trash row; requests take rows 1..cap
         rows = cap + 1
         graph_rows = max(cap, ingraph_cap) + 1
+        # the in-graph scatter's index follows the gather index (see ``_slot_idx_cpu``)
+        idx_cols = 2 * max_batch_size if ingraph_scatter else max_batch_size
 
         def mk(dtype: torch.dtype, default: float) -> HostBuffer:
             return HostBuffer.allocate(
@@ -2174,8 +2184,8 @@ class SamplerBuffers:
             ingraph_scatter=ingraph_scatter,
             _ingraph_capacity=ingraph_cap,
             cg_slots=cg_slots,
-            _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
-            _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
+            _slot_idx_cpu=torch.zeros(cg_slots, idx_cols, dtype=torch.long, pin_memory=pinned),
+            _slot_idx_gpu=torch.zeros(cg_slots, idx_cols, dtype=torch.long, device=device),
             _last_real_bs=[0] * cg_slots,
             _free_slots=list(range(1, cap + 1)),
         )
@@ -2204,6 +2214,7 @@ class SamplerBuffers:
             "offset_master": self.offset.master,
             "last_token_master": self.last_token.master,
             "slot_idx_view": self._slot_idx_gpu[cg_slot, :bs],
+            "scatter_idx_view": self._slot_idx_gpu[cg_slot, bs:2 * bs] if self.ingraph_scatter else None,
             "ingraph_scatter": self.ingraph_scatter,
         }
 
@@ -2453,10 +2464,32 @@ class SamplerBuffers:
         self._slot_idx_np[cg_slot, :padded_bs] = rows
         self._staged_rids[cg_slot] = (tuple(request_ids), padded_bs)
 
+    def _stage_scatter_idx(
+        self, request_ids: list[str], padded_bs: int, cg_slot: int, kept: "frozenset | None",
+    ) -> None:
+        """The in-graph scatter's index, behind the staged gather index: the same
+        rows, except that a row ``kept`` leaves out writes the trash row, so its
+        offset and last token stay as they were (``SamplerStep.kept_rids``)."""
+        row = self._slot_idx_np[cg_slot]
+        scatter = row[padded_bs:2 * padded_bs]
+        scatter[:] = row[:padded_bs]
+        if kept is not None:
+            for i, rid in enumerate(request_ids):
+                if rid not in kept:
+                    scatter[i] = self._trash_slot
+
     def _upload_slot_idx(self, padded_bs: int, cg_slot: int) -> torch.Tensor:
-        """H2D the staged row on the CURRENT stream, and hand back its view."""
-        idx_view = self._slot_idx_gpu[cg_slot, :padded_bs]
-        idx_view.copy_(self._slot_idx_cpu[cg_slot, :padded_bs], non_blocking=True)
+        """H2D the staged row on the CURRENT stream, and hand back its gather view."""
+        key = (cg_slot, padded_bs)
+        views = self._upload_views.get(key)
+        if views is None:
+            cols = 2 * padded_bs if self.ingraph_scatter else padded_bs
+            views = self._upload_views[key] = (
+                self._slot_idx_gpu[cg_slot, :cols], self._slot_idx_cpu[cg_slot, :cols],
+                self._slot_idx_gpu[cg_slot, :padded_bs],
+            )
+        dst, src, idx_view = views
+        dst.copy_(src, non_blocking=True)
         return idx_view
 
     def gather_static(
@@ -2491,7 +2524,7 @@ class SamplerBuffers:
 
     def gather_dynamic(
         self, request_ids: list[str], padded_bs: int, cg_slot: int,
-        gather_seen_tokens: bool = True,
+        gather_seen_tokens: bool = True, kept: "frozenset | None" = None,
     ) -> None:
         """Gather the per-step state — RNG offset and seen-token mask — into
         ``cg_slot``. Must run inline (default stream) AFTER the previous step's
@@ -2501,13 +2534,17 @@ class SamplerBuffers:
         Only the H2D is re-issued (the pinned row ``gather_static`` staged for
         this slot is stream-agnostic, and this step's batch is the one it was
         staged for) — restaging is the fallback for a caller that reached here
-        without a matching ``gather_static``.
+        without a matching ``gather_static``. With ``ingraph_scatter`` the
+        scatter index for this step's ``kept`` rows is staged here, on the
+        step it is for, and goes up in the same copy.
 
         The seen-token mask is large ([bs, V] bool); only gathered when the
         caller's graph actually applies the penalty in-graph (the Talker)."""
         self._sync_device_capacity()
         if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
+        if self.ingraph_scatter:
+            self._stage_scatter_idx(request_ids, padded_bs, cg_slot, kept)
         with self._offset_reset_lock:
             resets, self._pending_offset_reset = self._pending_offset_reset, set()
         for slot in resets:

@@ -1366,7 +1366,8 @@ still brings it routed; put it over the one read from the device with
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
 allocated once, ``knobs: sampler_slots`` of them, so a request takes its row when the runner
-admits it and waits while none is free, as it does for a recurrent state slot.
+admits it and waits while none is free, as it does for a recurrent state slot. A row the
+step drops (``SamplerStep(kept_rids=...)``) writes the trash row, so it keeps its offset.
 
 State that a decode loop carries from step to step beside the token, such as Whisper's
 timestamp rule state, is declared on the sampler, not kept in the model:
