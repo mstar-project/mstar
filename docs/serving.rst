@@ -247,9 +247,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
-       a 503. Required for Qwen3.5, Qwen3-ASR and Whisper while the sampler's in-graph
-       scatter is on (``knobs: sampler_ingraph_scatter``, the default), at most half of
-       ``knobs: sampler_slots`` (4096).
+       a 503.
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against

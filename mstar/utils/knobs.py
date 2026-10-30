@@ -82,16 +82,16 @@ def sampler_ingraph_scatter() -> bool:
     (each is a GIL release the main thread's postprocess can win). Padding
     rows then address a trash master row, and the offset and last-token
     masters are allocated once for ``sampler_slots`` concurrent requests,
-    since a captured graph holds their addresses; a worker refuses to start
-    a deployment whose ``max_concurrent_requests`` doesn't fit them."""
+    since a captured graph holds their addresses; a request takes its row at
+    admission and waits while none is free."""
     return _setting("sampler_ingraph_scatter", "1") == "1"
 
 
 def sampler_slots() -> int:
     """``sampler_slots`` / ``MSTAR_SAMPLER_SLOTS`` (default 4096): request rows
     of the masters a captured graph indexes when the in-graph scatter is on
-    (see ``sampler_ingraph_scatter``); room for a ``max_concurrent_requests``
-    of half that."""
+    (see ``sampler_ingraph_scatter``), so the most requests admitted at once
+    on its node."""
     return int(_setting("sampler_slots", "4096"))
 
 

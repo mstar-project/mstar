@@ -2110,7 +2110,8 @@ class SamplerBuffers:
         outgrow them. With ``ingraph_scatter`` the offset and last-token masters
         hold ``slots`` request rows (the knob's 4096 by default), allocated
         once: the captured graphs keep their addresses, so those two never grow,
-        and the others grow up to them.
+        and the others grow up to them. A registration past them raises, so the
+        caller takes rows only while ``free_rows`` says one is left.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
         repetition penalty. ``history`` (with ``stop_ids`` and
@@ -2267,13 +2268,11 @@ class SamplerBuffers:
         ``_init_slot`` cannot land in the old array; device masters grow on the gpu thread.
         """
         if self.ingraph_scatter:
-            # the startup check (SamplerResource.admission_problem) keeps a capped
-            # deployment below this
+            # admission (`SamplerResource.reserve`) registers a request only while a row is free
             if self._master_capacity >= self._ingraph_capacity:
                 raise RuntimeError(
-                    f"more than {self._ingraph_capacity} concurrent requests on the "
-                    "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
-                    "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
+                    f"a registration past the sampler's {self._ingraph_capacity} in-graph "
+                    "rows (MSTAR_SAMPLER_SLOTS); a request takes one only once free_rows has one"
                 )
             new_capacity = min(new_capacity, self._ingraph_capacity)
         rows = new_capacity + 1  # plus the trash row
@@ -2301,6 +2300,12 @@ class SamplerBuffers:
         for buf in self.loopback.values():
             buf.grow_master(rows)
         self._device_capacity = cap
+
+    @property
+    def free_rows(self) -> int:
+        """With ``ingraph_scatter``, the registrations the fixed masters still
+        have rows for: the free list plus the rows the others haven't grown to."""
+        return len(self._free_slots) + self._ingraph_capacity - self._master_capacity
 
     def register_request(
         self, rid: str, sampling_config: SamplingConfig | None = None,

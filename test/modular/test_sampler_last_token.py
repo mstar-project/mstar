@@ -164,8 +164,10 @@ def test_ingraph_scatter_graph_masters_never_grow():
     offset, last_token = bufs.offset.master, bufs.last_token.master
     assert offset.shape[0] == last_token.shape[0] == 5
     assert bufs.temperature.master.shape[0] == bufs.seen_tokens.master.shape[0] == 3
+    assert bufs.free_rows == 4
     for rid in ("a", "b", "c", "d"):
         bufs.register_request(rid)
+    assert bufs.free_rows == 0
     bufs.write_last_tokens(["d"], torch.tensor([7]))  # a gpu-thread access grows the device rows
     assert bufs.temperature.master.shape[0] == bufs.seen_tokens.master.shape[0] == 5
     assert bufs.offset.master is offset and bufs.last_token.master is last_token
@@ -193,29 +195,3 @@ def test_capture_padding_rows_take_no_slot():
         bufs.last_token.master[0].item(), 5,
     ]
 
-
-def test_the_startup_check_wants_a_cap_that_fits_the_graph_masters(monkeypatch):
-    from mstar.engine.engine import Engine
-    from mstar.engine.resources.sampler.resource import SamplerResource
-
-    monkeypatch.delenv("MSTAR_SAMPLER_INGRAPH_SCATTER", raising=False)
-    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
-    monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", "64")
-    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
-    monkeypatch.setattr(res, "can_capture", lambda: True)
-    # a node that takes its tokens on the host never scatters in graph
-    assert res.admission_problem(None) is None
-    res.enable_device_loopback_reader()
-    assert "set max_concurrent_requests to at most 32" in res.admission_problem(None)
-    assert res.admission_problem(32) is None
-    assert "`knobs: {sampler_slots: 66}`" in res.admission_problem(33)
-    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "0")
-    assert res.admission_problem(None) is None
-
-    # the worker's engine refuses to start on it
-    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
-    engine = Engine.__new__(Engine)
-    engine._resources = {"sampler": res}
-    engine.check_admission(32)
-    with pytest.raises(ValueError, match="resource sampler: .*sampler_ingraph_scatter: false"):
-        engine.check_admission(None)

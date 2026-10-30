@@ -115,6 +115,8 @@ def test_capture_rows_take_no_master_rows(ingraph, monkeypatch):
     # a full machine of real requests fits without growing or raising
     for i in range(cap):
         res.ingest_request(f"real{i}")
+        if ingraph:  # the row is taken at admission
+            assert res.reserve(f"real{i}", "node", "decode", None) is None
     assert bufs._master_capacity == cap
     # removing a capture row frees nothing it never held
     res.remove_request(rids[0])

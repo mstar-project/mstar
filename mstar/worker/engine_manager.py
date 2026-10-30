@@ -174,7 +174,6 @@ class EngineManager:
             kv_cache_type=autocast_dtype,
             model=model,
         )
-        engine.check_admission(model_config.get("max_concurrent_requests"))
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
         return cls(engine=engine, node_names=set(node_names))
