@@ -36,7 +36,6 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
     CLIENT,
-    ClientStream,
     ClientStreamLimits,
     Connection,
     PartitionTopology,
@@ -285,14 +284,12 @@ def test_a_client_stream_with_a_shard_dim_is_refused(tmp_path, monkeypatch):
 
 
 def test_the_route_encodes_without_pickle():
-    consumers = find_client_streams(_DuplexToy())
-    body = ClientStreamRoute(request_id="r", workers={"audio_in": ["worker_0", "worker_1"]}, consumers=consumers)
+    body = ClientStreamRoute(request_id="r", workers={"audio_in": ["worker_0", "worker_1"]})
     msg = WorkerMessage(message_type=WorkerMessageType.CLIENT_STREAM_ROUTE, body=body)
     # typed fields, not the pickle fallback; the envelope finds it by its tag
     assert wire._encoder(ClientStreamRoute).__name__ == "_encode_dataclass"
     decoded = wire.decode(wire.encode(msg))
     assert decoded.body.request_id == "r" and decoded.body.workers == {"audio_in": ["worker_0", "worker_1"]}
-    assert decoded.body.consumers == consumers == {"audio_in": ClientStream("ear", "listen", "Ear")}
 
 
 def _stub_worker(sbuf):

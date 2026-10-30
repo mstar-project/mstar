@@ -167,12 +167,9 @@ def client_stream_limits(
     }
 
 
-@dataclass(frozen=True, slots=True)
-class ClientStream:
+class ClientStream(NamedTuple):
     """Where a client stream's items go: the node that consumes the edge, a
-    walk it runs in (for routing to its workers) and its partition. A
-    dataclass, which the wire codec carries in the conductor's route and a
-    NamedTuple it would refuse."""
+    walk it runs in (for routing to its workers) and its partition."""
     node: str
     graph_walk: str
     partition: str
@@ -184,7 +181,9 @@ def find_client_streams(model: Model) -> dict[str, ClientStream]:
     ``Worker._build_consumer_node_cache``), in a walk of the partition it
     flows into. Raises ``ValueError`` for a stream without one, which
     validate_deployment reports. The conductor derives it after the worker
-    graphs are built, and sends it to the data worker with each call's route."""
+    graphs are built (a model may shape its walks from the deployment, as
+    BAGEL does); the data worker from its own copy of the model, reading only
+    the node and partition, which address each item."""
     connections = model.get_partition_topology().client_connections()
     if not connections:
         return {}

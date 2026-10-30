@@ -565,6 +565,12 @@ class Conductor:
         self.producer_triggered_partitions: set[str] = (
             topology.producer_triggered_partitions() if topology else set()
         )
+        # Fed by a stream, from another partition or the client: such a
+        # partition self-triggers via StreamBuffer, and its worker signals
+        # partition_done directly.
+        self._stream_fed_partitions: set[str] = (
+            {conn.to_partition for conn in topology.connections} if topology else set()
+        )
         if topology:
             topology.check_walk_driving_connections()
 
@@ -1856,11 +1862,7 @@ class Conductor:
         pstate = request_data.partition_states[partition_name]
 
         incoming_connections = request_data.get_incoming_connections(partition_name)
-        # A partition that self-triggers via StreamBuffer, fed by another
-        # partition or the client: the worker signals partition_done directly.
-        stream_fed = bool(incoming_connections) or any(
-            stream.partition == partition_name for stream in self._client_streams.values()
-        )
+        stream_fed = partition_name in self._stream_fed_partitions
         if stream_fed and partition_done_from_worker:
             pstate.is_done = True
 
@@ -2046,9 +2048,7 @@ class Conductor:
         their consumers itself, where each of ``workers``' streams goes."""
         self.communicator.send(self.PREPROCESS_WORKER, WorkerMessage(
             message_type=WorkerMessageType.CLIENT_STREAM_ROUTE,
-            body=ClientStreamRoute(
-                request_id=request_id, workers=workers, consumers=self._client_streams,
-            ),
+            body=ClientStreamRoute(request_id=request_id, workers=workers),
         ))
 
     def _wait_for_workers_ready(self) -> None:

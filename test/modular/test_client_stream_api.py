@@ -44,7 +44,6 @@ from mstar.streaming.topology import (  # noqa: E402
     ClientStreamLimits,
     Connection,
     PartitionTopology,
-    find_client_streams,
 )
 from mstar.utils.ipc_format import (  # noqa: E402
     ClientStreamRoute,
@@ -158,7 +157,6 @@ def _thread(model=None, is_pending=None, model_config=None, routed=()):
     NEW_REQUEST has gone, as its dispatch does."""
     sent = []
     tm = _TensorManager()
-    model = model or _ListeningModel()
     queues = {name: queue.Queue() for name in (
         "in_queue", "result_tensor_queue", "out_queue", "profile_queue", "cleanup_request_queue",
         "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
@@ -169,9 +167,9 @@ def _thread(model=None, is_pending=None, model_config=None, routed=()):
             send=lambda entity, msg: sent.append((entity, msg)),
             codec=SimpleNamespace(encode=lambda msg: msg),  # sends arrive as objects
             try_send_bytes=lambda entity, msg: sent.append((entity, msg)) or True,
-            get_all_new_messages=_routed_once_opened(sent, model, *routed),
+            get_all_new_messages=_routed_once_opened(sent, *routed),
         ),
-        tensor_manager=tm, model=model, is_pending=is_pending,
+        tensor_manager=tm, model=model or _ListeningModel(), is_pending=is_pending,
         model_config=model_config,
     )
     return wt, sent, tm
@@ -187,18 +185,18 @@ def _bodies(sent, kind):
     return [msg.body for _entity, msg in sent if msg.message_type == kind]
 
 
-def _route_msg(model, rid="r", **workers):
+def _route_msg(rid="r", **workers):
     """The conductor's route for ``rid``; ``audio_in`` to ``w0`` by default."""
     return WorkerMessage(WorkerMessageType.CLIENT_STREAM_ROUTE, ClientStreamRoute(
-        request_id=rid, workers=workers or {"audio_in": ["w0"]}, consumers=find_client_streams(model),
+        request_id=rid, workers=workers or {"audio_in": ["w0"]},
     ))
 
 
 def _route(wt, rid="r", **workers):
-    wt._route_client_streams(_route_msg(wt.model, rid, **workers).body)
+    wt._route_client_streams(_route_msg(rid, **workers).body)
 
 
-def _routed_once_opened(sent, model, *rids):
+def _routed_once_opened(sent, *rids):
     """An inbox that delivers each of ``rids``' routes once its NEW_REQUEST
     has gone, as the conductor's dispatch does."""
     due = list(rids)
@@ -208,7 +206,7 @@ def _routed_once_opened(sent, model, *rids):
         ready = [rid for rid in due if rid in opened]
         for rid in ready:
             due.remove(rid)
-        return [_route_msg(model, rid) for rid in ready]
+        return [_route_msg(rid) for rid in ready]
 
     return inbox
 
@@ -344,7 +342,7 @@ def test_a_route_that_fails_fails_its_call_alone(tmp_path):
         raise RuntimeError("the store refused")
 
     tm.increment_ref_batch_uniform = refuse
-    batch = [_route_msg(wt.model, "r"), WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("q"))]
+    batch = [_route_msg("r"), WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("q"))]
     wt.communicator.get_all_new_messages = lambda: batch
     wt._process_messages()
 

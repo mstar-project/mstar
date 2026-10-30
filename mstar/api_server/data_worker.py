@@ -60,8 +60,10 @@ from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.streaming.topology import (
     CLIENT,
+    ClientStream,
     ClientStreamLimits,
     client_stream_limits,
+    find_client_streams,
 )
 from mstar.utils import profiler
 from mstar.utils.client_errors import client_error_text
@@ -928,7 +930,7 @@ class PreprocessWorkerThread:
             ranks = call.route.workers.get(name, ())
             if ranks:
                 self.tensor_manager.increment_ref_batch_uniform(uuids, len(ranks))
-                stream = call.route.consumers[name]
+                stream = self._client_streams[name]
                 body = InputSignals(
                     request_id=request_id,
                     inputs=[GraphEdge(next_node=stream.node, name=name, tensor_info=infos, is_streaming=True)],
@@ -950,9 +952,16 @@ class PreprocessWorkerThread:
         for worker, counts in per_rank.items():
             self.communicator.send(worker, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
                 request_id=request_id, inputs=[], request_info=None,
-                partition_name=call.route.consumers[next(iter(counts))].partition,
+                partition_name=self._client_streams[next(iter(counts))].partition,
                 producer_done={CLIENT}, producer_done_items=counts,
             )))
+
+    @cached_property
+    def _client_streams(self) -> dict[str, ClientStream]:
+        """Each client stream's consuming node and partition, which address
+        its items. Read on first use, a route's arrival, after the conductor's
+        validate_deployment has accepted the model's declaration of them."""
+        return find_client_streams(self.model)
 
     @cached_property
     def _item_limits(self) -> dict[str, ClientStreamLimits]:

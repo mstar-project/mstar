@@ -8,7 +8,6 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
-from mstar.streaming.topology import ClientStream
 
 
 class Status(Enum):
@@ -118,8 +117,6 @@ class ClientStreamRoute(MessageBody):
     request_id: str
     # client stream edge -> the consuming node's ranks for this request
     workers: dict[str, list[str]]
-    # client stream edge -> its consumer, which addresses the sends
-    consumers: dict[str, ClientStream]
 
 
 @dataclass
