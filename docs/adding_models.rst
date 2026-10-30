@@ -1841,9 +1841,11 @@ node_name, graph_walk)``, called once at startup before capture:
   call for a buffer.
 
 The engine refuses the walk at startup if any resource returns None (the
-default), if the walk has no batch cap to size the rows, or if the node is
-tensor- or sequence-parallel. Evicting a request that holds a row checks
-the row in first, so its resources offload the state the row held.
+default), if the walk has no batch cap to size the rows, if the node is
+tensor- or sequence-parallel, or if it shares a resource with another node.
+A node may keep rows for several walks; a request's step of one walk checks
+in its row of another first. Evicting a request that holds a row checks
+the row in first too, so its resources offload the state the row held.
 
 Step 6 — Write a config YAML
 ----------------------------

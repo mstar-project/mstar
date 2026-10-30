@@ -795,6 +795,22 @@ class Engine:
                     "tensor- or sequence-parallel node yet"
                 )
 
+            shared = sorted(
+                key for key, resource in submodule_mgmt.resources.items()
+                if any(
+                    resource is theirs
+                    for other, mgmt in self._submodules.items() if other != node_name
+                    for theirs in mgmt.resources.values()
+                )
+            )
+            if shared:
+                # rows are checked in per node, so another node's step would
+                # read the resource's stale per-request state
+                raise ValueError(
+                    f"{node_name}: persistent rows need resources of their own, "
+                    f"but {shared} are shared with other nodes"
+                )
+
             def max_rows(walk, submodule=submodule_mgmt.submodule, runner=ag_runners[node_name]):
                 caps = [submodule.max_batch_size(walk), runner.max_batch_size_for(walk)]
                 caps = [cap for cap in caps if cap is not None]
@@ -825,6 +841,12 @@ class Engine:
             node_rows.check_in(batch.request_ids)
             return batch.request_ids
         rids = batch.request_ids
+        # a request may hold a row of another persistent walk of the node
+        if preplan:
+            if node_rows.holds_any(rids, skip_walk=walk):
+                return None
+        else:
+            node_rows.check_in(rids, skip_walk=walk)
         rows = ctx.rows
         if rows is None or rows.stale or (
             tuple(rows.order) != tuple(rids) and set(rows.order) != set(rids)

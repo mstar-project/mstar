@@ -76,7 +76,7 @@ class _Counter(Resource):
         self.keeps_rows = keeps_rows
         self.count: dict[int, int] = {}
         self.store = torch.zeros(HANDLES, 2, device=device)
-        self.rows: _CounterRows | None = None
+        self.rows_by_walk: dict[str, _CounterRows] = {}
         self.offloaded: dict[int, tuple[int, torch.Tensor]] = {}
 
     def ingest_request(self, rid, overrides):
@@ -111,15 +111,19 @@ class _Counter(Resource):
         self.store[rid] = acc.to(self.device)
         return True
 
+    @property
+    def rows(self) -> _CounterRows:
+        return self.rows_by_walk[ROWS_WALK]
+
     def row_state(self, space, node_name, graph_walk):
         if not self.keeps_rows:
             return None
-        self.rows = _CounterRows(self, space)
-        return self.rows
+        rows = self.rows_by_walk[graph_walk] = _CounterRows(self, space)
+        return rows
 
     def plan(self, step, ctx):
         if ctx.rows is not None:
-            ctx.rows.advance(self.rows.count, 1)
+            ctx.rows.advance(self.rows_by_walk[ctx.graph_walk].count, 1)
 
     def commit(self, step, ctx):
         if ctx.rows is None:
@@ -136,12 +140,13 @@ class _CounterSpec(NodeResourceSpec):
 
 
 class _Toy(NodeSubmodule):
-    def __init__(self, cap=MAX_ROWS):
+    def __init__(self, cap=MAX_ROWS, walks=(ROWS_WALK,)):
         super().__init__()
         self.cap = cap
+        self.walks = frozenset(walks)
 
     def persistent_row_walks(self):
-        return frozenset({ROWS_WALK})
+        return self.walks
 
     def max_batch_size(self, graph_walk):
         return self.cap
@@ -165,11 +170,12 @@ class _Toy(NodeSubmodule):
         res = engine_inputs.resources["counter"]
         rids = list(engine_inputs.request_ids)
         n = len(rids)
-        if graph_walk == ROWS_WALK:
-            count = res.rows.count.rows(n).clone()
-            acc = res.rows.acc.rows(n)[:, 0].clone()
-            res.rows.count.device[:n] += 1
-            res.rows.acc.device[:n] += 1
+        if graph_walk in self.walks:
+            rows = res.rows_by_walk[graph_walk]
+            count = rows.count.rows(n).clone()
+            acc = rows.acc.rows(n)[:, 0].clone()
+            rows.count.device[:n] += 1
+            rows.acc.device[:n] += 1
         else:
             count = torch.tensor([res.count[rid] for rid in rids])
             index = torch.tensor(rids, device=res.store.device)
@@ -411,6 +417,36 @@ def test_a_pre_planned_step_advances_its_rows_once(monkeypatch, both_passes):
     engine.exec_and_postprocess(batch)
     space.check_mirrors()
     assert list(space.buffers[0].host[:2]) == [2, 2]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_a_request_moving_between_two_persistent_walks_carries_its_state(device):
+    engine = _engine(device, sub=_Toy(walks=(ROWS_WALK, OTHER_WALK)))
+    node_rows = engine._rows[NODE]
+    for rid in (1, 2):
+        engine.add_request(rid)
+    seen, last = [], None
+    for walk in (ROWS_WALK, OTHER_WALK, OTHER_WALK, ROWS_WALK, OTHER_WALK):
+        # a pre-plan waits for the check-in from the other walk
+        waits = last not in (None, walk)
+        assert (engine._enter_rows(_batch(walk, [1]), preplan=True) is None) == waits
+        _, s = _step(engine, walk, [1, 2])
+        last = walk
+        seen.append(s[1])
+        assert not node_rows.holds_any([1, 2], skip_walk=walk)
+    assert seen == [(i, float(i)) for i in range(5)]
+
+
+def test_a_resource_shared_with_another_node_refuses_rows_at_startup():
+    spec = _CounterSpec(resource_key="counter", nodes={NODE, "peer"})
+    engine = Engine(None, autocast_dtype=None)
+    engine.load_model(
+        submodules={NODE: _Toy(), "peer": _Toy(walks=())}, specs=[spec],
+        parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+        device=torch.device("cpu"), transfer_engine_info=None,
+    )
+    with pytest.raises(ValueError, match="shared with other nodes"):
+        engine.warmup()
 
 
 def test_a_resource_that_cannot_keep_rows_refuses_the_walk_at_startup():
