@@ -29,7 +29,6 @@ from typing import Callable, NamedTuple
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.diffusion.attention import Attend
 
 
 def sp_seq_split(total: int, world_size: int) -> list[int]:
@@ -174,7 +173,6 @@ def sp_head_gather(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
     return sp_group.all_gather(x, dim=1)
 
 
-
 class SeqParallel(NamedTuple):
     """Ulysses sequence parallelism over a ``[B, L, H, D]`` token stream: ``sizes`` is
     each rank's share of its ``L``. ``scatter`` cuts a replicated per-token tensor to
@@ -195,8 +193,12 @@ class SeqParallel(NamedTuple):
     def gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         return gather_sequence(self.group, x, self.sizes, dim=dim)
 
-    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
+    def attend(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Callable[..., torch.Tensor],
+    ) -> torch.Tensor:
         return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
 
-    def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
+    def attend_shards(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Callable[..., torch.Tensor],
+    ) -> torch.Tensor:
         return attention_over_sharded_keys(self.group, q, k, v, run)
