@@ -114,6 +114,3 @@ class FusedColumnLinear(nn.Module, LoraCapable):
             parallel="none",
             slice_names=tuple(self._shard_sizes),
         )
-
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.weight.shape[1], self.output_size

@@ -138,9 +138,6 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
             parallel="column",
         )
 
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.input_size_per_partition, self.output_size_per_partition
-
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
     """Packed linear layers with column parallelism.
@@ -488,9 +485,6 @@ class RowParallelLinear(nn.Module, LoraCapable):
             out_slices=(self.output_size_per_partition,),
             parallel="row",
         )
-
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.input_size_per_partition, self.output_size_per_partition
 
 class KVColumnParallelLinear(ColumnParallelLinear):
     """One K or V projection, sharded by head, replicated when heads run out.

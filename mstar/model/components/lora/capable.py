@@ -55,8 +55,10 @@ class LoraCapable:
 
     def lora_local_shape(self) -> tuple[int, int]:
         """``(in, out)`` of the delta on this rank: the input columns the module reads
-        and the output columns it writes before any collective."""
-        raise NotImplementedError
+        and the output columns it writes before any collective, which its weight
+        (``[out, in, *kernel]``) holds."""
+        weight = self.weight
+        return math.prod(weight.shape[1:]), weight.shape[0]
 
 
 class LoraBound:
@@ -85,9 +87,6 @@ class _LoraLinearMixin(LoraOutputAdd, LoraCapable):
     def lora_target(self) -> LoraTarget:
         return LoraTarget(in_features=self.in_features, out_slices=(self.out_features,), parallel="none")
 
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.in_features, self.out_features
-
 
 class _LoraPatchConvMixin(LoraBound, LoraCapable):
     """A convolution whose kernel is its stride, over inputs one kernel wide: a linear
@@ -112,9 +111,6 @@ class _LoraPatchConvMixin(LoraBound, LoraCapable):
             in_features=self.in_channels * math.prod(self.kernel_size),
             out_slices=(self.out_channels,), parallel="none",
         )
-
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.in_channels * math.prod(self.kernel_size), self.out_channels
 
 
 class LoraLinear(_LoraLinearMixin, nn.Linear):
