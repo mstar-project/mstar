@@ -1,6 +1,6 @@
 """KDA verify steps: the torch reference (``TorchKDAKernels.run_verify``) against sequential
-decode over only the accepted tokens, and the fused kernel (``kda_triton.kda_verify``) against
-the reference on CUDA."""
+decode over only the accepted tokens. The fused kernel's parity with it is in
+test_kda_triton.py."""
 from __future__ import annotations
 
 import pytest
@@ -9,12 +9,10 @@ import torch.nn.functional as F
 
 from mstar.engine.resources.linear_attn.kda import KDAPlan, SpecBlocks
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
-from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
 from mstar.model.components.distributed import ParallelKimiDeltaAttention
 from mstar.model.components.kda import KDAConfig
-from mstar.model.glm5_next import fused_decode
 
 
 def _layer(cfg, device, dtype, seed=0):
@@ -122,36 +120,6 @@ def test_padding_rows_on_the_sink_clamp_a_garbage_count():
     x = torch.randn(2 * 2, layer.hidden_size, dtype=torch.float64)
     out = _verify(TorchKDAKernels(), layer, x, pool, _plan(torch.tensor([3, SINK_SLOT]), 2))
     assert torch.isfinite(out).all()
-
-
-@pytest.mark.skipif(not (torch.cuda.is_available() and fused_decode._HAS_TRITON),
-                    reason="the fused verify kernel needs CUDA + triton")
-@torch.no_grad()
-@pytest.mark.parametrize("block", [1, 2, 4])
-@pytest.mark.parametrize("batch", [1, 7, 64])
-def test_kernel_matches_reference(block, batch):
-    """One TP8 rank's KDA layer (8 heads of 128) over four verify steps with random verdicts."""
-    cfg = KDAConfig(hidden_size=4096, num_heads=8, head_dim=128)
-    layer = _layer(cfg, "cuda", torch.bfloat16)
-    ker = _pool(layer, 70, 3, "cuda", torch.bfloat16)
-    ref = _clone(ker)
-    slots = torch.randperm(69, device="cuda")[:batch] + 1
-    gen = torch.Generator(device="cuda").manual_seed(3)
-    for step in range(4):
-        x = torch.randn(batch * block, cfg.hidden_size, device="cuda", generator=gen)
-        x = x.to(torch.bfloat16)
-        out = _verify(TritonKDAKernels(), layer, x, ker, _plan(slots, block))
-        out_ref = _verify(TorchKDAKernels(), layer, x, ref, _plan(slots, block))
-        torch.testing.assert_close(out, out_ref, rtol=2e-2, atol=2e-2, msg=f"step {step}")
-        # the kernel sums the state in 32-column tiles, torch whole: fp32 order alone moves
-        # single elements by ~1e-3; the cached inputs and windows are exact
-        for name, tol in (("state", 5e-3), ("conv", 0), ("spec_prefix", 0), ("spec_g", 0),
-                          ("spec_beta", 0), ("spec_conv", 0)):
-            torch.testing.assert_close(ker._blocks[name], ref._blocks[name], rtol=tol, atol=tol,
-                                       msg=f"{name} step {step}")
-        accepted = torch.randint(0, block, (batch,), device="cuda", generator=gen)
-        _after_verdict(ker, slots, accepted)
-        _after_verdict(ref, slots, accepted)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need CUDA")
