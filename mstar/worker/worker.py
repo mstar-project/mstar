@@ -2846,8 +2846,9 @@ class Worker:
         tp_seq: int = -1,
         request_walks: dict[int, str] | None = None,
     ) -> Speculation:
-        """Package prepared rids (batch order) into the ``Speculation`` the main
-        loop runs. Leader and follower differ only in how they pick the rids.
+        """Package prepared rids (batch order, which ``_make_executing_batch``
+        reorders for a split walk) into the ``Speculation`` the main loop runs.
+        Leader and follower differ only in how they pick the rids.
 
         ``fresh_final_edges`` is ``final_edges`` (see ``_make_executing_batch``)
         for the rids that did not come from batch N: their final chunks were
@@ -3390,7 +3391,7 @@ class Worker:
 
         new_request_to_worker_graph: dict[int, int] = {}
         per_request_inputs: dict[int, NameToTensorList] = {}
-        for rid in head_rids:  # wire order == the leader's batch order
+        for rid in head_rids:  # wire order == the leader's step order, split rows ordered
             if rid in prep_inputs:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
                 per_request_inputs[rid] = prep_inputs[rid]
