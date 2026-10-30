@@ -826,8 +826,8 @@ class LoraAdapterPool(Resource):
         follower's read usually starts at the ingest the leader's does; a remove that
         raced an ingest can leave them different for a while (see the module docstring).
 
-        A failed read is retried, except while a row reserved on that failure waits for
-        the admit that fails it, which would otherwise wait for the retry."""
+        A failed read is retried, except while a row is reserved on the adapter: a row let
+        through on the failure would otherwise have its admit wait for the retry."""
         retry = name not in self._reserved_count and self._read_errors.pop(name, None) is not None
         if self._store.hold(name, keep=self._live) or retry:
             self._read_in(name)
