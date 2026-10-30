@@ -12,6 +12,7 @@ from collections.abc import Callable, Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
+from typing import NamedTuple
 
 import torch
 
@@ -526,6 +527,14 @@ class RequestOutputState:
     frame_index: int = 0
 
 
+class HeldItems(NamedTuple):
+    """Client stream items stored before their call's route arrived."""
+
+    signals: dict[str, list[TensorPointerInfo]]
+    # the append's late answer; None for items that came with the request
+    on_late: Callable[[str], None] | None
+
+
 @dataclass(slots=True)
 class ClientCall:
     """A call's client streams, as their producer. The data worker sends each
@@ -537,9 +546,7 @@ class ClientCall:
     route: ClientStreamRoute | None = None
     # items stored before the route arrived, each with its append's on_late,
     # sent in this order once it does
-    held: list[tuple[dict[str, list[TensorPointerInfo]], Callable[[str], None] | None]] = field(
-        default_factory=list,
-    )
+    held: list[HeldItems] = field(default_factory=list)
     # stream edge -> items sent to each of its ranks
     items_sent: dict[str, int] = field(default_factory=dict)
     # streams that take no more items: the client ended them, or their
@@ -801,7 +808,7 @@ class PreprocessWorkerThread:
             self._charge_stream_items(call, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
         if stream_items:
-            call.held.append((self._store_held(input.request_id, stream_items), None))
+            call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         self.request_output_state[input.request_id] = RequestOutputState()
@@ -937,7 +944,7 @@ class PreprocessWorkerThread:
         their append answered as late; an append that also carried items for
         a stream already ended gets a second answer."""
         if call.route is None:
-            call.held.append((signals, on_late))
+            call.held.append(HeldItems(signals, on_late))
             return
         late = []
         for name, infos in signals.items():
