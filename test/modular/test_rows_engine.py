@@ -363,6 +363,56 @@ def test_rows_hold_the_capture_a_capped_step_pads_to(cap, rows):
         space.buffers[0].rows(rows + 1)
 
 
+def _pre_planned_step(engine, rids):
+    """What ``Engine._pre_plan_for_batch`` does to a batch, without a lease."""
+    batch = _batch(ROWS_WALK, rids)
+    order = engine._enter_rows(batch, preplan=True)
+    step = engine._submodules[NODE].submodule.declare_step(
+        graph_walk=ROWS_WALK, request_ids=list(order), inputs=None,
+    )
+    step.set_ctx(batch.step_context)
+    batch.step_context.is_preplan = True
+    engine._runner.pre_admit(step)
+    engine._runner.pre_plan(step)
+    batch.step_context.is_preplan = False
+    batch.step = step
+    batch.preplanned_rids = tuple(order)
+    return batch
+
+
+@pytest.mark.parametrize("both_passes", [False, True])
+def test_a_pre_planned_step_advances_its_rows_once(monkeypatch, both_passes):
+    """A step planned ahead is planned again at exec with the same rows: a
+    resource writing on both passes is refused rather than advancing twice."""
+    monkeypatch.setattr(_Counter, "supports_preplan", True, raising=False)
+    plan = _Counter.plan
+
+    def plan_once(self, step, ctx):
+        # as KV does: a step planned ahead keeps its staged plan at exec
+        if not both_passes and not ctx.is_preplan and ctx.rows is getattr(self, "staged", None):
+            return
+        if ctx.is_preplan:
+            self.staged = ctx.rows
+        plan(self, step, ctx)
+
+    monkeypatch.setattr(_Counter, "plan", plan_once)
+    engine = _engine("cpu")
+    space = engine._rows[NODE].space(ROWS_WALK)
+    for rid in (1, 2):
+        engine.add_request(rid)
+    _step(engine, ROWS_WALK, [1, 2])
+    batch = _pre_planned_step(engine, [1, 2])
+    engine.prepare_inputs(batch)
+    assert not engine.preplan_is_stale(batch)
+    if both_passes:
+        with pytest.raises(ValueError, match="advanced twice"):
+            engine.exec_and_postprocess(batch)
+        return
+    engine.exec_and_postprocess(batch)
+    space.check_mirrors()
+    assert list(space.buffers[0].host[:2]) == [2, 2]
+
+
 def test_a_resource_that_cannot_keep_rows_refuses_the_walk_at_startup():
     with pytest.raises(ValueError, match="resource 'counter'"):
         _engine("cpu", keeps_rows=False)
