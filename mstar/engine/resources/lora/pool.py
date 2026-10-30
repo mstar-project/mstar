@@ -582,8 +582,7 @@ class LoraAdapterPool(Resource):
             if (name not in self._reserved_count and name not in self._resident
                     and name not in self._store and name not in self._read_errors):
                 return self._changes  # its read, started at ingest, lands
-            self._reserved[rid] = name
-            self._reserved_count[name] = self._reserved_count.get(name, 0) + 1
+            self._reserve(rid, name)
             return None
 
     def unreserve(self, rid) -> None:
@@ -592,6 +591,11 @@ class LoraAdapterPool(Resource):
 
     def grew_since(self, mark: int) -> bool:
         return self._changes != mark
+
+    def _reserve(self, rid, name: str) -> None:
+        """Caller holds the lock."""
+        self._reserved[rid] = name
+        self._reserved_count[name] = self._reserved_count.get(name, 0) + 1
 
     def _unreserve(self, rid) -> str | None:
         """Caller holds the lock."""
@@ -697,8 +701,7 @@ class LoraAdapterPool(Resource):
                 self._awaiting.add(rid)
                 if reserved is not None:
                     # admitted already, so the next admit finds its slot still counted
-                    self._reserved[rid] = reserved
-                    self._reserved_count[reserved] = self._reserved_count.get(reserved, 0) + 1
+                    self._reserve(rid, reserved)
                 if slot:
                     self._release(slot)
 
@@ -723,16 +726,8 @@ class LoraAdapterPool(Resource):
             self._slots[slot].refcount += 1
         self._row_slot[rid] = slot
         self._awaiting.discard(rid)
-        reserved = self._reserved.get(rid)
-        if reserved is not None:
-            # held now, which counts it as the reservation did: no room grew
-            self._reserved.pop(rid)
-            count = self._reserved_count[reserved] - 1
-            if count:
-                self._reserved_count[reserved] = count
-            else:
-                del self._reserved_count[reserved]
-        self._admit_taken[rid] = (slot, reserved)
+        # held now, which counts it as the reservation did
+        self._admit_taken[rid] = (slot, self._unreserve(rid))
 
     def _load_miss(self, name: str, rids: list, slot: int) -> AdmitOutcome:
         """Load ``name`` into ``slot`` (picked by ``admit``) for ``rids``. Called without

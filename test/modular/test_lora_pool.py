@@ -635,7 +635,8 @@ class _Pages(Resource):
 
 def test_a_request_waiting_for_a_slot_holds_no_kv(adapters):
     """A request on a cold adapter waits in the same admission as KV, so it keeps no KV
-    reservation while it waits, and a base request takes the room instead."""
+    reservation while it waits; requests after it wait in arrival order, as behind any
+    resource that asks."""
     _, paths = adapters
     pool, kv = make_pool(paths, max_slots=1), _Pages(2)
     runner = lora_runner(kv, pool, keys=("kv", "lora"))
@@ -644,8 +645,7 @@ def test_a_request_waiting_for_a_slot_holds_no_kv(adapters):
     assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
     waits = runner.admit_retrieve("r2", "LLM", "decode")
     assert kv.held == {"r1"}, "a request waiting for a LoRA slot kept its KV reservation"
-    assert waits.queued
-    assert admitted(runner, "base")
+    assert waits.queued and runner.admit_retrieve("base", "LLM", "decode").queued
     runner.remove_request("r1")
-    assert runner.admit_waiting(_nothing_published) == [("LLM", "r2")]
+    assert runner.admit_waiting(_nothing_published) == [("LLM", "r2"), ("LLM", "base")]
     assert kv.held == {"base", "r2"} and run_step(pool, ["r2", "base"]).ok
