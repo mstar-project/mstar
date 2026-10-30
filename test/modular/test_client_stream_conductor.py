@@ -252,8 +252,8 @@ def test_a_call_with_open_input_is_refused_at_the_cap(tmp_path, monkeypatch):
 
 
 def test_completion_drains_the_workers_too(tmp_path, monkeypatch):
-    # A chunk forwarded just before the model ended the request may still be
-    # in a worker's read, so teardown waits for the workers' READS_DONE.
+    # An item the data worker sent just before the model ended the request may
+    # still be in a worker's read, so teardown waits for the workers' READS_DONE.
     c = _conductor(tmp_path, monkeypatch)
     _run(c, [[_new_request("r")], [_partition_done(c, "r")]])
 

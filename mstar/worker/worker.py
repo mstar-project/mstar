@@ -1176,14 +1176,10 @@ class Worker:
         )
 
     def _takes_input(self, wire_rid: str) -> bool:
-        """Whether an input for ``wire_rid`` still lands here: until this rank
-        has sent READS_DONE, even while draining. Rank 0 may have committed a
-        step on a request whose NEW_REQUEST or input copy for this rank, sent by
-        the conductor or a producer on another FIFO, arrives only behind the
-        forwarded drain, and READS_DONE waits for that step. After READS_DONE
-        the producer's segment may be unlinked, so no read starts. Both
-        messages that carry inputs, NEW_REQUEST and INPUT_SIGNALS, are gated by
-        this one check."""
+        """Whether this rank still takes NEW_REQUEST and INPUT_SIGNALS for
+        ``wire_rid``: until it sends READS_DONE, draining or not, since a step
+        rank 0 committed may wait on one that arrives behind the forwarded
+        drain. After READS_DONE the producer may free what it sent."""
         return wire_rid not in self._reads_done_sent
 
     def _process_new_inputs(self, body: InputSignals) -> None:
