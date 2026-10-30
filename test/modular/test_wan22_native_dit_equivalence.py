@@ -7,11 +7,11 @@ patchify, at each of the 30 block boundaries, and at the head. Never widen a bou
 pass — a nonzero there is a port bug, and the printed table names the first divergent
 stage.
 
-The time embedding and modulation rows are the exception. The native module computes
-them per latent frame and the reference per token, and cuBLAS may pick another GEMM
-kernel at the other row count, so those rows are held to that kernel's rounding. The
-stage comparison gives both modules the same rows (the native ones, expanded per token
-for the reference), so it stays bitwise.
+The native module computes the time embedding and modulation rows per latent frame and
+the reference per token, and cuBLAS may pick another GEMM kernel at the other row count.
+So the embedder is compared on the reference's per-token timesteps, where both run the
+same GEMMs, and the stage comparison gives both modules the native per-frame rows
+(expanded per token for the reference).
 
 Stage outputs are captured with forward hooks in execution order on BOTH modules, so
 a block-indexing mistake shifts every later row rather than passing silently.
@@ -68,14 +68,6 @@ DEVICE = torch.device("cuda")
 # (9, 15, 26) = 3510 tokens.
 LATENT_SHAPE = (2, 48, 9, 30, 52)
 TOKENS_PER_FRAME = (30 // 2) * (52 // 2)
-
-# Per-frame (18) vs per-token (7020) rows, about twice the worst seen. temb moves by
-# 9.8e-4 on H100, where cuBLAS picks another kernel for the time embedder's second
-# Linear. On B300 the rows are bitwise under the default numerics and move by 3.1e-5
-# (modulation 3.9e-3) with NVIDIA_TF32_OVERRIDE=0; switching TF32 off in the time embedder
-# alone moves temb by the same 9.8e-4 and the modulation rows by 1.6e-2.
-TEMB_ROWS_MAX_ABS = 2e-3
-TIMESTEP_PROJ_ROWS_MAX_ABS = 3.2e-2
 
 
 @pytest.fixture(scope="module")
@@ -249,23 +241,23 @@ def test_per_layer_outputs_bitwise_identical(wrapped, native, inputs):
     )
 
 
-def test_condition_embedder_rows_match_within_kernel_rounding(wrapped, native, inputs):
-    """Per-frame rows against the reference's per-token rows, to the rounding of a
-    different GEMM kernel. The projected text stream has the same row count on both
-    sides, so it stays bitwise."""
-    _, timestep, frame_timestep, text = inputs
+def test_condition_embedder_all_outputs_bitwise_identical(wrapped, native, inputs):
+    """The embedder given the reference's per-token timesteps, so both sides run the
+    same GEMM shapes: every output, the modulation projection and the projected text
+    stream included, must match exactly."""
+    _, timestep, _, text = inputs
     with torch.no_grad():
         ref_temb, ref_proj, ref_text, _ = wrapped.condition_embedder(
             timestep.flatten(), text, None, timestep_seq_len=timestep.shape[1]
         )
         ref_proj = ref_proj.unflatten(2, (6, -1))
-        temb, proj, text_out = native.condition_embedder(frame_timestep, text)
-    for name, ours, theirs, bound in (
-        ("temb", _per_token(temb), ref_temb, TEMB_ROWS_MAX_ABS),
-        ("timestep_proj", _per_token(proj), ref_proj, TIMESTEP_PROJ_ROWS_MAX_ABS),
-        ("text_proj", text_out, ref_text, 0.0),
+        temb, proj, text_out = native.condition_embedder(timestep, text)
+    for name, ours, theirs in (
+        ("temb", temb, ref_temb),
+        ("timestep_proj", proj, ref_proj),
+        ("text_proj", text_out, ref_text),
     ):
         assert ours.shape == theirs.shape and ours.dtype == theirs.dtype
         diff = (ours.float() - theirs.float()).abs().max().item()
         print(f"condition_embedder {name}: max_abs={diff:.3e}")
-        assert diff <= bound, f"condition_embedder {name} diverges (max_abs {diff:.3e}, bound {bound:.1e})"
+        assert torch.equal(ours, theirs), f"condition_embedder {name} diverges (max_abs {diff:.3e})"
