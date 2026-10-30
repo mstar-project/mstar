@@ -27,6 +27,7 @@ from mstar.utils.ipc_format import (
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import Rebuilds
 from mstar.worker.rid_table import RidTable
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -91,6 +92,7 @@ def _worker(
         has_inflight_reads=lambda rid: inflight_reads,
         force_cleanup_request=lambda rid: w.forced.append(rid), # noqa: PLW0108
     )
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     return w
 
 
@@ -407,6 +409,7 @@ def test_a_follower_takes_in_a_new_request_that_follows_rank_0s_drain_without_re
     w._graph_runtime = SimpleNamespace(add_request=lambda **kw: 5, get_sharding_config=lambda rid: None)
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: [], add_request=lambda rid, cfg, info=None: ingested.append(rid),
+        engine=SimpleNamespace(publisher_nodes={}),
     )
     w.request_state = SimpleNamespace(add_request=lambda rid, info: None)
     w.tensor_manager = SimpleNamespace(
@@ -434,7 +437,6 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w.worker_id = "w0"
     w._draining_rids = set()
     w._unprocessed_messages = {}
-    w._my_consumer_connections = []
     w._last_active = {}
     w._rebuilds = Rebuilds({}, {})
     w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
@@ -457,6 +459,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         per_request_info={}, add_request=_state_add,
     )
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         evictable_nodes=lambda: ["n"],
         add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )
@@ -465,6 +468,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],

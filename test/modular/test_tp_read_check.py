@@ -44,6 +44,7 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.rebuild import Rebuilds
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Speculation, Worker
 
 # ── two ranks through Worker.run (the acceptance harness) ─────────────────
@@ -191,6 +192,7 @@ def _check_rank(rank, layout, failed_here, store, out):
         w = Worker.__new__(Worker)
         w._walk_drivers = {}
         w._walk_driven_edges = {}
+        w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
         w._rebuilds = Rebuilds({}, {})
         w.scheduler = SimpleNamespace(read_failed_rids=set(failed_here))
         w.parallel_groups = SimpleNamespace(
@@ -338,6 +340,7 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._rebuilds = Rebuilds({}, {})
     w.scheduler, w.request_state, w.tensor_manager = sched, manager, tm
     w.wakeup_event = SimpleNamespace(drain=lambda: None)
@@ -376,6 +379,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._rebuilds = Rebuilds({}, {})
     w.scheduler, w.request_state, w.enable_nvtx = sched, manager, False
     w._in_flight_rids = set()
@@ -419,7 +423,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
             is_new_iter=False, is_same_node=True,
         )
 
-    w._assemble_speculation = assemble
+    w._spec_builder = SimpleNamespace(assemble=assemble)
     pending = SimpleNamespace(
         tp_seq=0, node_name=NODE, graph_walk=WALK,
         batch=ScheduledBatch(node_name=NODE, graph_walk=WALK,
@@ -489,7 +493,7 @@ def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_hea
         read_failed=["f1"], continuing=["c0"], fresh=["f0", "f1"], head_rids=["c0", "f0", "f1"],
     )
     spec = Worker._try_follow_speculation(w, pending)
-    spec.continuing_rids = set(w.continuing[-1])  # as ``_assemble_speculation`` sets it
+    spec.continuing_rids = set(w.continuing[-1])  # as ``SpeculationBuilder.assemble`` sets it
     manager = w.request_state
 
     # what ``_maybe_clear_spec`` gives back
@@ -520,6 +524,7 @@ def _leader(tmp_path, streamed=()):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._rebuilds = Rebuilds({}, {})
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = {NODE}, {NODE}
