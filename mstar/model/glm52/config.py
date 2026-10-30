@@ -194,9 +194,6 @@ class Glm52ModelConfig:
     # prefill_token_buckets too.
     prefill_batched_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
-    # Most prompt tokens one prefill step takes ("auto": the largest captured bucket), so a
-    # burst runs as captured chunks with decode steps between them. None: no cap.
-    prefill_max_step_tokens: int | str | None = None
 
     # Derived MLA cache geometry: the paged cache stores one 576-dim latent
     # vector per token per layer (512 compressed KV + 64 decoupled-RoPE key).

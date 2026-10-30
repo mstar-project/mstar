@@ -198,7 +198,7 @@ def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path):
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
             request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
-            partition_name="default",
+            partition_name="default", graph_walk=WALK,
         ),
     ))]
     assert got["api_server"] == [] and got[PEER] == []
@@ -1054,7 +1054,8 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
 
 def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     """A mixed step routes rows of two walks in one call; each request's
-    worker-graphs-done names its own walk's graph, not the call's first."""
+    worker-graphs-done names its own walk and that walk's graph, not the
+    call's first."""
     book = RustTensorBookkeeping()
     comm = ZmqCommunicator(ME, str(tmp_path))
     conductor = ZmqCommunicator("conductor", str(tmp_path))
@@ -1085,5 +1086,8 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids],
           new_token_counts=[], stream_tokens_consumed=[], profiling=[])
 
-    done = {m.body.request_id: m.body.worker_graph_ids for m in _collect(conductor)}
-    assert done == {"r_prefill": [0], "r_decode": [1]}
+    done = {
+        m.body.request_id: (m.body.worker_graph_ids, m.body.graph_walk)
+        for m in _collect(conductor)
+    }
+    assert done == {"r_prefill": ([0], "prefill"), "r_decode": ([1], "decode")}
