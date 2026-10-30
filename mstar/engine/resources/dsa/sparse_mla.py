@@ -50,8 +50,17 @@ def _plan(wrapper, indices: torch.Tensor, lens: list[int], heads: int,
     qo = torch.arange(len(lens) + 1, dtype=torch.int32)
     kv = torch.zeros(len(lens) + 1, dtype=torch.int32)
     kv[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
-    wrapper.plan(qo, kv, indices, torch.tensor(lens, dtype=torch.int32), heads,
-                 kv_lora_rank, kpe, 1, False, sm_scale, torch.bfloat16, torch.bfloat16)
+    # FlashInfer stages the plan (~600 KB at one decode row) through a host copy that ATen
+    # splits over every intra-op thread. With a worker per GPU, each with an OpenMP pool as
+    # wide as the host, that region waits on oversubscribed cores: ~30 ms of a captured
+    # decode step on 8 GPUs, ~25 us on one thread. The count is per thread under OpenMP.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        wrapper.plan(qo, kv, indices, torch.tensor(lens, dtype=torch.int32), heads,
+                     kv_lora_rank, kpe, 1, False, sm_scale, torch.bfloat16, torch.bfloat16)
+    finally:
+        torch.set_num_threads(threads)
 
 
 def _lens(lens: list[int], width: int) -> list[int]:
