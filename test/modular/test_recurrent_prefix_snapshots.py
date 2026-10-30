@@ -862,3 +862,11 @@ def test_the_engine_keeps_a_node_shut_over_a_resource_that_refuses_to_restore(mo
     monkeypatch.setattr(LinearAttnSpec, "restore_refusal", lambda self: refusal)
     opened = opening_prefix_caches(specs.values(), {"LLM": 1}, checkpoint_named=True)
     assert opened == (set() if refusal else {"kv", "state"})
+
+
+def test_refusing_snapshots_gives_the_slots_back():
+    pool = _pool(prefix_slots=2)
+    assert all(b.shape[1] == 6 for b in pool._blocks.values())
+    pool.refuse_snapshots("the kernels keep no checkpoints")
+    assert all(b.shape[1] == 4 for b in pool._blocks.values())
+    assert pool.config.prefix_slots == 0 and pool._kv is None
