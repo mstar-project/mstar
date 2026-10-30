@@ -24,17 +24,24 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
+import http.client
+import logging
 import re
+import ssl
+import urllib.error
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
+from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
 from mstar.model.whisper.config import WORDS_MARKER
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -305,6 +312,10 @@ class OpenAIAdapter:
     speech_chunk_lookahead: int = 2
     # most sub-requests one input may split into; longer inputs get a 400
     speech_chunk_max_pieces: int = 32
+
+    def split_speech_text(self, text: str) -> list[str]:
+        """The sentence chunks of a ``/v1/audio/speech`` input that chunking applies to."""
+        return split_sentences(text, max_chars=self.speech_chunk_max_chars)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
@@ -667,19 +678,49 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
+# A ref_audio URL that did not deliver: an HTTP error status or a refused
+# redirect (HTTPError), DNS or connect failures (URLError), a timeout, a dropped
+# connection, a TLS failure or a body cut short. These are the request's fault.
+_REF_AUDIO_FETCH_ERRORS = (
+    urllib.error.URLError,
+    http.client.HTTPException,
+    TimeoutError,
+    ConnectionError,
+    ssl.SSLError,
+)
+
+
+def _ref_audio_fetch_failure(exc: BaseException) -> str:
+    """What went wrong with a ref_audio fetch, in words that name no server path."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    return type(exc).__name__
+
+
 def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
     """A reference voice clip from the request: a data URL, an http(s) URL (only
     when the server allows remote fetch), or bare base64 that ``decoder`` (the
     model's audio loader) can open. Returns its path. Every form gets the same
     ``check_ref_audio``, so a clip the data worker would fail on, or one longer
-    than ``MAX_REF_AUDIO_SECONDS``, is a 400 here."""
+    than ``MAX_REF_AUDIO_SECONDS``, is a 400 here.
+
+    A clip that is not audio, malformed base64 and a failed fetch are 400s.
+    Failing to store the clip (a full disk, ``upload_dir`` permissions) is the
+    server's fault: a 500 whose text, like the 400s, names no server path."""
     if not isinstance(ref, str):
         raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
-    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
-        path = media_io.resolve_media_ref(ref, upload_dir)[1]
-        media_io.check_ref_audio(path, decoder)
-        return path
-    path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    try:
+        if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+            try:
+                path = media_io.resolve_media_ref(ref, upload_dir)[1]
+            except _REF_AUDIO_FETCH_ERRORS as exc:
+                raise ValueError(f"could not fetch ref_audio ({_ref_audio_fetch_failure(exc)})") from exc
+            media_io.check_ref_audio(path, decoder)
+            return path
+        path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    except OSError as exc:
+        logger.error("could not store a ref_audio upload under %s: %r", upload_dir, exc)
+        raise RuntimeError("the server could not store ref_audio") from None
     if path:
         return path
     raise ValueError(
@@ -765,6 +806,124 @@ class FishS2ProAdapter(OpenAIAdapter):
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
+class CosyVoice3Adapter(OpenAIAdapter):
+    """Fun-CosyVoice3: TTS that always clones a voice.
+
+    ``voice`` names a preset in the deployment's ``voices_dir`` (with its
+    transcript in ``<voice>.txt``); ``ref_audio`` in ``extra_body`` uploads a
+    clip instead (a data URL, an http(s) URL when the server allows remote
+    media, or bare base64 audio; never a server path), with its transcript in
+    ``ref_text``. ``instructions`` becomes ``instruct``. ``temperature``,
+    ``top_p`` and ``seed`` are the standard fields; ``top_k``, ``ras_window``,
+    ``ras_tau``, ``n_cfm_timesteps`` and ``max_new_tokens`` (25 Hz speech
+    tokens) pass through ``extra_body``. ``speed`` is dropped.
+
+    Long text is synthesized in sentence chunks, as the reference frontend
+    (``text_normalize``) does: pieces of about 80 tokens, or 60 to 80
+    characters for text with Chinese, cut at sentence ends (and at ``：`` and
+    ``、`` with Chinese), with a short tail merged into the piece before it.
+    A Chinese piece over 300 characters is cut again at its commas.
+    In one request the LM ends long text early or garbles its end. Without Chinese, an estimate of the Qwen2 BPE token
+    count stands in for the reference's real one, so Hangul, kana and
+    Cyrillic pieces stay near 80 tokens as English ones do.
+    """
+
+    supports_speech = True
+    _CHARS_PER_TOKEN = 4
+    speech_chunk_max_chars = 80 * _CHARS_PER_TOKEN
+    # nothing shorter than the smallest piece (80 characters of Chinese) is split
+    speech_chunk_min_chars = 81
+
+    # A sentence of the reference's ``split_paragraph(lang="zh")``: up to a CJK
+    # sentence or clause mark (with a closing quote), or a Latin one before a
+    # space or the end, so "3.5" stays whole.
+    _ZH_SENTENCE = re.compile(r".*?(?:[。？！；：、][\"”]?|[.?!;](?=\s|\Z)|\Z)", re.DOTALL)
+    # The same with commas, for a piece too long for the LM.
+    _ZH_CLAUSE = re.compile(r".*?(?:[。？！；：、，][\"”]?|[.?!;,](?=\s|\Z)|\Z)", re.DOTALL)
+    # A Han character is one token of this tokenizer, and Latin text fewer per
+    # character, so a piece's length bounds its tokens. The LM takes 512 tokens
+    # of prompt text and text: 7 for the system prompt, at most about 200 for
+    # the transcript of a 30 s reference clip, and 300 for the piece.
+    _ZH_MAX_PIECE_CHARS = 300
+
+    def split_speech_text(self, text: str) -> list[str]:
+        if re.search(r"[\u4e00-\u9fff]", text):  # the reference's ``contains_chinese``
+            return self._split_chinese(text)
+        # The reference counts real tokens here; characters per token differ
+        # by script (Hangul or kana about 1.5, Cyrillic about 2.7, English about 4.7).
+        chars_per_token = len(text) / max(1.0, self._estimated_tokens(text))
+        max_chars = min(self.speech_chunk_max_chars, max(80, int(80 * chars_per_token)))
+        return split_sentences(text, max_chars=max_chars, min_chars=int(20 * chars_per_token))
+
+    @classmethod
+    def _split_chinese(cls, text: str) -> list[str]:
+        """Text with Chinese cut as the reference cuts it: sentences joined with
+        nothing between them until a piece is past 60 characters and the next
+        sentence would take it past 80, a tail under 20 merged into the piece
+        before it, and a longer sentence kept whole rather than wrapped.
+
+        A piece over ``_ZH_MAX_PIECE_CHARS``, which the reference would send
+        whole but which could take a request past the LM's 512 tokens (a 400,
+        or audio cut short when it is not the first piece), is cut again at
+        commas as well, as ``split_paragraph(comma_split=True)`` cuts, after a clause over
+        80 characters (a run with no punctuation) is cut into even parts; every
+        piece of that is under 160 characters."""
+        pieces: list[str] = []
+        for piece in cls._group_chinese(cls._ZH_SENTENCE.findall(text)):
+            if len(piece) <= cls._ZH_MAX_PIECE_CHARS:
+                pieces.append(piece)
+                continue
+            clauses = cls._ZH_CLAUSE.findall(piece)
+            pieces += cls._group_chinese([c for clause in clauses for c in _cut_evenly(clause, 80)])
+        return pieces
+
+    @staticmethod
+    def _group_chinese(sentences: list[str]) -> list[str]:
+        """The grouping of the reference's ``split_paragraph(lang="zh")``."""
+        pieces: list[str] = []
+        current = ""
+        for sentence in sentences:
+            if len(current + sentence) > 80 and len(current) > 60:
+                pieces.append(current)
+                current = ""
+            current += sentence
+        if current.strip():
+            if len(current) < 20 and pieces:
+                pieces[-1] += current
+            else:
+                pieces.append(current)
+        return [piece.strip() for piece in pieces]
+
+    @classmethod
+    def _estimated_tokens(cls, text: str) -> float:
+        """An upper estimate of the Qwen2 BPE token count of ``text``."""
+        return sum(
+            1 / cls._CHARS_PER_TOKEN if ord(ch) < 0x80 else 0.5 if ord(ch) < 0x800 else 1.0 for ch in text
+        )
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk.setdefault("voice", req.voice)
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        file_paths = None
+        input_modalities = ["text"]
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            file_paths = {"audio": [_resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")]}
+            input_modalities = ["text", "audio"]
+        return SubmitArgs(
+            text=req.input,
+            file_paths=file_paths,
+            input_modalities=input_modalities,
             output_modalities=["audio"],
             model_kwargs=mk,
         )
@@ -937,7 +1096,7 @@ class LTX25Adapter(OpenAIAdapter):
     Returns one mp4 with the generated audio muxed in as an AAC track by default;
     ``audio: false`` in ``extra_body`` asks for video alone. ``size`` ("WxH") maps to
     the model's ``width`` / ``height``; ``seed``, ``num_frames`` and ``fps`` are
-    first-class fields, and any other knobs pass through via
+    first-class fields, and the model's other knobs (``recipe``) pass through via
     ``extra_body``. No image or video conditioning yet.
     """
 
@@ -1444,6 +1603,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),
     "fish_s2_pro": FishS2ProAdapter(),
+    "cosyvoice3": CosyVoice3Adapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
