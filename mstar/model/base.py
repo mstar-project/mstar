@@ -30,6 +30,7 @@ from mstar.graph.base import (
 )
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.rebuild import RebuildPolicy
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -598,6 +599,11 @@ class Model(ABC):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
+        return {}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        """``{node: policy}``: how a request dropped from each node's KV is rebuilt. A node without one never
+        drops a request."""
         return {}
 
     def combined_walk_of(self) -> dict[tuple[str, str], str]:

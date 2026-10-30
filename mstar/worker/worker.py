@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 import time as _time
-from array import array
 from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -36,14 +35,8 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import (
-    AdmitFailedReason,
-    AllocationFailed,
-    ResourceReqConfig,
-    SamplerStep,
-    StepContext,
-)
-from mstar.engine.resources.kv.config import KVReqConfig, without_layouts
+from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
+from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -102,6 +95,7 @@ from mstar.utils.profiler import (
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import RebuildRow, Rebuilds
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -304,26 +298,6 @@ class Speculation:
     # TP async scheduling: the broadcast seq of this speculation (leader:
     # assigned at broadcast; follower: the head's). PendingBatch.tp_seq on submit.
     tp_seq: int = -1
-
-
-@dataclass(slots=True)
-class KeptIds:
-    """A request's token ids on one node as int32: its prompt, then each sample it kept."""
-    prompt: bytes
-    sampled: array
-
-
-class RebuildRow(NamedTuple):
-    """A row of the prefill walk that recomputes a dropped request's KV. Its input is the request's
-    kept ids without the last one."""
-    node: str
-    walk: str
-    inputs: NameToTensorList
-
-
-# The output a sampling node returns its token under. A decode input such as `text_inputs` gets the
-# token only in the per-request `postprocess`, so a step's host rows lack that input.
-_SAMPLED = "new_token"
 
 
 class EvictionPolicy(Enum):
@@ -662,31 +636,13 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
-        # Kept so a dropped request can be rebuilt from its token ids.
-        # `_kv_keys`: node -> the keys of its paged KV caches.
-        # `_kept_ids`: node -> handle -> the request's ids on that node. Per node, since a colocated node
-        #   of another partition samples tokens of its own.
+        # What a dropped request is rebuilt from, on each node whose model declares how.
         # `_rebuild_rows`: handle -> its row waiting for a rebuild step.
-        # `_walk_inputs`: (walk, node) -> the node's inputs in that walk. A rebuild row's ids go under the
-        #   prefill walk's single input, such as `text_inputs`.
-        # `_growth_loops`: (walk, node) -> the loop that grows the node's KV in that walk.
-        self._kv_keys: dict[str, list[str]] = defaultdict(list)
-        for kv in self.engine_manager.engine.paged_kv_caches():
-            for node_name in kv.nodes:
-                self._kv_keys[node_name].append(kv.key)
-        self._kept_ids: dict[str, dict[int, KeptIds]] = {node_name: {} for node_name in self._kv_keys}
+        self._rebuilds = (
+            Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs()) if model is not None
+            else Rebuilds({}, {})
+        )
         self._rebuild_rows: dict[int, RebuildRow] = {}
-        self._walk_inputs: dict[tuple[str, str], set[str]] = {}
-        self._growth_loops: dict[tuple[str, str], str] = {}
-        if model is not None:
-            for walk_name, section in model.get_graph_walk_graphs().items():
-                for node_name, node in section.get_nodes().items():
-                    self._walk_inputs[(walk_name, node_name)] = node.input_names
-            labels = model.kv_labels()
-            for node_name, keys in self._kv_keys.items():
-                for kv_label in (label for key in keys for label in labels.get(key, {}).values()):
-                    for walk_name, loop in kv_label.growth:
-                        self._growth_loops[(walk_name, node_name)] = loop
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -938,7 +894,6 @@ class Worker:
             self._fail_requests({request_id: f"Error in worker: {text}"})
             self._process_unprocessed(body.request_id)
             return
-        self._keep_ids(request_id, body.request_info.resource_configs)
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         # Create StreamBuffers for consumer connections on this worker. A request
@@ -1111,46 +1066,21 @@ class Worker:
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
-        for kept in self._kept_ids.values():
-            kept.pop(request_id, None)
+        self._rebuilds.remove_request(request_id)
         self._rebuild_rows.pop(request_id, None)
         logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
 
-    def _keep_ids(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
-        """Keep the prompt's ids on each node where one prefill row can recompute the request's KV
-        from them. The node's paged KV caches must lay out one label, written by one walk and grown
-        by one loop. The node must also read a single input, with the same name in that walk and in
-        every walk the loop grows in, since the rebuild row's ids go under that name."""
-        for node_name, keys in self._kv_keys.items():
-            kept = self._kept_ids[node_name]
-            if request_id in kept:
-                continue  # its other partition's NewRequest
-            prompts = [
-                (layout, (config.prompt_ids or {}).get(label))
-                for key in keys if isinstance(config := configs.get(key), KVReqConfig)
-                for label, layout in (config.kv_layout or {}).items()
-            ]
-            if len(prompts) != 1 or prompts[0][1] is None:
-                continue
-            layout, ids = prompts[0]
-            walks = {span.walk for span in layout.spans}
-            if len(layout.growth) != 1 or len(walks) != 1:
-                continue
-            ((loop, _),) = layout.growth
-            reads = self._walk_inputs.get((*walks, node_name), set())
-            grows = [walk for (walk, node), name in self._growth_loops.items() if node == node_name and name == loop]
-            if len(reads) == 1 and grows and all(self._walk_inputs.get((walk, node_name)) == reads for walk in grows):
-                kept[request_id] = KeptIds(ids, array("i"))
-
     def _drop(self, request_id: int, node_name: str) -> int:
         """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
         the pages freed."""
-        if request_id not in self._kept_ids.get(node_name, {}):
+        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
+        why = self._rebuilds.refusal(request_id, node_name, info.graph_walk, info.dynamic_loop_iter_counts)
+        if why is not None:
             raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} keeps no ids on {node_name} to rebuild it from"
+                f"Worker {self.worker_id}: {self._rid_str(request_id)} can't be dropped on {node_name}, since {why}"
             )
         backlogged = any(
             request_id in batch.request_to_worker_graph
@@ -1160,18 +1090,6 @@ class Worker:
             raise RuntimeError(
                 f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step, a backlog or the rebuild queue "
                 f"on {node_name}"
-            )
-        # The rebuild row runs under the request's step_metadata as it stands at the drop, and a model
-        # discards the row's sample only under decode-time metadata, so the request must be in the walk
-        # that grows its KV. The prefill and each iteration of the growth loop sample once, and the KV
-        # holds all but the last sample.
-        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
-        loop = self._growth_loops.get((info.graph_walk, node_name))
-        kept = self._kept_ids[node_name][request_id]
-        if loop is None or len(kept.sampled) != info.dynamic_loop_iter_counts.get(loop, 0) + 1:
-            raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} on {node_name} is in walk "
-                f"{info.graph_walk!r}, which grows no KV, or its {len(kept.sampled)} kept samples don't cover its KV"
             )
         return self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
 
@@ -1186,13 +1104,9 @@ class Worker:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} isn't dropped on {node_name}")
         if request_id in self._rebuild_rows or request_id in self._in_flight_rids:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} is already being rebuilt")
-        kept = self._kept_ids[node_name][request_id]
-        ids = array("i", kept.prompt)
-        ids.extend(kept.sampled)
-        walk = engine.lay_out_rebuild(node_name, request_id, ids)
-        (name,) = self._walk_inputs[(walk, node_name)]
-        tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(self.device, dtype=torch.long)
-        self._rebuild_rows[request_id] = RebuildRow(node_name, walk, {name: [tokens]})
+        rebuild, row = self._rebuilds.rebuild(request_id, node_name, self.device)
+        engine.prepare_rebuild(node_name, request_id, rebuild)
+        self._rebuild_rows[request_id] = row
 
     def _runnable_rebuilds(self) -> dict[int, RebuildRow]:
         """The queued rebuild rows the scheduler would run now: not held, failed or removed."""
@@ -2143,6 +2057,7 @@ class Worker:
         final_stream_rids, stream_partition_done_rids = self._settle_final_streams(
             node_name, final_edges or {},
         )
+        self._rebuilds.keep_prompts(node_name, graph_walk, request_walks or {}, per_request_input_tensors)
         return ExecutingBatch(
             node_name=node_name,
             per_request_info=per_request_info,
@@ -3929,7 +3844,7 @@ class Worker:
             )
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
-        self._keep_samples(batch_N.node_batch, cpu_outputs, host_rows)
+        self._rebuilds.keep_samples(batch_N.node_batch, cpu_outputs, host_rows)
         # What the stop check withheld (``StopCheck.withheld``), and an output
         # cut to an empty span, is not stored, so not routed: a streaming edge
         # then carries no item for the row, and the producer's item count
@@ -4095,39 +4010,6 @@ class Worker:
         engine = self.engine_manager.get_engine(node_batch.node_name)
         for rid in node_batch.rebuild_rids & set(node_batch.request_ids):
             engine.land_rebuild(node_batch.node_name, rid)
-
-    def _keep_samples(
-        self, node_batch: ExecutingBatch, cpu_outputs, host_rows: "HostRows | None",
-    ) -> None:
-        """Append each kept row's sample, from the stop check's host copy, to its kept ids."""
-        kept_ids = self._kept_ids.get(node_batch.node_name)
-        if not kept_ids:
-            return
-        step = node_batch.step
-        kept_rows = None if step is None else next(
-            (s.kept_rids for s in step.steps.values() if isinstance(s, SamplerStep)), None,
-        )
-        ctx, rebuild = node_batch.step_context, node_batch.rebuild_rids
-        if host_rows is not None:
-            tokens = host_rows.buffers.get(_SAMPLED)
-            if not torch.is_tensor(tokens) or tokens.dim() == 0:
-                return
-            # the sampler's [B] output skips the reshape, which costs more than the rest of this method
-            values = tokens.tolist() if tokens.dim() == 1 else tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-            pairs = zip(host_rows.request_ids, values, strict=False)
-        else:
-            pairs = (
-                (rid, int(out[_SAMPLED][0])) for rid in node_batch.request_ids
-                if isinstance(out := cpu_outputs.get(rid), dict) and out.get(_SAMPLED)
-            )
-        for rid, token in pairs:
-            kept = kept_ids.get(rid)
-            # the host rows are the forward's, which can hold a row the worker has since taken out of the step
-            if (
-                kept is not None and ctx.is_real_row(rid) and (kept_rows is None or rid in kept_rows)
-                and rid not in rebuild
-            ):
-                kept.sampled.append(token)
 
     def _store_and_route(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,

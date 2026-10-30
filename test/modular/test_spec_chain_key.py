@@ -6,6 +6,7 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.worker import SpeculationTarget, Worker, _SpecFairness
 
 
@@ -28,6 +29,7 @@ def _worker(target):
         enable_nvtx=False,
         _phase_period=0,
         request_state=None,
+        _rebuilds=Rebuilds({}, {}),
         _rebuild_rows={},
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or True,

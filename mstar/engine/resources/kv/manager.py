@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
@@ -19,6 +19,7 @@ from mstar.engine.resources.base import (
     EngineResourceInfo,
     KeyedWalks,
     PublishedInfo,
+    Rebuild,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import (
@@ -582,7 +583,8 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        self._dropped: set[str] = set()
+        # dropped request -> the tokens its laid-out label held, which its rebuild must write again
+        self._dropped: dict[str, int] = {}
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
@@ -3077,9 +3079,14 @@ class KVManager(AttentionResource):
         with self._lock:
             if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
                 raise RuntimeError(f"KV {self.name}: {rid} has a step or a read in flight on its pages")
-            layouts = (self._overrides[rid].kv_layout or {}).values()
-            if any(span.kind != SpanKind.IDS for layout in layouts for span in layout.spans):
+            laid_out = [layout for layout in (self._overrides[rid].kv_layout or {}).values() if layout.spans]
+            if any(span.kind != SpanKind.IDS for layout in laid_out for span in layout.spans):
                 raise RuntimeError(f"KV {self.name}: {rid} holds KV that can't be recomputed from token ids")
+            if len(laid_out) > 1 or any(len(layout.spans) != 1 or len(layout.growth) != 1 for layout in laid_out):
+                raise RuntimeError(
+                    f"KV {self.name}: {rid} writes more than one label, span or growth loop, which one rebuild "
+                    "row can't lay out again"
+                )
 
     def drop(self, rid: str) -> int:
         """Take ``rid``'s KV off the device without a host copy, and return the
@@ -3089,29 +3096,39 @@ class KVManager(AttentionResource):
             self.check_drop(rid)
             # under the lock, so no other step allocates between the two counts
             free = self._arena.num_free
+            # `check_drop` allows at most one laid-out label
+            laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
+            held = sum(self._streams[rid][label].stored_len for label in laid_out)
             self.reset_request(rid, free=True)
-            self._dropped.add(rid)
+            self._dropped[rid] = held
             return self._arena.num_free - free
 
-    def lay_out_again(self, rid: str, ids: Sequence[int]) -> str:
-        """Lay ``rid``'s label out again as one ids span over ``ids`` without the last id, keyed as a
-        prompt of those ids would be, and return the walk that writes the span.
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+        """Lay ``rid``'s label out again as one ids span of the rebuild's walk over its ids without the last
+        one, keyed as a prompt of those ids would be.
 
         The growth loop's cap drops by the iterations the span now covers, so the footprint stays
         the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
         overrides = self._overrides[rid]
-        (label,) = overrides.prompt_ids
+        laid_out = [label for label, layout in (overrides.kv_layout or {}).items() if layout.spans]
+        if not laid_out:
+            return
+        (label,) = laid_out
+        ids, walk = rebuild.ids, rebuild.walk
         prompt, page_size = ids[:-1], self.config.page_size
         length = len(prompt)
+        if length != self._dropped[rid]:
+            raise RuntimeError(
+                f"KV {self.name}: {rid}'s rebuild writes {length} tokens, but its label held {self._dropped[rid]}"
+            )
         pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
         keyed = bool((overrides.prefix_keys or {}).get(label))
         # hashed before the lock, as `resolve_cached_prefix` hashes outside it
         keys = chain(pages) if keyed else None
         with self._lock:
             layout = overrides.kv_layout[label]
-            (walk,) = {span.walk for span in layout.spans}
             ((loop, slots),) = layout.growth
             grown = length - sum(span.length for span in layout.spans)
             changes = {}
@@ -3135,10 +3152,9 @@ class KVManager(AttentionResource):
             self._seed_keys(rid, label, stream)
             if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
                 stream.chain.extend([ids[-1]], page_size)
-            return walk
 
     def land_rebuild(self, rid: str) -> None:
-        self._dropped.discard(rid)
+        self._dropped.pop(rid, None)
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns the device pages
@@ -3699,7 +3715,7 @@ class KVManager(AttentionResource):
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
-            self._dropped.discard(rid)
+            self._dropped.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:

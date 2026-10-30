@@ -34,6 +34,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -110,7 +111,7 @@ def _worker(is_tp_follower=False) -> Worker:
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
-    w._kv_keys, w._kept_ids, w._rebuild_rows = {}, {}, {}
+    w._rebuilds, w._rebuild_rows = Rebuilds({}, {}), {}
     w.enable_nvtx = False
     return w
 

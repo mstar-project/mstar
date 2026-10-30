@@ -60,6 +60,7 @@ import pytest
 import torch
 
 from mstar.utils.ipc_format import WorkerMessageType
+from mstar.worker.rebuild import Rebuilds
 
 HERE = Path(__file__).resolve().parent
 
@@ -642,6 +643,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._rebuilds = Rebuilds({}, {})
     w.worker_id = WORKERS[rank]
     w.device = torch.device("cpu")
     w.enable_nvtx = w.enable_prof = False

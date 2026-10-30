@@ -14,11 +14,9 @@ import torch
 import yaml
 from test_kv_prefix_request_keys import _StubTensorManager
 
-import mstar.communication.wire_types  # noqa: F401 (registers the wire types)
 import mstar.conductor.conductor as conductor_mod
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
-from mstar.communication import wire
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
@@ -262,20 +260,3 @@ def test_a_layout_the_client_sent_is_dropped(tmp_path, monkeypatch):
     cfg = _ingest(model, kwargs, tmp_path, monkeypatch).request_info.resource_configs["kv"]
 
     assert cfg.kv_layout["main"].spans[0].length == PROMPT, "a client's layout would size another request's pages"
-
-
-# ("ids", "ids") as Cosmos3 lays out guidance.
-@pytest.mark.parametrize("main, uncond", [("ids", None), ("ids", "ids"), ("rows", None), ("digest", None)])
-def test_only_the_new_request_carries_the_ids_of_a_lone_label_laid_out_as_ids(tmp_path, monkeypatch, main, uncond):
-    def layout(kind):
-        return LabelLayout(spans=(Span(kind, "prefill", PROMPT, PROMPT, "text_inputs"),) if kind else ())
-    model = _Model({"kv": {"main": layout(main), "uncond": layout(uncond)}})
-    kwargs = _preprocess(model, {"max_output_tokens": 30, "prefix_cache": False, "prompt_ids": {"kv": {"uncond": b""}}})
-
-    comm = _conduct(model, kwargs, tmp_path, monkeypatch)
-
-    [frame] = [msg for msg in comm.sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"]
-    sent = wire.decode(wire.encode(frame)).body.request_info.resource_configs["kv"]
-    want = {"main": torch.arange(PROMPT).int().numpy().tobytes()} if (main, uncond) == ("ids", None) else None
-    assert sent.prompt_ids == want, "a rebuild would prefill a client's ids, or ids that aren't the label's own"
-    assert comm.conductor.requests["r"].resource_configs["kv"].prompt_ids is None, "later messages would carry them"
