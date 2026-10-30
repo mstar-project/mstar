@@ -416,5 +416,5 @@ def _worker_parallelism(
                 f"Resource {spec.resource_key} is shared by lockstep-parallel nodes "
                 f"{list(lockstep)} on {', '.join(wids)}; the other ranks replay rank 0's moves on the pool "
                 "per node, so a shared pool can admit out of step. "
-                "Place these nodes on different workers."
+                "Give each node a resource of its own, or place them on different workers."
             )

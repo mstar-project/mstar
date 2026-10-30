@@ -25,7 +25,7 @@ from test_startup_graph_validation import (
 
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.resources.base import Resource
+from mstar.engine.resources.base import EngineResourceInfo, Resource, build_resource
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
@@ -392,6 +392,31 @@ def test_lockstep_nodes_sharing_a_kv_resource_are_refused(offload, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources={"kv": {"cpu_offload_pages": offload}})
     [problem] = _problems(model, cfg)
     assert problem.startswith("Resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_0, worker_1;")
+
+
+class _Trail(_Stub):
+    """A resource whose page trail the followers check against rank 0's."""
+
+    @classmethod
+    def build(cls, spec, info):
+        return cls()
+
+    def page_trail(self):
+        return (0, 0)
+
+
+class _TrailSpec(_Spec):
+    @property
+    def resource_class(self):
+        return _Trail
+
+
+def test_a_resource_rank_0_decides_for_followers_needs_a_spec_that_says_so():
+    """Validation refuses lockstep nodes sharing a resource only by its spec's
+    journals_resident_moves, so a resource rank 0 decides for its followers
+    can't be built from a spec that leaves it False."""
+    with pytest.raises(ValueError, match="_TrailSpec.journals_resident_moves is False"):
+        build_resource(_TrailSpec("trail", {"a"}), EngineResourceInfo(device="cpu"))
 
 
 @pytest.mark.parametrize("b, placed", [

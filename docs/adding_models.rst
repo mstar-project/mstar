@@ -537,14 +537,14 @@ three common fields:
   attention spec that depends on nothing: it names no cache, because it has none.
 
 Two lockstep-parallel nodes on one worker (TP or SP nodes placed on the same ranks) must not
-name the same evictable resource. Under TP, rank 0 decides such a resource's state outside
-the step that uses it (offloads, reloads, prefix leases), and the other ranks replay each
-decision with the next step of the node it was recorded under, so a resource shared by two
-lockstep nodes could admit out of step on a follower. A spec marks this with the
-``journals_resident_moves`` property: ``KVSpec`` sets it, and the spec of any new resource
-with ``supports_eviction`` must set it too. The conductor refuses a deployment that places
-two lockstep nodes over one such resource on a worker; give each node a spec of its own, or
-place the nodes on different workers.
+share a resource whose state rank 0 decides for the other ranks outside the step that uses it:
+offloads and reloads, prefix leases, page trails. The other ranks replay each decision with the
+next step of the node it was recorded under, so two nodes on one such resource could admit out
+of step. A spec marks this with ``journals_resident_moves``. ``KVSpec`` always sets it, with or
+without host offload, and ``build_resource`` refuses a resource implementing
+``supports_eviction``, ``lease_cached_prefix`` or ``page_trail`` whose spec doesn't. The
+conductor refuses a deployment that places two lockstep nodes over one such resource on a
+worker; give each node a spec of its own, or place the nodes on different workers.
 
 The spec types are:
 

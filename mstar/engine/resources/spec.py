@@ -58,11 +58,13 @@ class NodeResourceSpec(ABC):
 
     @property
     def journals_resident_moves(self) -> bool:
-        """Under TP, rank 0 decides this resource's state for its followers
-        outside the step that uses it (offload, reload, prefix leases), and they
-        replay each decision with the next step of the node it was journaled
-        under, so lockstep nodes must not share it. Set it on the spec of any
-        resource with ``supports_eviction``."""
+        """In a lockstep instance, rank 0 decides this resource's state for its
+        followers outside the step that uses it (offload, reload, prefix leases,
+        page trails), and they replay each decision with the next step of the
+        node it was journaled under, so lockstep nodes must not share it. Set it
+        on the spec of any resource implementing ``supports_eviction``,
+        ``lease_cached_prefix`` or ``page_trail``; ``build_resource`` refuses
+        one that doesn't."""
         return False
 
     @property
