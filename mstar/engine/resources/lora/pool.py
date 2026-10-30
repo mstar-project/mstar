@@ -190,12 +190,12 @@ class LoraLayerDelta:
         ):
             raise RuntimeError(
                 "a LoRA delta was called with no planned step addressing its rows: the "
-                "node's declare_step returned None (or a step without segments) for this "
-                "walk; a piecewise region running adapted modules declared no LoraStep of "
-                "its own; or the call is outside the planned step (prepare_inputs, which "
-                "the async worker runs while the GPU thread's step is planned, or an "
-                "output cached from an earlier step), where the module's base computation "
-                "runs and the delta belongs in preprocess or the forward"
+                "node's declare_step returned None for this walk; a piecewise region "
+                "running adapted modules declared no LoraStep of its own; or the call is "
+                "outside the planned step (prepare_inputs, which the async worker runs "
+                "while the GPU thread's step is planned, or an output cached from an "
+                "earlier step), where the module's base computation runs and the delta "
+                "belongs in preprocess or the forward"
             )
         if not self._pool.active:
             # a base-only step: no row names an adapter, so nothing is launched
@@ -456,8 +456,8 @@ class LoraAdapterPool(Resource):
         if self._current is None:
             raise RuntimeError(
                 "the LoRA pool has no plan for this step: the node's declare_step returned "
-                "None (or a step without segments) for this walk, or a piecewise region "
-                "running adapted modules declared no LoraStep of its own"
+                "None for this walk, or a piecewise region running adapted modules declared "
+                "no LoraStep of its own"
             )
         return self._current[grouping]
 
