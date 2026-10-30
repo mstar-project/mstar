@@ -407,7 +407,7 @@ def _worker_parallelism(
     worker_ids = [f"worker_{rank}" for rank in ranks]
     try:
         per_worker = GlobalParallelConfig(dict(enumerate(worker_graphs)), worker_ids).per_worker_config
-    except RuntimeError as e:
+    except ValueError as e:
         yield str(e)
         return
 

@@ -118,7 +118,7 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch):
 
 
 @pytest.mark.parametrize(("tp", "sp", "shard_over_sp", "heads"), [
-    (2, 1, True, 4), (1, 2, True, 4), (2, 2, True, 2), (2, 2, False, 4),
+    (1, 1, True, 8), (2, 1, True, 4), (1, 2, True, 4), (2, 2, True, 2), (2, 2, False, 4),
 ])
 def test_cfg_ranks_keep_every_head(tp, sp, shard_over_sp, heads):
     """On a lockstep instance with a two-rank CFG axis, a ragged attention's
