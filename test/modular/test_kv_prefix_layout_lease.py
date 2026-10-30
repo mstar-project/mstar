@@ -80,7 +80,7 @@ def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WAL
     sent = PreprocessWorkerThread._prefix_keys(worker, tensors, layouts, rows, None, {})
     config = KVReqConfig()
     config.apply_conductor_config(
-        prefix_cache=True, kv_layout=rows["kv"], loop_caps={"decode_loop": decode},
+        kv_layout=rows["kv"], loop_caps={"decode_loop": decode},
         **{name: by_resource["kv"] for name, by_resource in sent.items()},
     )
     return config

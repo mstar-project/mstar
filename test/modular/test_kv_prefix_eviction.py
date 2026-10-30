@@ -86,7 +86,7 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
         tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)
     ]
     kv.ingest_request(rid, KVReqConfig(
-        prefix_cache=True, prefix_keys={"main": chain(pages)}, prefix_tail={"main": []},
+        prefix_keys={"main": chain(pages)}, prefix_tail={"main": []},
         kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
     ))
 

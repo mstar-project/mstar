@@ -93,7 +93,7 @@ def _layout(prompt: list[int]) -> StreamLayout:
 def _ingest(kv: KVManager, rid: str, prompt: list[int], chains: bool = True, decode: int = 0):
     whole = len(prompt) // PAGE_SIZE
     kv.ingest_request(rid, KVReqConfig(
-        prefix_cache=True, prefix_keys={"main": chain(_pages(prompt))},
+        prefix_keys={"main": chain(_pages(prompt))},
         prefix_tail={"main": prompt[whole * PAGE_SIZE:]},
         prefix_decode={"main": TENSOR} if chains else None,
         kv_layout={"main": _layout(prompt)},

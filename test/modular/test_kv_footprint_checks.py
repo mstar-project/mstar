@@ -97,9 +97,7 @@ def test_the_tail_after_a_cache_hit_fires_nothing(debug, monkeypatch):
     kv = _manager()
     tokens = list(range(100))
     keys = _seed(kv, tokens)
-    kv.ingest_request("r1", KVReqConfig(
-        prefix_cache=True, prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100), loop_caps={},
-    ))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100), loop_caps={}))
     inputs = ARNodeInputs(input_seq_len=100)
     prefix = kv.resolve_cached_prefix("r1", NODE, WALK, inputs)
     kv.apply_cached_prefix("r1", NODE, WALK, inputs, prefix)
@@ -144,7 +142,7 @@ def test_a_label_the_request_does_not_open_holds_no_pages(debug, caplog, monkeyp
 def test_a_keyed_label_the_request_does_not_open_gets_no_chain():
     kv = _manager()
     kv.ingest_request("r0", KVReqConfig(
-        prefix_cache=True, prefix_keys={"cfg_img": _keys(list(range(40)))}, kv_layout=_layout(40), loop_caps={},
+        prefix_keys={"cfg_img": _keys(list(range(40)))}, kv_layout=_layout(40), loop_caps={},
     ))
 
     _grow(kv, "r0", 20, label="cfg_img")

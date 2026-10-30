@@ -342,7 +342,6 @@ def _kv_config(tokens):
 
     whole = len(tokens) // PAGE_SIZE
     return KVReqConfig(
-        prefix_cache=True,
         prefix_keys={"main": chain([tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)])},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
         kv_layout={"main": StreamLayout(

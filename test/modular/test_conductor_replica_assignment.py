@@ -146,7 +146,9 @@ def _kv_spec():
 def _kv_conductor(weights=None):
     spec = _kv_spec()
     conductor = _conductor({0: _wg(0, [0, 1])}, specs=[spec], weights=weights)
-    conductor._resource_specs_cache = {"kv": spec}
+    # the model's specs, then each worker's, as `_node_resources` and `_resource_specs` build them
+    conductor._node_resources_cache = [spec]
+    conductor._resource_specs_cache = [{"kv": spec}]
     return conductor
 
 
@@ -156,7 +158,6 @@ def _prompt(prefix: str, pages: int = 4, unkeyed: int = 0, keys=("kv",)) -> dict
     each KV resource of ``keys``."""
     spans = [(pages * PAGE, pages * PAGE, "prefill")] + [(unkeyed, unkeyed, "prefill")] * bool(unkeyed)
     return {
-        "prefix_cache": True,
         "prefix_keys": {key: {"main": [f"{prefix}{i}".encode() for i in range(pages)]} for key in keys},
         "kv_layout": {key: {"main": (spans, (), 0, None, 1)} for key in keys},
     }
@@ -445,7 +446,6 @@ def test_the_kv_mirror_predicts_the_hits_the_real_cache_serves(monkeypatch):
         tokens = list(range(first, first + 4 * page + 1))
         return tokens, KVReqConfig(
             # as the data worker keys a prompt: every page, the partial last one included
-            prefix_cache=True,
             prefix_keys={"main": chain([tokens[at:at + page] for at in range(0, len(tokens), page)])},
             prefix_tail={"main": tokens[4 * page:]},
             kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), walk),), keyed_spans=1)},

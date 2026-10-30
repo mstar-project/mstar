@@ -780,8 +780,6 @@ class PreprocessWorkerThread:
             self._ended_streams[input.request_id] = set(input.ends)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
-        # always set, as KVReqConfig.prefix_cache reads only its truth
-        conductor_kwargs["prefix_cache"] = _prefix_cache(model_kwargs)
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(

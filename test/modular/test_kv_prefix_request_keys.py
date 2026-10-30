@@ -352,29 +352,13 @@ def test_a_request_can_turn_the_cache_off_for_itself():
 
 
 def test_a_request_that_says_nothing_is_still_cached():
-    worker = _worker(_Model(), _deployment())
-
-    for said in ({}, {"prefix_cache": None}):
-        kwargs = _run(worker, said)
-        assert kwargs["prefix_cache"] is True and "prefix_keys" in kwargs, (
-            f"a request that sent {said} was opted out of the cache"
-        )
-
-
-def test_a_config_handed_no_prefix_cache_is_not_cached():
     cfg = KVReqConfig()
 
     cfg.apply_conductor_config(seed=1, prefix_keys={"main": [b"k"]})
 
-    assert cfg.prefix_cache is False, (
-        "the worker sets prefix_cache on every request it sends; a config without it was cached anyway"
+    assert cfg.prefix_cache is True, (
+        "a request that never mentioned the cache was opted out of it"
     )
-
-
-def test_a_truthy_prefix_cache_opens_a_config():
-    cfg = _handed_over({"prefix_cache": 1, "prefix_keys": {"kv": {"main": [b"k"]}}})
-
-    assert cfg.prefix_cache is True, "a truthy prefix_cache did not open the request's cache"
 
 
 class _Talking(_ToyModel):
@@ -431,8 +415,7 @@ def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
         conductor._do_ingest_request(NewRequestConductor(
             request_id=out, initial_signals={}, initial_input_modalities=["text"],
             initial_output_modalities=[out], input_metadata={},
-            # as the data worker sends it, so only the streamed partition can turn it off
-            model_kwargs={"prefix_cache": True, "kv_layout": {"kv": {"main": layout.row()}}},
+            model_kwargs={"kv_layout": {"kv": {"main": layout.row()}}},
         ))
         cached[out] = conductor.requests[out].resource_configs["kv"].prefix_cache
 

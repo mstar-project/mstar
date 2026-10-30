@@ -92,7 +92,6 @@ def _manager(max_num_pages: int = 128, host_pages: int = 64) -> KVManager:
 def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
     whole = len(tokens) // PAGE_SIZE
     kv.ingest_request(rid, KVReqConfig(
-        prefix_cache=True,
         prefix_keys={"main": chain([tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)])},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
         kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},

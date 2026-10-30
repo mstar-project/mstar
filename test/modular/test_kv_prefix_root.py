@@ -327,7 +327,7 @@ _LAYOUT = {"main": StreamLayout(spans=(PrefixSpan(32, 32, "prefill_text"),), key
 def test_ingest_puts_the_requests_keys_on_the_stream():
     kv = _kv()
 
-    kv.ingest_request("r0", KVReqConfig(prefix_cache=True, prefix_keys={"main": [b"k0", b"k1"]}, kv_layout=_LAYOUT))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}, kv_layout=_LAYOUT))
 
     assert kv._streams["r0"]["main"].chain.keys == [b"k0", b"k1"], (
         "the chain the request brought never reached its stream"
@@ -336,7 +336,7 @@ def test_ingest_puts_the_requests_keys_on_the_stream():
 
 def test_a_label_the_request_did_not_key_carries_none():
     kv = _kv()
-    kv.ingest_request("r0", KVReqConfig(prefix_cache=True, prefix_keys={"main": [b"k0"]}, kv_layout=_LAYOUT))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0"]}, kv_layout=_LAYOUT))
 
     stream = kv._ensure_label("r0", "cfg_text")
 

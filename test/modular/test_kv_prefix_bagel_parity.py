@@ -182,7 +182,7 @@ class _Node:
     def ingest(self, rid: str, tokens: list[int]) -> None:
         whole = len(tokens) // PAGE_SIZE
         self.runner.ingest_request(rid, {"kv": KVReqConfig(
-            prefix_cache=True, prefix_keys={"main": chain([
+            prefix_keys={"main": chain([
                 tokens[at:at + PAGE_SIZE]
                 for at in range(0, len(tokens), PAGE_SIZE)
             ])},

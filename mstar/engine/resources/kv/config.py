@@ -266,8 +266,7 @@ class KVReqConfig(ResourceReqConfig):
     prefix_tail: dict[str, list[int]] | None = None
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
-    # read as its truth; the data worker sends it with every request, a client's unset or None as True
-    prefix_cache: bool = False
+    prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
 
@@ -288,7 +287,7 @@ class KVReqConfig(ResourceReqConfig):
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
         if prefix_cache is not None:
-            self.prefix_cache = bool(prefix_cache)
+            self.prefix_cache = prefix_cache
         if kv_layout is not None:
             # a model lays out every label the request could open on any deployment, so keep only the ones it opens
             opened = self.opened_labels()
