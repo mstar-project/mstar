@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import itertools
 import logging
-import os
 import time
 from typing import Any
 
@@ -97,11 +96,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # preprocess, read by check_stop); "ended_at_prefill", the prefill sampled a stop token:
         # the prefill walk has no loop to stop, so the first decode step stops decode_loop and
         # emits nothing.
-        # Which trunk stream the MTP plane pairs drafts against (see
-        # _mtp_pair_rows): the post-final-norm one by default.
-        self._mtp_pair_postnorm = (
-            os.environ.get("MSTAR_GLM52_MTP_PAIR_POSTNORM", "1") == "1"
-        )
         # Each request's seed slot (the MTP state that drafts d1, and d1) in the device seed
         # buffers; slot 0 is the sink that padding and capture rows write.
         self._mtp_slot: dict[str, int] = {}
@@ -491,13 +485,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             inputs[0].input_ids if len(inputs) == 1 else torch.cat([inp.input_ids for inp in inputs]))
         return out
 
-    def _mtp_pair_rows(self, normed: torch.Tensor, prenorm: torch.Tensor) -> torch.Tensor:
-        """The trunk stream the MTP plane pairs drafts against: the
-        post-final-norm one, which the reference implementation pairs and
-        which accepts markedly better, unless
-        MSTAR_GLM52_MTP_PAIR_POSTNORM=0."""
-        return normed if self._mtp_pair_postnorm else prenorm
-
     def _positions(self, engine_inputs: ModelInputsFromEngine, num_tokens: int) -> torch.Tensor:
         """The step's positions as the position resource planned them, in the KV plan's
         order, which ``input_ids`` packs in; captured, a slice of the slot's buffer."""
@@ -508,10 +495,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         rows: torch.Tensor | None = None,
-        with_prenorm: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.language_model.model(
-            input_ids, position_ids, rows=rows, return_prenorm=with_prenorm)
+    ) -> torch.Tensor:
+        return self.language_model.model(input_ids, position_ids, rows=rows)
 
     @torch.compiler.disable
     def _last_row_index(
@@ -608,15 +593,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         row (each request's last row pairs with its sampled token): it fills the MTP plane and
         seeds the first decode step."""
         lm = self.language_model
-        hidden, prenorm = self._hidden(input_ids, position_ids, with_prenorm=True)
+        hidden = self._hidden(input_ids, position_ids)
         last = self._last_row_index(engine_inputs, kwargs)
         new_tokens = self._sample_tokens(engine_inputs, self.lm_head(hidden.index_select(0, last)))
         # roll, not a shifted copy into empty memory: a captured bucket's tail is padding,
         # and every row must hold a valid id for the embedding
         nxt = torch.roll(input_ids, -1)
         nxt.index_copy_(0, last, new_tokens.to(nxt.dtype))
-        h_head, h_raw = lm.mtp(
-            lm.model.embed_tokens(nxt), self._mtp_pair_rows(hidden, prenorm), position_ids + 1)
+        # the MTP plane pairs the trunk's post-final-norm state, as the reference does
+        h_head, h_raw = lm.mtp(lm.model.embed_tokens(nxt), hidden, position_ids + 1)
         self._mtp_seed(kwargs["mtp_slots"], h_head.index_select(0, last),
                        h_raw.index_select(0, last), new_tokens)
         return {
@@ -645,7 +630,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             drafts.append(self._draft_tokens(h_head, drafts[-1]))
         drafts = torch.stack(drafts, 1)
         ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
-        hidden, prenorm = self._hidden(ids, position_ids, with_prenorm=True)
+        hidden = self._hidden(ids, position_ids)
         target = self.lm_head(hidden).argmax(-1).view(n, block)
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         # every rank keeps rank 0's verdict: each trims its KV and seeds its next step by it, so
@@ -653,8 +638,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block].contiguous(), verdict[:, block]
         self._stage_verdict(engine_inputs, verdict, mtp_seq)
-        h_head, h_raw = lm.mtp(
-            embed(target.view(-1)), self._mtp_pair_rows(hidden, prenorm), position_ids + 1)
+        h_head, h_raw = lm.mtp(embed(target.view(-1)), hidden, position_ids + 1)
         at = torch.arange(n, device=accepted.device) * block + accepted
         next_input = target.view(-1).index_select(0, at)
         self._mtp_seed(mtp_slots, h_head.index_select(0, at), h_raw.index_select(0, at), next_input)
@@ -839,10 +823,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         ]
         logger.info(
             "MTP acceptance by position: n_acc histogram %s, conditional accept "
-            "per position %s [trunk pairing: %s]",
+            "per position %s",
             self._mtp_stat_acc_hist, " ".join(cond),
-            "post-final-norm (default, vLLM's)" if self._mtp_pair_postnorm
-            else "pre-final-norm (MSTAR_GLM52_MTP_PAIR_POSTNORM=0)",
         )
 
     def postprocess(

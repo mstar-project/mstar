@@ -71,7 +71,7 @@ def test_mtp_acceptance_log_per_position(caplog):
     """
     k = 3
 
-    def _ns(pair_postnorm: bool) -> SimpleNamespace:
+    def _ns() -> SimpleNamespace:
         return SimpleNamespace(
             config=SimpleNamespace(mtp_num_draft_tokens=k),
             _MTP_STAT_LOG_EVERY=Glm52LLMSubmodule._MTP_STAT_LOG_EVERY,
@@ -80,10 +80,9 @@ def test_mtp_acceptance_log_per_position(caplog):
             # 512 steps halving at each position: reached = [512, 256, 128, 64].
             _mtp_stat_acc_hist=[256, 128, 64, 64],
             _mtp_stat_emitted=256 * 1 + 128 * 2 + 64 * 3 + 64 * 4,
-            _mtp_pair_postnorm=pair_postnorm,
         )
 
-    ns = _ns(False)
+    ns = _ns()
     with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
         Glm52LLMSubmodule._maybe_log_mtp_acceptance(ns)
     msgs = [r.getMessage() for r in caplog.records]
@@ -92,23 +91,9 @@ def test_mtp_acceptance_log_per_position(caplog):
     assert "[256, 128, 64, 64]" in pos_line
     assert "0.50 0.50 0.50" in pos_line
     assert ns._mtp_stat_logged == 512
-    # The line must name which trunk-pairing mode produced it: a profile whose
-    # mode you have to infer from the launch environment is one you cannot
-    # trust afterwards, and a mislabelled one inverts the comparison silently.
-    assert "pre-final-norm (MSTAR_GLM52_MTP_PAIR_POSTNORM=0)" in pos_line
-    assert "post-final-norm" not in pos_line
-
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
-        Glm52LLMSubmodule._maybe_log_mtp_acceptance(_ns(True))
-    (post_line,) = [
-        r.getMessage() for r in caplog.records if "by position" in r.getMessage()
-    ]
-    # post-norm pairing is the default (the env var's 1); the label said the opposite
-    assert "post-final-norm (default" in post_line
     # below the threshold nothing is logged
     caplog.clear()
-    quiet = _ns(True)
+    quiet = _ns()
     quiet._mtp_stat_steps = 100
     with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
         Glm52LLMSubmodule._maybe_log_mtp_acceptance(quiet)

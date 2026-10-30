@@ -239,11 +239,6 @@ model, so they are named for it.
        checkpoint the registry names. For serving a fine-tune of the same
        architecture off a mounted volume, where the registry entry would
        otherwise pull the public weights from the Hub.
-   * - ``MSTAR_GLM52_MTP_PAIR_POSTNORM``
-     - ``1``
-     - GLM-5.2 MTP: pair drafts against the trunk's post-norm hidden state,
-       the reference convention. ``0`` pairs the pre-norm state. Changes which
-       tokens are drafted, never which are emitted.
    * - ``MSTAR_ASR_DATA``
      - ``data/asr``
      - ``test/asr`` (GPU parity tests): the set ``benchmark.asr_data`` built.
