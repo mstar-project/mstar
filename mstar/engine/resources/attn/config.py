@@ -36,9 +36,10 @@ class AttentionConfig:
     # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
     # backend reads it; the others refuse it at build
     sm_scale: float | None = None
-    # FlashInfer only: combined walks whose captured steps plan their
-    # one-token rows on the decode wrapper and their prompt rows on a prefill
-    # wrapper sized to them (`FlashInferMixedWrapper`)
+    # FlashInfer only: combined walks whose captured steps run their leading
+    # one-token rows on a decode half and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`); the engine orders
+    # those steps decode first
     splits: tuple[CombinedSplit, ...] = ()
     # FlashInfer only: run one-token decode rows on the tensor-core kernel.
     # False picks the CUDA-core decode kernel, which can win for MHA and

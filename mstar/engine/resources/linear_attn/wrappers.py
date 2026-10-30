@@ -630,9 +630,10 @@ class GDNMixedWrapper(GDNWrapper):
     leading run of decode rows goes to the decode kernel and every row after
     it to the chunked one, each reading the step's tokens in place: the engine
     orders a split walk's rows decode first (``CombinedSplit``), so row i of
-    that run is token i. Both halves run over static shapes. The decode half
-    takes the first ``bs`` tokens, rows past the run on the null slot, which it
-    skips. Under capture the chunked half takes every token, the run as one
+    that run is token i. Both halves run over static shapes. Under capture
+    the decode half takes the bucket's first ``bs`` tokens, rows past the run
+    on the null slot with their outputs dropped; eagerly it takes only the
+    run. Under capture the chunked half takes every token, the run as one
     sequence on the null slot ahead of at most ``max_prefill_rows`` prompt
     rows, and the decode half's outputs overwrite that sequence's; an eager
     step's chunked half takes the tokens after the run.
@@ -724,7 +725,9 @@ class GDNMixedWrapper(GDNWrapper):
         if len(prompt) > cap:
             raise RuntimeError(
                 f"GDNMixedWrapper: {len(prompt)} prompt rows in a step "
-                f"captured for {cap}; the scheduler caps a mixed step's prompt rows"
+                f"captured for {cap}: more than the scheduler lets in, a decode "
+                "row behind a prompt row (a broken row order), or a "
+                "CombinedSplit that leaves out a multi-token walk"
             )
         # Under capture the decode half runs the bucket's rows; eagerly, the run's.
         width = max(self._bs or 0, rows) if self._accelerator_graph else run
@@ -802,8 +805,10 @@ class GDNMixedWrapper(GDNWrapper):
         return self._merge(out, rows)
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
-        # Decode first: the chunked half's sequence over the run writes the
-        # null slot only, and reads none of the run's slots.
+        # The chunked half's sequence over the run writes the null slot; with
+        # the sink off it is addressed at a live row's slot (slot 0 with none
+        # live) and writes back that row's result or what the slot holds, so
+        # no run row's state changes whichever half runs first.
         rows = None
         if self._num_rows:
             rows = self._decode.run(

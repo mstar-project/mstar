@@ -416,20 +416,20 @@ class FlashInferDecodeWrapper:
 class FlashInferMixedWrapper:
     """A step mixing one-token rows (decode) with prompt rows, on two plans.
 
-    The packed prefill planner over every row costs per row about twice what
-    the decode planner does, and its kernel runs the one-token rows as
-    prefill queries. The engine orders a split walk's rows decode first
-    (``CombinedSplit``), so the step's leading run of one-token rows is its
-    first tokens, row i token i. The decode half takes the bucket's first
-    ``batch_size`` tokens as its rows (a row of the run attends its own pages;
-    any other reads the sink page, and its output is dropped),
-    and the prefill wrapper takes every token: the run as one row on the sink
-    page, at most ``max_prefill_rows`` prompt rows, and a sink-page tail row
-    over the bucket's padding. Both read the step's queries in place, at
-    static shapes, and the decode outputs overwrite the run's.
+    The engine orders a split walk's rows decode first (``CombinedSplit``),
+    so the step's leading run of one-token rows is its first tokens, row i
+    token i. The decode half plans the bucket's ``batch_size`` rows: a row of
+    the run attends its own pages, and any other reads the sink page and its
+    output is dropped (the tensor-core half gives those rows no query, and
+    its last row takes the leftover tokens). The prefill wrapper takes every
+    token: the run as one row on the sink page, at most ``max_prefill_rows``
+    prompt rows, and a sink-page tail row over the bucket's padding. Both
+    read the step's queries in place, at static shapes, and the decode
+    outputs overwrite the run's.
 
-    Every host array is staged in page-locked buffers this wrapper owns: a
-    mixed step plans inline on the gpu thread, behind the step in flight.
+    A mixed step plans inline on the gpu thread, behind the step in flight,
+    so every host array is staged page-locked: in this wrapper's buffers, or
+    for the tensor-core half in its own (``_stage_pinned``).
     """
 
     def __init__(
@@ -546,7 +546,9 @@ class FlashInferMixedWrapper:
         if len(prompt) > self._max_prefill_rows:
             raise RuntimeError(
                 f"FlashInferMixedWrapper: {len(prompt)} prompt rows in a step "
-                f"captured for {self._max_prefill_rows}; the scheduler caps them"
+                f"captured for {self._max_prefill_rows}: more than the scheduler "
+                "lets in, a decode row behind a prompt row (a broken row order), "
+                "or a CombinedSplit that leaves out a multi-token walk"
             )
         dec = np.arange(rows) < run
 
