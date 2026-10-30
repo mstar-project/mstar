@@ -28,6 +28,7 @@ from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import KeptIds, RebuildRow, Rebuilds
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
@@ -81,7 +82,8 @@ def _worker():
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
-    w._in_flight_rids, w._last_active, w._stream_buffer_rids = set(), {}, set()
+    w._in_flight_rids, w._last_active = set(), {}
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
     w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
@@ -130,7 +132,9 @@ def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeyp
     w, _ = _worker()
     if shared:
         w._kv_keys["talker"] = ["kv"]
-    kv, w._my_consumer_connections, w._unprocessed_messages = _pool(), [], {}
+    kv, w._unprocessed_messages = _pool(), {}
+    # neither the publish skip nor the streams bear on the class
+    w._skip_unshared_publish, w.streams = lambda rid, workers: None, SimpleNamespace(add_request=lambda rid, info: None)
     w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
     w.engine_manager.evictable_nodes = list
     w.engine_manager.add_request = lambda rid, configs, info=None: kv.ingest_request(rid, configs["kv"])
