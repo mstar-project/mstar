@@ -179,8 +179,11 @@ class ClientStream:
 
 
 def find_client_streams(model: Model) -> dict[str, ClientStream]:
-    """Each client stream's consumer, in the partition it flows into, as
-    validate_deployment checked. The conductor derives it, after the worker
+    """Each client stream's consumer: the one node, over every walk, that
+    takes the edge (as the worker resolves a streamed edge's consumer,
+    ``Worker._build_consumer_node_cache``), in a walk of the partition it
+    flows into. Raises ``ValueError`` for a stream without one, which
+    validate_deployment reports. The conductor derives it after the worker
     graphs are built, and sends it to the data worker with each call's route."""
     connections = model.get_partition_topology().client_connections()
     if not connections:
@@ -189,11 +192,18 @@ def find_client_streams(model: Model) -> dict[str, ClientStream]:
     partitions = {p.name: p for p in model.get_partitions()}
     streams: dict[str, ClientStream] = {}
     for conn in connections:
-        name, partition = conn.edge_name, partitions[conn.to_partition]
-        (consumer,) = {
+        name, partition = conn.edge_name, partitions.get(conn.to_partition)
+        if partition is None:
+            raise ValueError(f"client stream {name!r} flows into {conn.to_partition!r}, which is not a partition")
+        consumers = {
             node.name for walk in walks.values() for node in walk.get_nodes().values()
             if name in node.input_names
         }
-        walk = max(walk for walk in partition.graph_walks if consumer in walks[walk].get_nodes())
-        streams[name] = ClientStream(consumer, walk, partition.name)
+        in_partition = [walk for walk in partition.graph_walks if consumers & walks[walk].get_nodes().keys()]
+        if len(consumers) != 1 or not in_partition:
+            raise ValueError(
+                f"client stream {name!r} needs exactly one consuming node, in "
+                f"partition {partition.name!r}; found {sorted(consumers) or 'none'}"
+            )
+        streams[name] = ClientStream(consumers.pop(), max(in_partition), partition.name)
     return streams

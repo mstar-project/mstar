@@ -560,16 +560,6 @@ class Conductor:
             for walk in wg.graph_walks
         }
         self.default_sharding_config.assert_streams_keep_tp_size(sorted(stream_edges))
-        # The data worker sends each rank of a client stream's consumer the whole item.
-        sharded = sorted(
-            name for name in self._client_streams
-            if self.default_sharding_config.shard_dim.get(name) is not None
-        )
-        if sharded:
-            raise ValueError(
-                f"client stream(s) {sharded} have a shard_dim; a client stream reaches "
-                "every rank of its consumer whole: drop its sharding_config.shard_dim entry"
-            )
 
         topology = model.get_partition_topology()
         self.producer_triggered_partitions: set[str] = (
@@ -993,13 +983,6 @@ class Conductor:
                     node_to_workers[NodeAndGraphWalk(node_name, walk)] = worker_ids
         cfg.setup(node_to_workers)
         cfg.assert_stream_consumer_compatibility(self.streaming_consumers)
-        # an unmapped consumer would fan its client stream out to the entity ""
-        unmapped = sorted(
-            name for name, stream in self._client_streams.items()
-            if NodeAndGraphWalk(stream.node, stream.graph_walk) not in cfg.group_mapping
-        )
-        if unmapped:
-            raise ValueError(f"client stream(s) {unmapped} have a consumer in no worker group")
         return cfg
 
     def _split_inputs_to_workers(
