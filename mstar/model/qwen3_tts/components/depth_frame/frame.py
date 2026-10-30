@@ -66,6 +66,11 @@ class DepthFrame:
         self.ACT = torch.zeros(MAX_ROWS, inter, device=dev, dtype=bf)
         self.LOGITS = torch.zeros(MAX_ROWS, fused.heads.shape[1], device=dev, dtype=bf)
         self.xd = [TensorDescriptor.from_tensor(t, [MAX_ROWS, 128], sl) for t in (self.X, self.ATT, self.ACT)]
+        # frame-local scratch the submodule hands back to `run`: every slot a frame reads, it wrote first
+        self.kv_cache = torch.zeros(layers, MAX_ROWS, 2, GROUPS, attn.num_kv_heads, self.head_dim, device=dev, dtype=bf)
+        self.positions = torch.arange(GROUPS, dtype=torch.int32, device=dev)[:, None, None].expand(
+            GROUPS, MAX_ROWS, 1).contiguous()
+        self.partials = torch.zeros(MAX_ROWS, MAX_ROWS, device=dev, dtype=torch.float32)
         self.rope = attend.rope_table(GROUPS, float(attn.rope_theta), self.head_dim, dev)
         self._schedule(torch.cuda.get_device_properties(dev).multi_processor_count // 2 * 2, layers)
         self.m16, self.bp, self.bo16, self.b1 = linear.layouts(16)
