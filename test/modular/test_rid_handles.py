@@ -137,6 +137,7 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     w._graph_runtime = SimpleNamespace(
         # The runtime mints the handle now; interning is still the whole of it.
         add_request=lambda request_id, **kw: t.intern(request_id),
+        register_stop_limits=lambda rid, info: None,
         get_rid_handle=t.handle, get_rid_string=t.name,
         get_sharding_config=lambda h: SimpleNamespace(groups=[]),
         remove_request=_runtime_remove,

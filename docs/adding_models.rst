@@ -1132,6 +1132,22 @@ methods are:
    starting early on a thread of the submodule's own; it must not touch the device. The
    DiT scaffold draws a request's seeded noise here (``PREFETCH_SEEDS``).
 
+``get_stop_policies(self, graph_walk) -> dict[str, StopPolicy] | None`` (optional)
+   Declare what ``check_stop`` amounts to on a walk, per loop it can stop, when it is
+   only the common checks; the graph runtime then runs them over the step's token column
+   without calling ``check_stop``. That takes the batched output carrying the policies'
+   ``token_signal`` as a stop buffer (``BatchedModelOutput(check_stop_buffers={...})``,
+   as Qwen3.5 and Orpheus return); a step without one, or one that mixes walks,
+   still calls ``check_stop``. ``StopPolicy(StopKind.AR, token_signal=...,
+   eos_tokens=..., sampler=...)`` stops its loop on an EOS token (unless the ``sampler``
+   resource's request config sets ``ignore_eos``) or when the loop's iteration count plus
+   one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
+   only the count. The limits are computed from the request's forward-pass info whenever
+   the worker receives it, not per step. Return ``{}`` for a
+   walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
+   calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
+   ``test/modular/test_stop_policies.py`` checks the models that declare them.
+
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
    per-request caches, counters. See Qwen3-Omni's ``Code2WavSubmodule`` for an example.
