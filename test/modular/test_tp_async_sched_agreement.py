@@ -17,7 +17,9 @@ from torch.distributed import ReduceOp
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.platforms import CudaPlatform, RocmPlatform  # noqa: E402
+from mstar.worker import worker as worker_module  # noqa: E402
+from mstar.worker.worker import Worker, _tp_async_sched_setting  # noqa: E402
 
 
 class _Group:
@@ -78,3 +80,34 @@ def test_agreeing_ranks_pass(axis, flag):
 def test_mismatch_is_refused_on_every_rank(axis):
     errors = _run_ranks([True, False], axis)
     assert all(exc is not None and "disagrees" in str(exc) for exc in errors)
+
+
+def _worker_with_tp_sizes(tp_sizes):
+    worker = Worker.__new__(Worker)
+    worker.parallel_nodes = set(tp_sizes)
+    groups = {node: types.SimpleNamespace(world_size=size) for node, size in tp_sizes.items()}
+    worker.parallel_groups = types.SimpleNamespace(get_tp_config_for_node=groups.__getitem__)
+    return worker
+
+
+@pytest.mark.parametrize("platform, want", [
+    (RocmPlatform(), frozenset({"tp2", "tp2_sp2"})),
+    (CudaPlatform(), frozenset()),
+])
+def test_the_platform_default_covers_tp_nodes_on_amd_gpus_only(monkeypatch, platform, want):
+    """Sequence-parallel-only nodes stay serial; the sizes come from the
+    config, so every rank of an instance gets the same answer."""
+    monkeypatch.setattr(worker_module, "current_platform", platform)
+    worker = _worker_with_tp_sizes({"tp2": 2, "tp2_sp2": 2, "sp2": 1})
+    assert worker._tp_async_default_nodes() == want
+
+
+@pytest.mark.parametrize("env, config, want", [
+    (None, None, (True, frozenset({"LLM"}))),
+    ("", None, (True, frozenset({"LLM"}))),
+    ("0", None, (False, None)),  # the env var turns the default off
+    (None, False, (False, None)),  # and so does the config
+    (None, ["talker"], (True, frozenset({"talker"}))),
+])
+def test_the_default_applies_only_when_nothing_sets_the_flag(env, config, want):
+    assert _tp_async_sched_setting(env, config, frozenset({"LLM"})) == want
