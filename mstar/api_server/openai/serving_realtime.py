@@ -1066,10 +1066,12 @@ class RealtimeConversation:
             await self.send(server_event("input_audio_buffer.committed", previous_item_id=None,
                                    item_id=f"item_{uuid.uuid4().hex[:12]}"))
         elif kind == "input_audio_buffer.clear":
-            # what reached the call is the model's, a partial frame included: it hears audio as it comes
-            self.odd_byte = b""
-            if self.in_resampler is not None:
-                self.in_resampler.reset()
+            # what reached the call is the model's, a partial frame included: it hears audio as it comes.
+            # Under the lock: a padding push may be resampling off the event loop.
+            async with self._input_lock:
+                self.odd_byte = b""
+                if self.in_resampler is not None:
+                    self.in_resampler.reset()
             await self.send(server_event("input_audio_buffer.cleared"))
         elif kind == "conversation.item.create":
             await self.create_item(event.get("item"))

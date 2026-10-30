@@ -11,6 +11,7 @@ import base64
 import json
 import sys
 import tempfile
+import threading
 import time
 import types
 import wave
@@ -25,6 +26,7 @@ pytest.importorskip("httpx")
 from fastapi import FastAPI, HTTPException, WebSocketDisconnect  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server import media_io  # noqa: E402
 from mstar.api_server.openai import adapters, serving_realtime  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs, Transcript  # noqa: E402
 
@@ -1301,6 +1303,46 @@ def test_a_paused_client_is_padded_with_silence(duplex, monkeypatch, half_sample
     padded = sum(p.size for p in pads)
     assert first.size == 1280 and not any(p.any() for p in pads)
     assert padded == 0 if half_sample else 0 < padded <= 0.24 * 16000 + len(pads)
+
+
+def test_clear_waits_for_a_padding_push_in_flight(duplex, monkeypatch):
+    """A padding push at 48 kHz resamples off the event loop; a clear that
+    reset the resampler in the middle of it would leave it emitting nothing
+    for as long as the call had run."""
+    entered, release, reset = threading.Event(), threading.Event(), threading.Event()
+    emit, real_reset = media_io.StreamResampler._emit, media_io.StreamResampler.reset
+
+    def held_emit(self, k_end):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:   # off the event loop: the clock's padding push
+            if not entered.is_set():
+                entered.set()
+                release.wait(5)
+        return emit(self, k_end)
+
+    def noted_reset(self):
+        real_reset(self)
+        if entered.is_set():
+            reset.set()
+
+    monkeypatch.setattr(media_io.StreamResampler, "_emit", held_emit)
+    monkeypatch.setattr(media_io.StreamResampler, "reset", noted_reset)
+    client, api = duplex()
+    tone = (np.sin(np.arange(48000) * 0.05) * 8000).astype("<i2").tobytes()
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 48000}}})
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(tone[:3840]).decode())   # 40 ms, inline
+        assert entered.wait(5)
+        _send(ws, "input_audio_buffer.clear")
+        reset.wait(0.5)   # a reset outside the lock lands now
+        release.set()
+        _recv_until(ws, "input_audio_buffer.cleared")
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(tone).decode())   # 1 s
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    assert api.appends[-1].size > 15900   # the second, at 16 kHz, less the resampler's lookahead
 
 
 def test_an_append_that_fails_inside_the_server_is_an_error_event(duplex, monkeypatch):
