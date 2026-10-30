@@ -165,23 +165,8 @@ tests and retains JUnit reports for seven days. Making
 **CPU Core** a required merge check is a separate repository ruleset or branch
 protection setting.
 
-#### Replaying randomized KV tests
-
-`test_kv_page_arena.py` checks page allocation, sharing, release and reuse
-against a model of logical owners. `test_kv_page_ownership.py` also drives the
-manager through request ingestion, forks, resets and removal. Both run in the
-CPU manifest with fixed seeds and small page pools. Failures include the seed
-and operation history while preserving the original traceback.
-
-Rerun a single arena case using its pytest ID, or the manager lifecycle test:
-
-```bash
-python -m pytest -q 'test/modular/test_kv_page_arena.py::test_random_ownership_matches_logical_owners[seed-20260920-pool-11]'
-python -m pytest -q test/modular/test_kv_page_ownership.py::test_the_invariant_survives_a_random_lifecycle
-```
-
-The separate offload and FlashInfer comparison cases skip when CUDA or the
-optional backend is unavailable. The ownership checks require neither.
+The randomized tests in `test/modular/test_kv_page_ownership.py` add their seed
+and recent operations to a failure; rerun one with the node id pytest prints.
 
 ## Adding a model
 
