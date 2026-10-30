@@ -32,15 +32,13 @@ model_kwargs:
     1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
   prefill_batched_token_buckets: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
   prefill_capture_batch_sizes: [1, 4, 16]
-  prefill_max_step_tokens: "auto"
 resources:
   kv:
     max_num_pages: 2304
     page_size: 128
-# MTP's prefill over DSA runs eager, a short prompt's too (the buckets above only size
-# prefill_max_step_tokens), in row chunks past prefill_chunk_tokens, and its kernels compile on
-# first use. Four lengths (1k, 6k, 12.5k and 20k tokens) take those compiles before the server
-# binds, not the first request.
+# MTP's prefill over DSA runs eager, a short prompt's too, in row chunks past
+# prefill_chunk_tokens, and its kernels compile on first use. Four lengths (1k, 6k, 12.5k
+# and 20k tokens) take those compiles before the server binds, not the first request.
 warmup_requests:
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 100, model_kwargs: {max_output_tokens: 4}}
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}

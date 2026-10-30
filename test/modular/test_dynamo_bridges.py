@@ -510,8 +510,8 @@ def test_chat_reaches_the_server_with_its_prompt_parts(tmp_path):
     ], "the bridge dropped the prompt parts, so the chat reaches the model as one user turn"
 
 
-def _chat_through_bridge(server, fields):
-    bridge = RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+def _chat_through_bridge(server, fields, model="qwen3_omni"):
+    bridge = RequestBridge(server, ADAPTER_REGISTRY[model], "q3o" if model == "qwen3_omni" else model)
 
     async def run():
         return [out async for out in bridge.generate({
@@ -526,14 +526,17 @@ def _chat_through_bridge(server, fields):
     {"tool_choice": "required"},
     {"tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
 ], ids=["tools", "required", "named"])
-def test_a_chat_that_asks_for_a_tool_call_is_a_400_with_the_adapters_message(tmp_path, fields):
+@pytest.mark.parametrize("model", ["qwen3_omni", "glm52"])
+def test_a_chat_that_asks_for_a_tool_call_is_a_400_with_the_adapters_message(tmp_path, fields, model):
     """Stripped before the adapter, the fields left a chat that ran and answered in plain text.
+    A model whose adapter serves tool calls (GLM) is refused too: the bridge parses none, so
+    the client would get the raw call markup as the answer.
 
     Dynamo's worker sends the client the ``code`` and ``message`` it finds on the exception.
     """
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     with pytest.raises(ValueError) as refused:
-        _chat_through_bridge(server, fields)
+        _chat_through_bridge(server, fields, model)
     assert (refused.value.code, refused.value.message) == (400, "tool calling is not supported for this model"), (
         "the client gets a 400 without the adapter's own message"
     )

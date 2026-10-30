@@ -26,6 +26,8 @@ np = pytest.importorskip("numpy")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server.entrypoint import APIServer  # noqa: E402
+
 
 class _Chunk:
     def __init__(self, modality, data, metadata=None):
@@ -40,6 +42,8 @@ class _StubModel:
 
 
 class _StubAPI:
+    open_result_stream = APIServer.open_result_stream
+
     def __init__(self, model_name="bagel"):
         self.model_name = model_name
         self.model = _StubModel()
@@ -139,6 +143,25 @@ def test_chat_text(client_and_stub):
     assert stub.last_submit["model_kwargs"]["max_output_tokens"] == 16
 
 
+@pytest.mark.parametrize("top_k", ["5", 5.0])
+def test_chat_extra_numeric_knob_is_coerced(client_and_stub, top_k):
+    from mstar.utils.generation_kwargs import normalize_generation_kwargs
+
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"ok")]
+    submit = stub.submit_request
+    # the real submit_request normalizes; the stub only records
+    stub.submit_request = lambda **kw: submit(**{**kw, "model_kwargs": normalize_generation_kwargs(kw["model_kwargs"])})
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}], "top_k": top_k},
+    )
+    assert r.status_code == 200
+    got = stub.last_submit["model_kwargs"]["top_k"]
+    assert got == 5 and type(got) is int
+
+
 def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
@@ -153,6 +176,7 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
         },
     )
     assert r.status_code == 400
+    # a refused input is the client's error, on every route
     assert r.json()["error"]["type"] == "invalid_request_error"
 
 
@@ -390,14 +414,14 @@ def test_videos_generations_ltx2_5_requests_audio_and_muxes(client_and_stub, mon
     body = client.post(
         "/v1/videos/generations",
         json={"model": "ltx2_5", "prompt": "a dog barking", "size": "960x544", "num_frames": 121,
-              "seed": 3, "negative_prompt": "blurry"},
+              "seed": 3, "recipe": "two_stage"},
     ).json()
     assert base64.b64decode(body["data"][0]["b64_json"]) == b"muxed"
     assert muxed == {"video": mp4, "audio": pcm, "sample_rate": 48000, "num_channels": 2}
     assert stub.last_submit["output_modalities"] == ["video", "audio"]
     mk = stub.last_submit["model_kwargs"]
     assert (mk["width"], mk["height"], mk["num_frames"], mk["seed"]) == (960, 544, 121, 3)
-    assert mk["negative_prompt"] == "blurry" and "audio" not in mk  # extra_body passthrough
+    assert mk["recipe"] == "two_stage" and "audio" not in mk
 
 
 def test_videos_generations_ltx2_5_video_only_and_rejects_conditioning(client_and_stub):
@@ -465,7 +489,7 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
     """Tokens that were waiting together leave as one body frame (one write
     on the socket), still one SSE event per token for the client; a chunk
     of another modality gets a frame of its own."""
-    from mstar.api_server.openai.serving_chat import _stream
+    from mstar.api_server.openai.serving_chat import _stream_events
 
     class _Batches:
         def submission_key(self, request_id):
@@ -476,7 +500,8 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
             yield [_Chunk("text", b"d"), _Chunk("audio", b"\x00\x01"), _Chunk("text", b"e")]
 
     async def _collect():
-        return [frame async for frame in _stream(_Batches(), "bagel", "rid", 24000)]
+        batches = _Batches().iter_result_chunk_batches("rid")
+        return [frame async for frame in _stream_events(batches, "bagel", "rid", 24000)]
 
     frames = asyncio.run(_collect())
     # abc (the role rides on a), d, audio, e, stop, DONE
@@ -533,16 +558,18 @@ def _stream_events(client, model="bagel"):
     return text, events
 
 
-def test_chat_stream_error_type_follows_the_status(client_and_stub):
-    """A 4xx from the data worker (a ValueError or TypeError in preprocess)
-    is the client's error, not a server_error."""
+def test_a_chat_stream_refused_up_front_gets_its_status(client_and_stub):
+    """A 4xx before the first token is the response's status, as on ``/generate``."""
     client, stub = client_and_stub
     stub.model_name = "bagel"
     stub.next_chunks = [_Chunk("error", b"ValueError: unknown domain 'x'", {"status": 400})]
-    _, events = _stream_events(client)
-    assert events[-1]["error"] == {
-        "message": "ValueError: unknown domain 'x'", "type": "invalid_request_error", "code": 400,
-    }
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "bagel", "messages": [{"role": "user", "content": "go"}], "stream": True},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == "ValueError: unknown domain 'x'"
+    assert r.json()["error"]["type"] == "invalid_request_error"
     assert stub.aborted == []
 
 
@@ -641,7 +668,9 @@ def test_images_edits_forwards_size(client_and_stub):
         data={"prompt": "make it neon", "size": "768x1024"},
     )
     assert resp.status_code == 200
-    assert stub.last_submit["model_kwargs"].get("size") == "768x1024"
+    # BAGEL reads width / height, so the adapter maps "WxH" onto them
+    mk = stub.last_submit["model_kwargs"]
+    assert (mk.get("width"), mk.get("height"), "size" in mk) == (768, 1024, False)
 
 
 def test_image_routes_report_validation_errors_as_400(client_and_stub):
@@ -662,6 +691,13 @@ def test_image_routes_report_validation_errors_as_400(client_and_stub):
     )
     assert resp.status_code == 400
 
+def test_images_n_below_one_is_400(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.submit_request = lambda **kw: pytest.fail("a refused n must not be submitted")
+    resp = client.post("/v1/images/generations", json={"model": "bagel", "prompt": "a cat", "n": 0})
+    message = resp.json()["error"]["message"]
+    assert resp.status_code == 400 and message.startswith("n must be between 1 and") and "got 0" in message
 
 @pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
 def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):

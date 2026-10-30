@@ -19,9 +19,11 @@ import base64
 from mstar.api_server import media_io
 from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
+    """The response dict, or for ``req.stream`` the SSE response itself."""
     args = adapter.chat_to_request(req, api.upload_dir)
     parser = adapter.make_output_parser(req)
     stops = adapter.stop_strings(req)
@@ -45,7 +47,14 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             request_id=request_id,
         )
         if req.stream:
-            return _stream(api, model_name, request_id, sample_rate, parser, include_usage, stops)
+            # a request the engine refuses gets its status, not a 200
+            batches = await api.open_result_stream(request_id, raw_request, batches=True)
+            return ReleasingStreamingResponse(
+                _stream_events(reply.reply_events(api, request_id, parser, stops, batches=batches),
+                               model_name, request_id, include_usage),
+                release=lambda: api.release_request(request_id),
+                media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
+            )
         if parser is not None or stops:
             # read chunk by chunk, so a stop string ends the request as it appears
             events = await reply.collect(reply.reply_events(api, request_id, parser, stops), raw_request)
@@ -132,12 +141,6 @@ def _build_response(model_name, request_id, chunks, sample_rate, parser=None) ->
         "choices": [{"index": 0, "message": message, "finish_reason": reply.finish_reason(parser, usage)}],
         "usage": _usage(usage),
     }
-
-
-def _stream(api, model_name, request_id, sample_rate, parser=None, include_usage=False, stops=None):
-    # Bound to the submission now: the body is iterated later, by Starlette.
-    batches = reply.reply_events(api, request_id, parser, stops)
-    return _stream_events(batches, model_name, request_id, include_usage)
 
 
 async def _stream_events(batches, model_name, request_id, include_usage=False):

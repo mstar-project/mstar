@@ -120,9 +120,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
         return _exception_error(e, "/v1/chat/completions")
     if request.stream:
-        return StreamingResponse(
-            result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
-        )
+        return result  # serving_chat builds the streaming response
     return JSONResponse(result)
 
 
@@ -286,11 +284,7 @@ async def videos_generations(request: VideoGenerationRequest, raw_request: Reque
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/videos/generations")
     if (request.model_extra or {}).get("stream_video"):
-        # A windowed request delivering each window as it lands: NDJSON lines
-        # (see serving_videos._stream_ndjson) instead of one JSON body.
-        return StreamingResponse(
-            result, media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"}
-        )
+        return result  # serving_videos builds the streaming response
     return JSONResponse(result)
 
 

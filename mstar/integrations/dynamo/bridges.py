@@ -42,7 +42,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
+from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs, _refuse_tool_calls
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
     ImageGenerationRequest,
@@ -50,6 +50,7 @@ from mstar.api_server.openai.protocol import (
     VideoGenerationRequest,
 )
 from mstar.api_server.openai.serving_images import image_count
+from mstar.utils.generation_kwargs import offset_seed
 from mstar.utils.utf8_stream import Utf8Stream
 
 if TYPE_CHECKING:
@@ -76,7 +77,7 @@ _STRIP_KEYS = {
     # OpenAI-standard, no M* mapping today
     "min_tokens", "eos_token_ids",
     "stream_options", "frequency_penalty", "presence_penalty", "logit_bias",
-    # not tools or tool_choice: the adapter refuses a chat that asks for a tool call
+    # not tools or tool_choice: the bridge refuses a chat that asks for a tool call
     "logprobs", "top_logprobs", "parallel_tool_calls",
     "response_format", "user", "store", "metadata", "service_tier",
 }
@@ -205,6 +206,9 @@ class RequestBridge:
             body["modalities"] = ["text"]
         req = ChatCompletionRequest.model_validate(body)
         try:
+            # the bridge streams text and parses no call out of a reply, so a model whose
+            # adapter serves tool calls (GLM's) would hand the client the raw call markup
+            _refuse_tool_calls(req)
             args = self.adapter.chat_to_request(req, self.server.upload_dir)
         except ValueError as exc:
             raise _BadRequestError(str(exc)) from exc
@@ -282,7 +286,7 @@ class RequestBridge:
             for i in range(1, n):
                 kwargs = dict(args.model_kwargs)
                 if seed is not None:
-                    kwargs["seed"] = int(seed) + i
+                    kwargs["seed"] = offset_seed(int(seed), i)
                 submits.append(dataclasses.replace(args, model_kwargs=kwargs))
 
         rids = [self._submit(args, prefix="img") for args in submits]

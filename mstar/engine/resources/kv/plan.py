@@ -274,6 +274,11 @@ class KVPlanOutput:
     def get_total_len(self):
         return int(self.cpu_indptrs.qo_indptr[-1])
 
+    def max_span(self) -> int:
+        """The most tokens one row writes this step."""
+        qo = self.cpu_indptrs.qo_indptr
+        return int((qo[1:] - qo[:-1]).max()) if len(qo) > 1 else 0
+
     @property
     def is_decode(self) -> bool:
         if self.decode_pages is not None:

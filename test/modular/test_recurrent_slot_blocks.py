@@ -33,6 +33,7 @@ def build_pool() -> RecurrentStatePool:
             "count": RecurrentBlockConfig(shape=(1,), dtype=torch.int32, per_layer=False),
         },
         max_slots=SLOTS,
+        labels=("main", "copy"),
     )
     spec = RecurrentStateSpec("pool", {"llm"}, config)
     return RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
