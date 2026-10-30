@@ -11,6 +11,7 @@ import base64
 import json
 import sys
 import tempfile
+import time
 import types
 import wave
 from pathlib import Path
@@ -1248,6 +1249,28 @@ def test_a_refused_open_keeps_none_of_its_append(duplex):
         _recv_until(ws, "input_audio_buffer.committed")
     (heard,) = api.appends
     np.testing.assert_array_equal(heard, np.array([1000, -2000, 7], np.float32) / 32768)
+
+
+@pytest.mark.parametrize("half_sample", [False, True])
+def test_a_paused_client_is_padded_with_silence(duplex, monkeypatch, half_sample):
+    """The model steps only on the audio it hears, so the server keeps time:
+    a client that stops sending is padded with silence once it is a frame
+    behind, at most MAX_PAD_SECONDS a pause, and never while half a sample
+    is pending."""
+    monkeypatch.setattr(serving_realtime, "MAX_PAD_SECONDS", 0.24)   # three frames
+    client, api = duplex()
+    frame = np.full(1280, 100, "<i2").tobytes() + (b"\x01" if half_sample else b"")
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 16000}}})
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(frame).decode())
+        time.sleep(0.6)
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    first, *pads = api.appends
+    padded = sum(p.size for p in pads)
+    assert first.size == 1280 and not any(p.any() for p in pads)
+    assert padded == 0 if half_sample else 0 < padded <= 0.24 * 16000 + len(pads)
 
 
 def _text(step, data=b"", mark=None):

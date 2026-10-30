@@ -776,8 +776,10 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   to 16 kHz, appends it as it comes, and sends each agent reply as one
   response (BOS / EOS on the agent text channel mark the reply,
   ``metadata.turn`` on ``/generate``). The voice is ``Aria``. Output is clocked by
-  the input, one agent frame per 80 ms of user audio, so a live client keeps
-  streaming (silence included) for as long as it wants the agent to talk. The
+  the input, one agent frame per 80 ms of user audio, so a ``/generate/ws``
+  client keeps streaming (silence included) for as long as it wants the agent
+  to talk; ``/v1/realtime`` pads a pause in the client's audio with silence,
+  up to 30 s. The
   model answers in the frames *after* the user stops, so append a few seconds
   of trailing silence to a clip. The checkpoint's demo recordings are
   two-channel conversations (user left, agent right); feed the left channel

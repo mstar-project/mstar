@@ -83,6 +83,7 @@ import logging
 import math
 import re
 import reprlib
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -125,6 +126,9 @@ MIN_CHUNK_SECONDS = 0.5
 # Longest uncommitted item: the most audio one step decodes. One append is
 # capped at this too, on both intents, as it is resampled before any other cap.
 MAX_ITEM_SECONDS = 300.0
+# Most silence a conversation pads one pause in the client's audio with:
+# longer than a reply, so a client that mutes its mic hears the agent out.
+MAX_PAD_SECONDS = 30.0
 # Longest excerpt of a client value quoted in an error.
 EXCERPT_CHARS = 100
 # Longest language a session accepts: a code ("en", "zh-Hant") or a name.
@@ -971,9 +975,10 @@ class RealtimeConversation:
 
     def __init__(self, api, model_name: str, websocket: WebSocket, stream: Connection):
         self.api, self.model_name, self.ws = api, model_name, websocket
-        # the stream's rate, which each append is resampled to
+        # the stream's rate, which each append is resampled to, and its frame's length
         self.stream = stream.edge_name
         self.rate = stream.audio.sample_rate
+        self.frame_seconds = stream.audio.frame_samples / self.rate
         model = api.model
         self.output_rate = model.get_output_sample_rate("audio")
         self.voice = model.get_default_voice()
@@ -984,6 +989,10 @@ class RealtimeConversation:
         self.request_id: str | None = None
         self.key: str | None = None
         self.relay_task: asyncio.Task | None = None
+        self.clock_task: asyncio.Task | None = None
+        self.played_until = 0.0              # when the call's audio so far has played, at real time
+        self.pad_left = MAX_PAD_SECONDS      # silence this pause may still take
+        self._input_lock = asyncio.Lock()    # one append on the stream at a time, padding included
         self.turns: deque[_AgentTurn] = deque()   # replies whose last audio is not sent yet, oldest first
         self.text_steps = 0                       # steps whose text has arrived
         self.early: deque[tuple[int, bytes]] = deque()   # audio steps waiting for their text
@@ -1028,9 +1037,10 @@ class RealtimeConversation:
         except WebSocketDisconnect:
             pass
         finally:
-            if self.relay_task is not None:
-                self.relay_task.cancel()
-                await asyncio.gather(self.relay_task, return_exceptions=True)
+            for task in (self.clock_task, self.relay_task):
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
             if self.key is not None:
                 self.api.abort_submission(self.key)
 
@@ -1167,20 +1177,43 @@ class RealtimeConversation:
         self.odd_byte = odd_byte
         return await self._put(audio)
 
-    async def _put(self, audio: np.ndarray) -> bool:
-        """Resample ``audio`` to the stream's rate and append it to the call;
-        False if the call has ended (the relay reports why)."""
-        if self.in_resampler is not None and audio.size:
-            # a long append, off the event loop: it would stall every other socket
-            audio = (self.in_resampler.push(audio) if audio.size <= INLINE_RESAMPLE_SAMPLES
-                     else await asyncio.to_thread(self.in_resampler.push, audio))
-        if not audio.size:
-            return True
-        try:
-            return self.api.stream_input(self.key, samples={self.stream: audio})
-        except ValueError as exc:  # past the call's input budget: the call ends with it
-            self.api.reject_input(self.key, f"append rejected: {exc}", 400)
-            return False
+    async def _put(self, audio: np.ndarray, padding: bool = False) -> bool:
+        """Resample ``audio`` (at the client's rate) to the stream's and
+        append it to the call; False if the call has ended (the relay
+        reports why)."""
+        async with self._input_lock:
+            # client audio after a pause plays from now; padding fills the pause
+            start = self.played_until if padding else max(self.played_until, time.monotonic())
+            self.played_until = start + audio.size / self.input_format.rate
+            if audio.size and not padding:
+                self.pad_left = MAX_PAD_SECONDS
+            if self.in_resampler is not None and audio.size:
+                # a long append, off the event loop: it would stall every other socket
+                audio = (self.in_resampler.push(audio) if audio.size <= INLINE_RESAMPLE_SAMPLES
+                         else await asyncio.to_thread(self.in_resampler.push, audio))
+            if not audio.size:
+                return True
+            try:
+                return self.api.stream_input(self.key, samples={self.stream: audio})
+            except ValueError as exc:  # past the call's input budget: the call ends with it
+                self.api.reject_input(self.key, f"append rejected: {exc}", 400)
+                return False
+
+    async def _clock(self) -> None:
+        """Keep the call's audio up with real time while the client sends
+        none (a muted mic, a client waiting for the reply), since the model
+        steps only on audio it hears: once it is a frame behind, silence goes
+        on, at most ``MAX_PAD_SECONDS`` a pause, counted against the call's
+        length cap like the client's audio. Never while half a sample is
+        pending, which the silence would split."""
+        while True:
+            await asyncio.sleep(self.frame_seconds)
+            behind = min(time.monotonic() - self.played_until, self.pad_left)
+            if behind < self.frame_seconds or self.odd_byte or self._input_lock.locked():
+                continue   # (an append in flight may leave half a sample)
+            self.pad_left -= behind
+            if not await self._put(np.zeros(round(behind * self.input_format.rate), np.float32), padding=True):
+                return   # the call has ended
 
     async def open(self) -> bool:
         """Open the call's engine request; False, with an ``error`` sent, if
@@ -1200,6 +1233,8 @@ class RealtimeConversation:
         self.key = self.api.submission_key(self.request_id)
         # bound now, before anything else runs (see APIServer._bind)
         self.relay_task = asyncio.create_task(self.relay(self.api.iter_result_chunks(self.request_id)))
+        self.played_until = time.monotonic()
+        self.clock_task = asyncio.create_task(self._clock())
         return True
 
     async def relay(self, chunks) -> None:
