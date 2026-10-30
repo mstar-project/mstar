@@ -86,10 +86,11 @@ def _stubs(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-def _build_engine(k: int, seed: int = 0, long_context: bool = False):
+def _build_engine(k: int, seed: int = 0, long_context: bool = False, max_seq_len: int | None = None,
+                  page_size: int | None = None):
     torch.manual_seed(seed)
-    cfg = (Glm5NextModelConfig.reduced_long_context() if long_context
-           else Glm5NextModelConfig.reduced())
+    cfg = (Glm5NextModelConfig.reduced_long_context(**({"max_seq_len": max_seq_len} if max_seq_len else {}))
+           if long_context else Glm5NextModelConfig.reduced())
     cfg.mtp_num_draft_tokens = k
     if long_context:
         cfg.prefill_window_tokens = 48  # long prompts run in several windows
@@ -107,8 +108,13 @@ def _build_engine(k: int, seed: int = 0, long_context: bool = False):
     lm.eval()
     sub = Glm5NextLLMSubmodule(lm, cfg)
     engine = Engine(None)  # no offload, so no runtime
+    specs = model.get_node_resources()
+    if page_size is not None:
+        for spec in specs:
+            if spec.resource_key == KV_CACHE:
+                spec.config.page_size = page_size
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, specs,
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -539,6 +545,27 @@ def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, dr
         _oracle(sub, long_reference, wrong_every=3 if drafts == "oracle_partial" else None)
     got = _generate_long(engine, sub, dict(LONG_PROMPTS), LONG_MAX_TOKENS)
     assert got == long_reference
+
+
+# hundreds of index pools against the 16 a query selects, on 16-token pages
+REAL_PROMPTS = {"a": (torch.arange(700) * 37 + 11) % 240, "b": (torch.arange(450) * 53 + 5) % 240}
+REAL_MAX_TOKENS = 120
+
+
+@pytest.mark.parametrize("drafts", ["mtp", "oracle_partial"])
+def test_long_context_mtp_at_a_real_geometry(drafts):
+    """The same parity where the trims bookkeeping can drift: ~175 pools against the 16
+    selected, 16-token pages, and after 120 tokens the host's rows several pages past the
+    device's. Greedy's tokens, and every step's host rows, context and MTP_LEN checked."""
+    geometry = {"long_context": True, "max_seq_len": 2048, "page_size": 16}
+    engine, sub, _ = _build_engine(0, **geometry)
+    reference = _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS)
+    assert all(len(v) == REAL_MAX_TOKENS for v in reference.values()), reference
+    engine, sub, cfg = _build_engine(3, **geometry)
+    assert cfg.mtp_trims and min(map(len, REAL_PROMPTS.values())) > 4 * cfg.index_topk
+    if drafts != "mtp":
+        _oracle(sub, reference, wrong_every=2)
+    assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference
 
 
 def test_long_context_mtp_layer_selects_with_its_own_indexer():
