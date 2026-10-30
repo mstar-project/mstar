@@ -2453,8 +2453,9 @@ streams (audio and video, say): each has its own buffer and its own end.
   ``/v1/realtime`` frames one response per reply from the marks and puts step ``k``'s
   audio in the reply whose text steps hold ``k``, so the text and the audio node must
   each emit from a loop that steps once per input item. Startup refuses one that emits
-  outside a loop, or from a partition not stepped one item at a time
-  (``FixedChunkPolicy(chunk_size=1)``) on every connection from the ``ClientAudio`` stream. Turns as a pair of token ids fit a
+  outside a loop, or from a partition not stepped one item at a time on every connection
+  from the ``ClientAudio`` stream; ``FixedChunkPolicy(chunk_size=1)`` is the only policy
+  the check takes as one. Turns as a pair of token ids fit a
   model that brackets each reply (Nemotron's BOS / EOS); one that marks speech another
   way, such as Moshi-style PAD / EPAD runs, can't declare them yet, and serves
   ``/generate/ws`` only.

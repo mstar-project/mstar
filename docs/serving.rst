@@ -265,7 +265,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_call_input_mb``
      - *(optional, default 512)* For a model that takes live client input: how many MiB
        of files (and append text) one call may send over its whole life, its opening
-       message's included.
+       message's included, and of decoded audio samples a route appends
+       (``/v1/realtime``: 4 bytes a sample at the stream's rate, server-padded silence
+       included).
        A live call's opening message past it is refused, and an append that would pass
        it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
        decoded input is larger than its files, and how much of it waits in buffers
