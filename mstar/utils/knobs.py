@@ -191,9 +191,9 @@ def pre_plan_enabled() -> bool:
 
 
 def step_thread_core() -> str | int:
-    """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``auto``):
-    the CPU a worker's main, GPU and plan threads share (and the one the API
-    server's result threads share). ``auto`` picks one per worker from its
+    """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``auto``,
+    ``off`` on AMD GPUs): the CPU a worker's main, GPU and plan threads share
+    (and the one the API server's result threads share). ``auto`` picks one per worker from its
     GPU's local CPUs, ``off`` leaves them on the process mask, and a number is
     the first worker's CPU (see ``mstar.utils.step_threads``)."""
     value = _setting("step_thread_core", "auto").strip().lower()
