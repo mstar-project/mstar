@@ -443,8 +443,9 @@ Per-model notes:
   8 kHz). Input is resampled to the model's rate and sent on in its frames (80 ms for
   Nemotron); a partial frame waits for the next append, and one append (or one item's
   parts together) holds at most 300 s. The model hears and answers frame by frame, so the
-  server keeps time: once a client's audio falls a frame behind real time (a muted mic, a
-  client waiting for the reply), silence is appended for it, at most 30 s a pause and
+  server keeps time: once a client's audio falls more than 200 ms (an allowance for
+  network jitter) and a frame behind real time (a muted mic, a client waiting for the
+  reply), whole frames of silence are appended for it, at most 30 s a pause and
   counted against the call's length cap, so a client that stops sending past that stops
   the agent. Each reply
   is one response, ``response.created`` through ``response.done``, with

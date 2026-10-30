@@ -131,6 +131,10 @@ MAX_ITEM_SECONDS = 300.0
 # Most silence a conversation pads one pause in the client's audio with:
 # longer than a reply, so a client that mutes its mic hears the agent out.
 MAX_PAD_SECONDS = 30.0
+# How late a client's audio may run (network jitter, this server's own event
+# loop) before the call counts a pause and pads it: silence padded into the
+# middle of speech reads to a duplex model as the user yielding the turn.
+JITTER_SECONDS = 0.2
 # Longest excerpt of a client value quoted in an error.
 EXCERPT_CHARS = 100
 # Longest language a session accepts: a code ("en", "zh-Hant") or a name.
@@ -1221,17 +1225,20 @@ class RealtimeConversation:
     async def _clock(self) -> None:
         """Keep the call's audio up with real time while the client sends
         none (a muted mic, a client waiting for the reply), since the model
-        steps only on audio it hears: once it is a frame behind, silence goes
-        on, at most ``MAX_PAD_SECONDS`` a pause, counted against the call's
-        length cap like the client's audio. Never while half a sample is
-        pending, which the silence would split."""
+        steps only on audio it hears: once it is a frame past
+        ``JITTER_SECONDS`` behind, whole frames of silence go on, at most
+        ``MAX_PAD_SECONDS`` a pause, counted against the call's length cap
+        like the client's audio. Never while half a sample is pending, which
+        the silence would split."""
         while True:
             await asyncio.sleep(self.frame_seconds)
-            behind = min(time.monotonic() - self.played_until, self.pad_left)
-            if behind < self.frame_seconds or self.odd_byte or self._input_lock.locked():
+            behind = min(time.monotonic() - JITTER_SECONDS - self.played_until, self.pad_left)
+            frames = int(behind / self.frame_seconds)
+            if frames < 1 or self.odd_byte or self._input_lock.locked():
                 continue   # (an append in flight may leave half a sample)
-            self.pad_left -= behind
-            if not await self._put(np.zeros(round(behind * self.input_format.rate), np.float32), padding=True):
+            self.pad_left -= frames * self.frame_seconds
+            pad = np.zeros(round(frames * self.frame_seconds * self.input_format.rate), np.float32)
+            if not await self._put(pad, padding=True):
                 return   # the call has ended
 
     async def open(self) -> bool:

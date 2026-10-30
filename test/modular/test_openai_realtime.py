@@ -1305,6 +1305,22 @@ def test_a_paused_client_is_padded_with_silence(duplex, monkeypatch, half_sample
     assert padded == 0 if half_sample else 0 < padded <= 0.24 * 16000 + len(pads)
 
 
+def test_a_late_append_is_not_padded(duplex):
+    """Audio up to JITTER_SECONDS late is a late packet, not a pause: no
+    silence goes into the middle of it."""
+    client, api = duplex()
+    frame = base64.b64encode(np.full(1280, 100, "<i2").tobytes()).decode()
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 16000}}})
+        _send(ws, "input_audio_buffer.append", audio=frame)
+        time.sleep(0.2)   # the second frame arrives 120 ms late
+        _send(ws, "input_audio_buffer.append", audio=frame)
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    assert [a.size for a in api.appends] == [1280, 1280]
+
+
 def test_clear_waits_for_a_padding_push_in_flight(duplex, monkeypatch):
     """A padding push at 48 kHz resamples off the event loop; a clear that
     reset the resampler in the middle of it would leave it emitting nothing
