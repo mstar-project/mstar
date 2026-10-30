@@ -154,3 +154,10 @@ def test_copy_in_refuses_a_mirrored_buffer():
     rows = space.propose([5])
     with pytest.raises(ValueError, match="mirrored"):
         rows.copy_in(buf, rows.diff.join_slots, torch.zeros(8, dtype=torch.int32), np.array([5]))
+
+
+def test_a_mirror_needs_a_dtype_numpy_has():
+    space = RowSpace(4, torch.device("cpu"))
+    with pytest.raises(ValueError, match="host mirror"):
+        space.buffer("x", (), torch.bfloat16)
+    space.buffer("y", (), torch.bfloat16, mirrored=False)

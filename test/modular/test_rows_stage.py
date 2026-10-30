@@ -67,6 +67,32 @@ def test_both_refuse_the_same_misuse():
             st.copy_rows(2, 0, 8, np.zeros(0, np.int64), 0, 8, np.zeros(0, np.int64), 8)
         with pytest.raises(ValueError):
             st.write(0, 8, np.arange(2, dtype=np.int64), np.zeros(8, np.uint8), 8)
+        with pytest.raises(ValueError):
+            st.write(0, 8, np.arange(4, dtype=np.int64)[::2], np.zeros(16, np.uint8), 8)
+        with pytest.raises(ValueError):
+            st.write(0, 8, np.arange(2, dtype=np.int64), np.zeros(8, np.uint8), 4, np.zeros(3, np.int64))
+        with pytest.raises(ValueError):
+            st.copy_rows(0, 0, 8, np.arange(2, dtype=np.int64), 0, 8, np.arange(3, dtype=np.int64), 8)
+        assert st.size() == 0, "a refused call registers nothing"
         st.put(np.ones(40, dtype=np.uint8), 0)
         with pytest.raises(ValueError):
             st.pack(np.zeros(st.size() - 1, dtype=np.uint8), 0)
+
+
+def test_both_copy_the_values_when_they_are_written():
+    """A caller may reuse its buffer for the next write."""
+    def block(make, reuse):
+        st = make(1)
+        values = np.full(8, 1, np.uint8)
+        st.write(0, 8, np.array([0], np.int64), values, 8)
+        if reuse:
+            values.fill(2)
+        else:
+            values = np.full(8, 2, np.uint8)
+        st.write(0, 8, np.array([1], np.int64), values, 8)
+        out = np.zeros(st.size(), np.uint8)
+        st.pack(out, 0)
+        return out
+
+    for make in (stage.PyRowStage, mstar_rust.RowStage):
+        assert np.array_equal(block(make, reuse=True), block(make, reuse=False))
