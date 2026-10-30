@@ -155,7 +155,7 @@ class PrefixChain:
     keyed_pages: int
     # tokens the chain accounts for: its prompt, and every token sampled since
     covered_len: int
-    # `spans` are the layout's keyed spans, one per write.
+    # `spans` are the layout's keyed spans, in write order. One write can fill several.
     # `unkeyed_items` are the items on the page `unkeyed` fills.
     spans: list[PrefixSpan]
     unkeyed_items: list[PageItem]
@@ -217,10 +217,23 @@ class SpanCursor:
     spans: tuple[PrefixSpan, ...]
     # `done` counts the spans the stream holds, whether written, read in or served from the cache.
     # `consumed` counts the tokens of those spans.
-    # `probed` is the span the latest probe answered for.
+    # `probed` is the span the latest probe answered for, and `probed_spans` how many it answered for from there.
     done: int = 0
     consumed: int = 0
     probed: int | None = None
+    probed_spans: int = 1
+
+    def spans_of_write(self, walk: str, length: int) -> int | None:
+        """How many spans from `done` a write of ``length`` slots under ``walk`` fills, or None if
+        it doesn't fill whole spans of that walk. A prefill can pack several spans into one row."""
+        filled = 0
+        for count, span in enumerate(self.spans[self.done:], start=1):
+            filled += span.length
+            if span.walk != walk or filled > length:
+                return None
+            if filled == length:
+                return count
+        return None
 
     def advance(self, start: int, end: int) -> list[tuple[int, int]]:
         """Return ``(index, end)`` for each span a write over ``[start, end)`` touched. A span
@@ -782,30 +795,31 @@ class KVManager(AttentionResource):
             chain, cursor = stream.chain, stream.span_cursor
             if chain is None or cursor.done >= len(chain.spans):
                 return None
-            span = chain.spans[cursor.done]
-            self._check_positions(span, graph_walk, inputs)
-            if span.walk != graph_walk or span.length != inputs.input_seq_len:
+            count = cursor.spans_of_write(graph_walk, inputs.input_seq_len)
+            self._check_positions(chain, cursor.done, count or 1, graph_walk, inputs)
+            if count is None:
+                span = chain.spans[cursor.done]
                 self._drop_layout(rid, label, stream, (
                     f"{graph_walk} writes {inputs.input_seq_len} slots where its "
                     f"layout's span {cursor.done} has {span.walk} write {span.length}"
                 ))
                 return None
             if stream.converted:
-                return self._answer(label, cursor, stream.stored_len)
+                return self._answer(label, cursor, stream.stored_len, count)
             if stream.lease is not None:
-                return self._answer(label, cursor, stream.lease_len)
+                return self._answer(label, cursor, stream.lease_len, count)
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
             if self._world_size > 1:
                 # Above one rank, use only the lease taken when rank 0 sent the step. A lookup now
                 # would also see this rank's later commits.
-                return self._answer(label, cursor, 0)
+                return self._answer(label, cursor, 0, count)
         if not self._lease(rid, node_name, label, stream, chain):
             return None
         with self._lock:
             if stream.lease is None:
                 return None
-            return self._answer(label, cursor, stream.lease_len)
+            return self._answer(label, cursor, stream.lease_len, count)
 
     def _lease(self, rid: str, node_name: str, label: str, stream: CacheStream, chain: PrefixChain) -> bool:
         """Lease what the index holds of the stream's prompt, unless the stream holds a lease already.
@@ -948,25 +962,35 @@ class KVManager(AttentionResource):
         with self._lock:
             return self._arena.trail
 
-    def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
-        assert span.digest is not None or inputs.custom_pos_ids is None, (
+    def _check_positions(self, chain: PrefixChain, start: int, count: int, graph_walk: str, inputs) -> None:
+        """A write of keyed ids alone leaves its positions to their count. One that runs past the keys
+        may hold anything, since a span past them carries no digest to tell an item by."""
+        spans = chain.spans[start:start + count]
+        assert inputs.custom_pos_ids is None or len(spans) < count or any(span.digest is not None for span in spans), (
             f"KV {self.name}: {graph_walk} places positions of its own, but "
             "the layout keys it by ids, whose positions are their count"
         )
 
     @staticmethod
-    def _answer(label: str, cursor: SpanCursor, present: int) -> CachedPrefix:
-        """This walk's share of the ``present`` tokens the stream holds, with the
-        position past that share. Records the span as the one the probe answered for."""
-        span = cursor.spans[cursor.done]
-        tokens = min(max(present - cursor.consumed, 0), span.length)
+    def _answer(label: str, cursor: SpanCursor, present: int, count: int = 1) -> CachedPrefix:
+        """This write's share of the ``present`` tokens the stream holds, with the position
+        past that share. Records the ``count`` spans as the ones the probe answered for."""
+        tokens = 0
         position = sum(earlier.advance for earlier in cursor.spans[:cursor.done])
-        if span.digest is None:
-            position += tokens
-        elif tokens == span.length:
-            # A partly held item doesn't move the position. Its walk still runs and advances it.
-            position += span.advance
+        left = max(present - cursor.consumed, 0)
+        for span in cursor.spans[cursor.done:cursor.done + count]:
+            held = min(left, span.length)
+            tokens += held
+            left -= held
+            if span.digest is None:
+                position += held
+            elif held == span.length:
+                # A partly held item doesn't move the position. Its write still runs and advances it.
+                position += span.advance
+            if held < span.length:
+                break
         cursor.probed = cursor.done
+        cursor.probed_spans = count
         return CachedPrefix(label, tokens, position)
 
     def _drop_layout(
@@ -1018,7 +1042,8 @@ class KVManager(AttentionResource):
                 stream = self._ensure_label(rid, label)
                 chain, cursor = stream.chain, stream.span_cursor
                 if chain is not None and cursor.done < len(chain.spans):
-                    self._check_positions(chain.spans[cursor.done], graph_walk, inputs)
+                    count = cursor.spans_of_write(graph_walk, inputs.input_seq_len)
+                    self._check_positions(chain, cursor.done, count or 1, graph_walk, inputs)
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.lease is None or stream.stored_len:
                 return
@@ -1026,7 +1051,8 @@ class KVManager(AttentionResource):
                 self._drop_layout(rid, label, stream, f"{graph_walk} writes unprobed")
                 return
             cursor = stream.span_cursor
-            if prefix.tokens == cursor.spans[cursor.done].length:
+            answered = cursor.spans[cursor.done:cursor.done + cursor.probed_spans]
+            if prefix.tokens == sum(span.length for span in answered):
                 return
             held = cursor.consumed + prefix.tokens
             if held < stream.lease_len:
@@ -1045,8 +1071,9 @@ class KVManager(AttentionResource):
             if stream is None or stream.chain is None:
                 return
             cursor = stream.span_cursor
-            cursor.consumed += cursor.spans[cursor.done].length
-            cursor.done += 1
+            for _ in range(cursor.probed_spans):
+                cursor.consumed += cursor.spans[cursor.done].length
+                cursor.done += 1
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
