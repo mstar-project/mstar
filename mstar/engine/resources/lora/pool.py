@@ -913,9 +913,11 @@ class LoraAdapterPool(Resource):
         # not where it lived, and its reservations and reads stand
         if evicted is not None and self._resident.get(evicted) == slot:
             # a row reserved on it while it was resident (which the pick cannot see: only
-            # the deciding rank reserves) now misses, still counting one slot, and finds
-            # the host copy it was reserved on, which the tier keeps while a request names it
+            # the deciding rank reserves) now misses, still counting one slot, and loads the
+            # host copy it was reserved on, or fails if that copy's read failed
             del self._resident[evicted]
+            # a request waiting on it whose read failed is let through now, to fail
+            self._changes += 1
         for name in self._a:
             a, b = adapter.a.get(name), adapter.b.get(name)
             if a is None:

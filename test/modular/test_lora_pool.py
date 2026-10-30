@@ -706,6 +706,11 @@ def test_a_request_on_a_resident_adapter_whose_read_failed_still_counts_a_slot(a
     settle_reads(pool)
     assert pool.resident_slot("a1") is not None and "a1" not in pool.store
     assert admitted(runner, "y") and runner.admit_retrieve("r", "LLM", "decode").queued
+    # y's miss evicts a1, so r is in no slot now: let through at once, to fail
+    assert run_step(pool, ["y"]).ok and pool.resident_slot("a1") is None
+    assert runner.admit_waiting(_nothing_published) == [("LLM", "r")]
+    reason = run_step(pool, ["y", "r"]).reason
+    assert isinstance(reason, AdmitRuntimeError) and reason.request_ids == {"r"}
 
 
 def test_two_missing_adapters_cannot_both_take_the_last_slot(adapters):
