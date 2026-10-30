@@ -623,6 +623,24 @@ def test_a_row_holding_the_step_keeps_it_over_a_backlog_that_fills_it():
     assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b"]
 
 
+@pytest.mark.parametrize("order", [StepOrder.ARRIVAL, StepOrder.TURNS])
+def test_a_yield_away_leaves_the_chains_backlog_to_it_under_arrival(order):
+    """A yield-away from the chain running a key: under ARRIVAL the chain's
+    rows hold that step, so the yield-away runs another node rather than a
+    request parked there; under TURNS the parked rows waited, and drain."""
+    sched = _scheduler(_Engine(max_bs=1, order=order))
+    sched.backlog[(NODE, WALK)] = _batch(["b0"])
+    sched.backlog[("B", WALK)] = _batch(["x0"], node="B")
+
+    batch = _next_batch(sched, _Manager([]), exclude_target=(NODE, WALK))
+
+    if order is StepOrder.ARRIVAL:
+        assert (batch.node_name, list(batch.request_to_worker_graph)) == ("B", ["x0"])
+        assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b0"]
+    else:
+        assert (batch.node_name, list(batch.request_to_worker_graph)) == (NODE, ["b0"])
+
+
 def test_a_backlog_that_waited_still_drains_first_under_turns():
     """The split set ran before the queued rows did, so it is first in line."""
     sched = _scheduler(_Engine(max_bs=4, order=StepOrder.TURNS))
