@@ -1362,3 +1362,34 @@ def test_gathered_items_of_every_size_keep_their_values(tmp_path, numel, dtype):
     for g, (_, t) in zip(got, sent.values(), strict=True):
         assert torch.equal(g.cpu(), t)
     assert len({g.untyped_storage().data_ptr() for g in got}) == 1, "one copy for the frame's items"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gathered read is for a device consumer")
+@pytest.mark.parametrize("env,gathered", [
+    ({"MSTAR_SHM_ARENA_GATHER_MAX_BYTES": "0"}, False),        # gather off
+    ({"MSTAR_SHM_ARENA_GATHER_MAX_BYTES": "4"}, False),        # 8 B items past the limit
+    ({"MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES": "0"}, True),   # a slice each, no word index
+])
+def test_the_gather_limits_come_from_the_environment(tmp_path, monkeypatch, env, gathered):
+    prod = _manager("w0", tmp_path)
+    sent = {}
+    for i, rid in enumerate(("r1", "r2", "r3")):
+        infos = prod.store_and_return_tensor_info(rid, {"tok": [torch.tensor([7 + i])]})
+        prod.register_for_send(rid, infos["tok"])
+        sent[rid] = infos["tok"]
+    monkeypatch.setenv("MSTAR_SHM_ARENA_SEGMENT_MB", "1")
+    monkeypatch.setenv("MSTAR_SHM_ARENA_MAX_SEGMENTS", "4")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    cons = ArenaShmCommunicationManager(
+        my_entity_id="w1", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    cons.start_read_tensors_multi([
+        (rid, [GraphEdge(next_node="B", name="tok", tensor_info=il, is_streaming=True)])
+        for rid, il in sent.items()
+    ])
+    torch.cuda.synchronize()
+    toks = [cons.tensor_store.get_tensor(il[0].uuid) for il in sent.values()]
+    assert [t.item() for t in toks] == [7, 8, 9]
+    assert (len({t.untyped_storage().data_ptr() for t in toks}) == 1) == gathered
