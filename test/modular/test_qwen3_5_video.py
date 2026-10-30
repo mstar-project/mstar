@@ -424,7 +424,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     ]
     llm = LLMSubmodule(_Embed(len(model.tokenizer)), model.config, model.vision_config)
     llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
-    fwd_info = SimpleNamespace(request_id="r", step_metadata={"prefill_order": step.order})
+    fwd_info = SimpleNamespace(request_id="r", rid_handle=0, step_metadata={"prefill_order": step.order})
     row = llm._vision_inputs(fwd_info, {
         "text_inputs": step.input_tensors["text_inputs"],
         "image_grid_thw": step.input_tensors["image_grid_thw"],
