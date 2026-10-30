@@ -300,20 +300,26 @@ def test_input_before_the_route_is_held_then_sent_in_order(tmp_path):
     assert set(tm.refs.values()) == {1}  # one reader each, the hold gone
 
 
-def test_a_stream_whose_partition_ended_answers_later_appends_as_late(tmp_path):
-    """The conductor's route names no rank for it any more."""
+@pytest.mark.parametrize("held", [False, True])
+def test_a_stream_whose_partition_ended_answers_later_appends_as_late(tmp_path, held):
+    """The conductor's route names no rank for it any more. An append held
+    for the first route is answered once that route names none (the
+    partition never ran), as one sent after it is."""
     wt, sent, tm = _thread()
     _open(wt)
-    _route(wt)
-    _route(wt, audio_in=[])
+    if not held:
+        _route(wt)
+        _route(wt, audio_in=[])
     late = []
 
     wt._process_stream_input(ClientAppend(
         "r", file_paths={"audio": [_audio_file(tmp_path, "c.raw", 4)]}, on_late=late.append,
     ))
+    if held:
+        _route(wt, audio_in=[])
 
     assert late == ["the call's 'audio_in' input has ended"]
-    assert _signals(sent) == [] and tm.refs == {}
+    assert _signals(sent) == [] and not any(tm.refs.values())
 
 
 def test_a_call_that_drains_before_its_route_sends_nothing(tmp_path):
