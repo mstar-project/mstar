@@ -219,9 +219,11 @@ def test_a_preplan_that_is_not_promoted_plans_again(kv):
     )
     ctx.set_padded_rids(padded)
     assert kv.admit(step, ctx).ok
-    assert kv.plan(step, ctx) is first
+    second = kv.plan(step, ctx)
+    assert second is not first  # slot 1 keeps an entry of its own
     kv.clear_preplan()
     assert _read(kv, ("a", "b")) is not first
+    assert _read(kv, ("a", "b"), slot=1) is not second
 
 
 def test_the_cached_plan_keeps_its_indptrs_while_the_ring_turns(kv):
