@@ -126,7 +126,10 @@ def _preprocess(model: _Model, model_kwargs: dict, **config) -> dict:
     worker = PreprocessWorkerThread(
         *(queue.Queue() for _ in range(8)), stop_event=threading.Event(), communicator=_Comm(),
         tensor_manager=_StubTensorManager(), model=model,
-        model_config={"model": "stub", "resources": {"kv": {"page_size": PS}}, **config},
+        model_config={
+            "model": "stub", "resources": {"kv": {"page_size": PS}},
+            "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}], **config,
+        },
     )
     worker._process_input(PreprocessInput(
         request_id="r", text="hello", file_paths=None, input_modalities=["text"],

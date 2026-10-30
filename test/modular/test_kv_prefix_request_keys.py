@@ -136,7 +136,10 @@ def _worker(model, model_config: dict | None) -> PreprocessWorkerThread:
 
 
 def _deployment(page_size: int = PAGE_SIZE) -> dict:
-    return {"model": "stub", "resources": {"kv": {"page_size": page_size}}}
+    return {
+        "model": "stub", "resources": {"kv": {"page_size": page_size}},
+        "node_groups": [{"node_names": ["LLM"], "ranks": [0]}],
+    }
 
 
 def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
