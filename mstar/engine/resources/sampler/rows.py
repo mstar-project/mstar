@@ -6,7 +6,9 @@ states, checked out of the slot masters; with a repetition penalty, also its
 seen-token mask, checked out of the request's own. The walk's sampler reads
 and advances them in place, so a step that changes no rows gathers and
 scatters nothing; the masters are only read when a row joins and written when
-it leaves.
+it leaves. The vocabulary-wide masks stay resident (``moved=False``): the
+sampler reads them by slot and sets one token a row, where a dense copy would
+move every row's whole mask in and out each step.
 """
 from __future__ import annotations
 
@@ -32,6 +34,7 @@ class SamplerRows(RowState):
     ):
         """``seen_masks``: the vocabulary width and each request's seen-token
         mask (None before its vocabulary is known), for a penalised sampler."""
+        self._space = space
         # looked up per use: the buffers are reallocated until capture is done
         self._buffers = buffers
         bufs = buffers()
@@ -52,7 +55,9 @@ class SamplerRows(RowState):
         self.seen = None
         if seen_masks is not None:
             width, self._seen_mask = seen_masks
-            self.seen = space.buffer("sampler.seen", (width,), torch.bool, pad=False, mirrored=False)
+            self.seen = space.buffer(
+                "sampler.seen", (width,), torch.bool, pad=False, mirrored=False, moved=False,
+            )
         self._samplers: dict[int, AcceleratorGraphableSampler] = {}
 
     def check_out(self, rows: StepRows) -> None:
@@ -122,7 +127,9 @@ class SamplerRows(RowState):
                 min_p_buf=view("min_p"),
                 order=order,
                 last_token_buf=self.last_token.rows(bs),
-                seen_tokens_buf=None if self.seen is None else self.seen.rows(bs),
+                seen_tokens_buf=None if self.seen is None else self.seen.resident,
+                seen_rows=None if self.seen is None else self._space.gather_slots[:bs],
+                seen_write_rows=None if self.seen is None else self._space.scatter_slots[:bs],
                 tp_group=self._buffers().tp_group,
             )
         sampler.applied_penalty_in_graph = False
