@@ -846,11 +846,21 @@ def test_unsupported_turn_detection_is_refused_and_echoed_as_null(client_and_stu
     assert updated["session"]["input_audio_transcription"]["language"] is None  # the refused update changed nothing
 
 
-@pytest.mark.parametrize("fmt", ["pcm16", {"type": "audio/pcm", "rate": 24000}])
+@pytest.mark.parametrize("fmt", [None, "pcm16"])
+def test_pcm16_is_the_default_16khz(client_and_stub, fmt):
+    """"pcm16" names what an omitted format means, 16 kHz: one meaning for both."""
+    client, stub = client_and_stub
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"input_audio_format": fmt}}))
+        session = json.loads(ws.receive_text())["session"]
+    assert (session["input_audio_format"], session["mstar"]["sample_rate"]) == ("pcm16", 16000)
+
+
+@pytest.mark.parametrize("fmt", [{"type": "audio/pcm", "rate": 24000}])
 def test_24khz_input_is_resampled_onto_the_true_timeline(client_and_stub, fmt):
-    """OpenAI's pcm rate is 24 kHz, "pcm16" included. Declared, it is resampled
-    as it arrives, so one second of audio is one second to the model and in
-    audio_seconds."""
+    """OpenAI's pcm rate, 24 kHz, declared, is resampled as it arrives, so one
+    second of audio is one second to the model and in audio_seconds."""
     client, stub = client_and_stub
     heard = _step_samples(stub)
     tone_24k = (np.sin(2 * np.pi * 440 * np.arange(24000) / 24000) * 8000).astype("<i2")
@@ -860,7 +870,7 @@ def test_24khz_input_is_resampled_onto_the_true_timeline(client_and_stub, fmt):
             "input_audio_format": fmt, "mstar": {"chunk_seconds": 0.5},
         }}))
         updated = json.loads(ws.receive_text())
-        assert updated["session"]["input_audio_format"] == "pcm16"
+        assert updated["session"]["input_audio_format"] == fmt
         assert updated["session"]["mstar"]["sample_rate"] == 24000
         for i in range(0, tone_24k.size, 240):  # 10 ms appends
             _append_bytes(ws, tone_24k[i:i + 240].tobytes())

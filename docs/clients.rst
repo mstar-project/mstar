@@ -343,11 +343,11 @@ Endpoints and model coverage:
      - Streaming speech-to-text: ``input_audio_buffer.append`` chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
-       finishes the utterance. ``input_audio_format`` is ``"pcm16"`` (24 kHz, as
-       OpenAI reads it; this endpoint read it as 16 kHz before), ``"g711_ulaw"``,
-       ``"g711_alaw"`` or a GA format object such as ``{"type": "audio/pcm", "rate":
-       16000}`` at the rates a conversation takes (below). A session that names no
-       format sends PCM16 at 16 kHz (not OpenAI's 24 kHz). Audio is resampled to 16 kHz. Turn
+       finishes the utterance. ``input_audio_format`` is ``"pcm16"`` (PCM16 at 16 kHz,
+       the default; OpenAI reads it as 24 kHz, so an OpenAI client at 24 kHz declares
+       ``{"type": "audio/pcm", "rate": 24000}``), ``"g711_ulaw"``, ``"g711_alaw"`` or
+       a GA format object at the rates a conversation takes (below). Audio is
+       resampled to 16 kHz. Turn
        detection is null (client commits), ``server_vad`` or ``semantic_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``

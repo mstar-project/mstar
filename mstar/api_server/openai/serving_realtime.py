@@ -20,10 +20,10 @@ Client events
     ``input_audio_buffer.commit``      end of the utterance: flush and finish
     ``input_audio_buffer.clear``       drop buffered audio and start over
 
-``input_audio_format`` is ``"pcm16"`` (PCM16 at 24 kHz, as OpenAI reads it),
-``"g711_ulaw"`` or ``"g711_alaw"`` (8 kHz), or a GA format object
-(``{"type": "audio/pcm", "rate": N}`` at a rate in ``REALTIME_RATES``, ``{"type": "audio/pcmu"}``,
-``{"type": "audio/pcma"}``); left out, it is PCM16 at the model's 16 kHz.
+``input_audio_format`` is ``"pcm16"`` (PCM16 at 16 kHz, the default; OpenAI
+reads it as 24 kHz), ``"g711_ulaw"`` or ``"g711_alaw"`` (8 kHz), or a GA format
+object (``{"type": "audio/pcm", "rate": N}`` at a rate in ``REALTIME_RATES``,
+``{"type": "audio/pcmu"}``, ``{"type": "audio/pcma"}``).
 Audio at another rate is resampled to 16 kHz as it arrives, so partial
 ``audio_seconds`` stay on the client's timeline. The format changes only with
 an empty buffer.
@@ -360,9 +360,11 @@ def encode_audio(audio: np.ndarray, codec: str) -> str:
     return base64.b64encode(pcm.tobytes() if codec == "audio/pcm" else media_io.g711_encode(pcm, codec)).decode("ascii")
 
 
-# The transcription intent's beta names for formats; "pcm16" is OpenAI's 24 kHz.
+# The transcription intent's beta names for formats. "pcm16" is 16 kHz, as an
+# omitted format is and as this endpoint has always read it (OpenAI reads it
+# as 24 kHz; a client at 24 kHz declares {"type": "audio/pcm", "rate": 24000}).
 _BETA_FORMATS = {
-    "pcm16": AudioFormat("audio/pcm", OPENAI_PCM_RATE),
+    "pcm16": AudioFormat("audio/pcm", SAMPLE_RATE),
     "g711_ulaw": AudioFormat("audio/pcmu", G711_RATE),
     "g711_alaw": AudioFormat("audio/pcma", G711_RATE),
 }
