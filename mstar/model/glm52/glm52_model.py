@@ -107,9 +107,6 @@ class Glm52Model(Model):
                     "prefill_capture_batch_sizes"):
             if key in kwargs:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
-        if kwargs.get("prefill_max_step_tokens") is not None:
-            cap = kwargs["prefill_max_step_tokens"]
-            self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
         if "mtp_num_draft_tokens" in kwargs:
             k = int(kwargs["mtp_num_draft_tokens"])
             if k < 0:

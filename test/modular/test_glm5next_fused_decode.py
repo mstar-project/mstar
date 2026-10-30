@@ -1,5 +1,6 @@
-"""Fused glm5_next kernels (fused_decode, and the KDA decode in kda_triton) vs the torch
-reference — parity on CUDA."""
+"""Fused glm5_next kernels (fused_decode) and the whole layer on the fused KDA kernels vs
+the torch reference — parity on CUDA. The KDA kernels' own parity tests are
+test_kda_triton.py."""
 import pytest
 import torch
 
@@ -7,8 +8,6 @@ from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn.kda import KDAPlan
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
-from mstar.model.components.distributed import ParallelKimiDeltaAttention
-from mstar.model.components.kda import KDAConfig
 from mstar.model.components.norm import RMSNorm
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components.decoder_layer import Glm5NextDecoderLayer
@@ -90,34 +89,6 @@ def _decode_plan(slots):
 
 def _bind(kda, rec, conv, plan, kernels):
     kda.mix = KDACallable(_Pool(rec, conv), _Kda(plan, kernels))
-
-
-@pytest.mark.parametrize("batch", [1, 5, 32])
-def test_kda_decode_matches_reference(batch):
-    heads, head_dim, hidden, slots = 8, 128, 4096, 40
-    kda = ParallelKimiDeltaAttention(KDAConfig(
-        hidden_size=hidden, num_heads=heads, head_dim=head_dim),
-        dtype=torch.bfloat16).cuda()
-    _randomize(kda, 0)
-    kda.process_weights_after_loading("cuda")
-    # the pool is V-first, [H, V, K]; the reference step is K-first
-    rec = torch.randn(slots, heads, head_dim, head_dim, device="cuda") * 0.1
-    conv = torch.randn(slots, 3 * heads * head_dim, 3, device="cuda").to(torch.bfloat16)
-    slot_index = torch.randperm(slots, device="cuda")[:batch]
-    _bind(kda, rec, conv, _decode_plan(slot_index), TritonKDAKernels())
-    rec_ref, conv_ref = rec.clone(), conv.clone()
-    with torch.no_grad():
-        for step in range(3):
-            x = torch.randn(batch, hidden, device="cuda", dtype=torch.bfloat16)
-            r, c = rec_ref[slot_index].transpose(-1, -2), conv_ref[slot_index]
-            ref = kda.decode_step(x.unsqueeze(1), r, c).squeeze(1)
-            rec_ref[slot_index], conv_ref[slot_index] = r.transpose(-1, -2), c
-            out = kda(x, 0)
-            # The merged in-projection rounds like the three separate ones up to 1 bf16 ulp.
-            torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2, msg=f"step {step}")
-    torch.testing.assert_close(conv, conv_ref, rtol=1e-2, atol=1e-2)
-    # that in-projection ulp reaches the state: ~4e-3 at the state's scale
-    torch.testing.assert_close(rec, rec_ref, rtol=4e-3, atol=4e-3)
 
 
 # -- mHC ---------------------------------------------------------------------

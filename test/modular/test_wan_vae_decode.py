@@ -147,6 +147,40 @@ def test_channels_last_stream_feeds_every_conv_channels_last(kind, monkeypatch) 
     torch.testing.assert_close(torch.cat(parts, dim=2), ref, rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("kind", KINDS)
+def test_channels_last_encoder_feeds_every_conv_channels_last(kind, monkeypatch) -> None:
+    """``encoder_to_channels_last`` (idempotent) leaves the decode path alone,
+    and a cached encode on it sees only channels-last conv inputs and matches
+    the default layout's to float rounding."""
+    import torch.nn.functional as F
+
+    vae = tiny_wan_vae(kind)
+    gen = torch.Generator().manual_seed(2)
+    x = torch.randn(1, vae.config.in_channels, 9, 16, 32, generator=gen)
+
+    def encode(v):
+        cache = [None] * sum(isinstance(m, wan_vae.WanCausalConv3d) for m in v.encoder.modules())
+        with torch.no_grad():
+            parts = [v.encoder(x[:, :, :1], feat_cache=cache, feat_idx=[0])]
+            parts += [v.encoder(x[:, :, i:i + 4], feat_cache=cache, feat_idx=[0]) for i in (1, 5)]
+            return v.quant_conv(torch.cat(parts, dim=2))
+
+    ref = encode(vae)
+    wan_vae.encoder_to_channels_last(vae)
+    wan_vae.encoder_to_channels_last(vae)
+    assert not wan_vae.is_channels_last(vae)
+    assert all(type(m) is wan_vae.WanCausalConv3d for m in vae.decoder.modules() if isinstance(m, torch.nn.Conv3d))
+    seen = []
+    for name, fmt in (("conv3d", torch.channels_last_3d), ("conv2d", torch.channels_last)):
+        def conv(x, *args, _orig=getattr(F, name), _fmt=fmt, **kw):
+            seen.append(x.is_contiguous(memory_format=_fmt))
+            return _orig(x, *args, **kw)
+        monkeypatch.setattr(F, name, conv)
+    out = encode(vae)
+    assert len(seen) > 20 and all(seen)
+    torch.testing.assert_close(out, ref, rtol=0, atol=1e-5)
+
+
 def _storage_bytes(cache: list) -> int:
     storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in cache if torch.is_tensor(t)}
     return sum(storages.values())

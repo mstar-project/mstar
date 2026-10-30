@@ -1,24 +1,29 @@
-"""Fused KDA prefill (kda_triton) vs the torch chunk_kda reference — parity on CUDA.
+"""The fused KDA kernels (kda_triton) against the torch reference, on CUDA: prefill, decode
+and verify.
 
-The oracle is ``KimiDeltaAttention.prefill`` run per span in fp32 against in-place slot
-views, as the reference bundle does. The fused path must be no less accurate than that
-reference under the engine's bf16 autocast.
+The prefill oracle is ``KimiDeltaAttention.prefill`` run per span in fp32 against in-place slot
+views, as the reference bundle does; the fused path must be no less accurate than that
+reference under the engine's bf16 autocast. Decode is checked against the layer's
+``decode_step``, verify against ``TorchKDAKernels.run_verify`` over the pool's speculative
+blocks.
 """
 from dataclasses import dataclass
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn import kda_triton
-from mstar.engine.resources.linear_attn.kda import KDAPlan
+from mstar.engine.resources.linear_attn.kda import KDAPlan, SpecBlocks
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
+from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.model.components.distributed import ParallelKimiDeltaAttention
 from mstar.model.components.kda import KDAConfig
-from mstar.model.glm5_next import fused_decode
 
 pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and fused_decode._HAS_TRITON),
+    not (torch.cuda.is_available() and kda_triton._HAS_TRITON),
     reason="fused kernels need CUDA + triton",
 )
 
@@ -253,3 +258,156 @@ def test_reference_bundle_matches_the_fused_prefill():
     assert _rel(out, ref) < 2e-2
     assert _rel(pools[0][0], pools[1][0]) < 2e-2
     torch.testing.assert_close(pools[0][1], pools[1][1], rtol=1e-2, atol=1e-2)
+
+
+# -- decode ---------------------------------------------------------------------
+
+
+def _randomize(module, seed):
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        for name, p in module.named_parameters():
+            if "conv1d" in name:
+                p.normal_(0.0, 0.3)
+            elif name.endswith(("A_log", "dt_bias", "base", "e_score_correction_bias")):
+                p.normal_(0.0, 0.5)
+            elif name.endswith("scale"):
+                p.uniform_(0.5, 1.5)
+            elif "norm" in name:
+                p.normal_(1.0, 0.1)
+            else:
+                p.normal_(0.0, 0.02)
+
+
+def _decode_plan(slots):
+    slots = slots.to(torch.int32)
+    n = slots.shape[0]
+    return KDAPlan(slot_ids=slots, has_state=torch.ones_like(slots, dtype=torch.bool),
+                   spans=(1,) * n, num_tokens=n, is_decode=True)
+
+
+def _bind(kda, rec, conv, plan, kernels):
+    kda.mix = KDACallable(_Pool(rec, conv), _Kda(plan, kernels))
+
+
+@pytest.mark.parametrize("batch", [1, 5, 32])
+def test_kda_decode_matches_reference(batch):
+    heads, head_dim, hidden, slots = 8, 128, 4096, 40
+    kda = ParallelKimiDeltaAttention(KDAConfig(
+        hidden_size=hidden, num_heads=heads, head_dim=head_dim),
+        dtype=torch.bfloat16).cuda()
+    _randomize(kda, 0)
+    kda.process_weights_after_loading("cuda")
+    # the pool is V-first, [H, V, K]; the reference step is K-first
+    rec = torch.randn(slots, heads, head_dim, head_dim, device="cuda") * 0.1
+    conv = torch.randn(slots, 3 * heads * head_dim, 3, device="cuda").to(torch.bfloat16)
+    slot_index = torch.randperm(slots, device="cuda")[:batch]
+    _bind(kda, rec, conv, _decode_plan(slot_index), kda_triton.TritonKDAKernels())
+    rec_ref, conv_ref = rec.clone(), conv.clone()
+    with torch.no_grad():
+        for step in range(3):
+            x = torch.randn(batch, hidden, device="cuda", dtype=torch.bfloat16)
+            r, c = rec_ref[slot_index].transpose(-1, -2), conv_ref[slot_index]
+            ref = kda.decode_step(x.unsqueeze(1), r, c).squeeze(1)
+            rec_ref[slot_index], conv_ref[slot_index] = r.transpose(-1, -2), c
+            out = kda(x, 0)
+            # The merged in-projection rounds like the three separate ones up to 1 bf16 ulp.
+            torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2, msg=f"step {step}")
+    torch.testing.assert_close(conv, conv_ref, rtol=1e-2, atol=1e-2)
+    # that in-projection ulp reaches the state: ~4e-3 at the state's scale
+    torch.testing.assert_close(rec, rec_ref, rtol=4e-3, atol=4e-3)
+
+
+# -- verify ---------------------------------------------------------------------
+
+
+def _layer(cfg, device, dtype, seed=0):
+    torch.manual_seed(seed)
+    layer = ParallelKimiDeltaAttention(cfg, dtype=dtype).to(device)
+    with torch.no_grad():
+        for name, p in layer.named_parameters():
+            if "conv1d" in name:
+                p.normal_(0.0, 0.3)
+            elif name.endswith(("A_log", "dt_bias")):
+                p.normal_(0.0, 0.5)
+            elif "norm" in name:
+                p.normal_(1.0, 0.1)
+            else:
+                p.normal_(0.0, 0.02 if p.shape[-1] > 256 else 0.1)
+    layer.process_weights_after_loading(device)
+    return layer.requires_grad_(False)
+
+
+def _pool(layer, slots, k, device, conv_dtype):
+    """One layer's pool with speculative blocks, its state and conv tails random."""
+    geometry = DeltaNetGeometry(
+        num_k_heads=layer.num_heads, num_v_heads=layer.num_heads, head_k_dim=layer.head_dim,
+        head_v_dim=layer.head_dim, conv_kernel_size=4,
+    )
+    pool = RecurrentStatePool(torch.device(device), RecurrentStateConfig(
+        num_layers=1, max_slots=slots,
+        blocks=geometry.to_blocks(conv_dtype=conv_dtype, speculative_tokens=k),
+    ))
+    pool.block("state", 0).copy_(torch.randn(pool.block("state", 0).shape) * 0.1)
+    pool.block("conv", 0).copy_(torch.randn(pool.block("conv", 0).shape) * 0.5)
+    pool.block("spec_side").random_(0, 2)  # the side a slot starts on does not matter
+    return pool
+
+
+def _clone(pool):
+    other = RecurrentStatePool(pool._device, pool.config)
+    for name, tensor in pool._blocks.items():
+        other._blocks[name].copy_(tensor)
+    return other
+
+
+def _verify_plan(slots, block):
+    n = slots.numel()
+    return KDAPlan(slot_ids=slots.to(torch.int32), has_state=torch.ones(n, dtype=torch.bool),
+                   spans=(block,) * n, num_tokens=n * block, is_decode=False, is_verify=True,
+                   block=block)
+
+
+def _verify(bundle, layer, x, pool, plan):
+    proj = F.linear(x, layer._in_proj_weight)
+    p, h, d = layer.qkv_dim, layer.num_heads, layer.head_dim
+    return bundle.run_verify(
+        proj[:, :3 * p], proj[:, 3 * p + h:3 * p + h + d], proj[:, 3 * p:3 * p + h], plan,
+        pool.block("conv", 0), pool.block("state", 0), SpecBlocks.of(pool, 0), layer.params(),
+        gate=proj[:, 3 * p + h + d:3 * p + h + 2 * d],
+    )
+
+
+def _after_verdict(pool, slots, accepted):
+    """``KDACallable.set_prefix_len``: the accepted tokens and the token after them."""
+    spec = SpecBlocks.of(pool, 0)
+    spec.prefix_len[slots, 0] = (accepted + 1).to(torch.int32)
+    spec.side[slots, 0] = 1 - spec.side[slots, 0]
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("block", [1, 2, 4])
+@pytest.mark.parametrize("batch", [1, 7, 64])
+def test_kernel_matches_reference(block, batch):
+    """One TP8 rank's KDA layer (8 heads of 128) over four verify steps with random verdicts."""
+    cfg = KDAConfig(hidden_size=4096, num_heads=8, head_dim=128)
+    layer = _layer(cfg, "cuda", torch.bfloat16)
+    ker = _pool(layer, 70, 3, "cuda", torch.bfloat16)
+    ref = _clone(ker)
+    slots = torch.randperm(69, device="cuda")[:batch] + 1
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    for step in range(4):
+        x = torch.randn(batch * block, cfg.hidden_size, device="cuda", generator=gen)
+        x = x.to(torch.bfloat16)
+        out = _verify(kda_triton.TritonKDAKernels(), layer, x, ker, _verify_plan(slots, block))
+        out_ref = _verify(TorchKDAKernels(), layer, x, ref, _verify_plan(slots, block))
+        torch.testing.assert_close(out, out_ref, rtol=2e-2, atol=2e-2, msg=f"step {step}")
+        # the kernel sums the state in 32-column tiles, torch whole: fp32 order alone moves
+        # single elements by ~1e-3; the cached inputs and windows are exact
+        for name, tol in (("state", 5e-3), ("conv", 0), ("spec_prefix", 0), ("spec_g", 0),
+                          ("spec_beta", 0), ("spec_conv", 0)):
+            torch.testing.assert_close(ker._blocks[name], ref._blocks[name], rtol=tol, atol=tol,
+                                       msg=f"{name} step {step}")
+        accepted = torch.randint(0, block, (batch,), device="cuda", generator=gen)
+        _after_verdict(ker, slots, accepted)
+        _after_verdict(ref, slots, accepted)

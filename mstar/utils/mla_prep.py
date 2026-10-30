@@ -20,6 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.platforms import current_platform
+
 _PDL: dict[torch.device, bool] = {}
 
 
@@ -31,7 +33,7 @@ def supports(q_lora_rank: int, kv_lora_rank: int, rope_dim: int) -> bool:
 
 def _pdl(device: torch.device) -> bool:
     if device not in _PDL:
-        _PDL[device] = torch.cuda.get_device_capability(device)[0] >= 9
+        _PDL[device] = current_platform.has_cuda_capability(9, device=device)
     return _PDL[device]
 
 

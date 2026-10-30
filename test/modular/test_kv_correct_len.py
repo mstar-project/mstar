@@ -172,6 +172,35 @@ def test_a_rewind_ending_inside_a_sealed_page_keeps_a_copy():
     assert _stream(mgr).stored_len == 6
 
 
+def test_a_reserved_rewind_over_a_lent_sealed_page_keeps_the_counts():
+    """A request with an allotment (#869) rewinds over a sealed page it holds as lent: the
+    page leaves through the pool's accounting, so its lent mark goes with it and the pool's
+    count of unused allotted pages follows."""
+    from test_kv_prefix_lease import NODE, WALK, _layout
+
+    from mstar.engine.resources import StepRunner
+    from mstar.engine.resources.kv.config import KVReqConfig
+
+    mgr = _make_manager()
+    mgr.ingest_request("r", KVReqConfig(kv_layout=_layout(12)))
+    runner = StepRunner({"kv": mgr}, node_resources={NODE: ["kv"]})
+    runner.admit_waiting(lambda rid, node: None)
+    assert runner.admit_retrieve("r", NODE, WALK, None).ready and "r" in mgr._allotments
+    _step(mgr, 12)  # three full pages
+    pages = list(_stream(mgr).page_indices)
+    mgr._arena.retain(pages[1:2])  # a second owner reads page 1
+    mgr._arena.seal(pages[1:2])
+    _stream(mgr).lent.add(pages[1])
+    mgr._recount("r")
+    mgr._arena.release(pages[1:2])  # the second owner leaves; "r" still lends the page
+
+    mgr.correct_len("r", "main", -8)  # back to 4, the end of page 0
+
+    assert _stream(mgr).page_indices == pages[:1]
+    assert not _stream(mgr).lent, "the stream still counts a page it gave up as lent"
+    mgr.assert_pages_conserved()
+
+
 def test_a_rewind_above_the_sealed_pages_keeps_them():
     mgr = _make_manager()
     _step(mgr, 10)

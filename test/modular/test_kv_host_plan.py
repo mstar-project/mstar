@@ -93,3 +93,15 @@ def test_small_multi_token_steps_skip_the_packed_path(monkeypatch):
     monkeypatch.setattr(manager_mod, "HOST_PLAN_MAX_TOKENS", 4)
     _step(mgr, (2, 2, 2))
     assert calls
+
+
+def test_a_prefill_sized_row_takes_the_packed_path(monkeypatch):
+    """Only MTP-sized rows plan on the host: a step with a 12-token row takes the packed
+    path however few tokens it holds, so every model's small prefills keep main's path."""
+    mgr = _make_manager()
+    calls = []
+    real = mgr._compute_plan_state
+    monkeypatch.setattr(mgr, "_compute_plan_state", lambda *a, **k: calls.append(1) or real(*a, **k))
+
+    _step(mgr, (12, 1, 1))
+    assert calls

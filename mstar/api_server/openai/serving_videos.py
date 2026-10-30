@@ -8,11 +8,13 @@ import logging
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, rid
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 logger = logging.getLogger(__name__)
 
 
 async def create_videos(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
+    """The response dict, or for ``stream_video`` the NDJSON response itself."""
     args = adapter.video_to_request(req, api.upload_dir)
     request_id = rid("vid")
 
@@ -29,7 +31,13 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
             request_id=request_id,
         )
         if stream:
-            return _stream_ndjson(api, request_id)
+            # A windowed request delivering each window as it lands: NDJSON
+            # lines (see _stream_ndjson) instead of one JSON body.
+            return ReleasingStreamingResponse(
+                _stream_ndjson(api, request_id),
+                release=lambda: api.release_request(request_id),
+                media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"},
+            )
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)

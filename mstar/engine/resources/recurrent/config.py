@@ -287,6 +287,10 @@ class RecurrentStateConfig:
     # label, so this bounds concurrent requests times labels.
     max_slots: int = 256
 
+    # The labels a request's steps address or fork into. Admission reserves a
+    # slot for each, and a step that opens any other label fails its request.
+    labels: tuple[str, ...] = ("main",)
+
     # Whether padding rows address a real sink slot or a -1 sentinel. Kernels
     # disagree on -1: FlashInfer's fp32 GDN decode skips it, its bf16 path
     # writes slot 0, and SM90 prefill masks it itself (`GDNPrefillWrapper.run`).
@@ -295,9 +299,16 @@ class RecurrentStateConfig:
     # TODO: derive this from (backend, dtype, ...) automatically.
     disable_sink_slot: bool = False
 
+    # Snapshots kept for prefix reuse, in slots past max_slots: the state a
+    # prompt reached at a page boundary of `kv_cache`, under that page's key.
+    prefix_slots: int = 0
+    kv_cache: str | None = None
+
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
+        if not self.labels:
+            raise ValueError("a recurrent state pool must declare a label")
         if not self.disable_sink_slot and self.max_slots < 2:
             raise ValueError(
                 f"max_slots={self.max_slots} leaves nothing to hand out: the "
@@ -326,10 +337,15 @@ class RecurrentStateSpec(NodeResourceSpec):
 
         return RecurrentStatePool
 
+    def depends_on(self) -> set[str]:
+        return {self.config.kv_cache} if self.config.kv_cache else set()
+
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
+        prefix_slots: int | None = None,
     ):
-        """How many slots this deployment gets, and the state's dtype.
+        """How many slots this deployment gets, the state's dtype, and how
+        many snapshots it keeps for prefix reuse.
 
         Block shapes are the model's and not tunable. The dtype trades
         accumulated precision against bandwidth and decides which kernels the
@@ -337,6 +353,10 @@ class RecurrentStateSpec(NodeResourceSpec):
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
+        if prefix_slots is not None:
+            if prefix_slots < 0:
+                raise ValueError(f"prefix_slots={prefix_slots} must be >= 0")
+            self.config.prefix_slots = prefix_slots
         if state_dtype is not None:
             try:
                 dtype = getattr(torch, state_dtype)

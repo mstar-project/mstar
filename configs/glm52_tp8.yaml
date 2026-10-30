@@ -53,9 +53,6 @@ model_kwargs:
     1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
   prefill_batched_token_buckets: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
   prefill_capture_batch_sizes: [1, 4, 16]
-  # tokens per prefill step: the largest bucket, so every prefill step replays a graph;
-  # an eager one compiles mid-serve (the fallback forward, the MoE kernels per row count)
-  prefill_max_step_tokens: "auto"
 resources:
   kv:
     # MLA latent pages: 576 dims x bf16 = 1.15 KB/token/layer, ~90 KB/token

@@ -246,7 +246,7 @@ The GPU model families depend on:
 
 - **FlashInfer** (``flashinfer-python``) — paged attention and continuous batching for the
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
-- **flash-attn** — used by Qwen3-Omni and LingBot-World. **Not installed by any extra**; install it separately
+- **flash-attn** — used by Qwen3-Omni and by LingBot-World's ``reference_numerics`` mode. **Not installed by any extra**; install it separately
   (see `flash-attn (Qwen3-Omni, LingBot-World)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
@@ -307,7 +307,7 @@ others) as unmet for ``qwen-tts``; that is expected.
 flash-attn (Qwen3-Omni, LingBot-World)
 --------------------------------------
 
-``flash-attn`` is only needed for **Qwen3-Omni** and **LingBot-World**, and it is **not** pulled in by
+``flash-attn`` is only needed for **Qwen3-Omni** and **LingBot-World** with ``reference_numerics: true``, and it is **not** pulled in by
 ``.[qwen3_omni]``, ``.[lingbot_world]`` or ``.[all]`` — you install it as a separate step. The reason: flash-attn
 publishes no wheels on PyPI, so ``pip``/``uv`` fall back to compiling it from source, which is
 slow. When a prebuilt GitHub wheel matches your stack, use it to skip the build; otherwise
@@ -553,6 +553,11 @@ it. Then opt in:
    cargo build --release --manifest-path rust/server/Cargo.toml
    mstar serve qwen3_omni --rust-frontend
    # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
+
+Use it when benchmarking or tuning streaming throughput: its output path costs
+about 8 µs of API-server CPU per streamed token against 18 µs for the Python
+frontend (``benchmark/api_output_path``), so at high token rates the Python
+frontend, not the model, can be the limit.
 
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
