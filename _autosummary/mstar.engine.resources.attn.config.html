@@ -690,6 +690,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec"><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.config"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resource_class</span></code></a></li>
@@ -856,6 +857,17 @@ this spec depends on, and is tuned under that resource’s own block.</p>
 <li><p><strong>flashinfer_backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>decode_tensor_cores</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.config.AttentionSpec.combined_splits">
+<span class="sig-name descname"><span class="pre">combined_splits</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.combined_splits"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.config.AttentionSpec.combined_splits" title="Link to this definition">#</a></dt>
+<dd><p>The combined walks this resource runs on split kernels.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.CombinedSplit" title="mstar.engine.resources.spec.CombinedSplit"><em>CombinedSplit</em></a>, …]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1143,6 +1155,7 @@ the step’s queries would attend to the tokens it appends as well.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec"><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.config"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resource_class</span></code></a></li>

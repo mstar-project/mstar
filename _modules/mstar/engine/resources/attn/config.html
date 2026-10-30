@@ -1012,9 +1012,10 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># pass the *original* qk head dim's scale, not the latent width's. Only the MLA</span>
     <span class="c1"># backend reads it; the others refuse it at build</span>
     <span class="n">sm_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="c1"># FlashInfer only: combined walks whose captured steps plan their</span>
-    <span class="c1"># one-token rows on the decode wrapper and their prompt rows on a prefill</span>
-    <span class="c1"># wrapper sized to them (`FlashInferMixedWrapper`)</span>
+    <span class="c1"># FlashInfer only: combined walks whose captured steps run their leading</span>
+    <span class="c1"># one-token rows on a decode half and their prompt rows on a prefill</span>
+    <span class="c1"># wrapper sized to them (`FlashInferMixedWrapper`); the engine orders</span>
+    <span class="c1"># every step of those walks decode first</span>
     <span class="n">splits</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">CombinedSplit</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
     <span class="c1"># FlashInfer only: run one-token decode rows on the tensor-core kernel.</span>
     <span class="c1"># False picks the CUDA-core decode kernel, which can win for MHA and</span>
@@ -1043,6 +1044,12 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the wrappers are planned against the cache's geometry, and it has to</span>
         <span class="c1"># be the same KVConfig the KV resource holds</span>
         <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="AttentionSpec.combined_splits">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionSpec.combined_splits">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">combined_splits</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">CombinedSplit</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">splits</span></div>
 
 
     <span class="nd">@property</span>

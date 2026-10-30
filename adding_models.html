@@ -1216,7 +1216,7 @@ protected prefix, which the window never releases.</p>
 <section id="step-2a-declare-your-resources">
 <span id="id1"></span><h2>Step 2a — Declare your resources<a class="headerlink" href="#step-2a-declare-your-resources" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">get_node_resources</span></code> returns a flat list of <code class="docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code> objects. Every spec has
-three common fields:</p>
+these common members:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">resource_key</span></code> is the name of this resource. Three places use this name, and all three
 must agree: the layers bind to it, <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> uses it as the key of its
@@ -1233,6 +1233,11 @@ node was called “stateless” in earlier versions.</p></li>
 name. If a spec names a dependency that the model does not declare, loading fails
 immediately, rather than during a forward pass. <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> is the one
 attention spec that depends on nothing: it names no cache, because it has none.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">combined_splits()</span></code> returns a <code class="docutils literal notranslate"><span class="pre">CombinedSplit</span></code> for each combined walk this spec
+runs on split kernels (see <a class="reference internal" href="#combined-walks"><span class="std std-ref">combined walks</span></a>); the default is
+none. The engine reads only this hook to order a split walk’s rows, so a spec whose
+config carries <code class="docutils literal notranslate"><span class="pre">splits</span></code> must return them here. <code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code> and
+<code class="docutils literal notranslate"><span class="pre">LinearAttnSpec</span></code> return their config’s <code class="docutils literal notranslate"><span class="pre">splits</span></code>.</p></li>
 </ul>
 <p>The spec types are:</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -2106,7 +2111,7 @@ When a batch runs, the engine calls this method instead of the single-request
 <code class="docutils literal notranslate"><span class="pre">forward</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">max_batch_size(self,</span> <span class="pre">graph_walk)</span></code> sets an optional upper limit.</p></li>
 </ul>
-<p><strong>Combined walks.</strong> By default a step holds one walk. A model lets several walks of a node
+<p id="combined-walks"><strong>Combined walks.</strong> By default a step holds one walk. A model lets several walks of a node
 share a step by returning <code class="docutils literal notranslate"><span class="pre">{node:</span> <span class="pre">{combined_walk:</span> <span class="pre">{walks}}}</span></code> from
 <code class="docutils literal notranslate"><span class="pre">get_combined_graph_walks</span></code>, for example decode rows beside a prompt’s prefill. The
 combined walk is a name of its own, which <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and the CUDA-graph configs
@@ -2114,7 +2119,15 @@ can key on. A step of one walk keeps that walk’s cap. A step that mixes walks 
 combined walk’s <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> when it has one, else the smallest cap of the walks it
 holds, so a small prefill cap never limits a decode-only step.
 <code class="docutils literal notranslate"><span class="pre">max_rows_in_combined(self,</span> <span class="pre">graph_walk)</span></code> also bounds how many rows of one walk a mixed
-step may hold, for kernels sized to a few prompt rows (see <code class="docutils literal notranslate"><span class="pre">CombinedSplit</span></code>).</p>
+step may hold, for kernels sized to a few prompt rows (see <code class="docutils literal notranslate"><span class="pre">CombinedSplit</span></code>). To run a
+combined walk on such split kernels, pass a <code class="docutils literal notranslate"><span class="pre">CombinedSplit</span></code> in the <code class="docutils literal notranslate"><span class="pre">splits</span></code> of each
+resource config that supports one (<code class="docutils literal notranslate"><span class="pre">AttentionConfig</span></code> on the <code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code> backend, for
+captured steps only, and <code class="docutils literal notranslate"><span class="pre">LinearAttnConfig</span></code> with the GDN variant; other backends ignore
+<code class="docutils literal notranslate"><span class="pre">splits</span></code> and run the walk unsplit); their specs return it from <code class="docutils literal notranslate"><span class="pre">combined_splits()</span></code>,
+which is what the engine reads, and resources of one node must agree on a walk’s
+<code class="docutils literal notranslate"><span class="pre">prefill_walks</span></code>. The engine then orders that walk’s steps with the <code class="docutils literal notranslate"><span class="pre">prefill_walks</span></code>
+rows last, so the kernels read the decode rows as the step’s first tokens, in place. Every
+other walk of the combined walk must be one token per row.</p>
 <p><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code> declares <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning <code class="docutils literal notranslate"><span class="pre">False</span></code> from <code class="docutils literal notranslate"><span class="pre">can_batch</span></code> in those cases.</p>

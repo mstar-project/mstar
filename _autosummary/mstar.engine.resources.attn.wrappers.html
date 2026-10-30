@@ -819,16 +819,20 @@ the append; after append it becomes last_page_len).
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.wrappers.</span></span><span class="sig-name descname"><span class="pre">FlashInferMixedWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">decode_workspace</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefill_workspace</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_total_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_prefill_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_tensor_cores</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FlashInferMixedWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FlashInferMixedWrapper" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>A step mixing one-token rows (decode) with prompt rows, on two plans.</p>
-<p>The packed prefill planner over every row costs per row about twice what
-the decode planner does, and its kernel runs the one-token rows as
-prefill queries. Here the decode wrapper takes every row of the bucket
-(a one-token row attends its own pages; any other row reads one token of
-the sink page, and its output is dropped), and the prefill wrapper takes
-at most <code class="docutils literal notranslate"><span class="pre">max_prefill_rows</span></code> prompt rows, their tokens moved to the front
-by a planned permutation. Both are captured at static shapes: the
-bucket’s rows and tokens, and <code class="docutils literal notranslate"><span class="pre">max_prefill_rows</span></code> sequences.</p>
-<p>Every host array is staged in page-locked buffers this wrapper owns: a
-mixed step plans inline on the gpu thread, behind the step in flight.</p>
+<p>The engine orders a split walk’s rows decode first (<code class="docutils literal notranslate"><span class="pre">CombinedSplit</span></code>),
+so the step’s leading run of one-token rows is its first tokens, row i
+token i. The decode half plans the bucket’s <code class="docutils literal notranslate"><span class="pre">batch_size</span></code> rows: a row of
+the run attends its own pages, and any other reads the sink page and its
+output is dropped (with tensor cores those rows get no query, except the
+last, which takes the rest of the half’s <code class="docutils literal notranslate"><span class="pre">batch_size</span></code> tokens). The
+prefill wrapper takes every token: the run as one row on the sink page,
+at most <code class="docutils literal notranslate"><span class="pre">max_prefill_rows</span></code> prompt rows, and a sink-page tail row over
+the bucket’s padding. Both read the step’s queries in place, at static
+shapes, and the decode outputs overwrite the run’s.</p>
+<p>A mixed step plans inline on the gpu thread, behind the step in flight,
+so every host array is staged page-locked: this wrapper’s own and the
+CUDA-core decode half’s in its buffers, the prefill wrapper’s and the
+tensor-core half’s in theirs (<code class="docutils literal notranslate"><span class="pre">_stage_pinned</span></code>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">

@@ -996,7 +996,17 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">CombinedSplit</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""A combined walk run on two kernels: decode for one-token rows, prefill</span>
 <span class="sd">    for the rows of ``prefill_walks``, captured for as many as</span>
-<span class="sd">    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows)."""</span>
+<span class="sd">    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows).</span>
+
+<span class="sd">    The engine orders a step of ``combined_walk`` with the rows of</span>
+<span class="sd">    ``prefill_walks`` last, so both kernels read the step's tokens in place:</span>
+<span class="sd">    the decode kernel the leading run of one-token rows, the prefill kernel</span>
+<span class="sd">    the rows after it (under capture every token, the run as one leading</span>
+<span class="sd">    sequence). Every walk of ``combined_walk`` outside ``prefill_walks`` must</span>
+<span class="sd">    be one token per row: its rows go first, and a multi-token one there</span>
+<span class="sd">    ends the run, so it and every decode row after it count as prompt rows,</span>
+<span class="sd">    and a captured step's plan raises if its prompt rows then exceed</span>
+<span class="sd">    ``max_prefill_rows``."""</span>
     <span class="n">combined_walk</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">prefill_walks</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
 
@@ -1031,6 +1041,13 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Keys whose specs this one builds against; the engine resolves them</span>
 <span class="sd">        into ``EngineResourceInfo.dependencies``."""</span>
         <span class="k">return</span> <span class="nb">set</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="NodeResourceSpec.combined_splits">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.combined_splits">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">combined_splits</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"tuple[CombinedSplit, ...]"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The combined walks this resource runs on split kernels."""</span>
+        <span class="k">return</span> <span class="p">()</span></div>
 
 
     <span class="nd">@property</span>
