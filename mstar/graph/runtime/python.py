@@ -1556,7 +1556,7 @@ class PythonGraphRuntime(GraphRuntime):
                             modality=edge.output_modality,
                             graph_edge=edge,
                             loop_indices=nested_idxs.get(rid),
-                            metadata={} if logprob is None else {"logprob": logprob},
+                            metadata={} if logprob is None else {"logprobs": [logprob]},
                         ),
                     ))
 
@@ -1620,12 +1620,12 @@ class PythonGraphRuntime(GraphRuntime):
             if frame is None:
                 frame = frames[(signal, modality)] = ResultTokens(
                     request_ids=[], values=[], loop_indices=[],
-                    signal=signal, modality=modality,
+                    signal=signal, modality=modality, logprobs=[] if completion.logprobs else None,
                 )
             frame.request_ids.append(self.get_rid_string(rid))
             frame.values.append(value)
             frame.loop_indices.append(completion.nested_loop_indices.get(rid))
-            if completion.logprobs:
+            if frame.logprobs is not None:
                 frame.logprobs.append(completion.logprobs.get(rid))
         return list(frames.values())
 

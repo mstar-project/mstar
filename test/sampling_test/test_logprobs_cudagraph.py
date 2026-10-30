@@ -39,9 +39,10 @@ class _Captured:
     def __init__(self, res: SamplerResource, rids):
         self.res = res
         self.logits = _logits(99)
-        ctx = self._plan(rids)
-        for _ in range(3):  # autotune outside the capture
+        for _ in range(3):  # autotune outside the capture, re-planned as the runner does
+            self._plan(rids)
             res.sample(list(rids), self.logits)
+        ctx = self._plan(rids)
         torch.cuda.synchronize()
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
@@ -93,6 +94,14 @@ def test_the_kernel_matches_log_softmax_whether_or_not_the_vocab_splits(vocab):
     chosen = token_logprobs(logits, tokens, temperature)
     expected = _reference(logits, tokens, temperature.tolist())
     torch.testing.assert_close(chosen, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_a_near_certain_token_never_scores_above_zero():
+    gen = torch.Generator(device=DEV).manual_seed(0)
+    logits = torch.randn(256, 248_320, device=DEV, generator=gen).mul_(2).to(torch.bfloat16)
+    logits[:, 7] = logits.max(dim=1).values + 12
+    tokens = torch.full((256,), 7, device=DEV)
+    assert token_logprobs(logits, tokens, torch.full((256,), 0.3, device=DEV)).max() <= 0
 
 
 def test_replayed_logprobs_match_log_softmax_with_padding_and_quiet_rows():

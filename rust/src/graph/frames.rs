@@ -416,7 +416,7 @@ pub struct ResultTensors<'a> {
     pub signal: &'a str,
     pub infos: Vec<TensorPointerInfo>,
     pub loop_indices: Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>,
-    /// The sampled token's log-prob, sent as `metadata["logprob"]`.
+    /// The sampled token's log-prob, sent as `metadata["logprobs"] = [lp]`.
     pub logprob: Option<f64>,
 }
 
@@ -443,7 +443,8 @@ impl ResultTensors<'_> {
             match self.logprob {
                 Some(lp) => {
                     w_map(m.key("metadata"), 1);
-                    w_str(m.buf(), "logprob");
+                    w_str(m.buf(), "logprobs");
+                    w_arr(m.buf(), 1);
                     w_f64(m.buf(), lp);
                 }
                 None => w_map(m.key("metadata"), 0),
@@ -492,11 +493,14 @@ impl ResultTokens<'_> {
             w_str(m.key("signal"), self.signal);
             w_str(m.key("modality"), self.modality);
             w_map(m.key("metadata"), 0);
-            w_arr(m.key("logprobs"), self.logprobs.len() as u32);
-            for &lp in self.logprobs {
-                match lp {
-                    Some(v) => w_f64(m.buf(), v),
-                    None => w_nil(m.buf()),
+            // left out, so a frame without log-probs is as it was
+            if !self.logprobs.is_empty() {
+                w_arr(m.key("logprobs"), self.logprobs.len() as u32);
+                for &lp in self.logprobs {
+                    match lp {
+                        Some(v) => w_f64(m.buf(), v),
+                        None => w_nil(m.buf()),
+                    }
                 }
             }
         });

@@ -222,12 +222,12 @@ def test_both_runtimes_send_the_same_frames(tmp_path):
     tokens = sorted(sorted(c.values) for c in rs_chunks if isinstance(c, ResultTokens))
     assert tokens == [[11, 21], [12, 22], [13, 23], [15]]
     logprobs = sorted(
-        (rid, lp) for c in rs_chunks if isinstance(c, ResultTokens)
-        for rid, lp in zip(c.request_ids, c.logprobs, strict=False) if lp is not None
+        (rid, lp) for c in rs_chunks if isinstance(c, ResultTokens) and c.logprobs
+        for rid, lp in zip(c.request_ids, c.logprobs, strict=True) if lp is not None
     )
     assert logprobs == [("r0", -3.0), ("r0", -2.5), ("r0", -1.5)]
     metadata = sorted(
-        (c.request_id, c.metadata["logprob"]) for c in rs_chunks
+        (c.request_id, *c.metadata["logprobs"]) for c in rs_chunks
         if not isinstance(c, ResultTokens) and c.metadata
     )
     # the prefills, and the step whose values missed a row
