@@ -415,6 +415,24 @@ def test_a_cache_has_a_mirror_where_a_walk_that_keys_it_runs(worker_graphs, node
     assert place("P")[0] == a, "a request did not follow its prefix to the replica its node cached it on"
 
 
+def test_a_request_mirrored_on_two_sets_of_replicas_saves_one_share_of_its_prompt():
+    # the keyed_walks_on_two_nodes shape: the cache's nodes in groups on other ranks, a mirror for each
+    walks = ("prefill_text", "prefill_vit")
+    router = ReplicaRouter(
+        _Model(keyed={"kv": {"main": walks}}, partitions=[SimpleNamespace(name="default", graph_walks=set(walks))]),
+        [_wg(0, [0, 1], nodes=("X",), walk=walks[0]), _wg(1, [2, 3], nodes=("Y",), walk=walks[1])],
+        specs=[KVSpec(resource_key="kv", nodes={"X", "Y"}, config=_kv_spec().config)],
+    )
+    configs = _configs(_prompt("P"))
+    groups_run = router.groups_run(["default"])
+    for _ in range(2):
+        router.add(router.pick(configs, groups_run), configs, groups_run)
+    # the second request is predicted to hold 3 of its 4 pages on the replica it went to, in each set
+    assert router.predicted_saving._values[("prefix",)] == pytest.approx(0.75), (
+        "a request added a share of its prompt per set of replicas, not one"
+    )
+
+
 @pytest.mark.parametrize("prefix_slots, mirrored", [(0, False), (2, True)])
 def test_a_cache_on_a_node_whose_recurrent_pool_keeps_no_snapshots_has_no_mirror(prefix_slots, mirrored):
     """As Qwen3.5's GDN state beside its KV cache: without snapshots the workers

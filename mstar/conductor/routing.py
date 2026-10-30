@@ -211,10 +211,13 @@ class ReplicaRouter:
                     mirror_handle = m.mirror.add_request(configs[m.key], replica)
                     if mirror_handle is not None:
                         handles.append(_Held(m, mirror_handle))
-        for term, alone in _TERMS.items():
-            saving = -sum(routing_cost(facts, alone) for facts in placement.facts.values())
-            if saving:
-                self.predicted_saving.inc((term,), saving)
+        if placement.facts:
+            # the facts of every set of replicas it was placed on, priced once: a share of its whole prompt
+            facts = RoutingFacts(*map(sum, zip(*placement.facts.values(), strict=True)))
+            for term, alone in _TERMS.items():
+                saving = -routing_cost(facts, alone)
+                if saving:
+                    self.predicted_saving.inc((term,), saving)
         handle = RoutingHandle(tuple(load), tuple(handles))
         self._load.update(handle.load)
         return handle
