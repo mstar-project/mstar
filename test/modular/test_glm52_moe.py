@@ -558,6 +558,78 @@ class _RecordingGroup:
         return t
 
 
+class _OutOfPlaceGroup(_RecordingGroup):
+    """A collective that returns its sum in a new tensor and leaves the input as this rank's
+    partial, as FlashInfer's all-reduce does; the sum is world_size equal ranks'."""
+
+    def all_reduce(self, t):
+        self.reduced.append(t.clone())
+        return t * self.world_size
+
+
+def _random_weights(block):
+    """Finite random weights; fp8 experts as block-quantized ones."""
+    for prm in block.parameters():
+        if prm.dtype.is_floating_point:
+            prm.data.normal_(0, 0.05)
+    if block.fp8_experts:
+        for name in ("gate_up_proj", "down_proj"):
+            weight, scale = getattr(block.experts, f"{name}_fp8"), getattr(block.experts, f"{name}_scale_inv")
+            for e in range(weight.shape[0]):
+                q, s, _ = fake_quantize_fp8_block(torch.randn(weight.shape[1:]) * 0.1, BLOCK)
+                weight.data[e] = q.view(torch.uint8)
+                scale.data[e] = s
+
+
+def _twins(cfg, setup=lambda block: None):
+    """The same block over an in-place and an out-of-place 2-rank collective."""
+    blocks = []
+    for group in (_RecordingGroup(), _OutOfPlaceGroup()):
+        block = Glm52SparseMoeBlock(cfg, comm_group=group)
+        setup(block)
+        blocks.append(block)
+    _random_weights(blocks[0])
+    blocks[1].load_state_dict(blocks[0].state_dict())
+    return blocks
+
+
+@pytest.mark.parametrize("fused_allreduce", [False, True], ids=["two-reduces", "fused-allreduce"])
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8-reference"])
+def test_an_out_of_place_all_reduce_result_is_kept(fp8, fused_allreduce):
+    """#957: the block keeps what all_reduce returns, so a collective that writes a new
+    tensor (FlashInfer's) gives what one that reduces in place does: here exactly twice
+    one rank's partials, at every reduction the bf16 dispatch, the fp8 reference loop and
+    the summed partials run."""
+    torch.manual_seed(11)
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK) if fp8 else Glm52ModelConfig.reduced()
+    cfg.moe_fused_allreduce = fused_allreduce
+    in_place, out_of_place = _twins(cfg)
+    x = torch.randn(5, cfg.hidden_size) * 0.1
+    assert torch.equal(out_of_place(x), 2 * in_place(x))
+
+
+@pytest.mark.parametrize("path", ["decode", "prefill", "fused"])
+def test_the_fused_paths_keep_an_out_of_place_all_reduce_result(monkeypatch, path):
+    """The same for the reductions behind the fused kernels, which stand-ins replace here:
+    the decode chain's one partial, the prefill kernels' and the runner's routed output."""
+    def setup(block):
+        block._use_fused = True
+        if path == "decode":
+            monkeypatch.setattr(block, "_use_decode", lambda flat: True)
+            monkeypatch.setattr(block, "_forward_decode", lambda flat: flat * 3.0)
+        elif path == "prefill":
+            block._prefill_kernel = True
+            monkeypatch.setattr(block, "_dispatch_prefill", lambda flat, weights, ids: flat * 3.0)
+
+    fake = types.ModuleType("mstar.utils.fused_moe")
+    fake.fused_experts_fp8 = lambda flat, *args, **kwargs: flat * 3.0
+    monkeypatch.setitem(sys.modules, "mstar.utils.fused_moe", fake)
+    torch.manual_seed(12)
+    in_place, out_of_place = _twins(Glm52ModelConfig.reduced_fp8(block=BLOCK), setup)
+    x = torch.randn(80 if path == "prefill" else 5, in_place.hidden_size) * 0.1
+    assert torch.equal(out_of_place(x), 2 * in_place(x))
+
+
 def test_fused_allreduce_reduces_once_and_keeps_local_math():
     """moe_fused_allreduce: the block issues ONE all-reduce
     (of routed_partial + shared_partial) instead of two, and what it reduces
