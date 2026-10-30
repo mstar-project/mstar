@@ -177,13 +177,11 @@ class ClientStream(NamedTuple):
 
 def find_client_streams(model: Model) -> dict[str, ClientStream]:
     """Each client stream's consumer: the one node, over every walk, that
-    takes the edge (as the worker resolves a streamed edge's consumer,
-    ``Worker._build_consumer_node_cache``), in a walk of the partition it
-    flows into. Raises ``ValueError`` for a stream without one, which
-    validate_deployment reports. The conductor derives it after the worker
-    graphs are built (a model may shape its walks from the deployment, as
-    BAGEL does); the data worker from its own copy of the model, reading only
-    the node and partition, which address each item."""
+    takes the edge (as ``Worker._build_consumer_node_cache`` resolves it), in
+    a walk of the partition it flows into; ``ValueError`` for a stream without
+    one. The conductor reads it after the worker graphs are built (a model may
+    shape its walks from the deployment, as BAGEL does); the data worker reads
+    only the node and partition, from its own copy of the model."""
     connections = model.get_partition_topology().client_connections()
     if not connections:
         return {}
