@@ -14,6 +14,7 @@ import re
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -30,6 +31,7 @@ from mstar.distributed.utils import split_tensor_along_last_dim  # noqa: E402
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file  # noqa: E402
 from mstar.engine.resources.lora.config import describe_load_error  # noqa: E402
 from mstar.engine.resources.lora.ops import lora_gather_shrink  # noqa: E402
+from mstar.engine.resources.lora.serving import declared_lora_specs  # noqa: E402
 from mstar.engine.resources.lora.store import inspect_adapter, inspect_keys  # noqa: E402
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding  # noqa: E402
 from mstar.model.components.distributed.linear import (  # noqa: E402
@@ -443,7 +445,7 @@ def test_unbound_module_runs_the_pre_lora_forward(name):
 
 # --- what binding refuses ------------------------------------------------------------------
 
-def test_binding_refuses_a_second_delta_a_silent_node_a_split_target_and_a_hand_spec(tmp_path):
+def test_binding_refuses_a_second_delta_a_silent_node_and_a_split_target(tmp_path):
     case = CASES["qkv"]
     paths, _ = _adapters(case, tmp_path)
     spec = serve(_spec(case), paths)
@@ -467,10 +469,13 @@ def test_binding_refuses_a_second_delta_a_silent_node_a_split_target_and_a_hand_
         bind_module_lora(_Node(root), {"lora": pool(spec, rank=0, world=2)})
     assert type(root.layers[0].qkv_proj) is QKVParallelLinear
 
-    # a spec not built by `module_lora_spec`: nothing would bind it, so no rows or deltas
+
+def test_a_lora_spec_not_built_by_module_lora_spec_is_refused_where_specs_are_declared():
+    """Nothing would bind its nodes' modules: refused before any worker starts."""
+    hand = replace(_spec(CASES["qkv"]), module_map=lambda m: None)
+    model = SimpleNamespace(get_lora_specs=lambda: [hand])
     with pytest.raises(ValueError, match="module_lora_spec"):
-        bind_module_lora(_Node(root), {"lora": pool(replace(spec, module_map=lambda m: None, adapters={}))})
-    assert type(root.layers[0].qkv_proj) is QKVParallelLinear
+        declared_lora_specs(model, {"resources": {"lora": {"adapters": {}}}})
 
 
 def test_target_names_widen_a_role_outside_every_stack():

@@ -463,12 +463,6 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> tupl
     pools: list[tuple[str, LoraAdapterPool]] = [
         (key, r) for key, r in resources.items() if isinstance(r, LoraAdapterPool)
     ]
-    for key, pool in pools:
-        if not isinstance(pool.spec.module_map, ModuleLoraMap):
-            raise ValueError(
-                f"LoRA resource {key!r} was not declared with `module_lora_spec`, so nothing "
-                "binds the node's modules to it; build the node's spec with `module_lora_spec`"
-            )
     if not pools:
         return ()
     if not getattr(submodule, "lora_segment_rows", False):
