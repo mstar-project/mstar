@@ -1048,10 +1048,12 @@ class RealtimeConversation:
         kind = event.get("type")
         if kind == "session.update":
             try:
-                self.update(_object(event.get("session"), "session"))
+                ignored = self.update(_object(event.get("session"), "session"))
             except (TypeError, ValueError) as exc:
                 await self.send(_error(str(exc)))
                 return
+            for message in ignored:
+                await self.send(_error(message, code="unsupported"))
             await self.send(server_event("session.updated", session=self._session_view()))
         elif kind == "input_audio_buffer.append":
             await self.append(event.get("audio", ""))
@@ -1073,8 +1075,12 @@ class RealtimeConversation:
         else:
             await self.send(_error(f"unknown event {_excerpt(kind)}"))
 
-    def update(self, session: dict) -> None:
-        """Apply a session update, all or nothing."""
+    def update(self, session: dict) -> list[str]:
+        """Apply a session update. One that is malformed, or would change
+        what the call has fixed, is refused whole (``ValueError``). An option
+        this model can't honour keeps its served value and is answered with
+        one of the returned messages, so a client's defaults (another voice,
+        input transcription) don't cost it the rest of the update."""
         if session.get("type", "realtime") != "realtime":
             raise ValueError(f'session.type must be "realtime"; got {_excerpt(session.get("type"))} '
                              "(transcription sessions are /v1/realtime?intent=transcription)")
@@ -1083,14 +1089,6 @@ class RealtimeConversation:
             instructions = ""
         if not isinstance(instructions, str):
             raise ValueError(f"instructions must be a string; got {_excerpt(instructions)}")
-        modalities = session.get("output_modalities")
-        if modalities is not None and modalities != ["audio"]:
-            raise ValueError(f'output_modalities must be ["audio"] (this model always speaks); '
-                             f'got {_excerpt(modalities)}')
-        if session.get("tools"):
-            raise ValueError("tools are not supported")
-        if session.get("max_output_tokens") not in (None, "inf"):
-            raise ValueError("max_output_tokens is not supported: the model decides how long it speaks")
         audio = _object(session.get("audio"), "audio")
         audio_in = _object(audio.get("input"), "audio.input")
         audio_out = _object(audio.get("output"), "audio.output")
@@ -1098,35 +1096,44 @@ class RealtimeConversation:
                   if audio_in.get("format") is not None else self.input_format)
         out_fmt = (_audio_format(audio_out["format"], "audio.output.format")
                    if audio_out.get("format") is not None else self.output_format)
-        for name in ("transcription", "noise_reduction"):
-            if audio_in.get(name) is not None:
-                raise ValueError(f"audio.input.{name} is not supported")
+        if self.key is not None and (instructions, in_fmt, out_fmt) != (
+                self.instructions, self.input_format, self.output_format):
+            raise ValueError("instructions and audio formats are fixed once audio flows")
+        ignored = []
+        modalities = session.get("output_modalities")
+        if modalities is not None and modalities != ["audio"]:
+            ignored.append(f'output_modalities must be ["audio"] (this model always speaks); '
+                           f'got {_excerpt(modalities)}')
+        if session.get("tools"):
+            ignored.append("tools are not supported")
+        if session.get("max_output_tokens") not in (None, "inf"):
+            ignored.append("max_output_tokens is not supported: the model decides how long it speaks")
+        ignored += [f"audio.input.{name} is not supported" for name in ("transcription", "noise_reduction")
+                    if audio_in.get(name) is not None]
         turn_detection = self.turn_detection
         if "turn_detection" in audio_in:
             td = audio_in["turn_detection"]
             if td is None:
-                raise ValueError("audio.input.turn_detection null is not supported: this model decides when it "
-                                 "speaks; use server_vad or semantic_vad")
-            td = _object(td, "audio.input.turn_detection")
-            if td.get("type") not in ("server_vad", "semantic_vad"):
-                raise ValueError(f"audio.input.turn_detection.type must be server_vad or semantic_vad; "
-                                 f"got {_excerpt(td.get('type'))}")
-            for name in ("create_response", "interrupt_response"):
-                if td.get(name, True) is not True:
-                    raise ValueError(f"audio.input.turn_detection.{name} must be true: this model always "
-                                     "answers and always yields")
-            turn_detection = td["type"]
+                ignored.append("audio.input.turn_detection null is not supported: this model decides when it "
+                               "speaks; use server_vad or semantic_vad")
+            elif _object(td, "audio.input.turn_detection").get("type") not in ("server_vad", "semantic_vad"):
+                ignored.append(f"audio.input.turn_detection.type must be server_vad or semantic_vad; "
+                               f"got {_excerpt(td.get('type'))}")
+            elif fixed := [name for name in ("create_response", "interrupt_response")
+                           if td.get(name, True) is not True]:
+                ignored.append(f"audio.input.turn_detection.{fixed[0]} must be true: this model always "
+                               "answers and always yields")
+            else:
+                turn_detection = td["type"]
         if audio_out.get("voice", self.voice) != self.voice:
-            raise ValueError(f"audio.output.voice must be {self.voice!r}, the voice this server speaks in; "
-                             f"got {_excerpt(audio_out['voice'])}")
+            ignored.append(f"audio.output.voice must be {self.voice!r}, the voice this server speaks in; "
+                           f"got {_excerpt(audio_out['voice'])}")
         if audio_out.get("speed") not in (None, 1):
-            raise ValueError("audio.output.speed is not supported")
-        if self.key is not None and (instructions, in_fmt, out_fmt) != (
-                self.instructions, self.input_format, self.output_format):
-            raise ValueError("instructions and audio formats are fixed once audio flows")
+            ignored.append("audio.output.speed is not supported")
         self.instructions, self.turn_detection = instructions, turn_detection
         if (in_fmt, out_fmt) != (self.input_format, self.output_format):
             self._set_formats(in_fmt, out_fmt)
+        return ignored
 
     def _set_formats(self, in_fmt: AudioFormat, out_fmt: AudioFormat) -> None:
         """Before audio flows: the resamplers hold nothing yet."""

@@ -460,7 +460,9 @@ Per-model notes:
   ``output_audio_buffer.clear`` and the item-editing events are answered with an
   ``unsupported`` error, and the call goes on. Input transcription and tools are not
   supported, nor are ``max_output_tokens`` and ``audio.output.speed`` other than their
-  defaults. ``voice`` is the model's own (Nemotron: ``Aria``). One response is in
+  defaults. ``voice`` is the model's own (Nemotron: ``Aria``). A ``session.update``
+  asking for one of these gets an ``unsupported`` error for it, keeps the served value,
+  and applies the rest, as ``session.updated`` shows. One response is in
   progress at a time: a reply that starts while the previous one is still speaking is
   its own response, sent once that one is done. If the call ends (its length cap, say),
   the server sends an ``error``, ends a reply still in progress with ``response.done``

@@ -1475,6 +1475,25 @@ def test_an_item_is_reported_only_when_its_audio_was_taken(duplex, monkeypatch):
     assert len(api.appends) == 1
 
 
+def test_an_option_the_model_cannot_honour_costs_the_update_nothing_else(duplex):
+    """A stock client's defaults (another voice, input transcription) are
+    answered with an error each, and its instructions still open the call."""
+    client, api = duplex()
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "session.update", session={"instructions": "be brief", "audio": {
+            "input": {"transcription": {"model": "gpt-4o-transcribe"}}, "output": {"voice": "ash"}}})
+        replies = _recv_until(ws, "session.updated")
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    errors = [r["error"]["message"] for r in replies if r["type"] == "error"]
+    assert len(errors) == 2 and "transcription" in errors[0] and "voice" in errors[1]
+    served = replies[-1]["session"]
+    assert served["instructions"] == "be brief" and served["audio"]["output"]["voice"] == "Aria"
+    assert api.submits[0]["text"] == "be brief"
+
+
 def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
     client, api = duplex()
     frame = base64.b64encode(b"\1\0" * 1280).decode()   # 80 ms at 16 kHz
@@ -1488,11 +1507,13 @@ def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
             assert error["type"] == "error" and error["error"]["code"] == "unsupported", kind
         _send(ws, "session.update", session={"audio": {"input": {"turn_detection": None}}})
         assert "turn_detection null is not supported" in json.loads(ws.receive_text())["error"]["message"]
-        # what would change what is heard, and the model cannot do, is refused
+        assert json.loads(ws.receive_text())["type"] == "session.updated"
+        # what the model cannot do is answered with an error, and the served value stays
         for session in ({"max_output_tokens": 100}, {"audio": {"output": {"speed": 1.5}}},
                         {"audio": {"output": {"voice": "Ash"}}}):
             _send(ws, "session.update", session=session)
-            assert json.loads(ws.receive_text())["type"] == "error", session
+            assert json.loads(ws.receive_text())["error"]["code"] == "unsupported", session
+            assert json.loads(ws.receive_text())["type"] == "session.updated"
         _send(ws, "session.update", session={"instructions": "be brief"})
         assert "fixed once audio flows" in json.loads(ws.receive_text())["error"]["message"]
         _send(ws, "input_audio_buffer.append", audio=frame)
