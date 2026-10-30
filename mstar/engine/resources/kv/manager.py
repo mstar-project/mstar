@@ -3559,13 +3559,22 @@ class KVManager(AttentionResource):
         Also 0 for a guaranteed request in a pool that decides, since a move to the host
         preempts it too."""
         with self._lock:
-            streams = self._streams.get(rid, {})
-            if self._decides and streams and self._overrides[rid].guaranteed:
+            if self._decides and self._streams.get(rid) and self._overrides[rid].guaranteed:
                 return 0
-            for stream in streams.values():
-                if any(self._reusable(page) for page in reversed(stream.page_indices)):
-                    return sum(len(stream.page_indices) for stream in streams.values())
-            return 0
+            return self._freeable(rid)
+
+    def frees_on_remove(self, rid: str) -> int:
+        """`reclaimable` for any class of request, since a teardown frees a guaranteed request's pages too."""
+        with self._lock:
+            return self._freeable(rid)
+
+    def _freeable(self, rid: str) -> int:
+        """Under the lock: the device pages ``rid`` holds, or 0 when releasing them would free none."""
+        streams = self._streams.get(rid, {})
+        for stream in streams.values():
+            if any(self._reusable(page) for page in reversed(stream.page_indices)):
+                return sum(len(stream.page_indices) for stream in streams.values())
+        return 0
 
     def get_offload_priority(self, rid: str) -> float:
         """What `reclaimable` counts, the most reclaimable first."""

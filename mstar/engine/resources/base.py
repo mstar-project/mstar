@@ -458,6 +458,11 @@ class Resource(ABC):
         """
         return 0
 
+    def frees_on_remove(self, rid: str) -> int:
+        """What a teardown of the request hands back, which is `reclaimable` unless a resource keeps some
+        requests from the offload."""
+        return self.reclaimable(rid)
+
     def get_offload_priority(self, rid: str) -> float:
         """How much this resource wants ``rid`` gone, higher being more.
 
