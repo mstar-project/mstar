@@ -1468,8 +1468,9 @@ decode), while one request takes the 1-GPU time.
 
 **Four GPUs.** ``configs/wan22_cfg2_sp2_4gpu.yaml`` also splits each branch's
 tokens over a pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's
-self-attention) to cut one request's latency. Set ``cfg_size`` before
-``sp_size``: on two GPUs, ``sp_size: 2`` alone is slower than ``cfg_size: 2``.
+self-attention) to cut one request's latency. Split the guidance branches
+first (``cfg_size: 2``), then add ``sp_size`` on top: on two GPUs,
+``sp_size: 2`` alone is slower than ``cfg_size: 2``.
 ``sp_size`` must divide the dit's 24 attention heads. Under concurrency,
 ``wan22_dp2.yaml`` stays the throughput layout; the four-GPU layout is unmeasured
 there.
