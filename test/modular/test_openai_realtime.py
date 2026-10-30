@@ -1273,6 +1273,22 @@ def test_a_paused_client_is_padded_with_silence(duplex, monkeypatch, half_sample
     assert padded == 0 if half_sample else 0 < padded <= 0.24 * 16000 + len(pads)
 
 
+def test_an_append_that_fails_inside_the_server_is_an_error_event(duplex, monkeypatch):
+    client, api = duplex()
+
+    def broken(*a, **k):
+        raise RuntimeError("/srv/secret/path is gone")
+
+    monkeypatch.setattr(api, "stream_input", broken)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        error = json.loads(ws.receive_text())["error"]
+        _send(ws, "input_audio_buffer.commit")   # the socket is still up
+        _recv_until(ws, "input_audio_buffer.committed")
+    assert error["type"] == "server_error" and "error id" in error["message"] and "secret" not in error["message"]
+
+
 def _text(step, data=b"", mark=None):
     return _Chunk("text", data, {"step": step, **({"turn": [mark]} if mark else {})})
 

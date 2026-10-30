@@ -1198,6 +1198,12 @@ class RealtimeConversation:
             except ValueError as exc:  # past the call's input budget: the call ends with it
                 self.api.reject_input(self.key, f"append rejected: {exc}", 400)
                 return False
+            except Exception as exc:  # noqa: BLE001 — the client gets an error event, not a bare close
+                error_id = uuid.uuid4().hex[:12]
+                logger.error("realtime append failed (error id %s, session %s)", error_id, self.session_id,
+                             exc_info=exc)
+                await self.send(_error(f"the append failed (error id {error_id})", kind="server_error"))
+                return False
 
     async def _clock(self) -> None:
         """Keep the call's audio up with real time while the client sends
