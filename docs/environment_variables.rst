@@ -526,9 +526,16 @@ Worker scheduling
        node's cores in the process mask, the API server the core at its
        first worker's GPU's rank from the top; further workers of one
        deployment on one GPU step by the node's GPU count. A GPU whose node
-       has no CPU in the mask picks, by its rank among all the host's GPUs,
-       from the cores the node-local GPUs leave. If the mask is too small to
-       leave a CPU unpinned, nothing is pinned and a warning says why. A
+       has no CPU in the mask picks, by its rank among the host's GPUs in
+       the same case, from the cores the node-local GPUs leave. The cores a GPU picks
+       from must hold two per GPU that picks from them (its workers count up
+       from the bottom, its API server down from the top); with fewer, or a
+       mask too small to leave a CPU unpinned, nothing is pinned and a
+       warning says why. Servers on one GPU (two MIG instances share its
+       address) would take the same CPUs, so the first ``auto`` server holds
+       ``/tmp/mstar-gpu-<PCI address>.lock`` for its life and a second one
+       pins nothing, with a warning; the lock goes with the process however
+       it exits. A
        number names the first worker's core (its hardware threads in the
        mask); the next workers take the next cores up and the API server the
        last core of the mask. A number outside the mask, or too near its top

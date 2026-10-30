@@ -50,6 +50,7 @@ from mstar.api_server.request_types import (
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
+from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -2619,23 +2620,30 @@ async def shutdown_event():
 # ------------------------------------------------------------------
 
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
-    """The deployment's CPU plan, as each worker builds it from the
-    conductor's device list: the config's ``step_thread_core`` and the
-    workers' devices (``node_groups`` ranks in order, through
-    ``rank_devices``). A bad knob value is left for the conductor's
-    deployment check to report; a CPU number the mask can't honour raises
-    ``CpuPlanError``."""
+    """The deployment's CPU plan, as each worker builds it from the conductor's
+    device list: the config's ``step_thread_core`` and ``deployment_workers``.
+    Under ``auto`` this also takes the GPUs' locks, and a server that finds one
+    held pins nothing, here or in its workers. A bad knob value is left for the
+    conductor's deployment check to report; a CPU number the mask can't honour
+    raises ``CpuPlanError``."""
     try:
         knobs.configure(config.get("knobs"))
     except ValueError:
         return cpus.plan()
     setting = knobs.step_thread_core()
-    groups = [g for g in config.get("node_groups") or [] if isinstance(g, dict)]
-    ranks = sorted({r for g in groups for r in g.get("ranks") or [] if isinstance(r, int)})
-    rank_devices = {int(r): int(i) for r, i in (config.get("rank_devices") or {}).items()}
-    indices = [rank_devices.get(rank, rank) for rank in ranks] or [0]
-    addresses = cpus.device_addresses(indices) if setting == "auto" else [None] * len(indices)
-    return cpus.deployment_plan(setting, addresses)
+    if setting == "off":
+        return cpus.deployment_plan(setting, [])
+    devices = deployment_workers(config, accelerator_type()).devices
+    plan = cpus.devices_plan(setting, devices)
+    if setting != "auto" or not plan.pinned:
+        return plan
+    refused = cpus.claim_gpus(cpus.device_addresses(devices))
+    if refused is None:
+        return plan
+    logger.warning("step_thread_core auto: nothing pinned, %s", refused)
+    # the workers read the knob when they build their plan
+    os.environ[knobs.KNOBS["step_thread_core"]] = "off"
+    return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
 
 
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:

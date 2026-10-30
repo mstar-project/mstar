@@ -1981,12 +1981,9 @@ class Worker:
         started, in ``worker_ids`` order; standalone, this worker is the only
         one.
         """
-        setting = knobs.step_thread_core()
-        devices = [torch.device(d) for d in (local_worker_devices or [str(self.device)])]
+        devices = local_worker_devices or [str(self.device)]
         slot = worker_ids.index(self.worker_id) if local_worker_devices else 0
-        indices = [None if d.type == "cpu" else d.index for d in devices]
-        addresses = cpus.device_addresses(indices) if setting == "auto" else [None] * len(devices)
-        plan = cpus.deployment_plan(setting, addresses)
+        plan = cpus.devices_plan(knobs.step_thread_core(), devices)
         cpus.install(plan)
         self._process_cpus = plan.mask
         self._step_cpus = plan.workers[slot] if plan.workers else None

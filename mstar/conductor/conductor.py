@@ -31,6 +31,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
     merge_publish_info,
 )
+from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
@@ -222,16 +223,6 @@ def _run_worker(worker) -> None:
         stop = stop or e
     if stop is not None:
         raise stop
-
-
-def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
-    """The device string a worker rank runs on: its own number unless the
-    deployment's ``rank_devices`` maps it elsewhere (several ranks may share a
-    GPU); CPU deployments ignore the mapping."""
-    if device_type == "cpu":
-        return "cpu"
-    index = (rank_devices or {}).get(rank, rank)
-    return f"{device_type}:{index}"
 
 
 def _worker_process_target(
@@ -495,8 +486,7 @@ class Conductor:
         # Every check that needs only the model, this YAML and the environment,
         # before any worker exists; raises listing every problem found.
         deployment = validate_deployment(model, self.model_config, model_config_file)
-        accelerator = torch.accelerator.current_accelerator(check_available=True)
-        self.device_type = accelerator.type if accelerator is not None else "cpu"
+        self.device_type = accelerator_type()
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
         logger.info(
@@ -506,14 +496,6 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
-        # Optional ``rank_devices: {rank: device_index}`` places a worker rank
-        # on a device other than the one its number implies, e.g. two workers
-        # sharing one GPU so a light node's steps stop interleaving with a
-        # heavy node's on the same worker loop.
-        self.rank_devices = {
-            int(rank): int(index)
-            for rank, index in (self.model_config.get("rank_devices") or {}).items()
-        }
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
         # of time-slicing. validate_deployment checked the value.
@@ -736,7 +718,7 @@ class Conductor:
             for rank in worker_graph.ranks:
                 rank_to_worker_graphs[rank].append(worker_graph)
 
-        self._sorted_ranks = sorted(rank_to_worker_graphs.keys())
+        self._sorted_ranks, self._worker_devices = deployment_workers(self.model_config, self.device_type)
         self.worker_ids = [f"worker_{rank}" for rank in self._sorted_ranks]
 
         # Messages that arrive before all workers report SETUP_DONE; replayed
@@ -821,8 +803,7 @@ class Conductor:
             self._mps.start()
         # every worker runs on this host and builds the same CPU plan from all
         # of their devices (see mstar.utils.cpus)
-        devices = [worker_device(self.device_type, rank, self.rank_devices) for rank in self._sorted_ranks]
-        for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
+        for worker_id, device in zip(self.worker_ids, self._worker_devices, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
                 kwargs={
@@ -842,8 +823,8 @@ class Conductor:
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
-                    "device": worker_device(self.device_type, rank, self.rank_devices),
-                    "local_worker_devices": devices,
+                    "device": device,
+                    "local_worker_devices": self._worker_devices,
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,

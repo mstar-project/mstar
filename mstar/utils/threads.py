@@ -55,11 +55,23 @@ def _to_process_mask() -> None:
 
 class Thread(threading.Thread):
     """A ``threading.Thread`` that runs on the process mask, whatever its
-    creator's. Pass ``target``; a subclass overriding ``run`` skips this."""
+    creator's and whatever its ``run`` is: a target, an override that doesn't
+    call ``super().run()``, a mixin's. Wrapped at ``start`` so that calling
+    ``run`` directly stays on the caller's thread and mask."""
 
-    def run(self) -> None:
-        _to_process_mask()
-        super().run()
+    def start(self) -> None:
+        run = self.run
+
+        def on_process_mask() -> None:
+            try:
+                _to_process_mask()
+                run()
+            finally:
+                # as Thread.run drops its target: no cycle through the bound method
+                del self.run
+
+        self.run = on_process_mask
+        super().start()
 
 
 def _on_process_mask(initializer: Callable[..., object] | None) -> Callable[..., None]:

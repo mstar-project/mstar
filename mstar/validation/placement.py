@@ -143,7 +143,9 @@ def _walk_partitions(model: Model, walk_graphs: Mapping[str, GraphSection]) -> I
 
 def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[dict]) -> Iterator[str]:
     """A node of a walk in no node_group or in two (the later group silently
-    wins), and a node_group naming a walk the model does not define."""
+    wins), a node_group naming a walk the model does not define, and a rank no
+    walk runs on: the deployment starts a worker per rank ``node_groups`` names
+    (``deployment_workers``), and this one would have nothing to do."""
     for i, group in enumerate(node_groups):
         unknown = sorted(set(group.get("graph_walks", [])) - walk_graphs.keys())
         if unknown:
@@ -152,6 +154,7 @@ def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[d
                 f"graph_walks {unknown}, which this model does not define "
                 f"(walks: {sorted(walk_graphs)})."
             )
+    used_ranks = set()
     for walk, graph in walk_graphs.items():
         for node in graph.get_nodes():
             groups = [
@@ -159,6 +162,7 @@ def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[d
                 if node in group["node_names"]
                 and ("graph_walks" not in group or walk in group["graph_walks"])
             ]
+            used_ranks.update(rank for i in groups for rank in node_groups[i]["ranks"])
             if len(groups) != 1:
                 where = ", ".join(f"node_groups[{i}]" for i in groups) or "no node_groups entry"
                 yield (
@@ -166,6 +170,9 @@ def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[d
                     f"{where}; place it in exactly one node_groups entry for that walk "
                     "(use graph_walks to give one node different ranks per walk)."
                 )
+    idle = sorted({rank for group in node_groups for rank in group["ranks"]} - used_ranks)
+    if idle:
+        yield f"node_groups names ranks {idle}, but no node of any graph walk runs on them."
 
 
 def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:

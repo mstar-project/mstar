@@ -17,10 +17,13 @@ NUMA node, as sysfs lists them (every GPU of the host, not only the ones this
 process was given), so servers on different GPUs pick different CPUs without
 knowing about each other. A worker takes the core at its device's rank from the
 bottom of the node's allowed CPUs, the API server the core at its first
-device's rank from the top.
+device's rank from the top, so the cores a GPU picks from must hold two per GPU
+or ``auto`` pins nothing. Servers on one GPU can't be told apart that way, so
+the first holds a lock on it (``claim_gpus``) and the next pins nothing.
 """
 from __future__ import annotations
 
+import fcntl
 import math
 import os
 from collections.abc import Callable, Collection, Iterable, Sequence
@@ -31,6 +34,8 @@ from typing import NamedTuple
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _PCI_DEVICES = Path("/sys/bus/pci/devices")
 _CPU_TOPOLOGY = "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list"
+# not TMPDIR: every server on the host has to find the same file
+_GPU_LOCK_DIR = Path("/tmp")
 
 PINNABLE = hasattr(os, "sched_setaffinity")
 
@@ -315,63 +320,135 @@ def _explicit(first: int, n: int, mask: frozenset[int], cores: list[tuple[int, .
     return workers, result_core[0], f"{why}; the API server on the last core of the mask"
 
 
+class _Pool(NamedTuple):
+    """The cores some GPUs pick from. A GPU's worker takes the core at ``rank``
+    from the bottom and its API server the one at ``rank`` from the top, so
+    they need two cores per GPU to stay apart."""
+    cores: list[tuple[int, ...]]
+    rank: int
+    gpus: int
+    why: str
+
+
+def _gpu_pools(gpus, mask, cores, siblings) -> dict[str, _Pool]:
+    """Each host GPU's pool. A GPU with allowed CPUs on its node picks among
+    those by its rank on the node; the GPUs with none pick, by their rank among
+    themselves, from the cores those ranks leave."""
+    nodes: dict[str | None, list[HostGpu]] = {}
+    for gpu in gpus:
+        nodes.setdefault(gpu.node, []).append(gpu)
+    pools, claimed = {}, set()
+    for members in nodes.values():
+        local = _cores(members[0].local & mask, siblings) if members[0].local else []
+        if not local:
+            continue
+        count = len(members)
+        where = format_cpu_list(c for core in local for c in core)
+        for rank, gpu in enumerate(members):
+            pools[gpu.address] = _Pool(
+                local, rank, count, f"GPU {rank + 1} of {count} on its NUMA node, over its allowed CPUs {where}")
+        if len(local) >= 2 * count:
+            claimed.update(local[:count] + local[-count:])
+    spare = [core for core in cores if core not in claimed]
+    elsewhere = [gpu for gpu in gpus if gpu.address not in pools]
+    for rank, gpu in enumerate(elsewhere):
+        pools[gpu.address] = _Pool(
+            spare, rank, len(elsewhere),
+            f"no allowed CPU on its NUMA node, so GPU {rank + 1} of {len(elsewhere)} without one, over the cores "
+            "the node-local GPUs leave")
+    return pools
+
+
 def _auto(addresses, mask, cores, pci_root, siblings):
     """``(workers, result, why)``, or why nothing can be pinned."""
     if not cores or not addresses:
         return "no CPU or no worker to place"
     gpus = next((found for a in addresses if a and (found := host_gpus(a, pci_root))), [])
-    # a GPU with allowed CPUs on its node picks among those by its rank on the
-    # node; the cores those ranks take are left out for a GPU with none
-    nodes: dict[str | None, list[HostGpu]] = {}
-    for gpu in gpus:
-        nodes.setdefault(gpu.node, []).append(gpu)
-    local, claimed = {}, set()
-    for members in nodes.values():
-        pool = _cores(members[0].local & mask, siblings) if members[0].local else []
-        for rank, gpu in enumerate(members if pool else []):
-            local[gpu.address] = pool, rank, len(members)
-            claimed |= {pool[rank % len(pool)], pool[(len(pool) - 1 - rank) % len(pool)]}
-    spare = [core for core in cores if core not in claimed] or cores
-
-    def home(address):
-        """The cores a device's threads pick from, its rank among the GPUs
-        that pick from them, how many those are, and why."""
-        if address in local:
-            pool, rank, count = local[address]
-            return pool, rank, count, (
-                f"GPU {rank + 1} of {count} on its NUMA node, over its allowed CPUs "
-                f"{format_cpu_list(c for core in pool for c in core)}")
-        rank = next((i for i, gpu in enumerate(gpus) if gpu.address == address), None)
-        if rank is None:
-            return cores, 0, 1, "no sysfs entry for its device, so over the process mask"
-        return spare, rank, len(gpus), (
-            f"no allowed CPU on its NUMA node, so GPU {rank + 1} of {len(gpus)} on the host, over the "
-            "cores the node-local GPUs leave")
-
-    homes = [home(a) for a in addresses]
-    first, rank, _, why = homes[0]
-    result_core = first[(len(first) - 1 - rank) % len(first)]
+    pools = _gpu_pools(gpus, mask, cores, siblings)
+    unplaced = _Pool(cores, 0, 1, "no sysfs entry for its device, so over the process mask")
+    homes = [pools.get(a, unplaced) for a in addresses]
+    for home in homes:
+        if len(home.cores) < 2 * home.gpus:
+            return (f"{home.why}: {len(home.cores)} core(s) there for {home.gpus} GPU(s), and each needs two; "
+                    "widen the mask or name a CPU")
+    first = homes[0]
+    result_core = first.cores[len(first.cores) - 1 - first.rank]
     taken = {result_core}
     workers = []
-    for i, (pool, rank, gpus_here, why_i) in enumerate(homes):
-        # workers of this deployment on one device (a split config) step by
-        # the GPU count, so the next GPU's first worker keeps its core
+    for i, home in enumerate(homes):
+        # workers of this deployment on one device (a split config) step by the
+        # pool's GPU count, so each GPU's first worker keeps its core; the top
+        # ``gpus`` cores are those GPUs' API servers'
         nth = sum(a == addresses[i] for a in addresses[:i])
-        start = (rank + nth * gpus_here) % len(pool)
-        core = next((c for c in pool[start:] + pool[:start] if c not in taken), None)
-        if core is None:
-            core = next((c for c in cores if c not in taken), None)
-            why_i += "; none free there, so the first free core of the mask"
+        steps = home.cores[home.rank + nth * home.gpus:len(home.cores) - home.gpus]
+        core = next((c for c in steps if c not in taken), None)
         if core is None:
             return f"{len(addresses)} worker(s) and the API server need more cores than the mask has"
         taken.add(core)
-        workers.append(_step_cpus(core, f"auto: {why_i}"))
-    return workers, result_core[0], f"auto: {why} (the first worker's device), from the top"
+        workers.append(_step_cpus(core, f"auto: {home.why}"))
+    return workers, result_core[0], f"auto: {first.why} (the first worker's device), from the top"
 
 
-def device_addresses(indices: Sequence[int | None]) -> list[str | None]:
-    """The PCI address of each accelerator index (None for None, or where the
-    platform doesn't report one)."""
+def device_addresses(devices: Sequence[str]) -> list[str | None]:
+    """The PCI address of each worker's device (``cuda:1``); None for a CPU
+    worker, or where the platform doesn't report one."""
     from mstar.platforms import current_platform
 
-    return [None if i is None else current_platform.pci_address(i) for i in indices]
+    addresses: list[str | None] = []
+    for device in devices:
+        kind, _, index = device.partition(":")
+        addresses.append(current_platform.pci_address(int(index)) if index and kind != "cpu" else None)
+    return addresses
+
+
+def devices_plan(setting: str | int, devices: Sequence[str]) -> CpuPlan:
+    """``deployment_plan`` for the workers' device strings, in the conductor's
+    worker order: the same call in the API server and in every worker."""
+    addresses = device_addresses(devices) if setting == "auto" else [None] * len(devices)
+    return deployment_plan(setting, addresses)
+
+
+# ── one server per GPU ──────────────────────────────────────────────────────
+
+_gpu_locks: dict[str, int] = {}
+
+
+def _open_lock(path: Path) -> int:
+    try:
+        return os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except PermissionError:
+        # another user's file in a sticky directory refuses O_CREAT, and flock
+        # needs no write access
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+
+
+def claim_gpus(addresses: Iterable[str | None]) -> str | None:
+    """Hold a lock on each GPU for the life of this process; if one can't be
+    had, hold none of them and say why.
+
+    ``auto`` depends only on the PCI address and the mask, so two servers on
+    one GPU (two MIG instances report one address) would take the same CPUs.
+    The kernel drops an ``flock`` however the process exits, so a dead server
+    leaves nothing to clean up. The file is never unlinked: another process may
+    already hold an fd on this inode, and removing it would let a third lock a
+    different one. The lock only reaches servers that share ``_GPU_LOCK_DIR``.
+    """
+    taken: dict[str, int] = {}
+    refused = None
+    for address in sorted({a for a in addresses if a} - _gpu_locks.keys()):
+        path = _GPU_LOCK_DIR / f"mstar-gpu-{address}.lock"
+        fd = None
+        try:
+            fd = _open_lock(path)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            refused = f"another server holds GPU {address} (its lock is {path})"
+        except OSError as e:
+            refused = f"can't lock GPU {address}: {e}"
+        if refused is not None:
+            for held in [*taken.values(), *([] if fd is None else [fd])]:
+                os.close(held)
+            return refused
+        taken[address] = fd
+    _gpu_locks.update(taken)
+    return None
