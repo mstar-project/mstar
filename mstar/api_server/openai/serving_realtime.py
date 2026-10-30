@@ -88,7 +88,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
@@ -97,8 +97,10 @@ from mstar.api_server import media_io
 from mstar.api_server.openai import realtime_vad
 from mstar.api_server.openai._util import error_type, now, rid
 from mstar.api_server.openai.protocol import TranscriptionRequest
-from mstar.streaming.topology import Connection
 from mstar.utils.utf8_stream import Utf8Stream, decode_joined
+
+if TYPE_CHECKING:
+    from mstar.streaming.topology import Connection
 
 logger = logging.getLogger(__name__)
 
@@ -351,7 +353,7 @@ def _append_error(audio: np.ndarray, rate: int) -> dict | None:
     ``rate`` audio, or None."""
     if audio.size <= MAX_ITEM_SECONDS * rate:
         return None
-    return _error(f"an append holds at most {MAX_ITEM_SECONDS:g} s of audio; send it in shorter appends")
+    return error_event(f"an append holds at most {MAX_ITEM_SECONDS:g} s of audio; send it in shorter appends")
 
 
 def encode_audio(audio: np.ndarray, codec: str) -> str:
@@ -573,7 +575,7 @@ def server_event(kind: str, **fields) -> dict:
     return {"event_id": f"event_{uuid.uuid4().hex[:12]}", "type": kind, **fields}
 
 
-def _error(message: str, kind: str = "invalid_request_error", code: str | None = None) -> dict:
+def error_event(message: str, kind: str = "invalid_request_error", code: str | None = None) -> dict:
     error = {"type": kind, "message": message}
     if code is not None:
         error["code"] = code
@@ -604,17 +606,17 @@ async def _events(ws: WebSocket, send):
         if message["type"] == "websocket.disconnect":
             return
         if message.get("text") is None:
-            await send(_error("an event must be a JSON text message, not binary"))
+            await send(error_event("an event must be a JSON text message, not binary"))
             continue
         try:
             event = json.loads(message["text"])
         # ValueError covers JSONDecodeError and integers past Python's
         # int-string digit limit; RecursionError is deep nesting
         except (ValueError, RecursionError):
-            await send(_error("not JSON"))
+            await send(error_event("not JSON"))
             continue
         if not isinstance(event, dict):
-            await send(_error("an event must be a JSON object"))
+            await send(error_event("an event must be a JSON object"))
             continue
         yield event
 
@@ -672,7 +674,7 @@ class RealtimeTranscription:
             try:
                 self.update(_object(event.get("session"), "session"))
             except (TypeError, ValueError) as exc:
-                await self.send(_error(str(exc)))
+                await self.send(error_event(str(exc)))
                 return
             await self.send(server_event("transcription_session.updated", session=self._session_view()))
         elif kind == "input_audio_buffer.append":
@@ -681,14 +683,14 @@ class RealtimeTranscription:
                 # not `or ""`: a null is an error, not an empty append, on every realtime path
                 audio, odd_byte = decode_append(event.get("audio", ""), s.odd_byte, s.input_format.codec)
             except Exception:  # noqa: BLE001 — bad base64
-                await self.send(_error("audio is not base64", code="invalid_audio"))
+                await self.send(error_event("audio is not base64", code="invalid_audio"))
                 return
             if (error := _append_error(audio, s.input_format.rate)) is not None:
                 await self.send(error)
                 return
             # with server_vad the segmenter ends a turn at the cap instead
             if s.segmenter is None and s.item_samples(audio.size) > s.max_item_seconds * SAMPLE_RATE:
-                await self.send(_error(
+                await self.send(error_event(
                     f"the item would pass {s.max_item_seconds:g} s of audio; "
                     "commit or clear the input audio buffer first",
                 ))
@@ -729,7 +731,7 @@ class RealtimeTranscription:
             s.reset_stream()
             await self.send(server_event("input_audio_buffer.cleared"))
         else:
-            await self.send(_error(f"unknown event {_excerpt(kind)}"))
+            await self.send(error_event(f"unknown event {_excerpt(kind)}"))
 
     async def apply(self, ops: list[tuple]) -> None:
         """Carry out segmenter operations in order (see ``TurnSegmenter``).
@@ -765,7 +767,7 @@ class RealtimeTranscription:
         logger.error("realtime end-of-turn model failed (error id %s, session %s); semantic_vad turns now end "
                      "on silence alone", error_id, s.session_id, exc_info=exc)
         silence_s = realtime_vad.EAGERNESS[s.turn_detection.eagerness][2] / 1000
-        await self.send(_error(
+        await self.send(error_event(
             f"semantic_vad's end-of-turn model failed (error id {error_id}); this session's turns now end after "
             f"{silence_s:g} s of silence; send transcription_session.update to switch to server_vad",
             kind="server_error", code="end_of_turn_failed",
@@ -910,9 +912,9 @@ class RealtimeTranscription:
             )
         if client_error:
             message = _clip(_scrub_paths(detail, self.api.upload_dir))
-            await self.send(_error(message))
+            await self.send(error_event(message))
         else:
-            await self.send(_error(f"realtime step failed (error id {error_id})", kind="server_error"))
+            await self.send(error_event(f"realtime step failed (error id {error_id})", kind="server_error"))
 
     async def emit(self, text: str, hold: int) -> None:
         """Send the part of ``text`` past what was already sent, minus the
@@ -1052,10 +1054,10 @@ class RealtimeConversation:
             try:
                 ignored = self.update(_object(event.get("session"), "session"))
             except (TypeError, ValueError) as exc:
-                await self.send(_error(str(exc)))
+                await self.send(error_event(str(exc)))
                 return
             for message in ignored:
-                await self.send(_error(message, code="unsupported"))
+                await self.send(error_event(message, code="unsupported"))
             await self.send(server_event("session.updated", session=self._session_view()))
         elif kind == "input_audio_buffer.append":
             await self.append(event.get("audio", ""))
@@ -1072,10 +1074,10 @@ class RealtimeConversation:
         elif kind == "conversation.item.create":
             await self.create_item(event.get("item"))
         elif isinstance(kind, str) and kind in _UNSUPPORTED_EVENTS:
-            await self.send(_error(f"{kind} is not supported: this model decides when it speaks; keep streaming "
+            await self.send(error_event(f"{kind} is not supported: this model decides when it speaks; keep streaming "
                                    "input_audio_buffer.append", code="unsupported"))
         else:
-            await self.send(_error(f"unknown event {_excerpt(kind)}"))
+            await self.send(error_event(f"unknown event {_excerpt(kind)}"))
 
     def update(self, session: dict) -> list[str]:
         """Apply a session update. One that is malformed, or would change
@@ -1152,7 +1154,7 @@ class RealtimeConversation:
         content = item.get("content") if item.get("type") == "message" and item.get("role") == "user" else None
         if not content or not isinstance(content, list) or any(
                 not isinstance(part, dict) or part.get("type") != "input_audio" for part in content):
-            await self.send(_error("conversation.item.create takes only a user message of input_audio parts",
+            await self.send(error_event("conversation.item.create takes only a user message of input_audio parts",
                                    code="unsupported"))
             return
         if not await self.append(*(part.get("audio", "") for part in content)):
@@ -1174,7 +1176,7 @@ class RealtimeConversation:
                 # not `or ""`: a null is an error, not an empty append, on every realtime path
                 audio, odd_byte = decode_append(payload, odd_byte, self.input_format.codec)
             except Exception:  # noqa: BLE001 — bad base64
-                await self.send(_error("audio is not base64", code="invalid_audio"))
+                await self.send(error_event("audio is not base64", code="invalid_audio"))
                 return False
             pieces.append(audio)
         audio = pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
@@ -1211,7 +1213,7 @@ class RealtimeConversation:
                 error_id = uuid.uuid4().hex[:12]
                 logger.error("realtime append failed (error id %s, session %s)", error_id, self.session_id,
                              exc_info=exc)
-                await self.send(_error(f"the append failed (error id {error_id})", kind="server_error"))
+                await self.send(error_event(f"the append failed (error id {error_id})", kind="server_error"))
                 return False
 
     async def _clock(self) -> None:
@@ -1240,10 +1242,10 @@ class RealtimeConversation:
                 streaming=True, request_id=rid(f"rt-{self.session_id}"), end_input=False,
             )
         except HTTPException as exc:
-            await self.send(_error(str(exc.detail), kind=error_type(exc.status_code)))
+            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
             return False
         except ValueError as exc:
-            await self.send(_error(_clip(_scrub_paths(str(exc), self.api.upload_dir))))
+            await self.send(error_event(_clip(_scrub_paths(str(exc), self.api.upload_dir))))
             return False
         self.key = self.api.submission_key(self.request_id)
         # bound now, before anything else runs (see APIServer._bind)
@@ -1266,17 +1268,17 @@ class RealtimeConversation:
                 elif chunk.modality == "error":
                     http_status = int((chunk.metadata or {}).get("status") or 500)
                     message = bytes(chunk.data).decode("utf-8", "replace")
-                    await self.send(_error(_clip(_scrub_paths(message, self.api.upload_dir)),
+                    await self.send(error_event(_clip(_scrub_paths(message, self.api.upload_dir)),
                                            kind=error_type(http_status)))
                     status, code = "failed", 1011 if http_status >= 500 else 1000
         except HTTPException as exc:
-            await self.send(_error(str(exc.detail), kind=error_type(exc.status_code)))
+            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
             status, code = "failed", 1011
         except Exception as exc:  # noqa: BLE001 — the socket must still close
             error_id = uuid.uuid4().hex[:12]
             logger.error("realtime conversation failed (error id %s, session %s)", error_id, self.session_id,
                          exc_info=exc)
-            await self.send(_error(f"the call failed (error id {error_id})", kind="server_error"))
+            await self.send(error_event(f"the call failed (error id {error_id})", kind="server_error"))
             status, code = "failed", 1011
         # no more text will come: held audio goes to its reply, and a reply still open ends here
         while self.early:

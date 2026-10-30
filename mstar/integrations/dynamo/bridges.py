@@ -50,7 +50,13 @@ from mstar.api_server.openai.protocol import (
     VideoGenerationRequest,
 )
 from mstar.api_server.openai.serving_images import image_count
-from mstar.api_server.openai.serving_realtime import content_event, decode_base64, response_object, server_event
+from mstar.api_server.openai.serving_realtime import (
+    content_event,
+    decode_base64,
+    error_event,
+    response_object,
+    server_event,
+)
 from mstar.utils.generation_kwargs import offset_seed
 from mstar.utils.utf8_stream import Utf8Stream
 
@@ -568,10 +574,6 @@ class RealtimeBridge:
     def _committed(turn: _RealtimeTurn) -> dict:
         return server_event("input_audio_buffer.committed", previous_item_id=None, item_id=turn.item_id)
 
-    @staticmethod
-    def _error(message: str, *, etype: str = "server_error", code: str | None = None) -> dict:
-        return server_event("error", error={"type": etype, "code": code, "message": message})
-
     # -- utterance -> engine -------------------------------------------
 
     def _utterance_args(self, session, pcm: bytes) -> SubmitArgs:
@@ -676,7 +678,7 @@ class RealtimeBridge:
             raise
         except Exception as exc:  # noqa: BLE001 — engine failures travel in-band
             logger.exception("realtime turn %s failed", turn.response_id)
-            await events.put(self._error(str(exc), code="generation_error"))
+            await events.put(error_event(str(exc), kind="server_error", code="generation_error"))
             await events.put(server_event("response.done", response=response_object(
                 turn.response_id, "failed", modalities,
                 status_details={
@@ -736,18 +738,18 @@ class RealtimeBridge:
                             refused = f"unsupported input audio rate {fmt.get('rate')!r}; only 24000 is supported"
                         if refused:
                             # keep reading the audio as before, and echo that
-                            out_stream.put_nowait(self._error(
-                                refused, etype="invalid_request_error", code="unsupported_audio_format"))
+                            out_stream.put_nowait(error_event(
+                                refused, kind="invalid_request_error", code="unsupported_audio_format"))
                             kept = served_in.get("format") if isinstance(served_in, dict) else None
                             audio_in = {**audio_in, "format": kept or {"type": "audio/pcm", "rate": 24000}}
                             session = {**session, "audio": {**session["audio"], "input": audio_in}}
                         if isinstance(audio_in, dict) and audio_in.get("turn_detection") is not None:
                             # no server turn detection: say so, and echo the
                             # session as served rather than as asked
-                            out_stream.put_nowait(self._error(
+                            out_stream.put_nowait(error_event(
                                 "server turn detection is not supported; set audio.input.turn_detection "
                                 "to null and end each turn with input_audio_buffer.commit",
-                                etype="invalid_request_error",
+                                kind="invalid_request_error",
                                 code="unsupported_turn_detection"))
                             session = {**session, "audio": {**session["audio"],
                                                             "input": {**audio_in, "turn_detection": None}}}
@@ -758,26 +760,26 @@ class RealtimeBridge:
                             # joined in pcm, and a commit takes whole samples only
                             pcm.extend(decode_base64(event.get("audio", "")))
                         except Exception:  # noqa: BLE001 — refuse the malformed chunk, keep the session
-                            out_stream.put_nowait(self._error(
+                            out_stream.put_nowait(error_event(
                                 "audio is not base64",
-                                etype="invalid_request_error",
+                                kind="invalid_request_error",
                                 code="invalid_audio"))
                     elif etype == "input_audio_buffer.commit":
                         # whole samples only: an odd trailing byte waits for
                         # the rest of its sample in the next append
                         whole = len(pcm) - len(pcm) % 2
                         if not whole:
-                            out_stream.put_nowait(self._error(
+                            out_stream.put_nowait(error_event(
                                 "input audio buffer is empty",
-                                etype="invalid_request_error",
+                                kind="invalid_request_error",
                                 code="input_audio_buffer_commit_empty"))
                             continue
                         try:
                             args = self._utterance_args(session, bytes(pcm[:whole]))
                         except Exception as exc:  # noqa: BLE001 — keep the session usable
                             logger.exception("realtime: building the utterance request failed")
-                            out_stream.put_nowait(self._error(
-                                str(exc), etype="invalid_request_error"))
+                            out_stream.put_nowait(error_event(
+                                str(exc), kind="invalid_request_error"))
                             pcm = pcm[whole:]
                             continue
                         pcm = pcm[whole:]

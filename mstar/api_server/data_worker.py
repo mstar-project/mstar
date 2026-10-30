@@ -1059,6 +1059,7 @@ class PreprocessWorkerThread:
 
     @cached_property
     def _turn_tokens(self) -> tuple[int, int] | None:
+        # getattr: a thread may run with no model, or a stand-in without it
         return getattr(self.model, "turn_tokens", None)
 
     def _turn_metadata(self, ids: list[int], loop_indices: NestedLoopIndices | None) -> dict:
