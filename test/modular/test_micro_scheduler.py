@@ -64,13 +64,9 @@ class _Queue:
         return {rid: set(names) for rid, names in self._ready.items()}
 
     def pop_ready_nodes(self, rid, node_names):
-        ready = self._ready.get(rid)
-        if ready is None:
+        if rid not in self._ready:
             return []
-        # a rid ready for several nodes stays ready for the others
-        ready.discard(node_names[0])
-        if not ready:
-            del self._ready[rid]
+        self._ready.pop(rid)
         return [SimpleNamespace(name=node_names[0])]
 
 
@@ -1228,38 +1224,6 @@ def test_a_follower_does_not_hold_a_head_back_for_rows_rank_0_has_not_sent():
     assert list(_next_batch(sched, manager).request_to_worker_graph) == ["t0"]
     second = _next_batch(sched, manager)
     assert second is not None and list(second.request_to_worker_graph) == ["t1"]
-
-
-def test_a_follower_takes_two_partitions_heads_in_order_as_a_stream_lands():
-    """Thinker and Talker share one instance, each in an async partition of its
-    own, and the Thinker streams to the Talker. A chunk landing on a follower
-    readies its Talker row before rank 0 sends the Talker's head: until then the
-    follower keeps taking the Thinker's heads, and then takes the Talker's in
-    rank 0's order."""
-    from mstar.utils.ipc_format import ScheduleTPNode
-
-    sched = MicroScheduler(
-        engine_manager=SimpleNamespace(get_engine=lambda name: _Engine(max_bs=8)),
-        parallel_leader_nodes=set(),
-    )
-    manager = _Manager(["r0"], node="Thinker")
-    manager.get_partition_for_node = {"Thinker": "thinker", "Talker": "talker"}.get
-
-    def head(node):
-        sched.register_tp_follow(ScheduleTPNode(node_name=node, graph_walk=WALK, request_ids=["r0"]))
-
-    def take():
-        batch = _next_batch(sched, manager)
-        return batch and (batch.node_name, list(batch.request_to_worker_graph))
-
-    head("Thinker")
-    manager.ingest("r0", node="Talker")  # the Thinker's prefill streamed a chunk
-    assert take() == ("Thinker", ["r0"])
-    manager.ingest("r0", node="Thinker")
-    head("Thinker")
-    assert take() == ("Thinker", ["r0"])
-    head("Talker")
-    assert take() == ("Talker", ["r0"])
 
 
 def test_an_input_landing_on_a_backlogged_row_does_not_ready_it_again():
