@@ -266,11 +266,13 @@ async def create_message(api, model_name, adapter, body, raw_request=None):
 
 async def count_tokens(api, adapter, body) -> dict:
     """``input_tokens`` of the prompt a Messages request renders, by the
-    model's own prompt processing (chat template and tokenizer)."""
+    model's own prompt processing (chat template and tokenizer), called
+    with what the data worker passes it for the request."""
     req, _ = to_chat_request(body, counting=True)
     args = adapter.chat_to_request(req, api.upload_dir)
     tensors = await asyncio.to_thread(
-        api.model.process_prompt, args.text, args.input_modalities, args.output_modalities, **args.model_kwargs)
+        api.model.process_prompt, args.text, args.input_modalities, args.output_modalities,
+        prompt_parts=args.prompt_parts, **args.model_kwargs)
     if isinstance(tensors, ProcessPromptOutput):  # a model that lays out its KV, both GLMs
         tensors = tensors.new_input_tensors
     return {"input_tokens": sum(t.numel() for t in tensors.get("text_inputs", []))}

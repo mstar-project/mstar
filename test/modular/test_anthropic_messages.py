@@ -324,3 +324,31 @@ def test_count_tokens_renders_the_prompt_the_model_would_get(client_and_stub):
     r = client.post("/v1/messages/count_tokens", json={"messages": [{"role": "user", "content": "hi"}],
                                                         "max_tokens": 5})
     assert r.status_code == 400 and "max_tokens" in r.json()["error"]["message"]
+
+
+def test_count_tokens_renders_the_prompt_as_the_request_does(client_and_stub):
+    """process_prompt gets what the data worker passes it for the request itself, the
+    prompt's parts (each turn's role) included: a model that renders the chat from them
+    counted the turns joined into one user turn."""
+    import torch
+
+    client, stub = client_and_stub
+    calls = []
+
+    def process_prompt(text, input_modalities, output_modalities, **kw):
+        calls.append(((text, input_modalities, output_modalities), kw))
+        return {"text_inputs": [torch.zeros(3, dtype=torch.long)]}
+
+    stub.model.process_prompt = process_prompt
+    body = {"system": "Be brief.", "messages": [{"role": "user", "content": "hi"},
+                                                {"role": "assistant", "content": "Hello."},
+                                                {"role": "user", "content": "bye"}]}
+    assert client.post("/v1/messages/count_tokens", json=body).json() == {"input_tokens": 3}
+    assert client.post("/v1/messages", json={**body, "model": "glm-5.2", "max_tokens": 8}).status_code == 200
+    ((args, kw),) = calls
+    sent = stub.last_submit
+    assert args == (sent["text"], sent["input_modalities"], sent["output_modalities"])
+    assert kw.pop("prompt_parts") == sent["prompt_parts"]
+    assert [p.role for p in sent["prompt_parts"]] == ["system", "user", "assistant", "user"]
+    # and every model kwarg the request renders with: all but its token budget
+    assert kw == {k: v for k, v in sent["model_kwargs"].items() if k != "max_output_tokens"}
