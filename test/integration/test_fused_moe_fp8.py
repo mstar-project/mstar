@@ -166,3 +166,30 @@ def test_int64_ids_align_as_int32_ids_do(num_tokens):
         return sorted((expert * 10**6 + sorted_ids[:n].to(torch.int64)).tolist())
 
     assert pairs(got[0], got[1]) == pairs(want[0], want[1])
+
+
+@pytest.mark.parametrize("num_tokens,num_experts", [(1, 128), (8, 128), (32, 128), (511, 128), (32, 256),
+                                                    (520, 128)])
+def test_align_one_and_two_kernel_paths_agree_with_the_torch_reference(num_tokens, num_experts):
+    """Below 4096 slots the alignment runs as one kernel, above as two; both match the torch
+    fallback (as sets within each expert's span: the scatter is atomics-ordered)."""
+    from mstar.utils.fused_moe import align
+
+    torch.manual_seed(num_tokens)
+    ids = torch.stack([torch.randperm(num_experts, device=DEVICE)[:8] for _ in range(num_tokens)])
+    ids[0, 0] = num_experts  # a skipped slot (the EP sentinel)
+    got = align.moe_align_block_size(ids, 16, num_experts)
+    n_pad = ids.numel() + num_experts * 15
+    want = (torch.empty(n_pad, dtype=torch.int32, device=DEVICE),
+            torch.empty(-(-n_pad // 16), dtype=torch.int32, device=DEVICE),
+            torch.empty(1, dtype=torch.int32, device=DEVICE))
+    align._moe_align_block_size_torch(ids, 16, num_experts, *want)
+    assert torch.equal(got[1], want[1]) and torch.equal(got[2], want[2])
+    n = int(want[2])
+    assert torch.equal(got[0][n:], want[0][n:])
+
+    def pairs(sorted_ids, expert_ids):
+        expert = expert_ids[torch.arange(n, device=DEVICE) // 16].to(torch.int64)
+        return sorted((expert * 10**6 + sorted_ids[:n].to(torch.int64)).tolist())
+
+    assert pairs(got[0], got[1]) == pairs(want[0], want[1])
