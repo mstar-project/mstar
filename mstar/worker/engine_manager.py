@@ -8,10 +8,10 @@ from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
-from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
+from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs
+from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -117,12 +117,11 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
-        specs = model.get_node_resources()
-        apply_yaml_overrides(specs, model_config)
+        specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
         # autocast for a model that pinned its numerics (see node_dtype)
-        autocast_dtype = resolve_model_dtype(model, model_config)
+        autocast_dtype = parse_autocast_dtype(resolve_model_dtype(model, model_config))
 
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before

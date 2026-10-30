@@ -42,6 +42,7 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
                 model_kwargs=model_kwargs,
                 streaming=False,
                 request_id=request_id,
+                model=req.model,
             )
         except BaseException:
             release_unread(api, request_ids, 0)
@@ -79,6 +80,7 @@ async def create_image_edit(
     image_bytes,
     image_filename,
     model_kwargs,
+    requested_model=None,
     raw_request=None,
 ):  # noqa: ARG001
     # Persist the uploaded image so the model's loader can read it by path
@@ -108,6 +110,7 @@ async def create_image_edit(
             model_kwargs=args.model_kwargs,
             streaming=False,
             request_id=request_id,
+            model=requested_model,
         )
         chunks = await api.collect_results(request_id, raw_request)
     finally:

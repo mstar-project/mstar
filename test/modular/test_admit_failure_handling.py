@@ -475,7 +475,7 @@ class _EvictingWorker(_HoldingWorker):
         self.eviction_policy = SimpleNamespace(value="lru")
         self._last_active = {(rid, SCHED_NODE): float(i) for i, rid in enumerate(holders)}
         engine = SimpleNamespace(
-            evictable=lambda node: True,
+            evictable=lambda node, resources=None: True,
             is_offloaded=lambda node, rid: rid in self.offloaded,
             reclaimable=lambda node, rid, resources: rid in holders,
             offload_request=lambda node, rid, affected_resources=None: self.offloaded.append(rid) or 12,

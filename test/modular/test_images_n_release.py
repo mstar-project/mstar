@@ -86,7 +86,7 @@ _ADAPTER = SimpleNamespace(
 
 
 def _create(api, n, raw_request=None):
-    return create_images(api, "model", _ADAPTER, SimpleNamespace(n=n), raw_request)
+    return create_images(api, "model", _ADAPTER, SimpleNamespace(n=n, model=None), raw_request)
 
 
 def _assert_nothing_left(api, engine, *, aborted, reads_done):

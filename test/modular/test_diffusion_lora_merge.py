@@ -16,13 +16,12 @@ from torch import nn
 
 sys.path.insert(0, ".")
 
-from mstar.model.components.diffusion.lora import (  # noqa: E402
-    LoraSpec,
-    apply_loras,
-    merge_lora,
+from mstar.engine.resources.lora.checkpoint import (  # noqa: E402
+    LoraFile,
     normalize_lora_state_dict,
     sidecar_default_alpha,
 )
+from mstar.model.components.diffusion.lora import apply_loras, merge_lora  # noqa: E402
 from mstar.model.components.linear import FusedColumnLinear  # noqa: E402
 from mstar.model.loader.base import StackedParamRule  # noqa: E402
 
@@ -128,7 +127,6 @@ def test_kohya_names_alpha_and_scale(model):
         "base_model.model.transformer_blocks.0.attn.to_k.lora_down.weight": a,
         "base_model.model.transformer_blocks.0.attn.to_k.lora_up.weight": b,
         "base_model.model.transformer_blocks.0.attn.to_k.alpha": torch.tensor(8.0),
-        "base_model.model.transformer_blocks.0.attn.to_k.dora_scale": torch.ones(DIM),  # ignored
     }
     adapter = normalize_lora_state_dict(sd)
     assert adapter.layers["transformer_blocks.0.attn.to_k"][2] == 8.0
@@ -172,7 +170,7 @@ def test_apply_loras_stacks_adapters_in_order(model, tmp_path):
     save_file({key.format("A"): a2, key.format("B"): b2}, p2)
 
     before = model.blocks[0].out.weight.detach().clone()
-    apply_loras(model, [LoraSpec.parse(str(p1)), LoraSpec.parse({"path": str(p2), "scale": 0.25})], remap, RULES)
+    apply_loras(model, [LoraFile.parse(str(p1)), LoraFile.parse({"path": str(p2), "scale": 0.25})], remap, RULES)
     # Each adapter rounds once: the second merge starts from the first's bf16 result.
     ref = expected(expected(before, a1, b1, 1.0), a2, b2, 0.25)
     torch.testing.assert_close(model.blocks[0].out.weight, ref, rtol=0, atol=0)
@@ -238,7 +236,7 @@ def test_sidecar_config_sets_the_default_alpha_like_peft(model, tmp_path):
         rule = sidecar_default_alpha(str(d / "pytorch_lora_weights.safetensors"))
         assert (rule is None) == (name == "none")
         before = model.blocks[0].out.weight.detach().clone()
-        apply_loras(model, [LoraSpec.parse(str(d / "pytorch_lora_weights.safetensors"))], remap, RULES)
+        apply_loras(model, [LoraFile.parse(str(d / "pytorch_lora_weights.safetensors"))], remap, RULES)
         torch.testing.assert_close(model.blocks[0].out.weight, expected(before, a, b, factor), rtol=0, atol=0)
     # an explicit alpha key in the weights still wins over the sidecar
     d = tmp_path / "explicit"
@@ -246,5 +244,5 @@ def test_sidecar_config_sets_the_default_alpha_like_peft(model, tmp_path):
     (d / "config.json").write_text(json.dumps({"lora_alpha": 2 * RANK, "use_rslora": True}))
     save_file({**weights, "transformer_blocks.0.attn.to_out.0.alpha": torch.tensor(float(RANK))}, d / "w.safetensors")
     before = model.blocks[0].out.weight.detach().clone()
-    apply_loras(model, [LoraSpec.parse(str(d / "w.safetensors"))], remap, RULES)
+    apply_loras(model, [LoraFile.parse(str(d / "w.safetensors"))], remap, RULES)
     torch.testing.assert_close(model.blocks[0].out.weight, expected(before, a, b, 1.0), rtol=0, atol=0)

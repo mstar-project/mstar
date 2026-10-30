@@ -27,6 +27,8 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources.lora.config import LoraBaseOnly
+from mstar.engine.resources.step import PIECEWISE_WALK
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
@@ -762,21 +764,28 @@ class AcceleratorGraphRunner:
     def _get_slot_specs(self) -> list[CGSlotSpec]:
         specs = []
         for config_idx, config in enumerate(self._capture_configs):
+            keys = [config.additional_key_info]
+            if getattr(self._submodule, "lora_keys", ()):
+                # a node serving adapters also captures each bucket for steps with no
+                # adapter row, recording no LoRA kernel (see `LoraBaseOnly`); the two
+                # share the config's compiled forward, static buffers and padding rows
+                keys.append(LoraBaseOnly(config.additional_key_info))
             for bs in self._batch_sizes(config):
                 for num_tokens in config.get_total_tokens(bs):
-                    bucket = BucketKey(
-                        graph_walk=config.capture_graph_walk,
-                        cg_key_info=config.additional_key_info,
-                        bs=bs,
-                        num_tokens=num_tokens,
-                    )
-                    for slot in range(self._num_slots):
-                        specs.append(CGSlotSpec(
-                            bucket=bucket,
-                            slot=slot,
-                            config=config,
-                            config_idx=config_idx,
-                        ))
+                    for key in keys:
+                        bucket = BucketKey(
+                            graph_walk=config.capture_graph_walk,
+                            cg_key_info=key,
+                            bs=bs,
+                            num_tokens=num_tokens,
+                        )
+                        for slot in range(self._num_slots):
+                            specs.append(CGSlotSpec(
+                                bucket=bucket,
+                                slot=slot,
+                                config=config,
+                                config_idx=config_idx,
+                            ))
         return specs
 
     def _get_addtl_slot_specs(self, spec: CGSlotSpec) -> list[CGSlotSpec]:
@@ -1569,8 +1578,8 @@ class AcceleratorGraphRunner:
 # Piecewise buckets share the resources' (bucket, slot, label) buffer space
 # with the full-forward captures. They never coexist on one node — a forward
 # either replays whole or runs eager around captured regions — so the walk name
-# below plus the region's label is enough to keep the keys apart.
-PIECEWISE_WALK = "__piecewise__"
+# (`PIECEWISE_WALK`, defined beside `StepContext`) plus the region's label is
+# enough to keep the keys apart.
 
 
 @dataclass

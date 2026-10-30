@@ -18,6 +18,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -34,6 +35,9 @@ from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.lora.config import LoraSpec
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -426,6 +430,52 @@ class ForwardPassArgs:
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
 
+def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment's YAML turns on, before its ``resources:``
+    overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
+    (``mstar.engine.resources.lora.serving``)."""
+    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+
+    specs = list(model.get_node_resources() or [])
+    lora = declared_lora_specs(model, model_config)
+    size_lora_specs(lora, model_config)
+    return specs + lora
+
+
+def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
+    """The specs a deployment builds of its ``enabled_resources``, the YAML's overrides
+    applied: all but a LoRA spec the YAML's ``targets`` left with none."""
+    from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
+
+    return drop_lora_specs_without_targets(specs)
+
+
+def parse_autocast_dtype(value) -> torch.dtype | None:
+    """The serving YAML's ``autocast_dtype``, spelled as a string (``float16``). ``null``
+    stays None, as the serving config passed it before dtypes were parsed."""
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    dtype = getattr(torch, str(value).removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"autocast_dtype {value!r} is not a torch dtype (e.g. bfloat16, float16)")
+    return dtype
+
+
+def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment builds: ``enabled_resources``, the YAML's
+    ``resources:`` overrides applied, as ``built_resources``.
+
+    Every process that reads specs resolves them here, so the conductor validates
+    requests against what the workers built. ``validate_deployment`` takes the same
+    steps, reporting every problem rather than the first.
+    """
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = enabled_resources(model, model_config)
+    apply_yaml_overrides(specs, model_config)
+    return built_resources(specs)
+
+
 class Model(ABC):
     # Inputs consumed by process_prompt (tokenized or placed on tensor edges).
     # Retain them locally for postprocessing, but do not send the original
@@ -441,7 +491,7 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache")
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", LORA_ADAPTER_KWARG)
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -579,6 +629,21 @@ class Model(ABC):
         hands each node the subset naming it.
         """
         pass
+
+    def get_lora_specs(self) -> list["LoraSpec"]:
+        """The per-request LoRA adapters this model can serve: a spec per node they
+        reach (none for a model that serves none), the first keyed
+        ``LORA_RESOURCE_KEY`` and the others apart (an LLM's and its vision encoder's),
+        and the conductor opens a request with the same adapter on each.
+
+        Built only when the deployment's YAML has a ``resources: lora:`` block (see
+        ``serving_resources``): a deployment without one builds exactly what it did
+        before. The node declares its rows in ``declare_step`` (a ``LoraStep`` under each
+        pool's key) and adds each target's delta (``LoraAdapterPool.layer_delta``). The
+        conductor opens each request with a ``LoraReqConfig`` from the ``lora_adapter``
+        kwarg.
+        """
+        return []
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.

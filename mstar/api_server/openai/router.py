@@ -104,8 +104,15 @@ def _resolve(require: str):
 @router.get("/v1/models")
 async def list_models():
     api = _api()
-    name = api.model_name if api is not None else "unknown"
-    return JSONResponse(ModelList(data=[ModelCard(id=name, created=now())]).model_dump())
+    if api is None:
+        return JSONResponse(ModelList(data=[ModelCard(id="unknown", created=now())]).model_dump())
+    created = now()
+    # served LoRA adapters beside the base model, each naming it as its parent (vLLM's shape)
+    cards = [ModelCard(id=api.model_name, created=created)] + [
+        ModelCard(id=name, created=created, parent=api.model_name)
+        for name in api.served_models.adapters
+    ]
+    return JSONResponse(ModelList(data=cards).model_dump(exclude_none=True))
 
 
 @router.post("/v1/chat/completions")
@@ -266,6 +273,7 @@ async def images_edits(request: Request):
             image_bytes=image_bytes,
             image_filename=getattr(image, "filename", None),
             model_kwargs=extra,
+            requested_model=form.get("model"),
             raw_request=request,
         )
     except Exception as e:  # noqa: BLE001

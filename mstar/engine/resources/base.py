@@ -60,6 +60,9 @@ class EngineResourceInfo:
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
+    # the dtype this resource's nodes compute in (their autocast dtype); None when they
+    # disagree or run outside autocast
+    compute_dtype: torch.dtype | None = None
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
     # this resource's local nodes

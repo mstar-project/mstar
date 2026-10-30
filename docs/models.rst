@@ -1476,3 +1476,5 @@ own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha
 ``use_rslora``) of an ``adapter_config.json`` / ``config.json`` next to them, else ``alpha = r``;
 ``scale`` multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers'
 fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
+A DoRA adapter (PEFT's ``lora_magnitude_vector`` or Kohya's ``dora_scale``) is refused,
+since its magnitudes would be dropped from the merge.
