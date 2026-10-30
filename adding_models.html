@@ -381,6 +381,7 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
@@ -883,9 +884,6 @@ the inputs for that walk, and whether the request is finished
 (<code class="docutils literal notranslate"><span class="pre">request_done=True</span></code>). A simple prefill-decode model sets <code class="docutils literal notranslate"><span class="pre">is_prefill</span></code> to false
 once, then repeats the decode walk until EOS.</p>
 </dd>
-<dt><code class="docutils literal notranslate"><span class="pre">postprocess(self,</span> <span class="pre">output,</span> <span class="pre">modality)</span> <span class="pre">-&gt;</span> <span class="pre">bytes</span></code></dt><dd><p>Encode a finished output tensor to bytes for the client: <code class="docutils literal notranslate"><span class="pre">utf-8</span></code> for text, PNG for
-images, raw PCM for audio, and so on.</p>
-</dd>
 <dt><code class="docutils literal notranslate"><span class="pre">get_submodule(self,</span> <span class="pre">node_name,</span> <span class="pre">device=&quot;cpu&quot;,</span> <span class="pre">tp_group=None,</span> <span class="pre">autocast_dtype=None,</span> <span class="pre">sp_group=None,</span> <span class="pre">moe_parallel=None)</span> <span class="pre">-&gt;</span> <span class="pre">NodeSubmodule</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Build and return the <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> for <code class="docutils literal notranslate"><span class="pre">node_name</span></code>, and cache the result. Load
 weights here, on <code class="docutils literal notranslate"><span class="pre">device</span></code>. Return <code class="docutils literal notranslate"><span class="pre">None</span></code> for dummy mode.</p>
 <p><code class="docutils literal notranslate"><span class="pre">tp_group</span></code> and <code class="docutils literal notranslate"><span class="pre">sp_group</span></code> are the node’s tensor-parallel and sequence-parallel
@@ -938,10 +936,31 @@ such facts under their own key: LTX-2.5 nests the request’s geometry under
 <code class="docutils literal notranslate"><span class="pre">kwargs[&quot;request&quot;]</span></code>, since its stage-1 walk sends a half-size <code class="docutils literal notranslate"><span class="pre">height</span></code>.</p>
 </div>
 <p>The following methods have defaults and are optional to override:
+<code class="docutils literal notranslate"><span class="pre">text_output</span></code>, <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> and <code class="docutils literal notranslate"><span class="pre">postprocess_inline</span></code> (described next),
 <code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code> (described below), <code class="docutils literal notranslate"><span class="pre">get_sampling_config</span></code>,
 <code class="docutils literal notranslate"><span class="pre">get_max_output_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">get_autocast_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">load_image</span></code>, <code class="docutils literal notranslate"><span class="pre">load_audio</span></code>,
-<code class="docutils literal notranslate"><span class="pre">load_video</span></code>, and the partition methods described at the end of this page.
-<code class="docutils literal notranslate"><span class="pre">Model.nodes</span></code> is a read-only property. It returns the sorted set of node names that
+<code class="docutils literal notranslate"><span class="pre">load_video</span></code>, and the partition methods described at the end of this page.</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">text_output(self)</span> <span class="pre">-&gt;</span> <span class="pre">TextOutput</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
+end a reply, which are dropped unless the request sets <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>.
+<code class="docutils literal notranslate"><span class="pre">postprocess</span></code> and <code class="docutils literal notranslate"><span class="pre">postprocess_inline</span></code> derive their text paths from it. A text
+chunk may end inside a character, since the API server joins a request’s text
+chunks before decoding them, so a byte-level BPE model should declare
+<code class="docutils literal notranslate"><span class="pre">mstar.model.utils.TextChunkDetokenizer</span></code> (or <code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer</span></code>), which
+emits each token’s raw bytes, rather than <code class="docutils literal notranslate"><span class="pre">tokenizer.decode([id])</span></code>, which turns
+a split character into U+FFFD.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">postprocess(self,</span> <span class="pre">output,</span> <span class="pre">modality,</span> <span class="pre">request_kwargs=None)</span> <span class="pre">-&gt;</span> <span class="pre">bytes</span></code></dt><dd><p>Encode a finished output tensor to bytes for the client: <code class="docutils literal notranslate"><span class="pre">utf-8</span></code> for text, PNG for
+images, raw PCM for audio, and so on. Override it for any modality other than
+text, and hand text to <code class="docutils literal notranslate"><span class="pre">super().postprocess</span></code>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">postprocess_inline(self,</span> <span class="pre">values,</span> <span class="pre">modality,</span> <span class="pre">request_kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">list[bytes]</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">postprocess</span></code> for one decode step’s inline values (one sampled token id per
+request), called once per step. With <code class="docutils literal notranslate"><span class="pre">text_output</span></code> declared, each id maps to
+its memoized bytes; otherwise each value goes through <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> as a
+one-element tensor.</p>
+</dd>
+</dl>
+<p><code class="docutils literal notranslate"><span class="pre">Model.nodes</span></code> is a read-only property. It returns the sorted set of node names that
 appear in any graph walk.</p>
 <section id="per-request-resource-parameters">
 <h3>Per-request resource parameters<a class="headerlink" href="#per-request-resource-parameters" title="Link to this heading">#</a></h3>

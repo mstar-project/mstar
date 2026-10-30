@@ -735,6 +735,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
@@ -1827,6 +1828,11 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># eviction OVER-cautious (skip a sweep), never unsafe.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_reads_active</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="k">try</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">any</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">tensor_info</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">graph_edges</span><span class="p">):</span>
+                <span class="c1"># signal-only edges: no stream context to pay for, but the</span>
+                <span class="c1"># (time-gated) sweep of dead peers' segments still runs here</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_evict_dead_peers</span><span class="p">()</span>
+                <span class="k">return</span> <span class="p">[]</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_start_read_tensors</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">,</span>
                                             <span class="n">graph_walk</span><span class="p">)</span>
         <span class="k">finally</span><span class="p">:</span>

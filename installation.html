@@ -382,6 +382,7 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
@@ -1223,6 +1224,10 @@ mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class=
 <span class="c1"># or, with an explicit config: mstar-serve --config &lt;model.yaml&gt; --rust-frontend</span>
 </pre></div>
 </div>
+<p>Use it when benchmarking or tuning streaming throughput: its output path costs
+about 8 µs of API-server CPU per streamed token against 18 µs for the Python
+frontend (<code class="docutils literal notranslate"><span class="pre">benchmark/api_output_path</span></code>), so at high token rates the Python
+frontend, not the model, can be the limit.</p>
 <p>The binary is resolved via <code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code> /
 the environment’s scripts directory / <code class="docutils literal notranslate"><span class="pre">$PATH</span></code> / the in-repo build. Its knobs
 are listed in <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>.</p>

@@ -735,6 +735,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
@@ -977,10 +978,12 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    frontend -&gt; bridge:  {t:"submit", rid, sub, text, file_paths,</span>
 <span class="sd">                          input_modalities, output_modalities, model_kwargs,</span>
-<span class="sd">                          prompt_parts, streaming} | {t:"abort", rid, sub}</span>
+<span class="sd">                          prompt_parts, streaming, accepts_chunks}</span>
+<span class="sd">                       | {t:"abort", rid, sub}</span>
 <span class="sd">                       | {t:"ping", rid, sub}</span>
 <span class="sd">                       | {t:"metrics", rid, sub, refusals:{route, status, count}}</span>
 <span class="sd">    bridge -&gt; frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}</span>
+<span class="sd">                       | {t:"chunks", subs, modalities, payloads(bin), metadatas}</span>
 <span class="sd">                       | {t:"err", rid, sub, msg} | {t:"done", rid, sub}</span>
 <span class="sd">                       | {t:"pong", rid, sub}</span>
 <span class="sd">                       | {t:"metrics", rid, sub, data(bin), metadata}</span>
@@ -991,6 +994,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">serves on the Python frontend: the text rendered from ``APIServer.metrics``</span>
 <span class="sd">with its ``content_type`` in ``metadata``, or empty ``metadata`` when metrics</span>
 <span class="sd">are off (a 404; the counts are then ignored).</span>
+
+<span class="sd">``chunks`` carries many submissions' chunks as parallel lists, in order:</span>
+<span class="sd">the API server's message thread hands the bridge every chunk it drained in</span>
+<span class="sd">one pass (``APIServer.relay_chunks_to``), so a decode step costs one message</span>
+<span class="sd">rather than one per request. Only a submit that sets ``accepts_chunks`` gets</span>
+<span class="sd">them, so a frontend binary older than this bridge still gets ``chunk``s. A</span>
+<span class="sd">submission's error chunk, and anything its handler finds unrelayed at the</span>
+<span class="sd">end, always goes out as ``chunk``.</span>
 
 <span class="sd">``sub`` names one submission and is never reused. A client may resubmit its</span>
 <span class="sd">``rid`` as soon as it drops a stream, and that stream's ``done`` or late</span>
@@ -1125,6 +1136,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="c1"># sub -&gt; its submission's key, until its relay ends.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_keys</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># set by _serve; the API server's message thread schedules relay() on it</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="p">:</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">AbstractEventLoop</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># -- outbound ----------------------------------------------------------</span>
 
@@ -1133,6 +1146,18 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_err</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">sub</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">detail</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"err"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">rid</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">sub</span><span class="p">,</span> <span class="s2">"msg"</span><span class="p">:</span> <span class="n">detail</span><span class="p">})</span>
+
+<div class="viewcode-block" id="RustFrontendBridge.relay">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.RustFrontendBridge.relay">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">relay</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tags</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">chunks</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``ChunkSink.relay``: one ``chunks`` message for a message pass."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span>
+            <span class="s2">"t"</span><span class="p">:</span> <span class="s2">"chunks"</span><span class="p">,</span> <span class="s2">"subs"</span><span class="p">:</span> <span class="n">tags</span><span class="p">,</span>
+            <span class="s2">"modalities"</span><span class="p">:</span> <span class="p">[</span><span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span><span class="p">],</span>
+            <span class="s2">"payloads"</span><span class="p">:</span> <span class="p">[</span><span class="nb">bytes</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span><span class="p">],</span>
+            <span class="s2">"metadatas"</span><span class="p">:</span> <span class="p">[</span><span class="n">c</span><span class="o">.</span><span class="n">metadata</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span><span class="p">],</span>
+        <span class="p">})</span></div>
+
 
     <span class="c1"># -- request lifecycle ---------------------------------------------------</span>
 
@@ -1185,7 +1210,9 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span>
         <span class="c1"># Bound to this submission now, not when the task first runs: a later</span>
         <span class="c1"># submit in the same receive batch may reuse the rid.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_keys</span><span class="p">[</span><span class="n">sub</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">submission_key</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys</span><span class="p">[</span><span class="n">sub</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">submission_key</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"accepts_chunks"</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">relay_chunks_to</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="bp">self</span><span class="p">,</span> <span class="n">sub</span><span class="p">)</span>
         <span class="n">chunks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="n">asyncio</span><span class="o">.</span><span class="n">get_running_loop</span><span class="p">()</span><span class="o">.</span><span class="n">create_task</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_relay</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="n">chunks</span><span class="p">))</span>
 
@@ -1252,7 +1279,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_serve</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Rust-frontend bridge serving"</span><span class="p">)</span>
-        <span class="n">loop</span> <span class="o">=</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">get_running_loop</span><span class="p">()</span>
+        <span class="n">loop</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop</span> <span class="o">=</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">get_running_loop</span><span class="p">()</span>
         <span class="c1"># Blocking receive on an executor thread: the wait happens inside the</span>
         <span class="c1"># transport (GIL released), so an arriving submit is picked up</span>
         <span class="c1"># immediately instead of on the next tick of a sleep/poll loop — and</span>

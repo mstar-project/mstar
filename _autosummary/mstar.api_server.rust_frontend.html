@@ -382,6 +382,7 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
@@ -678,6 +679,8 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.BRIDGE_RECV_WAIT_S"><code class="docutils literal notranslate"><span class="pre">BRIDGE_RECV_WAIT_S</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.OPENAI_ADAPTER_ENV"><code class="docutils literal notranslate"><span class="pre">OPENAI_ADAPTER_ENV</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.loop"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.loop</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.relay"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.relay()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.run"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.stop"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.stop()</span></code></a></li>
 </ul>
@@ -709,14 +712,16 @@ protocol are untouched):</p>
 <div><dl>
 <dt>frontend -&gt; bridge:  {t:”submit”, rid, sub, text, file_paths,</dt><dd><blockquote>
 <div><p>input_modalities, output_modalities, model_kwargs,
-prompt_parts, streaming} | {t:”abort”, rid, sub}</p>
+prompt_parts, streaming, accepts_chunks}</p>
 </div></blockquote>
 <div class="line-block">
+<div class="line">{t:”abort”, rid, sub}</div>
 <div class="line">{t:”ping”, rid, sub}</div>
 <div class="line">{t:”metrics”, rid, sub, refusals:{route, status, count}}</div>
 </div>
 </dd>
 <dt>bridge -&gt; frontend:  {t:”chunk”, rid, sub, modality, data(bin), metadata}</dt><dd><div class="line-block">
+<div class="line">{t:”chunks”, subs, modalities, payloads(bin), metadatas}</div>
 <div class="line">{t:”err”, rid, sub, msg} | {t:”done”, rid, sub}</div>
 <div class="line">{t:”pong”, rid, sub}</div>
 <div class="line">{t:”metrics”, rid, sub, data(bin), metadata}</div>
@@ -730,6 +735,13 @@ exports as <code class="docutils literal notranslate"><span class="pre">mstar_ht
 serves on the Python frontend: the text rendered from <code class="docutils literal notranslate"><span class="pre">APIServer.metrics</span></code>
 with its <code class="docutils literal notranslate"><span class="pre">content_type</span></code> in <code class="docutils literal notranslate"><span class="pre">metadata</span></code>, or empty <code class="docutils literal notranslate"><span class="pre">metadata</span></code> when metrics
 are off (a 404; the counts are then ignored).</p>
+<p><code class="docutils literal notranslate"><span class="pre">chunks</span></code> carries many submissions’ chunks as parallel lists, in order:
+the API server’s message thread hands the bridge every chunk it drained in
+one pass (<code class="docutils literal notranslate"><span class="pre">APIServer.relay_chunks_to</span></code>), so a decode step costs one message
+rather than one per request. Only a submit that sets <code class="docutils literal notranslate"><span class="pre">accepts_chunks</span></code> gets
+them, so a frontend binary older than this bridge still gets <code class="docutils literal notranslate"><span class="pre">chunk``s.</span> <span class="pre">A</span>
+<span class="pre">submission's</span> <span class="pre">error</span> <span class="pre">chunk,</span> <span class="pre">and</span> <span class="pre">anything</span> <span class="pre">its</span> <span class="pre">handler</span> <span class="pre">finds</span> <span class="pre">unrelayed</span> <span class="pre">at</span> <span class="pre">the</span>
+<span class="pre">end,</span> <span class="pre">always</span> <span class="pre">goes</span> <span class="pre">out</span> <span class="pre">as</span> <span class="pre">``chunk</span></code>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">sub</span></code> names one submission and is never reused. A client may resubmit its
 <code class="docutils literal notranslate"><span class="pre">rid</span></code> as soon as it drops a stream, and that stream’s <code class="docutils literal notranslate"><span class="pre">done</span></code> or late
 chunks can cross the retry, so everything about a submission is addressed by
@@ -807,6 +819,28 @@ its OpenAI translation by it (<code class="docutils literal notranslate"><span c
 <dd class="field-odd"><p><strong>bridge_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.rust_frontend.RustFrontendBridge.loop">
+<span class="sig-name descname"><span class="pre">loop</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">AbstractEventLoop</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.api_server.rust_frontend.RustFrontendBridge.loop" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.rust_frontend.RustFrontendBridge.relay">
+<span class="sig-name descname"><span class="pre">relay</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tags</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunks</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#RustFrontendBridge.relay"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.RustFrontendBridge.relay" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">ChunkSink.relay</span></code>: one <code class="docutils literal notranslate"><span class="pre">chunks</span></code> message for a message pass.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tags</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>chunks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.api_server.rust_frontend.RustFrontendBridge.run">
 <span class="sig-name descname"><span class="pre">run</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#RustFrontendBridge.run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.RustFrontendBridge.run" title="Link to this definition">#</a></dt>
@@ -934,6 +968,8 @@ environment’s older binary never serves this one’s bridge.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.BRIDGE_RECV_WAIT_S"><code class="docutils literal notranslate"><span class="pre">BRIDGE_RECV_WAIT_S</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.OPENAI_ADAPTER_ENV"><code class="docutils literal notranslate"><span class="pre">OPENAI_ADAPTER_ENV</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.loop"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.loop</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.relay"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.relay()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.run"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.stop"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.stop()</span></code></a></li>
 </ul>
