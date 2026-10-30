@@ -40,6 +40,7 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
     worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: 0, get_fwd_info=lambda rid, p: None)
     target = SpeculationTarget(SimpleNamespace(node_name="decoder", graph_walk="walk"), [1, 2, 3])
 
-    worker._try_speculate_next(SimpleNamespace(batch=SimpleNamespace(node_name="audio_encoder")), target)
+    batch = SimpleNamespace(node_name="audio_encoder", incomplete_node_rids=set())
+    worker._try_speculate_next(SimpleNamespace(batch=batch), target)
 
     assert worker._graph_runtime.prepped == [1, 3], "a request the decoder would not run was carried onto it anyway"
