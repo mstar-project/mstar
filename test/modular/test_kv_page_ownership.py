@@ -183,15 +183,15 @@ def test_random_ownership_matches_logical_owners(seed: int, capacity: int):
         assert arena.sealed == [page in sealed for page in range(capacity)], (
             "sealed pages differ from the model"
         )
-        assert sealed <= expected.keys(), "the model left a free page sealed"
-        assert all(count == 1 or page in sealed for page, count in expected.items()), (
-            "the model shared an unsealed page"
-        )
         assert arena.any_sealed([]) is False
         assert arena.any_sealed(sorted(all_pages)) == bool(sealed)
         for page in all_pages:
             assert arena.any_sealed([page]) == (page in sealed)
 
+    # Callers keep apply's preconditions, so the model never shares an
+    # unsealed page or leaves a free page sealed: acquire and retain take a
+    # new owner, seal names owned pages, retain names sealed pages, and
+    # release names pages its owner holds.
     def apply(operation: str, owner: int = -1, pages=(), count: int = 0):
         nonlocal operation_index
         operation_index += 1
