@@ -578,6 +578,45 @@ def test_a_decode_never_evicts_the_snapshot_a_prompt_restored_in_the_same_step()
     assert pool._snap_meta.get(restored) == pool._kv.chain_key("a", "main", 2), "r's decode evicted b's restore"
 
 
+def _answered(pool: RecurrentStatePool, rid: str, prompt: list[int], reply: list[int]) -> None:
+    """Prefill ``prompt``, decode ``reply`` with the KV chain keying it, and finish the request."""
+    step = _prefill(pool, rid, prompt, hit=None)
+    pool.plan(step, _ctx(rid))
+    pool.commit(step, _ctx(rid))
+    pool._kv.add(rid, prompt + reply)
+    _decode(pool, rid, len(reply))
+    pool.remove_request(rid)
+
+
+def test_a_full_pool_keeps_a_prompt_per_slot_though_every_reply_files_a_snapshot():
+    """Each answered request files its prompt's snapshot and its reply's. A resend restores only
+    the prompt's, so with one LRU over both a pool of n slots held n / 2 prompts, and resends
+    past that restored nothing while the KV cache still held their pages."""
+    pool = _pool(prefix_slots=4)
+    prompts = [[100 * i + j for j in range(12)] for i in range(3)]
+    for i, prompt in enumerate(prompts):
+        _answered(pool, f"p{i}", prompt, [100 * i + 50 + j for j in range(4)])
+    for i, prompt in enumerate(prompts):
+        assert _probe(pool, f"again{i}", prompt, hit=8).tokens == 8, (
+            f"prompt {i}'s snapshot went to keep a reply's, so its resend recomputes the prompt"
+        )
+
+
+def test_a_reply_snapshot_that_served_a_prompt_is_kept_like_a_prompts():
+    pool = _pool(prefix_slots=2)
+    _reply(pool, "r")
+    _decode(pool, "r", 1)
+    served = pool._decode[("r", "main")]
+    pool.remove_request("r")
+    step = _prefill(pool, "b", A[:6], hit=4)
+    pool.plan(step, _ctx("b"))
+    pool.commit(step, _ctx("b"))
+    pool.remove_request("b")
+    # a newer reply crosses two pages, so the full pool evicts once
+    _answered(pool, "s", [7, 7, 7], [8] * 5)
+    assert pool._snap_by_key.get(served.key) == served.slot, "a reply's snapshot that a prompt restored went first"
+
+
 class _StubKeyedWalks:
     """The pool's answer for the walks its KV cache keys."""
 

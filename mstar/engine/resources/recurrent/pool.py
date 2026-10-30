@@ -222,12 +222,15 @@ class RecurrentStatePool(Resource):
         # Snapshots:
         # `_kv` is the KV cache whose page keys name them, None while they are off.
         # `_snap_meta` maps a filed slot to its key, least recently filed or restored first.
+        # `_replies` holds the filed decode snapshots in the same order, which eviction takes
+        # before any other: they serve only a prompt that repeats the reply token for token.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
         self._kv: KVManager | None = None
         first = config.max_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
         self._snap_meta: OrderedDict[int, bytes] = OrderedDict()
+        self._replies: OrderedDict[int, None] = OrderedDict()
         self._snap_refs: dict[int, int] = {}
         # Handle-keyed, purged by `remove_request`.
         # `_keyed` holds the (rid, label) streams the KV cache keys.
@@ -840,16 +843,29 @@ class RecurrentStatePool(Resource):
                     slot.has_state = True
                     slot.tokens = restore.tokens
                     self._snap_meta.move_to_end(restore.slot)
+                    # a reply's snapshot that served a hit is kept like a prompt's
+                    self._replies.pop(restore.slot, None)
                 self._unref(restore.slot)
 
     def _reserve_snapshot(self) -> int | None:
         """A free snapshot slot, else the least recently used one nothing
-        holds. Caller holds the lock."""
+        holds, a decode snapshot before a prompt's.
+
+        A prompt's snapshot serves a resend and every later turn of its chat,
+        while a decode snapshot serves only a prompt that repeats the reply as
+        decoded, which a chat template that re-renders the reply never sends.
+        Taking decode snapshots first keeps about one prompt per slot; one LRU
+        over both holds half as many, since every request files one of each.
+        Caller holds the lock."""
         if self._snap_free:
             return self._snap_free.pop()
-        snap = next((snap for snap in self._snap_meta if snap not in self._snap_refs), None)
+        refs = self._snap_refs
+        snap = next((snap for snap in self._replies if snap not in refs), None)
+        if snap is None:
+            snap = next((snap for snap in self._snap_meta if snap not in refs), None)
         if snap is not None:
             del self._snap_by_key[self._snap_meta.pop(snap)]
+            self._replies.pop(snap, None)
         return snap
 
     def _index(self, snap: int, key: bytes) -> bool:
@@ -894,6 +910,7 @@ class RecurrentStatePool(Resource):
         else:
             del self._snap_by_key[decode.key]
             del self._snap_meta[decode.slot]
+            self._replies.pop(decode.slot, None)
         self._snap_free.append(decode.slot)
 
     def _file_decodes(self) -> None:
@@ -910,6 +927,7 @@ class RecurrentStatePool(Resource):
                 self._drop_decode(key, decode.replaces)
             if self._index(decode.slot, name):
                 self._decode[key] = DecodeSnapshot(decode.slot, decode.tokens, name)
+                self._replies[decode.slot] = None
             else:
                 del self._decode[key]
 
