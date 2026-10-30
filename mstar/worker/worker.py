@@ -2064,9 +2064,12 @@ class Worker:
             if logger.isEnabledFor(logging.DEBUG):
                 # test/waypoint/serve_rollout.py parses this line (wire ids,
                 # logged before prepare_inputs runs) to recover the DiT schedule.
+                # Wire ids come from the infos; the runtime may be mid-call on
+                # the main thread.
+                infos = node_batch.per_request_info
                 logger.debug(
                     "Executing: %s graph_walk=%s %s", node_batch.node_name,
-                    batch.graph_walk, [self._rid_str(r) for r in node_batch.request_ids],
+                    batch.graph_walk, [infos[r].request_id for r in node_batch.request_ids],
                 )
             laps.lap("setup")
             # The plan thread wrote this batch's plan into the resources; wait
@@ -3789,10 +3792,10 @@ class Worker:
             )
 
     def _walk_signals(self, batch: ScheduledBatch, walk: str):
-        return (
-            batch.walk_output_signals.get(walk)
-            or self._graph_runtime.get_output_signals(batch.node_name, walk)
-        )
+        signals = batch.walk_output_signals.get(walk)
+        if signals is not None:
+            return signals
+        return self._graph_runtime.get_output_signals(batch.node_name, walk)
 
     def _loopback_rids(self, engine, batch: ScheduledBatch) -> frozenset:
         """A mixed step's rows whose own walk keeps every output signal on

@@ -212,6 +212,8 @@ class SpeculationBuilder:
         # (source node, dest node, walk) -> ``get_consumed_edges``, which is
         # structural
         self._consumed_edges_cache: dict[tuple[str, str, str], frozenset] = {}
+        # (node, walk) -> its output signals, also structural
+        self._walk_signals_cache: dict[tuple[str, str], list[str]] = {}
 
     def build(
         self, pending: PendingBatch, spec_target: SpeculationOutput,
@@ -283,6 +285,12 @@ class SpeculationBuilder:
             graph_walk=label,
             request_to_worker_graph=request_to_worker_graph,
             request_walks=request_walks,
+            # Resolved here, on the main thread, so the GPU thread never asks
+            # the runtime, which may be mid-call with the GIL released.
+            walk_output_signals={
+                walk: self._walk_output_signals(spec_node, walk, spec_target)
+                for walk in set(request_walks.values())
+            },
             # Reported by whichever step chose the target -- speculate_node on
             # the leader, get_spec_target on a follower -- so the hot path does
             # not cross back into the runtime once per forward pass.
@@ -388,6 +396,19 @@ class SpeculationBuilder:
             is_same_node=spec_node == pending.node_name,
             loop_name=spec_target.loop_name,
         )
+
+    def _walk_output_signals(
+        self, node_name: str, walk: str, spec_target: SpeculationOutput,
+    ) -> list[str]:
+        if walk == spec_target.graph_walk:
+            return list(spec_target.output_signals)
+        key = (node_name, walk)
+        signals = self._walk_signals_cache.get(key)
+        if signals is None:
+            signals = self._walk_signals_cache[key] = list(
+                self._ctx.graph_runtime.get_output_signals(node_name, walk)
+            )
+        return list(signals)
 
     def _consumed_edges(
         self, source_node: str, dest_node: str, graph_walk: str,
