@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.sampler.utils import HostBuffer, SamplerBuffers, SamplingConfig
+from mstar.utils.h2d import PinnedStager
 
 
 def _buffers(max_bs=4, cg_slots=2):
@@ -26,6 +27,19 @@ def test_eager_write_and_read_go_by_request():
     bufs.write_last_tokens(["c"], torch.tensor([13], dtype=torch.int32))
     assert bufs.last_tokens_for(["c", "a"]).tolist() == [13, 11]
     assert bufs.has_slot("a") and not bufs.has_slot("zz")
+
+
+def test_a_routed_write_takes_its_slot_index_through_the_stager():
+    bufs = _buffers()
+    for rid in ("a", "b", "c"):
+        bufs.register_request(rid)
+    stager = PinnedStager(torch.long, numel=4)
+    calls = []
+    to_device = stager.to_device
+    stager.to_device = lambda values, device: calls.append(list(values)) or to_device(values, device)
+    bufs.write_last_tokens(["c", "a"], torch.tensor([31, 11]), stager)
+    assert calls == [[bufs._rid_to_slot["c"], bufs._rid_to_slot["a"]]]
+    assert bufs.last_tokens_for(["a", "c"]).tolist() == [11, 31]
 
 
 def test_the_captured_row_scatters_to_the_slot_master_and_gathers_back():
