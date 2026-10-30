@@ -35,7 +35,7 @@ class WorkerMessageType(Enum):
     DRAIN_REQUEST = "drain_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_SIGNALS = "input_signals"
-    STREAM_ITEMS = "stream_items"
+    EDGE_ITEMS = "edge_items"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
@@ -93,7 +93,7 @@ class InputSignals(MessageBody):
 
 
 @dataclass
-class StreamItems(MessageBody):
+class EdgeItems(MessageBody):
     """One step's streamed tensors from a producer worker to one consumer
     worker, as columns: a row per (request, streaming edge), and per row its
     items, row-major. It carries what one INPUT_SIGNALS per (request, worker)

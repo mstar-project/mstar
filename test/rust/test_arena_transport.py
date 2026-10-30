@@ -1268,7 +1268,7 @@ def test_a_failed_pin_leaves_cuda_usable():
 
 
 def test_several_requests_read_in_one_call_as_in_one_call_each(tmp_path):
-    """``start_read_tensors_multi`` (a STREAM_ITEMS frame's reads) leaves the
+    """``start_read_tensors_multi`` (an EDGE_ITEMS frame's reads) leaves the
     store and the pending reads as one ``start_read_tensors`` per request
     does: every tensor read, each request's edge pending under its own rid."""
     prod = _manager("w0", tmp_path)

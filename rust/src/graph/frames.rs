@@ -406,11 +406,11 @@ impl InputSignals<'_> {
     }
 }
 
-/// STREAM_ITEMS to one peer worker: a step's streamed tensors as columns
-/// (Python's `StreamItems`). Rows go in with `try_add`; a row whose
+/// EDGE_ITEMS to one peer worker: a step's streamed tensors as columns
+/// (Python's `EdgeItems`). Rows go in with `try_add`; a row whose
 /// descriptors differ from the frame's shared fields is refused, and the
 /// caller sends it as INPUT_SIGNALS.
-pub struct StreamItems {
+pub struct EdgeItems {
     partition_name: String,
     // (session, entity, node, tp_size, tp_rank), fixed by the first row
     shared: Option<(Sym, Sym, Option<Sym>, u32, u32)>,
@@ -435,9 +435,9 @@ pub struct StreamItems {
     shm_offsets: Vec<i64>,
 }
 
-impl StreamItems {
+impl EdgeItems {
     pub fn new(partition_name: &str) -> Self {
-        StreamItems {
+        EdgeItems {
             partition_name: partition_name.to_string(),
             shared: None,
             names: Vec::new(), name_at: FxHashMap::default(),
@@ -520,9 +520,9 @@ impl StreamItems {
 
     pub fn encode(&self, bk: &StrToId) -> Vec<u8> {
         let mut out = Vec::with_capacity(256 + 64 * self.uuids.len());
-        open_frame(&mut out, "worker_msg", "stream_items", Some("stream_items"));
+        open_frame(&mut out, "worker_msg", "edge_items", Some("edge_items"));
         let (session, entity, node, tp_size, tp_rank) =
-            self.shared.expect("StreamItems::encode with no rows");
+            self.shared.expect("EdgeItems::encode with no rows");
         fn ints(out: &mut Vec<u8>, v: &[i64]) {
             w_arr(out, v.len() as u32);
             for &x in v {
@@ -729,7 +729,7 @@ mod tests {
         }
     }
 
-    /// As Python's `StreamItemsBuilder.try_add`: a refused row leaves the
+    /// As Python's `EdgeItemsBuilder.try_add`: a refused row leaves the
     /// frame as it was, so it doesn't decide which rows come after it.
     #[test]
     fn a_refused_first_row_does_not_fix_the_frames_fields() {
@@ -744,7 +744,7 @@ mod tests {
         let mixed = [info(&mut bk, "w0", "a"), info(&mut bk, "w0", "b")];
         let other = [info(&mut bk, "w1", "a")];
         let first = [info(&mut bk, "w0", "a")];
-        let mut frame = StreamItems::new("p");
+        let mut frame = EdgeItems::new("p");
         assert!(!frame.try_add(&bk, "r1", "s", "n", &mixed));
         assert!(frame.is_empty());
         assert!(frame.try_add(&bk, "r2", "s", "n", &other));

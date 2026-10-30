@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server.request_types import APIServerMessage, ResultTensors, ResultTokens
 from mstar.communication.communicator import BaseCommunicator
-from mstar.communication.stream_items import StreamItemsBuilder, stream_items_eligible
+from mstar.communication.edge_items import EdgeItemsBuilder, edge_items_eligible
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
@@ -1568,8 +1568,8 @@ class PythonGraphRuntime(GraphRuntime):
             else dict(iter(input.resource_publish_info))
         )
         sent_rids: list[int] = []
-        # worker -> its STREAM_ITEMS, sent after the per-request frames
-        streamed: dict[str, StreamItemsBuilder] = {}
+        # worker -> its EDGE_ITEMS, sent after the per-request frames
+        streamed: dict[str, EdgeItemsBuilder] = {}
 
         # counted before any WORKER_GRAPHS_DONE below reports them
         result_tokens = self._result_tokens(completion, input.failed_rids)
@@ -1624,10 +1624,10 @@ class PythonGraphRuntime(GraphRuntime):
                 self._tensor_manager.refresh_shm_placement(edges)
                 builder = streamed.get(worker_id)
                 if builder is None:
-                    builder = streamed[worker_id] = StreamItemsBuilder(partition)
+                    builder = streamed[worker_id] = EdgeItemsBuilder(partition)
                 rest = [
                     e for e in edges
-                    if not (stream_items_eligible(e) and builder.try_add(self.get_rid_string(rid), e))
+                    if not (edge_items_eligible(e) and builder.try_add(self.get_rid_string(rid), e))
                 ]
                 if rest:
                     # streamed edges only: the receiver doesn't read the info
@@ -1673,7 +1673,7 @@ class PythonGraphRuntime(GraphRuntime):
         for worker_id, builder in streamed.items():
             if builder:
                 self._communicator.send(worker_id, WorkerMessage(
-                    message_type=WorkerMessageType.STREAM_ITEMS, body=builder.build(),
+                    message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build(),
                 ))
 
         for frame in result_tokens:

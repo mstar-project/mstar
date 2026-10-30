@@ -3967,10 +3967,10 @@ impl GraphRuntime {
             // counted from the descriptors that go out, not the refs.
             let mut stream_items: Vec<(u32, String, Sym, i64)> = Vec::new();
             // A step's plain streamed edges (unsharded, one producer) go to
-            // each worker as one STREAM_ITEMS, not one INPUT_SIGNALS per
+            // each worker as one EDGE_ITEMS, not one INPUT_SIGNALS per
             // request: the receiver then decodes, reads and routes the step's
             // items once. Worker order kept as first seen.
-            let mut streamed: Vec<(Sym, frames::StreamItems)> = Vec::new();
+            let mut streamed: Vec<(Sym, frames::EdgeItems)> = Vec::new();
             let mut streamed_at: FxHashMap<Sym, usize> = FxHashMap::default();
             {
                 // One acquisition for every descriptor lookup in the batch, not
@@ -3988,7 +3988,7 @@ impl GraphRuntime {
                                 PyValueError::new_err(format!("unknown rid handle {}", w.rid))
                             })?;
                             let i = *streamed_at.entry(w.worker).or_insert_with(|| {
-                                streamed.push((w.worker, frames::StreamItems::new(&partition)));
+                                streamed.push((w.worker, frames::EdgeItems::new(&partition)));
                                 streamed.len() - 1
                             });
                             if streamed[i].1.try_add(

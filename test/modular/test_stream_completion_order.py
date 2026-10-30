@@ -18,8 +18,8 @@ import pytest
 import torch
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.communication.stream_items import row_infos
-from mstar.communication.stream_items import rows as stream_rows
+from mstar.communication.edge_items import row_infos
+from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.communication.wire import decode
@@ -41,8 +41,8 @@ from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
     ConductorMessageType,
+    EdgeItems,
     InputSignals,
-    StreamItems,
     WorkerGraphsDone,
     WorkerMessageType,
 )
@@ -292,8 +292,8 @@ def _consumer(policy):
 
 def _deliver(w, descriptor):
     """The descriptor arrives and its read completes."""
-    if isinstance(descriptor, StreamItems):
-        w._process_stream_items(descriptor)
+    if isinstance(descriptor, EdgeItems):
+        w._process_edge_items(descriptor)
         edges = [
             GraphEdge(next_node=row.next_node, name=row.signal,
                       tensor_info=row_infos(descriptor, row), is_streaming=True)

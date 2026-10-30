@@ -27,7 +27,7 @@ pytest.importorskip("mstar_rust")
 from mstar_rust import GraphRuntime, ZmqCommunicator
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.communication.stream_items import StreamItemsBuilder, row_infos, rows
+from mstar.communication.edge_items import EdgeItemsBuilder, row_infos, rows
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.communication.wire import decode, encode, encode_field, encode_fields
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -434,7 +434,7 @@ def test_stream_items_sent_ride_the_worker_graphs_done(tmp_path):
     _put(mesh, 1)
     _put(mesh, 2)
     got = mesh.run(rid, uuids=[1, 2])
-    assert got[PEER][0].message_type == WorkerMessageType.STREAM_ITEMS
+    assert got[PEER][0].message_type == WorkerMessageType.EDGE_ITEMS
     assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 2}}
     _put(mesh, 3)
     got = mesh.run(rid, uuids=[3])
@@ -1095,9 +1095,9 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     assert done == {"r_prefill": ([0], "prefill"), "r_decode": ([1], "decode")}
 
 
-def test_a_streamed_edge_goes_as_the_stream_items_python_builds(tmp_path):
-    """A plain streamed edge to a peer rides STREAM_ITEMS, and the frame Rust
-    builds decodes to the one Python's StreamItemsBuilder makes of the same
+def test_a_streamed_edge_goes_as_the_edge_items_python_builds(tmp_path):
+    """A plain streamed edge to a peer rides EDGE_ITEMS, and the frame Rust
+    builds decodes to the one Python's EdgeItemsBuilder makes of the same
     edge."""
     mesh = _stream_mesh(tmp_path)
     rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
@@ -1108,12 +1108,12 @@ def test_a_streamed_edge_goes_as_the_stream_items_python_builds(tmp_path):
              shm_offset=128, _source_node_name="only", _source_graph_walk=WALK),
     ]
     (frame,) = mesh.run(rid, uuids=[1, 2])[PEER]
-    builder = StreamItemsBuilder("default")
+    builder = EdgeItemsBuilder("default")
     assert builder.try_add("r1", GraphEdge(
         next_node="remote", name="out", tensor_info=infos, is_streaming=True,
     ))
     assert frame == _sent(WorkerMessage(
-        message_type=WorkerMessageType.STREAM_ITEMS, body=builder.build(),
+        message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build(),
     ))
 
 
@@ -1174,5 +1174,5 @@ def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, stre
     _send(rt, out.completion_id)
     (frame,) = _collect(peer)
     assert frame.message_type == (
-        WorkerMessageType.STREAM_ITEMS if streaming else WorkerMessageType.INPUT_SIGNALS
+        WorkerMessageType.EDGE_ITEMS if streaming else WorkerMessageType.INPUT_SIGNALS
     )

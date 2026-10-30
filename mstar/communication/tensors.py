@@ -1585,7 +1585,7 @@ class TensorCommunicationManager(ABC):
         self, reads: list[tuple[Rid, list[GraphEdge]]],
     ) -> list[Future]:
         """``start_read_tensors`` for several requests' edges at once (a
-        STREAM_ITEMS frame); a transport with per-call setup overrides it to
+        EDGE_ITEMS frame); a transport with per-call setup overrides it to
         pay that once."""
         futures: list[Future] = []
         for request_id, graph_edges in reads:
