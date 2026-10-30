@@ -38,6 +38,8 @@ model_kwargs:
   vae_compile: true
   # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.19x images/s at
   # c=1 and 1.21x at c=16 on MI325X; median 22.6 vs 23.9 dB from diffusers (docs/models.rst). Default bf16
+  # On AMD GPUs fp8 needs `knobs: dit_exact_ops: true` (top level). MI325X: 22.6 dB with the knob on, 22.5-22.7
+  # with it off (floor 22.4). The knob costs 7% of fp8 images/s at c=1, leaving 1.13x bf16
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
   # LoRA adapters folded into the transformer at load (diffusers / PEFT or BFL-layout
