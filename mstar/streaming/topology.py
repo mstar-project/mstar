@@ -114,9 +114,9 @@ class PartitionTopology:
                 raise ValueError(f"the client only produces streams; {conn.edge_name!r} flows into it")
             if (conn.limits is not None or conn.audio is not None) and conn.from_partition != CLIENT:
                 raise ValueError(f"{conn.edge_name!r} has limits or audio but is not a client stream")
-            frame = None if conn.audio is None else conn.audio.frame_samples
-            if frame is not None and (isinstance(frame, bool) or not isinstance(frame, int) or frame < 1):
-                raise ValueError(f"{conn.edge_name!r}'s audio frame_samples must be a positive integer, not {frame!r}")
+            for name, value in (conn.audio._asdict() if conn.audio is not None else {}).items():
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(f"{conn.edge_name!r}'s audio {name} must be a positive integer, not {value!r}")
             if conn.consumer_walk is not None and conn.from_partition == CLIENT:
                 # the hook runs on the producer worker, and the client has none
                 raise ValueError(f"client stream {conn.edge_name!r} cannot drive its consumer's walk")

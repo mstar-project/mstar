@@ -587,7 +587,10 @@ def test_bad_client_stream_settings_fail_startup(config, match):
 @pytest.mark.parametrize("producer, declared, match", [
     ("A", {"limits": ClientStreamLimits(max_items=1)}, "not a client stream"),
     ("A", {"audio": ClientAudio(16000, 1280)}, "not a client stream"),
-    *((CLIENT, {"audio": ClientAudio(16000, frame)}, "positive integer") for frame in (0, -4, True, 2.5)),
+    *((CLIENT, {"audio": ClientAudio(16000, frame)}, "frame_samples must be a positive integer")
+      for frame in (0, -4, True, 2.5)),
+    *((CLIENT, {"audio": ClientAudio(rate, 1280)}, "sample_rate must be a positive integer")
+      for rate in (0, 16000.0, False)),
 ])
 def test_a_topology_refuses_a_stream_declaration_it_cannot_serve(producer, declared, match):
     with pytest.raises(ValueError, match=match):
