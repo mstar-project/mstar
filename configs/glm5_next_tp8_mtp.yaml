@@ -32,11 +32,11 @@ resources:
   kv_cache:
     # The 11 MLA layers and the MTP layer are paged, one 576-wide latent
     # (512 + the rope slot that masks rejected drafts) per token per layer:
-    # ~13.8 KB/token/rank. A request holds up to 4096 rows (2048 tokens plus
-    # the rejected drafts), so 2048 pages x 128 = 64 of them, plus the sink
-    # page, ~3.6 GB/rank. Sized to the slot pool below, which is the real
-    # concurrency limit.
-    max_num_pages: 2049
+    # ~13.8 KB/token/rank. A request holds up to 8192 rows (2048 tokens plus
+    # up to 3 rejected drafts each), so 4096 pages x 128 = 64 of them, plus
+    # the sink page, ~7.2 GB/rank. Sized to the slot pool below, which is the
+    # real concurrency limit.
+    max_num_pages: 4097
     page_size: 128
   kda_state:
     # One slot per in-flight request plus the pool's sink, head-sharded

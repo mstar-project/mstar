@@ -345,9 +345,10 @@ class Glm5NextModelConfig:
     def kv_rows(self) -> int:
         """Cache rows a request may hold. Its real context is held to
         max_seq_len; under MTP each verify step also leaves its rejected drafts
-        as holes, and twice the rows keeps those from binding first until
-        acceptance falls below about (k + 1) / 2 tokens per step."""
-        return self.max_seq_len * (2 if self.mtp_num_draft_tokens > 0 else 1)
+        as holes. Admission books every step's whole block (no draft accepted),
+        so k + 1 rows a token keep the rows from refusing a request its context
+        holds. Pages are taken as the rows fill, so the bound allocates nothing."""
+        return self.max_seq_len * (self.mtp_num_draft_tokens + 1)
 
     @property
     def padded_head_dim(self) -> int:

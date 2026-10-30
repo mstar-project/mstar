@@ -107,6 +107,19 @@ def test_a_request_that_asks_no_length_fills_the_cache_rows(tmp_path, monkeypatc
 
 
 @_K
+@pytest.mark.parametrize("max_tokens", [1024, 1600, 2048 - PROMPT])
+def test_mtp_admits_what_the_context_holds(tmp_path, monkeypatch, k, max_tokens):
+    """A request the context holds is dispatched with or without MTP: the rows its rejected
+    drafts could take never refuse it first (1024 was past the rows, 1600 past the loop cap)."""
+    model = _model(mtp_num_draft_tokens=k)
+
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": max_tokens}), tmp_path, monkeypatch)
+
+    assert _failed(sent) == []
+    assert _dispatched(sent).loop_caps["decode_loop"] == max_tokens - 1
+
+
+@_K
 @pytest.mark.parametrize("past", [0, 1])
 def test_max_tokens_past_the_rows_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past, k):
     model = _model(mtp_num_draft_tokens=k)
