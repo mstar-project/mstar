@@ -66,13 +66,6 @@ class Admission:
         """None once ``rid`` is admitted on ``node_name``, else why it waits or fails. ``keys`` are the
         resources of ``node_name`` that ask."""
         entry = self._waiting.get(rid)
-        # a request asked again while it waits retries a resource that has grown since it didn't fit
-        waited = entry is not None
-        if waited:
-            for key in entry.asked:
-                mark = self._short.get(key)
-                if mark is not None and self._queues[key][0] == rid and self._resources[key].grew_since(mark):
-                    del self._short[key]
         waits = False
         for key in keys:
             if entry is not None and key in entry.asked:
@@ -97,10 +90,7 @@ class Admission:
         entry.published[node_name] = published
         tried = all(self._queues[key][0] == rid and key not in self._short for key in entry.asked)
         if tried and (nodes := self._reserve(rid, entry.published.get)):
-            # The other nodes waiting on it resume, and this one too when its own check waited before: the
-            # worker asks for a dropped request outside the scheduler's checks.
-            others = set(nodes) if waited else nodes.keys() - {node_name}
-            if others:
+            if others := nodes.keys() - {node_name}:
                 self._started.setdefault(rid, set()).update(others)
             return None
         return FULL_ADMIT_QUEUED

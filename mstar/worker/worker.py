@@ -674,6 +674,8 @@ class Worker:
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
         self.scheduler.pending_removes = self._pending_removes
+        # The scheduler hands each dropped request its node's resources admit again to `_readmit`.
+        self.scheduler.dropped, self.scheduler.readmit = self._dropped, self._readmit
 
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
         # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after
@@ -1117,6 +1119,8 @@ class Worker:
         freed = self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
         self._rebuilds.drop_rows(request_id, node_name)
         self._dropped[request_id] = node_name
+        # the drop asked the node's resources again, which may admit it at once or refuse it
+        self._readmit(request_id, node_name)
         return freed
 
     def _rebuild_refusal(self, request_id: int, node_name: str) -> str | None:
@@ -1234,21 +1238,20 @@ class Worker:
         self._dropped.pop(request_id, None)
         self._preemptions[node_name].rebuild_tokens += len(rebuild.ids) - 1
 
-    def _readmit_dropped(self) -> None:
-        """Rebuild each dropped request once its node's resources admit it again, the KV with its history and
-        one page more."""
-        for rid, node_name in list(self._dropped.items()):
-            if self._is_tearing_down(rid):
-                continue
-            info = self.request_state.get_fwd_info(rid, self.request_state.get_partition_for_node(node_name))
-            waits = self.engine_manager.get_engine(node_name).admit_request(node_name, rid, info)
-            if waits is not None:
-                if not waits.ok:
-                    self._fail_requests({rid: f"Error in worker: {waits.reason.message}"})
-                continue
-            if rid in self._preempted:
-                self._preempted[rid].returned_at = len(self._rebuilds.kept(rid, node_name).sampled)
-            self._rebuild(rid, node_name)
+    def _readmit(self, rid: int, node_name: str) -> None:
+        """Rebuild the dropped request once its node's resources admit it again, the KV with its history and one
+        page more. Called at the drop, and by `MicroScheduler._unpark` once `admit_waiting` admits it."""
+        if self._is_tearing_down(rid):
+            return
+        info = self.request_state.get_fwd_info(rid, self.request_state.get_partition_for_node(node_name))
+        waits = self.engine_manager.get_engine(node_name).admit_request(node_name, rid, info)
+        if waits is not None:
+            if not waits.ok:
+                self._fail_requests({rid: f"Error in worker: {waits.reason.message}"})
+            return
+        if rid in self._preempted:
+            self._preempted[rid].returned_at = len(self._rebuilds.kept(rid, node_name).sampled)
+        self._rebuild(rid, node_name)
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -5000,9 +5003,6 @@ class Worker:
                 if metrics is not None:
                     metrics.maybe_report()
                     laps.lap("metrics")
-
-                if self._dropped:
-                    self._readmit_dropped()
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
