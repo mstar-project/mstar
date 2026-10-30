@@ -382,7 +382,7 @@ def _paged_kv_on_cfg_ranks(
                 f"KV {spec.resource_key}: a node with cfg_size > 1 can't hold a paged KV "
                 f"cache, since its CFG ranks run different branches ({_describe(wg)} has "
                 f"cfg_size {wg.cfg_size}). Make each branch its own node in a graph Parallel, "
-                "on its own node group, as BAGEL's LLM_cfg_text and LLM_cfg_img are."
+                "on a node group with cfg_size 1, as BAGEL's LLM_cfg_text and LLM_cfg_img are."
             )
 
 

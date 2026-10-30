@@ -2032,7 +2032,7 @@ head; only TP and SP ranks split them. The ranks run in lockstep on the same req
 any per-request resource the node declares must stay the same shape on every rank, and a
 node with ``cfg_size > 1`` can't hold a paged KV cache (placement refuses one before
 any worker starts): branches that hold different KV are separate nodes in a graph ``Parallel``
-instead, each on its own node group, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are.
+instead, on a node group with ``cfg_size: 1``, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are.
 ``Wan22DitSubmodule`` is the reference.
 
 .. _Expert parallelism (MoE):
