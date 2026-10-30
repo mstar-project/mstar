@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 class GraphRuntimePartitionInfo:
     graph_walk: str
     graph_walk_worker_graph_ids: list[int] = field(default_factory=list) # for this worker
-    stream_partition_done: bool = False  # set True when last chunk pops with is_final
+    partition_done: bool = False  # see GraphRuntime.mark_partition_done
 
 @dataclass
 class _SpecRidPrep:
@@ -451,10 +451,10 @@ class PythonGraphRuntime(GraphRuntime):
         # the caller.
         return FreedTensors.none()
 
-    def mark_stream_partition_done(self, rid: int, partition: str):
+    def mark_partition_done(self, rid: int, partition: str):
         info = self._request_info.get(rid)
         if info is not None and partition in info.partition_info:
-            info.partition_info[partition].stream_partition_done = True
+            info.partition_info[partition].partition_done = True
 
     def get_consumed_edges(
         self, source_node: str, dest_node: str, graph_walk: str,
@@ -1595,7 +1595,7 @@ class PythonGraphRuntime(GraphRuntime):
                     # A speculatively-scheduled node has not really finished
                     # the partition, so it must not report done.
                     partition_done=(
-                        part is not None and part.stream_partition_done
+                        part is not None and part.partition_done
                         and not speculative
                     ),
                     profiling=profiling.get(rid),

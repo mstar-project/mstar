@@ -1078,7 +1078,16 @@ methods are:
 ``check_stop(...) -> set[str] | StopCheck`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
-   terminates. To also keep some of this step's outputs from being routed, return
+   terminates. A prefill samples the first token before its decode loop exists, so a stop
+   there is returned as ``END_PARTITION`` (from ``mstar.model.submodule_base``) instead:
+   the worker reports the partition done with that pass, and the conductor ends it rather
+   than start decode. Return it only from a row outside any loop; from inside one the
+   request fails. ``TokenStepNode`` does this for its ``PREFILL_WALK``. It suits a partition
+   with nothing left to run once generation stops: a model that runs another walk after its
+   loop (an ``align`` walk, or image generation after thinking) or publishes final-only
+   state at the loop's stop needs its own transition instead. Keep ``check_stop_batched``,
+   if you write one, in agreement.
+   To also keep some of this step's outputs from being routed, return
    ``StopCheck(stops, withheld=(names...))``, for example a frame streamed alongside the
    EOS token: its consumer then never receives it, instead of finding and dropping it with
    a device read. ``check_stop_batched`` returns a ``BatchedStopCheck`` for the same.

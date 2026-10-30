@@ -117,7 +117,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
         ),
         node_batch=SimpleNamespace(
             request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
-            final_stream_rids={7}, stream_partition_done_rids={7},
+            final_stream_rids={7}, partition_done_rids={7},
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
     )
@@ -144,7 +144,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     assert pending.node_batch.request_ids == []
     assert pending.node_batch.per_request_info == {}
     assert pending.node_batch.final_stream_rids == set()
-    assert pending.node_batch.stream_partition_done_rids == set()
+    assert pending.node_batch.partition_done_rids == set()
     assert pending.batch.request_to_worker_graph == {}
     assert ranges == []
     assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])
@@ -168,7 +168,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
         ),
         node_batch=SimpleNamespace(
             request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
-            final_stream_rids=set(), stream_partition_done_rids=set(),
+            final_stream_rids=set(), partition_done_rids=set(),
             completion_event=event,
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",

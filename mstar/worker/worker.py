@@ -56,7 +56,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
-from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
+from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.streaming.topology import Connection, ProducerWalkCtx
@@ -739,11 +739,12 @@ class Worker:
         }
 
         # (graph_walk, node) -> innermost enclosing loop, for ending a
-        # stream-terminated loop in _postprocess_batch. Structural, so it is
-        # derived from the model here rather than asked of the graph runtime
-        # per step -- which also keeps it identical under both runtimes.
+        # stream-terminated loop and refusing an END_PARTITION from inside a
+        # loop in _postprocess_batch. Structural, so it is derived from the
+        # model here rather than asked of the graph runtime per step -- which
+        # also keeps it identical under both runtimes.
         self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
-        if self._my_consumer_connections and model:
+        if model:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
                 model.get_graph_walk_graphs(),
             )
@@ -1967,7 +1968,7 @@ class Worker:
         consumes. The context starts unleased and eager; a slot is reserved
         later, once the real token count is known.
         """
-        final_stream_rids, stream_partition_done_rids = self._settle_final_streams(
+        final_stream_rids, partition_done_rids = self._settle_final_streams(
             node_name, final_edges or {},
         )
         return ExecutingBatch(
@@ -1975,7 +1976,7 @@ class Worker:
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids,
-            stream_partition_done_rids=stream_partition_done_rids,
+            partition_done_rids=partition_done_rids,
             per_request_input_metadata=per_request_input_metadata or {},
             step_context=StepContext(
                 request_ids=tuple(request_ids),
@@ -3259,7 +3260,7 @@ class Worker:
                 speculation.node_batch.per_request_input_metadata.pop(r, None)
                 # Its final chunks go back below; it must not flush or report done.
                 speculation.node_batch.final_stream_rids.discard(r)
-                speculation.node_batch.stream_partition_done_rids.discard(r)
+                speculation.node_batch.partition_done_rids.discard(r)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
 
@@ -3640,7 +3641,7 @@ class Worker:
                 batch_N.node_batch.per_request_info.pop(stopped_rid, None)
                 # its loop already stopped; see ExecutingBatch.drop_rids
                 batch_N.node_batch.final_stream_rids.discard(stopped_rid)
-                batch_N.node_batch.stream_partition_done_rids.discard(stopped_rid)
+                batch_N.node_batch.partition_done_rids.discard(stopped_rid)
         # keep the forward's order: other code walks this list positionally
         batch_N.node_batch.request_ids = [
             rid for rid in batch_N.node_batch.request_ids if rid in valid_rids
@@ -3762,13 +3763,30 @@ class Worker:
             if loop_name is not None:
                 stops.setdefault(rid, set()).add(loop_name)
 
+        # END_PARTITION (e.g. a prefill that sampled a stop token) ends the
+        # partition on this pass's report. Only a row outside any loop can end
+        # its pass here: inside one it would stop only the innermost loop, and
+        # a speculated next iteration would carry no report of it. Returning it
+        # from a loop is a model bug, so the client sees an internal error.
+        for rid in [rid for rid, s in stops.items() if END_PARTITION in s]:
+            walk = batch_N.batch.walk_of(rid)
+            if (walk, batch_N.node_name) in self._innermost_loop_by_node:
+                batch_N.node_batch.register_failure(rid, RuntimeError(
+                    f"check_stop of node {batch_N.node_name!r} returned END_PARTITION "
+                    f"inside a loop of walk {walk!r}; it may end a partition only "
+                    "from a row outside any loop"
+                ), walk)
+            else:
+                del stops[rid]
+                batch_N.node_batch.partition_done_rids.add(rid)
+
         if batch_N.node_batch.failed_requests:
-            # A rid whose stop check raised has no trustworthy stop decision:
-            # routing it would either run its loop forever or end it early.
-            # Fail it here and take it out of the batch before the routing
-            # loops below touch it. Only ever the ones `check_stop_for_batch`
-            # just added: the caller already reported (and cleared) the rids
-            # that failed in prepare_inputs / postprocess.
+            # A rid whose stop check raised (or was refused above) has no
+            # trustworthy stop decision: routing it would either run its loop
+            # forever or end it early. Fail it here and take it out of the
+            # batch before the routing loops below touch it. Only ever the
+            # ones this stop stage just added: the caller already reported
+            # (and cleared) the rids that failed in prepare_inputs / postprocess.
             failed = dict(batch_N.node_batch.failed_requests)
             self._drop_failed_rids(batch_N, outputs, failed)
             self._fail_requests(failed)
@@ -3782,7 +3800,7 @@ class Worker:
                 return
 
         # the stop check itself is the direct window above; this stage is its
-        # tail (prefix chains, stream-terminated loops, failed rids)
+        # tail (prefix chains, stream-terminated loops, failed rids, partition ends)
         _pp_stage("check_stop_tail")
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -3874,9 +3892,10 @@ class Worker:
             range_push("worker.send_outputs", synchronize=False)
 
         # The consuming pass (not the earlier ingest) reports the partition
-        # done, so it rides the WGD that also counts this pass's last chunks.
-        for rid in batch_N.node_batch.stream_partition_done_rids:
-            self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
+        # done, so it rides the WGD that also counts this pass's last chunks;
+        # an END_PARTITION stop rides this pass's WGD the same way.
+        for rid in batch_N.node_batch.partition_done_rids:
+            self._graph_runtime.mark_partition_done(rid, batch_N.partition)
 
         # set this before send_outputs so that we can send updated profiling info to the conductor
         if self.enable_prof:
@@ -4583,7 +4602,7 @@ class Worker:
             pending.node_batch.failed_requests.pop(rid, None)
             # its streams do not end here; see ExecutingBatch.drop_rids
             pending.node_batch.final_stream_rids.discard(rid)
-            pending.node_batch.stream_partition_done_rids.discard(rid)
+            pending.node_batch.partition_done_rids.discard(rid)
         pending.node_batch.request_ids = [
             rid for rid in pending.node_batch.request_ids
             if rid not in failed_requests

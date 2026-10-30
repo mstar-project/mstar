@@ -3,7 +3,7 @@
 A stream-consuming node in a loop with no stop of its own (nemotron_duplex's
 ``nano_llm``) ends when it consumes its stream's final chunk:
 ``ExecutingBatch.final_stream_rids`` stops the loop in postprocess and
-``stream_partition_done_rids`` reports the partition done. A rid that left the
+``partition_done_rids`` reports the partition done. A rid that left the
 speculation chain (it caught up with its stream, or waited in the backlog) has
 its final chunk ingested by the plain stream poll, and can then join another
 chain's speculative step as a FRESH rid. Its final flag rides on the fresh
@@ -162,7 +162,7 @@ def test_leader_fresh_rid_final_chunk_ends_its_stream():
 
     assert list(spec.scheduled_batch.request_to_worker_graph) == [CONTINUING, FRESH]
     assert spec.node_batch.final_stream_rids == {FRESH}
-    assert spec.node_batch.stream_partition_done_rids == {FRESH}
+    assert spec.node_batch.partition_done_rids == {FRESH}
 
 
 def test_follower_fresh_rid_final_chunk_ends_its_stream():
@@ -170,7 +170,7 @@ def test_follower_fresh_rid_final_chunk_ends_its_stream():
 
     assert list(spec.scheduled_batch.request_to_worker_graph) == [CONTINUING, FRESH]
     assert spec.node_batch.final_stream_rids == {FRESH}
-    assert spec.node_batch.stream_partition_done_rids == {FRESH}
+    assert spec.node_batch.partition_done_rids == {FRESH}
 
 
 def test_fresh_rid_without_a_final_chunk_keeps_its_stream_open():
@@ -178,4 +178,4 @@ def test_fresh_rid_without_a_final_chunk_keeps_its_stream_open():
         spec = build(final=False)
         assert FRESH in spec.scheduled_batch.request_to_worker_graph
         assert not spec.node_batch.final_stream_rids
-        assert not spec.node_batch.stream_partition_done_rids
+        assert not spec.node_batch.partition_done_rids

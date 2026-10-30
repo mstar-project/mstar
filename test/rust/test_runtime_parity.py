@@ -646,8 +646,8 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
     pytest.param(lambda rt, r: rt.get_rid_string(r), id="get_rid_string"),
     pytest.param(lambda rt, r: rt.set_walk(r, "default", "w"), id="set_walk"),
     pytest.param(
-        lambda rt, r: rt.mark_stream_partition_done(r, "default"),
-        id="mark_stream_partition_done"),
+        lambda rt, r: rt.mark_partition_done(r, "default"),
+        id="mark_partition_done"),
     pytest.param(
         lambda rt, r: rt.get_dynamic_loop_iters([r], "default"),
         id="get_dynamic_loop_iters"),
