@@ -90,6 +90,8 @@ class CompletionState:
     nested_loop_indices: dict[int, NestedLoopIndices]
     # (rid, signal, modality, value) of each emit that rides inline
     emit_inline: list[tuple[int, str, str, int]] = field(default_factory=list)
+    # rid -> the log-prob its client emits carry (``RouteInput.logprobs``)
+    logprobs: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -1348,6 +1350,7 @@ class PythonGraphRuntime(GraphRuntime):
         # no per-request frame. A persisted one keeps the tensor for the conductor.
         inline_on = input.inline_signal is not None and len(input.inline_values) == len(rids)
         emit_inline: list[tuple[int, str, str, int]] = []
+        logprobs = {rid: lp for rid, lp in zip(rids, input.logprobs, strict=False) if lp is not None}
 
         cursor = 0
         for i, (rid, wg_id) in enumerate(zip(rids, wg_ids, strict=True)):
@@ -1477,6 +1480,7 @@ class PythonGraphRuntime(GraphRuntime):
             nested_loop_indices=nested_idxs,
             rid_walk=rid_walk,
             emit_inline=emit_inline,
+            logprobs=logprobs,
         )
         return RouteOutput(
             completion_id=completion_id,
@@ -1543,6 +1547,7 @@ class PythonGraphRuntime(GraphRuntime):
                 info.current_output_chunks.extend(
                     edge.name for edge in routing.emit_to_client
                 )
+                logprob = completion.logprobs.get(rid)
                 for edge in routing.emit_to_client:
                     self._communicator.send("api_server", APIServerMessage(
                         message_type="result_tensors",
@@ -1551,7 +1556,7 @@ class PythonGraphRuntime(GraphRuntime):
                             modality=edge.output_modality,
                             graph_edge=edge,
                             loop_indices=nested_idxs.get(rid),
-                            metadata={},
+                            metadata={} if logprob is None else {"logprobs": [logprob]},
                         ),
                     ))
 
@@ -1615,11 +1620,13 @@ class PythonGraphRuntime(GraphRuntime):
             if frame is None:
                 frame = frames[(signal, modality)] = ResultTokens(
                     request_ids=[], values=[], loop_indices=[],
-                    signal=signal, modality=modality,
+                    signal=signal, modality=modality, logprobs=[] if completion.logprobs else None,
                 )
             frame.request_ids.append(self.get_rid_string(rid))
             frame.values.append(value)
             frame.loop_indices.append(completion.nested_loop_indices.get(rid))
+            if frame.logprobs is not None:
+                frame.logprobs.append(completion.logprobs.get(rid))
         return list(frames.values())
 
     def _send_input_signals(

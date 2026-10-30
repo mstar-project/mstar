@@ -262,6 +262,17 @@ There are two ``ResourceReqConfig`` subclasses:
   - ``top_p_first``, ``top_p_min_keep`` (``enable_top_p_first``): HF's order (top-p,
     then top-k) instead of FlashInfer's, and HF's ``min_tokens_to_keep``.
 
+  ``return_logprobs`` (``enable_logprobs``, any device) reports each sampled token's
+  log-prob under ``softmax(logits / T)``, before the penalty and filters, with T = 1
+  for greedy requests; it reaches the client as ``{"logprobs": [...]}`` in the chunk's
+  metadata. The model passes ``return_logprobs`` into its ``SamplingReqConfig`` (the
+  conductor refuses the request otherwise), its forward samples once per step and
+  hands over row-addressed stop buffers (``BatchedModelOutput.check_stop_buffers``):
+  the log-probs ride the same copy to the host. ``logprobs_mode`` is ``"raw"`` only
+  for now. The captured sampler scores every step once it is on, so it is off by
+  default and a deployment turns it on with
+  ``resources: {<sampler key>: {enable_logprobs: true}}``.
+
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and

@@ -166,6 +166,7 @@ class InlineToken:
     value: int
     loop_indices: NestedLoopIndices | None
     modality: str
+    logprob: float | None = None
 
 
 def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
@@ -366,6 +367,7 @@ class PreprocessWorker:
     def new_result_token(
         self, request_id: str, value: int,
         loop_indices: NestedLoopIndices | None, signal: str, modality: str,
+        logprob: float | None = None,
         wake: bool = True,
     ):
         """A value that rode inline: same accounting as a result tensor, no
@@ -379,7 +381,7 @@ class PreprocessWorker:
         counts[signal] = counts.get(signal, 0) + 1
         self.per_request_reading_tensors[request_id] += 1
         self.result_tensor_input_queue.put(
-            InlineToken(request_id, value, loop_indices, modality)
+            InlineToken(request_id, value, loop_indices, modality, logprob)
         )
         if wake:
             self._signal()
@@ -1210,6 +1212,7 @@ class PreprocessWorkerThread:
                 tensor, item.modality,
                 request_kwargs=self.request_model_kwargs.get(request_id),
             )
+            metadata = {} if item.logprob is None else {"logprobs": [item.logprob]}
             self._queue_completed_output(
                 request_id,
                 sequence,
@@ -1217,7 +1220,7 @@ class PreprocessWorkerThread:
                     request_id=request_id,
                     modality=item.modality,
                     data=postprocessed,
-                    metadata={},
+                    metadata=self._with_token_ids(request_id, item.modality, tensor, metadata),
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1225,6 +1228,17 @@ class PreprocessWorkerThread:
                 request_id, exc, f"{item.modality} output postprocessing",
                 sequence=sequence,
             )
+
+    def _with_token_ids(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
+        """``metadata`` plus the chunk's sampled ids, stop tokens included,
+        for a text chunk of a request that set ``return_token_ids``. A float
+        text tensor (Whisper's word alignment) carries no ids."""
+        if (
+            modality != "text" or tensor.is_floating_point()
+            or not (self.request_model_kwargs.get(request_id) or {}).get("return_token_ids")
+        ):
+            return metadata
+        return {**metadata, "token_ids": tensor.reshape(-1).tolist()}
 
     def _queue_completed_output(
         self,
@@ -1289,6 +1303,7 @@ class PreprocessWorkerThread:
             )
 
         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
+        chunk_metadata = self._with_token_ids(request_id, modality, tensor, chunk_metadata)
         # Audio is emitted as headerless 16-bit PCM; surface the
         # model's output sample rate + channel count so clients can
         # wrap it.
