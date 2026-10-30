@@ -936,8 +936,7 @@ class PreprocessWorkerThread:
                     inputs=[GraphEdge(next_node=stream.node, name=name, tensor_info=infos, is_streaming=True)],
                     request_info=None, partition_name=stream.partition,
                 )
-                for worker in ranks:
-                    self.communicator.send(worker, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, body))
+                self.communicator.send_each(ranks, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, body))
                 call.items_sent[name] = call.items_sent.get(name, 0) + len(infos)
             self.tensor_manager.dereference_batch_uniform(uuids)
 

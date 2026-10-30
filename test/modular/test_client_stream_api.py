@@ -34,6 +34,7 @@ from mstar.api_server.request_types import (  # noqa: E402
     PreprocessInput,
     RequestComplete,
 )
+from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
 from mstar.conductor.request_info import PartitionDefinition  # noqa: E402
 from mstar.graph.base import GraphNode, TensorPointerInfo  # noqa: E402
 from mstar.model.base import TensorAndMetadata  # noqa: E402
@@ -163,12 +164,11 @@ def _thread(model=None, is_pending=None, model_config=None, routed=()):
     )}
     wt = PreprocessWorkerThread(
         **queues, stop_event=threading.Event(),
-        communicator=SimpleNamespace(
-            send=lambda entity, msg: sent.append((entity, msg)),
+        communicator=OutboxCommunicator(SimpleNamespace(
             codec=SimpleNamespace(encode=lambda msg: msg),  # sends arrive as objects
             try_send_bytes=lambda entity, msg: sent.append((entity, msg)) or True,
             get_all_new_messages=_routed_once_opened(sent, *routed),
-        ),
+        )),
         tensor_manager=tm, model=model or _ListeningModel(), is_pending=is_pending,
         model_config=model_config,
     )
