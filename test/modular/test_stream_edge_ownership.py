@@ -56,8 +56,8 @@ class _Ledger(StreamBufferManager):
         self.returned: set[int] = set()
         self.offered: list = []
 
-    def pop_edge(self, sbuf, edge_name, request_id):
-        se = super().pop_edge(sbuf, edge_name, request_id)
+    def pop_edge(self, sbuf, edge_name, request_id, **kwargs):
+        se = super().pop_edge(sbuf, edge_name, request_id, **kwargs)
         if se is not None:
             self.popped[id(se)] = se
             self.returned.discard(id(se))  # a re-pop of a returned chunk
