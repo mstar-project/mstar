@@ -226,6 +226,28 @@ class _Harness:
         n = len(order)
         return order, out[:n].float().clone(), self.k[:n].clone(), self.v[:n].clone(), self.q[:n].float().clone()
 
+    def eager_step(self, rids):
+        """One step over ``rids`` with no capture of its size, as the engine
+        runs it: planned and run eagerly, its rows stepped after."""
+        ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False)
+        ctx.rows = self.node_rows.begin(WALK, rids)
+        order = list(ctx.rows.order)
+        n = len(order)
+        ctx.request_ids = tuple(order)
+        ctx.set_padded_rids(tuple(order))
+        step = self._plan(ctx, order)
+        ctx.rows.stage()
+        self.node_rows.commit(WALK, ctx.rows)
+        ctx.rows.apply()
+        self.node_rows.gather(WALK, n)
+        q, k, v = (torch.randn(n, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda") for _ in range(3))
+        self.kv.write_kv(k, v, layer_idx=0, label=LABEL)
+        out = self.attn.run(q, LABEL, self.kv.layer_view(0))
+        self.space.after_forward()
+        self.kv.commit(step, ctx)
+        torch.cuda.synchronize()
+        return order, out.float().clone(), k, v, q.float()
+
     def stream_kv(self, rid):
         stream = self.kv._streams[rid][LABEL]
         layer = self.kv.kv_cache.tensor[0]  # [pages, 2, page, heads, dim]
@@ -274,6 +296,39 @@ def test_replays_write_and_attend_each_rows_own_stream(monkeypatch, tensor_cores
             torch.testing.assert_close(out[i], want, atol=2e-2, rtol=2e-2)
     h.space.check_mirrors()
     assert idle, "some steps ran while other rows stayed resident"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
+@pytest.mark.parametrize("seed", range(3))
+def test_eager_steps_leave_the_rows_right_for_the_replays_after(monkeypatch, seed):
+    """A step of a size with no capture runs eagerly; the rows it joins and
+    the pages its rows gain must be in the rows for the next replay."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    rng = random.Random(seed)
+    h = _Harness(tensor_cores=False, max_live=8)
+    live: set[int] = set()
+    free = list(range(HANDLES))
+    slot = 0
+    for _ in range(60):
+        while free and len(live) < 6 and rng.random() < 0.3:
+            rid = free.pop(0)
+            h.prefill(rid, rng.randrange(1, 40))
+            live.add(rid)
+        if not live:
+            continue
+        rids = rng.sample(sorted(live), rng.randint(1, min(BUCKET, len(live))))
+        if rng.random() < 0.5:
+            order, out, k, v, q = h.eager_step(rids)
+        else:
+            order, out, k, v, q = h.step(rids, slot)
+            slot ^= 1
+        for i, rid in enumerate(order):
+            keys, values = h.stream_kv(rid)
+            assert torch.equal(keys[-1], k[i]) and torch.equal(values[-1], v[i]), rid
+            scores = torch.einsum("hd,thd->ht", q[i], keys.float()) / HEAD_DIM ** 0.5
+            want = torch.einsum("ht,thd->hd", scores.softmax(-1), values.float())
+            torch.testing.assert_close(out[i], want, atol=2e-2, rtol=2e-2)
+    h.space.check_mirrors()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
