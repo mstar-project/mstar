@@ -649,7 +649,7 @@ def g711_encode(pcm: np.ndarray, law: str) -> bytes:
     if law == "audio/pcmu":
         x = x >> 2
         mask = np.where(x < 0, 0x7F, 0xFF)
-        x = np.minimum(np.abs(x), 32635) + (0x84 >> 2)
+        x = np.minimum(np.abs(x), 8159) + (0x84 >> 2)   # audioop's 14-bit clip
         seg = np.searchsorted(_ULAW_SEG_END, x)
         code = (np.minimum(seg, 7) << 4) | ((x >> (np.minimum(seg, 7) + 1)) & 0xF)
     else:
