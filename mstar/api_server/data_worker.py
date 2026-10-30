@@ -790,6 +790,7 @@ class PreprocessWorkerThread:
                 client_input=ClientStreamInput(
                     request_id=input.request_id, signals=stream_signals, ended=sorted(input.ends),
                 ) if self._client_edges else None,
+                streaming=input.streaming,
             ),
         )
         self.communicator.send("conductor", msg)

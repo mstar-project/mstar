@@ -720,9 +720,9 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   per row from the request's seeded generator before the step, so a session's
   speech does not depend on which other sessions share it. The per-frame step
   is captured as a CUDA graph for 1 to 32 sessions; a session's first step
-  (its 38-token speaker warm-up) runs eager. The talker KV pool is 1025 pages
-  of 128 positions (28 GiB): 32 sessions x 2 streams x 16 pages plus a sink
-  page, enough for ``max_session_s`` (160 s) per session, with no
+  (its 38-token speaker warm-up) runs eager. The talker KV pool is 1089 pages
+  of 128 positions (29.8 GiB): 32 sessions x 2 streams x 17 pages plus a sink
+  page, enough for ``max_session_s`` (160 s) per session at its loop cap, with no
   sliding-window eviction yet; longer audio is refused (below).
 - Measured on one H100 80GB (``benchmark/nemotron_duplex/sessions.py`` on the
   106-frame demo clip, three repeats): 24-25 ms per 80 ms tick with one

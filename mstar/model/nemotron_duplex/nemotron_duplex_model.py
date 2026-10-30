@@ -439,8 +439,8 @@ class NemotronDuplexModel(Model):
     # once: a full pool stalls every session, not just the one that outgrew it.
     # A page is 128 positions: 28 layers x 128 x 16 heads x 128 (the padded
     # head dim) x K,V x bf16 = 28 MiB. 160 s = 2001 frames, so 37 warm-up + 2001
-    # + 1 final PAD frame fit 16 pages a stream; 32 sessions x 2 streams x 16 =
-    # 1024 pages (+ the sink) = 28 GiB.
+    # + 1 final PAD frame + LOOP_ITERS_MARGIN fit 17 pages a stream; 32 sessions
+    # x 2 streams x 17 = 1088 pages (+ the sink) = 29.8 GiB.
     max_session_s = 160.0
     # Most channels an upload may have; the model takes 16 kHz mono speech.
     max_upload_channels = 2
@@ -475,8 +475,11 @@ class NemotronDuplexModel(Model):
         return self._session_kv_pages(self.max_prompt_tokens, 1, page_size, sessions)
 
     def _session_kv_pages(self, prefix: int, streams: int, page_size: int, sessions: int | None) -> int:
+        """The KV pool reserves a guaranteed session's whole loop cap before admitting it, and
+        `get_max_output_tokens` sets that cap LOOP_ITERS_MARGIN past the session's frames, so each stream
+        is sized for the cap."""
         sessions = self.DEFAULT_SESSIONS if sessions is None else sessions
-        positions = prefix + self.max_session_frames + 1
+        positions = prefix + self.max_session_frames + 1 + self.LOOP_ITERS_MARGIN
         # + 1 for the pool's sink page
         return sessions * streams * -(-positions // page_size) + 1
 

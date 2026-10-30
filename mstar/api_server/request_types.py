@@ -133,6 +133,7 @@ class PreprocessInput:
     client_request_id: str | None = None
     # the client streams the opening ends; the others stay open for appends
     ends: frozenset[str] = frozenset()
+    streaming: bool = False
 
 
 @dataclass

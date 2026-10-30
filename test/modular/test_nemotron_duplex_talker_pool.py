@@ -7,10 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_kv_prefix_lease import _StubTransfer
 from test_nemotron_duplex_codec import tiny_codec
 from test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, StepRunner
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.recurrent import RecurrentStep
 from mstar.model.nemotron_duplex.components.eartts_talker import _rand_rows, maskgit_schedule
 from mstar.model.nemotron_duplex.config import (
@@ -21,6 +25,7 @@ from mstar.model.nemotron_duplex.config import (
     TALKER_POS,
     NemotronDuplexConfig,
 )
+from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
 
 P = 37   # speaker warm-up positions
@@ -257,3 +262,29 @@ def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
     assert sub.declare_step("talker_decode", ["b"], [later]).cg_key_info == sub.DECODE_KEY
     (cfg,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert cfg.additional_key_info == sub.DECODE_KEY
+
+
+def test_every_session_of_the_longest_length_fits_the_talker_pool_at_once(monkeypatch):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    model = NemotronDuplexModel.__new__(NemotronDuplexModel)
+    model.config = NemotronDuplexConfig()
+    page_size = PagedKVConfig.page_size
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
+                          max_num_pages=model.talker_kv_pages(page_size), page_size=page_size),
+        name=TALKER_KV, joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.local_loops = {"talker_decode_loop"}
+    stream = StreamLayout(spans=(PrefixSpan(P, P, "talker_decode", kind="rows"),), growth=(("talker_decode_loop", 1),))
+    runner = StepRunner({TALKER_KV: kv}, node_resources={"talker": [TALKER_KV]})
+    for session in range(model.DEFAULT_SESSIONS):
+        runner.ingest_request(f"s{session}", {TALKER_KV: KVReqConfig(
+            kv_layout={"main": stream, "uncond": stream}, needed_labels=["main", "uncond"],
+            loop_caps={"talker_decode_loop": model.get_max_output_tokens()}, arrival=session, guaranteed=True,
+        )})
+
+    admitted = [runner.admit_retrieve(f"s{session}", "talker", "talker_decode").ready
+                for session in range(model.DEFAULT_SESSIONS)]
+
+    assert all(admitted), f"{admitted.count(False)} sessions wait for a stream's loop cap the pool wasn't sized for"

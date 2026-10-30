@@ -15,10 +15,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_kv_preemption import _pool
+from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.step import AdmitRuntimeError
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
@@ -109,12 +113,47 @@ def _rebuilding(fresh: dict[int, int] | None = None):
     return w, eng, batch, w._build_executing_batch(batch)
 
 
+def _config(growth=(("loop", 1),), labels=("main",), walk=PREFILL) -> dict[str, KVReqConfig]:
+    layout = StreamLayout(spans=(PrefixSpan(2, 2, walk),), growth=growth)
+    return {"kv": KVReqConfig(kv_layout=dict.fromkeys(labels, layout), loop_caps={loop: 1 for loop, _ in growth})}
+
+
 def test_a_rebuild_tells_the_node_what_its_row_writes_and_queues_the_row():
     w, eng, _, _ = _rebuilding()
 
     [(rid, rebuild)] = eng.prepared
     assert (rid, rebuild.walk, list(rebuild.ids)) == (R, PREFILL, [1, 2, 3, 4]), "the KV would lay out other ids"
     assert w.scheduler.rebuild_queued(R), "the row would never reach a step"
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["own pool", "pool shared with a node with no rebuild policy"])
+def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeypatch, shared):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    w, _ = _worker()
+    if shared:
+        w._kv_keys["talker"] = ["kv"]
+    kv, w._unprocessed_messages = _pool(), {}
+    # neither the publish skip nor the streams bear on the class
+    w._skip_unshared_publish, w.streams = lambda rid, workers: None, SimpleNamespace(add_request=lambda rid, info: None)
+    w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
+    w.engine_manager.evictable_nodes = list
+    w.engine_manager.add_request = lambda rid, configs, info=None: kv.ingest_request(rid, configs["kv"])
+    w.request_state.add_request, w.request_state.per_request_info = lambda rid, info: None, defaultdict(dict)
+    w.tensor_manager.register_request, w.tensor_manager.start_read_tensors = lambda *a: None, lambda *a, **k: []
+    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    # 12's KV grows in a loop the node's policy doesn't name, so no rebuild can write it again.
+    # 13's prompt was written in a walk the node's policy doesn't prefill, so it keeps no ids.
+    # 10 lays out nothing, so it isn't guaranteed.
+    configs = {R: _config(), 12: _config(growth=(("embeds_loop", 1),)), 13: _config(walk="audio"),
+               10: {"kv": KVReqConfig(kv_layout={})}}
+    for rid, config in configs.items():
+        info = SimpleNamespace(partition_name="p", graph_walk=PREFILL, resource_configs=config, stream_lead_items={})
+        w._add_new_request(SimpleNamespace(request_id=str(rid), partition_worker_graph_ids=None, loop_caps={},
+                                           worker_graph_to_workers={}, initial_inputs=[], request_info=info))
+    guaranteed = {rid for rid in configs if kv._overrides[rid].guaranteed}
+    assert guaranteed == ({R, 12, 13} if shared else {12, 13}), (
+        "a request nothing can drop would reserve only its prompt"
+    )
 
 
 def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():

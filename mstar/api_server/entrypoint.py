@@ -747,6 +747,7 @@ class APIServer:
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
             ends=ending,
+            streaming=streaming,
         ))
 
         logger.info(

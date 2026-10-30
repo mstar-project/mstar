@@ -32,11 +32,13 @@ def _stub_transfer(monkeypatch):
 
 
 def _pool():
-    """A pool where requests can hold 10 pages, past the sink page."""
-    return _manager(max_num_pages=11)
+    """A pool where requests can hold 10 pages, past the sink page, on a worker that runs the decode loop."""
+    kv = _manager(max_num_pages=11)
+    kv.local_loops = {"decode"}
+    return kv
 
 
-def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | None = None) -> None:
+def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | None = None, guaranteed=False) -> None:
     """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
     tokens = pages * PAGE_SIZE
     layout = StreamLayout(
@@ -44,7 +46,7 @@ def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | N
     )
     _runner(kv).ingest_request(rid, {"kv": KVReqConfig(
         prefix_keys={"main": _keys(keyed)} if keyed else None, kv_layout={"main": layout},
-        loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival,
+        loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival, guaranteed=guaranteed,
     )})
 
 
@@ -92,9 +94,9 @@ def _step(kv, rid: str, tokens: int) -> AdmitOutcome:
     return outcome
 
 
-def _running(kv, rid: str, pages: int, arrival: int) -> None:
+def _running(kv, rid: str, pages: int, arrival: int, **kwargs) -> None:
     """Admit ``rid`` and prefill its prompt of ``pages`` pages, ending on a full page."""
-    _request(kv, rid, pages, arrival)
+    _request(kv, rid, pages, arrival, **kwargs)
     assert _ready(kv, rid)
     assert _step(kv, rid, pages * PAGE_SIZE).ok
 
@@ -242,6 +244,54 @@ def test_a_page_the_failing_step_gives_back_is_no_release():
     )
 
 
+@pytest.mark.parametrize("guaranteed, local_loops", [(False, {"decode"}), (True, {"decode"}), (True, set())])
+def test_a_guaranteed_request_reserves_what_it_grows_into_on_this_worker(guaranteed, local_loops):
+    kv, whole = _pool(), guaranteed and bool(local_loops)
+    kv.local_loops = local_loops
+    _running(kv, "x", 5, arrival=0)
+    _request(kv, "r", 2, arrival=1, guaranteed=guaranteed)
+    assert _ready(kv, "r") is not whole, "the request was admitted into room sized for another class"
+    _remove(kv, "x")
+    caps = kv._overrides["r"].loop_caps if whole else {"decode": 0}
+    reserved = kv._overrides["r"].pages(None, caps, PAGE_SIZE)
+    assert _ready(kv, "r") and kv._allotments["r"].pages == reserved, "the reservation doesn't match the class"
+
+
+def test_a_guaranteed_hit_on_pages_another_request_releases_still_grants_within_its_reservation():
+    kv, tokens = _pool(), list(range(3 * PAGE_SIZE))
+    _running(kv, "h", 3, arrival=0, keyed=tokens)
+    _request(kv, "g", 3, arrival=1, keyed=tokens, guaranteed=True)
+    assert _ready(kv, "g")
+    _remove(kv, "h")
+    kv._index.evict(3)  # as a third request's grant does when no page is free
+    room = kv._room()
+    assert _step(kv, "g", 7 * PAGE_SIZE).ok and kv._room() == room, "g's hit on h's pages left it short once h left"
+
+
+def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_back():
+    kv, tokens = _pool(), list(range(3 * PAGE_SIZE))
+    _running(kv, "h", 3, arrival=0, keyed=tokens)
+    _request(kv, "g", 3, arrival=1, keyed=tokens, guaranteed=True)
+    assert _ready(kv, "g")
+    room, inputs = kv._room(), ARNodeInputs(input_seq_len=3 * PAGE_SIZE)
+
+    kv.apply_cached_prefix("g", NODE, WALK, inputs, kv.resolve_cached_prefix("g", NODE, WALK, inputs))
+    leased = len(kv._streams["g"]["main"].lease or ())
+    assert leased and kv._room() == room + leased, "g's charge for the pages it leases stayed out of the room"
+
+
+@pytest.mark.parametrize("decides", [True, False])
+def test_only_a_deciding_pool_keeps_a_guaranteed_request_from_the_offload(decides):
+    kv = _pool()
+    _running(kv, "p", 2, arrival=0)
+    _running(kv, "g", 2, arrival=1, guaranteed=True)
+    kv._decides = decides
+    # Only a deciding pool reserves a guaranteed request's pages and drops requests to free room.
+    # Any other pool frees room only through the offload, which has to be able to take any request.
+    assert kv.reclaimable("p") and bool(kv.reclaimable("g")) is not decides, "the offload saw the wrong class"
+    assert kv.frees_on_remove("g"), "a guaranteed request's teardown would lift no caps"
+
+
 def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
     """A host fetch holds a run of cached pages that starts below the root, and eviction takes leaves only, so the
     pages above that run stay. Counting those pages as room would send a victim to a host that can't take
@@ -310,3 +360,13 @@ def test_an_offload_outside_preemption_reloads_as_before(decides):
 
     assert kv.can_reload("r") and kv.reload("r"), "r waited in the queue behind w"
     assert kv._allotments.get("r", manager_mod.Allotment(0)).remaining == remaining, "the reload changed r's allotment"
+
+
+def test_a_guaranteed_request_is_never_moved_to_the_host():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "r", 3, arrival=0)
+    _running(kv, "g", 2, arrival=1, guaranteed=True)
+    short = _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short
+
+    assert kv.preempt("r", short, droppable=lambda rid: False) == ["r"], "a guaranteed request was moved to the host"

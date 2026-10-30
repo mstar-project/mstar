@@ -20,7 +20,14 @@ from mstar.api_server.request_types import PreprocessInput
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVSpec,
+    PagedKVConfig,
+    PrefixSpan,
+    StreamLayout,
+    mark_guaranteed,
+)
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
@@ -132,7 +139,9 @@ def _preprocess(model: _Model, model_kwargs: dict) -> dict:
     return worker.communicator.sent[-1].body.model_kwargs
 
 
-def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, rids=("r",), **config) -> _Comm:
+def _conduct(
+    model: _Model, model_kwargs: dict, tmp_path, monkeypatch, rids=("r",), streaming=False, outputs=("text",), **config,
+) -> _Comm:
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump({
         "max_seq_len": 4096, "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}], **config,
@@ -145,7 +154,8 @@ def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, rids=("r"
         [ConductorMessage(ConductorMessageType.SETUP_DONE, SetupDone(w)) for w in conductor.worker_ids],
         [ConductorMessage(ConductorMessageType.NEW_REQUEST, NewRequestConductor(
             request_id=rid, initial_signals={}, initial_input_modalities=["text"],
-            initial_output_modalities=["text"], input_metadata={}, model_kwargs=model_kwargs,
+            initial_output_modalities=list(outputs), input_metadata={}, model_kwargs=model_kwargs,
+            streaming=streaming,
         )) for rid in rids],
     ])
 
@@ -159,8 +169,8 @@ def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, rids=("r"
     return comm
 
 
-def _ingest(model: _Model, model_kwargs: dict, tmp_path, monkeypatch):
-    sent = _conduct(model, model_kwargs, tmp_path, monkeypatch).sent
+def _ingest(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, **kwargs):
+    sent = _conduct(model, model_kwargs, tmp_path, monkeypatch, **kwargs).sent
     return next(msg.body for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST")
 
 
@@ -241,6 +251,25 @@ def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypa
 
     assert new_request.loop_caps["decode_loop"] == 29, "the default cap ran past the context"
     assert new_request.request_info.max_tokens == 29
+
+
+@pytest.mark.parametrize("streaming, outputs, kinds, guaranteed", [
+    (True, ["text", "audio"], ("ids", "ids"), True), (False, ["text", "audio"], ("ids", "ids"), False),
+    (True, ["text"], ("ids", "ids"), False), (False, ["text"], ("digest", "ids"), True),
+    (False, ["text"], ("ids", "rows"), True),
+])
+def test_every_kv_config_gets_the_class_of_the_whole_request(streaming, outputs, kinds, guaranteed):
+    configs = {key: KVReqConfig(kv_layout={"main": StreamLayout(spans=(PrefixSpan(PS, PS, "prefill", kind=kind),))})
+               for key, kind in zip(("kv", "talk"), kinds, strict=True)}
+    mark_guaranteed(configs, streaming, outputs)
+    assert [config.guaranteed for config in configs.values()] == [guaranteed] * 2, "a pool got another class"
+
+
+def test_the_conductor_marks_a_request_that_streams_audio_guaranteed(tmp_path, monkeypatch):
+    model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    kwargs = _preprocess(model, {})
+    new_request = _ingest(model, kwargs, tmp_path, monkeypatch, streaming=True, outputs=["text", "audio"])
+    assert new_request.request_info.resource_configs["kv"].guaranteed, "a voice stream would be preempted"
 
 
 def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):

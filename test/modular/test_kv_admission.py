@@ -336,6 +336,48 @@ def test_a_repeat_is_allotted_the_cached_image_end_its_probe_will_take():
     assert node.kv._allotments[RID].pages == 2, "the cached image end the probe will take was left out of the allotment"
 
 
+def test_a_guaranteed_repeat_whose_footprint_fills_the_pool_is_admitted_to_an_idle_pool():
+    node = _LayoutNode([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK])
+    node.runner.remove_request("seed")
+    overrides, node.kv.local_loops = node.kv._overrides[RID], {"decode_loop"}
+    prompt = sum(span.length for span in overrides.kv_layout["main"].spans)
+    overrides.guaranteed, overrides.loop_caps = True, {"decode_loop": node.kv.config.request_pages * PAGE_SIZE - prompt}
+
+    assert _ready(node.kv, RID), "the cached image end's copy pushed a guaranteed reservation past the pool"
+    node.walk(*_walks([TEXT, IMAGE, OTHER_ASK])[0])
+    node.kv.assert_pages_conserved()
+
+
+def _fill(kv, rid: str, spare: int = 0) -> None:
+    _laid_out(kv, rid, list(range((kv._room() - spare) * PAGE_SIZE)))
+    assert _ready(kv, rid) and kv._room() == spare
+
+
+@pytest.mark.parametrize("other", ["before", "after", None])
+def test_a_guaranteed_repeat_that_copies_an_image_end_grows_to_its_cap_in_a_full_pool(other):
+    node = _LayoutNode([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK])
+    kv, cap, walks = node.kv, 3 * PAGE_SIZE, _walks([TEXT, IMAGE, OTHER_ASK])
+    overrides, kv.local_loops = kv._overrides[RID], {"decode_loop"}
+    overrides.guaranteed, overrides.loop_caps = True, {"decode_loop": cap}
+    # "c" probes the cached image end before the repeat leases it, or while the repeat holds it
+    kv.ingest_request("c", _config([TEXT, IMAGE, list(range(400, 405))]))
+    if other == "before":
+        _probe(kv, "c", len(TEXT))
+    assert _ready(kv, RID)
+    # a page another request holds is lent in a full pool, and an evictable one takes a page of room
+    _fill(kv, "b", spare=int(other != "before"))
+    node.walk(*walks[0])
+    if other == "after":
+        _probe(kv, "c", len(TEXT))
+    assert [node.walk(walk, length) for walk, length in walks[1:]][0] == IMAGE, "the repeat recomputed its image"
+    _fill(kv, "d")
+
+    for _ in range(cap):
+        node.step(RID, 1, "decode")
+
+    kv.assert_pages_conserved()
+
+
 def test_an_image_end_copied_onto_the_repeats_page_leaves_its_allotment():
     node = _LayoutNode([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK])
     assert _ready(node.kv, RID)

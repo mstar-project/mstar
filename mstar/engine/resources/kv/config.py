@@ -5,7 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
@@ -271,6 +271,8 @@ class KVReqConfig(ResourceReqConfig):
     loop_caps: dict[str, int] | None = None
     # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
     arrival: int | None = None
+    # in a pool that decides admission, a guaranteed request reserves what it grows into and is never preempted
+    guaranteed: bool = False
 
     def apply_conductor_config(
         self,
@@ -343,8 +345,8 @@ class KVReqConfig(ResourceReqConfig):
         the one model that declares one, computes its positions in each forward.
 
         Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
-        has for requests. The pool admits on the prompt alone, so such a request would be admitted
-        and then could not finish even alone in an empty pool."""
+        has for requests. The pool admits a preemptible request on its prompt alone, so a request this
+        large would be admitted and then could not finish even alone in an empty pool."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
@@ -421,6 +423,30 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned a kv_layout for {key!r}/{extra[0]!r}, which it does not declare")
         if missing := sorted(configs[key].opened_labels() - laid_out):
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
+
+
+def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
+    """Why one rebuild row can't write a request's laid-out labels again from its token ids, or None."""
+    laid_out = [layout for layout in layouts if layout.spans]
+    if any(span.kind != SpanKind.IDS for layout in laid_out for span in layout.spans):
+        return "it holds KV that can't be recomputed from token ids"
+    if len(laid_out) > 1 or any(len(layout.spans) != 1 or len(layout.growth) != 1 for layout in laid_out):
+        return "it writes more than one label, span or growth loop, which one rebuild row can't lay out again"
+    return None
+
+
+def mark_guaranteed(
+    configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
+) -> None:
+    """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause is a gap in
+    playback, or when any of them lays out KV that a rebuild from token ids can't recompute."""
+    kv_configs = [config for config in configs.values() if isinstance(config, KVReqConfig)]
+    guaranteed = (streaming and "audio" in output_modalities) or any(
+        span.kind != "ids"
+        for config in kv_configs for layout in (config.kv_layout or {}).values() for span in layout.spans
+    )
+    for config in kv_configs:
+        config.guaranteed = guaranteed
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:

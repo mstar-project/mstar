@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -12,6 +12,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.engine.resources import Rebuild, SamplerStep
+from mstar.engine.resources.kv.config import StreamLayout, rebuild_refusal
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
 
@@ -67,6 +68,16 @@ class Rebuilds:
 
     def kept(self, rid: int, node: str) -> KeptIds | None:
         return self._kept.get(node, {}).get(rid)
+
+    def can_rebuild(self, node: str, layouts: Iterable[StreamLayout]) -> bool:
+        """Whether a rebuild on ``node`` can write a request's laid-out labels again: the node declares a policy,
+        and its loop grows labels one rebuild row can lay out again, written in the policy's walk."""
+        policy, layouts = self._policies.get(node), list(layouts)
+        return (
+            policy is not None and rebuild_refusal(layouts) is None
+            and all(loop == policy.loop for layout in layouts for loop, _ in layout.growth)
+            and all(span.walk == policy.walk for layout in layouts for span in layout.spans)
+        )
 
     def keep_prompts(
         self, node: str, graph_walk: str, request_walks: Mapping[int, str],

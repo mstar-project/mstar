@@ -255,6 +255,7 @@ class NewRequestConductor(MessageBody):
     # first chunk and the streams it ends, forwarded once the request is
     # admitted. A stream it leaves open makes it a live call.
     client_input: ClientStreamInput | None = None
+    streaming: bool = False
 
 
 @dataclass

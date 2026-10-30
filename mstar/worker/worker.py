@@ -33,8 +33,8 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.engine import ExecutingBatch, PagedKVCache
-from mstar.engine.resources import AdmitFailedReason, AllocationFailed
-from mstar.engine.resources.kv.config import without_layouts
+from mstar.engine.resources import AdmitFailedReason, AllocationFailed, ResourceReqConfig
+from mstar.engine.resources.kv.config import KVReqConfig, without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -642,6 +642,7 @@ class Worker:
         self._preemptions: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
         # node -> when its last move of a victim was logged, and the moves since
         self._drop_logged: dict[str, tuple[float, int]] = {}
+        self._set_local_loops(model, my_walks)
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -911,6 +912,7 @@ class Worker:
             self._fail_requests({request_id: f"Error in worker: {text}"})
             self._process_unprocessed(body.request_id)
             return
+        self._guarantee(request_id, body.request_info.resource_configs)
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         self.streams.add_request(request_id, body.request_info)
@@ -1068,6 +1070,27 @@ class Worker:
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
+
+    def _set_local_loops(self, model: Model | None, my_walks: set[tuple[str, str]]) -> None:
+        """Give each paged KV cache the loops that grow it in a walk this worker runs on one of the cache's nodes."""
+        labels = model.kv_labels() if model is not None else {}
+        for kv in self._kv_caches.values():
+            kv.cache.local_loops = {
+                loop for label in labels.get(kv.key, {}).values() for walk, loop in label.growth
+                if any((node, walk) in my_walks for node in kv.nodes)
+            }
+
+    def _guarantee(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+        """Where a node lays out KV for the request that no rebuild here can write again, no drop can free the
+        request's pages, so the request is guaranteed in every paged KV cache of that node."""
+        for node_name, keys in self._kv_keys.items():
+            node_configs = [config for key in keys if isinstance(config := configs.get(key), KVReqConfig)]
+            layouts = [layout for config in node_configs for layout in (config.kv_layout or {}).values()]
+            if any(layout.spans or layout.growth for layout in layouts) and not self._rebuilds.can_rebuild(
+                node_name, layouts,
+            ):
+                for config in node_configs:
+                    config.guaranteed = True
 
     def _drop(self, request_id: int, node_name: str) -> int:
         """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return

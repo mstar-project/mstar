@@ -35,6 +35,7 @@ from mstar.engine.engine import PagedKVCache
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.step import Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
+from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -251,6 +252,29 @@ def test_preemptions_after_metrics_start_are_reported():
     (snapshot,) = [s for s in metrics.snapshot() if s.name == "mstar_kv_preemptions_total"]
     reported = dict(zip(map(tuple, snapshot.label_values), snapshot.values, strict=True))
     assert reported == {(NODE,): 1}, "the preemption went unreported"
+
+
+@pytest.mark.parametrize("walks, loops", [
+    ({(NODE, "prefill")}, set()), ({(NODE, "prefill"), (NODE, "decode")}, {"decode"}),
+], ids=["prefill worker", "worker that runs every walk"])
+def test_a_pool_reserves_growth_only_for_the_loops_its_worker_runs(walks, loops):
+    kv = _pool()
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    _worker(kv)._set_local_loops(model, walks)
+    assert kv.local_loops == loops, "a guaranteed request would reserve growth its worker never runs"
+
+
+def test_an_older_request_drops_itself_rather_than_a_newer_guaranteed_one():
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 1, arrival=2, guaranteed=True)
+    w = _worker(kv)
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(node_name=NODE, admit_error=_step(kv, "r", 1).reason, failed_resource="kv")
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert w._dropped == {"r": NODE} and kv.is_resident("v"), "a guaranteed request was dropped for an older page"
 
 
 def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_twice():

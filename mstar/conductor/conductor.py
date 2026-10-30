@@ -36,7 +36,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.kv.config import mark_guaranteed, refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
@@ -1405,6 +1405,7 @@ class Conductor:
             )
             for key, cfg in request_data.resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
+        mark_guaranteed(request_data.resource_configs, body.streaming, body.initial_output_modalities)
         for specs in self._resource_specs():
             for key, cfg in request_data.resource_configs.items():
                 cfg.validate(specs.get(key))
