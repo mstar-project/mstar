@@ -1,6 +1,5 @@
 
 
-import functools
 import logging
 import os
 import threading
@@ -460,14 +459,6 @@ class ExecutingBatch:
         self.step_context.slot_lease = slot_lease
         if self.slot is None:
             self.set_slot(slot_lease.slot)
-
-
-@functools.cache
-def _warn_host_rows_dropped(resource_key: str) -> None:
-    logger.warning(
-        "resource %r has rows for the host (e.g. log-probs), but this node's forward hands over "
-        "no row-addressed stop buffers, so they are dropped", resource_key,
-    )
 
 
 class Engine:
@@ -1457,9 +1448,13 @@ class Engine:
             if not (rows := resource.step_host_rows()):
                 continue
             if out.check_stop_buffers is None:
-                _warn_host_rows_dropped(key)
-            else:
-                out.check_stop_buffers = {**out.check_stop_buffers, **rows}
+                raise RuntimeError(
+                    f"resource {key!r} has rows for the host (e.g. log-probs), but this node's "
+                    "forward hands over no row-addressed stop buffers",
+                )
+            if clash := rows.keys() & out.check_stop_buffers.keys():
+                raise RuntimeError(f"resource {key!r} adds host rows {sorted(clash)} the step already has")
+            out.check_stop_buffers = {**out.check_stop_buffers, **rows}
 
     def _exec_per_request(
         self, batch: ExecutingBatch

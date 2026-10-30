@@ -176,9 +176,25 @@ def test_resource_rows_join_the_stop_buffers_without_touching_the_models_dict():
     assert stop == {"new_token": tokens}
 
 
-def test_resource_rows_without_stop_buffers_are_dropped_with_a_warning(caplog):
-    out = BatchedModelOutput()
-    mgmt = SimpleNamespace(resources={"sampler": _Rows({SAMPLED_LOGPROB: torch.tensor([-0.1])})})
-    Engine._add_resource_host_rows(mgmt, out)
-    assert out.check_stop_buffers is None
-    assert "no row-addressed stop buffers" in caplog.text
+def test_resource_rows_with_nowhere_to_go_raise():
+    rows = _Rows({SAMPLED_LOGPROB: torch.tensor([-0.1])})
+    with pytest.raises(RuntimeError, match="no row-addressed stop buffers"):
+        Engine._add_resource_host_rows(SimpleNamespace(resources={"sampler": rows}), BatchedModelOutput())
+    # two resources under one key would keep only the last one's
+    out = BatchedModelOutput(check_stop_buffers={"new_token": torch.tensor([1])})
+    with pytest.raises(RuntimeError, match="already has"):
+        Engine._add_resource_host_rows(SimpleNamespace(resources={"talker": rows, "code_pred": rows}), out)
+
+
+def test_a_second_sample_in_one_step_raises_while_logprobs_are_on():
+    res = _resource()
+    res.ingest_request(0, SamplingReqConfig(return_logprobs=True))
+    _step(res, [0], _logits()[:1])
+    with pytest.raises(RuntimeError, match="one sample"):
+        res.sample([0], _logits()[:1])
+    _step(res, [0], _logits()[:1])  # the next plan starts a new step
+    # without them, a node may sample as often as it likes
+    plain = _resource(enable=False)
+    plain.ingest_request(0, SamplingReqConfig())
+    plain.sample([0], _logits()[:1])
+    plain.sample([0], _logits()[:1])

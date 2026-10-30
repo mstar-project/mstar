@@ -382,8 +382,10 @@ via ``extra_body``.
 
 With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
 YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
-token's raw log-prob in its chunk's ``metadata`` (``{"logprob": ...}``); top
-alternatives and OpenAI's ``logprobs`` are not supported yet. On any deployment,
+token's raw log-prob in its chunk's ``metadata`` (``{"logprobs": [...]}``, one per
+token, as ``token_ids``). Qwen3.5 reports them; other models refuse the request
+with a 400. Top alternatives and OpenAI's ``logprobs`` are not supported yet. On
+any deployment,
 ``"return_token_ids": true`` adds each text chunk's sampled ids
 (``{"token_ids": [...]}``), stop tokens included, so a trainer need not
 re-tokenize the text.

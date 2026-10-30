@@ -103,6 +103,7 @@ class SamplerResource(Resource):
         # Resident requests that asked for log-probs: with none, no step's
         # log-prob rows are copied to the host.
         self._logprob_rids: set[str] = set()
+        self._sampled_this_step = False
         self._device = device
         self._comm_group = comm_group
         self._cg_buffers: SamplerBuffers | None = None
@@ -375,6 +376,7 @@ class SamplerResource(Resource):
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
             self._kept_rids = step.kept_rids
+            self._sampled_this_step = False
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -518,6 +520,11 @@ class SamplerResource(Resource):
         which is what the graph sampler's per-row params were gathered for.
         The eager sampler keys off request ids and sees the real batch only.
         """
+        if self._enable_logprobs:
+            # under capture this fires once, at capture; a replay never calls in
+            if self._sampled_this_step:
+                raise RuntimeError("log-probs need one sample() per step, and this node's forward samples again")
+            self._sampled_this_step = True
         if self._cg_sampler is not None:
             # The capability flag, not the liveness one. Under a replay this
             # argument is inert (the kernel variant was baked at capture), and
@@ -544,6 +551,10 @@ class SamplerResource(Resource):
         return tokens
 
     def step_host_rows(self) -> dict[str, torch.Tensor]:
+        """The step's log-prob rows. They assume one ``sample`` per step whose
+        token is the row's emitted one, which ``sample`` enforces while
+        log-probs are on; a node that samples more than once (a code
+        predictor) needs its own path."""
         if not self._logprob_rids:
             return {}
         # a replay never calls `sample`: its rows are the slot's static ones

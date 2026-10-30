@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -45,6 +46,8 @@ def test_result_tokens_round_trips_through_the_codec():
     assert back.body.loop_indices[2].wg_fwd_pass_idx == 10
     assert back.body.signal == "text_inputs" and back.body.modality == "text"
     assert back.body.logprobs == [-0.25, None, -1.0]
+    plain = replace(msg, body=replace(msg.body, logprobs=None))
+    assert wire.decode(wire.encode(plain)).body.logprobs is None
 
 
 # -- api server --------------------------------------------------------------
@@ -172,7 +175,7 @@ def test_inline_logprobs_land_in_their_chunks_metadata():
     worker._draining_rids.add("gone")
     worker.result_tensor_queue.put(InlineTokens(["gone", "req", "quiet"], [1, 11, 12], "text", [-0.1, -0.5, None]))
     chunks = {c.request_id: c.metadata for c in _run_until(worker, stop, 2)}
-    assert chunks == {"req": {"logprob": -0.5}, "quiet": {}}
+    assert chunks == {"req": {"logprobs": [-0.5]}, "quiet": {}}
 
 
 def test_a_request_that_asks_gets_each_text_chunks_token_ids():
@@ -180,12 +183,13 @@ def test_a_request_that_asks_gets_each_text_chunks_token_ids():
     worker.request_model_kwargs = {"req": {"return_token_ids": True}}
     worker.result_tensor_queue.put(InlineTokens(["req", "other"], [11, 12], "text", [-0.5, None]))
     chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
-    assert chunks["req"].metadata == {"logprob": -0.5, "token_ids": [11]}
+    assert chunks["req"].metadata == {"logprobs": [-0.5], "token_ids": [11]}
     assert chunks["other"].metadata == {}
-    # a tensor chunk's ids too, and nothing on a modality that is not text
+    # a tensor chunk's ids too, and nothing on another modality or a float text tensor (Whisper's alignment)
     ids = torch.tensor([[5, 151645]])
     assert worker._with_token_ids("req", "text", ids, {}) == {"token_ids": [5, 151645]}
     assert worker._with_token_ids("req", "audio", ids, {"sample_rate": 1}) == {"sample_rate": 1}
+    assert worker._with_token_ids("req", "text", torch.rand(2, 3), {}) == {}
 
 
 def test_the_facade_accounts_an_inline_token_like_a_tensor():

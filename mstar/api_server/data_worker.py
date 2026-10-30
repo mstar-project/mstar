@@ -1379,7 +1379,7 @@ class PreprocessWorkerThread:
                     )[0]
                 else:
                     data = datas[i]
-                metadata = {} if not logprobs or logprobs[i] is None else {"logprob": logprobs[i]}
+                metadata = {} if not logprobs or logprobs[i] is None else {"logprobs": [logprobs[i]]}
                 if self._wants_token_ids(request_id, item.modality):
                     metadata["token_ids"] = [values[i]]
                 self._queue_completed_output(
@@ -1398,8 +1398,9 @@ class PreprocessWorkerThread:
         return modality == "text" and bool((self.request_model_kwargs.get(request_id) or {}).get("return_token_ids"))
 
     def _with_token_ids(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
-        """``metadata`` plus the chunk's sampled ids, stop tokens included."""
-        if not self._wants_token_ids(request_id, modality):
+        """``metadata`` plus the chunk's sampled ids, stop tokens included. A
+        float text tensor (Whisper's word alignment) carries no ids."""
+        if tensor.is_floating_point() or not self._wants_token_ids(request_id, modality):
             return metadata
         return {**metadata, "token_ids": tensor.reshape(-1).tolist()}
 

@@ -775,7 +775,8 @@ def _token_logprob_kernel(
     inv_temp = tl.where(temp == 0, 1.0, 1.0 / tl.maximum(temp, 1e-30))
     tok = tl.load(tokens_ptr + row)
     picked = tl.load(logits_ptr + row * stride_b + tok * stride_v).to(tl.float32) * inv_temp
-    tl.store(out_ptr + row, picked - gmax - tl.log(gsum))
+    # the partials' approximate exp can put a near-certain token a hair above 0
+    tl.store(out_ptr + row, tl.minimum(picked - gmax - tl.log(gsum), 0.0))
 
 
 def _token_logprobs_cuda(logits: torch.Tensor, tokens: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
