@@ -167,7 +167,10 @@ def dummy_metadata(
     }
 
 
-def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False):
+def capture_into_graph(
+    run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
+    node_name: str | None = None,
+):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
@@ -196,7 +199,7 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, 
     torch.backends.cudnn.benchmark = False
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
-                autocast_scope(autocast_dtype, backend.device_type):
+                autocast_scope(autocast_dtype, backend.device_type, node_name):
             with backend.capture(graph, pool=pool):
                 output = run()
     except BaseException:
@@ -212,6 +215,7 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, 
 
 def capture_with_static_outputs(
     run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
+    node_name: str | None = None,
 ):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
@@ -240,7 +244,7 @@ def capture_with_static_outputs(
             static_outputs[name].copy_(value)
         return static_outputs
 
-    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph)
+    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph, node_name=node_name)
     return graph, static_outputs
 
 
@@ -862,7 +866,7 @@ class AcceleratorGraphRunner:
                             CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
-                                autocast_dtype=self._autocast_dtype,
+                                autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
@@ -898,7 +902,7 @@ class AcceleratorGraphRunner:
                     memory = _capture_thrown_away(
                         partial(
                             capture_into_graph, warmed.run, device=self._device,
-                            autocast_dtype=self._autocast_dtype,
+                            autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
                         ),
                         f"{self._submodule_name} {spec}",
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
@@ -1080,6 +1084,7 @@ class AcceleratorGraphRunner:
             torch.accelerator.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+                node_name=self._submodule_name,
             )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
@@ -1813,6 +1818,7 @@ class PiecewiseAcceleratorGraphRunner:
                                 partial(
                                     capture_with_static_outputs, warmed.run, warmed.warm_outputs,
                                     device=self._device, autocast_dtype=self._autocast_dtype,
+                                    node_name=self._node_name,
                                 ),
                                 f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                             )
@@ -1847,6 +1853,7 @@ class PiecewiseAcceleratorGraphRunner:
                         partial(
                             capture_with_static_outputs, warmed.run, self._outputs_like(bucket),
                             device=self._device, autocast_dtype=self._autocast_dtype,
+                            node_name=self._node_name,
                         ),
                         f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                     )
@@ -1968,6 +1975,7 @@ class PiecewiseAcceleratorGraphRunner:
             graph, static_outputs = capture_with_static_outputs(
                 warmed.run, warmed.warm_outputs if forwards else self._outputs_like(self._bucket(shape)),
                 self._memory_pool, self._device, self._autocast_dtype,
+                node_name=self._node_name,
             )
 
         self._graphs[PiecewiseGraphKey(

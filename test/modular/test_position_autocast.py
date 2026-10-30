@@ -1,3 +1,8 @@
+import types
+from contextlib import nullcontext
+from unittest import mock
+
+import pytest
 import torch
 
 from mstar.engine.resources.position.config import PositionConfig
@@ -59,3 +64,40 @@ def test_apply_qk_without_autocast_downcasts_fp32_and_warns_once(monkeypatch, ca
     warnings = [r.getMessage() for r in caplog.records if r.name == node_dtype.__name__]
     assert len(warnings) == 1
     assert "RoPE" in warnings[0] and "code2wav" in warnings[0]
+
+
+@pytest.mark.parametrize("static_outputs", [False, True])
+def test_downcast_during_capture_names_the_node(monkeypatch, caplog, static_outputs):
+    """A capture runs under the node's scope too, so a downcast it records
+    names the node rather than ``<unknown>``."""
+    from mstar.engine import accelerator_graph_runner, node_dtype
+    from mstar.utils.device import DeviceCapability
+
+    backend = types.SimpleNamespace(
+        device_type="cpu", current_stream=lambda: None, create_graph=lambda keep_graph=False: object(),
+        capture=lambda graph, pool: nullcontext(), synchronize=lambda: None,
+        recover_failed_capture=lambda pool, stream: None,
+    )
+    monkeypatch.setattr(DeviceCapability, "of", lambda device: types.SimpleNamespace(graph_backend=backend))
+    monkeypatch.setattr(
+        torch.ops.mstar, "rope_apply_qk_inplace", lambda q, k, *args, **kwargs: None,
+    )
+    monkeypatch.setattr(node_dtype, "_warned", set())
+    manager = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"), max_seq_len=8)
+    manager._current_pos_ids["main"] = torch.arange(1)
+    q = torch.ones((1, 1, 2), dtype=torch.float32)
+
+    def run():
+        return {"q": manager.apply_qk(q, q.clone(), "main")[0]}
+
+    with caplog.at_level("WARNING", logger=node_dtype.__name__):
+        if static_outputs:
+            accelerator_graph_runner.capture_with_static_outputs(
+                run, {"q": q.clone()}, mock.Mock(), "cpu", None, node_name="code2wav",
+            )
+        else:
+            accelerator_graph_runner.capture_into_graph(run, mock.Mock(), "cpu", None, node_name="code2wav")
+
+    warnings = [r.getMessage() for r in caplog.records if r.name == node_dtype.__name__]
+    assert len(warnings) == 1
+    assert "code2wav" in warnings[0] and "<unknown>" not in warnings[0]
