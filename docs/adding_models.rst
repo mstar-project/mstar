@@ -981,12 +981,11 @@ request puts through the adapted linears, in the order they are packed), and eac
 adapted linear adds ``pool.layer_delta(target, layer)(x, y)`` to its base output before
 anything reads it: before a column-parallel gather, before a row-parallel all-reduce.
 
-The pool keeps the last step's addressing after commit, so a delta called outside a step
-would add another step's adapters to these rows. The engine brackets every planned step's
-``preprocess`` and forward, and every capture, in ``StepRunner.compute_scope``
-(``Resource.enter_compute`` / ``exit_compute``); an engine-built pool refuses a delta
-called outside one when run eagerly. ``warmup_compiles`` runs outside any step, so a node
-serving adapters runs no adapted linear there.
+The pool holds a step's addressing from its plan to its commit (or rollback), so a delta
+called outside a step (``prepare_inputs``, an output cached from an earlier step) refuses
+when run eagerly instead of adding another step's adapters to these rows.
+``warmup_compiles`` runs outside any step, so a node serving adapters runs no adapted
+linear there.
 
 A ``LoraSpec``'s parts:
 

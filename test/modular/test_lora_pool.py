@@ -110,12 +110,14 @@ def step(rids, spans=None) -> LoraStep:
     return LoraStep(segments=tuple(Segment(r, "main", s) for r, s in zip(rids, spans, strict=True)))
 
 
-def run_step(pool, rids, spans=None, **ctx_kw):
+def run_step(pool, rids, spans=None, commit=True, **ctx_kw):
+    """Admit and plan a step over ``rids``; and commit it, unless a delta is to run in it."""
     s, c = step(rids, spans), ctx(rids, **ctx_kw)
     outcome = pool.admit(s, c)
     if outcome.ok:
         pool.plan(s, c)
-        pool.commit(s, c)
+        if commit:
+            pool.commit(s, c)
     return outcome
 
 
@@ -329,7 +331,7 @@ def test_callable_matches_per_token_reference(adapters, layer):
         ingest(pool, rid, name)
     spans = [s for _, _, s in rows]
     tokens = sum(spans)
-    assert run_step(pool, [r for r, _, _ in rows], spans).ok
+    assert run_step(pool, [r for r, _, _ in rows], spans, commit=False).ok
     # a layer an adapter does not adapt is rank 0 there, which the kernels skip
     s1, s2, s3 = (pool.slot_of(r) for r in ("r1", "r2", "r3"))
     qkv, o = pool.layer_ranks("qkv", layer), pool.layer_ranks("o", layer)
@@ -357,7 +359,7 @@ def test_compiles_without_graph_breaks(adapters):
     pool = make_pool(paths)
     ingest(pool, "r1", "a1")
     ingest(pool, "b", None)
-    assert run_step(pool, ["r1", "b"], [2, 1]).ok
+    assert run_step(pool, ["r1", "b"], [2, 1], commit=False).ok
     lora = pool.layer_delta("qkv", 0)
 
     def layer(x, y):

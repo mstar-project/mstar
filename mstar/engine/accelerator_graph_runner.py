@@ -1133,12 +1133,11 @@ class AcceleratorGraphRunner:
                         f"capture admit failed for {spec.bucket}: {outcome.reason}"
                     )
                 self._step_runner.plan(step)
-            with self._step_runner.compute_scope(step):
-                return self._submodule.preprocess(
-                    graph_walk=walk,
-                    engine_inputs=engine_inputs,
-                    inputs=dummy_inputs,
-                )
+            return self._submodule.preprocess(
+                graph_walk=walk,
+                engine_inputs=engine_inputs,
+                inputs=dummy_inputs,
+            )
 
         try:
             static_inputs = prepare()
@@ -1161,12 +1160,11 @@ class AcceleratorGraphRunner:
             forward = self._forward_for(spec)
 
             def run_forward():
-                with self._step_runner.compute_scope(step):
-                    return forward(
-                        graph_walk=walk,
-                        engine_inputs=engine_inputs,
-                        **static_inputs,
-                    )
+                return forward(
+                    graph_walk=walk,
+                    engine_inputs=engine_inputs,
+                    **static_inputs,
+                )
 
             self._graph_backend.set_device()
             self._graph_backend.synchronize()
@@ -2010,8 +2008,7 @@ class PiecewiseAcceleratorGraphRunner:
             )
 
         def run_fn():
-            with self._step_runner.compute_scope(step):
-                return self._normalize_output(fn(call))
+            return self._normalize_output(fn(call))
 
         try:
             self._plan(step, shape)

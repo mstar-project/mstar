@@ -150,11 +150,12 @@ class LoraLayerDelta:
         self._embedding = declared.kind == "embedding"
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        if self._pool.outside_compute() and not torch.compiler.is_compiling():
+        # compile check first, so a traced forward installs no guard on the pool
+        if not torch.compiler.is_compiling() and self._pool._current is None:
             raise RuntimeError(
                 "a LoRA delta was called outside its node's planned step (e.g. from "
-                "prepare_inputs, or on an output cached from an earlier step): it would "
-                "address another step's rows. Call the module's base computation there "
+                "prepare_inputs, or on an output cached from an earlier step): there is "
+                "no addressing for its rows. Call the module's base computation there "
                 "and add the delta in preprocess or the forward"
             )
         if not self._pool.active:
@@ -257,14 +258,10 @@ class LoraAdapterPool(Resource):
                     return bool(joint.agree([int(flag)])[0])
                 # the instance's leader picks every batch; the others run what it picked
                 decides = joint.rank == 0
-        pool = cls(
+        return cls(
             spec, info.device, rank=rank, world_size=world_size, dtype=info.compute_dtype,
             agree=agree, decides=decides,
         )
-        # the engine brackets every planned step's compute (`enter_compute`), so a delta
-        # called outside one is a bug from the start
-        pool._scoped = True
-        return pool
 
     def __init__(
         self,
@@ -335,12 +332,6 @@ class LoraAdapterPool(Resource):
         self._store = LoraAdapterStore(spec, rank=rank, world_size=world_size, dtype=self.dtype)
         # (target, layer) -> its bound delta, one per binding so compiled code guards on it
         self._layer_deltas: dict[tuple[str, int], LoraLayerDelta] = {}
-        # Depth of the engine's compute scopes (a planned step's preprocess and forward,
-        # a capture), and whether the engine drives them (an engine-built pool, or one a
-        # scope was entered on): then a delta called outside one raises, since
-        # `_current` still holds the last step's rows.
-        self._compute_depth = 0
-        self._scoped = False
 
         # Handle-keyed request state, all purged by `remove_request`.
         self._adapter_of: dict = {}   # rid -> adapter name, None for the base model
@@ -370,7 +361,7 @@ class LoraAdapterPool(Resource):
         self._stager = PinnedStager(torch.int32)
         self._eager: _Buffers | None = None
         self._cg: dict[CGSlotKey, _Buffers] = {}
-        # row grouping -> this step's addressing
+        # row grouping -> this step's addressing, from its plan until its commit
         self._current: dict[int, LoraAddressing] | None = None
         # whether this step adds deltas (`plan`); a plain bool, which compiled forwards
         # guard on
@@ -414,18 +405,6 @@ class LoraAdapterPool(Resource):
                 )
             found = self._layer_deltas[(target, layer_idx)] = LoraLayerDelta(self, target, layer_idx)
         return found
-
-    def enter_compute(self) -> None:
-        self._compute_depth += 1
-        self._scoped = True
-
-    def exit_compute(self) -> None:
-        self._compute_depth -= 1
-
-    def outside_compute(self) -> bool:
-        """A delta called now would run outside a planned step's compute, once the
-        engine has started bracketing them (``enter_compute``)."""
-        return self._scoped and not self._compute_depth
 
     def addressing(self, grouping: int = 1) -> LoraAddressing:
         """This step's addressing for rows of ``grouping`` (``LoraTarget.row_grouping``),
@@ -690,6 +669,8 @@ class LoraAdapterPool(Resource):
         """Give back the slots this step's admit took. An adapter it loaded stays resident
         in its now-unheld slot, as a cache."""
         del step
+        if ctx.graph_walk != PIECEWISE_WALK:
+            self._current = None
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
@@ -708,7 +689,11 @@ class LoraAdapterPool(Resource):
 
     def commit(self, step: LoraStep, ctx: StepContext) -> None:
         del step
-        if self._enclosing is not None and ctx.graph_walk == PIECEWISE_WALK:
+        if ctx.graph_walk != PIECEWISE_WALK:
+            # nothing reads the addressing past the step's forward: a delta called
+            # before the next plan refuses rather than add these rows' adapters
+            self._current = None
+        elif self._enclosing is not None:
             # the region is done; the eager code after it reads the enclosing plan
             (self._current, self.active), self._enclosing = self._enclosing, None
         if ctx.capture or not self._admit_taken:

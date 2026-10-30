@@ -1711,31 +1711,6 @@ class Engine:
             per_request_input_metadata=batch.per_request_input_metadata,
         )
         laps.lap("engine_inputs")
-        with self._runner.compute_scope(step):
-            raw = self._preprocess_and_forward(
-                batch, submodule_mgmt, cg_runner, engine_inputs, inputs, ctx,
-                lease, running_batched, request_ids, set_launch,
-            )
-
-        if step is not None:
-            if nvtx:
-                range_push("engine.commit")
-            t0 = phase_start()
-            try:
-                self._runner.commit(step)
-            finally:
-                phase_end("engine.commit", t0)
-                if nvtx:
-                    range_pop()
-        return raw, step
-
-    def _preprocess_and_forward(
-        self, batch, submodule_mgmt, cg_runner, engine_inputs, inputs, ctx,
-        lease, running_batched, request_ids, set_launch,
-    ):
-        """``preprocess`` then the forward, inside the step's compute scope."""
-        nvtx = self._enable_nvtx
-        submodule = submodule_mgmt.submodule
         if nvtx:
             range_push("engine.preprocess")
         t0 = phase_start()
@@ -1762,7 +1737,7 @@ class Engine:
         try:
             # eager, compiled (its first call traces under it too) or replayed
             with fp32_precision_scope(submodule_mgmt.fp32_precision):
-                return self._forward(
+                raw = self._forward(
                     batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                     lease, running_batched, request_ids, release_event,
                 )
@@ -1770,6 +1745,18 @@ class Engine:
             phase_end("engine.forward", t0)
             if nvtx:
                 range_pop()
+
+        if step is not None:
+            if nvtx:
+                range_push("engine.commit")
+            t0 = phase_start()
+            try:
+                self._runner.commit(step)
+            finally:
+                phase_end("engine.commit", t0)
+                if nvtx:
+                    range_pop()
+        return raw, step
 
     def _forward(
         self,

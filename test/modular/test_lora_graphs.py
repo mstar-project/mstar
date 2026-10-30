@@ -121,13 +121,12 @@ def test_a_refusal_unwinds_the_pools_partial_takes_through_the_runner(adapters):
     assert pool.resident_slot("a1") == 1
 
 
-def test_a_delta_runs_only_inside_its_planned_steps_compute_scope(adapters):
-    """A delta outside a step (prepare_inputs, a cached output) would read the last step's
-    addressing. The engine brackets preprocess, forward and capture in
-    ``StepRunner.compute_scope``, and an engine-built pool refuses a delta outside one."""
-    pool = LoraAdapterPool.build(P.make_spec(adapters[1]), ENGINE_INFO)
+def test_a_delta_runs_only_between_its_steps_plan_and_commit(adapters):
+    """A delta outside a step (prepare_inputs, a cached output) would read another step's
+    addressing: the pool keeps a step's addressing from its plan to its commit or rollback,
+    and a delta called outside that refuses."""
+    pool = P.make_pool(adapters[1])
     P.ingest(pool, "r", "a1")
-    assert P.run_step(pool, ["r"]).ok  # committed: the pool keeps its addressing
 
     def delta():
         x, y = torch.randn(1, P.HIDDEN, dtype=F64), torch.zeros(1, P.Q_OUT + 2 * P.KV_OUT, dtype=F64)
@@ -135,22 +134,14 @@ def test_a_delta_runs_only_inside_its_planned_steps_compute_scope(adapters):
 
     with pytest.raises(RuntimeError, match="outside its node's planned step"):
         delta()
-    runner = StepRunner({"lora": pool, "plain": _Plain()})
-    with runner.compute_scope(_runner_step(["r"], ["lora"])):
+    for end in (pool.commit, pool.rollback_admit):
+        s, c = P.step(["r"]), P.ctx(["r"])
+        assert pool.admit(s, c).ok
+        pool.plan(s, c)
         delta()
-        with runner.compute_scope(_runner_step(["r"], ["lora", "plain"])):  # a nested region's step
+        end(s, c)
+        with pytest.raises(RuntimeError, match="outside"):
             delta()
-        delta()
-    with pytest.raises(RuntimeError, match="outside"):
-        delta()
-    with pytest.raises(ValueError), runner.compute_scope(_runner_step(["r"], ["lora"])):
-        raise ValueError
-    with pytest.raises(RuntimeError, match="outside"):  # a raising forward still leaves the scope
-        delta()
-    # a piecewise region whose own step leaves the LoRA resource out is refused at its capture
-    with runner.compute_scope(_runner_step(["r"], ["plain"])), pytest.raises(RuntimeError, match="outside"):
-        delta()
-    assert runner.compute_scope(None) is runner.compute_scope(_runner_step(["r"], ["plain"]))  # the shared no-op
 
 
 # --- base-only captures ------------------------------------------------------------------
