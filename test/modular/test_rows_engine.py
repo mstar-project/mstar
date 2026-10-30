@@ -8,6 +8,7 @@ accumulator (checked out of a per-request store); each step adds one to
 both, so a request's state is the number of steps it ran.
 """
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -75,6 +76,7 @@ class _Counter(Resource):
         self.count: dict[int, int] = {}
         self.store = torch.zeros(HANDLES, 2, device=device)
         self.rows: _CounterRows | None = None
+        self.offloaded: dict[int, tuple[int, torch.Tensor]] = {}
 
     def ingest_request(self, rid, overrides):
         if rid not in self.count:
@@ -83,6 +85,30 @@ class _Counter(Resource):
 
     def remove_request(self, rid):
         self.count.pop(rid, None)
+
+    @property
+    def supports_eviction(self):
+        return True
+
+    def is_offloaded(self, rid):
+        return rid in self.offloaded
+
+    def reclaimable(self, rid):
+        return int(rid in self.count and rid not in self.offloaded)
+
+    def offload(self, rid):
+        # what the store holds for it, which a row that wasn't checked in
+        # hasn't written back yet
+        self.offloaded[rid] = (self.count[rid], self.store[rid].cpu().clone())
+        self.store[rid] = -1
+        self.count[rid] = -1
+        return 1
+
+    def reload(self, rid):
+        count, acc = self.offloaded.pop(rid)
+        self.count[rid] = count
+        self.store[rid] = acc.to(self.device)
+        return True
 
     def row_state(self, space, node_name, graph_walk):
         if not self.keeps_rows:
@@ -264,6 +290,24 @@ def test_a_pre_plan_is_stale_once_its_rows_moved_on(device):
     assert not engine.preplan_is_stale(batch)
     _step(engine, ROWS_WALK, [2])
     assert engine.preplan_is_stale(batch)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_a_request_holding_a_row_is_evicted_with_the_state_its_row_held(device):
+    engine = _engine(device)
+    engine._graph_runtime = SimpleNamespace(get_rid_string=str)  # for the reload's log line
+    space = engine._rows[NODE].space(ROWS_WALK)
+    for rid in (1, 2, 3):
+        engine.add_request(rid)
+    for _ in range(3):
+        _step(engine, ROWS_WALK, [1, 2, 3])
+    assert engine.offload_request(NODE, 2) > 0
+    assert not space.holds(2)
+    space.check_mirrors()
+    _step(engine, ROWS_WALK, [1, 3])
+    assert engine.reload_request(NODE, 2)
+    _, seen = _step(engine, ROWS_WALK, [1, 2, 3])
+    assert seen == {1: (4, 4.0), 2: (3, 3.0), 3: (4, 4.0)}
 
 
 def test_a_resource_that_cannot_keep_rows_refuses_the_walk_at_startup():
