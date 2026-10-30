@@ -1055,7 +1055,9 @@ ones: requests behind it wait too, and the held slots drain. A slot is reserved 
 only once its adapter's host copy is in, so its admit never waits on a read. A reservation
 counts slots and pins none: which slot an admit takes follows from the slot table alone. An
 adapter with nothing for a pool's targets (a text-only adapter on a vision tower's pool)
-takes no slot there once an admit has read it: its rows address the zero adapter. Only the
+takes no slot there and runs no delta (its steps can replay the base-only capture): the
+pool knows it from the file's header at startup, or from a runtime load's read, and its
+rows address the zero adapter. Only the
 rank that chooses batches admits: on a lockstep instance the leader, whose choice the
 followers run as sent, so its reservations need no agreement across ranks.
 The plan writes each step's addressing (for each row grouping its targets read, per token,

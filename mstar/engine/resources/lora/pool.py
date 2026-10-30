@@ -71,7 +71,7 @@ from mstar.engine.resources.lora.config import (
     LoraStep,
     describe_load_error,
 )
-from mstar.engine.resources.lora.store import LoadedAdapter, LoraAdapterStore
+from mstar.engine.resources.lora.store import LoadedAdapter, LoraAdapterStore, adapter_targets
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -317,16 +317,19 @@ class LoraAdapterPool(Resource):
 
         self._slots = [SlotState(index=i) for i in range(num_slots)]
         self._resident: dict[str, int] = {}  # adapter -> slot
-        # adapters with nothing for this spec's targets (rank 0 here, e.g. a text-only
-        # adapter on a vision tower's pool): their rows address the zero adapter and
-        # hold no slot. Known from the first admit that read one, on every rank alike.
-        self._empty: set[str] = set()
         # adapter -> where it is read from: those a new request may name, and those
         # unloaded while live requests still named them, kept until the last of those
         # requests is removed
         self._serving: dict[str, _Served] = {
             name: _Served(path, spec.adapter_digests.get(name))
             for name, path in spec.adapters.items()
+        }
+        # adapters with nothing for this spec's targets (rank 0 here, e.g. a text-only
+        # adapter on a vision tower's pool): their rows address the zero adapter, take
+        # no slot and run no delta. Known before any request names one, from its file's
+        # header (or a runtime load's read), so the same on every rank.
+        self._empty: set[str] = {
+            name for name, served in self._serving.items() if not adapter_targets(spec, served.path)
         }
         self._retiring: dict[str, _Served] = {}
         self._store = LoraAdapterStore(spec, rank=rank, world_size=world_size, dtype=self.dtype)
@@ -371,7 +374,7 @@ class LoraAdapterPool(Resource):
         self._enclosing: tuple[dict[int, LoraAddressing], bool] | None = None
 
         # read adapters ahead, so a first request finds its adapter in the host tier
-        for name in list(self._serving)[:spec.cpu_capacity]:
+        for name in [n for n in self._serving if n not in self._empty][:spec.cpu_capacity]:
             served = self._serving[name]
             adapter = self._store.load(name, served.path, served.digest)
             self._pin_digest(name, served, adapter.digest)
@@ -491,7 +494,11 @@ class LoraAdapterPool(Resource):
         adapter = self._store.read(name, path, digest)
         with self._lock:
             self._refuse_reload(name)
-            self._store.put(adapter, keep=self._wanted())
+            if adapter.rank == 0:
+                # no request can name it before it is served, below
+                self._empty.add(name)
+            else:
+                self._store.put(adapter, keep=self._wanted())
             self._serving[name] = _Served(path, adapter.digest)
         logger.info("LoRA pool: loaded %s from %s", name, path)
 
@@ -896,12 +903,13 @@ class LoraAdapterPool(Resource):
     # Addressing
 
     def runs_adapters(self, rids) -> bool:
-        """Whether any of ``rids`` names an adapter: set at ingest, so the same on every
-        rank of a lockstep instance."""
+        """Whether any of ``rids`` names an adapter with something for this pool: set at
+        ingest and from the adapters' files, so the same on every rank of a lockstep
+        instance."""
         if not self._adapter_rows:
             return False
-        get = self._adapter_of.get
-        return any(get(rid) is not None for rid in rids)
+        get, empty = self._adapter_of.get, self._empty
+        return any((name := get(rid)) is not None and name not in empty for rid in rids)
 
     def _adds_deltas(self, segments, ctx: StepContext) -> bool:
         """Whether this step's deltas run: under a capture lease, unless its bucket is a

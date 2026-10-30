@@ -191,19 +191,19 @@ def test_admit_refcount_lru_evict_and_the_zero_slot(adapters):
 
 
 def test_an_adapter_with_nothing_for_the_pools_targets_takes_no_slot(adapters, tmp_path):
+    """Known from its header before any admit: its first request neither waits for the
+    held slot nor runs the deltas."""
     _, paths = adapters
     path = str(tmp_path / "mlp.safetensors")
     write_adapter(path, rank=2, projs=(), extra=("up_proj",))
     pool = make_pool({**paths, "mlp": path}, max_slots=1, ignored_modules=lambda m: ".mlp." in m)
-    ingest(pool, "e1", "mlp")
-    assert run_step(pool, ["e1"]).ok
-    assert pool.slot_of("e1") == ZERO_SLOT and pool.slot_state(1).adapter is None
-    # the one slot fills; later rows on the empty adapter are ready and admitted beside it
-    for rid, name in [("r1", "a1"), ("e2", "mlp")]:
+    runner = lora_runner(pool)
+    for rid, name in [("r1", "a1"), ("e1", "mlp")]:
         ingest(pool, rid, name)
-    assert run_step(pool, ["r1"]).ok and admitted(lora_runner(pool), "e2")
-    assert run_step(pool, ["r1", "e2"]).ok and pool.slot_of("e2") == ZERO_SLOT
-    assert pool.slot_state(1).refcount == 1 and pool.resident_slot("mlp") is None
+    assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
+    assert admitted(runner, "e1") and not pool.runs_adapters(["e1"]) and pool.runs_adapters(["e1", "r1"])
+    assert run_step(pool, ["r1", "e1"]).ok and pool.slot_of("e1") == ZERO_SLOT
+    assert pool.slot_state(1).refcount == 1 and pool.resident_slot("mlp") is None and "mlp" not in pool.store
 
 
 def test_rollback_undoes_only_what_this_admit_took(adapters):
