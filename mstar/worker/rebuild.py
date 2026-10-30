@@ -124,9 +124,6 @@ class Rebuilds:
     def kept(self, rid: int, node: str) -> KeptIds | None:
         return self._kept.get(node, {}).get(rid)
 
-    def keeps_any(self, node: str) -> bool:
-        return bool(self._kept.get(node))
-
     def keep(self, rid: int, node: str, configs: Iterable[KVReqConfig]) -> bool:
         """Keep ``rid``'s prefill steps and samples on ``node`` from now on, and return True, when a rebuild
         there could write the labels its ``configs`` lay out again: the node declares a policy, and its loop

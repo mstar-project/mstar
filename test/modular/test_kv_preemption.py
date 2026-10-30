@@ -304,6 +304,7 @@ def test_only_a_deciding_pool_keeps_a_guaranteed_request_from_the_offload(decide
     # Only a deciding pool reserves a guaranteed request's pages and drops requests to free room.
     # Any other pool frees room only through the offload, which has to be able to take any request.
     assert kv.reclaimable("p") and bool(kv.reclaimable("g")) is not decides, "the offload saw the wrong class"
+    assert kv.frees_on_remove("g"), "a guaranteed request's teardown would lift no caps"
 
 
 def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
