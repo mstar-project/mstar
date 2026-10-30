@@ -470,6 +470,19 @@ def test_client_audio_goes_on_in_whole_frames_whatever_the_appends(tmp_path):
         ("w0", None, [], {"audio_in": 6})]
 
 
+def test_an_opening_clip_shorter_than_a_frame_sends_nothing_until_one_fills():
+    class _Short(_FramedModel):
+        def process_prompt(self, *a, **k):
+            return {"text_inputs": [torch.tensor([1])], "audio_in": [torch.zeros(3)]}
+
+    wt, sent, _tm = _thread(_Short())
+    _open(wt)
+    _route(wt)
+    assert _signals(sent) == []
+    wt._process_stream_input(ClientAppend("r", samples={"audio_in": np.zeros(1, np.float32)}))
+    assert _signals(sent) == [("w0", "audio_in", [[4]], {})]
+
+
 @pytest.mark.parametrize("append, error", [
     (ClientAppend("r", text="hello"), b"audio appends only; got text"),
     (ClientAppend("r", samples={"audio_in": np.array([0.0, np.nan], np.float32)}), b"NaN or inf"),

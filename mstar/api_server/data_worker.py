@@ -803,7 +803,8 @@ class PreprocessWorkerThread:
         call = None
         if self._client_edges:
             call = self._client_calls[input.request_id] = ClientCall(ended=set(input.ends))
-            stream_items = self._framed(call, stream_items, call.ended, per_frame=False)
+            stream_items = {name: tensors for name, tensors in
+                            self._framed(call, stream_items, call.ended, per_frame=False).items() if tensors}
             self._charge_stream_items(call, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
         if stream_items:
