@@ -181,10 +181,10 @@ class Gr00tN17LanguageModel(nn.Module):
         for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states)
             if i < len(deepstack):
-                # Out of place, though the target is always a layer's own
-                # fresh output today, so `index_add_` would be identical: the
-                # engine double-buffers rows across the async worker, and an
-                # in-place write into a buffer it still owns is the hazard
-                # that costs most to find. transformers 5.19 clones here too.
+                # Out of place: `index_add_` would be identical while the target
+                # is a layer's fresh output, but the engine double-buffers rows
+                # across the async worker, and an
+                # in-place write into a buffer it still owns is the costliest
+                # hazard to find. transformers 5.19 clones here too.
                 hidden_states = hidden_states.index_add(0, image_rows, deepstack[i])
         return hidden_states

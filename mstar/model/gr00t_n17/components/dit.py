@@ -1,11 +1,9 @@
 """GR00T's DT: the action head's transformer, and the pieces around it.
 
-The DT is 32 blocks at 32 heads x 48, conditioned on the denoising timestep
-through AdaLN, alternating cross-attention over the bridge's rows with
-self-attention over its own 41 tokens.
-
-Attention arrives as a callable, so nothing here knows whether it is a CPU
-stand-in or one of M\\*'s ragged resources.
+32 blocks at 32 heads x 48, conditioned on the denoising timestep through
+AdaLN, alternating cross-attention over the bridge's rows with self-attention
+over its own 41 tokens. Attention arrives as a callable, so nothing here knows
+whether it is a CPU stand-in or one of M\\*'s ragged resources.
 """
 from __future__ import annotations
 
@@ -26,44 +24,36 @@ from mstar.model.gr00t_n17.config import (
     Gr00tN17Config,
 )
 
-# What a block attends with when no ragged resource is bound: SDPA over the
-# same `[B, S, H, D]` layout, which is the parity backend the DiT scaffold
-# sanctions (`diffusion-scaffold/SKILL.md:47`). Module-level, so its identity
-# is stable -- a compiled region guards on the identity of the callables it is
-# handed, and a fresh one per step retraces that frame every step.
+# The attention when no ragged resource is bound: SDPA, the DiT scaffold's
+# parity backend. Module-level so its identity is stable: a compiled region
+# guards on the callables it is handed, and a fresh one per step retraces.
 _SDPA_ATTEND = functools.partial(joint_attention, ragged=None)
 
-# Every span a block can ask for. A label outside this set reaches no block, so
-# without the check below a misspelt key would leave that span on SDPA --
-# bitwise identical to passing nothing, off the planned resource and off the
-# kernel a captured graph recorded. The engine side raises for an unplanned
-# label; this makes our side raise too.
+# Every span a block can ask for. A misspelt label would reach no block and
+# silently leave that span on SDPA, off the planned resource, so `DiT.forward`
+# raises for one, as the engine does for an unplanned label.
 _SPANS = frozenset({SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN})
 
-# Every LayerNorm in the DT is non-affine, and the checkpoint says so: `norm1`
-# carries only its `linear`, and `norm3` carries no tensor at all.
+# Every LayerNorm in the DT is non-affine: the checkpoint's `norm1` carries
+# only its `linear`, and `norm3` carries no tensor at all.
 _NORM_EPS = 1e-5
 
-# The output head's norm is the one exception: the reference hardcodes 1e-6
-# there while the blocks take the config's 1e-5. No weight records an eps and
-# the bf16 recordings cannot resolve one either, so this is a reading of
-# `dit.py:284`, not something parity against the checkpoint would recover.
+# The output norm alone is 1e-6, hardcoded in the reference (`dit.py:284`).
+# No weight records an eps and bf16 parity cannot resolve one, so this is read
+# off the source.
 _OUT_NORM_EPS = 1e-6
 
-# The sinusoid's width. Not a config field: the checkpoint's
-# `timestep_encoder.timestep_embedder.linear_1` is 1536x256, so 256 is what
-# the weights were trained against.
+# Not a config field: the checkpoint's `timestep_embedder.linear_1` is
+# 1536x256, so 256 is what the weights were trained against.
 _TIME_PROJ_CHANNELS = 256
 
 
 class TimestepEncoder(nn.Module):
     """The denoising timestep as a conditioning vector, ``[B] -> [B, dim]``.
 
-    Both halves are diffusers' own classes, which is what the reference
-    imports too, so this is an import rather than a port -- and
-    ``timestep_embedder.linear_1`` / ``linear_2`` are the checkpoint's keys.
-    Note the flip: ``flip_sin_to_cos=True`` here, where the action encoder's
-    own sinusoid does not flip (see ``SinusoidalPositionalEncoding``).
+    Both halves are diffusers' own classes, imported as the reference does. This one flips sin
+    to cos; the action encoder's sinusoid does not
+    (``SinusoidalPositionalEncoding``).
     """
 
     def __init__(self, embedding_dim: int):
@@ -78,8 +68,7 @@ class TimestepEncoder(nn.Module):
         )
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        # the reference casts the projection to the weights' dtype before the
-        # embedder, which matters once the model is bf16
+        # cast before the embedder, as the reference does; matters in bf16
         dtype = next(self.parameters()).dtype
         return self.timestep_embedder(self.time_proj(timesteps).to(dtype))
 
@@ -87,25 +76,17 @@ class TimestepEncoder(nn.Module):
 class AdaLayerNorm(nn.Module):
     """Normalise, then scale and shift from the timestep, per request.
 
-    ``scale`` comes first out of the chunk and is applied as ``1 + scale``, and
-    both are indexed ``[:, None]`` so one request's pair applies to all of its
-    tokens -- which is what lets a batch hold requests at different denoising
-    steps.
+    Indexed ``[:, None]`` so one request's pair applies to all of its tokens,
+    which lets a batch hold requests at different denoising steps.
 
-    The activation is ``nn.SiLU``, where the action encoder's swish is spelled
-    ``x * sigmoid(x)``. The same function twice in one model, and the two are
-    **not** bit-identical, so each has to keep its own spelling (measured: up to
-    0.5 apart in bf16 on a trained slot).
+    ``nn.SiLU`` here, where the action encoder writes ``x * sigmoid(x)``: the
+    two are not bit-identical, so each keeps the reference's spelling.
 
-    This is written out rather than imported because **no argument to
-    diffusers' own ``AdaLayerNorm`` reproduces it**: that class chunks
-    ``shift, scale`` along dim 1 when ``chunk_dim=1`` and ``scale, shift``
-    along dim 0 otherwise (its source calls its own inconsistency "a bit
-    weird"). The reference copied the class, kept the ``chunk_dim=0`` *order*
-    and hardcoded the ``dim=1`` *axis* -- a pairing diffusers cannot produce,
-    and its ``chunk_dim`` survives as an attribute nothing reads. Importing
-    with ``chunk_dim=1`` would silently swap a learned gain for a learned
-    offset. ``DiT``'s output head below is the *other* convention.
+    Written out because no argument to diffusers' ``AdaLayerNorm`` reproduces
+    it: the reference keeps diffusers' ``chunk_dim=0`` order (``scale,
+    shift``) but chunks along dim 1, a pairing diffusers cannot produce.
+    Importing with ``chunk_dim=1`` would silently swap gain for offset.
+    ``DiT``'s output head is the *other* order.
     """
 
     def __init__(self, embedding_dim: int):
@@ -120,15 +101,9 @@ class AdaLayerNorm(nn.Module):
 
 
 class BasicTransformerBlock(nn.Module):
-    r"""One DT block: AdaLN, attention, residual, LayerNorm, feed-forward,
-    residual.
-
-    ``attend`` is supplied by the caller, so this module never knows whether
-    it is a CPU stand-in or one of M\*'s ragged resources. The even blocks
-    cross-attend the bridge's rows and the odd blocks attend their own tokens;
-    the checkpoint shows which is which, because a cross block's ``to_k`` and
-    ``to_v`` are ``2048`` wide against the DT's own ``1536``.
-    """
+    """One DT block: AdaLN, attention, residual, LayerNorm, feed-forward,
+    residual. A cross block's ``to_k``/``to_v`` are 2048 wide in the
+    checkpoint, against the DT's own 1536."""
 
     def __init__(
         self,
@@ -173,8 +148,7 @@ class _BlockAttention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner, bias=True)
         self.to_k = nn.Linear(kv_dim, inner, bias=True)
         self.to_v = nn.Linear(kv_dim, inner, bias=True)
-        # as in the bridge: diffusers keeps a dropout at `to_out.1`, inert at
-        # eval, so only the linear is here
+        # diffusers' dropout at `to_out.1` is inert at eval, so only the linear
         self.to_out = nn.ModuleList([nn.Linear(inner, query_dim, bias=True)])
 
     def forward(
@@ -188,10 +162,8 @@ class _BlockAttention(nn.Module):
         heads = (batch, -1, self.num_heads, self.head_dim)
         query = self.to_q(hidden_states).view(heads)
         out = attend(query, self.to_k(source).view(heads), self.to_v(source).view(heads))
-        # `[B, H, T, D]` is the natural mistake for a kernel that wants heads
-        # first, and it has the same element count as `[B, T, H, D]` -- so a
-        # transposed return would reshape without complaint and scramble every
-        # row. The callable is swappable, so the shape is checked here.
+        # a swappable kernel returning heads-first `[B, H, T, D]` would reshape
+        # without complaint and scramble every row
         if out.shape != query.shape:
             raise ValueError(
                 f"attention returned {list(out.shape)}, expected "
@@ -201,16 +173,11 @@ class _BlockAttention(nn.Module):
 
 
 def _attends_encoder(index: int) -> bool:
-    """Whether block ``index`` cross-attends the bridge's rows.
+    """Whether block ``index`` cross-attends the bridge's rows (the even ones).
 
-    The even blocks cross-attend and the odd ones attend their own tokens.
-    The stack reads this once to size ``to_k``/``to_v`` and again to decide
-    what to hand each block, so the two cannot disagree -- a block given
-    1536-wide rows will cross-attend them perfectly happily, so nothing below
-    this function would catch a mismatch.
-
-    Not to be confused with ``attend_text_every_n_blocks``, which chooses
-    *which* rows a cross block reads -- that is ``_span_for`` below.
+    The stack reads this both to size ``to_k``/``to_v`` and to decide what to
+    hand each block, so the two cannot disagree. Which rows a cross block
+    reads is ``_span_for``.
     """
     return index % 2 == 0
 
@@ -219,14 +186,11 @@ def _span_for(index: int, attend_text_every_n_blocks: int) -> str:
     """Which span block ``index`` attends: its own rows, the text rows, or the
     image rows.
 
-    The odd blocks attend themselves. The cross blocks alternate between the
-    bridge's two spans every ``attend_text_every_n_blocks`` *cross* blocks, so
-    at its one value, 2, the text blocks are 0, 4, 8 ... and the image blocks
-    are 2, 6, 10 ... (``dit.py:380-396``). Block 0 is a text block; starting
-    on an image block is the easy off-by-one.
-
-    One function decides both which rows a block reads and which attention it
-    reads them with, so the two cannot disagree.
+    Every ``attend_text_every_n_blocks``-th *cross* block reads text and the
+    rest read image, so at its one value, 2, text is 0, 4, 8 ... and image is
+    2, 6, 10 ... (``dit.py:380-396``). Block 0 is text; starting on image is
+    the easy off-by-one. This one function picks both the rows and the
+    attention, so the two cannot disagree.
     """
     if not _attends_encoder(index):
         return SA_SPAN
@@ -236,15 +200,10 @@ def _span_for(index: int, attend_text_every_n_blocks: int) -> str:
 class ActionPositionEmbedding(nn.Module):
     """The learned table, added to the action rows and to nothing else.
 
-    The reference adds it to ``action_features`` *before* the state token is
-    concatenated (``gr00t_n1d7.py:408-413``), so of the DT's 41 input rows the
-    40 action rows carry a position and the state row carries none. Adding 41
-    rows, or adding the table after the concat, changes no shape and raises
+    The reference adds it before the state token is concatenated
+    (``gr00t_n1d7.py:408-413``), so the 40 action rows carry a position and the
+    state row none. Adding it after the concat changes no shape and raises
     nothing.
-
-    Rows ``0:T`` are taken as a slice, which is what the reference's
-    ``self.position_embedding(arange(T))`` gathers -- the same rows in the
-    same order, without the index tensor.
     """
 
     def __init__(self, config: Gr00tN17Config):
@@ -259,15 +218,8 @@ class ActionPositionEmbedding(nn.Module):
 
 
 class DiT(nn.Module):
-    r"""GR00T's action-head transformer: the ``action_head.model`` tensors.
-
-    32 AdaLN blocks alternating cross-attention over the bridge's rows with
-    self-attention over the DT's own, then a conditioned output norm and two
-    projections down to ``output_dim``.
-
-    ``attend`` is handed to every block, so swapping the attention is one
-    constructor argument and nothing else moves.
-    """
+    """The ``action_head.model`` tensors: the blocks, then a conditioned output
+    norm and two projections down to ``output_dim``."""
 
     def __init__(self, config: Gr00tN17Config):
         super().__init__()
@@ -280,10 +232,8 @@ class DiT(nn.Module):
                 dim,
                 stack.num_attention_heads,
                 stack.attention_head_dim,
-                # a cross block reads the bridge's rows, which are as wide as
-                # the backbone's; `cross_attention_dim` is in no config file,
-                # so this field and the checkpoint's 2048-wide `to_k` are the
-                # only two places the width is written down
+                # the bridge's rows are backbone-wide; `cross_attention_dim`
+                # is in no config file
                 cross_attention_dim=config.backbone_embedding_dim if _attends_encoder(i) else None,
             )
             for i in range(stack.num_layers)
@@ -303,14 +253,11 @@ class DiT(nn.Module):
         """The DT's ``[B, T, dim]`` rows and the bridge's two spans to
         ``[B, T, output_dim]``, conditioned on one ``[B]`` timestep.
 
-        ``attends`` maps a span label to the attention it is read with, built
-        once per resource binding by whoever owns this stack. A label with no
-        entry falls back to SDPA, which is how the CPU parity tests run; a served
-        model always binds its ragged resources.
-
-        Passing the *same* rows as ``vl_text`` and ``vl_image`` makes every
-        cross block read all of them, which is the reference's plain
-        ``DiT.forward``, the unmasked case.
+        ``attends`` maps a span label to its attention, built once per resource
+        binding. A missing label falls back to SDPA, which is how the CPU
+        parity tests run; a served model always binds its ragged resources.
+        The same rows as ``vl_text`` and ``vl_image`` give the reference's
+        plain, unmasked ``DiT.forward``.
         """
         if attends is not None and not attends.keys() <= _SPANS:
             raise ValueError(
@@ -319,10 +266,8 @@ class DiT(nn.Module):
                 "spans it declared in its step."
             )
         temb = self.timestep_encoder(timestep)
-        # the reference makes both contiguous here, and it is load-bearing:
-        # non-contiguous rows take a different GEMM path and move the output by
-        # a whole fp32 floor (1.14e-05, measured). Free when they already
-        # are, which is the usual case.
+        # as the reference does, and load-bearing: non-contiguous rows take a
+        # different GEMM path and move the output by a whole fp32 floor
         hidden_states = hidden_states.contiguous()
         spans = {VL_TEXT_SPAN: vl_text.contiguous(), VL_IMAGE_SPAN: vl_image.contiguous()}
         for index, block in enumerate(self.transformer_blocks):
@@ -333,11 +278,8 @@ class DiT(nn.Module):
                 spans.get(span),
                 _SDPA_ATTEND if attends is None else attends.get(span, _SDPA_ATTEND),
             )
-        # `shift` first, where `AdaLayerNorm` takes `scale` first: the same
-        # arithmetic from a differently-ordered linear (`dit.py:331`). Both
-        # halves are learned and both look plausible, so only parity catches a
-        # swap. `F.silu` is the reference's spelling here and `nn.SiLU`'s is
-        # the module calling it, so the two are the same function.
+        # `shift` first, where `AdaLayerNorm` takes `scale` first (`dit.py:331`);
+        # both halves look plausible, so only parity catches a swap
         shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
         return self.proj_out_2(hidden_states)

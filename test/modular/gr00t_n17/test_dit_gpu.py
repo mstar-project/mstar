@@ -1,25 +1,22 @@
 """GR00T N1.7's DT on the GPU: the real ragged kernels against the masked reference.
 
-``test_dit.py`` pins each piece of the DT on the CPU with the attention handed in. This file runs
-the whole 32-block stack in bf16 on **FlashInfer's ragged prefill kernels** against NVIDIA's
-``AlternateVLDiT``, the masked variant the checkpoint was trained as. The reference hands each
-cross block one tensor of bridge rows plus a mask of which it may read; we hand it only those
-rows, packed, one segment per request. Same weights and inputs, so the answers must differ only
-by rounding: the packing is the mask.
+``test_dit.py`` pins each piece of the DT on the CPU. This file runs the whole 32-block stack in
+bf16 on **FlashInfer's ragged prefill kernels** against NVIDIA's ``AlternateVLDiT``, the masked
+variant the checkpoint was trained as. The reference hands each cross block one tensor of bridge
+rows plus a mask of which it may read; we hand it only those rows, packed, one segment per
+request. Same weights and inputs, so the answers must differ only by rounding: the packing is the
+mask.
 
 The bar: ours against the reference in fp32 within **1.2x the bf16 floor**, the reference in bf16
 against itself in fp32, measured here. Two traps would make a test that passes and says nothing:
 
-1. **Random weights do not round, they diverge.** At ``std=0.3`` the 32 residual blocks send the
-   output rms to ~3900 and the "floor" to 643, inside which every control passes. So the
-   reference carries the checkpoint's 456 ``action_head.model.*`` tensors, and the output rms
-   (~0.2) is asserted.
-2. **One copy of the weights.** The stack is 1.09B parameters (4.4 GiB fp32, 2.2 GiB bf16, on a
-   12 GiB device). The reference runs in fp32, is converted in place to bf16 for the floor, then
-   hands its tensors to ours (built on ``meta``) through ``load_state_dict(..., assign=True)``.
+1. **Random weights do not round, they diverge**, to a "floor" inside which every control passes.
+   So the reference carries the checkpoint's 456 DT tensors, and the output rms is asserted.
+2. **One copy of the weights** (1.09B parameters). The reference runs in fp32, is converted in
+   place to bf16 for the floor, then hands its tensors to ours (built on ``meta``) through
+   ``load_state_dict(..., assign=True)``.
 
-FlashInfer JIT-compiles its kernels, so the tests also need ``nvcc`` (on PATH or under
-``CUDA_HOME``) and ``ninja`` on PATH; they skip without either.
+FlashInfer JIT-compiles its kernels, so the tests skip without ``nvcc`` and ``ninja``.
 """
 
 from __future__ import annotations
@@ -62,10 +59,9 @@ _CKPT_PREFIX = "action_head.model."
 _CKPT_TENSORS = 456
 
 def _toolchain() -> bool:
-    """Whether FlashInfer can JIT-build its kernels here. Without a compiler, a GPU machine fails
-    at ``write_ninja`` instead of skipping, an environment failure that would hide a real one.
-    ``CUDA_HOME`` alone is not enough: ``ninja`` lives in the venv's ``bin``, and running pytest
-    as ``.venv/bin/python`` does not put it on PATH.
+    """Whether FlashInfer can JIT-build its kernels here; without a compiler a GPU machine fails
+    at ``write_ninja`` instead of skipping. ``CUDA_HOME`` alone is not enough: ``ninja`` lives in
+    the venv's ``bin``, which running pytest as ``.venv/bin/python`` does not put on PATH.
     """
     cuda_home = os.environ.get("CUDA_HOME")
     nvcc = shutil.which("nvcc") or (cuda_home and (Path(cuda_home) / "bin/nvcc").exists())
@@ -96,7 +92,7 @@ _INPUT_SCALE = 0.3  # the rms the bridge's rows and the DT's own arrive at
 _HEADS, _HEAD_DIM = 32, 48  # what the checkpoint fixes, asserted against the config below
 _BAR = 1.2  # a multiple of the measured floor, never an absolute tolerance
 _WORKSPACE = 128 << 20  # FlashInfer's scratch, per wrapper
-# The trained weights, not a fill: a random stack at `_INPUT_SCALE` lands at rms ~3900 (trap 1).
+# The trained weights, not a fill: a random stack diverges (trap 1).
 _OUTPUT_RMS = (0.05, 1.0)
 
 
@@ -334,7 +330,7 @@ def test_the_packed_spans_are_the_reference_mask(stacks: _Stacks):
 
     Past the bar by a little points at the kernel or the sm_scale; by orders of magnitude, at the
     span assignment or the alternation, which the negative control separates. The output rms is
-    asserted because random weights land at rms ~3900 and a "floor" of 643 that passes anything.
+    asserted against trap 1.
     """
     layout = stacks.equal
     spans = _Spans(stacks.config).plan(layout.batch, layout.text_rows[0])
@@ -390,8 +386,8 @@ def test_the_wrappers_run_at_the_checkpoints_head_dim(stacks: _Stacks):
 
     The checkpoint is 32 heads x head_dim 48, and no FlashInfer prefill kernel exists for 48 (an
     unsupported head dim fails to build), so the wrappers run at 64 with q/k/v zero-padded and the
-    output sliced back. The tests above already go through it; this pins that, and that the three
-    wrappers build and run at the checkpoint's own shape.
+    output sliced back. This pins that, and that the three wrappers build and run at the
+    checkpoint's own shape.
     """
     config = stacks.config
     assert config.dit.attention_head_dim not in SUPPORTED_HEAD_DIMS

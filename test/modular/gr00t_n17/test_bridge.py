@@ -184,12 +184,11 @@ def _bridge(config: Gr00tN17Config, tokens: int, seed: int = 0) -> Gr00tN17VLBri
 # ----------------------------------------------------------------------------
 
 # Not exact: the stand-in's SDPA blocks its reductions differently from the reference's
-# written-out matmul-softmax-matmul. Worst measured over both geometries x 5 token counts
-# (1 to 300) x 5 weight seeds x 1/2/4 threads: 7.81e-07 relative, ~6 fp32 ulps after four
-# blocks.
+# written-out matmul-softmax-matmul. The worst relative gap over geometries, token counts, weight
+# seeds and thread counts: ~6 fp32 ulps after four blocks.
 _MEASURED_GAP = 7.815e-07
-# 4x for other BLAS/SDPA blockings; the closest wiring mistake misses by 3.6e+05x. A wrong
-# LayerNorm eps does *not* clear it on ordinary rows, hence the eps test's narrow rows.
+# 4x for other BLAS/SDPA blockings. A wrong LayerNorm eps does *not* clear it on ordinary rows,
+# hence the eps test's narrow rows.
 _BAR = 4 * _MEASURED_GAP
 
 
@@ -207,8 +206,7 @@ def test_our_bridge_is_a_norm_and_four_reference_blocks(geometry, tokens):
 
 @pytest.mark.parametrize("deviation", DEVIATIONS)
 def test_a_block_assembled_wrongly_misses_by_orders_of_magnitude(deviation):
-    """A plausible mistake cannot slip under the bar: measured attention residual dropped
-    2.8e+00, feed-forward residual dropped 2.5e+00, norm1/norm3 swapped 1.1e+00 (>= 3.6e+05x)."""
+    """A plausible mistake misses the bar by orders of magnitude, not a few multiples."""
     config = _config(*_GEOMETRIES["the checkpoint's head width"])
     ours = _bridge(config, tokens=17)
     rows = _rows(17, config.backbone_embedding_dim, seed=1)
@@ -219,16 +217,15 @@ def test_a_block_assembled_wrongly_misses_by_orders_of_magnitude(deviation):
 
 def test_the_layer_norms_use_eps_1e_5_and_not_1e_6():
     """eps is added to a variance, so 1e-5 and 1e-6 only part when the variance is that
-    small: on ordinary rows a 1e-6 build sits within 0.6-5x the bar (asserted below), so the
-    rows here are 8 wide with variance ~1e-6, which separates them by 2.3e-01 (7e+04x)."""
+    small: on ordinary rows a 1e-6 build sits within a few multiples of the bar, so the rows
+    here are 8 wide with variance ~1e-6."""
     config = _config(*_GEOMETRIES["a narrow block"])
     ours = _bridge(config, tokens=8)
     ordinary = _rows(8, config.backbone_embedding_dim, seed=1)
     near_constant = _rows(8, config.backbone_embedding_dim, seed=1, spread=1e-3)
     wrong = _reference(ours, config, eps=1e-6)
 
-    # the measurement the rest of this test rests on: on ordinary rows the wrong eps sits
-    # in the noise, within a few multiples of the bar rather than orders of magnitude off
+    # what the rest of this test rests on: on ordinary rows the wrong eps sits in the noise
     assert relative_gap(ours(ordinary), wrong(ordinary)) <= 10 * _BAR
     assert relative_gap(ours(near_constant), _reference(ours, config)(near_constant)) <= _BAR
     assert relative_gap(ours(near_constant), wrong(near_constant)) > 1000 * _BAR
@@ -494,9 +491,8 @@ _HAVE_RECORDED = bool(_RECORDED) and BACKBONE is not None
 
 
 def _reference_image_token_id() -> int:
-    """The id the reference's mask compares against, ``input_ids == image_token_id``
-    (``gr00t/model/modules/qwen3_backbone.py:364``), read off the backbone's config rather
-    than ours."""
+    """The id the reference's mask (``input_ids == image_token_id``, ``qwen3_backbone.py``)
+    compares against, read off the backbone's config rather than ours."""
     return json.loads((Path(BACKBONE) / "config.json").read_text())["image_token_id"]
 
 
@@ -532,8 +528,7 @@ def _image_rows(request: _Request) -> torch.Tensor:
         vocab_size=1, mrope_section=(2, 1, 1), mrope_interleaved=True,
         image_token_id=_reference_image_token_id(), vision_start_token_id=0,
     )
-    # the one vision field the node reads, and it has to be the real one: it is what the
-    # M-RoPE grids are measured in, so a stand-in would make the recorded grids disagree
+    # the one vision field the node reads; a stand-in would make the recorded grids disagree
     # with the prompt's image runs and raise
     vision = Qwen3_5VisionConfig(
         depth=1, hidden_size=16, intermediate_size=32, num_heads=1, in_channels=3,
@@ -566,9 +561,9 @@ def _image_rows(request: _Request) -> torch.Tensor:
 def test_the_split_is_the_references_image_token_predicate(path):
     """On prompts the reference ran: ``vl_image`` is exactly the rows ``input_ids ==
     image_token_id`` selects and ``vl_text`` exactly the rest, with the ``LLM`` node deriving the
-    rows as in the engine. A swap changes no shape and costs 31% relative error at full depth.
-    Only the row pattern (448 image rows in four blocks) comes from the recording; the rows are
-    this file's narrow stand-ins, since the split is a gather."""
+    rows as in the engine. A swap changes no shape. Only the row pattern (448 image rows in four
+    blocks) comes from the recording; the rows are this file's narrow stand-ins, since the split
+    is a gather."""
     request = _request(path)
     image_rows = _image_rows(request)
     run = _drive_rows(request.input_ids.numel(), image_rows.tolist())

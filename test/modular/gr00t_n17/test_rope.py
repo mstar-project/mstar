@@ -128,9 +128,8 @@ _MALFORMED = {
     ),
     "more grids than runs": ([_TEXT] + [_IMAGE] * 4, [[1, 4, 4]] * 2, r"2 image grid\(s\) for 1 image span\(s\)"),
     # Two images with nothing between them read as one run, which no single grid accounts
-    # for. Refusing is the deliberate choice, not a side effect of scanning by run:
-    # transformers 4.57 finds the one vision_start and hands the second image plain text
-    # positions, and 5.19 dies on an opaque shape error. A named ValueError beats both.
+    # for. Refusing is deliberate: transformers 4.57 gives the second image text positions and
+    # 5.19 dies on an opaque shape error; a named ValueError beats both.
     "two runs glued together": ([_IMAGE] * 4 + [_IMAGE] * 6, [[1, 4, 4], [1, 4, 6]], r"10 image tokens"),
 }
 

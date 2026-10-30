@@ -222,8 +222,7 @@ class Gr00tN17LLMSubmodule(NodeSubmodule):
         )
 
     def max_batch_size(self, graph_walk: str) -> int | None:
-        # as the vision node: no batched forward, so a wider batch would only
-        # be the engine's per-request fallback in disguise
+        # as the vision node: no batched forward
         return 1
 
     def preprocess(
@@ -291,8 +290,7 @@ class Gr00tN17StateEncoderSubmodule(NodeSubmodule):
         )
 
     def max_batch_size(self, graph_walk: str) -> int | None:
-        # as the other nodes: no batched forward, so a wider batch would only
-        # be the engine's per-request fallback in disguise
+        # as the vision node: no batched forward
         return 1
 
     def preprocess(
@@ -320,26 +318,20 @@ class Gr00tN17VLBridgeSubmodule(NodeSubmodule):
     """The ``vl_bridge`` node: the backbone's features become the two spans
     the denoise loop cross-attends.
 
-    The split is the point. The reference masks every DT cross-attention
-    against the image rows or the non-image rows, alternating by block; here
-    the rows are separated **once**, into ``vl_text`` and ``vl_image``, and the
-    loop attends a whole span with no mask at all. Softmax over a span does
-    not care in what order the keys arrive, so the two are the same
-    computation.
-
-    Unmasked in the reference, so one ragged segment per request is the same
-    thing at B = 1 and keeps a request independent of its neighbours.
+    The reference masks every DT cross-attention against the image rows or the
+    non-image rows, alternating by block; here the rows are split **once**, into
+    ``vl_text`` and ``vl_image``, and the loop attends a whole span unmasked.
+    Softmax does not care in what order the keys arrive, so the two are the
+    same computation.
     """
 
-    # Under autocast `vlln` runs in fp32 and its output *is* the residual
-    # stream, so all four blocks and both spans come out fp32. NVIDIA runs the
-    # bridge in plain bf16; so does this node, which then matches it bitwise
-    # on SDPA and hands the denoise loop bf16 rows.
+    # Under autocast `vlln` runs in fp32 and its output is the residual stream,
+    # so everything downstream would be fp32. NVIDIA runs the bridge in plain
+    # bf16, and so does this node.
     disable_autocast = True
-    # Compiled in plain bf16, a request's spans changed once a prompt of
-    # another length had been served (the recompile for dynamic shapes rounds
-    # differently), so the same request stopped returning the same actions.
-    # Eager is also NVIDIA's arithmetic; a captured graph keeps it.
+    # A recompile for a new prompt length rounds differently, so the same
+    # request would stop returning the same actions. Eager is NVIDIA's
+    # arithmetic; a captured graph keeps it.
     disable_torch_compile = True
 
     def __init__(self, model: Gr00tN17VLBridge, config: Gr00tN17Config):
@@ -373,8 +365,8 @@ class Gr00tN17VLBridgeSubmodule(NodeSubmodule):
         inputs: list[NodeInputs],
         **kwargs: Any,
     ) -> SubmoduleStep | None:
-        # one segment per request, unmasked: every row of a prompt sees every
-        # other row of that prompt, and none of anyone else's
+        # one segment per request, unmasked as in the reference: a prompt's rows
+        # see each other and none of anyone else's
         segments = [
             Segment(request_id=rid, label="main", span=inp.input_seq_len)
             for rid, inp in zip(request_ids, inputs, strict=True)
@@ -385,8 +377,7 @@ class Gr00tN17VLBridgeSubmodule(NodeSubmodule):
         )
 
     def max_batch_size(self, graph_walk: str) -> int | None:
-        # as the other nodes: no batched forward, so a wider batch would only
-        # be the engine's per-request fallback in disguise
+        # as the vision node: no batched forward
         return 1
 
     def preprocess(
@@ -423,10 +414,8 @@ class Gr00tN17Shape:
 
     The scaffold stacks a step's conditioning rectangularly, so a batch's requests
     have to agree on both span lengths; ``can_batch`` keys on this and so do the
-    graph buckets. Measured over the 20 recorded requests: the image span is
-    constant (448: two cameras at two timesteps, four frames) and only the text span varies (13 or 21), so
-    in practice this buckets on the prompt. The image count is carried all the same,
-    because nothing makes it a constant -- another camera set is another number.
+    graph buckets. For one camera set the image span is fixed and this buckets on
+    the prompt, but nothing makes the image count a constant.
     """
 
     text_rows: int
@@ -436,13 +425,9 @@ class Gr00tN17Shape:
 class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
     """The ``denoise_step`` node: one flow-matching step of the action head.
 
-    The loop is the scaffold's, not ours: it owns the iteration counter, the
-    seeded noise, the per-request schedule, the graph buckets, the overshoot veto and
-    the step declaration's plumbing. What is here is the hooks -- what GR00T's step
-    *is*, rather than how a step is driven.
-
-    The children are named for the checkpoint: ``action_encoder``, ``model``,
-    ``action_decoder`` and ``position_embedding`` are what ``action_head.`` strips to.
+    The scaffold drives the loop (counter, seeded noise, schedule, graph buckets,
+    overshoot veto); these hooks say what GR00T's step *is*. The children are
+    named for the checkpoint's keys under ``action_head.``.
     """
 
     def __init__(
@@ -496,13 +481,11 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
     def schedule_for(self, fwd_info, bucket_key: Gr00tN17Shape) -> FlowMatchSchedule:
         """GR00T's four steps, written out rather than built.
 
-        ``FlowMatchSchedule.build`` would give the image convention -- sigmas
-        descending from 1 and timesteps ``[1000, 750, 500, 250]``. GR00T's time runs
-        the other way: `t = k / 4`, conditioned on `int(t * 1000)`, with
-        `actions += dt * velocity`. So sigma *ascends* and `sigma_next - sigma` is
-        the reference's `dt`, which is what `euler_step` multiplies by. Our "sigma"
-        is therefore GR00T's time, not a noise level -- same arithmetic, read the
-        other way round, and not something to "fix" into descending.
+        ``FlowMatchSchedule.build`` gives the image convention, sigmas descending
+        from 1. GR00T's time ascends: `t = k / 4`, conditioned on `int(t * 1000)`,
+        with `actions += dt * velocity`, so `sigma_next - sigma` is the reference's
+        `dt`. "sigma" here is GR00T's time, not a noise level: do not "fix" it
+        into descending.
         """
         steps = self.config.num_inference_timesteps
         sigmas = torch.arange(steps + 1, dtype=torch.float32) / steps
@@ -513,10 +496,9 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         """The noisy trajectory the loop carries, ``[40, 132]`` without a batch dim.
 
         Drawn at the **weights'** dtype, as the reference draws it at
-        ``vl_embeds.dtype`` (`gr00t_n1d7.py:349-353`). That keeps the carried dtype
-        the same at every iteration, which `denoise` returns and which a captured
-        graph records -- an fp32 seed feeding a bf16 step would change dtype after
-        iteration 0 and need two graphs.
+        ``vl_embeds.dtype`` (`gr00t_n1d7.py:349-353`), so the carried dtype is the
+        same at every iteration; an fp32 seed would change dtype after iteration 0
+        and need two captured graphs.
         """
         return torch.randn(
             (self.config.action_horizon, self.config.max_action_dim),
@@ -528,18 +510,13 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         """One request's frozen conditioning, each **without** a batch dim: the base
         stacks them, so a leading 1 here would arrive as a spurious axis.
 
-        Both checks below live here rather than in ``denoise`` because this runs
-        host-side in ``prepare_inputs``; ``denoise`` is the region a graph captures,
-        and reading a tensor's values there (``.min()``, ``int(...)``) would sync the
-        device and make it uncapturable.
+        Checks live here, host-side in ``prepare_inputs``, not in ``denoise``:
+        reading a tensor's values in the captured region would sync the device.
         """
         text, image = inputs["vl_text"][0], inputs["vl_image"][0]
-        # The bucket key comes from `step_metadata` and the spans come from the
-        # bridge. Nothing else compares them, and they are declared to the engine:
-        # a miscount plans spans the forward does not use, and a real ragged kernel
-        # reads the *declared* length. Inside a batch `torch.stack` forces the rows
-        # to agree and `can_batch` forces the keys to agree, so a preprocessing
-        # miscount would be uniform and silent.
+        # The key (from `step_metadata`) and the spans (from the bridge) are
+        # compared nowhere else, and a ragged kernel reads the *declared* length,
+        # so a miscount would plan spans the forward does not use, silently.
         if (text.shape[0], image.shape[0]) != (bucket_key.text_rows, bucket_key.image_rows):
             raise ValueError(
                 f"denoise_step was told {bucket_key.text_rows} text and "
@@ -598,12 +575,10 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
                     joint_attention, ragged=functools.partial(resource.run, label=label),
                 )
 
-            # All or nothing. Nothing bound is the parity backend -- every span on
-            # SDPA, which is how the CPU tests run; a deployment always binds both,
-            # since `get_node_resources` declares every resource unconditionally.
-            # *Partly* bound is incoherent: `declare_step` declares both resources,
-            # so the engine plans a step whose kernel the forward would not use, and
-            # a captured graph would record SDPA where the plan says ragged.
+            # All or nothing. Nothing bound is the parity backend (SDPA, as the CPU
+            # tests run); a deployment binds both (`get_node_resources`). Partly
+            # bound is incoherent: `declare_step` declares both, so the engine
+            # would plan a kernel the forward does not use.
             if (self_attn is None) != (cross is None):
                 raise RuntimeError(
                     f"denoise_step has {DT_ATTN if self_attn is not None else DT_XATTN} "
@@ -677,21 +652,11 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         rows = torch.cat([state, self.position_embedding(actions)], dim=1)
         out = self.model(rows, vl_text, vl_image, timestep, self.attends())
         velocity = self.action_decoder(out, cat_ids)[:, -self.config.action_horizon:]
-        # The carried trajectory stays at the weights' dtype, which `euler_step`
-        # gives us by returning in the velocity's. That is what the reference does:
-        # it is served in bf16 (`gr00t_policy.py:111`), draws `actions` at
-        # `vl_embeds.dtype`, and updates with a Python-float `dt`, so its trajectory
-        # is bf16 at every step.
-        #
-        # Carrying fp32 instead is the better *integrator* -- one increment is about
-        # 3 bf16 ulp, so the reference quantises each update -- but it costs the only
-        # end-to-end bar that catches a wiring bug: over 4 steps an fp32 carry moves
-        # the trajectory by 0.0243, while an off-by-one in the DT's text/image
-        # alternation moves it by 0.0391. A tolerance wide enough to admit our own
-        # "improvement" is within 1.6x of admitting a real defect. Accuracy we were
-        # not asked for, bought with the test that matters.
-        #
-        # `euler_step` already sums in fp32 before rounding back, and for two bf16
-        # operands and an exact `dt` that is bit-identical to bf16 arithmetic
-        # (measured over 200k samples), so matching the reference costs nothing.
+        # The trajectory is carried at the weights' dtype (`euler_step` returns the
+        # velocity's), as the reference, served in bf16 (`gr00t_policy.py:111`),
+        # carries bf16 at every step. An fp32 carry is the better integrator, but
+        # it moves the trajectory within 1.6x of what an off-by-one in the DT's
+        # text/image alternation does, so the end-to-end bar could no longer catch
+        # that. `euler_step` sums in fp32 and rounds back, which for bf16 operands
+        # and an exact `dt` is bit-identical to bf16 arithmetic.
         return euler_step(latents, velocity, sigma, sigma_next)

@@ -32,29 +32,23 @@ _REQUIRED = {
 def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
     """A 6D rotation -- a rotation matrix's first two rows -- back to the matrix.
 
-    ``pose.py:436-455``'s Gram-Schmidt, **in the input's own dtype**, which for a
-    relative group's reference frame is the raw state's float32. Upcasting here
-    is the tempting change and it is a worse one: it loses every request's last
-    bits rather than one request's (see `unapply`'s measurements).
-
-    On a degenerate row the reference raises ``LinAlgError: SVD did not converge``
-    out of scipy, where plain Gram-Schmidt would divide by zero and return NaN. A
-    NaN action is worse than a refused one, so the norms are checked.
+    ``pose.py:436-455``'s Gram-Schmidt, **in the input's own dtype** (the raw
+    state's float32 for a reference frame); upcasting is worse, see `unapply`.
+    The reference refuses a degenerate row (scipy ``LinAlgError``) where plain
+    Gram-Schmidt would return NaN, so the norms are checked.
     """
     rows = rot6d.reshape(2, 3)
     if not np.all(np.isfinite(rows)):
-        # The reference reaches scipy and dies on a bare `LinAlgError: SVD did not
-        # converge`, which names nothing. Same rejection, with the cause.
+        # the reference's rejection too, as a bare scipy `LinAlgError`
         raise ValueError(
             "GR00T action decode: the rotation has a non-finite component, so no "
             "frame can be built from it"
         )
     row1, row2 = rows[0], rows[1]
     n1 = np.linalg.norm(row1)
-    # `> 0` rather than `!= 0`, and finite: in float32 a row near 1e20 overflows the
-    # norm to `inf`, the division then gives exactly zero, and a `== 0` test on the
-    # *raw* row would pass it through to a silent identity rotation. The reference
-    # rejects that case (scipy: "null coordinate frame"), so we have to as well.
+    # finite and `> 0`: a float32 row near 1e20 overflows the norm to `inf`, the
+    # division gives zero, and a `== 0` test on the raw row would pass it through
+    # as a silent identity rotation. The reference rejects it ("null coordinate frame").
     if not (np.isfinite(n1) and n1 > 0.0):
         raise ValueError(
             "GR00T action decode: the rotation's first row has norm "
@@ -75,16 +69,10 @@ def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
 def _nearest_rotation(m: np.ndarray) -> np.ndarray:
     """The nearest true rotation to ``m``, by SVD: ``U @ Vt``.
 
-    The reference gets this step for free by storing every rotation as a scipy
-    ``Rotation``: ``_set_rotation`` and ``_from_homogeneous`` both go through
-    ``Rotation.from_matrix`` (``pose.py:500-501``, ``:424``), which
-    re-orthogonalises whatever it is handed. **It is not a no-op and must be
-    reproduced**: a Gram-Schmidt run in the state's float32 is orthonormal only
-    to 1.2e-07, and snapping it moves the matrix by 6e-08. Dropping this step
-    costs more than every other choice in this file.
-
-    numpy's SVD reproduces scipy's snap to 8e-16, measured on the real matrices
-    in both venvs, so scipy earns no place in M\\*'s dependencies for it.
+    The reference stores every rotation as a scipy ``Rotation``, whose
+    ``from_matrix`` re-orthogonalises (``pose.py:500-501``, ``:424``). **Not a
+    no-op**: a float32 Gram-Schmidt is orthonormal only to ~1e-07. numpy's SVD
+    reproduces scipy's snap to 8e-16, so scipy is not a dependency.
     """
     u, _, vt = np.linalg.svd(np.asarray(m, dtype=np.float64))
     return u @ vt
@@ -101,13 +89,10 @@ def _homogeneous(xyz_rot6d: np.ndarray) -> np.ndarray:
 def _compose_eef(relative: np.ndarray, reference: np.ndarray) -> np.ndarray:
     """``(T, 9)`` relative poses on a ``(9,)`` reference -> ``(T, 9)`` absolute.
 
-    ``T_abs = T_ref @ T_rel`` per pose (``action_chunking.py:641-653``), which is
-    why this cannot be the addition the joint groups use: composing two rigid
-    transforms rotates the relative translation into the reference's frame.
-
-    Kept as a Python loop over 40 poses, like the reference's, rather than a
-    batched ``matmul``: it runs once per request on the host, and a batched BLAS
-    call could pick a different kernel and move the last bits.
+    ``T_abs = T_ref @ T_rel`` per pose (``action_chunking.py:641-653``), not the
+    joints' addition: composing rigid transforms rotates the relative translation
+    into the reference's frame. A loop like the reference's, not a batched
+    ``matmul``, which could pick a different BLAS kernel and move the last bits.
     """
     t_ref = _homogeneous(reference)
     out = np.empty_like(relative)
@@ -157,31 +142,20 @@ class Gr00tN17Preprocessor:
         # frames per view, 2 for every tag in this checkpoint
         self.video_steps = {tag: len(mc["video"]["delta_indices"]) for tag, mc in modality_configs.items()}
         self.action_keys = {tag: mc["action"]["modality_keys"] for tag, mc in modality_configs.items()}
-        # The decode's three tables, built to the reference's own rules
+        # The decode's tables follow the reference's rules
         # (`state_action_processor.py:156-204`), which are not the state's:
-        #
-        #  * `action_dims` is the *absolute* stats' width even for a relative
-        #    key, because the relative override copies the group's stats wholesale
-        #    and puts back only the `dim` computed before it (`:200-204`). Where a
-        #    group has no absolute stats this is 0, and the reference's own decode
-        #    then fails -- see `unapply`.
-        #  * the two sources are also **shaped differently**, and the decode leans
-        #    on it: an absolute group's percentiles are one bound per dimension,
-        #    `(D,)`, while a relative group's are one per *timestep*, `(T, D)` --
-        #    (40, 9) and (40, 7) for DROID. So the unnormalise broadcasts across
-        #    the batch axis, never the time axis, and a group whose horizon and
-        #    whose relative bounds disagreed would raise rather than mis-scale.
-        #  * `action_bounds` switches **source and field**: a relative key reads
-        #    `min`/`max` off `relative_action`, an absolute one reads `q01`/`q99`
-        #    off `action` (`use_percentiles`). The override bypasses the percentile
-        #    choice entirely. On DROID's `eef_9d` the two spans differ by a factor
-        #    running from 0.03 to 3.17 depending on the dimension and the step, so
-        #    reading percentiles for a relative key does not scale an action by any
-        #    one factor -- it warps the trajectory, silently.
-        #  * the `1e-8` range floor at `:169` is deliberately **not** carried: it
-        #    only ever sizes `dim`, and the stored bounds it is computed from are
-        #    unfloored, so the inverse never sees it. A constant dimension
-        #    (`max == min`) therefore decodes to that constant.
+        #  * `action_dims` is the *absolute* stats' width even for a relative key:
+        #    the relative override keeps the `dim` computed before it (`:200-204`).
+        #    It is 0 where a group has no absolute stats; see `unapply`.
+        #  * a relative key reads `min`/`max` off `relative_action`, an absolute
+        #    one `q01`/`q99` off `action`: the override bypasses `use_percentiles`.
+        #    Percentiles for a relative key would silently warp the trajectory.
+        #  * relative bounds are per timestep, `(T, D)`, absolute ones per
+        #    dimension, `(D,)`, so the unnormalise broadcasts over the batch axis
+        #    only, and a horizon that disagrees raises rather than mis-scales.
+        #  * the `1e-8` range floor (`:169`) only sizes `dim` and the stored bounds
+        #    are unfloored, so it is not carried: a constant dimension decodes to
+        #    that constant.
         self.action_configs = {}
         self.action_bounds = {}
         self.action_dims = {}
@@ -221,10 +195,8 @@ class Gr00tN17Preprocessor:
     ):
         """``backbone_path`` (Cosmos-Reason2-2B) loads the text/image processor;
         without it only ``state``/``image``/``embodiment_id``/``action_mask`` work.
-
-        It may be a hub id, which is what registration passes, so ``cache_dir``
-        goes with it: a deployment that sets one expects nothing written to the
-        default cache."""
+        It may be a hub id, so ``cache_dir`` goes with it: a deployment that sets
+        one expects nothing in the default cache."""
         processor = None
         if backbone_path is not None:
             from transformers import AutoProcessor
@@ -257,7 +229,7 @@ class Gr00tN17Preprocessor:
         tag = self._tag(embodiment_tag)
         parts = []
         for key in self.state_keys[tag]:
-            # ponytail: float32 like the reference's dataset path; float64
+            # float32 like the reference's dataset path; float64
             # input would round differently from what NVIDIA serves.
             x = np.asarray(state[key], dtype=np.float32)
             lo, hi = self.state_bounds[tag][key]
@@ -303,47 +275,28 @@ class Gr00tN17Preprocessor:
         Mirrors ``Gr00tN1d7Processor.unapply`` (``processing_gr00t_n1d7.py:406``)
         and ``StateActionProcessor.unapply_action`` (``state_action_processor.py:421``).
 
-        ``action`` is ``(B, T, max_action_dim)`` straight off the action decoder:
-        the horizon is cut to this embodiment's own and the width is cut per
-        group, both of which the 132-wide padding hides. ``state`` is the
-        request's **raw** state per group, which the relative groups compose onto
-        -- it is required exactly when some group is relative.
+        ``action`` is ``(B, T, max_action_dim)`` off the action decoder; the
+        horizon and each group's width are cut out of the padding. ``state`` is
+        the request's **raw** state per group, required when a group is relative.
 
-        Dtypes are the reference's, not the widest available: the chunk and a
-        relative group's reference frame stay as they arrive and widen only where
-        the reference widens, on the multiply by the float64 bounds.
-
-        Against the 20 recorded DROID requests (``test_preprocessing.py``'s decode
-        parity test) this is **bit-exact** for ``gripper_position`` (absolute) and
-        ``joint_position`` (relative, additive), and for the SE(3) group
-        ``eef_9d`` it is min 4.7e-16 / median 8.3e-16 / max 3.3e-09 -- a bound of
-        **one float32 ulp of the reference frame**, which 96 of 300 random frames
-        realise across the two numpy builds; one in twenty is this checkpoint's
-        luck. The single
-        outlier is not ours: ``np.dot`` on two float32 3-vectors returns exactly
-        ``0.0`` under the reference venv's numpy 1.26.4 and ``3.7e-09`` under
-        M\\*'s 2.5.4, which moves that request's Gram-Schmidt by one float32 ulp.
-        So bit-exactness for ``eef_9d`` is not available at any dtype, and doing
-        the Gram-Schmidt in float64 to dodge it is worse everywhere -- median
-        6.0e-09, max 2.2e-08, nothing bit-exact.
+        Dtypes are the reference's, not the widest: the chunk and the reference
+        frame widen only where the reference does, on the multiply by the float64
+        bounds. ``eef_9d`` is not bit-exact at any dtype: ``np.dot`` on float32
+        3-vectors can differ between the reference's numpy 1.26 and ours, 2.5,
+        which moves the Gram-Schmidt by one float32 ulp of the reference frame;
+        that ulp is the bound, and a float64 Gram-Schmidt is worse everywhere.
         """
         tag = self._tag(embodiment_tag)
-        # **Not** upcast, for the same reason as the reference frame below: the
-        # reference runs `(clip(x) + 1) / 2` in the chunk's own float32 and only
-        # widens on the multiply by the float64 bounds. For most values that is
-        # exact anyway -- the chunk is bf16 off the decoder, and a bf16 value plus
-        # one needs 16 of float32's 24 mantissa bits -- but a *tiny* value needs
-        # 28, so it rounds. That rounding is worth `2**-24 / 2 * range`, about
-        # 8e-09 here, and it moved one of the 20 recorded requests by 3.3e-09
-        # while the other 19 matched to 1e-15.
+        # **Not** upcast: the reference runs `(clip(x) + 1) / 2` in the chunk's
+        # own float32. A bf16 value plus one is exact there, but a tiny one
+        # rounds, by up to `2**-24 / 2 * range`, which upcasting would not reproduce.
         chunk = np.asarray(action)
         if chunk.ndim != 3:
             raise ValueError(f"GR00T action decode wants (B, T, D); got {chunk.shape}")
         horizon = self.action_horizon[tag]
         width = sum(self.action_dims[tag].values())
-        # the padding is what makes both of these silent: a chunk one group short
-        # would decode every group after it from the wrong offset, and a chunk
-        # shorter than the horizon would return fewer steps than asked for
+        # the padding would hide both: a chunk one group short decodes every later
+        # group from the wrong offset, one short of the horizon returns fewer steps
         if chunk.shape[1] < horizon or chunk.shape[2] < width:
             raise ValueError(
                 f"GR00T {tag!r} decodes {width} dims over {horizon} steps, but the "
@@ -354,15 +307,9 @@ class Gr00tN17Preprocessor:
         for key in self.action_keys[tag]:
             dim = self.action_dims[tag][key]
             if dim == 0:
-                # The width comes from the *absolute* stats, which this group has
-                # none of, so there is nothing to decode into. The reference fails
-                # here too, though earlier than the pose code: `unapply_action`
-                # unnormalises every group before any relative->absolute work
-                # (`state_action_processor.py:451-469`), so the empty slice meets
-                # this group's (40, 9) relative bounds and raises
-                # "operands could not be broadcast together with shapes
-                # (1,40,0) (40,9)". Either way it is the checkpoint's hole, not
-                # ours; here it is only xdof's two wrist groups.
+                # no absolute stats, so no width to decode into: the checkpoint's
+                # hole (only xdof's two wrist groups). The reference fails too, when
+                # its unnormalise meets the empty slice (`state_action_processor.py:451-469`).
                 raise ValueError(
                     f"GR00T embodiment {tag!r} has no action statistics for joint "
                     f"group {key!r}, so its decoded width is 0 and the chunk cannot "
@@ -396,13 +343,9 @@ class Gr00tN17Preprocessor:
                 f"state {state_key!r}, so the request's raw state is required to "
                 "turn it into an absolute action"
             )
-        # **Not** upcast. The reference builds the relative poses in float64 --
-        # the unnormalise runs against float64 bounds -- but the reference *frame*
-        # from the raw state, whose float32 it keeps, so its Gram-Schmidt runs in
-        # float32 and only widens when scipy takes the matrix. Upcasting here is
-        # measurably worse: see `unapply`. The cast is for the wire: JSON
-        # delivers the state as Python floats, which `asarray` makes float64,
-        # and that moves `eef_9d` by an ulp against the reference's float32.
+        # float32, not upcast: the reference builds the frame from the raw
+        # state's float32 and runs its Gram-Schmidt there (see `unapply`). JSON
+        # delivers Python floats, which `asarray` alone would make float64.
         ref = np.asarray(state[state_key], dtype=np.float32)
         if ref.ndim == 2:  # (T, D) -- one request, as the reference also allows
             ref = ref[None]
@@ -429,23 +372,15 @@ class Gr00tN17Preprocessor:
     def frame_layout(self, embodiment_tag: str) -> tuple[tuple[str, ...], int]:
         """This embodiment's camera views, in order, and its frames per view.
 
-        The order is the contract a request is sent in: the engine's media path
-        keys loaded files by *modality*, not by name
-        (`PreprocessWorkerThread._load_media`), so several cameras arrive as one
-        positional list and only this order says which frame is which camera.
+        The order is the request's contract: the engine keys media by *modality*,
+        not name (`PreprocessWorkerThread._load_media`), so cameras arrive as one
+        positional list.
         """
         tag = self._tag(embodiment_tag)
         return tuple(self.video_keys[tag]), self.video_steps[tag]
 
     def warmup_chat_template(self) -> None:
-        """Compile the backbone processor's jinja chat template once, up front.
-
-        `apply_chat_template` compiles the template on its first call and caches it
-        on the processor, so a server that does not do this charges its first robot
-        observation for the compile.
-        Without a backbone processor there is no template, so there is nothing to
-        warm.
-        """
+        """Compile the chat template up front, rather than on the first observation."""
         if self.processor is None:
             return
         self.processor.apply_chat_template(
@@ -467,7 +402,7 @@ class Gr00tN17Preprocessor:
     def _shortest_edge_to(self, img: np.ndarray) -> np.ndarray:
         # albumentations' SmallestMaxSize: round() each side, skip at scale 1.
         # cv2's INTER_AREA is the reference's filter; torchvision's bilinear
-        # moved actions ~5x the error of the rest of the port.
+        # moves the actions measurably.
         import cv2
 
         h, w = img.shape[:2]
@@ -487,11 +422,9 @@ class Gr00tN17Preprocessor:
         ``process_observation``. ``video[view]`` is uint8 ``(B, T, H, W, 3)``,
         ``language`` one instruction per item, ``state[key]`` ``(B, T, D)``."""
         tag = self._tag(embodiment_tag)
-        # The per-tag view and joint-group names are the checkpoint's, so a client
-        # cannot guess them: name the ones this embodiment wants. Without this a
-        # missing view is a bare `KeyError`, which `PreprocessWorkerThread._fail_request`
-        # answers with a **500** whose body is just the key -- the same trap the
-        # top-level guards in `gr00t_n17_model.py` were added to avoid.
+        # The names are the checkpoint's, so a client cannot guess them; a bare
+        # `KeyError` would be a 500 whose body is just the key
+        # (`PreprocessWorkerThread._fail_request`).
         for name, want, got in (("video", self.video_keys[tag], video),
                                 ("state", self.state_keys[tag], state)):
             missing = [k for k in want if k not in got]
@@ -500,11 +433,9 @@ class Gr00tN17Preprocessor:
                     f"GR00T {tag!r} needs {name} {list(want)}; missing {missing}"
                 )
         views = [np.asarray(video[v]) for v in self.video_keys[tag]]
-        # uint8, as the reference asserts (`gr00t_policy.py:276-279`), and not for
-        # tidiness: the HF image processor rescales by 1/255 whatever it is handed,
-        # so a client that normalised its frames first gets them divided twice and
-        # the model sees a black image -- same shapes, same token count, no error,
-        # plausible-looking actions. Measured: pixel mean -0.997 against -0.164.
+        # uint8, as the reference asserts (`gr00t_policy.py:276-279`): the HF image
+        # processor rescales by 1/255 whatever it gets, so pre-normalised frames
+        # become a black image with no error and plausible-looking actions.
         bad = [v for v, a in zip(self.video_keys[tag], views, strict=True) if a.dtype != np.uint8]
         if bad:
             raise ValueError(
@@ -522,9 +453,8 @@ class Gr00tN17Preprocessor:
                 for t in range(steps)
                 for v in views
             ]
-            # the reference stacks the transformed frames of every view
-            # (`processing_gr00t_n1d7.py:746`), so cameras may differ in size but
-            # must transform to one: the same aspect ratio
+            # the reference stacks every view's transformed frames
+            # (`processing_gr00t_n1d7.py:746`), so cameras must share an aspect ratio
             sizes = {tuple(f.shape[1:]) for f in item}
             if len(sizes) > 1:
                 raise ValueError(

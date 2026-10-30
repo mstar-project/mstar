@@ -1,22 +1,19 @@
 """GR00T N1.7's whole ``action_gen`` loop on the GPU, against NVIDIA's reference recordings.
 
-``test_dit_gpu.py`` pins one DT forward. This file pins the loop around it: the four iterations of
-``Gr00tN17DenoiseStepSubmodule.denoise`` (``submodules.py``) from the seeded noise to the
-served chunk, then ``Gr00tN17Preprocessor.unapply`` to the joint values a robot is sent. It also
-checks that batching two requests, or two rows at different loop iterations, changes neither row.
+``test_dit_gpu.py`` pins one DT forward. This file pins the four ``denoise`` iterations
+(``Gr00tN17DenoiseStepSubmodule``) from the seeded noise to the served chunk, then ``unapply`` to
+joint values, and checks that batching two requests, or two rows at different loop iterations,
+changes neither row.
 
-The recordings (~420 MB, outside the repo) are NVIDIA's ``gr00t`` code run on M\\*'s stack (same
-torch, CUDA and SDPA kernels), one per DROID request: ``~/gr00t-runs/oracle_fp32`` and
-``oracle_bf16`` from the recorded noise, ``oracle_{fp32,bf16}_seedN`` from the noise M\\*'s
-server draws for seed N, and ``dump``, the requests' inputs (``input_ids``, ``embodiment_id``,
-embodiment tag, raw state). The bf16 run against the fp32 one is the **bf16 floor**, measured per
-request; the bar is mean abs error within **1.2x** of it. Ours is handed the bf16 run's own
-``vl_embeds`` and ``state_features``: the dump's differ by mean abs 8.4e-02 (another stack's
-backbone) and would still pass at 0.98-1.09x, so the ratio would read two backbones, not our loop.
+The recordings (outside the repo) are NVIDIA's ``gr00t`` code run on M\\*'s stack, one per DROID
+request: ``oracle_{fp32,bf16}`` from the recorded noise, ``oracle_{fp32,bf16}_seedN`` from the
+noise M\\*'s server draws for seed N, and ``dump``, the requests' inputs. The bf16 run against the
+fp32 one is the **bf16 floor**, per request; the bar is mean abs error within **1.2x** of it. Ours
+is handed the bf16 run's own ``vl_embeds`` and ``state_features``, since the dump's come from
+another stack's backbone and the ratio would read two backbones, not our loop.
 
-Every span runs on SDPA (no attention resource is bound, so ``DiT.forward`` falls back to
-``_SDPA_ATTEND``); the ragged kernels are ``test_dit_gpu.py``'s. Needs CUDA, the cached checkpoint
-and the recordings, and skips without any of them.
+Every span runs on SDPA (no attention resource is bound); the ragged kernels are
+``test_dit_gpu.py``'s. Skips without CUDA, the cached checkpoint or the recordings.
 """
 
 from __future__ import annotations
@@ -41,8 +38,8 @@ from .helpers import BACKBONE, GR00T
 _RUNS = Path.home() / "gr00t-runs"
 _ORACLE_FP32, _ORACLE_BF16, _DUMP = _RUNS / "oracle_fp32", _RUNS / "oracle_bf16", _RUNS / "dump"
 _REQUESTS = 20
-# Every recording set as its (fp32, bf16) pair. `recorded` starts from the dump's own noise and
-# is what the parity tests read; the per-seed statistic belongs to the served check, not here.
+# Each recording set's (fp32, bf16) pair. `recorded` starts from the dump's own noise and is what
+# the parity tests read.
 _SETS = {
     "recorded": (_ORACLE_FP32, _ORACLE_BF16),
     **{
@@ -73,9 +70,8 @@ _BF16 = torch.bfloat16
 
 # A multiple of the floor measured in the test, never an absolute tolerance.
 _BAR = 1.2
-# The 20 requests' (text rows, image rows) buckets, spelled out because they are what the test
-# catches changing. 448 image rows = four frames (DROID's two cameras) at a 1 x 16 x 28 patch
-# grid merged by 2, 112 rows each; only the prompt length varies.
+# The 20 requests' (text rows, image rows) buckets. 448 image rows = four frames (DROID's two
+# cameras) of 112 rows (a 1 x 16 x 28 patch grid merged by 2); only the prompt length varies.
 _BUCKETS = {(13, 448): 8, (21, 448): 12}
 # The denoise step's tensors: action encoder, position table, the DT (456), decoder; the count
 # says the node is the whole step, not the DT alone.
@@ -84,17 +80,17 @@ _STEP_TENSORS = 467
 # time, not a noise level, and the recordings were made against it.
 _SIGMAS = (0.0, 0.25, 0.5, 0.75, 1.0)
 _TIMESTEPS = (0.0, 250.0, 500.0, 750.0)
-# The fp32 answer's rms, measured 1.057 to 1.106 over the 20: says the weights are the trained
-# ones, since untrained weights set a floor inside which every bar passes.
+# The fp32 answer's rms: says the weights are the trained ones, since untrained weights set a
+# floor inside which every bar passes.
 _ACTION_RMS = (0.9, 1.3)
 # One row mid-loop and one at the last step, so neither the timestep nor the sigma pair is shared.
 _MIXED_ITERS = (1, 3)
-# How far above the batching floor the span-assignment control must sit. Hand-chosen; measured
-# 26x. Only says a wiring bug and re-blocking are of different orders.
+# How far above the re-blocking floor the span-assignment and perturbation controls must sit.
+# Hand-chosen: it only says a wiring bug and re-blocking are of different orders.
 _CONTROL_MARGIN = 10
-# How far past its floor our loop must land on the wrong seed's noise. Hand-chosen; measured
-# chunk 222-315x, decoded worst group 3.7-44x (req 00 the closest: a group's error is a few dims
-# of a mostly-padding chunk). 2.5x is what req 00 leaves room for above the 1.2x bar.
+# How far past its floor (chunk, decoded worst group) our loop must land on the wrong seed's
+# noise. Hand-chosen. The decoded bar is lower because a group's error is a few dims of a
+# mostly-padding chunk; it still sits above the 1.2x parity bar.
 _WRONG_NOISE_CHUNK, _WRONG_NOISE_DECODED = 50, 2.5
 
 
@@ -133,9 +129,8 @@ class _Request:
 def _load(
     config: Gr00tN17Config, index: int, fp32: Path = _ORACLE_FP32, bf16: Path = _ORACLE_BF16,
 ) -> _Request:
-    """One request of one recording set, conditioned on the **bf16** run's tensors. The image
-    rows are the reference's own predicate, ``input_ids == image_token_id``
-    (``gr00t/model/modules/qwen3_backbone.py:364``), pinned in ``test_bridge.py``."""
+    """One request of one recording set, conditioned on the **bf16** run's tensors. Image rows
+    use the reference's own predicate, ``input_ids == image_token_id`` (``qwen3_backbone.py``)."""
     oracle32 = torch.load(fp32 / f"req_{index:02d}.pt", map_location="cpu", weights_only=False)
     oracle16 = torch.load(bf16 / f"req_{index:02d}.pt", map_location="cpu", weights_only=False)
     dump = torch.load(_DUMP / f"req_{index:02d}.pt", map_location="cpu", weights_only=False)
@@ -173,9 +168,9 @@ class _Loop:
 
 @pytest.fixture(scope="session")
 def loop() -> _Loop:
-    """The denoise step at the checkpoint's weights, bf16 on the device, built once: it is
-    2.55 GiB on a 12 GiB card and the loader is the slowest thing in the file. The schedule is
-    asserted here because every bar below is measured against it."""
+    """The denoise step at the checkpoint's weights, bf16 on the device, built once (2.55 GiB,
+    and the slowest load in the file). The schedule is asserted here because every bar below is
+    measured against it."""
     config = Gr00tN17Config.from_hf(GR00T, BACKBONE)
     submodule = Gr00tN17DenoiseStepSubmodule(
         config,
@@ -209,8 +204,8 @@ def loop() -> _Loop:
 
 @pytest.fixture(scope="session")
 def recordings(loop: _Loop) -> Callable[[str], list[_Request]]:
-    """A recording set's 20 requests by its ``_SETS`` name, each set loaded once (~2 MB of device
-    memory per request), and a skip for a set that is not complete."""
+    """A recording set's 20 requests by its ``_SETS`` name, each set loaded once; skips a set
+    that is not complete."""
     loaded: dict[str, list[_Request]] = {}
 
     def get(name: str) -> list[_Request]:
@@ -254,9 +249,8 @@ def pair(requests: list[_Request]) -> tuple[_Request, _Request]:
 def _run(loop: _Loop, batch: list[_Request], iters: tuple[int, ...] | None = None) -> torch.Tensor:
     """``action_gen``'s loop over same-shaped requests: ``[B, 40, 132]`` in fp32.
 
-    ``denoise`` reads neither ``engine_inputs`` nor ``bucket_key``, so both are None; the
-    scaffold around the step is tested on the CPU. ``iters=None`` is the real four-step loop; a
-    tuple gives each row **its own** iteration index in one shared forward.
+    ``denoise`` reads neither ``engine_inputs`` nor ``bucket_key``, so both are None. ``iters=None``
+    is the real four-step loop; a tuple gives each row **its own** iteration in one forward.
     """
     latents = torch.cat([request.noise for request in batch])
     text = torch.cat([request.text for request in batch])
@@ -287,9 +281,9 @@ def _reblocking_floor(
 ) -> torch.Tensor:
     """How far one request's answer moves when a second row shares its forward.
 
-    A shared GEMM re-blocks with the row count, so M=2 does not return M=1's bits and neither
-    ``torch.equal`` nor an absolute tolerance holds. The second row is **the same request**, so
-    what is left is the re-blocking alone: the floor the batching bars are ratios to.
+    A shared GEMM re-blocks with the row count, so M=2 does not return M=1's bits. The second row
+    is **the same request**, so what is left is the re-blocking alone: the floor the batching bars
+    are ratios to.
     """
     duplicated = _run(loop, [request, request], iters=None if iters is None else (iters[0], iters[0]))
     alone = _run(loop, [request], iters=None if iters is None else iters[:1])
@@ -347,11 +341,9 @@ def test_the_four_step_loop_matches_the_oracle_on_every_recorded_request(
 ):
     """Ours in bf16 against the fp32 reference, all 20 requests, each at **its own** floor.
 
-    The port's one end-to-end number: action encoder, position table on the 40 action rows only
-    (``Gr00tN17DenoiseStepSubmodule.denoise``), the 32 DT blocks, the decoder's horizon slice and
-    four bf16 Euler updates (``euler_step`` in ``denoise``). The floor ranges 3.1e-03 to 9.0e-03
-    over the 20, so one pooled bar would let the easy requests pay for a bad one. The reference's
-    rms is asserted too, so the answer off disk is the trained model's.
+    The floor varies about 3x across requests, so one pooled bar would let the easy requests pay
+    for a bad one. The reference's rms is asserted too, so the answer off disk is the trained
+    model's.
     """
     for request in requests:
         rms = request.want.pow(2).mean().sqrt().item()
@@ -372,15 +364,11 @@ def test_the_decoded_actions_match_the_oracle_in_every_joint_group(
 ):
     """Ours and both reference runs through ``unapply``, compared **per joint group**.
 
-    The 132-wide chunk is mostly padding, and ``unapply`` cuts it per group from the absolute
-    statistics (``Gr00tN17Preprocessor.action_dims``), un-normalises each by its own bounds and
-    composes the relative groups onto the raw state: a 7-dim group that is 5% of the chunk is
-    100% of one joint. Both reference runs are decoded here so the decode's own arithmetic sits
-    inside the floor; ``unapply``'s parity is ``test_preprocessing.py``'s.
-
-    The bar is the worst group against the worst group's floor: measured median 1.013, max
-    1.066. Each group against its own floor also passes but only just (worst 1.194, on
-    ``gripper_position``, a mean over 40 values), so it is not asserted.
+    The 132-wide chunk is mostly padding: a 7-dim group that is 5% of the chunk is 100% of one
+    joint. Both reference runs are decoded so the decode's own arithmetic sits inside the floor;
+    ``unapply``'s parity is ``test_preprocessing.py``'s. The bar is the worst group against the
+    worst group's floor. Each group against its own floor passes only just (``gripper_position``
+    is a mean over 40 values), so it is not asserted.
     """
     for request in requests:
         worst, floor, per_group = _decoded_error(loop, _run(loop, [request]).cpu(), request)
@@ -397,9 +385,8 @@ def test_the_parity_bar_rejects_our_loop_on_another_seeds_noise(
     """Negative control on the noise: seed 7's conditioning and answer, seed 8's noise.
 
     A dropped seed or a shared generator still returns a plausible chunk at the trained rms, so
-    both readings above must put this far past the floor on **every** request. A loop that
-    ignores its conditioning still follows its noise, so the blanked-camera control is the
-    other half.
+    both readings must put this far past the floor on **every** request. A loop that ignores its
+    conditioning still follows its noise, so the blanked-camera control is the other half.
     """
     right = recordings(_RIGHT_SET)
     wrong = recordings(_WRONG_NOISE_SET)
@@ -422,8 +409,7 @@ def test_the_parity_bar_rejects_our_loop_with_the_image_rows_blanked(
 ):
     """Negative control on the conditioning: the right noise, the 448 image rows zeroed, and
     both readings must fail the 1.2x bar on every request. Zeroed, not scaled: an affine change
-    is nearly invisible through ``AdaLayerNorm`` (see the last test). How far past the bar it
-    lands has not been measured on the 20."""
+    is nearly invisible through ``AdaLayerNorm`` (see the last test)."""
     for request in requests:
         blind = _Request(**{**vars(request), "image": torch.zeros_like(request.image)})
         ours = _run(loop, [blind]).cpu()
@@ -439,10 +425,8 @@ def test_the_parity_bar_rejects_our_loop_with_the_image_rows_blanked(
 def test_the_recorded_requests_occupy_two_buckets(requests: list[_Request]):
     """The 20 requests are exactly two (text rows, image rows) buckets, 8 and 12 deep.
 
-    Each bucket key is its own forward and CUDA graph
-    (``Gr00tN17DenoiseStepSubmodule.bucket_key_for``), so the count is what a DROID deployment
-    pays per step. It is also what lets ``pair`` find two different requests the engine would
-    batch together.
+    Each bucket key is its own forward and CUDA graph (``bucket_key_for``), so the count is what a
+    DROID deployment pays per step; it also lets ``pair`` find two requests the engine would batch.
     """
     counts: dict[tuple[int, int], int] = {}
     for request in requests:
@@ -459,11 +443,10 @@ def test_batching_two_requests_of_one_shape_costs_only_the_gemm_re_blocking(
     loop: _Loop, pair: tuple[_Request, _Request],
 ):
     """Two different same-shaped requests batched against each run alone, at the bar over each
-    row's own re-blocking floor (measured 1.15e-03 and 1.17e-03 mean; ratio 1.00x).
+    row's own re-blocking floor.
 
     The floor is per row, not one row's applied to both: a per-element max of bf16 differences
-    moves in whole ulps (one row's 3.125e-02 over 2.34e-02 is exactly 4/3), and across the 20
-    the duplicate-batch max reaches 4.6875e-02 (req_16). Isolation itself is the next test's.
+    moves in whole ulps, so two rows' maxima can differ by a third. Isolation is the next test's.
     """
     batched = _run(loop, list(pair))
     for row, request in enumerate(pair):
@@ -482,8 +465,7 @@ def test_a_rows_result_does_not_depend_on_who_shares_its_batch(
 
     The duplicate-batch floor is blind to a cross-row leak (two identical rows make the leak a
     no-op). cuBLAS picks a kernel from shapes and dtypes, not values, so the fixed row's bits
-    must not change. One request per bucket, four partners each (itself included), both
-    positions.
+    must not change.
     """
     for anchor in (0, 8):  # one per bucket; `requests` is ordered by index
         fixed = requests[anchor]
@@ -508,8 +490,7 @@ def test_giving_the_text_blocks_the_image_rows_dwarfs_the_batching_gap(
     """Negative control for the batching bar: the text blocks read the image rows instead.
 
     ``_span_for`` (``components/dit.py``) picks text when ``idx % 4 == 0``; a swap keeps every
-    shape, and slicing the image rows to the text count keeps the bucket. Measured: mean
-    2.97e-02 against a floor of 1.15e-03, 26x where the bar admits 1.2x.
+    shape, and slicing the image rows to the text count keeps the bucket.
     """
     request, _ = pair
     text_rows = request.text.shape[1]
@@ -537,8 +518,7 @@ def test_rows_at_different_loop_iterations_match_each_row_run_alone(
 
     A request that arrives a step late rides in the same forward as one three steps in, so the
     timestep embedding, ``ada_norm`` conditioning and Euler ``dt`` must be per row. Indices 1 and
-    3, not 0: index 0's sigma is 0 and its ``dt`` equals every other step's. Measured: mean
-    5.55e-04, max 1.56e-02, 1.00x the floor.
+    3, not 0: index 0's sigma is 0 and its ``dt`` equals every other step's.
     """
     assert len(set(_MIXED_ITERS)) == len(_MIXED_ITERS), "the point is two different indices"
     mixed = _run(loop, list(pair), iters=_MIXED_ITERS)
@@ -558,11 +538,9 @@ def test_perturbing_one_rows_conditioning_leaves_the_other_row_bit_identical(
     """Blank row 0's image rows: row 1 must come back **bit-identical**, over one mixed step (a
     reduction over the batch) and the four-step loop (a shared carried trajectory).
 
-    Row 0 must also move by ``_CONTROL_MARGIN`` x the floor (measured 24x at one step, 33x over
-    the loop), or the check is vacuous. The perturbation must not be affine: each block opens
-    with a per-row ``nn.LayerNorm`` (``AdaLayerNorm``) that removes a shift and a rescale.
-    Measured: ``state += 1.0`` 1.1x, ``state *= 2`` 1.0x, against ``state += 1x-rms noise`` 8.4x,
-    ``vl_text = 0`` 9.3x and ``vl_image = 0`` 17x.
+    Row 0 must also move by ``_CONTROL_MARGIN`` x the floor, or the check is vacuous. The
+    perturbation must not be affine: each block opens with a per-row ``nn.LayerNorm``
+    (``AdaLayerNorm``) that removes a shift and a rescale.
     """
     first, second = pair
     perturbed = _Request(**{**vars(first), "image": torch.zeros_like(first.image)})

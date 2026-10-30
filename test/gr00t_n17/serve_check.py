@@ -8,9 +8,9 @@ holds the decoded actions to the parity bar: per request, the worst joint group'
 against NVIDIA's model in fp32 is at most 1.2x the worst group's bf16 floor (NVIDIA's model in
 bf16 against itself in fp32), all through the same decode, **each averaged over the seeds**.
 
-One seed is one sample: the four-step loop turns a floor-sized rounding difference into anything
-from 0.3x to 2.2x the floor depending on its direction, and NVIDIA's own autocast route misses a
-one-seed bar too. So every observation is served once per seed.
+One seed is one sample: the four-step loop turns a floor-sized rounding difference into well
+under or well over the floor depending on its direction. So every observation is served once per
+seed.
 
 The server draws its own noise from the request's ``seed``, so the recordings must be NVIDIA's
 reference run (its ``action_pred`` per request, fp32 and bf16) made with that same seed. Then, on
@@ -129,7 +129,7 @@ def malformed(url: str, obs, seed: int) -> dict[str, int]:
         "a lossy frame": ([("f.jpg", jpeg.getvalue()), *frames[1:]], json.dumps({**kwargs, "seed": seed})),
         "one frame short": (frames[:-1], json.dumps({**kwargs, "seed": seed})),
         "a state group one value short": (frames, json.dumps({**kwargs, "state": narrow, "seed": seed})),
-        # the wrong JSON type, which once reached an AttributeError and a 500
+        # a wrong JSON type reaches `.items()`/`.lower()`; it must still be a 400
         "state a list, not an object": (frames, json.dumps({**kwargs, "state": [1.0], "seed": seed})),
         "embodiment_tag a number": (frames, json.dumps({**kwargs, "embodiment_tag": 3, "seed": seed})),
     }
@@ -201,7 +201,7 @@ def main() -> int:
                   f"per seed {', '.join(f'{e / f:.2f}' for e, f in pairs)})")
             if not r <= BAR:
                 failures.append(f"{name}: ratio {r:.3f} past the bar {BAR}")
-            # every request, not one: the weakest observed (req_00) is 3.7x, the strongest 44x
+            # negative control, on every request: noise from another seed must miss the bar
             e, f = errors(pre, decode(send(client, obs, wrong)), oracle(args.oracle_fp32, seed, name),
                           oracle(args.oracle_bf16, seed, name), dump)
             report["other_seed_ratios"][name] = e / f

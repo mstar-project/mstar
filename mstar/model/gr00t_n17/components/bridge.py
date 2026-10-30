@@ -2,15 +2,11 @@
 self-attention blocks, before the rows are split into text and image.
 
 The blocks are the reference's ``BasicTransformerBlock`` at its plainest
-setting -- ``layer_norm``, no AdaLN, no cross-attention, no positional
-embedding, no timestep -- which ``SelfAttentionTransformer`` gets by passing
-none of those arguments, so the block's own defaults apply (eps 1e-5, affine).
-The only piece that is ours is the attention: it calls M\\*'s ragged resource
-where the reference calls diffusers' ``Attention``. The feed-forward *is*
-diffusers' own, imported -- its ``net.0.proj`` and ``net.2`` are exactly the
-checkpoint's keys, at exactly its shapes.
-
-Class and parameter names are the reference's, so the checkpoint maps 1:1.
+setting (``layer_norm``, no AdaLN, no cross-attention, no positional embedding,
+no timestep), so the block's own defaults apply: eps 1e-5, affine. Only the
+attention is ours, calling M\\*'s ragged resource where the reference calls
+diffusers' ``Attention``; the feed-forward is diffusers' own. Class and
+parameter names are the reference's, so the checkpoint maps 1:1.
 """
 from __future__ import annotations
 
@@ -45,9 +41,7 @@ class BridgeAttention(nn.Module):
         self.to_q = nn.Linear(dim, dim, bias=True)
         self.to_k = nn.Linear(dim, dim, bias=True)
         self.to_v = nn.Linear(dim, dim, bias=True)
-        # diffusers' `Attention` holds a dropout after the projection, which
-        # is why the checkpoint's key is `to_out.0`; the dropout is inert at
-        # eval, so only the linear is here
+        # diffusers' dropout at `to_out.1` is inert at eval, so only the linear
         self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=True)])
         self.ragged_attn = None
 

@@ -1,8 +1,5 @@
 """GR00T N1.7's ``denoise_step`` node: one flow-matching step of the action head on the
-scaffold's ``DenoiseLoopSubmodule``. Covers the hooks: the schedule (ascending, unlike the image
-models), the 41-row/40-row counts, the carried dtype, the bucket key, batching, the
-conditioning, the attention callables and the step declaration. Value tests run a shallow DT.
-"""
+scaffold's ``DenoiseLoopSubmodule``. Value tests run a shallow DT."""
 
 import dataclasses
 import functools
@@ -45,23 +42,19 @@ from .helpers import BACKBONE, GR00T, needs_checkpoint, randomize
 _LOOP = "action_gen"
 _WALK = "action_gen"
 
-# The checkpoint's numbers, spelled out rather than read off the config; the last test ties
-# them to the checkpoint.
+# The checkpoint's numbers, spelled out; the last test ties them to the checkpoint.
 _HORIZON = 40          # `action_horizon`: the action rows, and the latents' rows
 _ACTION_DIM = 132      # `max_action_dim`: the latents' width
 _ROWS = 1 + _HORIZON   # what the DT sees: the state row, then the action rows
 _STEPS = 4             # `num_inference_timesteps`
 _BUCKETS = 1000        # `num_timestep_buckets`
 
-# The reference's schedule, written out from `gr00t_n1d7.py:398-399`:
-#   t_cont = t / float(num_inference_timesteps); t_discretized = int(t_cont * num_timestep_buckets)
-# so the expectation is the reference's expression, not the implementation's `floor` of a sigma.
+# The reference's own expression (`gr00t_n1d7.py:398-399`), not the implementation's `floor` of a sigma.
 _REF_TIMESTEPS = tuple(float(int(t / _STEPS * _BUCKETS)) for t in range(_STEPS))
-# `dt = 1.0 / self.num_inference_timesteps` (`gr00t_n1d7.py:355`): what `sigma_next - sigma` has to be.
+# The reference's `dt` (`gr00t_n1d7.py:355`): what `sigma_next - sigma` has to be.
 _REF_DT = 1.0 / _STEPS
 
-# A tiny DT. The state row and the action rows enter the DT unprojected, so
-# `input_embedding_dim == dit.inner_dim` (1536 in the checkpoint, 8 here).
+# A tiny DT. State and action rows enter it unprojected, so `input_embedding_dim == dit.inner_dim`.
 _HEADS, _HEAD_DIM = 2, 4
 _WIDTH = _HEADS * _HEAD_DIM
 _BRIDGE_DIM = 7        # the bridge's rows, a different width from the stack's
@@ -71,8 +64,7 @@ _CATEGORIES = 3        # `max_num_embodiments`
 _EMBODIMENT = 2        # the id every test runs under: the last category, so an off-by-one bites
 _DEPTH = 2             # one cross block and one self block, the shortest stack that alternates
 
-# Different span lengths on purpose (real: 13 or 21 text rows, 448 image rows), so neither
-# span can stand in for the other.
+# Unequal span lengths, so neither span can stand in for the other.
 _TXT, _IMG = 5, 9
 _SHAPE = Gr00tN17Shape(text_rows=_TXT, image_rows=_IMG)
 
@@ -96,7 +88,6 @@ _BASE_CONFIG = Gr00tN17Config(
 
 
 def _config(depth: int = _DEPTH) -> Gr00tN17Config:
-    """The tiny config at ``depth`` blocks."""
     return dataclasses.replace(
         _BASE_CONFIG, dit=dataclasses.replace(_BASE_CONFIG.dit, num_layers=depth),
     )
@@ -105,7 +96,7 @@ def _config(depth: int = _DEPTH) -> Gr00tN17Config:
 def _node(
     depth: int = _DEPTH, seed: int = 0, dtype: torch.dtype = torch.float32,
 ) -> Gr00tN17DenoiseStepSubmodule:
-    """Ours, filled, shallow. ``dtype`` casts the whole node, and so the carried loop state."""
+    """``dtype`` casts the whole node, and so the carried loop state."""
     config = _config(depth)
     node = Gr00tN17DenoiseStepSubmodule(
         config,
@@ -115,8 +106,8 @@ def _node(
         build_action_decoder(config),
         loop_name=_LOOP,
     )
-    # filled because `ActionPositionEmbedding` allocates with `torch.empty`; 0.1 because at
-    # 0.3 a few random blocks already saturate the residuals and the action encoder's swish
+    # filled because `ActionPositionEmbedding` allocates with `torch.empty`; small so random
+    # blocks do not saturate the residuals and the action encoder's swish
     randomize(node, seed, scale=0.1)
     return node.to(dtype).eval()
 
@@ -124,11 +115,10 @@ def _node(
 def _info(
     rid: str = "r0", k: int = 0, text: int = _TXT, image: int = _IMG, seed: int = 0,
 ) -> CurrentForwardPassInfo:
-    """One request's forward-pass info, with the span counts in ``step_metadata``. The base
-    keys per-request state by the handle, not the id."""
+    """One request's forward-pass info, with the span counts in ``step_metadata``."""
     return CurrentForwardPassInfo(
         request_id=rid, graph_walk=_WALK, fwd_index=k, random_seed=seed, max_tokens=0,
-        # distinct per id and stable across processes (`hash()` is salted per process)
+        # the base keys request state by this; stable across processes, unlike salted `hash()`
         rid_handle=int(rid.removeprefix("r")),
         step_metadata={"vl_text_rows": text, "vl_image_rows": image},
         dynamic_loop_iter_counts={_LOOP: k},
@@ -176,8 +166,7 @@ def _stacked_cond(
 def _latents(
     batch: int = 1, seed: int = 7, dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """``[B, 40, 132]`` in the node's dtype, as ``seed_latents`` draws it. Drawn in fp32 and
-    cast, so the bf16 and fp32 chains start at the same place."""
+    """``[B, 40, 132]``, drawn in fp32 and cast, so the bf16 and fp32 chains start together."""
     return torch.randn(
         batch, _HORIZON, _ACTION_DIM, generator=torch.Generator().manual_seed(seed),
     ).to(dtype)
@@ -203,12 +192,9 @@ def _scalars(step: int, batch: int = 1) -> dict:
 
 
 class _SpanAttention:
-    """Stands in for one DT resource, built from its own declared segments, so a
-    declaration that disagrees with the forward shows up as a wrong slice. ``q<-kv``
-    (``cross_label``) pairs the ``q`` spans with the ``kv`` spans, request for request.
-    At one request the per-segment call is exactly ``sdpa_attention``'s, so the ragged path
-    compares to the SDPA fallback with ``torch.equal``.
-    """
+    """Stands in for one DT resource, built from its own declared segments, so a declaration
+    that disagrees with the forward shows up as a wrong slice. At one request the per-segment
+    call is exactly ``sdpa_attention``'s, so the ragged path is ``torch.equal`` to the fallback."""
 
     def __init__(self, segments):
         self.spans: dict[str, list[int]] = {}
@@ -266,9 +252,8 @@ def _declare(node: Gr00tN17DenoiseStepSubmodule, rids=("r0",), infos=None):
 @torch.no_grad()
 def _by_hand(node: Gr00tN17DenoiseStepSubmodule, latents: torch.Tensor, cond: dict,
              timestep: torch.Tensor) -> torch.Tensor:
-    """The reference's iteration up to the velocity (``gr00t_n1d7.py:401-432``) on this
-    node's children: encode, add positions, state row in front, DT, decode, last
-    ``action_horizon`` rows. No Euler update: that is what the dtype tests compare."""
+    """The reference's iteration up to the velocity (``gr00t_n1d7.py:401-432``) on this node's
+    children. No Euler update: that is what the dtype tests compare."""
     dtype = next(node.model.parameters()).dtype
     cat_ids = cond["embodiment_id"].reshape(-1)
     actions = node.action_encoder(latents.to(dtype), timestep, cat_ids)
@@ -283,11 +268,9 @@ def _by_hand(node: Gr00tN17DenoiseStepSubmodule, latents: torch.Tensor, cond: di
 
 
 def test_the_schedule_is_four_ascending_sigmas_and_the_references_buckets():
-    """GR00T's time runs the other way from the image models' ``FlowMatchSchedule.build``:
-    sigmas ascend from 0, so ``sigma_next - sigma`` is the reference's ``dt = +1/4``, and the
-    timesteps are the reference's buckets. Reversed, the DT is conditioned on the wrong time
-    and the trajectory integrates backwards, still finite and plausible.
-    """
+    """GR00T's sigmas ascend from 0, unlike the image models' ``FlowMatchSchedule.build``, so
+    ``sigma_next - sigma`` is the reference's ``dt = +1/4``. Reversed, the trajectory integrates
+    backwards on the wrong time, still finite and plausible."""
     schedule = _node().schedule_for(None, _SHAPE)
 
     assert schedule.num_steps == _STEPS
@@ -303,10 +286,8 @@ def test_the_schedule_is_four_ascending_sigmas_and_the_references_buckets():
 
 
 def test_the_steps_scalars_come_off_our_schedule_at_every_step():
-    """The base slices ``sigmas[k]``, ``sigmas[k + 1]`` and ``timesteps[k]`` out of our
-    schedule at all four iterations (the only place the terminal sigma is read), and vetoes
-    a fifth step, which async speculation would otherwise run.
-    """
+    """The base slices each step's scalars out of our schedule (the only place the terminal
+    sigma is read), and vetoes a fifth step, which async speculation would otherwise run."""
     node = _node()
     inputs = _walk_inputs(node.config)
     for k in range(_STEPS):
@@ -314,7 +295,6 @@ def test_the_steps_scalars_come_off_our_schedule_at_every_step():
         assert float(prepared.tensor_inputs["sigma"]) == k * _REF_DT
         assert float(prepared.tensor_inputs["sigma_next"]) == (k + 1) * _REF_DT
         assert float(prepared.tensor_inputs["timestep"]) == _REF_TIMESTEPS[k]
-    # the request runs exactly `num_inference_timesteps` steps; the base vetoes the next
     assert node.request_state(_info("r0").rid_handle)["num_steps"] == _STEPS
     assert node.prepare_inputs(
         _WALK, _info("r0", _STEPS), {**inputs, LATENTS: [_latents(1)[0]]},
@@ -327,11 +307,8 @@ def test_the_steps_scalars_come_off_our_schedule_at_every_step():
 
 
 def test_the_41_rows_reach_the_dt_and_the_40_come_back():
-    """The DT sees 41 rows (state row + 40 action rows); the latents carry 40. The 41 sizes
-    the attention segment, capture bucket and ``input_seq_len``; the 40 sizes the trajectory.
-    Swapped, both flow through without a shape error, so this pins the declaration, the DT's
-    actual input and the output against each other.
-    """
+    """The DT sees 41 rows (state + 40 actions); the latents carry 40. Swapped, both flow
+    through without a shape error, so this pins the declaration, the DT's input and the output."""
     node = _node()
     prepared, step = _declare(node)
     _bind(node, step)
@@ -357,25 +334,17 @@ def test_the_41_rows_reach_the_dt_and_the_40_come_back():
 
 
 def _ref_euler(actions: torch.Tensor, velocity: torch.Tensor) -> torch.Tensor:
-    """The reference's Euler update, ``actions + dt * pred_velocity * vel_strength``
-    (``gr00t_n1d7.py:435``), with ``dt`` a Python float (``:355``) and ``vel_strength`` the
-    ``ones_like`` used without RTC (``:356``). Nothing upcast: at a bf16 model it is all bf16.
-    """
+    """The reference's Euler update (``gr00t_n1d7.py:435``), ``vel_strength`` being the
+    ``ones_like`` used without RTC. ``_REF_DT`` is a Python float, so nothing upcasts:
+    at a bf16 model it is all bf16."""
     return actions + _REF_DT * velocity * torch.ones_like(actions)
 
 
 def test_the_carried_dtype_is_the_weights_and_does_not_change_mid_loop():
-    """The carried trajectory is in the weights' dtype at every iteration, because the
-    reference's is: it is served bf16 (``gr00t_policy.py:111``), draws ``actions`` at
-    ``vl_embeds.dtype`` (``gr00t_n1d7.py:347-351``) and steps with a Python-float ``dt``
-    (``:435``). Do not "improve" it to an fp32 carry: over four steps that moves the
-    trajectory 0.0243 from the reference, while an off-by-one in the DT's block alternation moves it
-    0.0391, so a parity tolerance admitting the first is within 1.6x of admitting the second.
-
-    It must also not change mid-loop: ``euler_step`` returns the velocity's dtype and
-    ``seed_latents`` the weights'; if they differed, one bucket would need two graphs and the
-    loop would quietly run eager.
-    """
+    """The carried trajectory is in the weights' dtype, because the reference's is
+    (``gr00t_n1d7.py:347-351``, served bf16). Do not "improve" it to an fp32 carry: its drift
+    from the reference is close to that of a real DT bug, so a tolerance admitting one admits
+    the other. It must also not change mid-loop, or one bucket needs two graphs and runs eager."""
     for dtype in (torch.bfloat16, torch.float32):
         node = _node(dtype=dtype)
         cond = _stacked_cond(node.config, dtype=dtype)
@@ -386,23 +355,19 @@ def test_the_carried_dtype_is_the_weights_and_does_not_change_mid_loop():
             carried = node.denoise(None, _SHAPE, latents=carried, **_scalars(k), **cond)
             seen.append(carried.dtype)
 
-        # the premise: the forward is in `dtype`, so what `euler_step` returns in the
-        # velocity's dtype is testable at all
+        # the premise: the forward is in `dtype`
         assert _by_hand(node, carried, cond, _scalars(0)["timestep"]).dtype is dtype
         assert seen == [dtype] * _STEPS, seen
         assert carried.shape == (1, _HORIZON, _ACTION_DIM)
-        # the same dtype the loop's own seed arrives in, which is what makes it stable: the
-        # carried dtype is the seed's dtype and not a second decision
+        # the seed's dtype too, so the carried dtype is not a second decision
         assert node.seed_latents(None, _SHAPE, torch.Generator().manual_seed(0)).dtype is dtype
         assert not torch.equal(carried, start)  # the four steps moved the trajectory
 
 
 def test_four_bf16_iterations_are_the_references_arithmetic_to_the_bit():
-    """Four steps fed back as the Loop feeds them, ``torch.equal`` to the reference's bf16
-    chain at every iteration. ``euler_step`` sums in fp32 and rounds once, which is
-    bit-identical to bf16 ``a + dt * v`` only because ``dt = 1/4`` is a power of two (a ``dt``
-    that is not need not round the same). The fp32 carry, stepped alongside, must differ.
-    """
+    """Four steps, ``torch.equal`` to the reference's bf16 chain at every iteration. ``euler_step``
+    sums in fp32 and rounds once: bit-identical to bf16 ``a + dt * v`` only because ``dt = 1/4``
+    is a power of two. The fp32 carry, stepped alongside, must differ."""
     node = _node(dtype=torch.bfloat16)
     cond = _stacked_cond(node.config, dtype=torch.bfloat16)
     start = _latents(1, dtype=torch.bfloat16)
@@ -411,8 +376,7 @@ def test_four_bf16_iterations_are_the_references_arithmetic_to_the_bit():
     fp32_carry = start.float()  # the better integrator, and not the reference's
     for k in range(_STEPS):
         scalars = _scalars(k)
-        # the hand-written chain steps by the schedule's own dt, so it is not a second
-        # schedule that can disagree with the node's
+        # the hand-written chain steps by the schedule's own dt, not a second schedule
         assert float(scalars["sigma_next"] - scalars["sigma"]) == _REF_DT
 
         ours = node.denoise(None, _SHAPE, latents=ours, **scalars, **cond)
@@ -439,8 +403,7 @@ def test_four_bf16_iterations_are_the_references_arithmetic_to_the_bit():
 def test_the_bucket_key_is_the_two_span_counts_off_step_metadata():
     """The span lengths are needed before the bridge's tensors arrive, so they ride in
     ``step_metadata``. Missing is an error, not a default: a zero would key a bucket whose
-    spans are not the request's and plan the segments at the wrong lengths.
-    """
+    spans are not the request's and plan the segments at the wrong lengths."""
     node = _node()
 
     assert node.bucket_key_for(_info(text=13, image=448)) == Gr00tN17Shape(13, 448)
@@ -454,19 +417,16 @@ def test_the_bucket_key_is_the_two_span_counts_off_step_metadata():
     )
     with pytest.raises(KeyError):
         node.bucket_key_for(bare)
-    # a padding row of a captured bucket carries no metadata, and the base drops it from the
-    # vote rather than asking for its key
+    # a captured bucket's padding row carries no metadata; the base drops it from the vote
     assert node.cg_key_info(_WALK, {"r0": _info("r0"), "pad": bare}) == _SHAPE
 
 
 def test_two_requests_batch_only_when_both_spans_match():
     """A key that ignored a field would stack two requests whose conditioning is not the same
     rectangle. Each field is checked separately: the real image span is constant at 448, so a
-    key that dropped ``image_rows`` would pass every recorded request.
-    """
+    key that dropped ``image_rows`` would pass every recorded request."""
     node = _node()
-    # distinct request ids per case: the base caches a request's key for the walk, so the
-    # same id with different metadata would be answered from that cache
+    # distinct ids per case: the base caches a request's key for the walk
     same = [_info("r0"), _info("r1")]
     other_text = [_info("r0"), _info("r2", text=_TXT + 1)]
     other_image = [_info("r0"), _info("r3", image=_IMG + 1)]
@@ -521,16 +481,14 @@ def test_the_scheduler_batches_each_prompt_length_apart(monkeypatch):
 # The conditioning: no batch dim, and the capture's twin of it
 # ----------------------------------------------------------------------------
 
-# rank of each conditioning entry for one request; a leading 1 would reach `denoise` as a
-# spurious axis (`[B, 1, T, width]` rows, a `[B, 1]` embodiment id).
+# rank of each conditioning entry for one request; a leading 1 would reach `denoise` as a spurious axis
 _REQUEST_RANKS = {"vl_text": 2, "vl_image": 2, "state": 2, "embodiment_id": 0}
 
 
 def test_the_request_inputs_carry_no_batch_dim_and_stack_into_the_forwards_shapes():
     """``request_inputs`` returns each tensor without a batch dim, since ``preprocess``
     stacks the batch. The state token ``[1, 1, D]`` must become ``[1, D]``: left at rank 3 it
-    stacks to ``[B, 1, 1, D]`` and the concatenation with the action rows fails or broadcasts.
-    """
+    stacks to ``[B, 1, 1, D]`` and the concatenation with the action rows fails or broadcasts."""
     node = _node()
     inputs = _walk_inputs(node.config)
     single = node.request_inputs(_info(), inputs, _SHAPE)
@@ -541,8 +499,7 @@ def test_the_request_inputs_carry_no_batch_dim_and_stack_into_the_forwards_shape
     assert single["vl_image"].shape == (_IMG, node.config.backbone_embedding_dim)
     assert single["state"].shape == (1, node.config.input_embedding_dim)
     assert int(single["embodiment_id"]) == _EMBODIMENT
-    # the spans are not pulled from the key, so a key disagreeing with the tensors is caught
-    # by the step's segments rather than silently reshaping them
+    # the spans come from the tensors, not the key, so a disagreeing key shows in the step's segments
     assert torch.equal(single["vl_text"], inputs["vl_text"][0])
     assert torch.equal(single["vl_image"], inputs["vl_image"][0])
 
@@ -557,11 +514,9 @@ def test_the_request_inputs_carry_no_batch_dim_and_stack_into_the_forwards_shape
 
 
 def test_driving_the_node_is_one_denoise_call_per_row_and_each_row_is_its_own():
-    """The engine's path (``prepare_inputs -> declare_step -> preprocess ->
-    forward_batched``) returns the rows of one stacked ``denoise``, each from its own
+    """The engine's path returns the rows of one stacked ``denoise``, each from its own
     conditioning and embodiment. Weights are gathered by ``W[cat_ids]``, so one row's id
-    broadcast over the batch changes no shape; this is the only test that would see it.
-    """
+    broadcast over the batch changes no shape; this is the only test that would see it."""
     node = _node()
     rids = ["r0", "r1"]
     infos = [_info(rid) for rid in rids]
@@ -591,8 +546,7 @@ def test_driving_the_node_is_one_denoise_call_per_row_and_each_row_is_its_own():
         assert torch.equal(rows[rid][LATENTS][0], batched[index])
     assert not torch.equal(batched[0], batched[1])
 
-    # changing row 0's embodiment moves row 0 and leaves row 1 bit-identical (same shapes on
-    # both sides, so no reduction order differs)
+    # row 0's embodiment moves row 0 only; row 1 stays bit-identical (same shapes, same reductions)
     moved = node.denoise(
         None, _SHAPE,
         **{name: stacked[name] for name in (LATENTS, "sigma", "sigma_next", "timestep")},
@@ -605,10 +559,8 @@ def test_driving_the_node_is_one_denoise_call_per_row_and_each_row_is_its_own():
 
 def test_the_captures_placeholders_are_the_shapes_and_dtypes_a_real_row_brings():
     """A graph captured on ``capture_request_inputs`` replays on what ``request_inputs`` and
-    the seeded noise produce. A shape mismatch misses the capture and runs eager; a dtype
-    mismatch replays over a buffer the kernels reinterpret. Every dtype is the model's, latents
-    included; both dtypes run because a hardcoded placeholder dtype is wrong on exactly one.
-    """
+    the seeded noise produce: a shape mismatch runs eager, a dtype mismatch replays over a
+    buffer the kernels reinterpret. Both dtypes run: a hardcoded one is wrong on exactly one."""
     cpu = torch.device("cpu")
     for dtype in (torch.bfloat16, torch.float32):
         node = _node(dtype=dtype)
@@ -642,8 +594,7 @@ def test_the_captures_placeholders_are_the_shapes_and_dtypes_a_real_row_brings()
 def test_the_attention_callables_are_memoised_per_binding_and_dropped_on_rebinding():
     """A compiled region guards on the callables' identity, so fresh ones per step retrace
     every step. After a rebind the old callables would run the retired resource's plan.
-    Identity is checked per span too: a cached dict of fresh callables would still retrace.
-    """
+    Identity is checked per span too: a cached dict of fresh callables would still retrace."""
     node = _node()
     _, step = _declare(node)
     _bind(node, step)
@@ -662,8 +613,7 @@ def test_the_attention_callables_are_memoised_per_binding_and_dropped_on_rebindi
 def test_each_span_reads_its_own_resource_under_the_label_the_step_declared():
     """``sa`` is self-attention on ``DT_ATTN``; the bridge spans are cross pairs on
     ``DT_XATTN`` under ``cross_label(sa, span)``. A ragged plan is keyed by label, so a callable
-    asking for an undeclared label finds no plan.
-    """
+    asking for an undeclared label finds no plan."""
     node = _node()
     _, step = _declare(node)
     _bind(node, step)
@@ -685,8 +635,7 @@ def test_each_span_reads_its_own_resource_under_the_label_the_step_declared():
 
 def test_nothing_bound_leaves_attends_empty_and_the_dt_reads_every_span_with_sdpa():
     """Nothing bound is the parity backend: every span runs on SDPA. Unbound spans are left
-    out, not mapped to ``None``, which would reach ``joint_attention`` and raise mid-forward.
-    """
+    out, not mapped to ``None``, which would reach ``joint_attention`` and raise mid-forward."""
     node = _node()
     _, step = _declare(node)
     _bind(node, step, keys=())
@@ -704,10 +653,8 @@ def test_nothing_bound_leaves_attends_empty_and_the_dt_reads_every_span_with_sdp
     ids=["self-attention only", "cross-attention only"],
 )
 def test_binding_one_of_the_two_resources_is_refused(bound, missing):
-    """All or nothing: the node declares both resources, so a half binding plans a kernel the
-    forward does not use and a captured graph records SDPA where the plan says ragged, with
-    the arithmetic still right. Regression: partial binding was once silent.
-    """
+    """All or nothing: a half binding plans a kernel the forward does not use, and a captured
+    graph records SDPA where the plan says ragged, with the arithmetic still right."""
     node = _node()
     _, step = _declare(node)
     _bind(node, step, keys=bound)
@@ -717,10 +664,8 @@ def test_binding_one_of_the_two_resources_is_refused(bound, missing):
 
 
 def test_the_two_resources_planned_from_the_step_are_the_sdpa_fallback_at_one_request():
-    """At one request the ragged path is the SDPA fallback exactly, so this tests the wiring:
-    a span declared at the wrong length, a cross pair reversed, or a callable bound to the
-    other resource all give a different tensor.
-    """
+    """At one request the ragged path is exactly the SDPA fallback, so this tests the wiring: a
+    wrong span length, a reversed cross pair or a swapped resource all give a different tensor."""
     node = _node()
     latents, scalars, cond = _latents(1), _scalars(2), _stacked_cond(node.config)
 
@@ -739,11 +684,9 @@ def test_the_two_resources_planned_from_the_step_are_the_sdpa_fallback_at_one_re
 
 
 def test_the_step_names_both_dt_resources_with_the_spans_each_one_plans():
-    """``DT_ATTN`` plans the ``sa`` segments; ``DT_XATTN`` plans ``sa + text + image`` with
-    ``DT_XATTN_PAIRS`` (a cross plan needs both ends of each pair). Order is pinned, grouped by
-    label, which is how a request's queries line up with its own keys. Top-level
-    ``segments`` stays None so neither resource inherits the other's layout.
-    """
+    """``DT_ATTN`` plans ``sa``; ``DT_XATTN`` plans ``sa + text + image`` with both ends of each
+    pair. Segments are grouped by label, which is how a request's queries line up with its own
+    keys; top-level ``segments`` stays None so neither resource inherits the other's layout."""
     node = _node()
     rids = ["r0", "r1"]
     _, step = _declare(node, rids, [_info("r0"), _info("r1")])
@@ -765,7 +708,6 @@ def test_the_step_names_both_dt_resources_with_the_spans_each_one_plans():
         *(Segment(rid, VL_TEXT_SPAN, _TXT) for rid in rids),
         *(Segment(rid, VL_IMAGE_SPAN, _IMG) for rid in rids),
     )
-    # both ends of every declared pair are in the layout, which is what a cross plan needs
     labels = {segment.label for segment in cross.segments}
     assert all({q, kv} <= labels for q, kv in cross.pairs)
 
@@ -787,8 +729,7 @@ def test_the_declared_spans_are_each_requests_own_lengths():
 
 def test_attention_segments_lists_the_same_three_spans_the_step_declares():
     """``declare_step`` builds its segments without the scaffold's ``attention_segments``,
-    so the two describe one layout twice; a span added to only one leaves a label unplanned.
-    """
+    so the two describe one layout twice; a span added to only one leaves a label unplanned."""
     node = _node()
     _, step = _declare(node)
 
@@ -803,8 +744,7 @@ def test_attention_segments_lists_the_same_three_spans_the_step_declares():
 def test_the_node_declares_no_single_base_resource():
     """The node passes ``attn_resource_key=None`` and declares its two resources itself.
     Left set, the base would plan a third resource that no layer reads, and ``ragged_for``
-    would hand the DT callables bound to it.
-    """
+    would hand the DT callables bound to it."""
     node = _node()
 
     assert node.attn_resource_key is None
@@ -820,8 +760,7 @@ def test_the_node_declares_no_single_base_resource():
 
 @needs_checkpoint
 def test_the_checkpoints_numbers_are_the_ones_these_tests_run():
-    """Ties the spelled-out counts to the checkpoint. Built on ``meta``: the real DT is
-    1.12B parameters, 4.2 GiB per fp32 copy."""
+    """Ties the spelled-out counts to the checkpoint, on ``meta`` (the real DT is 1.12B params)."""
     config = Gr00tN17Config.from_hf(GR00T, BACKBONE)
     with torch.device("meta"):
         node = Gr00tN17DenoiseStepSubmodule(

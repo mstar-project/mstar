@@ -289,7 +289,7 @@ def _rope_into_blocks(encoder: Gr00tN17VisionEncoder, args: tuple[torch.Tensor, 
 @torch.no_grad()
 def test_a_bf16_encoder_feeds_its_blocks_the_fp32_rope(monkeypatch):
     """transformers' Qwen3-VL keeps the vision rope fp32 into the blocks, where ``embed``
-    rounds it; in bf16 that rounding alone put vision_embeds at 1.25x the bf16 floor."""
+    rounds it; in bf16 that rounding alone is enough to push vision_embeds past the parity bar."""
     encoder = Gr00tN17VisionEncoder(_config((0,), depth=2)).to(torch.bfloat16)
     args = _inputs(encoder.tower.config, [(1, 4, 4)])
     args = (args[0].to(torch.bfloat16), *args[1:])
@@ -305,7 +305,7 @@ def test_a_bf16_encoder_feeds_its_blocks_the_fp32_rope(monkeypatch):
     embeds, seen = _rope_into_blocks(encoder, args)
     assert len(seen) == 2 and fp32_table(seen)
 
-    # the old wiring: every block gets `embed`'s rounded copy
+    # the negative control: every block gets `embed`'s rounded copy
     fp32 = rope.forward
     monkeypatch.setattr(rope, "forward", lambda p: [t.to(torch.bfloat16) for t in fp32(p)])
     rounded_embeds, seen = _rope_into_blocks(encoder, args)

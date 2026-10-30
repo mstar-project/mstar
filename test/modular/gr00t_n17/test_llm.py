@@ -218,14 +218,11 @@ def _run(model: Gr00tN17LanguageModel, layers: list[RefDecoderLayer], tokens: in
 # ----------------------------------------------------------------------------
 
 # Our q/k/v are one GEMM where the reference has three, and gate/up one where it has two, so
-# the two stacks differ by the BLAS's rounding rather than by their maths. Measured over
-# 6 weight seeds x 7 token counts (1 to 300) x intra-op thread counts 1, 2 and 4, the worst
-# max|ours - ref| / max|ref| was 1.021e-06, about 8 fp32 ulps; at 11 tokens or fewer it is
-# exactly 0, because the kernel's reduction over K does not depend on the output width until
-# the output is wide enough to re-block.
+# the two stacks differ by the BLAS's rounding rather than by their maths. The worst
+# max|ours - ref| / max|ref| over weight seeds, token counts and thread counts: ~8 fp32 ulps.
 _MEASURED_GAP = 1.021e-06
 # Four times that, so a BLAS blocking differently from this host's still passes. It stays far
-# under a wiring mistake: the closest deviation below misses by 8.3e+04 times this bar.
+# under every wiring mistake below.
 _BAR = 4 * _MEASURED_GAP
 
 
@@ -242,12 +239,7 @@ def test_our_stack_is_the_reference_decoder_layer(tmp_path, tokens):
 
 @pytest.mark.parametrize("deviation", DEVIATIONS)
 def test_a_layer_assembled_wrongly_misses_by_orders_of_magnitude(tmp_path, deviation):
-    """The bar above only means something if a plausible mistake cannot slip under it.
-
-    Measured relative gaps, against a bar of 4.1e-06: rope before the qk-norm 3.4e-01,
-    k and v swapped 1.1e+00, kv heads repeated instead of interleaved 9.3e-01, the mlp
-    residual dropped 1.0e+00 -- the smallest of them 8.3e+04 times the bar.
-    """
+    """The bar above only means something if a plausible mistake cannot slip under it."""
     config = _config()
     weights = _checkpoint(config.text, seed=0)
     ours, theirs = _run(
@@ -290,8 +282,7 @@ _IMAGE_ROWS = torch.tensor([5, 6, 7, 8, 30, 31, 32, 33])
 # layers), which also leaves the off-by-one deviations below a layer to land on.
 _FEATURES = 3
 _DEEPSTACK_LAYERS = 4
-# the reversal (a list read backwards) and a 3-cycle; the closest of all five orders missed by
-# 1.5e-02 (3.8e+03x the bar)
+# the reversal (a list read backwards) and a 3-cycle
 _PERMUTATIONS = [(2, 1, 0), (1, 2, 0)]
 
 
@@ -364,7 +355,7 @@ def _case(tmp_path, num_layers: int = _DEEPSTACK_LAYERS, features: int = _FEATUR
 
 def test_deepstack_features_land_on_the_image_rows_after_their_layer(tmp_path):
     """The layer-parity bar, for the same reason (fused vs separate GEMMs); the injection adds
-    the same fp32 numbers on both sides. Worst measured 1.3e-06 over 6 x 3 seeds."""
+    the same fp32 numbers on both sides."""
     case = _case(tmp_path)
     ours = case.ours()
     assert ours.shape == case.hidden.shape
@@ -373,8 +364,7 @@ def test_deepstack_features_land_on_the_image_rows_after_their_layer(tmp_path):
 
 @pytest.mark.parametrize("shift", [-1, 1], ids=["a layer early", "a layer late"])
 def test_a_feature_added_after_the_wrong_layer_misses_by_orders_of_magnitude(tmp_path, shift):
-    """Moving an injection one layer cannot slip under the bar: measured a layer early
-    6.8e-01, a layer late 4.9e-02, the smaller 1.2e+04 times the bar."""
+    """Moving an injection one layer cannot slip under the bar."""
     case = _case(tmp_path)
     assert relative_gap(case.ours(), case.theirs(shift=shift)) > 1000 * _BAR
 
@@ -394,9 +384,7 @@ def test_features_applied_in_the_wrong_order_miss_by_orders_of_magnitude(tmp_pat
 )
 def test_row_k_of_a_feature_lands_on_image_row_k(tmp_path, permute):
     """The vision encoder packs its rows in image-token order and we hand the LLM that order
-    as indices, so the mapping is ours to get right. Measured 6.4e-02 reversed and 8.4e-02
-    rolled, both over 1.5e+04 times the bar.
-    """
+    as indices, so the mapping is ours to get right."""
     case = _case(tmp_path)
     assert relative_gap(case.ours(), case.theirs(rows=permute(case.rows))) > 1000 * _BAR
 
@@ -702,8 +690,7 @@ _SCATTERS = {
 
 @pytest.mark.parametrize("permute", list(_SCATTERS.values()), ids=list(_SCATTERS))
 def test_row_k_of_the_vision_embeds_lands_on_image_row_k(tmp_path, permute):
-    """The node hands the vision rows over as indices, so the pairing is its to get right.
-    Measured gaps for the four permutations: 1.0e+00, 8.3e-01, 1.0e+00, 1.0e+00 (>= 2.0e+05x the bar)."""
+    """The node hands the vision rows over as indices, so the pairing is its to get right."""
     run = _drive(tmp_path, _PROMPTS["two images with text between"])
     # the unpermuted scatter is exact, which is what makes the gap below mean something
     assert torch.equal(run.features, run.by_hand())
