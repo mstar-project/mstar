@@ -385,8 +385,6 @@ class Worker:
     # instance.
     _lockstep_led: frozenset[str] = frozenset()
     _lockstep_unread: Mapping[int, dict[str, set[str]]] = MappingProxyType({})
-    # (producer, walk) -> {signal: the led nodes it is routed to}; structural
-    _lockstep_consumers: Mapping[tuple[str, str], dict[str, tuple[str, ...]]] = MappingProxyType({})
 
     @cached_property
     def device_capability(self) -> DeviceCapability:
@@ -1614,7 +1612,8 @@ class Worker:
         any rank (``_drop_rows_whose_read_failed``)."""
         self._lockstep_led = frozenset(self.parallel_nodes & self.parallel_leader_nodes)
         self._lockstep_unread = {}
-        self._lockstep_consumers = {}
+        # (producer, walk) -> {signal: the led nodes it is routed to}; structural
+        self._lockstep_consumers: dict[tuple[str, str], dict[str, tuple[str, ...]]] = {}
 
     def _note_lockstep_reads(self, ready: dict[int, list[GraphEdge]]) -> None:
         """Rank 0: the inputs of a lockstep node it leads that landed here by a
