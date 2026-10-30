@@ -47,6 +47,7 @@ from mstar.graph.base import Loop  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
@@ -333,8 +334,9 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     # check_stop / preprocess only read self.config; skip nn.Module init.
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
-    sub._index_stager = PinnedStager(torch.long)
     sub.request_states = {}  # no prefill ran: check_stop falls back to the request's max_tokens
+    sub._index_stager = PinnedStager(torch.long)
+    sub._int_stager = PinnedStager(torch.int32)
     return sub
 
 
@@ -467,6 +469,7 @@ def test_glm52_preprocess_supplies_eager_last_token_indices():
     sub = _make_submodule(Glm52ModelConfig())
     out = _preprocess(sub, {"r0": 0, "r1": 0}, seq_len=16)
     assert torch.equal(out["last_token_indices"], torch.tensor([15, 31]))
+    assert sub._dsa_ctx(out) is None
 
 
 def test_glm52_positions_are_the_position_resources_plan():
@@ -600,6 +603,22 @@ def test_indexer_exists_only_on_the_dsa_path():
     cfg.num_hidden_layers = 4  # MTP position lands FULL
     cfg.mtp_num_draft_tokens = 2
     assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
+
+
+def test_flag_off_layer_refuses_the_dsa_resource():
+    from mstar.model.glm52._testing import build_cpu_resources
+    from mstar.model.glm52.components.attention import Glm52MLAAttention
+
+    cfg = Glm52ModelConfig.reduced()
+    cfg.mla_absorb = True
+    cfg.dsa_long_context = True
+    resources, _ = build_cpu_resources(cfg)  # a node that declares the DSA resource
+    assert DSA_RESOURCE in resources
+    cfg.dsa_long_context = False
+    attn = Glm52MLAAttention(cfg, layer_idx=0)  # FULL slot, built flag-off
+    assert attn.indexer is None
+    with pytest.raises(RuntimeError, match="dsa_long_context off"):
+        attn.bind_resources(resources)
 
 
 def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():

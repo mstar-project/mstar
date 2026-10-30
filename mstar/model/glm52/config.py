@@ -83,13 +83,18 @@ class Glm52ModelConfig:
     mtp_num_draft_tokens: int = 0
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
-    # the exact DSA computation. On: the guard checks max_seq_len instead,
-    # FULL layers hand their index keys and queries to the DSA resource
-    # (mstar/engine/resources/dsa), which picks each query's top index_topk,
-    # and decode beyond index_topk attends just those latents. Decode-only
-    # beyond topk (prefill prompts must still fit index_topk) and eager-only
-    # (the resource selects per request on the host).
+    # the exact DSA computation. On: the guard checks max_seq_len instead;
+    # FULL layers write their index keys to a KV resource and the DSA resource
+    # (mstar/engine/resources/dsa) has every row past index_topk attend its top
+    # index_topk latents, prefill rows included, with selection and sparse
+    # attention on device.
     dsa_long_context: bool = False
+    # a prefill step longer than this runs the trunk over row chunks of it in turn,
+    # so its activations are a chunk's, whatever the prompt's length
+    prefill_chunk_tokens: int = 8192
+    # under TP: each rank selects a block of a long prefill's rows and the blocks are
+    # all-gathered, instead of every rank selecting every row
+    dsa_shard_prefill: bool = False
 
     # --- MoE ---
     first_k_dense_replace: int = 3  # layers 0..2 are dense
@@ -224,9 +229,9 @@ class Glm52ModelConfig:
         """The longest prompt served. Decode runs at least one step after the
         prefill and the next may already be scheduled when it stops, so the
         prompt leaves two steps' rows under the context limit (an MTP step
-        writes k + 1); a DSA prefill attends densely, within index_topk."""
+        writes k + 1). The paged DSA path selects past index_topk in prefill too."""
         limit = self.max_seq_len if self.dsa_long_context else self.index_topk
-        return min(limit - 2 * (self.mtp_num_draft_tokens + 1), self.index_topk)
+        return limit - 2 * (self.mtp_num_draft_tokens + 1)
 
     @classmethod
     def from_hf_config(cls, hf_config: dict) -> "Glm52ModelConfig":

@@ -1,4 +1,4 @@
-"""glm5_next DSA's CUDA paths against its torch ones (dsa.py) at the real indexer and latent dims:
+"""glm5_next DSA's CUDA paths against its torch ones (dsa/paged.py) at the real indexer and latent dims:
 the pool-key and score kernels, flashinfer's top-k + slot transform, and a captured decode
 against the same rows eager."""
 from __future__ import annotations
@@ -10,7 +10,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources.dsa import kpool as dsa
+from mstar.engine.resources.dsa import paged as dsa
 from mstar.engine.resources.dsa import sparse_mla
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -44,7 +44,7 @@ def _ctx(tables, row_req, positions, device, max_pools=None, graph=False):
         starts.append(len(flat))
         flat.extend(t)
     spans = None if graph else [(r, 1, q) for r, q in enumerate(row_req)]
-    return dsa.KPoolContext(
+    return dsa.DSAContext(
         pos=torch.tensor(positions, dtype=torch.int32, device=device),
         row_req=torch.tensor(row_req, dtype=torch.int32, device=device),
         pages=torch.tensor(flat, dtype=torch.int32, device=device),
@@ -62,7 +62,7 @@ def _write_pools(plane, tables, lens, ape, device):
     if device == "cpu":
         dsa._pool_keys_torch(view, ctx, ape, D)
     else:
-        from mstar.engine.resources.dsa.kpool_kernels import pool_keys
+        from mstar.engine.resources.dsa.kernels import pool_keys
 
         pool_keys(view, ctx.pages, ctx.page_start, ctx.row_req, ctx.pos, ape.to(device), D)
     return view
@@ -88,7 +88,7 @@ def test_decode_selection_matches_torch(lens):
     q = torch.randn(len(lens), NH, D, device=DEV).bfloat16()
     w = torch.randn(len(lens), NH, device=DEV)
     ctx = _ctx(tables, list(range(len(lens))), positions, DEV)
-    scores = dsa._decode_scores(q, w, view, ctx)
+    scores = dsa._decode_scores(q, w, view, ctx, ctx.pos, ctx.row_req, ctx.max_pools)
     ref = dsa._scores_torch(q, w, view, ctx, ctx.row_req.long(), ctx.pos, ctx.max_pools)
     for r, p in enumerate(positions):
         n = (p + 1) // KP
@@ -133,7 +133,7 @@ def _compiled(fn) -> int:
 def test_prefill_scores_compile_once_whatever_the_split():
     """The split count follows the rows and the context, so one long prompt's chunks take many
     values of it; none may compile the kernel again mid-request."""
-    from mstar.engine.resources.dsa.kpool_kernels import _prefill_scores_kernel, prefill_scores
+    from mstar.engine.resources.dsa.kernels import _prefill_scores_kernel, prefill_scores
 
     lens = [64000]
     plane, tables, ape = _store(lens, seed=9)

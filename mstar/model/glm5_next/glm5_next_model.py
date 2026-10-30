@@ -111,7 +111,7 @@ class Glm5NextModel(Model):
             if kwargs.get(key) is not None:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
         if kwargs.get("dsa_long_context", False):
-            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource, dsa/kpool.py).
+            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
             # token windows.
             self.config.dsa_long_context = True

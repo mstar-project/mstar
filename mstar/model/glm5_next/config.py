@@ -156,7 +156,7 @@ class Glm5NextModelConfig:
     # where dense MLA computes exactly what DSA would (selecting
     # <= topk/kpool pools out of <= topk/kpool is the identity, tail
     # included). On: contexts up to max_seq_len, every MLA layer through
-    # the k-pool indexer and sparse MLA (mstar/engine/resources/dsa/kpool.py).
+    # the k-pool indexer and sparse MLA (the DSA resource, mstar/engine/resources/dsa).
     dsa_long_context: bool = False
     # dsa_long_context: a prefill step runs its tokens through the model in windows of
     # this many, so activations stay bounded however long the prompt.

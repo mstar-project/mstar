@@ -615,23 +615,17 @@ The spec types are:
        own included. It needs the FlashInfer backend and causal attention, and the
        pages behind the window stay allocated.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
-     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step
-       declares ``DSAStep()``, and the resource takes each request's rows from the KV plan.
-       The model's indexer layers store their index keys (``store_keys``) and pick each
-       query's top ``topk`` positions by the indexer's score (``select``); a layer that
-       reuses an earlier layer's pick reads it with ``shared_selection``. ``attend`` runs
-       absorbed MLA over just the picked latents. The keys sit in per-request buffers
-       outside the paged pool and the selection runs per request on the host, so the
-       resource is eager only, a prompt must fit in ``topk`` and past ``topk`` a request
-       decodes one row per step. Once one row of a batch passes ``topk``, every row of it
-       attends its pick. GLM-5.2 declares it under ``dsa_long_context``. Planned: the keys
-       move onto the MLA cache's pages under its page table, so the allocator, eviction and
-       prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
-       ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3). That
-       resource is the paged one: its index rows sit on the aux planes ``INDEX_PLANES``
-       the model declares on the cache, and it scores, picks and attends
-       on device, under CUDA graphs. ``sm_scale`` is the absorbed MLA's softmax scale for
-       its sparse-attention plans.
+     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
+       keys, each query row attends only the ``topk`` tokens its indexer scores highest.
+       The index keys sit on the cache's pages, in the aux planes ``INDEX_PLANES`` the
+       model declares on its ``PagedKVConfig``, so they share its page table. Each step
+       the submodule stages its rows from the KV plan (``step_inputs``, preprocess outputs
+       a CUDA graph interns) and opens the forward's context (``context``, then ``use``);
+       the layers write their keys, select and attend through ``dsa.paged``
+       (``write_index``, ``select``, ``sparse_attend``), on device and under CUDA graphs.
+       ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
+       ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
+       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
