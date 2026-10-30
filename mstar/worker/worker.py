@@ -550,6 +550,7 @@ class Worker:
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
+        topology = model.get_partition_topology() if model else None
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
@@ -562,6 +563,10 @@ class Worker:
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
+            walk_driven_signals=frozenset(
+                conn.edge_name for conn in topology.connections
+                if conn.consumer_walk is not None
+            ) if topology is not None else frozenset(),
         )
 
         self.engine_manager = EngineManager.build(
@@ -715,7 +720,7 @@ class Worker:
         self.streaming_buffers: dict[int, dict[str, list[torch.Tensor]]] = {}
 
         # New streaming path: PartitionTopology + StreamBuffer on consumer worker
-        self.partition_topology = model.get_partition_topology() if model else None
+        self.partition_topology = topology
 
         # Determine which partition this worker serves (by checking which node names
         # appear in my_worker_graphs vs the topology connections)
@@ -1303,7 +1308,9 @@ class Worker:
                 request_id, streaming_with_tensors,
             )
             self.wakeup_event.register_futures(futures)
-            # a client stream's chunks come with no forward-pass info, and drive no walk
+            # no forward-pass info comes with a client stream's chunks, nor with
+            # a stream whose walk the producer does not decide (see
+            # `walk_driven_signals`)
             walks = body.request_info.stream_consumer_walks if body.request_info is not None else {}
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]

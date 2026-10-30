@@ -44,6 +44,7 @@ def _worker():
     w = Worker.__new__(Worker)
     w.worker_id = "w1"
     w.enable_nvtx = False
+    w._walk_driven_edges = {}  # no producer-driven walk transitions here
     w._draining_rids = {"draining"}
     w._removed_rids = RecentSet(16)
     w._removed_rids.add("removed")
@@ -79,7 +80,8 @@ def _worker():
 def _state(w):
     return (
         w.reads, w.acked,
-        {h: list(i.stream_buffers[EDGE]._tensor_ids_in_order) for h, i in w.request_state.per_request_info.items()
+        {h: [uuid for uuid, _walk in i.stream_buffers[EDGE]._tensor_ids_in_order]
+         for h, i in w.request_state.per_request_info.items()
          if EDGE in i.stream_buffers},
         {r: [m.body for m in ms] for r, ms in w._unprocessed_messages.items()},
     )
