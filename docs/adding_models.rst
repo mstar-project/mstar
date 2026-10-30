@@ -2453,7 +2453,10 @@ streams (audio and video, say): each has its own buffer and its own end.
   audio in the reply whose text steps hold ``k``, so the text and the audio node must
   each emit from a loop that steps once per input item. Startup refuses one that emits
   outside a loop, or from a partition not stepped one item at a time
-  (``FixedChunkPolicy(chunk_size=1)``) on every connection from the ``ClientAudio`` stream.
+  (``FixedChunkPolicy(chunk_size=1)``) on every connection from the ``ClientAudio`` stream. Turns as a pair of token ids fit a
+  model that brackets each reply (Nemotron's BOS / EOS); one that marks speech another
+  way, such as Moshi-style PAD / EPAD runs, can't declare them yet, and serves
+  ``/generate/ws`` only.
 - A stream ends when the client ends it: ``end_input: true`` ends all of the call's
   streams, a list of names only those. The consumer gets ``producer_done`` for that edge
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
