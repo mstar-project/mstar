@@ -30,6 +30,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import SpeculationPreparer
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -164,6 +165,7 @@ def _worker(
     w.parallel_nodes = set()
     w.worker_id = ME
     w._rid_str = rt.get_rid_string
+    w._rebuilds = Rebuilds({}, {})
     return w
 
 
