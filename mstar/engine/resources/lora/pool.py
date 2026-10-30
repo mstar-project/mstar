@@ -23,9 +23,11 @@ runner's admission (``ask`` / ``reserve``) until a slot can take its adapter, in
 with every other resource that asks, so it holds no KV pages meanwhile and the rows already
 running never lose a step to it. A reservation counts slots and pins none: the slot an
 admit picks follows from the slot table alone, and the reservations never promise more
-slots than exist, so every reserved row finds one at its admit. Only the rank that chooses
-batches decides (a lockstep instance's leader), so no other rank keeps reservations; the
-admit refusal stays as a backstop.
+slots than exist, so every reserved row finds one at its admit. A row whose adapter
+failed to read is the exception: it is let through at once, to fail at its admit, which
+fails it even with no slot free. Only the rank that chooses batches decides (a lockstep
+instance's leader), so no other rank keeps reservations; the admit refusal stays as a
+backstop.
 
 A model with LoRA specs on several nodes (an LLM and its vision encoder) has a pool per
 node, and each admits only its own node's rows. A request holds a slot in each until it
@@ -576,16 +578,17 @@ class LoraAdapterPool(Resource):
 
     def reserve(self, rid, node_name, graph_walk, published) -> int | None:
         """Count ``rid``'s adapter against the free slots once its host copy is in, so its
-        admit never waits for a read. A copy whose read failed is not waited for: the
-        admit then fails the request, on every rank alike."""
+        admit never waits for a read. A row whose adapter failed to read is let through at
+        once, slots or not: its admit fails it, on every rank alike."""
         del node_name, graph_walk, published
         with self._lock:
             name = self._adapter_of[rid]
-            if self._spare_slots(name) < 0:
-                return self._changes
-            if name not in self._store and name not in self._read_errors:
-                # its read, started at ingest, lands. An adapter resident in a slot waits
-                # for it too: a reservation pins no slot, so a miss admitted first may evict it
+            if name not in self._store:
+                if name not in self._read_errors:
+                    # its read, started at ingest, lands. An adapter resident in a slot waits
+                    # for it too: a reservation pins no slot, so a miss admitted first may evict it
+                    return self._changes
+            elif self._spare_slots(name) < 0:
                 return self._changes
             self._reserve(rid, name)
             return None
@@ -666,28 +669,43 @@ class LoraAdapterPool(Resource):
             if not misses:
                 return ADMIT_OK
             reserved: list[int] = []
+            full = None
             for name, rids in misses.items():
                 slot = self._pick_slot(exclude=reserved)
                 if slot is None:
-                    # refused on every rank alike, before any rank reaches an agreement
-                    return AdmitOutcome(
-                        ok=False,
-                        reason=AllocationFailed(
-                            message=(
-                                f"LoRA pool is full: all {self.spec.max_slots} slots hold "
-                                f"adapters of running requests, none free for {name!r}"
-                            ),
-                            pages_short=1,
-                            label=_LABEL,
-                            request_id=rids[0],
-                        ),
-                    )
+                    full = (name, rids)
+                    break
                 reserved.append(slot)
+        if full is not None:
+            # no slot is left for it: on every rank alike, before anything is installed
+            return self._refuse_full(*full)
         for (name, rids), slot in zip(misses.items(), reserved, strict=True):
             outcome = self._load_miss(name, rids, slot)
             if not outcome.ok:
                 return outcome
         return ADMIT_OK
+
+    def _refuse_full(self, name: str, rids: list) -> AdmitOutcome:
+        """The step's refusal when no slot is left for ``name``'s rows, or their failure if
+        its read failed on any rank: admission lets such rows through at once, so they do
+        not wait for a slot only to fail. Called without the lock; every rank of a lockstep
+        instance reaches it for the same miss, since all pick from the same slot table."""
+        with self._lock:
+            error = None if name in self._store else self._read_errors.get(name)
+        if self._agreed(_IN if error is None else _FAILED) == _FAILED:
+            return _load_failed(name, rids, error)
+        return AdmitOutcome(
+            ok=False,
+            reason=AllocationFailed(
+                message=(
+                    f"LoRA pool is full: all {self.spec.max_slots} slots hold "
+                    f"adapters of running requests, none free for {name!r}"
+                ),
+                pages_short=1,
+                label=_LABEL,
+                request_id=rids[0],
+            ),
+        )
 
     def rollback_admit(self, step: LoraStep, ctx: StepContext) -> None:
         """Give back the slots this step's admit took. An adapter it loaded stays resident
@@ -769,16 +787,7 @@ class LoraAdapterPool(Resource):
                     error = describe_load_error(exc)
             state = self._agreed(_FAILED if error is not None else _IN)
         if state == _FAILED:
-            return AdmitOutcome(
-                ok=False,
-                reason=AdmitRuntimeError(
-                    message=(
-                        f"LoRA adapter {name!r} failed to load: "
-                        f"{error or 'it failed to load on another rank of its instance'}"
-                    ),
-                    request_ids=frozenset(rids),
-                ),
-            )
+            return _load_failed(name, rids, error)
         with self._lock:
             if loaded.rank == 0:
                 # nothing for this spec: the same file, digest-pinned, on every rank, so
@@ -1068,6 +1077,20 @@ class LoraAdapterPool(Resource):
         self._layer_deltas.clear()
         self._eager = None
         self._current = self._enclosing = None
+
+
+def _load_failed(name: str, rids, error: str | None) -> AdmitOutcome:
+    """Fails ``rids``: ``name`` failed to load, here with ``error`` or on another rank."""
+    return AdmitOutcome(
+        ok=False,
+        reason=AdmitRuntimeError(
+            message=(
+                f"LoRA adapter {name!r} failed to load: "
+                f"{error or 'it failed to load on another rank of its instance'}"
+            ),
+            request_ids=frozenset(rids),
+        ),
+    )
 
 
 def _next_pow2(n: int) -> int:

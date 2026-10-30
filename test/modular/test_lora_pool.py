@@ -24,6 +24,7 @@ from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     ASKS,
+    AdmitRuntimeError,
     AllocationFailed,
     BucketKey,
     Segment,
@@ -617,6 +618,31 @@ def test_a_request_on_a_resident_adapter_waits_for_its_host_copy(adapters):
     gate.set()
     settle_reads(pool)
     assert runner.admit_waiting(_nothing_published) == [("LLM", "r")]
+
+
+def test_a_request_whose_read_fails_fails_without_waiting_for_a_slot(adapters):
+    """r2 queues for a2's copy on a full pool, and the read fails: r2 is let through at
+    once, and its admit fails it instead of refusing the step until a1's slot drains."""
+    _, paths = adapters
+    pool = make_pool(paths, max_slots=1, cpu_capacity=1)
+    runner = lora_runner(pool)
+    gate, read = threading.Event(), pool.store._read
+
+    def unreadable(name, path):
+        if name == "a2":
+            gate.wait(10)
+            raise OSError("a2 is unreadable")
+        return read(name, path)
+    pool.store._read = unreadable
+    for rid, name in [("r1", "a1"), ("r2", "a2")]:
+        ingest(pool, rid, name)
+    assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
+    assert runner.admit_retrieve("r2", "LLM", "decode").queued
+    gate.set()
+    settle_reads(pool)
+    assert runner.admit_waiting(_nothing_published) == [("LLM", "r2")]
+    reason = run_step(pool, ["r1", "r2"]).reason
+    assert isinstance(reason, AdmitRuntimeError) and reason.request_ids == {"r2"}
 
 
 def test_two_missing_adapters_cannot_both_take_the_last_slot(adapters):
