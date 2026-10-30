@@ -34,7 +34,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
-    declared_step,
+    engine_step,
 )
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
@@ -820,7 +820,7 @@ class AcceleratorGraphRunner:
                     continue
                 checked_configs.add(spec.config_idx)
                 rids = self._dummy_rows.handles(f"{spec.config_idx}_slot0", spec.bs)
-                step = declared_step(
+                step = engine_step(
                     self._submodule,
                     graph_walk=spec.bucket.graph_walk,
                     request_ids=rids,
@@ -1125,7 +1125,7 @@ class AcceleratorGraphRunner:
         engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
 
         lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
-        step = declared_step(
+        step = engine_step(
             self._submodule,
             graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
             slot_lease=lease, per_request_info=engine_inputs.per_request_info,

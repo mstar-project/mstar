@@ -60,7 +60,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
     StopCheck,
-    declared_step,
+    engine_step,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -1581,7 +1581,7 @@ class Engine:
                 range_push("engine.declare_step")
             t0 = phase_start()
             try:
-                step = declared_step(
+                step = engine_step(
                     submodule,
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
                     slot_lease=ctx.slot_lease,
@@ -2500,7 +2500,7 @@ class Engine:
         )
         laps.lap("pad")
         t0 = phase_start()
-        step = declared_step(
+        step = engine_step(
             submodule_mgmt.submodule,
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,

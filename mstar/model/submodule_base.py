@@ -605,7 +605,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # A node serving LoRA from its modules (``module_lora_spec``) must say how its rows
     # meet the pool: True when ``declare_step``'s segments are, in order, the rows its
     # adapted linears see, each a request's span of tokens (a request may have several,
-    # as CFG's cond and uncond copies); ``declared_step`` then adds the pools'
+    # as CFG's cond and uncond copies); ``engine_step`` then adds the pools'
     # ``LoraStep``. A piecewise region that runs adapted modules declares its rows in its
     # own step too; its capture refuses a delta called without one.
     lora_segment_rows: bool = False
@@ -1138,7 +1138,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self.request_states.pop(request_id, None)
 
 
-def declared_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
+def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     """What the engine calls for a node's step: its ``declare_step``, plus the LoRA
     pools' steps for a node whose segments lay out its rows (``lora_segment_rows``), so
     a model declaring LoRA from its modules writes no LoRA step."""
@@ -1158,7 +1158,7 @@ def declared_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
         if key in step.steps:
             raise ValueError(
                 f"{type(submodule).__name__} declares its own step under {key!r}, which "
-                "declared_step adds from its segments"
+                "engine_step adds from its segments"
             )
         step.steps[key] = LoraStep(segments=segments)
     return step

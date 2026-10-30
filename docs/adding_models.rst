@@ -1068,7 +1068,7 @@ placed exactly as weights are.
   shard is its rank-local shape (a module built whole on a TP node fails here, not in a
   forward). It requires ``lora_segment_rows = True``: ``declare_step``'s segments are, in
   order, the rows its linears see (a request may have several: Chatterbox's cond and
-  uncond copies), and the engine (``declared_step``) adds each pool's ``LoraStep`` from
+  uncond copies), and the engine (``engine_step``) adds each pool's ``LoraStep`` from
   them (Qwen3.5's vision encoder: one segment per frame, the merger's rows folding
   them). A node whose step is ``None`` declares no rows, so one that serves adapters
   returns a step with its segments even when nothing else needs one.
