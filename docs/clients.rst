@@ -447,7 +447,8 @@ Per-model notes:
   network jitter) and a frame behind real time (a muted mic, a client waiting for the
   reply), whole frames of silence are appended for it, at most 30 s a pause and
   counted against the call's length cap, so a client that stops sending past that stops
-  the agent. Each reply
+  the agent. A client that stops sending hears the reply up to that 200 ms later; one
+  that streams its mic, silence included, doesn't. Each reply
   is one response, ``response.created`` through ``response.done``, with
   ``response.output_audio.delta`` and ``response.output_audio_transcript.delta`` in
   between; audio between replies is silence and is not sent. ``turn_detection``
