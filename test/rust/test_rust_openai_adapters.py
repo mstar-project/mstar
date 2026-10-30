@@ -13,6 +13,7 @@ import contextlib
 import json
 import os
 import subprocess
+import sys
 import types
 import urllib.error
 import urllib.request
@@ -32,7 +33,8 @@ from test_rust_frontend import (
     _wait_healthy,
 )
 
-from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+from mstar.api_server.entrypoint import APIServer
+from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, OpenAIAdapter
 from mstar.api_server.rust_frontend import OPENAI_ADAPTER_ENV, openai_adapter_class
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
@@ -48,12 +50,15 @@ ROUTES = {
 # /v1/audio/transcriptions and /v1/realtime have no route there at all.
 NOT_PORTED = {
     ("ChatterboxAdapter", "speech"),
+    ("CosyVoice3Adapter", "speech"),
+    ("FishS2ProAdapter", "speech"),
     ("KokoroAdapter", "speech"),
     ("OmniVoiceAdapter", "speech"),
     ("Qwen3TTSAdapter", "speech"),
     ("DiffusionImageAdapter", "images"),
     ("LTX25Adapter", "videos"),
     ("Wan22Adapter", "videos"),
+    ("TextChatAdapter", "chat"),
 }
 
 
@@ -104,6 +109,10 @@ def test_each_registry_class_serves_its_python_surfaces_or_lists_them_as_not_por
     """Every route answers non-404 exactly when the Python adapter serves it
     and the surface is ported. A new adapter class, or a new surface on one,
     fails here until it is ported or listed in NOT_PORTED."""
+    _check_routes(cls)
+
+
+def _check_routes(cls: str) -> None:
     adapter = _classes()[cls]
     with _mock_server(cls) as (port, _proc):
         for surface, (path, body) in ROUTES.items():
@@ -182,17 +191,39 @@ def _files(paths: dict[str, list[str]] | None) -> dict[str, list[bytes]]:
     return {m: [Path(p).read_bytes() for p in ps] for m, ps in (paths or {}).items()}
 
 
-CHAT_CLASSES = sorted(c for c, a in _classes().items() if a.supports_chat)
+def _chat_classes() -> list[str]:
+    """The classes whose chat mstar-server ports: those NOT_PORTED lists for
+    chat answer it with the 404 that names them, so they reach no backend."""
+    return sorted(c for c, a in _classes().items()
+                  if a.supports_chat and (c, "chat") not in NOT_PORTED)
+
+
+CHAT_CLASSES = _chat_classes()
 
 
 def test_the_chat_classes_are_the_ones_this_pr_ports():
     assert CHAT_CLASSES == ["BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter"]
 
 
+class _UnportedChatAdapter(OpenAIAdapter):
+    supports_chat = True
+
+
+def test_a_chat_class_listed_as_not_ported_passes_the_route_and_chat_checks(monkeypatch):
+    """A model PR can register a chat adapter before mstar-server ports it, as
+    long as NOT_PORTED lists it."""
+    cls = _UnportedChatAdapter.__name__
+    monkeypatch.setitem(ADAPTER_REGISTRY, "unported_chat_model", _UnportedChatAdapter())
+    monkeypatch.setattr(sys.modules[__name__], "NOT_PORTED", NOT_PORTED | {(cls, "chat")})
+    assert cls in _classes()
+    assert cls not in _chat_classes()
+    _check_routes(cls)
+
+
 @pytest.mark.parametrize("fields", [{}, {"max_completion_tokens": 0}], ids=["fields", "zero-max"])
 @pytest.mark.parametrize("cls", CHAT_CLASSES)
 def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields, tmp_path):
-    """``max_completion_tokens: 0`` falls through to ``max_tokens`` in Python."""
+    """``max_completion_tokens: 0`` is kept, not replaced by ``max_tokens``, as in Python."""
     model = _model_of(cls)
     stub = _StubAPIServer()
     body = {**CHAT, **fields}
@@ -215,6 +246,8 @@ def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields,
 
 class _PythonServer:
     """What the Python routes call on APIServer, replying as the stub does."""
+
+    open_result_stream = APIServer.open_result_stream
 
     def __init__(self, model_name, upload_dir):
         self.model_name, self.upload_dir, self.model = model_name, upload_dir, None

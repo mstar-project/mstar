@@ -27,6 +27,8 @@ class RaggedAttnBackend(Enum):
     # the platform's default, decided when the resource is built
     AUTO = "auto"
     FLASHINFER = "flashinfer"
+    # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
+    DENSE = "dense"
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,16 @@ class RaggedAttentionConfig:
     # KV cache, so it is free to declare a separate dtype here; when None, the
     # engine's KV dtype (which is actually a misnamed autocast dtype) is used.
     dtype: torch.dtype | None = None
+
+    # False keeps every head on each sequence-parallel rank (TP still shards
+    # them), for an attention a rank runs whole over its own tokens: one over a
+    # replicated stream, or a cross-attention from the rank's query shard.
+    shard_over_sp: bool = True
+
+    # Each label's FlashInfer workspace, per slot; None takes
+    # MSTAR_WORKSPACE_BUFFER_MB. A ragged prefill only spends it on split-KV
+    # partials (tens of MB), so a resource with many labels can declare less.
+    workspace_mb: int | None = None
 
     def __post_init__(self):
         if self.sm_scale is None:
@@ -163,3 +175,23 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
         from mstar.engine.resources.attn.ragged.base import RaggedCrossAttnManager
 
         return RaggedCrossAttnManager
+
+
+@dataclass
+class RaggedBlockCausalAttentionSpec(_RaggedSpecBase):
+    """Cacheless block-causal self-attention within each declared span: a token in
+    block ``b`` of its span (``block_size`` tokens a block, from the span's start)
+    attends every key of blocks ``0..b``. Declared with ``AttentionStep(causal=False)``,
+    since the block structure is the whole mask.
+
+    Its own kind, not a flag on ``RaggedAttentionSpec``: it runs a different kernel
+    (paged prefill over one-token pages, see ``attn.ragged.block_causal``).
+    """
+
+    block_size: int
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedBlockCausalAttnManager
+
+        return RaggedBlockCausalAttnManager

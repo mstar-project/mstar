@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import queue
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
+from mstar.model.base import Model
+from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -34,9 +37,16 @@ class _Model:
     def __init__(self, fail_preprocess=False):
         self.fail_preprocess = fail_preprocess
 
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
+
     def process_prompt(self, *args, **kwargs):
         if self.fail_preprocess:
             raise ValueError("bad knob")
+
+    # the inline path's per-value default, over the stub's postprocess
+    postprocess_inline = Model.postprocess_inline
+    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
@@ -71,6 +81,13 @@ class _Conductor:
     def send(self, entity, msg):
         self.sent.append((entity, msg))
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
     def deliver(self, message_type, body):
         self.inbox.put(WorkerMessage(message_type=message_type, body=body))
 
@@ -89,6 +106,11 @@ class _TensorManager:
 
     def register_for_send(self, request_id, tensor_infos):
         pass
+
+    def take_failed_reads(self):
+
+        return []
+
 
     def get_ready_tensors(self):
         # the loop polls this after its release queues and before in_queue
@@ -119,8 +141,11 @@ def _input(rid):
 
 
 class _Rig:
-    def __init__(self, model, start=True):
+    def __init__(self, model, start=True, api_pending=False):
         self.conductor = _Conductor()
+        # api_pending: the API server's pending set, as is_pending reads it.
+        # It lets go of a submission before queueing its abort.
+        self.pending: set[str] = set()
         self.tm = _TensorManager()
         self.stop = threading.Event()
         self.worker = PreprocessWorkerThread(
@@ -136,6 +161,7 @@ class _Rig:
             communicator=self.conductor,
             tensor_manager=self.tm,
             model=model,
+            is_pending=(lambda key: key in self.pending) if api_pending else None,
         )
         # the API server's side of the same queues
         facade = PreprocessWorker.__new__(PreprocessWorker)
@@ -145,6 +171,18 @@ class _Rig:
         facade.reads_done_queue = self.worker.reads_done_queue
         facade.received_chunk_counts = {}
         facade.per_request_reading_tensors = {}
+        if api_pending:
+            new_request, abort_request = facade.new_request, facade.abort_request
+
+            def submit(input):
+                self.pending.add(input.request_id)
+                new_request(input)
+
+            def abort(request_id):
+                self.pending.discard(request_id)
+                abort_request(request_id)
+
+            facade.new_request, facade.abort_request = submit, abort
         self.api = facade
         self.thread = threading.Thread(target=self.worker.run, daemon=True)
         if start:
@@ -197,8 +235,8 @@ class _Rig:
 def rig():
     made = []
 
-    def make(model=None, start=True):
-        made.append(_Rig(model or _Model(), start=start))
+    def make(model=None, start=True, api_pending=False):
+        made.append(_Rig(model or _Model(), start=start, api_pending=api_pending))
         return made[-1]
 
     yield make
@@ -274,7 +312,7 @@ def test_new_request_reusing_a_removed_id_reads_and_acks(rig):
     r.submit("X")
     assert len(r.conductor.sent_of(ConductorMessageType.NEW_REQUEST, "X")) == 2
     acked = len(r.reads_done("X"))
-    r.api.new_result_token("X", 7, None, "text_inputs", "text")
+    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
     chunk = r.worker.out_queue.get(timeout=2)
     assert chunk.request_id == "X" and chunk.data == b"<7>"
 
@@ -333,13 +371,29 @@ def test_abort_during_a_failure_keeps_nothing(rig):
 
 def test_abort_queued_before_a_failing_preprocess_leaves_nothing(rig):
     """The abort is handled first in the pass, then preprocessing fails; the
-    request never reached the conductor, so no REMOVE_REQUEST comes."""
+    request never reached the conductor, so no REMOVE_REQUEST comes. (A
+    thread with no is_pending preprocesses whatever is queued.)"""
     r = rig(_Model(fail_preprocess=True), start=False)
     r.api.new_request(_input("X"))
     r.api.abort_request("X")
     r.thread.start()
     assert r.worker.out_queue.get(timeout=10).modality == "error"
     r.settle()
+    r.assert_forgotten("X")
+
+
+def test_abort_queued_before_preprocessing_drops_it_unsent(rig):
+    """The API server lets go of the request while it waits for
+    preprocessing: it is dropped unprocessed and unsent, so no REMOVE_REQUEST
+    comes, and nothing is kept for it."""
+    r = rig(_Model(fail_preprocess=True), start=False, api_pending=True)
+    r.api.new_request(_input("X"))
+    r.api.abort_request("X")
+    r.thread.start()
+    r.settle()
+    assert r.worker.out_queue.empty()
+    assert r.conductor.sent_of(ConductorMessageType.NEW_REQUEST, "X") == []
+    assert len(r.conductor.sent_of(ConductorMessageType.ABORT_REQUEST, "X")) == 1
     r.assert_forgotten("X")
 
 
@@ -354,7 +408,7 @@ def test_late_remove_of_a_finished_request_does_not_swallow_a_retry(rig):
     r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
     r.settle()
 
-    r.api.new_result_token("X", 7, None, "text_inputs", "text")
+    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)
@@ -384,7 +438,7 @@ def test_abort_of_a_queued_retry_does_not_swallow_the_next_retry(rig):
     r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
     r.settle()
 
-    r.api.new_result_token("X", 7, None, "text_inputs", "text")
+    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)
@@ -394,6 +448,72 @@ def test_abort_of_a_queued_retry_does_not_swallow_the_next_retry(rig):
     r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
     r.settle()
     r.assert_forgotten("X")
+
+
+def test_a_queued_retry_dropped_for_its_abort_does_not_swallow_the_next_retry(rig):
+    """As above, but the API server let go of B before its abort, so B is
+    dropped unsent; C reuses the id again. C must ACK."""
+    r = rig(api_pending=True)
+    r.submit("X")
+    r.fail_in_engine("X")
+
+    r.hold()
+    r.api.new_request(_input("X"))
+    r.api.abort_request("X")
+    r.resume()
+    assert len(r.conductor.sent_of(ConductorMessageType.NEW_REQUEST, "X")) == 1
+
+    r.submit("X")
+    assert len(r.conductor.sent_of(ConductorMessageType.NEW_REQUEST, "X")) == 2
+
+    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    assert r.worker.out_queue.get(timeout=2).data == b"<7>"
+    acked = len(r.reads_done("X"))
+    r.api.finished_reading("X", drained=True)
+    r.settle()
+    assert len(r.reads_done("X")) == acked + 1
+
+    r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
+    r.settle()
+    r.assert_forgotten("X")
+
+
+def test_abort_landing_after_the_pending_check_tears_the_retry_down(rig):
+    """As above, but B's abort lands just after the thread found B still
+    pending: B goes to the conductor and its abort after it, B is drained as
+    any running request, and B's REMOVE_REQUEST comes only after C was
+    preprocessed. C must ACK."""
+    r = rig(api_pending=True)
+    r.submit("X")
+    r.fail_in_engine("X")
+
+    check = r.worker._is_pending
+
+    def pending_then_aborted(key):
+        held = check(key)
+        if held:
+            r.worker._is_pending = check
+            r.api.abort_request(key)
+        return held
+
+    r.worker._is_pending = pending_then_aborted
+    r.submit("X")
+    sent = [m.message_type for e, m in r.conductor.sent if m.body.request_id == "X"]
+    # drained as a running request: with no read in flight it ACKs at once
+    assert sent[-3:] == [
+        ConductorMessageType.NEW_REQUEST, ConductorMessageType.ABORT_REQUEST, ConductorMessageType.READS_DONE,
+    ]
+
+    r.submit("X")
+    r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
+    r.settle()
+
+    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    assert r.worker.out_queue.get(timeout=2).data == b"<7>"
+    acked = len(r.reads_done("X"))
+    r.api.finished_reading("X", drained=True)
+    r.settle()
+    assert len(r.reads_done("X")) == acked + 1
 
 
 def test_release_queued_just_before_a_retry_does_not_drain_it(rig):
@@ -412,7 +532,7 @@ def test_release_queued_just_before_a_retry_does_not_drain_it(rig):
     assert len(r.conductor.sent_of(ConductorMessageType.NEW_REQUEST, "X")) == 2
     assert "X" not in r.worker._draining_rids
 
-    r.api.new_result_token("X", 7, None, "text_inputs", "text")
+    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)
@@ -435,7 +555,7 @@ def test_two_late_removals_do_not_swallow_a_retry(rig):
     r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
     r.settle()
 
-    r.api.new_result_token("X", 7, None, "text_inputs", "text")
+    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)

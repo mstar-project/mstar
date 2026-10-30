@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=78.1.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -23,6 +23,7 @@ bagel = ["mstar-ai[bagel]"]
 cosmos3 = ["mstar-ai[cosmos3]"]
 qwen3_omni = ["mstar-ai[qwen3_omni]"]
 qwen3_tts = ["mstar-ai[qwen3_tts]"]
+fish_s2_pro = ["mstar-ai[fish_s2_pro]"]
 orpheus = ["mstar-ai[orpheus]"]
 pi05 = ["mstar-ai[pi05]"]
 vjepa2 = ["mstar-ai[vjepa2]"]
@@ -30,6 +31,7 @@ wan22 = ["mstar-ai[wan22]"]
 waypoint = ["mstar-ai[waypoint]"]
 vjepa2_ac = ["mstar-ai[vjepa2_ac]"]
 asr = ["mstar-ai[asr]"]
+glm = ["mstar-ai[glm]"]
 all = ["mstar-ai[all]"]
 
 [project.urls]

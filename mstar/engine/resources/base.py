@@ -62,6 +62,8 @@ class EngineResourceInfo:
     kv_dtype: torch.dtype = torch.bfloat16
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
+    # this resource's local nodes
+    nodes: "frozenset[str] | None" = None
     # the specs this one named in `depends_on`, by resource key
     dependencies: "Mapping[str, NodeResourceSpec]" = field(
         default_factory=dict
@@ -93,6 +95,13 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+class KeyedWalks(NamedTuple):
+    """A keyed label's walks, as a resource's prefix cache takes them: the walks whose
+    writes are keyed, and the growth walks whose sampled ids extend the keys."""
+    writes: tuple[str, ...]
+    growth: tuple[str, ...] = ()
+
+
 class Resource(ABC):
     @classmethod
     @abstractmethod
@@ -110,15 +119,18 @@ class Resource(ABC):
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
-    def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
-    ) -> bool:
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;
-        True if anything opened.
-
-        ``walks`` names, per label, the walks that write the keyed stream.
-        """
+        True if anything opened."""
         return False
+
+    def close_prefix_cache(self) -> None:
+        """Undo `enable_prefix_cache`. Called before any request."""
+        return
+
+    def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:
+        """The live resources this one's spec names in `depends_on`, once all are built."""
+        return
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs: Any,
@@ -128,6 +140,13 @@ class Resource(ABC):
         None leaves the answer to other resources; 0 tokens means nothing can be skipped.
         """
         return None
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """The longest prefix up to ``prefix`` this resource can serve, for a
+        resource that holds only some lengths."""
+        return prefix
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -157,6 +176,27 @@ class Resource(ABC):
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
+
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+        """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
+        return the pages, or None."""
+        return None
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+    ) -> bool:
+        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and
+        raises if it still lacks them once ``caught_up``."""
+        return True
+
+    def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Give back what `lease_cached_prefix` or `adopt_cached_prefix` took, for a step that will not run."""
+        return
+
+    def page_trail(self) -> tuple[int, int] | None:
+        """How many page allocations this resource has made and a hash of their pages in
+        order, for a TP follower to check against rank 0's. None where it keeps no trail."""
+        return None
 
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
@@ -194,6 +234,30 @@ class Resource(ABC):
         Returns whether the retrieve has completed.
         """
         return ADMIT_OK
+
+    # Admission. A resource with limited capacity answers for it, and the runner decides who
+    # gets it and when: one order across resources, a request takes all it asks or none, and
+    # nothing is retrieved for it before then.
+
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        """`ASKS` while ``rid`` waits for this resource's capacity to start on ``node_name``, None
+        when it needs none, or the outcome that fails it when it can never fit."""
+        return None
+
+    def reserve(
+        self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
+    ) -> object | None:
+        """Take what ``rid`` asked for and return None, or return a mark of what it didn't fit
+        against for `grew_since`."""
+        return None
+
+    def unreserve(self, rid: str) -> None:
+        """Give back what `reserve` took, because another resource ``rid`` asks didn't fit."""
+        return
+
+    def grew_since(self, mark: object) -> bool:
+        """Whether a request that didn't fit against ``mark`` may fit now."""
+        return True
 
     # Step lifecycle
 

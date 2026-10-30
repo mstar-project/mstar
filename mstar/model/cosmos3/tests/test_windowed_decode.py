@@ -76,10 +76,14 @@ def _windows(stream: torch.Tensor, start: int = 0):
 
 
 def _run(sub, rid, windows, frames, **md):
+    """Each window's emitted ``[T, C, H, W]`` frames, as ``[1, C, T, H, W]`` pixels
+    to compare with ``_decode_pixels``."""
     md = {"num_windows": len(windows), "overlap_latent_units": OVERLAP, "num_frames": frames,
           "stream_video": True, **md}
     infos = SimpleNamespace(request_ids=[rid], per_request_info={rid: SimpleNamespace(step_metadata=md)})
-    return [sub.forward(C.VIDEO_DECODE_AR_WALK, infos, w)["video_output"][0] for w in windows]
+    emitted = [sub.forward(C.VIDEO_DECODE_AR_WALK, infos, w)["video_output"][0] for w in windows]
+    assert all(f.is_contiguous() for f in emitted)
+    return [f.transpose(0, 1)[None] for f in emitted]
 
 
 def _u8_close(a: torch.Tensor, b: torch.Tensor, tol: int = 1) -> None:
@@ -224,9 +228,7 @@ def test_channels_last_decoder(monkeypatch) -> None:
     sub = _decoder(monkeypatch, _tiny_vae(), channels_last=True)
     assert is_channels_last(sub.vae)
     assert sub._vae_input(stream).is_contiguous(memory_format=torch.channels_last_3d)
-    chunks = _run(sub, "r", _windows(stream), 77)
-    video = torch.cat(chunks, dim=2)
-    assert all(c.is_contiguous() for c in chunks)
+    video = torch.cat(_run(sub, "r", _windows(stream), 77), dim=2)
     _u8_close(video, sub._decode_pixels(stream))
     plain = _decoder(monkeypatch, _tiny_vae())._decode_pixels(stream)
     assert (video.int() - plain.int()).abs().max() <= 1
@@ -347,6 +349,7 @@ def test_whole_clip_decoder_keeps_its_default_layout_and_cudnn_flag(monkeypatch)
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Config()
     cfg.vae_decode_cudnn_benchmark = True
+    cfg.vae_decode_fast = False  # the stock whole-clip path; the fast one is tested below
     assert cfg.vae_decode_channels_last
     vae = _tiny_vae()
     sub = Cosmos3VAEDecoderSubmodule(vae, cfg)
@@ -359,6 +362,27 @@ def test_whole_clip_decoder_keeps_its_default_layout_and_cudnn_flag(monkeypatch)
     with torch.no_grad():
         ref = vae.decode(sub._vae_input(stream)).sample
     assert torch.equal(video, (ref / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
+
+
+def test_fast_whole_clip_decode_matches_stock_decode(monkeypatch) -> None:
+    """vae_decode_fast decodes a whole clip through the shared decoder,
+    channels-last, on the node's own VAE: the frames of the stock decode."""
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    ref_vae = _tiny_vae()
+    stream = _stream(5)
+    stock = Cosmos3VAEDecoderSubmodule(ref_vae, Cosmos3Config(vae_decode_fast=False))
+    stock._decode_dtype_cached = torch.float32
+    want = stock._decode_pixels(stream)
+    fast_vae = _tiny_vae()
+    fast_vae.load_state_dict(ref_vae.state_dict())
+    cfg = Cosmos3Config()
+    assert cfg.vae_decode_fast
+    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    fast = Cosmos3VAEDecoderSubmodule(fast_vae, cfg, fast=cfg.vae_decode_fast)
+    assert is_channels_last(fast_vae)
+    got = fast._decode_pixels(stream)
+    assert got.shape == want.shape
+    assert (got.int() - want.int()).abs().max() <= 1
 
 
 @pytest.mark.parametrize("enabled", [False, True])

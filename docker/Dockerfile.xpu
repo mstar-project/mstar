@@ -1,0 +1,115 @@
+# Build with an empty context:
+# docker build -t mstar:xpu - < docker/Dockerfile.xpu
+
+# Use Intel deep learning essentials base image with Ubuntu 24.04
+FROM intel/deep-learning-essentials:2026.1.2-devel-ubuntu24.04
+
+# Avoid interactive prompts during package install
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Define build arguments
+ARG PYTHON_VERSION=3.12
+
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
+# Keep in lockstep with the host xe KMD; override via --build-arg.
+ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
+ARG IGC_VERSION=2.38.2+22051
+ARG GMM_VERSION=22.10.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates software-properties-common curl && \
+    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
+    apt-get update && \
+    # Loader + media/metrics from the PPA; the GPU driver is pinned below.
+    apt-get install -y \
+        libze1 intel-metrics-discovery clinfo intel-gsc \
+        intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
+        libze-dev && \
+    cd /tmp && \
+    igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
+    cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \
+    # IGC first: libze-intel-gpu1 / intel-opencl-icd depend on its exact version.
+    curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
+    apt-get install -y --allow-downgrades \
+        ./intel-igc-core-2_${IGC_VERSION}_amd64.deb \
+        ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb \
+        ./libigdgmm12_${GMM_VERSION}_amd64.deb \
+        ./libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb && \
+    rm -f /tmp/*.deb && \
+    # Hold so later apt upgrades can't pull the rolling PPA version back.
+    apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12 \
+        intel-igc-core-2 intel-igc-opencl-2 && \
+    rm -rf /var/lib/apt/lists/*
+
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-dev \
+    build-essential \
+    cmake \
+    ffmpeg \
+    git \
+    libgomp1 \
+    libssl-dev \
+    libzmq3-dev \
+    pkg-config \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:/root/.cargo/bin:$PATH"
+RUN curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
+| sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+ENV VIRTUAL_ENV="/opt/venv"
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN uv venv --python ${PYTHON_VERSION} ${VIRTUAL_ENV}
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+WORKDIR /mstar-workspace
+
+ARG MSTAR_REPO=https://github.com/mstar-project/mstar.git
+ARG MSTAR_REF=main
+RUN git clone --depth 1 --branch "${MSTAR_REF}" "${MSTAR_REPO}" ./mstar
+# The toolchain the checkout pins (rust-toolchain.toml), also as the default so
+# cargo works outside the clone.
+RUN cd ./mstar && rustup toolchain install \
+    && rustup default "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+    && cd / && rustc --version && cargo --version
+
+# uv selects the XPU index for PyTorch and TorchCodec in the single install below.
+# torchaudio's latest XPU wheel is 2.11; the import check below checks this pairing.
+ARG TORCH_VERSION=2.13.0+xpu
+ARG TORCHVISION_VERSION=0.28.0+xpu
+ARG TORCHAUDIO_VERSION=2.11.0+xpu
+ARG TORCHCODEC_VERSION=0.16.0+cpu
+ARG TORCHCODEC_XPU_VERSION=0.16.0
+# Override upstream's torch<2.13 cap for this XPU image without changing metadata.
+RUN cd ./mstar && uv pip install --no-cache --torch-backend=xpu \
+    --overrides <(printf 'torch==%s\n' "${TORCH_VERSION}") \
+    "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}" "torchcodec==${TORCHCODEC_VERSION}" \
+    "torchcodec-xpu==${TORCHCODEC_XPU_VERSION}" \
+    ".[bagel_xpu]" ./rust \
+    msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser tabulate && \
+    python -c "import torch, torchvision, torchaudio, torchcodec, mstar, mstar_rust; \
+        import vllm_xpu_kernels._C; import vllm_xpu_kernels._xpu_C; \
+        from mstar.model.bagel import bagel_model; \
+        from mstar.api_server import entrypoint; \
+        import torchcodec_xpu; \
+        assert torch.version.xpu is not None; \
+        print('M* XPU imports OK:', torch.__version__)" && \
+    mstar serve --help && \
+    rm -rf rust/target build ./*.egg-info
+
+EXPOSE 8000
+
+CMD ["bash"]

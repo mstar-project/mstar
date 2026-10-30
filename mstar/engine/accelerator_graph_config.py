@@ -8,11 +8,18 @@ import torch
 from mstar.engine.resources import SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
+# A compile mode of the engine's own rather than torch.compile's: Inductor's
+# defaults in its deterministic mode, which picks each kernel's config by rule
+# instead of timing candidates on the device, so every process compiles the
+# same kernels and one input gives one output from any server. See
+# ``accelerator_graph_runner.compile_kwargs``.
+DETERMINISTIC_COMPILE_MODE = "deterministic"
+
 
 def check_compile_mode(mode: str | None) -> str | None:
     """A capture config's ``compile_mode``, refused at build rather than at capture,
     where the per-capture fallback would serve the bucket eager."""
-    if mode is None or mode == "default":
+    if mode is None or mode in ("default", DETERMINISTIC_COMPILE_MODE):
         return mode
     if not mode:
         # torch.compile takes a falsy mode for "default"
@@ -49,8 +56,8 @@ class AcceleratorGraphConfig(ABC):
         # Must be hashable.
         additional_key_info: Any | None = None,
         compile: bool = True, # whether to run torch.compile before cuda graph capture
-        # torch.compile mode for the captured forward; None takes the runner's
-        # default, max-autotune-no-cudagraphs
+        # torch.compile mode for the captured forward; None takes the deployment's
+        # compile level (mstar serve -O), a mode opts the config out of it
         compile_mode: str | None = None,
 
         # Per-config override for the set of batch sizes to capture
@@ -292,6 +299,13 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # own work; the lease only tells the outer declaration which resources are
     # already spoken for, so it can leave them out.
     lease_before_step: bool = False
+    # For a `lease_before_step` region: whether this batch may take a slot at
+    # all, beyond fitting a captured bucket. For a limit the bucket key does
+    # not express, such as how many attention segments a replay's plan holds.
+    # A batch it rejects gets no lease, so its forward runs the region eagerly
+    # (`ModelInputsFromEngine.step` is the declaration that tells it so).
+    # None: every batch that fits a bucket.
+    can_lease: Callable[[list[NodeInputs]], bool] | None = None
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
     # None => defer to the runner's default batch-size buckets
@@ -299,8 +313,8 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # Whether to torch.compile capture_fn before capture. Default off; the
     # block loop already benefits from graph capture alone.
     compile: bool = False
-    # torch.compile mode for the region; None takes the runner's default,
-    # max-autotune-no-cudagraphs
+    # torch.compile mode for the region; None takes the deployment's compile
+    # level (mstar serve -O), a mode opts the config out of it
     compile_mode: str | None = None
 
     def __post_init__(self):

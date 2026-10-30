@@ -8,7 +8,9 @@ import socket
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from collections.abc import Collection
+from dataclasses import dataclass, field, replace
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -21,6 +23,7 @@ from mstar.api_server.request_types import (
     RequestFailed,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -32,17 +35,23 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
+from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
-from mstar.platforms import apply_process_env_defaults
+from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.streaming.topology import CLIENT
+from mstar.utils import knobs
+from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
 from mstar.utils.ipc_format import (
+    ClientStreamInput,
     ConductorMessageType,
     DrainRequest,
     FailRequests,
@@ -59,6 +68,8 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.validation import validate_deployment
+from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +152,9 @@ def keep_bootstrap_sockets_on_loopback() -> None:
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
 
 
-def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
+def _exit_when_orphaned(
+    worker_id: str, parent=None, poll_s: float = 0.5, before_hard_exit=None,
+) -> None:
     """Worker-side watchdog that leaves once the conductor is gone.
 
     So no worker outlives it holding GPU memory. That includes a worker still
@@ -152,37 +165,63 @@ def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> Non
     """
     exit_when_orphaned(
         f"Worker {worker_id}", "conductor", signal.SIGTERM,
-        parent=parent, poll_s=poll_s,
+        parent=parent, poll_s=poll_s, before_hard_exit=before_hard_exit,
     )
 
 
+def _unlink_owned_files(tensor_manager) -> None:
+    """Unlink the files ``tensor_manager`` still owns, if no later launch can
+    be writing the same names: under a launch token it names its own, so this
+    holds even once the conductor is gone. Without one (a Conductor built
+    directly, not under an API server) the names are the endpoint's alone, a
+    restart on the same prefix reuses them, and no check of the conductor
+    covers the unlinks that follow it (#767); the files stay for a later
+    start to sweep or reclaim instead."""
+    if tensor_manager.names_unique_per_launch:
+        tensor_manager.unlink_owned_files()
+
+
 def _run_worker(worker) -> None:
-    """``worker.run()``, then unlink the tensor files the worker still owns.
+    """``worker.run()``, then unlink the tensor files (and arena segments) the
+    worker still owns.
 
     A stop (the conductor's SIGTERM, a Ctrl-C) leaves the files of requests in
     flight waiting for a TENSOR_RECEIVED or REMOVE_REQUEST that will not come,
-    in a RAM-backed dir. Only while the conductor lives: it holds the
-    deployment's IPC lock and ports until it has joined its workers, so no
-    other deployment can be using these names yet. An orphaned worker leaves
-    them, as a new deployment on the same prefix may already reuse them.
+    in a RAM-backed dir. Then leave with the first stop or error ``run()``
+    ended on.
     """
+    stop = None
     try:
         worker.run()
-    finally:
-        # A Ctrl-C reaches the conductor too, and its SIGTERM lands here within
-        # milliseconds, often already pending. Finish unlinking (it resumes
-        # where it was cut), then leave with that stop.
-        stop = None
-        while True:
-            try:
-                parent = mp.parent_process()
-                if parent is not None and parent.is_alive():
-                    worker.tensor_manager.unlink_owned_files()
-                break
-            except (KeyboardInterrupt, SystemExit) as e:
-                stop = e
-        if stop is not None:
-            raise stop
+    except BaseException as e:
+        stop = e
+    handlers = None
+    while True:
+        try:
+            # A Ctrl-C reaches the conductor too, and its SIGTERM lands here
+            # within milliseconds, often already pending. One that fires before
+            # these are ignored is caught below, and the unlinks start over
+            # (each file is untracked only once it is gone).
+            if handlers is None:
+                handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            _unlink_owned_files(worker.tensor_manager)
+            break
+        except (KeyboardInterrupt, SystemExit) as e:
+            stop = stop or e
+    # A signal that arrives while ignored is dropped, not queued. Putting the
+    # handlers back lets a second stop break a teardown that hangs (a thread
+    # join, an atexit hook). One that fires right away must not hide the
+    # error run() ended on.
+    try:
+        for s, h in handlers.items():
+            if h is not None:  # None: set outside Python, nothing to put back
+                signal.signal(s, h)
+    except (KeyboardInterrupt, SystemExit) as e:
+        stop = stop or e
+    if stop is not None:
+        raise stop
 
 
 def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
@@ -216,11 +255,15 @@ def _worker_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    env: dict[str, str] | None = None,
+    all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
     picklability. ``status_interval_s`` turns on the worker's metrics."""
-    # before anything in this process touches the device runtime
+    # before anything in this process touches the device runtime; the MPS pipe
+    # directory in ``env`` decides whether this process becomes an MPS client
     apply_process_env_defaults()
+    os.environ.update(env or {})
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
     # segments were never unlinked and leaked into /dev/shm for the life of
@@ -239,8 +282,10 @@ def _worker_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    built: list = []  # the Worker, once it exists
     threading.Thread(
         target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
+        kwargs={"before_hard_exit": lambda: [_unlink_owned_files(w.tensor_manager) for w in built]},
     ).start()
 
     from mstar.worker.worker import Worker
@@ -257,6 +302,7 @@ def _worker_process_target(
             all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+            all_worker_graph_ids_to_instances=all_worker_graph_ids_to_instances,
             sharding_config=sharding_config,
             parallel_groups=parallel_groups,
             hostname=hostname,
@@ -274,6 +320,7 @@ def _worker_process_target(
     except BaseException as e:
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
+    built.append(worker)
     _run_worker(worker)
 
 
@@ -338,6 +385,14 @@ class RequestData:
             conn for conn in self.streaming_connections.values()
             if conn.to_partition == partition_name
         ]
+
+
+class ClientStream(NamedTuple):
+    """Where a client stream's chunks go: the node that consumes the edge, a
+    walk it runs in (for routing to its workers) and its partition."""
+    node: str
+    graph_walk: str
+    partition: str
 
 
 @dataclass
@@ -432,15 +487,22 @@ class Conductor:
 
         with open(model_config_file, "r") as f:
             self.model_config = yaml.safe_load(f)
+        # fail here, once, rather than in every worker
+        knobs.check(self.model_config.get("knobs"))
+        # Every check that needs only the model, this YAML and the environment,
+        # before any worker exists; raises listing every problem found.
+        deployment = validate_deployment(model, self.model_config, model_config_file)
         accelerator = torch.accelerator.current_accelerator(check_available=True)
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
+        logger.info(
+            "Compile caches: Inductor %s, Triton %s",
+            os.environ.get("TORCHINDUCTOR_CACHE_DIR"), os.environ.get("TRITON_CACHE_DIR"),
+        )
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
-        assert "max_seq_len" in self.model_config
-        assert "node_groups" in self.model_config
         # Optional ``rank_devices: {rank: device_index}`` places a worker rank
         # on a device other than the one its number implies, e.g. two workers
         # sharing one GPU so a light node's steps stop interleaving with a
@@ -449,13 +511,20 @@ class Conductor:
             int(rank): int(index)
             for rank, index in (self.model_config.get("rank_devices") or {}).items()
         }
-        model.validate_config_yaml(self.model_config, model_config_file)
+        # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
+        # conductor owns, so workers sharing a GPU overlap their kernels instead
+        # of time-slicing. validate_deployment checked the value.
+        self._mps_requested = self.model_config.get("mps", False)
+        self._mps: MpsDaemon | None = None
 
-        self.default_sharding_config = model.get_sharding_config(model_config_file)
+        self.default_sharding_config = deployment.sharding_config
         # The conductor is the only process that sees every worker graph, so it
         # owns the numbering. Workers receive their graphs (and these ids) at
         # spawn, so everyone agrees without the ids having to be negotiated.
-        worker_graphs = model.get_worker_graphs(model_config_file)
+        worker_graphs = deployment.worker_graphs
+        # edge name -> where its chunks go, for each stream the client feeds. After
+        # the worker graphs are built: a model may shape them from the deployment (bagel).
+        self._client_streams = self._find_client_streams(model)
         for index, worker_graph in enumerate(worker_graphs):
             worker_graph.worker_graph_id = index
         self.worker_graphs = {
@@ -463,8 +532,8 @@ class Conductor:
             for worker_graph in worker_graphs
         }
 
-        # (1) Set up worker graph TP ranks
-        # (2) Assert that streaming consumers don't have graph-walk-specific sharding config
+        # Set up worker graph TP ranks; validate_deployment checked each worker
+        # graph belongs to one sharding group of its tp_size.
         self.streaming_consumers = set()
         self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
 
@@ -472,6 +541,7 @@ class Conductor:
         self.worker_group_to_instance_rank: dict[int, dict[str, int]] = {}
 
         graph_walks = set()
+        streamed_inputs: dict[str, set[str]] = defaultdict(set)
         for wg in self.worker_graphs.values():
             for walk in wg.graph_walks:
                 graph_walks.add(walk)
@@ -480,21 +550,37 @@ class Conductor:
                     self.node_walk_to_wg[(name, walk)] = wg
                 if node.consumes_stream:
                     self.streaming_consumers.add(name)
+                    streamed_inputs[name] |= node._streaming_inputs
+        stream_edges = {
+            (edge.name, name, walk, edge.next_node)
+            for wg in self.worker_graphs.values()
+            for name, node in wg.section.get_nodes().items()
+            for edge in node.outputs
+            if edge.name in streamed_inputs.get(edge.next_node, ())
+            for walk in wg.graph_walks
+        }
+        # a Loop streams its outputs on completion; the producer is the inner
+        # node that makes the signal
+        stream_edges |= {
+            (edge.name, name, walk, edge.next_node)
+            for wg in self.worker_graphs.values()
+            for loop in wg.section.get_loops().values()
+            for edge in loop.outputs + loop.accumulated_outputs
+            if edge.name in streamed_inputs.get(edge.next_node, ())
+            for name, node in loop.get_nodes().items()
+            if any(out.name == edge.name for out in node.outputs)
+            for walk in wg.graph_walks
+        }
+        self.default_sharding_config.assert_streams_keep_tp_size(sorted(stream_edges))
 
-        # v1: one sharding group per worker graph. Track which group "owns"
-        # each wg so we can assert single-group-per-wg.
-        wg_to_owning_group: dict[int, str] = {}
+        topology = model.get_partition_topology()
+        self.producer_triggered_partitions: set[str] = (
+            topology.producer_triggered_partitions() if topology else set()
+        )
+        if topology:
+            topology.check_walk_driving_connections()
 
         for group in self.default_sharding_config.groups:
-            if group.graph_walks is not None and any([
-                node in self.streaming_consumers for node in group.nodes
-            ]):
-                raise RuntimeError((
-                    f"Sharding group with nodes {group.nodes} includes a streaming consumer but "
-                    f"has custom graph walk configuration {group.graph_walks}. It is currently "
-                    "disallowed to set custom graph walks for TP groups that include streaming "
-                    "consumer nodes."
-                ))
             group_graph_walks = group.graph_walks or graph_walks
             group_key = group.key_str()
             for walk in group_graph_walks:
@@ -502,22 +588,6 @@ class Conductor:
                     if (node, walk) not in self.node_walk_to_wg:
                         continue
                     wg = self.node_walk_to_wg[(node, walk)]
-                    # v1: a worker graph belongs to at most one sharding group.
-                    # Construct worker graphs so this holds; revisit if we
-                    # need multiple TP groups colocated in one wg.
-                    prior = wg_to_owning_group.setdefault(wg.worker_graph_id, group_key)
-                    assert prior == group_key, (
-                        f"Worker graph {wg.worker_graph_id} is claimed by two sharding "
-                        f"groups ({prior!r} and {group_key!r}). v1 requires one TP group "
-                        f"per worker graph; split the wg or merge the groups."
-                    )
-                    # wg._tp_ranks is computed in WorkerGraph.__post_init__
-                    # from wg.tp_size (which came from the node_group entry).
-                    assert wg.tp_size == group.tp_size, (
-                        f"Worker graph {wg.worker_graph_id} has tp_size {wg.tp_size}, "
-                        f"but its sharding group has tp_size {group.tp_size}. "
-                        f"node_groups and sharding_config disagree."
-                    )
                     # The instance rank is the worker's index within the
                     # lockstep instance (0..tp*sp-1), used by the
                     # replicated-signal fanout (so exactly one rank — index 0
@@ -559,32 +629,81 @@ class Conductor:
         )
 
     def _max_output_tokens(self, model_kwargs: dict) -> int:
-        """The request's output cap: an int >= 1 within the model's published
-        limit, else ``ValueError`` (a 400). Checked here because the cap is
-        compared inside the run loop, where a non-int would raise and the
-        request would hang."""
+        """The request's output cap: an int >= 1, else ``ValueError`` (a 400).
+        Checked here because the cap is compared inside the run loop, where a
+        non-int would raise and the request would hang."""
         requested = model_kwargs.get("max_output_tokens")
         if requested is not None and (
             isinstance(requested, bool) or not isinstance(requested, int) or requested < 1
         ):
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {requested!r}")
-        limit = self.model.get_max_output_tokens_limit()
-        if requested is not None and limit is not None and requested > limit:
-            raise ValueError(
-                f"max_output_tokens is {requested}; this model produces at most {limit}"
-            )
         cap = self.model.get_max_output_tokens(**model_kwargs)
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {cap!r}")
         return cap
 
-    def _resource_specs(self) -> dict:
-        """The model's resource specs by key, for admission-time capability checks."""
+    def _loop_caps(self, model_kwargs: dict) -> dict[str, int]:
+        """Each named loop's cap for the request. A cap past its loop's ``max_iters``
+        would end the request short of what it asked for, so it is a ``ValueError`` (a 400)."""
+        caps = self.model.get_loop_caps(**model_kwargs)
+        for name, cap in caps.items():
+            max_iters = self._loop_max_iters.get(name)
+            if max_iters is not None and cap > max_iters:
+                raise ValueError(
+                    f"this request needs {cap} iterations of {name!r}, and this model runs at most {max_iters}"
+                )
+        return {name: caps.get(name, n) for name, n in self._loop_max_iters.items()}
+
+    def _resource_specs(self) -> list[dict]:
+        """Each worker's resource specs by key, after this deployment's YAML, for admission-time checks.
+        A spec's ``nodes`` is cut to the worker's own, as the worker's engine does when it builds the resource."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
-            specs = {s.resource_key: s for s in (self.model.get_node_resources() or [])}
-            self._resource_specs_cache = specs
+            built = self._node_resources()
+            specs = self._resource_specs_cache = [
+                {s.resource_key: replace(s, nodes=s.nodes & nodes) for s in built if s.nodes & nodes}
+                for nodes in {frozenset(self._worker_nodes(worker_id)) for worker_id in self._per_worker_graphs}
+            ]
         return specs
+
+    def _node_resources(self) -> list:
+        """The model's resource specs after this deployment's YAML, each with all of its nodes."""
+        built = getattr(self, "_node_resources_cache", None)
+        if built is None:
+            built = self._node_resources_cache = self.model.get_node_resources() or []
+            apply_yaml_overrides(built, self.model_config)
+        return built
+
+    def _streamed_partitions(self) -> frozenset[str]:
+        streamed = getattr(self, "_streamed_partitions_cache", None)
+        if streamed is None:
+            streamed = streamed_partitions(self._node_resources(), self.model)
+            self._streamed_partitions_cache = streamed
+        return streamed
+
+    def _fit_loop_caps(self, model_kwargs: dict, configs: dict, cap: int) -> tuple[int, dict[str, int]]:
+        """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
+        within what the request's resources hold. A loop that ``max_output_tokens`` doesn't drive is
+        left as it is, and ``validate`` then refuses the request if it doesn't fit."""
+        room: dict[str, int] = {}
+        for specs in self._resource_specs():
+            for key, cfg in configs.items():
+                for name, n in cfg.loop_room(specs.get(key)).items():
+                    room[name] = min(n, room.get(name, n))
+
+        def overrun(caps: dict[str, int]) -> int:
+            return max((caps[name] - n for name, n in room.items() if name in caps), default=0)
+
+        caps = self._loop_caps({**model_kwargs, "max_output_tokens": cap})
+        over = overrun(caps)
+        while over > 0 and cap > 1:
+            cap = max(1, cap - over)
+            caps = self._loop_caps({**model_kwargs, "max_output_tokens": cap})
+            over, last = overrun(caps), over
+            if over >= last:
+                # the loop that overruns is one max_output_tokens doesn't drive
+                break
+        return cap, caps
 
     def _get_resource_configs(
         self, model_kwargs: dict,
@@ -596,14 +715,14 @@ class Conductor:
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
 
-        A declared stream gets a config even when the model returned none, or its
-        keys would have nowhere to go.
+        A KV resource with declared labels gets a config even when the model
+        returned none, or its keys and layout would have nowhere to go.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
-        for key, streams in self.model.prefix_key_streams().items():
-            configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        for key, labels in self._kv_labels.items():
+            configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs
 
     def _derive_worker_info(self):
@@ -641,6 +760,22 @@ class Conductor:
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
+        # each worker graph's lockstep instances, as worker ids; a request of
+        # the worker graph runs on one of them
+        self._all_worker_graph_ids_to_instances: dict[int, list[list[str]]] = {
+            worker_graph_id: [
+                [f"worker_{rank}" for rank in instance]
+                for instance in (worker_graph._instance_ranks or [[r] for r in worker_graph.ranks])
+            ]
+            for worker_graph_id, worker_graph in self.worker_graphs.items()
+        }
+        self._loop_max_iters: dict[str, int] = {}
+        for worker_graph in self.worker_graphs.values():
+            for name, loop in worker_graph.section.get_loops().items():
+                self._loop_max_iters[name] = max(loop.max_iters, self._loop_max_iters.get(name, 0))
+        self._kv_labels: dict[str, tuple[str, ...]] = {
+            key: tuple(labels) for key, labels in self.model.kv_labels().items()
+        }
 
         # set each group's _tp_rank (the worker's instance rank) per worker
         self.per_worker_sharding_config: dict[str, ShardingConfig] = {}
@@ -674,6 +809,13 @@ class Conductor:
 
             _cuda_op_available()
         ctx = mp.get_context("spawn")
+        atexit.register(self.shutdown)
+        if self._mps_requested:
+            # a host check, not a config one: shipped configs validate on any machine
+            if not current_platform.is_cuda():
+                raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
+            self._mps = MpsDaemon()
+            self._mps.start()
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
@@ -685,6 +827,7 @@ class Conductor:
                     "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
+                    "all_worker_graph_ids_to_instances": self._all_worker_graph_ids_to_instances,
                     "sharding_config": self.per_worker_sharding_config[worker_id],
                     "parallel_groups": self.parallel_config.per_worker_config[worker_id],
                     "hostname": self.hostname,
@@ -698,16 +841,22 @@ class Conductor:
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
                     "status_interval_s": self._status_interval_s,
+                    "env": self._mps.client_env if self._mps is not None else None,
                 },
                 daemon=False,
             )
             p.start()
             self._worker_processes.append(p)
 
-        atexit.register(self.shutdown)
-
     def shutdown(self):
-        """Terminate and join all worker processes."""
+        """Terminate and join all worker processes, then stop the MPS daemon if any."""
+        try:
+            self._stop_workers()
+        finally:
+            if self._mps is not None:
+                self._mps.stop()
+
+    def _stop_workers(self):
         if not self._worker_processes:
             return  # already done (run()'s caller and the atexit hook both call this)
         logger.info("Shutting down conductor...")
@@ -857,6 +1006,26 @@ class Conductor:
         cfg.setup(node_to_workers)
         cfg.assert_stream_consumer_compatibility(self.streaming_consumers)
         return cfg
+
+    @staticmethod
+    def _find_client_streams(model: Model) -> dict[str, ClientStream]:
+        """Where each client stream's chunks go: to the one node that consumes
+        it, in the partition it flows into, as validate_deployment checked."""
+        connections = model.get_partition_topology().client_connections()
+        if not connections:
+            return {}
+        walks = model.get_graph_walk_graphs()
+        partitions = {p.name: p for p in model.get_partitions()}
+        streams: dict[str, ClientStream] = {}
+        for conn in connections:
+            name, partition = conn.edge_name, partitions[conn.to_partition]
+            (consumer,) = {
+                node.name for walk in walks.values() for node in walk.get_nodes().values()
+                if name in node.input_names
+            }
+            walk = max(walk for walk in partition.graph_walks if consumer in walks[walk].get_nodes())
+            streams[name] = ClientStream(consumer, walk, partition.name)
+        return streams
 
     def _split_inputs_to_workers(
         self,
@@ -1031,6 +1200,15 @@ class Conductor:
             return
         if (self.max_concurrent_requests is not None
                 and len(self.requests) >= self.max_concurrent_requests):
+            ended = body.client_input.ended if body.client_input is not None else ()
+            if self._client_streams.keys() - set(ended):
+                # A live call that waited for a slot would start, and stay, as
+                # far behind its client as it waited.
+                self._reject_request(
+                    body.request_id, "server at capacity: a call with open input can't wait for a slot",
+                    status=503,
+                )
+                return
             logger.info(
                 "Request %s queued (at capacity: %d/%d)",
                 body.request_id, len(self.requests),
@@ -1061,19 +1239,23 @@ class Conductor:
             if request_data is None or not request_data.dispatched:
                 self.requests.pop(body.request_id, None)
                 if isinstance(exc, ValueError):
-                    self._reject_request(body.request_id, str(exc), status=400)
+                    self._reject_request(body.request_id, scrub_paths(str(exc)), status=400)
                     return
-                logger.exception("Ingest failed for request %s", body.request_id)
-                self._reject_request(
-                    body.request_id, f"Ingest failed: {type(exc).__name__}: {exc}", status=500,
+                text, _ = client_error_text(
+                    exc, f"Ingest failed for request {body.request_id}", log=logger,
                 )
+                self._reject_request(body.request_id, f"Ingest failed: {text}", status=500)
             elif body.request_id not in self.draining:
-                logger.exception("Ingest failed for request %s", body.request_id)
+                text, _ = client_error_text(
+                    exc, f"Ingest failed for request {body.request_id}", log=logger,
+                )
                 # Some workers may already hold it: drain them like a worker failure.
                 self._remove_request(
-                    body.request_id, request_data,
-                    failure_error=f"Ingest failed: {type(exc).__name__}: {exc}",
+                    body.request_id, request_data, failure_error=f"Ingest failed: {text}",
                 )
+        else:
+            if body.client_input is not None:
+                self._stream_input(body.client_input)
 
     def _reject_request(self, request_id: str, error: str, status: int):
         """Fail a request that was never dispatched to any worker.
@@ -1107,6 +1289,7 @@ class Conductor:
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
+        loop_caps = self._loop_caps(model_kwargs)
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.
@@ -1191,16 +1374,16 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
-        specs = self._resource_specs()
-        for key, cfg in request_data.resource_configs.items():
-            cfg.validate(specs.get(key))
         # keyed by resource, so each config is handed only its own chain
         kwargs = model_kwargs or {}
         prefix_keys = kwargs.get("prefix_keys") or {}
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
-        prefix_layout = kwargs.get("prefix_layout") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        if not all(partition_states[name].is_done for name in self._streamed_partitions()):
+            prefix_cache = False
+        kv_layout = kwargs.get("kv_layout") or {}
+        refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,
@@ -1208,9 +1391,19 @@ class Conductor:
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
-                prefix_layout=prefix_layout.get(key),
                 prefix_cache=prefix_cache,
+                kv_layout=kv_layout.get(key),
+                loop_caps=loop_caps,
             )
+        if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
+            request_data.max_output_tokens, loop_caps = self._fit_loop_caps(
+                model_kwargs, request_data.resource_configs, max_output_tokens,
+            )
+            for key, cfg in request_data.resource_configs.items():
+                cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
+        for specs in self._resource_specs():
+            for key, cfg in request_data.resource_configs.items():
+                cfg.validate(specs.get(key))
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True
@@ -1237,6 +1430,7 @@ class Conductor:
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
+                    loop_caps=loop_caps,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
@@ -1255,6 +1449,8 @@ class Conductor:
                         body=message,
                     ),
                 )
+
+        request_data.resource_configs = without_layouts(request_data.resource_configs)
 
         # After the loop: a tensor's reader count must cover every worker and
         # partition it went to before the producer may free it.
@@ -1314,6 +1510,16 @@ class Conductor:
         )
         if not expected_acks:
             self._finalize_draining(request_id)
+
+    def _send_drain(self, request_id: str, entities: set[str]):
+        for entity in entities:
+            self._send_for_teardown(
+                request_id, entity,
+                WorkerMessage(
+                    message_type=WorkerMessageType.DRAIN_REQUEST,
+                    body=DrainRequest(request_id),
+                ),
+            )
 
     def _send_remove_to_preprocess_worker(self, request_id: str):
         self._send_for_teardown(
@@ -1490,14 +1696,7 @@ class Conductor:
         # barrier whose READS_DONE all came early finalizes on registration,
         # and a DRAIN_REQUEST must not reach a participant after its
         # REMOVE_REQUEST.
-        for entity in participants:
-            self._send_for_teardown(
-                request_id, entity,
-                WorkerMessage(
-                    message_type=WorkerMessageType.DRAIN_REQUEST,
-                    body=DrainRequest(request_id),
-                ),
-            )
+        self._send_drain(request_id, participants)
         logger.info("Draining request %s (%d participants) before teardown", request_id, len(participants))
         self._register_draining(
             request_id,
@@ -1551,11 +1750,17 @@ class Conductor:
         # that emits extra/erroneous tensors could leave a worker read scheduled
         # past completion, which this path won't wait for. Gating the happy path
         # on per-worker READS_DONE too (like abort/fail) would handle that
-        # robustly — TODO once the barrier has proven out.
+        # robustly — TODO once the barrier has proven out. A model with a client
+        # stream already does: the client can append after the model ended the
+        # request, so a chunk can be in a worker's read at any point.
         workers = self._request_workers(request_data)
+        expected_acks = {self.PREPROCESS_WORKER}
+        if self._client_streams:
+            self._send_drain(request_id, workers)
+            expected_acks |= workers
         self._register_draining(
             request_id,
-            expected_acks={self.PREPROCESS_WORKER},
+            expected_acks=expected_acks,
             participants=workers | {self.PREPROCESS_WORKER},
         )
 
@@ -1634,6 +1839,19 @@ class Conductor:
                         continue  # skip producer connections
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
                     conn.consumed_count = max(conn.consumed_count, consumed)
+
+        # The stream moves a producer-triggered partition's walk on the
+        # worker; follow it so the completion check and the model's state
+        # machine see the walk this pass actually ran.
+        if (
+            partition_name in self.producer_triggered_partitions
+            and body.graph_walk
+            and body.graph_walk != pstate.metadata.graph_walk
+        ):
+            pstate.metadata.graph_walk = body.graph_walk
+            self._set_partition_worker_graph_ids(
+                body.request_id, partition_name, body.graph_walk,
+            )
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
@@ -1718,6 +1936,11 @@ class Conductor:
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
+                    # A finished consumer takes no more input; told its
+                    # producer is done, a continue_after_done stream would
+                    # keep feeding it empty chunks
+                    if request_data.partition_states[conn.to_partition].is_done:
+                        continue
                     if conn.to_partition not in consumers:
                         consumers.add(conn.to_partition)
                         self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
@@ -1745,26 +1968,38 @@ class Conductor:
         self, request_id: str, partition_name: str, fwd_args: ForwardPassArgs,
     ):
         """Send InputSignals for a specific partition's next forward pass."""
+        self._send_inputs(
+            request_id, partition_name, fwd_args.inputs,
+            fwd_args.full_metadata.graph_walk, fwd_args.step_metadata,
+        )
+
+    def _send_inputs(
+        self, request_id: str, partition_name: str, inputs: list[GraphEdge],
+        graph_walk: str, step_metadata: dict,
+    ) -> dict[str, list[GraphEdge]]:
+        """Split ``inputs`` over the ranks that consume them, count each rank as
+        a reader of the tensors, and send each its INPUT_SIGNALS. Returns what
+        each rank was sent."""
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
 
         inputs_per_worker = self._split_inputs_to_workers(
             sharding_config=request_data.sharding_config,
-            inputs=fwd_args.inputs,
-            graph_walk=fwd_args.full_metadata.graph_walk,
+            inputs=inputs,
+            graph_walk=graph_walk,
         )
 
-        for worker, inputs in inputs_per_worker.items():
-            self._update_persist_ref_counts(request_id, inputs)
+        for worker, worker_inputs in inputs_per_worker.items():
+            self._update_persist_ref_counts(request_id, worker_inputs)
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
                     request_id=request_id,
-                    inputs=inputs,
+                    inputs=worker_inputs,
                     request_info=CurrentForwardPassInfo(
                         request_id=request_id,
-                        graph_walk=fwd_args.full_metadata.graph_walk,
-                        step_metadata=fwd_args.step_metadata,
+                        graph_walk=graph_walk,
+                        step_metadata=step_metadata,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
                         resource_publish_info=pstate.resource_publish_info,
@@ -1776,12 +2011,14 @@ class Conductor:
                 ),
             )
             self.communicator.send(worker, message)
+        return inputs_per_worker
 
     def _send_producer_done(
         self, request_id: str, producer_partition: str,
-        consumer_partition_name: str
+        consumer_partition_name: str, edges: Collection[str] | None = None,
     ):
-        """Send producer_done signal to the consumer partition's worker(s)."""
+        """Send producer_done signal to the consumer partition's worker(s): for
+        every stream between the two partitions, or only ``edges``."""
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[consumer_partition_name]
 
@@ -1793,12 +2030,13 @@ class Conductor:
             if walks & pdef.graph_walks:
                 consumer_workers.update(worker_ids)
 
-        # The signal ends every stream from the producer, so it carries the
-        # counts of every edge between the two partitions.
+        # The worker ends the streams the signal counts, so it names each edge
+        # it ends: every one between the two partitions, or ``edges``.
         conns = [
             conn for conn in request_data.streaming_connections.values()
             if conn.from_partition == producer_partition
             and conn.to_partition == consumer_partition_name
+            and (edges is None or conn.edge_name in edges)
         ]
         for worker_id in consumer_workers:
             message = WorkerMessage(
@@ -1823,6 +2061,62 @@ class Conductor:
                 ),
             )
             self.communicator.send(worker_id, message)
+
+    def _stream_input(self, body: ClientStreamInput):
+        """Forward the next chunk of a request's client streams, or end them.
+        A chunk this request can't take fails the request alone."""
+        request_id = body.request_id
+        request_data = self.requests.get(request_id)
+        if request_data is None or request_id in self.draining:
+            # It ended, failed or was aborted (a request still waiting for a
+            # slot has no open input); the preprocess worker frees the chunk
+            # with the request's other tensors.
+            return
+        try:
+            for name, infos in body.signals.items():
+                self._forward_client_chunk(request_id, request_data, name, infos)
+            # each stream ends on its own; the call's input has ended once all have
+            ended: dict[str, list[str]] = {}
+            for name in body.ended:
+                stream = self._client_streams.get(name)
+                if stream is None:
+                    logger.warning("Request %s: %r is not a client stream; not ending it", request_id, name)
+                    continue
+                conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+                if not conn.producer_done:
+                    conn.producer_done = True
+                    ended.setdefault(stream.partition, []).append(name)
+            for partition in sorted(ended):
+                self._send_producer_done(request_id, CLIENT, partition, edges=ended[partition])
+        except Exception as exc:  # noqa: BLE001 — this request's failure, not the batch's
+            text, _ = client_error_text(exc, f"Client input for request {request_id} failed", log=logger)
+            self._remove_request(request_id, request_data, failure_error=f"client input failed: {text}")
+
+    def _forward_client_chunk(
+        self, request_id: str, request_data: RequestData, name: str,
+        infos: list[TensorPointerInfo],
+    ):
+        """Send one client chunk to the workers of the node that consumes it,
+        the way a partition's inputs are sent, and release its persist hold."""
+        stream = self._client_streams.get(name)
+        if stream is None:
+            logger.warning("Request %s: %r is not a client stream; dropping it", request_id, name)
+            return
+        conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+        pstate = request_data.partition_states[stream.partition]
+        if conn.producer_done or pstate.is_done:
+            return  # nothing reads it any more; freed with the request
+        if not infos:
+            return
+        edge = GraphEdge(next_node=stream.node, name=conn.edge_name, tensor_info=list(infos), is_streaming=True)
+        sent = self._send_inputs(request_id, stream.partition, [edge], stream.graph_walk, {})
+        conn.token_count += len(infos)
+        # each tensor is one stream item; the producer-done signal reports them
+        for worker, edges in sent.items():
+            n = sum(len(e.tensor_info) for e in edges)
+            conn.items_sent[worker] = conn.items_sent.get(worker, 0) + n
+        # After the send: the hold is released with every reader counted.
+        self._un_persist_tensors(request_id, infos)
 
     def _wait_for_workers_ready(self) -> None:
         """Block until every worker reports ``SETUP_DONE`` (weight load + warmup
@@ -1859,6 +2153,8 @@ class Conductor:
             self._fail_requests(message.body)
         elif message.message_type == ConductorMessageType.READS_DONE:
             self._handle_reads_done(message.body)
+        elif message.message_type == ConductorMessageType.CLIENT_STREAM_INPUT:
+            self._stream_input(message.body)
         elif message.message_type == ConductorMessageType.WORKER_STATUS:
             self._worker_metrics[message.body.worker_id] = message.body.metrics
         elif message.message_type == ConductorMessageType.ENABLE_METRICS:
@@ -1898,7 +2194,9 @@ class Conductor:
 
         A request whose ``request_complete`` already went out is only torn
         down: its client has the result."""
-        logger.exception("Conductor error %s for request %s", step, request_id)
+        text, _ = client_error_text(
+            exc, f"Conductor error {step} for request {request_id}", log=logger,
+        )
         request_data = self.requests.get(request_id)
         if request_data is None or request_id in self.draining:
             return  # unknown, never admitted, or already being torn down
@@ -1907,7 +2205,7 @@ class Conductor:
                 request_id, request_data,
                 failure_error=(
                     None if request_data.completion_sent
-                    else f"Conductor error {step}: {type(exc).__name__}: {exc}"
+                    else f"Conductor error {step}: {text}"
                 ),
             )
         except Exception:

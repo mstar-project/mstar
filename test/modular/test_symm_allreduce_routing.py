@@ -77,7 +77,7 @@ class _CudaTensor:
 def _one_process(monkeypatch):
     monkeypatch.setattr(ar, "SYMM_BACKENDS", _fakes(_FakeSymm))
     # one process: every rank is this one
-    monkeypatch.setattr(ar, "_all_ranks_agree", lambda flag, cpu_group: flag)
+    monkeypatch.setattr(CommGroup, "agree", lambda self, values, op=None: list(values))
     _FakeSymm.instances.clear()
 
 
@@ -138,7 +138,7 @@ def test_setup_failure_falls_back_to_nccl_with_warning(monkeypatch, fake_cuda, c
 def test_a_peer_that_failed_takes_every_rank_to_nccl(monkeypatch, fake_cuda, caplog):
     """One rank on NCCL while its peers wait in the symmetric kernel for its signal
     deadlocked the first all-reduce."""
-    monkeypatch.setattr(ar, "_all_ranks_agree", lambda flag, cpu_group: False)
+    monkeypatch.setattr(CommGroup, "agree", lambda self, values, op=None: [0] * len(values))
     with caplog.at_level(logging.WARNING, logger=ar.__name__):
         backend = AllReduce.new(_group(), "symm_multimem")
     assert type(backend) is AllReduce
@@ -524,3 +524,94 @@ def test_single_rank_is_a_no_op(nccl_calls):
     t = torch.zeros(4)
     assert g.all_reduce(t) is t
     assert nccl_calls == []
+
+
+# --- flashinfer: FlashInfer's one-kernel all-reduce --------------------------
+
+
+@dataclass
+class _Matrix:
+    """Only the attributes ``FlashInferAllReduce.all_reduce`` inspects before routing."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype = torch.bfloat16
+    contiguous: bool = True
+    is_cuda: bool = True
+
+    def dim(self):
+        return len(self.shape)
+
+    def is_contiguous(self):
+        return self.contiguous
+
+
+class _Workspace:
+    def __init__(self, max_bytes):
+        self.max_bytes = max_bytes
+
+    def is_buffer_size_sufficient(self, tp_size, num_tokens, hidden_dim, dtype):
+        return num_tokens * hidden_dim * dtype.itemsize <= self.max_bytes
+
+
+@pytest.fixture
+def flashinfer(monkeypatch, fake_cuda):
+    """``AllReduce.new`` over a faked FlashInfer workspace and kernel: the group,
+    the workspaces built and the tensors routed to the kernel."""
+    from mstar.distributed import ar_fusion
+
+    built, routed = [], []
+
+    def create_workspace(group, max_tokens, hidden, dtype):
+        nbytes = max_tokens * hidden * dtype.itemsize
+        built.append((group.cpu_group, nbytes))
+        ar_fusion._WORKSPACES.append(_Workspace(nbytes))
+        return len(ar_fusion._WORKSPACES) - 1
+
+    monkeypatch.setattr(ar_fusion, "_WORKSPACES", [])
+    monkeypatch.setattr(ar_fusion, "create_workspace", create_workspace)
+    monkeypatch.setattr(ar_fusion, "allreduce_oneshot", lambda t, ws_id: routed.append(t) or t)
+    monkeypatch.setattr(ar, "SYMM_BACKENDS", _REAL_BACKENDS)
+    g = _group()
+    g.cpu_group = SimpleNamespace(name="gloo")
+    return g, built, routed
+
+
+def test_flashinfer_sizes_its_workspace_in_bytes_over_the_gloo_group(flashinfer):
+    g, built, _ = flashinfer
+    assert AllReduce.new(g, "flashinfer", 16384).mode == "flashinfer"
+    assert built == [(g.cpu_group, 16384 * 1024)]
+
+
+def test_flashinfer_without_a_workspace_falls_back_to_nccl(monkeypatch, flashinfer, caplog):
+    from mstar.distributed import ar_fusion
+
+    monkeypatch.setattr(ar_fusion, "create_workspace", lambda *args: None)
+    with caplog.at_level(logging.WARNING, logger=ar.__name__):
+        backend = AllReduce.new(flashinfer[0], "flashinfer")
+    assert type(backend) is AllReduce
+    assert any("using NCCL" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("message, kernel", [
+    (_Matrix((64, 4096)), True),  # 512 KiB, the max
+    (_Matrix((1, 4096)), True),
+    (_Matrix((65, 4096)), False),
+    (_Matrix((4096,)), False),
+    (_Matrix((8, 4096), dtype=torch.float32), False),
+    (_Matrix((8, 4096), contiguous=False), False),
+    (_Matrix((8, 4096), is_cuda=False), False),
+])
+def test_flashinfer_routing(nccl_calls, flashinfer, message, kernel):
+    g, _, routed = flashinfer
+    g._all_reduce = AllReduce.new(g, "flashinfer")
+    assert g.all_reduce(message) is message
+    assert routed == ([message] if kernel else [])
+    assert nccl_calls == ([] if kernel else [(message, g.device_group)])
+
+
+def test_compiled_flashinfer_goes_nccl(monkeypatch, nccl_calls, flashinfer):
+    g, _, routed = flashinfer
+    g._all_reduce = AllReduce.new(g, "flashinfer")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    g.all_reduce(_Matrix((8, 4096)))
+    assert routed == []

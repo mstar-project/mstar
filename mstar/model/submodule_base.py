@@ -26,6 +26,49 @@ class HostRows(NamedTuple):
     request_ids: tuple
     buffers: dict[str, torch.Tensor]
 
+    def first_values(self, name: str, request_ids: Sequence[str]):
+        """``(rid, value)`` for each of ``request_ids`` that has a row, where
+        ``value`` is the first element of its row of buffer ``name``, off one
+        ``tolist``; None when the step staged no such buffer. A request with
+        no row is skipped, as the per-request stop path skips a request with
+        no output."""
+        buffer = self.buffers.get(name)
+        if not torch.is_tensor(buffer) or buffer.dim() == 0:
+            return None
+        values = buffer.reshape(buffer.shape[0], -1)[:, 0].tolist()
+        rows = self.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            # the common case: the batch in forward order, no row map needed
+            return zip(request_ids, values, strict=False)
+        row_of = {rid: i for i, rid in enumerate(rows)}
+        return (
+            (rid, values[i]) for rid in request_ids
+            if (i := row_of.get(rid)) is not None and i < len(values)
+        )
+
+
+class StopCheck(NamedTuple):
+    """``check_stop``'s answer when the step also has outputs that are not data.
+
+    ``withheld`` names outputs of this step the worker leaves unrouted for the
+    request, e.g. a frame streamed beside a stop token: a streaming edge then
+    gets no item for it, so its consumer needs no device read to find and drop
+    it. A plain ``set`` return is the same as ``StopCheck(stops)``.
+    """
+
+    stops: set[str] | frozenset[str] = frozenset()
+    withheld: tuple[str, ...] = ()
+
+
+class BatchedStopCheck(NamedTuple):
+    """``StopCheck`` for ``check_stop_batched``: rid -> loops to stop and
+    rid -> withheld outputs, rids with none left out of each."""
+
+    stops: dict[str, set[str]]
+    withheld: dict[str, tuple[str, ...]]
+
 
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
@@ -95,6 +138,17 @@ class BatchedModelOutput:
     # A mixed step's rows whose own walk keeps every output signal on the
     # device (see ``ExecutingBatch.loopback_rids``)
     loopback_rids: frozenset = frozenset()
+    # output name -> [bs, 2] int64 on the forward's device: row i holds the
+    # first and one-past-last index of the valid part of request i's output
+    # along its last dim. The worker cuts the rows to it once the step has
+    # run (see ``NodeSubmodule.spanned_outputs``).
+    output_spans: dict[str, torch.Tensor] | None = None
+    # The request each row of ``output_spans`` belongs to, stamped by the
+    # engine like ``row_request_ids``.
+    span_request_ids: tuple | None = None
+    # ``output_spans`` on the host, staged by the gpu thread behind the step
+    # like ``host_rows``.
+    host_spans: dict[str, torch.Tensor] | None = None
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -132,22 +186,23 @@ class BatchedModelOutput:
 
         ``reuse`` holds clones already taken of the row outputs (see
         ``clone_row_outputs``); a stop buffer that is the very same tensor as a
-        row output takes that clone instead of a second copy. The row clone is
-        narrowed to the real rows, which is every row the stop check reads.
+        row output takes that clone instead of a second copy, and a tensor under
+        two names is cloned once. The row clone is narrowed to the real rows,
+        which is every row the stop check reads.
         """
         if self.check_stop_buffers is None:
             return None
         rows = self.row_outputs or {}
+        clones = {
+            id(rows[name]): clone for name, clone in (reuse or {}).items()
+            if name in rows and isinstance(clone, torch.Tensor)
+        }
 
-        def _clone(value, name=None):
+        def _clone(value):
             if isinstance(value, torch.Tensor):
-                if (
-                    reuse is not None and name is not None
-                    and value is rows.get(name)
-                    and isinstance(reuse.get(name), torch.Tensor)
-                ):
-                    return reuse[name]
-                return value.clone()
+                if id(value) not in clones:
+                    clones[id(value)] = value.clone()
+                return clones[id(value)]
             if isinstance(value, list):
                 return [
                     x.clone() if isinstance(x, torch.Tensor) else x for x in value
@@ -157,7 +212,7 @@ class BatchedModelOutput:
             # pass anything else through: dropping it could lose a stop signal
             return value
 
-        return {k: _clone(v, k) for k, v in self.check_stop_buffers.items()}
+        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
         """One clone per row-addressed batch tensor, narrowed to the real rows
@@ -200,6 +255,26 @@ class BatchedModelOutput:
             if self.row_outputs is None:
                 self.row_outputs = {}
             self.row_outputs.update(other.row_outputs)
+        # Unlike the stop buffers, spans cannot be dropped on a merge: a row
+        # left without its span would leave the step uncut. Both sides span
+        # the same names (the engine checks a step against its declaration),
+        # so the rows concatenate name by name.
+        if other.output_spans:
+            if not self.output_spans:
+                self.output_spans = dict(other.output_spans)
+                self.span_request_ids = other.span_request_ids
+            else:
+                if other.output_spans.keys() != self.output_spans.keys():
+                    raise ValueError(
+                        f"cannot merge spans for {sorted(self.output_spans)} with spans "
+                        f"for {sorted(other.output_spans)}: every forward of a step spans "
+                        f"the same outputs"
+                    )
+                self.output_spans = {
+                    name: torch.cat([span, other.output_spans[name]])
+                    for name, span in self.output_spans.items()
+                }
+                self.span_request_ids = self.span_request_ids + other.span_request_ids
 
 
 @dataclass
@@ -464,6 +539,13 @@ class ModelInputsFromEngine:
     # ``capture_forward_method``, so most submodules never need this.
     captured: bool = False
 
+    # Every row is a dummy request (CUDA-graph capture or warmup), not real traffic.
+    synthetic: bool = False
+
+    # Real requests' token count; they lead the batch, later rows are replay padding.
+    # None: no padding.
+    real_seq_len: int | None = None
+
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
@@ -500,6 +582,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # params to the autocast dtype nor wraps its forward (or capture) in
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
+
+    # Float32 math for this node's forward, where the process default (TF32
+    # matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:
+    # "highest" runs fp32 matmuls in full fp32, and ``cudnn_allow_tf32 = False``
+    # does the same for cuDNN convolutions and RNNs. None keeps the default. The
+    # engine applies them around the forward, its compile and its capture (see
+    # ``mstar.engine.fp32_precision``); don't flip the process-wide flags here.
+    # Read once, when the engine loads the submodule.
+    float32_matmul_precision: str | None = None
+    cudnn_allow_tf32: bool | None = None
 
     # Set True on a submodule whose decode walk may read its last sampled
     # tokens back off the sampler's slot masters (``device_loopback_signals``).
@@ -584,7 +676,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return state
 
     def get_device(self):
-        return next(self.parameters()).device
+        # Cached rather than read off ``parameters()``, which walks the module
+        # tree; ``_apply`` (to / cuda / to_empty) drops it, so a moved module
+        # reports its new device.
+        device = self.__dict__.get("_cached_device")
+        if device is None:
+            device = self.__dict__["_cached_device"] = next(self.parameters()).device
+        return device
+
+    def _apply(self, fn, recurse=True):
+        self.__dict__.pop("_cached_device", None)
+        return super()._apply(fn, recurse)
 
     @abstractmethod
     def prepare_inputs(
@@ -673,10 +775,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         **kwargs # coming from preprocess output
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | BatchedModelOutput:
         """
         Pure tensor → NameToTensorList computation.
-        Compilable + CUDA-graphable.
+        Compilable + CUDA-graphable. A ``BatchedModelOutput`` keyed by the
+        request id, as ``forward_batched`` returns, can carry ``output_spans``.
         """
         pass
 
@@ -749,6 +852,25 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return frozenset()
 
+    def spanned_outputs(self, graph_walk: str) -> frozenset[str]:
+        """Outputs of this walk that may come with a valid span per row, in
+        ``BatchedModelOutput.output_spans`` under the output's name. The worker
+        cuts each row to its span along the last dim once the step's completion
+        event has fired, before the stop check, transport or a streaming edge
+        reads it, so a forward (and its captured graphs) can keep a fixed width
+        and still emit a length known only on the device, without a host read.
+        The cut is a view, and a row whose span covers its whole output is left
+        as it is.
+
+        The engine-side ``postprocess`` and ``batch_postprocess`` see the
+        uncut output. A spanned output must not feed a node this worker
+        speculates into, which would read it before the cut; startup refuses
+        that unless one of the two nodes sets ``enable_async_scheduling=False``.
+        Not for a signal kept on the device or sent inline, which have no
+        per-request tensor to cut. Empty by default."""
+        del graph_walk
+        return frozenset()
+
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         """Output signals whose client-facing value is one scalar per row that
         the stop check already copies to the host, as signal name -> the name
@@ -788,15 +910,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return None
 
     def get_autocast_dtype(self) -> torch.dtype | None:
-        """Per-submodule autocast dtype override for the engine's forward
-        wrap. The engine consults this on each ``execute_batch`` and uses
-        the returned dtype instead of its own when non-``None``.
+        """This node's dtype in place of the model's: the engine manager casts
+        the node's params to it, and every forward, warm-up and capture runs
+        under autocast in it. Read once at load (``resolve_node_dtype``).
 
-        Default: ``None`` (inherit the engine's autocast dtype). To turn
-        autocast off for one specific submodule whose engine otherwise has
-        it enabled, wrap the submodule's forward with
-        ``torch.amp.autocast(enabled=False)`` — that path is engine-agnostic
-        and doesn't need this surface.
+        Default: ``None`` (inherit the model's dtype). Ignored when
+        ``disable_autocast`` is set; to run a node without autocast, in the
+        dtype it was built in, set that instead.
         """
         return None
 
@@ -811,9 +931,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
-        ``autocast_dtype`` is the engine's autocast dtype — passed so a config's
-        ``make_static_inputs`` can allocate the hidden-state buffer in the dtype
-        the captured region runs under (avoids a copy-time upcast at replay).
+        ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
+        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
+        allocate the hidden-state buffer in the dtype the captured region runs
+        under (avoids a copy-time upcast at replay).
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the
@@ -839,6 +960,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         independent graphs (i.e., one per outer function to be graphed).
         """
         return {}
+
+    def warmup_compiles(self) -> None:
+        """Compile what a forward would otherwise compile on its first request,
+        outside the accelerator graph runner. Called once, at the end of the
+        engine's warmup, after capture, under ``no_grad`` and the node's fp32
+        precision; the node's resources are bound but nothing is admitted or
+        planned, so it must not read or change resource state. On a lockstep
+        node every rank calls it in the same order, so it may run the
+        collectives its forward runs. Default: nothing."""
 
     def can_use_accelerator_graphs(
         self,
@@ -936,7 +1066,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
+    ) -> set[str] | StopCheck:
         """
         Return the set of dynamic-loop names that should stop after this step.
 
@@ -951,6 +1081,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         will run for that rid and its output discarded — the standard
         1-wasted-step cost for any stop signal.
 
+        A ``StopCheck`` also names outputs of this step that are not routed
+        (``StopCheck.withheld``), decided off the same read; it may withhold
+        without stopping.
+
         Default: no stops.
         """
         return set()
@@ -960,15 +1094,25 @@ class NodeSubmodule(torch.nn.Module, ABC):
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
         step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
+    ) -> dict[str, set[str]] | BatchedStopCheck | None:
         """``check_stop`` for the whole batch at once, off the host rows.
 
-        Optional. Returns rid -> loops to stop (rids with none left out), and
-        must agree with ``check_stop`` for every rid. None, or a raise, falls
-        back to the per-request path. ``step_walk`` is the walk every row ran,
-        or None when the step mixes walks (each row's is on its info).
+        Optional. Returns rid -> loops to stop (rids with none left out), or a
+        ``BatchedStopCheck`` for a submodule whose ``check_stop`` withholds,
+        and must agree with ``check_stop`` for every rid. None, or a raise,
+        falls back to the per-request path. ``step_walk`` is the walk every row
+        ran, or None when the step mixes walks (each row's is on its info).
         """
         return None
+
+    def on_request_added(self, request_id: int, request_info: CurrentForwardPassInfo) -> None:
+        """The request has reached this worker; none of its steps has run yet.
+
+        Runs on the worker's main thread, so host work worth starting early
+        belongs on a thread of the submodule's own, and nothing here may touch
+        the device. State goes in :meth:`request_state`, which the removal of
+        the request frees. Default: nothing.
+        """
 
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes. The engines call
@@ -978,6 +1122,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 
 class ARNodeSubmodule(NodeSubmodule):
+    # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
+    # The engine probes the prefix cache for a walk that carries them only then.
+    cuts_tensor_inputs: bool = False
+
     def split_inputs(
         self,
         graph_walk: str,
