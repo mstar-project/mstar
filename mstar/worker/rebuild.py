@@ -68,9 +68,6 @@ class Rebuilds:
     def kept(self, rid: int, node: str) -> KeptIds | None:
         return self._kept.get(node, {}).get(rid)
 
-    def keeps_any(self, node: str) -> bool:
-        return bool(self._kept.get(node))
-
     def keep_prompts(
         self, node: str, graph_walk: str, request_walks: Mapping[int, str],
         inputs: Mapping[int, NameToTensorList],
