@@ -163,7 +163,7 @@ def test_mtp_layer_reduces_its_own_partials_under_fused_add_rmsnorm():
     reduce in o_proj and the FFN itself and return one tensor."""
     import dataclasses
 
-    cfg = dataclasses.replace(_reduced_mtp_config(), fused_add_rmsnorm=True)
+    cfg = dataclasses.replace(_reduced_mtp_config(), kernels="auto")
     layer = Glm52MTPModule(cfg).transformer_layer
     assert layer.fused_add_rmsnorm is False
     assert layer.self_attn.o_proj.reduce_results is True
@@ -354,6 +354,7 @@ def test_mtp_load_end_to_end_reduced_fp8():
     loaded = load_glm52_hf_weights(
         model, iter(state), cfg.n_routed_experts,
         quant_config=cfg.quantization_config, fp8_experts=True,
+        dense_fp8=cfg.dense_fp8, fp8_shared_expert=cfg.fp8_shared_expert,
         num_hidden_layers=cfg.num_hidden_layers, load_mtp=True,
     )
 

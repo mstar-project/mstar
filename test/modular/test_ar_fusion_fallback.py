@@ -9,6 +9,13 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# Imported here, not in _worker, so each spawned rank loads torch._dynamo (via
+# communication.py) before init_process_group: loaded after it, dynamo keeps the
+# gloo group alive past destroy_process_group, and its still-running threads
+# abort the rank at exit.
+from mstar.distributed import ar_fusion
+from mstar.distributed.communication import CommGroup
+
 WORLD = 2
 
 
@@ -44,9 +51,6 @@ def _worker(rank, store_path, fails, out_dir):
                             rank=rank, world_size=WORLD)
     built: list = []
     _install_fake_flashinfer(fails, rank, built)
-    from mstar.distributed import ar_fusion
-    from mstar.distributed.communication import CommGroup
-
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(WORLD)))
     group.cpu_group = dist.group.WORLD
     ws_id = ar_fusion.create_workspace(group, 128, 64, None)

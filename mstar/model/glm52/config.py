@@ -17,6 +17,8 @@ POS_RESOURCE = "pos"
 SAMPLER_RESOURCE = "sampler"
 # dsa_long_context: the DSA resource (mstar/engine/resources/dsa)
 DSA_RESOURCE = "dsa"
+# Glm52ModelConfig.kernels
+KERNELS = ("auto", "reference")
 
 # config.json keys read by Glm52ModelConfig.from_hf_config under the same
 # name (eos_token_id becomes eos_token_ids).
@@ -130,60 +132,28 @@ class Glm52ModelConfig:
 
     # --- quantization / serving knobs ---
     # The official checkpoint is FP8 e4m3 with [128, 128] block scales
-    # (`weight_scale_inv`). Populated from config.json by Glm52Model.
+    # (`weight_scale_inv`). Populated from config.json by Glm52Model. The routed experts
+    # and the non-expert linears it stores in fp8 stay fp8 (``dense_fp8``).
     quantization_config: Fp8BlockQuantConfig | None = None
-    # Keep routed experts FP8-resident (uint8 container + block scales);
-    # everything else dequantizes to bf16 on load. Disabling this dequantizes
-    # experts too — fine for reduced tests, but bf16 routed experts alone
-    # outsize a device at TP8 on the real 753B checkpoint.
+    # Keep routed experts FP8-resident (uint8 container + block scales). Disabling this
+    # dequantizes them to bf16 on load — fine for reduced tests, but bf16 routed experts
+    # alone outsize a device at TP8 on the real 753B checkpoint.
     moe_fp8_resident: bool = True
-    # Routed-expert dispatch for the fp8-resident path: "auto" = the fused
-    # W8A8 kernel (fused_experts_fp8, capture-safe) where it can run, else
-    # "reference"; "triton" = the fused kernel or an error; "reference" = the
-    # per-hit-expert dequant loop, the numerics anchor (uncapturable). W8A8
-    # activation quantization is the standard fp8 serving numerics, as in vLLM.
-    moe_quant_kernel: str = "auto"
-    # With the fused path resolved, small batches run the router and the
-    # routed + shared experts in fused_moe's decode kernels instead: fp8
-    # weights times bf16 activations (w8a16) and fp32 routing weights, so
-    # numerics differ from the W8A8 runner.
-    moe_decode_kernel: bool = False
-    # On the fused path the router's sigmoid, bias, top-k and normalization run as
-    # fused_moe's one-program-per-token router kernel on the fp32 logits: one launch
-    # where torch takes several; ids can differ at exact ties, weights by an ulp.
-    # Off by default.
-    moe_router_kernel: bool = False
-    # Batches above 64 tokens on the fused path run fused_moe's prefill kernels:
-    # the runner's with wider tiles and a one-pass down GEMM, bit-identical output.
-    moe_prefill_kernel: bool = False
-    # Under TP, sum the shared expert's partial into the routed one and
-    # all-reduce once per MoE layer (components/moe.py). Off by default: bf16
-    # rounding order moves.
-    moe_fused_allreduce: bool = False
-    # Keep the non-expert linears the checkpoint stores in fp8 (q_a/kv_a, q_b, o_proj, the
-    # shared expert, the dense-layer MLPs) fp8 with their block scales instead of
-    # dequantizing them to bf16: half the bytes per step. kv_b_proj still dequantizes (the
-    # absorbed MLA folds it into w_kc / w_vc), and so does the shared expert under
-    # moe_decode_kernel, whose chain runs it faster in bf16. Numerics differ from the bf16
-    # copies (w8a16 for decode batches, W8A8 above), so off until the quality gate.
-    dense_fp8: bool = False
-    # The absorbed MLA's latent norms, RoPEs and KV-cache write as two kernels (mla_prep.py)
-    # instead of seven; the same bits as the compiled unfused path. Off by default.
-    mla_fused_prep: bool = False
-    # Under TP, o_proj and the FFN return partials, and each all-reduce runs fused into
-    # the next residual add + RMSNorm (CommGroup.allreduce_add_rmsnorm); the MoE block
-    # then sums its two partials as moe_fused_allreduce does. Off by default: the norm
-    # rounds differently.
-    fused_add_rmsnorm: bool = False
+    # "auto": the tuned kernels, each choosing per GPU from its module's table: the fused fp8
+    # MoE (the W8A8 runner, and up to 64 tokens fused_moe's decode chain, w8a16 with fp32
+    # routing weights, and its router kernel), the MLA latent prep as two kernels, every TP
+    # all-reduce fused into the next residual add + RMSNorm (and the MoE block's two partials
+    # reduced once), and prefill running the last layer's FFN on the rows it samples only.
+    # "reference": the numerics anchor, served eager: the per-expert dequant loop, the fp8
+    # linears dequantized per call as the loader would, the latent prep op by op, unfused
+    # all-reduces and norms, every prefill row through the last layer. The MoE prefill
+    # kernels, the runner's bits, run under both.
+    kernels: str = "auto"
     # torch.compile the forward the CUDA graphs capture and the uncaptured steps run. False
     # (model_kwargs.graph_compile) captures and runs it eager, for an Inductor failure that
     # would otherwise fail every capture and serve eager.
     graph_compile: bool = True
 
-    # Prefill runs the last layer's FFN half (norm, MoE, all-reduce) on the rows it samples
-    # only. Those few rows take the small-batch MoE path, so the first token's numerics
-    # move. Off by default.
-    prefill_last_layer_rows: bool = False
     prefill_token_buckets: list[int] | None = None
     # Token buckets for the prefill batch sizes above 1; None captures them at
     # prefill_token_buckets too.
@@ -198,8 +168,22 @@ class Glm52ModelConfig:
         self.cache_latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
     @property
+    def tuned_kernels(self) -> bool:
+        """``kernels: auto``, the tuned kernels rather than the reference."""
+        return self.kernels == "auto"
+
+    @property
+    def dense_fp8(self) -> bool:
+        """The non-expert linears the checkpoint stores in fp8 (q_a/kv_a, q_b, o_proj, the
+        shared expert, the dense-layer MLPs) stay fp8 with their block scales, half the bytes
+        of bf16 copies: exactly when the checkpoint is block fp8. kv_b_proj still dequantizes
+        (the absorbed MLA folds it into w_kc / w_vc)."""
+        return self.quantization_config is not None
+
+    @property
     def fp8_shared_expert(self) -> bool:
-        return self.dense_fp8 and not self.moe_decode_kernel
+        # the decode chain runs the shared expert faster from bf16 weights
+        return self.dense_fp8 and not self.tuned_kernels
 
     @property
     def qk_head_dim(self) -> int:

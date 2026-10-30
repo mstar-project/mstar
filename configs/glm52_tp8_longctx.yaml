@@ -8,10 +8,9 @@ model: "glm52"
 # across the 21 full-attention layers, ~2.1 GB/rank at 24 x 8192 tokens.
 # Decode beyond 2048 runs sparse absorbed attention over each token's
 # top-2048 latents. A request that stays within 2048 runs the dense paged
-# path, bit-identical to this config without dsa_long_context (not to
-# glm52_tp8.yaml, whose speedups change numerics); batched with a longer one it takes
-# the sparse gather instead (fp32, outside the engine's bf16 autocast): same
-# selection, but not bitwise equal to the dense path.
+# path, bit-identical to this config without dsa_long_context; batched with a
+# longer one it takes the sparse gather instead (fp32, outside the engine's bf16
+# autocast): same selection, but not bitwise equal to the dense path.
 #
 # Limits, both follow-ups in mstar/engine/resources/dsa/manager.py: prefill prompts must
 # still fit index_topk, and serving is eager only, since the indexer's

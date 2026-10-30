@@ -25,6 +25,7 @@ import torch
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv import page_copier
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.cpu_page_pool import PageCopies
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import (
     KVManager,
@@ -361,3 +362,96 @@ def test_copies_by_key_do_not_block_the_host():
     assert kv.reload("a")
     elapsed = time.perf_counter() - start
     assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on an offload and reload by key"
+
+
+def _commit(kv: KVManager) -> KVStep:
+    """A step's commit, as the engine runs it."""
+    step = KVStep(segments=())
+    kv.commit(step, StepContext(request_ids=(), graph_walk=WALK, slot=0, capture=False))
+    return step
+
+
+def _step(kv: KVManager) -> None:
+    """A step's commit, then its outputs on the host once the worker has seen the step finish."""
+    kv.after_output_copy(_commit(kv))
+
+
+def _land(kv: KVManager) -> None:
+    torch.cuda.synchronize()
+    with kv._lock:
+        kv._land_host_copies()
+        kv._host_writes.land()
+
+
+@requires_cuda
+@pytest.mark.parametrize("layout", [KVLayout.NHD, KVLayout.MLA])
+def test_every_page_written_ahead_comes_back_byte_for_byte(layout):
+    kv = _manager(cpu_offload_pages=32, layout=layout)
+    prompt = SHARED + list(range(100, 100 + 2 * PAGE_SIZE))
+    _serve(kv, "a", prompt + [1, 2])
+    pages = kv._streams["a"]["main"].page_indices[:6]
+    expected = _paint(kv, pages, base=1.0)
+    kv.kv_cache.tensor[:, pages] = 0.0
+    torch.cuda.synchronize()
+    # The paint queues behind compute, one page at a time, since a list index would copy to the device and make
+    # the host wait. A write that doesn't wait for the commit after the paint copies stale bytes.
+    torch.cuda._sleep(100_000_000)
+    for i, page in enumerate(pages):
+        kv.kv_cache.tensor[:, page] = 1.0 + i
+    kv.remove_request("a")
+    step = _commit(kv)
+    # the worker waits on the step's completion event before the hook runs
+    torch.cuda.synchronize()
+    kv.after_output_copy(step)
+    _land(kv)
+    assert kv._evict(6) == 6
+    _scribble_free(kv)
+
+    _ingest(kv, "b", prompt + [7, 8])
+    assert not kv.admit_retrieve("b", NODE, WALK, None).ready
+    _land(kv)
+    inputs = ARNodeInputs(input_seq_len=len(prompt) + 2)
+    assert kv.resolve_cached_prefix("b", NODE, WALK, inputs).tokens == len(prompt)
+
+    assert torch.equal(kv.kv_cache.tensor[:, kv._streams["b"]["main"].lease], expected), (
+        "a page written to the host and copied back came back with other bytes"
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("queued", ["copy_in", "copy_out"])
+def test_a_write_waits_for_a_queued_copy_of_its_host_page(queued):
+    kv = _manager(cpu_offload_pages=32)
+    pool, device = kv._cpu_pool, kv.kv_cache.tensor
+    device[:, 1], device[:, 2] = 1.0, 2.0
+    pool.copy_out(device, PageCopies(gpu=[1], cpu=[0]))
+    # so the next copy is the only one queued since a write last waited on the copy stream
+    pool.write(device, PageCopies(gpu=[1], cpu=[1]))
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(pool._stream):
+        torch.cuda._sleep(100_000_000)
+    getattr(pool, queued)(device, PageCopies(gpu=[3] if queued == "copy_in" else [1], cpu=[0]))
+    # host page 0 taken by a write, as if `reload` or `_abandon_claims` had released it with its copy queued
+    pool.write(device, PageCopies(gpu=[2], cpu=[0]))
+    torch.cuda.synchronize()
+
+    if queued == "copy_in":
+        assert torch.equal(device[:, 3], device[:, 1]), "a write replaced a host page before a queued copy read it"
+    else:
+        assert torch.equal(pool.cpu_kv_cache[:, 0], device[:, 2].cpu()), "a queued copy replaced a page just written"
+
+
+@requires_cuda
+def test_a_write_ahead_does_not_block_the_host():
+    kv = _manager(cpu_offload_pages=32)
+    _serve(kv, "a", list(range(6 * PAGE_SIZE + 3)))
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(500_000_000)  # a few hundred ms of compute ahead of the commit
+    start = time.perf_counter()
+    kv.remove_request("a")
+    _step(kv)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on a write ahead of eviction"
+    assert len(kv._host_writes._writing) == 6, "the step queued no write"

@@ -183,7 +183,7 @@ class NoAuxTcRouter(nn.Module):
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
         # a fused top-k op (logits, bias, top_k, scale, renormalize) -> (weights, ids), set by a
-        # block whose kernels provide one (GLM-5.2's moe_router_kernel: mstar::moe_router_topk)
+        # block whose kernels provide one (GLM-5.2's kernels: auto: mstar::moe_router_topk)
         self._topk_op = None
         # fp32 copy of ``weight``, built once by ``finalize_weights``: the
         # forward needs fp32 and the router never changes, so casting it once

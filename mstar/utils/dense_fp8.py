@@ -34,12 +34,21 @@ logger = logging.getLogger(__name__)
 # block-scaled GEMM beyond.
 _W8A16_MAX_TOKENS = 32
 _W8A16_MAX_TOKENS_BY_SHAPE = {(256, 6144, True): 128, (6144, 256, False): 128}
+# The same per GPU model where it differs (H100 and H200 are both SM90), applied only where
+# flashinfer's GEMM runs. GLM-5.2's o_proj and dense-layer down on one H200, cold weights, us a
+# call at 4 / 8 / 16 tokens: w8a16 10.3 / 11.1 / 9.8 and 9.3 / 9.3 / 8.7, flashinfer
+# 8.0 / 8.0 / 8.1 and 7.5 / 7.6 / 7.6.
+_W8A16_MAX_TOKENS_BY_GPU = {
+    "NVIDIA H200": {(6144, 2048, False): 2, (6144, 1536, False): 2},
+}
 _FI_MAX_TOKENS = 512
 # block-scaled fp8 in torch's scaled_mm (1x128 activations, 128x128 weights), probed per device:
 # the API exists from torch 2.10 but raises off SM90 or on a cuBLASLt before 12.9 (cu128 builds)
 _W8A8_API = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
 _W8A8_OK: dict[torch.device, bool] = {}
 _FI_OK: dict[torch.device, bool] = {}
+# w8a16's token limits per (N, K, glu) on each reserved device
+_W8A16_MAX: dict[torch.device, dict[tuple[int, int, bool], int]] = {}
 # Split-K arrival counters, one per output tile; every launch leaves them at zero.
 _COUNTERS: dict[torch.device, torch.Tensor] = {}
 _MAX_TILES = 4096
@@ -221,8 +230,8 @@ def _w8a16_kernel(x, w, s, out, part, cnt, M, N_OUT,
 
 
 def reserve(device: torch.device | str) -> None:
-    """Allocate the split-K counters for ``device`` and load flashinfer's GEMM, outside any
-    graph capture."""
+    """Allocate the split-K counters for ``device``, load flashinfer's GEMM and resolve the
+    GPU's token limits, outside any graph capture."""
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -230,6 +239,14 @@ def reserve(device: torch.device | str) -> None:
         _COUNTERS[device] = torch.zeros(_MAX_TILES, dtype=torch.int32, device=device)
         _FI_OK[device] = _probe_fi(device)
         _W8A8_OK[device] = _probe_w8a8(device)
+        _W8A16_MAX[device] = _w8a16_max_tokens(torch.cuda.get_device_name(device), _FI_OK[device])
+
+
+def _w8a16_max_tokens(gpu: str, fi_ok: bool) -> dict[tuple[int, int, bool], int]:
+    """w8a16's token limit per (N, K, glu) on a GPU model: the shape table, under the GPU's own
+    rows when flashinfer's GEMM runs there (without it those sizes would go to cuBLAS's GEMM,
+    which is slower than w8a16 at decode sizes)."""
+    return {**_W8A16_MAX_TOKENS_BY_SHAPE, **(_W8A16_MAX_TOKENS_BY_GPU.get(gpu, {}) if fi_ok else {})}
 
 
 def _probe_w8a8(device: torch.device) -> bool:
@@ -404,7 +421,7 @@ def _linear(x, w, s, block_size, glu):
     N = w.shape[0] // 2 if glu else w.shape[0]
     if M == 0:
         return x.new_empty(0, N)
-    w8a16_max = _W8A16_MAX_TOKENS_BY_SHAPE.get((N, K, glu), _W8A16_MAX_TOKENS)
+    w8a16_max = _W8A16_MAX.get(x.device, _W8A16_MAX_TOKENS_BY_SHAPE).get((N, K, glu), _W8A16_MAX_TOKENS)
     if M <= w8a16_max or tuple(block_size) != (128, 128):
         return _w8a16(x, w, s, block_size, glu)
     if M <= _FI_MAX_TOKENS and _FI_OK.get(x.device):
