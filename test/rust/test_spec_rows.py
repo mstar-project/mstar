@@ -62,6 +62,7 @@ class _StubTM:
     dereference = TensorCommunicationManager.dereference
     dereference_batch = TensorCommunicationManager.dereference_batch
     dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
+    increment_ref_batch_uniform = TensorCommunicationManager.increment_ref_batch_uniform
     cleanup_collectable = TensorCommunicationManager.cleanup_collectable
 
     def __init__(self, bookkeeping):

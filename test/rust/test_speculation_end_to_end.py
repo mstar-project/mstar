@@ -98,11 +98,8 @@ def _worker(kind: str, section: Loop):
 
 # --- a stream through speculation ----------------------------------------------
 
-def _values(w, edge) -> list[int]:
-    return [
-        int(v) for info in edge.tensor_info
-        for v in w.tensor_manager.get_tensor(info.uuid).flatten().tolist()
-    ]
+def _values(w, uuids) -> list[int]:
+    return [int(v) for u in uuids for v in w.tensor_manager.get_tensor(u).flatten().tolist()]
 
 
 def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
@@ -133,9 +130,14 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
     def produce():
         for r in sorted(alive):
             for _ in range(min(rng.randint(0, 2), n_items - sent[r])):
-                uid = f"{r}-{sent[r]}"
-                sbuf[r].pre_read_register(uid)
-                sbuf[r].put(uid, torch.tensor([float(sent[r])]))
+                # stored with the one reference its stream destination
+                # holds, which the buffer takes over, as the worker does
+                (info,) = w.tensor_manager.store_and_return_tensor_info(
+                    r, {CODES: [torch.tensor([float(sent[r])])]},
+                )[CODES]
+                w.tensor_manager.tensor_store.increment_ref(info.uuid, 1)
+                sbuf[r].pre_read_register(info.uuid)
+                sbuf[r].put(info.uuid, info.uuid)
                 sent[r] += 1
             if sent[r] == n_items and not sbuf[r].producer_done:
                 sbuf[r].signal_done(n_items)
@@ -160,9 +162,9 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
         """The rest of the row's stream, as its buffer still holds it."""
         vals = []
         while (se := w.streams.pop_edge(sbuf[r], CODES, r)) is not None:
-            vals += _values(w, se.edge)
+            vals += _values(w, se.uuids)
         sbuf[r]._update_buffer()  # items short of a chunk
-        left[r] = vals + [int(v) for t in sbuf[r]._buffer for v in t.flatten().tolist()]
+        left[r] = vals + _values(w, sbuf[r]._buffer)
 
     def retire(r):
         # No loop-back output means its loop ended: stop polling it.
