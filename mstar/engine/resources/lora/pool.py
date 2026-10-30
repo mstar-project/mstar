@@ -579,9 +579,10 @@ class LoraAdapterPool(Resource):
             name = self._adapter_of[rid]
             if self._spare_slots(name) < 0:
                 return self._changes
-            if (name not in self._reserved_count and name not in self._resident
-                    and name not in self._store and name not in self._read_errors):
-                return self._changes  # its read, started at ingest, lands
+            if name not in self._store and name not in self._read_errors:
+                # its read, started at ingest, lands. An adapter resident in a slot waits
+                # for it too: a reservation pins no slot, so a miss admitted first may evict it
+                return self._changes
             self._reserve(rid, name)
             return None
 
@@ -880,7 +881,7 @@ class LoraAdapterPool(Resource):
         if evicted is not None and self._resident.get(evicted) == slot:
             # a row reserved on it while it was resident (which the pick cannot see: only
             # the deciding rank reserves) now misses, still counting one slot, and finds
-            # the copy the host tier holds for as long as a request names it
+            # the host copy it was reserved on, which the tier keeps while a request names it
             del self._resident[evicted]
         for name in self._a:
             a, b = adapter.a.get(name), adapter.b.get(name)

@@ -12,7 +12,6 @@ import queue
 import random
 import sys
 import threading
-import time
 from datetime import timedelta
 
 import pytest
@@ -21,10 +20,10 @@ import torch
 pytest.importorskip("safetensors")
 
 try:
-    from .test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, step, write_adapter
+    from .test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, settle_reads, step, write_adapter
 except ImportError:  # collected without package context
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, step, write_adapter
+    from test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, settle_reads, step, write_adapter
 
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
@@ -68,15 +67,6 @@ def _verdict(outcome):
     if isinstance(outcome.reason, AdmitRuntimeError):
         return ("load", tuple(sorted(outcome.reason.request_ids)))
     return ("full", outcome.reason.request_id)
-
-
-def _settle_reads(pool: LoraAdapterPool, timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while pool._reads:
-        assert time.monotonic() < deadline, f"reads never completed: {list(pool._reads)}"
-        time.sleep(0.001)
-    with pool._lock:  # a completion stores its copy under the lock
-        pass
 
 
 class _Rank:
@@ -137,7 +127,7 @@ def _simulate(paths, seed: int, admits: bool, fenced: bool = True, steps: int = 
                     waiting.append(rid)
                 fresh = waiting[:3]
                 if admits:
-                    _settle_reads(leader.pool)  # a step outlasts a small adapter's read
+                    settle_reads(leader.pool)  # a step outlasts a small adapter's read
                     runner.admit_waiting(lambda rid, node: None)
                     fresh = [rid for rid in waiting if admitted(runner, rid)][:3]
                 rows = list(active) + fresh
@@ -248,12 +238,12 @@ def test_the_host_tier_follows_the_ingests_not_when_reads_land(tmp_path):
     slow.store._read = lambda name, path: gate.wait(10) and read(name, path)
     for pool in (fast, slow):
         ingest(pool, "x", "a2")
-        _settle_reads(fast)
+        settle_reads(fast)
         ingest(pool, "y", "a3")
-        _settle_reads(fast)
+        settle_reads(fast)
         pool.remove_request("x")
     gate.set()
-    _settle_reads(slow)
+    settle_reads(slow)
     assert list(fast.store._adapters) == list(slow.store._adapters) == ["a2", "a3"]
     assert "a2" in slow.store and "a3" in slow.store
 
@@ -344,7 +334,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
     for pool in ranks:  # a1's slot unheld, a4's held by "k"
         ingest(pool, "h", "a1")
         ingest(pool, "k", "a4")
-        _settle_reads(pool)
+        settle_reads(pool)
     (v1, v2), errors = _on_both(lambda: admit(leader, ["h", "k"]), lambda: admit(follower, ["h", "k"]))
     assert not errors and v1 == v2 == "ok"
     for pool in ranks:
@@ -354,7 +344,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
     for pool in ranks:
         ingest(pool, "rA", "a2")
         ingest(pool, "rB", "a3")
-    _settle_reads(leader)
+    settle_reads(leader)
     mid_admit.append(lambda: leader.remove_request("k"))
     threading.Timer(0.2, gate.set).start()
 
@@ -370,7 +360,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
         assert errors or v1 != v2 or _slots(leader) != _slots(follower)
         return
     assert not errors and v1 == v2 == ("full", "rB") and _slots(leader) == _slots(follower)
-    _settle_reads(follower)  # the retry, k gone on both, loads both adapters on both
+    settle_reads(follower)  # the retry, k gone on both, loads both adapters on both
     (v1, v2), errors = _on_both(lambda: admit(leader, ["rA", "rB"]), lambda: admit(follower, ["rA", "rB"]))
     assert not errors and v1 == v2 == "ok" and _slots(leader) == _slots(follower)
     assert {leader.slot_state(i).adapter for i in (1, 2)} == {"a2", "a3"}

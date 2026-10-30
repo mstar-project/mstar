@@ -8,6 +8,8 @@ row-parallel ``o`` target. Other LoRA test modules import the helpers defined he
 from __future__ import annotations
 
 import re
+import threading
+import time
 
 import pytest
 import torch
@@ -148,6 +150,15 @@ def admitted(runner, rid, node="LLM") -> bool:
 
 def _nothing_published(rid, node):
     return None
+
+
+def settle_reads(pool: LoraAdapterPool, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while pool._reads:
+        assert time.monotonic() < deadline, f"reads never completed: {list(pool._reads)}"
+        time.sleep(0.001)
+    with pool._lock:  # a completion stores its copy under the lock
+        pass
 
 
 # --- lifecycle and addressing ------------------------------------------------------------------
@@ -584,6 +595,28 @@ def test_admission_holds_back_only_rows_that_need_a_slot_and_only_on_the_leader(
         ingest(follower, rid, name)
     assert run_step(follower, ["r1"]).ok and admitted(lora_runner(follower), "r2")
     assert not follower._reserved
+
+
+def test_a_request_on_a_resident_adapter_waits_for_its_host_copy(adapters):
+    """a1 sits in an unheld slot but out of the host tier. A reservation pins no slot, so a
+    miss admitted first could evict a1 and leave r's admit to read it: r is reserved only
+    once its copy is in."""
+    _, paths = adapters
+    pool = make_pool(paths, max_slots=2, cpu_capacity=1)
+    runner = lora_runner(pool)
+    ingest(pool, "h", "a1")
+    assert admitted(runner, "h") and run_step(pool, ["h"]).ok
+    runner.remove_request("h")
+    ingest(pool, "x", "a2")  # drops a1 from the tier
+    settle_reads(pool)
+    gate, read = threading.Event(), pool.store._read
+    pool.store._read = lambda name, path: gate.wait(10) and read(name, path)
+    ingest(pool, "r", "a1")
+    assert pool.resident_slot("a1") is not None and "a1" not in pool.store
+    assert runner.admit_retrieve("r", "LLM", "decode").queued
+    gate.set()
+    settle_reads(pool)
+    assert runner.admit_waiting(_nothing_published) == [("LLM", "r")]
 
 
 def test_two_missing_adapters_cannot_both_take_the_last_slot(adapters):
