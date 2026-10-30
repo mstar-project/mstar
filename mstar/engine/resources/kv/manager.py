@@ -4461,10 +4461,9 @@ class KVManager(AttentionResource):
         of what ``rid`` was allotted and hasn't used, then out of the room, and the walk
         recomputes the pages neither covers.
 
-        ``counted`` means that ``rid``'s allotment already counts ``pages``. A guaranteed request is
-        then charged for a page another request holds, instead of being lent it. Otherwise an
-        evictable page comes out of the room for a guaranteed request, and its allotment grows by
-        that page.
+        ``counted`` is False for pages ``rid``'s allotment doesn't count, such as an image end. A
+        guaranteed request is charged for a page its allotment counts, even one another request holds,
+        and its allotment grows by each evictable page it doesn't count.
         """
         if self._decides:
             evictable = self._index.evictable()
