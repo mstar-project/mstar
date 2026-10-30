@@ -310,6 +310,38 @@ def test_a_request_holding_a_row_is_evicted_with_the_state_its_row_held(device):
     assert seen == {1: (4, 4.0), 2: (3, 3.0), 3: (4, 4.0)}
 
 
+@pytest.mark.parametrize("drop", [False, True])
+def test_a_pre_plan_leaves_the_batch_to_the_main_thread(drop):
+    """A pre-plan runs in row order but doesn't reorder the batch: the main
+    thread may be dropping rows from it meanwhile, and a write-back would
+    bring a dropped row back. Exec reorders it."""
+    engine = _engine("cpu")
+    for rid in (1, 2, 3):
+        engine.add_request(rid)
+    _step(engine, ROWS_WALK, [1, 2])  # 1 and 2 hold the first rows
+    batch = _batch(ROWS_WALK, [3, 2, 1])
+    node_rows = engine._rows[NODE]
+    begin = node_rows.begin
+
+    def begin_while_the_main_thread_drops(walk, rids):
+        rows = begin(walk, rids)
+        if drop:
+            batch.request_ids = [r for r in batch.request_ids if r != 2]
+        return rows
+
+    node_rows.begin = begin_while_the_main_thread_drops
+    order = engine._enter_rows(batch, preplan=True)
+    node_rows.begin = begin
+    assert list(order) == [1, 2, 3]
+    batch.preplanned_rids = tuple(order)  # as _pre_plan_for_batch records it
+    assert list(batch.request_ids) == ([3, 1] if drop else [3, 2, 1])
+    assert engine.preplan_is_stale(batch) == drop
+    if not drop:
+        engine.prepare_inputs(batch)
+        engine.exec_and_postprocess(batch)
+        assert list(batch.request_ids) == [1, 2, 3]
+
+
 def test_a_resource_that_cannot_keep_rows_refuses_the_walk_at_startup():
     with pytest.raises(ValueError, match="resource 'counter'"):
         _engine("cpu", keeps_rows=False)
