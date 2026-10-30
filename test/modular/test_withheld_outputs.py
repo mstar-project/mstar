@@ -201,6 +201,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
         check_stop_for_batch=engine.check_stop_for_batch,
         extend_prefix_chains=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
+        after_output_copy=lambda batch: None,
     ))
     w.request_state = SimpleNamespace(
         per_request_info={},

@@ -1191,7 +1191,7 @@ def test_a_new_request_under_a_live_calls_id_is_refused_and_the_call_goes_on(mon
         {"request_id": "call", "text": "a separate question", "end_input": True},
         {"request_id": "other", "end_input": True},
     ])
-    asyncio.run(_serve(ws, until=lambda: len(ws.sent) >= 3))
+    asyncio.run(_serve(ws, until=lambda: len(ws.sent) >= 3 and server.preprocess_worker.items))
 
     retried, one_shot, stray_end = sorted(ws.sent, key=lambda r: r["request_id"])
     assert retried["status"] == 409 and one_shot["status"] == 409
