@@ -166,10 +166,6 @@ You must implement these abstract methods:
    (``request_done=True``). A simple prefill-decode model sets ``is_prefill`` to false
    once, then repeats the decode walk until EOS.
 
-``postprocess(self, output, modality) -> bytes``
-   Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
-   images, raw PCM for audio, and so on.
-
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
    weights here, on ``device``. Return ``None`` for dummy mode.
@@ -217,10 +213,41 @@ You must implement these abstract methods:
    data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
    lists its prompt layout, speaker, language, clip digest and codec stream lead.
 
+.. note::
+
+   The conductor merges each walk's ``ForwardPassArgs.step_metadata`` into the
+   request's ``metadata.kwargs``, so a request fact stored under a key that a
+   later walk's step metadata also uses is overwritten by that walk's value. Keep
+   such facts under their own key: LTX-2.5 nests the request's geometry under
+   ``kwargs["request"]``, since its stage-1 walk sends a half-size ``height``.
+
 The following methods have defaults and are optional to override:
+``text_output``, ``postprocess`` and ``postprocess_inline`` (described next),
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,
 ``load_video``, and the partition methods described at the end of this page.
+
+``text_output(self) -> TextOutput | None``
+   Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
+   end a reply, which are dropped unless the request sets ``ignore_eos``.
+   ``postprocess`` and ``postprocess_inline`` derive their text paths from it. A text
+   chunk may end inside a character, since the API server joins a request's text
+   chunks before decoding them, so a byte-level BPE model should declare
+   ``mstar.model.utils.TextChunkDetokenizer`` (or ``ByteLevelDetokenizer``), which
+   emits each token's raw bytes, rather than ``tokenizer.decode([id])``, which turns
+   a split character into U+FFFD.
+
+``postprocess(self, output, modality, request_kwargs=None) -> bytes``
+   Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
+   images, raw PCM for audio, and so on. Override it for any modality other than
+   text, and hand text to ``super().postprocess``.
+
+``postprocess_inline(self, values, modality, request_kwargs) -> list[bytes]``
+   ``postprocess`` for one decode step's inline values (one sampled token id per
+   request), called once per step. With ``text_output`` declared, each id maps to
+   its memoized bytes; otherwise each value goes through ``postprocess`` as a
+   one-element tensor.
+
 ``Model.nodes`` is a read-only property. It returns the sorted set of node names that
 appear in any graph walk.
 
@@ -604,7 +631,14 @@ The spec types are:
        ``flashinfer_backend``, and the
        two CUDA-graph ceilings ``max_segments_per_request`` and
        ``max_tokens_per_request``. ``DENSE`` runs FA3 ``flash_attn_varlen`` (AITER on ROCm)
-       and falls back to FlashInfer if that kernel is missing. See `Cacheless attention (encoder towers)`_.
+       and falls back to FlashInfer if that kernel is missing. By default the heads are split
+       across all TP × SP ranks of the node; ``shard_over_sp=False`` splits them across the
+       TP ranks only, for an attention each sequence-parallel rank runs whole over its own
+       tokens (one over a replicated stream, or a cross-attention from the rank's query
+       shard). ``workspace_mb`` sizes each label's FlashInfer workspace per slot (default
+       ``MSTAR_WORKSPACE_BUFFER_MB``, 512); a node with many labels can declare less, since a
+       ragged prefill only uses it for split-KV partials. See `Cacheless attention (encoder
+       towers)`_.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
        (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
@@ -883,6 +917,13 @@ request's ``kv_label`` span; cross-attention is never causal. A layer attends th
 span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model whose
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
+
+Called with ``return_lse=True``, a ragged or ragged cross-attention callable on the FlashInfer
+backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32, natural log)
+from the same plan, which is what merging attentions over disjoint key sets needs. Under sequence parallelism
+LTX-2.5's audio queries attend each rank's share of the video tokens, and
+``attention_over_sharded_keys`` (``mstar/model/components/distributed/sequence_parallel.py``)
+merges them.
 
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -851,6 +851,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # eviction OVER-cautious (skip a sweep), never unsafe.
         self._reads_active += 1
         try:
+            if not any(e.tensor_info for e in graph_edges):
+                # signal-only edges: no stream context to pay for, but the
+                # (time-gated) sweep of dead peers' segments still runs here
+                self._evict_dead_peers()
+                return []
             return self._start_read_tensors(request_id, graph_edges,
                                             graph_walk)
         finally:
