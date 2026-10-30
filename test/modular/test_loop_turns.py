@@ -303,6 +303,7 @@ def _worker(chain: ChainPick, prep, taken=None) -> SimpleNamespace:
         tensor_manager=SimpleNamespace(get_tensor=lambda uuid: None),
         request_state=SimpleNamespace(),
         _is_tearing_down=lambda rid: False,
+        _teardowns_pending=lambda: False,
         _streams_possible=lambda: False,
         _yield_away_speculation=lambda batch, gave_way=False: SimpleNamespace(
             scheduled_batch=batch, gave_way=gave_way,
