@@ -27,6 +27,7 @@ from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import Rebuilds
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 STEPS, RID, NODE, WALK = 4, 7, "rollout_predictor", "rollout"
@@ -107,6 +108,7 @@ def _worker(tmp_path):
         return {RID: {"pred": [reused]}}, None
 
     w._prematerialize_for_check_stop = stop_check_copies
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     return w
 
 
