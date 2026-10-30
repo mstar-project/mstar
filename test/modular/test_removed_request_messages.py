@@ -93,6 +93,7 @@ def _worker(is_tp_follower=False) -> Worker:
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=w.wire_rids_cleared.append,
         fail_rids=lambda rids: None,
+        note_arrival=lambda rid: None,
         pending_tp_follow_count={},
         last_consumed_tp_seq=-1,
     )

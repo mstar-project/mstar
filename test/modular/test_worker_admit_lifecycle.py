@@ -87,6 +87,7 @@ def _worker():
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=lambda rid_str: None,
+        note_arrival=lambda rid: None,
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)
