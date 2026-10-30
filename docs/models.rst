@@ -534,6 +534,15 @@ Qwen3-Omni notes
   default) at the same text throughput, with image throughput 3% lower in its
   one pair of runs. Spoken questions at c=32 keep one GPU too busy for either
   ramp (0.90 of chunks in time, 0.87 with the default).
+- A request prefills in one Thinker step. Its walk runs the encoders its
+  attachments need (``prefill_audio``, ``prefill_vision`` or
+  ``prefill_audio_vision``; ``prefill_text`` for a text-only prompt), then the
+  whole prompt as one row, each attachment spliced in where it was written.
+  That step also sends the first text token's embedding to the Talker, which
+  prefills the prompt and its assistant prefix and samples its first frame in
+  one step, without waiting for the Thinker's first decode step. A config that
+  pins walks to ranks (``configs/qwen3omni_pd_disaggregated.yaml``) lists all
+  four prefill walks.
 - On AMD GPUs the audio and vision encoders run eager. Compiled, they
   recompiled for most new clip lengths and for each new image grid in a
   three-grid sweep (dynamo guards the chunk lengths and the image grid the HF
