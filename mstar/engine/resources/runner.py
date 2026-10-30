@@ -11,6 +11,7 @@ import logging
 from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
+from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
@@ -100,10 +101,18 @@ class StepRunner:
         # name every node, including one that owns nothing — an absent node
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
+        self._ask_order = [key for key in self._order if type(self._resources[key]).ask is not Resource.ask]
+        self._node_ask_order = self._per_node(node_resources, self._ask_order)
+        self._admission = Admission(self._resources, self._ask_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
         self._trail_order = [
             key for key in self._order if self._resources[key].page_trail() is not None
         ]
+        self._cap_order = [
+            key for key in self._order
+            if type(self._resources[key]).cap_cached_prefix is not Resource.cap_cached_prefix
+        ]
+        self._node_cap_order = self._per_node(node_resources, self._cap_order)
         self._node_trail_order = self._per_node(node_resources, self._trail_order)
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
@@ -121,7 +130,8 @@ class StepRunner:
 
         The smallest answer wins, because a step is one span: a resource that
         holds less than another has to be caught up by the tokens that run.
-        A resource with no opinion is not an answer of zero.
+        A resource with no opinion is not an answer of zero. A resource that
+        holds only some lengths then caps the agreed prefix.
         """
         agreed = None
         for key in self._sweep(self._node_order, self._order, node_name):
@@ -130,6 +140,9 @@ class StepRunner:
             )
             if answer is not None and (agreed is None or answer.tokens < agreed.tokens):
                 agreed = answer
+        if agreed is not None:
+            for key in self._sweep(self._node_cap_order, self._cap_order, node_name):
+                agreed = self._resources[key].cap_cached_prefix(rid, node_name, graph_walk, agreed)
         return agreed
 
     def apply_cached_prefix(
@@ -333,6 +346,7 @@ class StepRunner:
             self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
+        self._admission.remove_request(rid)
         for key in self._order:
             self._resources[key].remove_request(rid)
 
@@ -340,7 +354,7 @@ class StepRunner:
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
     ) -> FullAdmitOutcome:
-        """bring published state in
+        """bring published state in, once `node_name`'s resources have admitted the request
 
         gives `ready=False` when still has inflights; shortcircuit on failure
 
@@ -350,6 +364,13 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
+        if not self._admission.admitted(rid, node_name):
+            waits = self._admission.admit(
+                rid, node_name, graph_walk, published,
+                self._sweep(self._node_ask_order, self._ask_order, node_name),
+            )
+            if waits is not None:
+                return waits
         ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
@@ -367,7 +388,10 @@ class StepRunner:
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
-
+    def admit_waiting(
+        self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
+    ) -> list[tuple[str, str]]:
+        return self._admission.admit_waiting(published_of)
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
     #

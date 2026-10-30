@@ -38,6 +38,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "chatterbox": "chatterbox.yaml",
     "chatterbox_multilingual": "chatterbox_multilingual.yaml",
     "chatterbox_turbo": "chatterbox_turbo.yaml",
+    "cosyvoice3": "cosyvoice3.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
@@ -334,7 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--rust-frontend-bin", default=None,
         help="path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
-             "$PATH, then rust/server/target/release)",
+             "the environment's scripts dir, $PATH, then "
+             "rust/server/target/release)",
     )
     serve.set_defaults(func=_serve)
     return parser

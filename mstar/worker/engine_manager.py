@@ -3,9 +3,11 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
+from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
@@ -25,6 +27,30 @@ def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
                 f"{type(model).__name__}: {node!r} splits its combined walk "
                 f"{combined!r} by capture key"
             )
+
+
+def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
+    """A spanned output is cut after its step ends, but speculation hands a
+    step's outputs to the next step before then: no spanned output may feed a
+    node this worker speculates into (see ``NodeSubmodule.spanned_outputs``)."""
+    for walk, section in model.get_graph_walk_graphs().items():
+        nodes = section.get_nodes()
+        for name, node in nodes.items():
+            submodule = submodules.get(name)
+            if submodule is None or not node.enable_async_scheduling:
+                continue
+            spanned = submodule.spanned_outputs(walk)
+            for edge in node.outputs:
+                target = nodes.get(edge.next_node)
+                if (
+                    edge.name in spanned and edge.next_node in submodules
+                    and target is not None and target.enable_async_scheduling
+                ):
+                    raise ValueError(
+                        f"{type(model).__name__}: {name!r} spans {edge.name!r}, which "
+                        f"feeds {edge.next_node!r} on the same worker in walk {walk!r}; "
+                        "set enable_async_scheduling=False on one of them"
+                    )
 
 
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
@@ -94,13 +120,9 @@ class EngineManager:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, model_config)
 
-        # Resolve autocast dtype: explicit YAML config wins; otherwise we
-        # fall back to the Model's own preference (so models that need to
-        # match a reference numerically can override get_autocast_dtype
-        # without forcing every config file to set the same value).
-        autocast_dtype = model.get_autocast_dtype()
-        if "autocast_dtype" in model_config:
-            autocast_dtype = model_config["autocast_dtype"]
+        # YAML autocast_dtype over the model's own, but never re-enabling
+        # autocast for a model that pinned its numerics (see node_dtype)
+        autocast_dtype = resolve_model_dtype(model, model_config)
 
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
@@ -128,15 +150,12 @@ class EngineManager:
             )
             if submodule is None:
                 continue
-            if submodule.disable_autocast:
-                # keeps the dtype it was built in; the engine won't autocast it
-                submodules[name] = submodule.to(device=device)
-                continue
-            # A submodule that must run in its own dtype (an audio codec in
-            # fp32, say) says so; otherwise it takes the engine's.
-            node_dtype = submodule.get_autocast_dtype() or autocast_dtype
+            # the one dtype the load cast and every forward and capture use;
+            # None keeps the dtype the node was built in
+            node_dtype = resolve_node_dtype(submodule, autocast_dtype)
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
+        _refuse_speculated_spans(submodules, model)
 
         engine = Engine(
             graph_runtime=graph_runtime,
@@ -174,10 +193,12 @@ class EngineManager:
     def add_request(
         self, request_id: str,
         resource_configs: dict[str, ResourceReqConfig] | None = None,
+        request_info: CurrentForwardPassInfo | None = None,
     ) -> None:
         """Open resource state for a request, on the per-resource configs the
-        conductor resolved for it (``Model.get_request_resource_configs``)."""
-        self.engine.add_request(request_id, resource_configs)
+        conductor resolved for it (``Model.get_request_resource_configs``),
+        and hand the submodules its ``request_info``."""
+        self.engine.add_request(request_id, resource_configs, request_info)
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down; returns the resources it handed pages back to."""

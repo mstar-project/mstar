@@ -179,6 +179,8 @@ def _groups(rank, layout):
 
 def _check_rank(rank, layout, failed_here, store, out):
     import torch.distributed as dist
+
+    from mstar.distributed.communication import JointGroups
     try:
         dist.init_process_group(
             "gloo", init_method=f"file://{store}", rank=rank, world_size=4,
@@ -186,9 +188,11 @@ def _check_rank(rank, layout, failed_here, store, out):
         )
         tp, sp = _groups(rank, layout)
         w = Worker.__new__(Worker)
+        w._walk_drivers = {}
+        w._walk_driven_edges = {}
         w.scheduler = SimpleNamespace(read_failed_rids=set(failed_here))
         w.parallel_groups = SimpleNamespace(
-            get_tp_config_for_node=lambda node: tp, get_sp_config_for_node=lambda node: sp,
+            get_joint_group_for_node=lambda node: JointGroups(tp_group=tp, sp_group=sp),
         )
         # a follower that could not read a row left it out; the others hold it
         rows = [r for r in ROWS if r not in failed_here]
@@ -330,6 +334,8 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     sched.fail_rids({"r1"})
     tm, _ = _shm_manager(tmp_path)
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.scheduler, w.request_state, w.tensor_manager = sched, manager, tm
     w.wakeup_event = SimpleNamespace(drain=lambda: None)
     w.enable_nvtx = False
@@ -365,6 +371,8 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
         ready=[r for r in fresh if r not in read_failed], read_failed=read_failed,
     )
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.scheduler, w.request_state, w.enable_nvtx = sched, manager, False
     w._in_flight_rids = set()
     w.preps, w.assembled = [], []
@@ -506,6 +514,8 @@ FOLLOWERS = ["w0", "w1"]
 def _leader(tmp_path, streamed=()):
     tm, _ = _shm_manager(tmp_path)
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = {NODE}, {NODE}
     w.is_tp_follower, w.enable_nvtx = False, False

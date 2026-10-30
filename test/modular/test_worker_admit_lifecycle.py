@@ -81,7 +81,7 @@ def _worker():
     w.request_state = RequestStateManager(node_to_partition=node_to_partition)
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: [NODE],
-        add_request=lambda rid, cfgs: None,
+        add_request=lambda rid, cfgs, info: None,
         remove_request=lambda rid: None,
     )
     w.scheduler = SimpleNamespace(
