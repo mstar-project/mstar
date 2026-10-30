@@ -512,10 +512,10 @@ Worker scheduling
        C6-class state of 100 µs or more and the server is host-bound (small
        models, high concurrency); leave it off on a VM without deep idle
        states. Measured off → ``auto`` (all three threads on one CPU in
-       parentheses). B300 host, server ``taskset`` to 8 cores and their
-       siblings: Qwen3.5-0.8B c=1 338 → 529 (566) tok/s, c=64 12247 → 18990
-       (17824); 2B c=1 318 → 586 (529); Qwen3-TTS 1.7B c=1 TTFA p50 23.5 →
-       23.6 (34.6) ms. H100 VM, 40-CPU ``taskset`` (from the #919 review):
+       parentheses). B300 host, server ``taskset`` to 16 cores and their
+       siblings: Qwen3.5-0.8B c=1 408 → 546 tok/s, c=16 5969 → 8049;
+       Qwen3-TTS 1.7B c=1 TTFA p50 24.9 → 24.3 ms. H100 VM, 40-CPU
+       ``taskset`` (from the #919 review):
        0.8B c=1 525 → 434 (486) tok/s, c=64 14455 → 14040 (12800); Qwen3-TTS
        c=1 TTFA mean 21.0 → 21.0 (25.6) ms. ``auto``
        places by the GPU's rank among the host's GPUs on its NUMA node (sysfs
@@ -535,7 +535,10 @@ Worker scheduling
        address) would take the same CPUs, so the first ``auto`` server holds
        ``/tmp/mstar-gpu-<PCI address>.lock`` for its life and a second one
        pins nothing, with a warning; the lock goes with the process however
-       it exits. A
+       it exits. The lock only reaches servers that share ``/tmp``, so
+       servers in separate containers on one GPU still take the same CPUs.
+       A split config's second worker can also take a core that a server on
+       a GPU without allowed CPUs takes under the same mask. A
        number names the first worker's core (its hardware threads in the
        mask); the next workers take the next cores up and the API server the
        last core of the mask. A number outside the mask, or too near its top
