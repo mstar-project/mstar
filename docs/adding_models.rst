@@ -508,6 +508,11 @@ three common fields:
   name. If a spec names a dependency that the model does not declare, loading fails
   immediately, rather than during a forward pass. ``RaggedAttentionSpec`` is the one
   attention spec that depends on nothing: it names no cache, because it has none.
+- ``combined_splits()`` returns a ``CombinedSplit`` for each combined walk this spec
+  runs on split kernels (see :ref:`combined walks <combined-walks>`); the default is
+  none. The engine reads only this hook to order a split walk's rows, so a spec whose
+  config carries ``splits`` must return them here. ``AttentionSpec`` and
+  ``LinearAttnSpec`` return their config's ``splits``.
 
 The spec types are:
 
@@ -1418,6 +1423,8 @@ into one GPU call. A submodule controls this behavior with three methods:
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
 
+.. _combined-walks:
+
 **Combined walks.** By default a step holds one walk. A model lets several walks of a node
 share a step by returning ``{node: {combined_walk: {walks}}}`` from
 ``get_combined_graph_walks``, for example decode rows beside a prompt's prefill. The
@@ -1426,10 +1433,14 @@ can key on. A step of one walk keeps that walk's cap. A step that mixes walks ta
 combined walk's ``max_batch_size`` when it has one, else the smallest cap of the walks it
 holds, so a small prefill cap never limits a decode-only step.
 ``max_rows_in_combined(self, graph_walk)`` also bounds how many rows of one walk a mixed
-step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``). A resource
-that runs a combined walk on such split kernels declares it with a ``CombinedSplit``; the
-engine then orders that walk's steps with the ``prefill_walks`` rows last, so the kernels
-read the decode rows as the step's first tokens, in place.
+step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``). To run a
+combined walk on such split kernels, pass a ``CombinedSplit`` in the ``splits`` of each
+resource config that supports one (``AttentionConfig`` and ``LinearAttnConfig``); their
+specs return it from ``combined_splits()``, which is what the engine reads, and resources
+of one node must agree on a walk's ``prefill_walks``. The engine then orders that walk's
+steps with the ``prefill_walks`` rows last, so the kernels read the decode rows as the
+step's first tokens, in place. Every other walk of the combined walk must be one token
+per row.
 
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
