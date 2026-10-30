@@ -15,6 +15,7 @@ Usage:
     tokens = sample_tokens(logits, temperature=0.7, top_p=0.9)
 """
 
+import heapq
 import logging
 import threading
 from abc import ABC, abstractmethod
@@ -2085,7 +2086,8 @@ class SamplerBuffers:
     )
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
-    _free_slots: list[int] = field(default_factory=list, repr=False)
+    _free_slots: list[int] = field(default_factory=list, repr=False)  # a heap
+    _top_slot: int = 0  # the highest slot handed out
     # Slots awaiting init, consumed by the next gather so the rows are written
     # on the gathering thread rather than racing it from the main one.
     _pending_init: set[int] = field(default_factory=set, repr=False)
@@ -2179,8 +2181,14 @@ class SamplerBuffers:
 
         # seen token mask is not double-buffered, as it depends on the GPU
         # value of the previous step. Same goes for offset
+        # Unless a captured graph scatters into it, the mask master starts at
+        # a step's rows and grows to the slots in use (_sync_device_capacity),
+        # fixed masters or not.
         seen_tokens = (
-            MaskBuffer.allocate(max_batch_size, rows, vocab_size, device, cg_slots=1)
+            MaskBuffer.allocate(
+                max_batch_size, rows if ingraph_scatter else max_batch_size + 1,
+                vocab_size, device, cg_slots=1,
+            )
             if vocab_size is not None else None
         )
         windowed = history is not None and history.window > 0
@@ -2329,14 +2337,19 @@ class SamplerBuffers:
 
         Swapping them on the main thread let an in-flight scatter land in the old tensor.
         """
+        seen = self.seen_tokens
+        if seen is not None and len(seen.master) <= self._top_slot:
+            # vocab-wide, so it grows to the slots in use even while the other
+            # masters are fixed (persistent rows keep their own masks)
+            seen.grow_master(max(2 * len(seen.master), self._top_slot + 1))
         cap = self._master_capacity
         if self._device_capacity >= cap:
             return
         rows = cap + 1  # plus the trash row
         self.offset.grow_master(rows)
         self.last_token.grow_master(rows)
-        if self.seen_tokens is not None:
-            self.seen_tokens.grow_master(rows)
+        if seen is not None and len(seen.master) < rows:
+            seen.grow_master(rows)
         for buf in self.loopback.values():
             buf.grow_master(rows)
         self._device_capacity = cap
@@ -2355,7 +2368,10 @@ class SamplerBuffers:
             return
         if not self._free_slots:
             self._grow_master(self._master_capacity * 2)
-        slot = self._free_slots.pop()
+        with self._slot_lock:
+            # lowest first, so a mask master that grows on demand stays small
+            slot = heapq.heappop(self._free_slots)
+        self._top_slot = max(self._top_slot, slot)
         self._rid_to_slot[rid] = slot
         # CPU-only; every GPU write for this slot is deferred to the next gather.
         self._pending_init.add(slot)
@@ -2385,7 +2401,7 @@ class SamplerBuffers:
             if slot in self._row_held:
                 self._orphaned.add(slot)
             else:
-                self._free_slots.append(slot)
+                heapq.heappush(self._free_slots, slot)
 
     def check_out_slots(self, request_ids: Sequence[str]) -> np.ndarray:
         """The master slots of registered ``request_ids``, each initialized,
@@ -2414,7 +2430,7 @@ class SamplerBuffers:
                 self._row_held.discard(slot)
                 if slot in self._orphaned:
                     self._orphaned.discard(slot)
-                    self._free_slots.append(slot)
+                    heapq.heappush(self._free_slots, slot)
 
     def sync_slots(self) -> None:
         """Grow the device masters and reset newly registered slots' offsets
