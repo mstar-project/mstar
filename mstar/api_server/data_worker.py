@@ -105,6 +105,15 @@ def encode_workers(cpus: int | None = None, png_workers: int | None = None) -> i
     return max(1, min(4, cpus // png_workers))
 
 
+def copy_workers(cpus: int | None = None, png_workers: int | None = None) -> int:
+    """Threads a large output read copies over (``host_copy.HostCopier``): one
+    encode's share of the CPUs in the budget ``encode_workers`` sets. Reads run
+    one at a time on the data worker's thread, each ahead of its own encode."""
+    if cpus is None:
+        cpus = usable_cpus()
+    return max(1, cpus // encode_workers(cpus, png_workers))
+
+
 def _sha256(path: str) -> bytes:
     with open(path, "rb") as file:
         return hashlib.file_digest(file, "sha256").digest()
@@ -271,6 +280,7 @@ class PreprocessWorker:
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof,
+            copy_workers=copy_workers(),
         )
 
         self.thread = threading.Thread(
