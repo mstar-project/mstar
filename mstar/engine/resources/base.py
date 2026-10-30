@@ -59,9 +59,10 @@ class EngineResourceInfo:
     device: torch.device
     joint_comm_group: JointGroups | None = None
     # how many ways the node's ranks split its attention heads; each builder
-    # sizes head counts by it. None means every rank of ``joint_comm_group``
-    # (1 without one); the engine passes the node's own count
-    # (``NodeSubmodule.splits_heads``).
+    # sizes head counts by it, except a ragged resource declaring
+    # ``shard_over_sp=False``, which splits over the TP ranks only. None means
+    # every rank of ``joint_comm_group`` (1 without one); the engine passes the
+    # node's own count (``NodeSubmodule.splits_heads``).
     head_shards: int | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16

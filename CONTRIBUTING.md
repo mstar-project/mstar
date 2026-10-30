@@ -165,6 +165,9 @@ tests and retains JUnit reports for seven days. Making
 **CPU Core** a required merge check is a separate repository ruleset or branch
 protection setting.
 
+The randomized tests in `test/modular/test_kv_page_ownership.py` add their seed
+and recent operations to a failure; rerun one with the node id pytest prints.
+
 ## Adding a model
 
 Start with the [Adding a New Model](https://mstar-project.github.io/mstar/adding_models.html)

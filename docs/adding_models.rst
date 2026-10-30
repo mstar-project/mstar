@@ -217,6 +217,14 @@ You must implement these abstract methods:
    data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
    lists its prompt layout, speaker, language, clip digest and codec stream lead.
 
+.. note::
+
+   The conductor merges each walk's ``ForwardPassArgs.step_metadata`` into the
+   request's ``metadata.kwargs``, so a request fact stored under a key that a
+   later walk's step metadata also uses is overwritten by that walk's value. Keep
+   such facts under their own key: LTX-2.5 nests the request's geometry under
+   ``kwargs["request"]``, since its stage-1 walk sends a half-size ``height``.
+
 The following methods have defaults and are optional to override:
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,
@@ -613,11 +621,19 @@ The spec types are:
        default, ``RaggedAttnBackend.FLASHINFER``, or ``RaggedAttnBackend.DENSE``),
        ``flashinfer_backend``, the
        two CUDA-graph ceilings ``max_segments_per_request`` and
-       ``max_tokens_per_request``, and ``compile_op``, described under `Cacheless
-       attention (encoder towers)`_. ``compile_op`` is the model's declaration; the
-       serving config's ``resources:`` overrides take only the backends and the two
-       ceilings. ``DENSE`` runs FA3 ``flash_attn_varlen`` (AITER on ROCm)
-       and falls back to FlashInfer if that kernel is missing. See `Cacheless attention (encoder towers)`_.
+       ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp`` and
+       ``workspace_mb``. ``DENSE`` runs FA3
+       ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
+       missing. By default the heads are split across all TP × SP ranks of the node (the TP
+       ranks only, on a node that sets ``splits_heads = False``); ``shard_over_sp=False``
+       splits them across the TP ranks only, for an attention each sequence-parallel rank
+       runs whole over its own tokens (one over a replicated stream, or a cross-attention
+       from the rank's query shard). ``workspace_mb`` sizes each label's FlashInfer
+       workspace per slot (default ``MSTAR_WORKSPACE_BUFFER_MB``, 512); a node with many
+       labels can declare less, since a ragged prefill only uses it for split-KV partials.
+       ``compile_op``, ``shard_over_sp`` and ``workspace_mb`` are the model's declaration;
+       the serving config's ``resources:`` overrides take only the backends and the two
+       ceilings. See `Cacheless attention (encoder towers)`_ for ``compile_op``.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
        (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
@@ -901,6 +917,14 @@ span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
 
+Called with ``return_lse=True``, a ragged or ragged cross-attention resource's ``run`` on the
+FlashInfer backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32,
+natural log) from the same plan, which is what merging attentions over disjoint key sets
+needs; a compiled caller breaks there even with ``compile_op``. Under sequence parallelism
+LTX-2.5's audio queries attend each rank's share of the video tokens, and
+``attention_over_sharded_keys`` (``mstar/model/components/distributed/sequence_parallel.py``)
+merges them.
+
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -1088,7 +1112,8 @@ methods are:
    recurrent state) for one rank's slice of the heads. A node whose SP ranks split other
    work instead, such as one guidance branch per rank, sets ``splits_heads = False``,
    and its SP ranks keep all the heads (TP ranks still split them). Nodes sharing a
-   resource must agree.
+   resource must agree. A ragged attention that each SP rank of a head-splitting node runs
+   whole declares that on the resource, with ``RaggedAttentionConfig(shard_over_sp=False)``.
 
 ``postprocess(...)`` (optional)
    Metadata-only fixups that run on the GPU thread. This method must not read tensor

@@ -117,7 +117,7 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch):
     assert prefill.call_args.kwargs["use_cuda_graph"] is True
 
 
-def _load_heads(kind, splits_heads, tp=1, sp=2):
+def _load_heads(kind, splits_heads, tp=1, sp=2, shard_over_sp=True):
     """Load one resource of ``kind`` (4 heads) for nodes declaring
     ``splits_heads`` (node -> flag) on a tp x sp lockstep instance, and
     return the heads one rank holds."""
@@ -168,7 +168,9 @@ def _load_heads(kind, splits_heads, tp=1, sp=2):
     if kind == "ragged":
         spec = RaggedAttentionSpec(
             resource_key="res", nodes=nodes,
-            config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=72, dtype=torch.bfloat16),
+            config=RaggedAttentionConfig(
+                num_qo_heads=4, num_kv_heads=4, head_dim=72, dtype=torch.bfloat16, shard_over_sp=shard_over_sp,
+            ),
         )
     else:
         spec = RecurrentStateSpec("res", nodes, RecurrentStateConfig(
@@ -191,10 +193,18 @@ def _load_heads(kind, splits_heads, tp=1, sp=2):
 @pytest.mark.parametrize("kind", ["ragged", "recurrent"])
 def test_a_node_whose_ranks_split_other_work_keeps_every_head(kind, tp, sp, splits_heads, heads):
     """Every resource the engine builds for a multi-rank node holds one rank's
-    slice of the heads, whatever the resource kind. A node whose SP ranks
+    slice of the heads, whatever the resource kind (a ragged resource declaring
+    ``shard_over_sp=False`` is the exception, tested below). A node whose SP ranks
     split something else (``splits_heads = False``, e.g. guidance branches)
     keeps every head across them; its TP ranks still split them."""
     assert _load_heads(kind, {"dit": splits_heads}, tp=tp, sp=sp) == heads
+
+
+@pytest.mark.parametrize("tp,sp,heads", [(1, 2, 4), (2, 2, 2)])
+def test_a_ragged_attention_kept_whole_over_sp_splits_heads_over_tp_only(tp, sp, heads):
+    """``shard_over_sp=False`` keeps a ragged attention's heads whole across the
+    SP ranks of a node that splits heads there; its TP ranks still split them."""
+    assert _load_heads("ragged", {"dit": True}, tp=tp, sp=sp, shard_over_sp=False) == heads
 
 
 def test_nodes_sharing_a_resource_must_agree_on_splitting_heads():

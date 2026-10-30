@@ -32,7 +32,7 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
         key: str,
     ):
         super().__init__(device=device, dtype=dtype, config=config, key=key)
-        self._workspaces = WorkspacePool(device)
+        self._workspaces = WorkspacePool(device, config.workspace_mb)
         self._kwargs["backend"] = config.flashinfer_backend
 
     def _build_wrapper(self, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
