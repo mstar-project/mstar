@@ -185,23 +185,29 @@ async def realtime(websocket: WebSocket):
     intent = websocket.query_params.get("intent")
     api = _api()
     audio = api.client_audio if api is not None else []
-    reason = None
-    if intent is None and audio:
+    # why a model with an audio client stream can't hold a conversation (None: it can)
+    no_conversation = None
+    if audio:
+        channels = api.model.get_output_audio_channels("audio")
         if api.model.turn_tokens is None:
-            reason = "this model has no turn tokens, so it can't serve OpenAI Realtime conversations; use /generate/ws"
-        elif len(audio) == 1:
+            no_conversation = "this model has no turn tokens, so it can't serve OpenAI Realtime conversations"
+        elif len(audio) > 1:
+            no_conversation = f"this model takes audio on {len(audio)} client streams, and a conversation feeds one"
+        elif channels != 1:
+            no_conversation = f"this model speaks in {channels} channels, and a conversation's audio is mono"
+        elif intent is None:
             await serving_realtime.RealtimeConversation(api, api.model_name, websocket, audio[0]).run()
             return
-        else:
-            reason = (f"this model takes audio on {len(audio)} client streams, and a conversation feeds one; "
-                      "use /generate/ws")
-    elif intent not in (None, "transcription"):
-        reason = f"unsupported intent {intent!r}; " + ("omit intent for a conversation" if audio
+    converses = bool(audio) and no_conversation is None
+    reason = None
+    if intent not in (None, "transcription"):
+        reason = f"unsupported intent {intent!r}; " + ("omit intent for a conversation" if converses
                                                         else "use intent=transcription")
-    if reason is None:
+    else:
         api, model_name, adapter, err = _resolve("supports_realtime_transcription")
         if err is not None:
-            reason = ("this model serves /v1/realtime conversations; omit intent" if audio
+            reason = ("this model serves /v1/realtime conversations; omit intent" if converses
+                      else f"{no_conversation}; use /generate/ws" if audio
                       else json.loads(bytes(err.body))["error"]["message"])
     if reason is not None:
         # 1008 is policy violation, the served model has no such endpoint

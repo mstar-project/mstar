@@ -1116,6 +1116,10 @@ def test_a_character_split_across_token_chunks_survives_a_step():
 
 class _DuplexModel:
     turn_tokens = (1, 2)
+    channels = 1
+
+    def get_output_audio_channels(self, modality="audio"):
+        return self.channels
 
     def get_output_sample_rate(self, modality="audio"):
         return 24000
@@ -1199,16 +1203,32 @@ def _session_update(ws, **session):
     return _recv_until(ws, "session.updated")[-1]["session"]
 
 
-def test_a_conversation_needs_turn_tokens(duplex):
+@pytest.mark.parametrize("attr, value, reason", [("turn_tokens", None, "no turn tokens"),
+                                                  ("channels", 2, "speaks in 2 channels")])
+def test_a_conversation_needs_turn_tokens_and_mono_output(duplex, attr, value, reason):
     """A duplex model without turn tokens serves /generate/ws, but a
-    conversation has no replies to cut, so it is refused before any event."""
+    conversation has no replies to cut, and its audio out is mono: either
+    is refused before any event."""
     client, api = duplex()
-    api.model.turn_tokens = None
+    setattr(api.model, attr, value)
     with pytest.raises(WebSocketDisconnect) as refused:
         with client.websocket_connect("/v1/realtime") as ws:
             ws.receive_text()
-    assert refused.value.code == 1008 and "no turn tokens" in refused.value.reason
+    assert refused.value.code == 1008 and reason in refused.value.reason and "/generate/ws" in refused.value.reason
     assert api.submits == []
+
+
+def test_a_model_that_cannot_converse_still_serves_transcription_by_default(client_and_stub, monkeypatch):
+    """An omitted intent is the one the model serves: transcription, when an
+    audio-streaming model has no turn tokens but its adapter transcribes."""
+    from mstar.streaming.topology import CLIENT, ClientAudio, Connection
+
+    client, stub = client_and_stub
+    monkeypatch.setattr(stub, "client_audio", [Connection(CLIENT, "Ear", "audio_in", chunk_policy_factory=lambda: None,
+                                                          audio=ClientAudio(16000, 1280))])
+    stub.model.turn_tokens, stub.model.get_output_audio_channels = None, lambda modality="audio": 1
+    with client.websocket_connect("/v1/realtime") as ws:
+        assert json.loads(ws.receive_text())["type"] == "transcription_session.created"
 
 
 @pytest.mark.parametrize("fmt", [{"type": "audio/pcm", "rate": 24000}, {"type": "audio/pcmu"}])

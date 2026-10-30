@@ -2430,7 +2430,7 @@ streams (audio and video, say): each has its own buffer and its own end.
   ``Connection(..., audio=ClientAudio(sample_rate, frame_samples))``: mono audio at
   ``sample_rate``, whose consumer computes on frames of ``frame_samples``. ``/v1/realtime``
   then serves the model as a conversation (:doc:`clients`), when only one of its client
-  streams declares it: the route decodes the caller's codec, resamples to
+  streams declares it and its audio output is mono: the route decodes the caller's codec, resamples to
   ``sample_rate`` and turns the model's output back into the caller's format from
   ``get_output_sample_rate``. On every route the data worker, the stream's producer,
   sends it in whole frames: an append's whole frames (the opening's included) go as
@@ -2445,7 +2445,7 @@ streams (audio and video, say): each has its own buffer and its own end.
   ``/v1/realtime`` conversations it also declares ``turn_tokens = (start_id, end_id)`` on
   the model (a property when the ids come from its config): the text tokens that open and
   close each reply. Without them ``/generate/ws`` still serves it, and a conversation is
-  refused. The data worker marks the text chunks they arrive in with
+  refused (an omitted ``intent`` then means transcription, if the model's adapter serves it). The data worker marks the text chunks they arrive in with
   ``metadata["turn"]``, their marks (``"start"`` / ``"end"``) in token order, on every
   route, before ``postprocess`` (which may decode them to nothing), and stamps each text
   and audio chunk with ``metadata["step"]``, the iteration of the loop that emitted it.
