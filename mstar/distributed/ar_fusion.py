@@ -214,11 +214,9 @@ class FlashInferARFusion(ARFusion):
 # --- ROCm: AITER --------------------------------------------------------------
 
 
-def _agree(cpu_group, values: list[int]) -> list[int]:
-    """Element-wise max of ``values`` across ``cpu_group`` (gloo, on the host)."""
-    t = torch.tensor(values, dtype=torch.int64)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=cpu_group)
-    return t.tolist()
+def _agree(group, values: list[int]) -> list[int]:
+    """Element-wise max of ``values`` across the group's ranks, through the group's vote."""
+    return group.agree(values, op=dist.ReduceOp.MAX)
 
 
 def _aiter_version() -> str | None:
@@ -326,10 +324,10 @@ class AiterARFusion(ARFusion):
     # next call's data. No API changed with the fix, so we check the version.
     MIN_VERSION = (0, 1, 19, 1)
 
-    def __init__(self, ca, cpu_group, hidden: int, dtype: torch.dtype,
+    def __init__(self, ca, group, hidden: int, dtype: torch.dtype,
                  max_tokens: int, register_in_capture: bool):
         self._ca = ca
-        self._cpu_group = cpu_group
+        self._group = group
         self.hidden = hidden
         self.dtype = dtype
         self.max_tokens = max_tokens
@@ -381,7 +379,7 @@ class AiterARFusion(ARFusion):
         # AITER names its store keys after a per-process pool counter. Line it
         # up across the group so all members use the same keys.
         seq = pool_cls._pool_seq if reason is None else 0
-        refused, seq = _agree(cpu_group, [int(reason is not None), seq])
+        refused, seq = _agree(group, [int(reason is not None), seq])
         if refused:
             logger.warning("AITER fused all-reduce + RMSNorm unavailable (%s), "
                            "using RCCL + separate norm",
@@ -402,7 +400,7 @@ class AiterARFusion(ARFusion):
         except Exception:
             logger.exception("AITER CustomAllreduce construction failed")
             built = False
-        if _agree(cpu_group, [int(not built)])[0]:
+        if _agree(group, [int(not built)])[0]:
             logger.warning("AITER custom all-reduce failed to build on some rank, "
                            "using RCCL + separate norm")
             if ca is not None:
@@ -413,7 +411,7 @@ class AiterARFusion(ARFusion):
         # AITER turns off registering captured inputs under expandable segments
         register = bool(getattr(ca, "enable_register_for_capturing", False)
                         and hasattr(ca, "_ops_get_graph_buffer_count"))
-        failed, no_register = _agree(cpu_group, [int(bad is not None), int(not register)])
+        failed, no_register = _agree(group, [int(bad is not None), int(not register)])
         if failed:
             logger.error("AITER fused all-reduce + RMSNorm failed its startup check "
                          "(tp=%d hidden=%d %s, %s), using RCCL + separate norm",
@@ -425,7 +423,7 @@ class AiterARFusion(ARFusion):
                     "%d tokens x %d, max_size %d MiB, captured inputs %s",
                     bound, hidden, max_size >> 20,
                     "copied into the pool" if no_register else "registered")
-        return cls(ca, cpu_group, hidden, dtype, bound, not no_register)
+        return cls(ca, group, hidden, dtype, bound, not no_register)
 
     @classmethod
     def _unsupported(cls, custom_allreduce, pool_cls) -> str | None:
@@ -510,7 +508,7 @@ class AiterARFusion(ARFusion):
         """
         count = self._ca._ops_get_graph_buffer_count(self._ca._ptr)
         hi, neg_lo, failed = _agree(
-            self._cpu_group, [count, -count, int(not captured)],
+            self._group, [count, -count, int(not captured)],
         )
         if hi != -neg_lo:
             logger.error("graph capture recorded %d to %d all-reduce inputs across "
