@@ -321,9 +321,9 @@ def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager-forward", "compiled"])
 def test_paged_dsa_with_fused_mla_prep_matches_the_unfused_path(tmp_path, monkeypatch, compiled):
-    """mla_fused_prep on the selecting path: DSA at index_topk 8, so decode selects, captured
-    with the fused prep emits the unfused path's tokens (q_lora_rank 256, a width the fused
-    norms take)."""
+    """The fused MLA prep on the selecting path: DSA at index_topk 8, so decode selects,
+    captured with the fused prep emits the op-by-op path's tokens (q_lora_rank 256, a width
+    the fused norms take)."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     streams = {}
     for fused_prep in (False, True):
@@ -331,10 +331,9 @@ def test_paged_dsa_with_fused_mla_prep_matches_the_unfused_path(tmp_path, monkey
         ckpt.mkdir()
         overrides = dict(dsa_long_context=True, index_topk=8, index_n_heads=16,
                          index_head_dim=64, max_seq_len=64, q_lora_rank=256,
-                         mla_fused_prep=fused_prep, graph_compile=compiled)
+                         graph_compile=compiled)
         model, submodule = _load(ckpt, monkeypatch, False, cfg_overrides=overrides)
-        attn = submodule.language_model.model.layers[0].self_attn
-        assert attn.mla_fused_prep == fused_prep
+        _fused_prep(submodule, fused_prep)
         node = _Node(model, submodule, capture=True, prompts=PROMPTS)
         assert node.cg.any_graphs and node.cg.dropped_buckets == []
         streams[fused_prep] = node.generate()
