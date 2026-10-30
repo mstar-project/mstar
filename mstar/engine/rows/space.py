@@ -52,11 +52,12 @@ class RowBuffer:
     """One per-row field: resident rows by slot, and the dense step view a
     step of ``n`` requests reads as its first ``n`` rows, both at fixed
     device addresses. The rows are allocated when the space is sealed, at its
-    first use."""
+    first use. An unmoved buffer has no dense view: a step addresses its
+    resident rows by slot (``RowSpace.gather_slots``)."""
 
     def __init__(
         self, space: RowSpace, name: str, shape: tuple[int, ...],
-        dtype: torch.dtype, pad, mirrored: bool, step: int = 0,
+        dtype: torch.dtype, pad, mirrored: bool, step: int = 0, moved: bool = True,
     ):
         self.space = space
         self.name = name
@@ -64,6 +65,7 @@ class RowBuffer:
         self.dtype = dtype
         self.mirrored = mirrored
         self.step = step
+        self.moved = moved
         # one value, or one per element of the row
         if dtype in _NO_NUMPY:
             raise ValueError(f"{name}: numpy has no {dtype} for the rows' host values")
@@ -82,6 +84,8 @@ class RowBuffer:
     @property
     def device(self) -> torch.Tensor:
         """The dense step view, ``max_rows`` rows."""
+        if not self.moved:
+            raise RuntimeError(f"{self} stays resident: address it by slot")
         if self._device is None:
             self.space.seal()
         return self._device
@@ -310,8 +314,8 @@ def _store_ptr(buf: RowBuffer, store: torch.Tensor) -> int:
     checked on first use only, as stores are long-lived."""
     if store is buf._store:
         return buf._store_ptr
-    if store.device != buf.device.device or store.dtype != buf.dtype:
-        raise ValueError(f"{buf.name}: a store must be {buf.dtype} on {buf.device.device}")
+    if store.device != buf.resident.device or store.dtype != buf.dtype:
+        raise ValueError(f"{buf.name}: a store must be {buf.dtype} on {buf.resident.device}")
     if not store.is_contiguous() or store[0].numel() * store.element_size() != buf.row_bytes:
         raise ValueError(f"{buf.name}: a store must be contiguous rows of the buffer's shape")
     buf._store, buf._store_ptr = store, store.data_ptr()
@@ -320,8 +324,8 @@ def _store_ptr(buf: RowBuffer, store: torch.Tensor) -> int:
 
 def _tensor_ptr(buf: RowBuffer, t: torch.Tensor) -> int:
     """``t``'s address, once it is checked to be one row of ``buf``."""
-    if t.device != buf.device.device or t.dtype != buf.dtype:
-        raise ValueError(f"{buf.name}: a row's tensor must be {buf.dtype} on {buf.device.device}")
+    if t.device != buf.resident.device or t.dtype != buf.dtype:
+        raise ValueError(f"{buf.name}: a row's tensor must be {buf.dtype} on {buf.resident.device}")
     if not t.is_contiguous() or t.numel() * t.element_size() != buf.row_bytes:
         raise ValueError(f"{buf.name}: a row's tensor must be contiguous and of the row's shape")
     return t.data_ptr()
@@ -397,19 +401,39 @@ class RowSpace:
 
     def buffer(
         self, name: str, shape: Sequence[int], dtype: torch.dtype, pad=0, mirrored: bool = True,
-        step: int = 0,
+        step: int = 0, moved: bool = True,
     ) -> RowBuffer:
         """Rows of ``shape``. Each forward of the walk adds ``step`` to the
         step's rows (a position, say): on the device after the forward, in
         its graph (``after_forward``), and on the mirror as the step commits,
-        so a steady step uploads nothing."""
+        so a steady step uploads nothing.
+
+        ``moved=False`` keeps the rows out of the per-step gather and scatter,
+        for wide rows a step reads or changes only in part (a vocabulary-wide
+        mask): the forward addresses them by slot instead."""
         if self._sealed:
             raise RuntimeError(f"{name}: the rows are allocated; register buffers before the first step")
         if step and dtype.is_floating_point:
             raise ValueError(f"{name}: only integer rows can step")
-        buf = RowBuffer(self, name, tuple(shape), dtype, pad, mirrored, step)
+        if not moved and (mirrored or step):
+            raise ValueError(f"{name}: unmoved rows are device state that doesn't step")
+        buf = RowBuffer(self, name, tuple(shape), dtype, pad, mirrored, step, moved)
         self.buffers.append(buf)
         return buf
+
+    @property
+    def gather_slots(self) -> torch.Tensor:
+        """``[max_rows]`` int32 on the device: each dense row's resident slot
+        to read (padding rows: the pad slot), for unmoved buffers."""
+        self.seal()
+        return self._gather_at
+
+    @property
+    def scatter_slots(self) -> torch.Tensor:
+        """``[max_rows]`` int32 on the device: each dense row's resident slot
+        to write (padding rows: the trash slot), for unmoved buffers."""
+        self.seal()
+        return self._scatter_at
 
     @property
     def n_active(self) -> torch.Tensor:
@@ -450,7 +474,8 @@ class RowSpace:
             buf._resident = torch.from_numpy(buf.pad).to(self.device).expand(slots, *buf.shape).contiguous()
         for buf in self.buffers:
             buf._ptr = buf._resident.data_ptr()
-            buf._device = torch.from_numpy(buf.pad).to(self.device).expand(rows, *buf.shape).contiguous()
+            if buf.moved:
+                buf._device = torch.from_numpy(buf.pad).to(self.device).expand(rows, *buf.shape).contiguous()
 
         # the step header: its row count, then each dense row's slot to gather
         # from and to scatter to (padding rows: the pad and trash slots)
@@ -460,10 +485,11 @@ class RowSpace:
         self._n_active = self._header[0:1]
         self._gather_at = self._header[1:1 + rows]
         self._scatter_at = self._header[1 + rows:]
-        self._gather_table = RowTable([(b._resident, b._device) for b in self.buffers], self.device)
+        moved = [b for b in self.buffers if b.moved]
+        self._gather_table = RowTable([(b._resident, b._device) for b in moved], self.device)
         # what a forward may change: device state, and stepped rows
         self._scatter_table = RowTable(
-            [(b._resident, b._device) for b in self.buffers if not b.mirrored or b.step], self.device,
+            [(b._resident, b._device) for b in moved if not b.mirrored or b.step], self.device,
         )
 
         self._stepped = [b for b in self.buffers if b.step]
