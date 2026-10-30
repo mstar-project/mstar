@@ -69,9 +69,10 @@ class ProducerWalkCtx:
 
 class ClientAudio(NamedTuple):
     """What an audio client stream carries: mono audio at ``sample_rate``.
-    ``frame_samples`` is the frame its consumer computes on, which a route
-    that translates a client's own codec and rate (``/v1/realtime``) cuts the
-    audio into, one frame per item."""
+    ``frame_samples`` is the frame its consumer computes on: the stream's
+    producer (the data worker) sends whole frames on every route, holding
+    the rest for the next append, and turns appends into items itself when
+    every client stream declares one."""
     sample_rate: int
     frame_samples: int
 

@@ -957,7 +957,7 @@ class RealtimeConversation:
     The call is one engine request, opened by the first append with the
     session's instructions as its prompt; formats and instructions are fixed
     from then on. Input is decoded, resampled to the stream's rate and
-    appended in whole frames, a partial frame waiting for the next append.
+    appended as it comes; the data worker cuts it into the stream's frames.
     Each reply between the model's ``turn_tokens`` marks is one response:
     text and audio chunks are paired by the loop step the data worker
     stamps on them (``metadata["step"]``), audio that arrives before its
@@ -970,9 +970,9 @@ class RealtimeConversation:
 
     def __init__(self, api, model_name: str, websocket: WebSocket, stream: Connection):
         self.api, self.model_name, self.ws = api, model_name, websocket
-        # the stream's rate, and its consumer's frame: what each append is cut into
+        # the stream's rate, which each append is resampled to
         self.stream = stream.edge_name
-        self.rate, self.frame = stream.audio.sample_rate, stream.audio.frame_samples
+        self.rate = stream.audio.sample_rate
         model = api.model
         self.output_rate = model.get_output_sample_rate("audio")
         self.voice = model.get_default_voice()
@@ -980,7 +980,6 @@ class RealtimeConversation:
         self.instructions = ""
         self.turn_detection = "server_vad"
         self.odd_byte = b""
-        self.pending = np.zeros(0, dtype=np.float32)   # model-rate audio short of a frame
         self.request_id: str | None = None
         self.key: str | None = None
         self.relay_task: asyncio.Task | None = None
@@ -1050,7 +1049,8 @@ class RealtimeConversation:
             await self.send(server_event("input_audio_buffer.committed", previous_item_id=None,
                                    item_id=f"item_{uuid.uuid4().hex[:12]}"))
         elif kind == "input_audio_buffer.clear":
-            self.odd_byte, self.pending = b"", np.zeros(0, dtype=np.float32)
+            # what reached the call is the model's, a partial frame included: it hears audio as it comes
+            self.odd_byte = b""
             if self.in_resampler is not None:
                 self.in_resampler.reset()
             await self.send(server_event("input_audio_buffer.cleared"))
@@ -1164,36 +1164,22 @@ class RealtimeConversation:
         self.odd_byte = odd_byte
         if self.key is None and not await self.open():
             return False
+        return await self._put(audio)
+
+    async def _put(self, audio: np.ndarray) -> bool:
+        """Resample ``audio`` to the stream's rate and append it to the call;
+        False if the call has ended (the relay reports why)."""
+        if self.in_resampler is not None and audio.size:
+            # off the event loop: a long append takes long enough to resample
+            # to stall every other socket
+            audio = await asyncio.to_thread(self.in_resampler.push, audio)
         if not audio.size:
             return True
-        # off the event loop: resampling and writing the frames is about a
-        # millisecond per frame, which every other socket would wait on
-        paths = await asyncio.to_thread(self._frames, audio)
-        if not paths:
-            return True
         try:
-            appended = self.api.stream_input(self.key, {"audio": paths},
-                                             file_streams={"audio": [self.stream] * len(paths)})
+            return self.api.stream_input(self.key, samples={self.stream: audio})
         except ValueError as exc:  # past the call's input budget: the call ends with it
-            appended = False
             self.api.reject_input(self.key, f"append rejected: {exc}", 400)
-        if not appended:   # the call has ended; the relay reports why
-            for path in paths:
-                Path(path).unlink(missing_ok=True)
-        return appended
-
-    def _frames(self, audio: np.ndarray) -> list[str]:
-        """Resample ``audio`` to the stream's rate and write each whole frame
-        as a WAV file; the rest waits for the next append."""
-        if self.in_resampler is not None:
-            audio = self.in_resampler.push(audio)
-        audio = np.concatenate([self.pending, audio]) if self.pending.size else audio
-        n = self.frame
-        whole = audio.size - audio.size % n
-        self.pending = audio[whole:]
-        upload = Path(self.api.upload_dir)
-        return [media_io.write_wav(audio[i:i + n], str(upload / f"{self.request_id}-{uuid.uuid4().hex[:8]}.wav"),
-                                   self.rate) for i in range(0, whole, n)]
+            return False
 
     async def open(self) -> bool:
         """Open the call's engine request; False, with an ``error`` sent, if

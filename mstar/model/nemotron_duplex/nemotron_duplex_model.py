@@ -72,7 +72,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ClientChunk, ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart
@@ -535,8 +535,9 @@ class NemotronDuplexModel(Model):
         # the streaming encoder's frame (FastConformerStreamSubmodule.frame_samples)
         frame = stt.hop_length * stt.encoder.subsampling_factor
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker"], connections=[
-            # the user's audio, one item per uploaded file or append, at most a
-            # session's samples: past them the talker KV and the decode loops run out
+            # the user's audio, which the data worker cuts on the encoder's frame
+            # (ClientAudio), at most a session's samples: past them the talker KV
+            # and the decode loops run out
             Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
                        limits=ClientStreamLimits(max_items=self.max_session_samples,
@@ -641,22 +642,6 @@ class NemotronDuplexModel(Model):
             NANO_KV: {"main": KVLabel(growth=(("decode", "decode_loop"),))},
             TALKER_KV: {"main": talker, "uncond": talker},
         }
-
-    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
-        # Each appended file is one stream item, in order; audio_in's max_items
-        # caps the call's samples as its audio grows. A piece of a stream can't
-        # be resampled or scaled alone without a seam at every append. The one
-        # client stream is audio_in, so a file's named stream changes nothing.
-        if chunk.text:
-            raise ValueError("this model takes audio appends only; got text")
-        for key, items in chunk.tensors.items():
-            if items and key != "audio_inputs":
-                raise ValueError(f"this model takes audio appends only; got {key.removesuffix('_inputs')}")
-        rate = self.config.stt.sample_rate
-        for meta in chunk.input_metadata.get("audio_inputs") or []:
-            if meta.get("source_sample_rate", rate) != rate:
-                raise ValueError(f"appends must be {rate} Hz audio; got {meta['source_sample_rate']} Hz")
-        return {AUDIO_IN: [self._checked_audio(w).clamp(-1.0, 1.0) for w in chunk.tensors.get("audio_inputs") or []]}
 
     @staticmethod
     def _checked_audio(wav: torch.Tensor) -> torch.Tensor:

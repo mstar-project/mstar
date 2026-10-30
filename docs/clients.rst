@@ -153,8 +153,8 @@ streaming back:
 Every field of the record is optional, but an append needs text, files or ``end_input``.
 ``stream`` names the client stream a file is for (the model decides when it is absent; a
 name the model doesn't have is rejected), and ``model_kwargs`` are this append's own: they
-reach only the model's ``process_stream_chunk``, so they mean what that model reads from
-them, and the opening message's still hold for the request (its sampling settings, say).
+reach only the model's ``process_stream_chunk`` (a model whose streams all declare their
+audio has none and ignores them), so they mean what that model reads from them, and the opening message's still hold for the request (its sampling settings, say).
 ``"append": [files]`` is short for ``"append": {"files": [files]}``. What a model takes
 in an append is its own. An append of text alone that the model turns into no stream item
 is rejected; text sent with files reaches the model, and if it ignores the text, the text
@@ -192,13 +192,12 @@ is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than 
 slot and start that far behind its input; a one-shot request waits in the queue. Other
 models ignore ``end_input``, and an append to them is rejected.
 Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``
-or ``/v1/realtime``. ``/v1/realtime`` cuts audio into the model's frames for you; over
-``/generate/ws`` the append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
-CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
-audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
-multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
-the call off the graph for the rest of its life. Other sizes are served the same, more
-slowly (see :doc:`models`).
+or ``/v1/realtime``. On either route, a model that declares its audio frame (Nemotron
+VoiceChat: 80 ms, 1280 samples at 16 kHz) gets a live call's audio in whole frames: each
+append's whole frames go on as one step and the rest waits for the next append, or goes
+with the stream's end. Nemotron runs a step of one frame as one CUDA graph, so appends of
+80 ms or less serve best; a larger append is served the same, as one step, more slowly
+(see :doc:`models`).
 
 .. code-block:: python
 
@@ -451,8 +450,9 @@ Per-model notes:
   between; audio between replies is silence and is not sent. ``turn_detection``
   ``server_vad`` and ``semantic_vad`` both mean "the model decides", and their knobs are
   not used; null, or ``create_response`` / ``interrupt_response`` false, are refused.
-  ``input_audio_buffer.commit`` is acknowledged and flushes nothing, ``clear`` drops a
-  partial frame, and ``conversation.item.create`` takes a user message of ``input_audio``
+  ``input_audio_buffer.commit`` is acknowledged and flushes nothing; ``clear`` drops only
+  what the server holds before the model (half a PCM16 sample, the resampler's few
+  milliseconds), since the model hears audio as it comes; and ``conversation.item.create`` takes a user message of ``input_audio``
   parts, all of them or none. ``response.create``, ``response.cancel``,
   ``output_audio_buffer.clear`` and the item-editing events are answered with an
   ``unsupported`` error, and the call goes on. Input transcription and tools are not

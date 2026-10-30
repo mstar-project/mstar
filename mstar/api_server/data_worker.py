@@ -547,6 +547,10 @@ class ClientCall:
     ended: set[str] = field(default_factory=set)
     # stream edge -> what it carried, charged against its max_items
     charged: dict[str, int] = field(default_factory=dict)
+    # ClientAudio stream edge -> the audio short of a whole frame, which goes
+    # with the stream's next item; a stream that ended with its partition
+    # keeps it unsent
+    tails: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class PreprocessWorkerThread:
@@ -593,13 +597,14 @@ class PreprocessWorkerThread:
         self._keyed_labels = {
             key: by_label for key, by_label in declared.items() if key in self._prefix_page_sizes
         }
-        # client stream edge -> the partition it flows into, which its items and
-        # ends name; the consuming node comes in the conductor's route
-        self._client_partitions = {
-            conn.edge_name: conn.to_partition for conn in model.get_partition_topology().client_connections()
+        # client stream edge -> its declaration: the partition it flows into,
+        # which its items and ends name, and its ClientAudio; the consuming
+        # node comes in the conductor's route
+        self._client_connections = {
+            conn.edge_name: conn for conn in model.get_partition_topology().client_connections()
         } if model is not None else {}
         # tensors under these names are client stream items, not prompt signals
-        self._client_edges = frozenset(self._client_partitions)
+        self._client_edges = frozenset(self._client_connections)
         self._model_config = model_config
         # per request of a model with client streams, those streams' state
         self._client_calls: dict[str, ClientCall] = {}
@@ -798,6 +803,7 @@ class PreprocessWorkerThread:
         call = None
         if self._client_edges:
             call = self._client_calls[input.request_id] = ClientCall(ended=set(input.ends))
+            stream_items = self._framed(call, stream_items, call.ended)
             self._charge_stream_items(call, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
         if stream_items:
@@ -870,7 +876,9 @@ class PreprocessWorkerThread:
                 return  # ended, failed or aborted: nothing will read it
             items: NameToTensorList = {}
             if chunk.file_paths or chunk.text:
-                items = self.model.process_stream_chunk(self._client_chunk(chunk))
+                loaded = self._client_chunk(chunk)
+                items = (self._client_audio_items(loaded) if self._audio_only
+                         else self.model.process_stream_chunk(loaded))
                 unknown = set(items) - self._client_edges
                 if unknown:  # the model's bug, not the client's: a 500
                     raise RuntimeError(
@@ -879,12 +887,15 @@ class PreprocessWorkerThread:
                     )
                 if chunk.text and not any(items.values()):
                     raise ValueError("this model takes no text in an append")
-                items = self._without_ended_streams(call, chunk, items)
-                self._charge_stream_items(call, items)
+            for name, audio in (chunk.samples or {}).items():
+                items.setdefault(name, []).append(torch.from_numpy(audio))
+            items = self._without_ended_streams(call, chunk, items)
+            ending = chunk.ends - call.ended
+            items = self._framed(call, items, ending)
+            self._charge_stream_items(call, items)
             items = {name: tensors for name, tensors in items.items() if tensors}
             if items:
                 self._send_stream_items(request_id, call, self._store_held(request_id, items), chunk.on_late)
-            ending = chunk.ends - call.ended
             call.ended |= ending
             if ending and call.route is not None:  # else they go once the route arrives
                 self._send_ends(request_id, call, ending)
@@ -904,6 +915,65 @@ class PreprocessWorkerThread:
             return items
         _answer_late(chunk.on_late, late)
         return {name: tensors for name, tensors in items.items() if name not in late}
+
+    @cached_property
+    def _audio_only(self) -> bool:
+        """Every client stream declares ``ClientAudio``: this thread turns the
+        model's appends into items itself, and the model has no
+        ``process_stream_chunk``."""
+        return bool(self._client_connections) and all(
+            conn.audio is not None for conn in self._client_connections.values())
+
+    def _client_audio_items(self, chunk: ClientChunk) -> NameToTensorList:
+        """An append's files as items of the ClientAudio streams they name (or
+        of the one stream, when the model has one), each already at its
+        stream's rate: resampling a piece of a stream alone would leave a seam
+        at every append."""
+        if chunk.text:
+            raise ValueError("this model takes audio appends only; got text")
+        for key, files in chunk.tensors.items():
+            if files and key != "audio_inputs":
+                raise ValueError(f"this model takes audio appends only; got {key.removesuffix('_inputs')}")
+        items: NameToTensorList = {}
+        files = chunk.tensors.get("audio_inputs") or []
+        metas = chunk.input_metadata.get("audio_inputs") or [{}] * len(files)
+        (only, *more) = self._client_connections
+        for wav, meta, name in zip(files, metas, chunk.streams.get("audio_inputs") or [], strict=True):
+            if name is None and more:
+                raise ValueError(f"name the client stream each audio file is for; this model takes "
+                                 f"{sorted(self._client_connections)}")
+            name = name or only
+            rate = self._client_connections[name].audio.sample_rate
+            got = meta.get("source_sample_rate", meta.get("sample_rate", rate))
+            if got != rate:
+                raise ValueError(f"{name} appends must be {rate} Hz audio; got {got} Hz")
+            items.setdefault(name, []).append(wav)
+        return items
+
+    def _framed(self, call: ClientCall, items: NameToTensorList, ending: Collection[str]) -> NameToTensorList:
+        """``items`` with each ClientAudio stream's cut on its consumer's
+        frame: what the stream holds, with the call's tail before it, goes as
+        one item of whole frames and the rest waits for the next append, so
+        every route keeps a live call on the frame grid. A stream that ends
+        here takes its tail along instead."""
+        out = dict(items)
+        for name in (items.keys() | set(ending)) & self._client_edges:
+            audio = self._client_connections[name].audio
+            if audio is None:
+                continue
+            pieces = [call.tails.pop(name)] if name in call.tails else []
+            for wav in items.get(name, ()):
+                if wav.dim() != 1:
+                    raise ValueError(f"{name} takes mono audio; got a {tuple(wav.shape)} tensor")
+                if not torch.isfinite(wav).all():
+                    raise ValueError("audio contains NaN or inf samples")
+                pieces.append(wav.clamp(-1.0, 1.0))
+            wav = torch.cat(pieces) if len(pieces) > 1 else (pieces[0] if pieces else torch.zeros(0))
+            whole = wav.numel() if name in ending else wav.numel() - wav.numel() % audio.frame_samples
+            if whole < wav.numel():
+                call.tails[name] = wav[whole:].clone()
+            out[name] = [wav[:whole]] if whole else []
+        return out
 
     def _route_client_streams(self, body: ClientStreamRoute) -> None:
         """Where a call's client streams go. The first route sends what the
@@ -948,7 +1018,7 @@ class PreprocessWorkerThread:
                 edge = GraphEdge(next_node=call.route.nodes[name], name=name, tensor_info=infos, is_streaming=True)
                 body = InputSignals(
                     request_id=request_id, inputs=[edge], request_info=None,
-                    partition_name=self._client_partitions[name],
+                    partition_name=self._client_connections[name].to_partition,
                 )
                 self.communicator.send_each(ranks, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, body))
                 call.items_sent[name] = call.items_sent.get(name, 0) + len(infos)
@@ -964,7 +1034,7 @@ class PreprocessWorkerThread:
         them."""
         ends: dict[tuple[str, str], dict[str, int]] = {}
         for name in sorted(names):
-            partition = self._client_partitions[name]
+            partition = self._client_connections[name].to_partition
             for worker in call.route.workers.get(name, ()):
                 ends.setdefault((worker, partition), {})[name] = call.items_sent.get(name, 0)
         for (worker, partition), counts in ends.items():

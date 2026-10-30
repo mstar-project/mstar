@@ -743,7 +743,9 @@ class Model(ABC):
 
         Keep it stateless: the consuming node folds items into its own state.
         Tensors ``process_prompt`` returns under a client edge's name are the
-        stream's first chunk, so a one-shot request needs no append.
+        stream's first chunk, so a one-shot request needs no append. A model
+        whose client streams all declare ``ClientAudio`` needs none: the data
+        worker turns its appends into items.
         """
         raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
 

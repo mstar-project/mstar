@@ -18,6 +18,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -42,6 +43,7 @@ from mstar.profile.format import RequestProfile, RequestTiming  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
     CLIENT,
+    ClientAudio,
     ClientStreamLimits,
     Connection,
     PartitionTopology,
@@ -429,6 +431,66 @@ def test_prompt_tensors_named_after_a_client_stream_are_its_first_chunk(tmp_path
     assert not new.input_open
     _route(wt)
     assert _signals(sent) == [("w0", "audio_in", [[8]], {}), ("w0", None, [], {"audio_in": 1})]
+
+
+class _FramedModel(_ListeningModel):
+    """``audio_in`` declares ClientAudio on a 4-sample frame, and the model
+    has no process_stream_chunk: the data worker turns its appends into items."""
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["Ear"], connections=[
+            Connection(from_partition=CLIENT, to_partition="Ear", edge_name="audio_in",
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), audio=ClientAudio(16000, 4)),
+        ])
+
+    def process_prompt(self, *a, **k):
+        return {"text_inputs": [torch.tensor([1])], "audio_in": [torch.zeros(6)]}
+
+    def process_stream_chunk(self, chunk):
+        raise AssertionError("the data worker takes ClientAudio appends itself")
+
+
+def test_client_audio_goes_on_in_whole_frames_whatever_the_appends(tmp_path):
+    """Each append's whole frames, the opening's included, go as one item
+    with the rest waiting for the next append, so every route keeps a call on
+    its consumer's frame; the stream's end takes the rest along, before it."""
+    wt, sent, _tm = _thread(_FramedModel())
+    _open(wt)                                                                 # 6: 4 and 2 left
+    _route(wt)
+    for append in (
+        ClientAppend("r", samples={"audio_in": np.full(1, 0.5, np.float32)}),   # 3: nothing yet
+        ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 9)]}),   # 12
+        ClientAppend("r", samples={"audio_in": np.zeros(5, np.float32)}),        # 4 and 1 left
+        ClientAppend("r", ends=END),                                             # the 1, then the end
+    ):
+        wt._process_stream_input(append)
+
+    assert _signals(sent) == [("w0", "audio_in", [[n]], {}) for n in (4, 12, 4, 1)] + [
+        ("w0", None, [], {"audio_in": 4})]
+
+
+@pytest.mark.parametrize("append, error", [
+    (ClientAppend("r", text="hello"), b"audio appends only; got text"),
+    (ClientAppend("r", samples={"audio_in": np.array([0.0, np.nan], np.float32)}), b"NaN or inf"),
+    (ClientAppend("r", samples={"audio_in": np.zeros((2, 2), np.float32)}), b"mono audio"),
+    ("48000", b"must be 16000 Hz audio; got 48000 Hz"),
+])
+def test_client_audio_appends_are_checked_before_they_are_sent(tmp_path, append, error):
+    class _Resampled(_FramedModel):
+        def load_audio(self, filepath, device):
+            out = super().load_audio(filepath, device)
+            return TensorAndMetadata(out.data, {"sample_rate": 16000, "source_sample_rate": 48000})
+
+    wt, sent, _tm = _thread(_Resampled())
+    _open(wt)
+    _route(wt)
+    if append == "48000":
+        append = ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 8)]})
+    wt._process_waiting_input(append)
+
+    reply = wt.out_queue.get_nowait()
+    assert reply.metadata["status"] == 400 and error in reply.data
+    assert _signals(sent) == [("w0", "audio_in", [[4]], {})]   # the opening's frame alone
 
 
 def test_an_append_for_a_finished_request_is_dropped(tmp_path):
@@ -999,13 +1061,17 @@ def test_an_opening_file_naming_a_stream_the_model_lacks_is_refused_with_a_400()
     assert isinstance(server.preprocess_worker.items[0], PreprocessInput)
 
 
-def test_an_append_s_text_counts_against_the_input_budget():
+def test_an_append_s_text_and_samples_count_against_the_input_budget():
     server = _server()
+    server.client_audio = [Connection(CLIENT, "Ear", "audio_in", chunk_policy_factory=lambda: None,
+                                      audio=ClientAudio(16000, 4))]
     server.max_call_input_bytes = 8
     key = _submit(server, end_input=False)
     assert server.stream_input(key, text="four") is True                 # 4 of 8
     with pytest.raises(ValueError, match="max_call_input_mb"):
         server.stream_input(key, text="fives")                           # 9 of 8
+    with pytest.raises(ValueError, match="max_call_input_mb"):
+        server.stream_input(key, samples={"audio_in": np.zeros(2, np.float32)})   # 12 of 8
     assert server.preprocess_worker.items[-1] == ClientAppend(key, text="four")
 
 

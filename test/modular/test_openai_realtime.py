@@ -1114,7 +1114,7 @@ class _DuplexModel:
 
 
 class _DuplexAPI:
-    """One live call: records its opening and each append's frames, and
+    """One live call: records its opening and each append's samples, and
     plays ``outputs`` as the call's result chunks; with ``end`` the call
     then ends, else its output goes on."""
 
@@ -1128,7 +1128,7 @@ class _DuplexAPI:
         self.end = end
         self.upload_dir = Path(tempfile.mkdtemp())
         self.submits: list = []
-        self.appends: list[list[np.ndarray]] = []
+        self.appends: list[np.ndarray] = []
         self.aborted: list = []
         self.outputs = list(outputs)
 
@@ -1139,15 +1139,9 @@ class _DuplexAPI:
     def submission_key(self, request_id):
         return request_id
 
-    def stream_input(self, key, file_paths, file_streams=None, **kw):
-        assert file_streams == {"audio": ["audio_in"] * len(file_paths["audio"])}
-        frames = []
-        for path in file_paths["audio"]:
-            with wave.open(path) as wav:
-                assert wav.getframerate() == 16000
-                frames.append(np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2") / 32768.0)
-            Path(path).unlink()
-        self.appends.append(frames)
+    def stream_input(self, key, file_paths=None, *, samples, **kw):
+        assert file_paths is None and set(samples) == {"audio_in"}
+        self.appends.append(samples["audio_in"])
         return True
 
     async def _chunks(self):
@@ -1202,10 +1196,10 @@ def test_a_conversation_needs_turn_tokens(duplex):
 
 
 @pytest.mark.parametrize("fmt", [{"type": "audio/pcm", "rate": 24000}, {"type": "audio/pcmu"}])
-def test_conversation_audio_reaches_the_model_as_whole_frames(duplex, fmt):
+def test_conversation_audio_reaches_the_stream_resampled(duplex, fmt):
     """Audio in the client's codec and rate reaches the stream resampled to
-    16 kHz and cut into 80 ms frames, the same however the appends split it:
-    a partial frame waits for the next append."""
+    16 kHz, the same however the appends split it (the data worker cuts it
+    into the stream's frames)."""
     from mstar.api_server import media_io
 
     client, api = duplex()
@@ -1228,10 +1222,9 @@ def test_conversation_audio_reaches_the_model_as_whole_frames(duplex, fmt):
             start += n
         _send(ws, "input_audio_buffer.commit")
         _recv_until(ws, "input_audio_buffer.committed")
-    frames = [f for append in api.appends for f in append]
     assert len(api.submits) == 1 and api.submits[0]["end_input"] is False
-    assert [f.size for f in frames] == [1280] * (expected.size // 1280) and len(frames) == 6
-    np.testing.assert_allclose(np.concatenate(frames), expected[:len(frames) * 1280], atol=1 / 32768)
+    assert all(a.dtype == np.float32 for a in api.appends)
+    np.testing.assert_allclose(np.concatenate(api.appends), expected, atol=1 / 32768)
 
 
 def _text(step, data=b"", mark=None):
@@ -1401,7 +1394,7 @@ def test_an_item_is_reported_only_when_its_audio_was_taken(duplex, monkeypatch):
         added = json.loads(ws.receive_text())
     assert added["type"] == "conversation.item.added"
     assert added["item"]["content"] == [{"type": "input_audio"}]
-    assert sum(len(a) for a in api.appends) == 1
+    assert len(api.appends) == 1
 
 
 def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
@@ -1428,4 +1421,4 @@ def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
         _send(ws, "input_audio_buffer.commit")
         _recv_until(ws, "input_audio_buffer.committed")
         assert not api.aborted
-    assert len(api.submits) == 1 and sum(len(a) for a in api.appends) == 2
+    assert len(api.submits) == 1 and len(api.appends) == 2

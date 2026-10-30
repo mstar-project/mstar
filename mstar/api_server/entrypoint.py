@@ -19,7 +19,7 @@ from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgpack
 import uvicorn
@@ -70,6 +70,9 @@ from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -787,13 +790,16 @@ class APIServer:
         file_streams: dict[str, list[str | None]] | None = None,
         model_kwargs: dict | None = None,
         on_late: Callable[[str], None] | None = None,
+        samples: "dict[str, np.ndarray] | None" = None,
     ) -> bool:
         """Append text and files to a running request's client streams, then
         end them: all of them if ``end_input`` is True, or the client streams
         it names. The preprocess worker deletes the files once loaded.
         ``file_streams`` names, per modality in ``file_paths``' order, the
         client stream each file is for (None: the model decides);
-        ``model_kwargs`` are this append's own. ``on_late`` answers the
+        ``model_kwargs`` are this append's own. ``samples`` appends decoded
+        mono float32 audio to ``ClientAudio`` streams, at each one's declared
+        rate, without a file. ``on_late`` answers the
         append as late if the model routes any of it to a stream that has
         ended (by the client, or with its consuming partition), which only
         the preprocess worker can tell.
@@ -809,7 +815,9 @@ class APIServer:
         """
         named = self._check_streams(
             name for names in (file_streams or {}).values() for name in names if name is not None
-        )
+        ) | self._check_streams(samples or ())
+        if not_audio := set(samples or ()) - {conn.edge_name for conn in self.client_audio}:
+            raise ValueError(f"samples go only to a ClientAudio stream, not {sorted(not_audio)}")
         ending = None if end_input is True else self._check_streams(end_input or ())
         with self.request_lock:
             req = self.pending_requests.get(key)
@@ -819,7 +827,8 @@ class APIServer:
                 ending = req.open_streams
             if (named | ending) - req.open_streams:
                 return False  # late for a stream the client already ended
-            size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
+            size = (req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
+                    + sum(audio.nbytes for audio in (samples or {}).values()))
             self._check_call_input(size)
             req.input_bytes = size
             req.last_input_time = time.time()
@@ -827,7 +836,7 @@ class APIServer:
             # under the lock: an append can't land behind its call's end
             self.preprocess_worker.stream_input(ClientAppend(
                 key, file_paths=file_paths, ends=ending, text=text,
-                file_streams=file_streams, model_kwargs=model_kwargs, on_late=on_late,
+                file_streams=file_streams, model_kwargs=model_kwargs, on_late=on_late, samples=samples,
             ))
         return True
 

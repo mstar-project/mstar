@@ -48,9 +48,12 @@ def _consumer_problems(model: Model, connections: list[Connection]) -> list[str]
     if not connections:
         return []
     problems = []
-    if type(model).process_stream_chunk is Model.process_stream_chunk:
+    # the data worker turns appends into ClientAudio items itself
+    if type(model).process_stream_chunk is Model.process_stream_chunk and any(
+            conn.audio is None for conn in connections):
         problems.append(
-            f"{type(model).__name__} declares client streams but does not implement process_stream_chunk"
+            f"{type(model).__name__} declares client streams without ClientAudio but does not implement "
+            "process_stream_chunk"
         )
     names = [conn.edge_name for conn in connections]
     problems += [

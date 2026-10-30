@@ -26,7 +26,6 @@ from mstar.engine.resources import (
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
-from mstar.model.base import ClientChunk
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
     ENCODER_FRONT,
@@ -561,15 +560,6 @@ def test_duplex_process_prompt_scales_a_multi_file_upload_as_one():
     assert torch.allclose(torch.cat(out), torch.cat([wav, wav / 8.0]), atol=1e-6)
 
 
-def _append(tensors, input_metadata=None, text=None):
-    """An append of ``tensors`` as the data worker hands it to the hook."""
-    return ClientChunk(
-        text=text, tensors=tensors, input_metadata=input_metadata or {},
-        streams={key: [None] * len(items) for key, items in tensors.items()},
-        model_kwargs={}, request_kwargs={},
-    )
-
-
 def test_duplex_audio_in_caps_a_call_at_the_session_in_samples():
     """The client stream, not the encoder, enforces the session cap, so a live
     call past it gets a 400 naming the limit; a deployment may lower the cap
@@ -588,40 +578,15 @@ def test_duplex_audio_in_caps_a_call_at_the_session_in_samples():
     assert "may lower" in problem
 
 
-def test_duplex_appended_audio_becomes_stream_items_in_order():
-    """Each appended file streams as ``audio_in`` items, checked like an upload
-    but with no length limit of its own: a live chunk can be shorter than a frame,
-    and audio_in's max_items caps the call's samples as it grows."""
-    model = _make_model()
-    short, loud = torch.zeros(320), torch.full((1280,), 4.0)
-    items = model.process_stream_chunk(_append({"audio_inputs": [short, loud]}, {"audio_inputs": [{}, {}]}))["audio_in"]
-    assert [w.numel() for w in items] == [320, 1280]
-    assert float(items[1].abs().max()) == 1.0           # clamped, not rescaled: no seam
-    wav = torch.zeros(16)
-    wav[3] = float("nan")
-    with pytest.raises(ValueError, match="NaN or inf"):
-        model.process_stream_chunk(_append({"audio_inputs": [wav]}))
-    with pytest.raises(ValueError, match="16000 Hz"):
-        model.process_stream_chunk(_append({"audio_inputs": [short]},
-                                           {"audio_inputs": [{"source_sample_rate": 48000}]}))
-    with pytest.raises(ValueError, match="audio appends only"):
-        model.process_stream_chunk(_append({"image_inputs": [torch.zeros(3, 4, 4)]}))
-    with pytest.raises(ValueError, match="audio appends only; got text"):
-        model.process_stream_chunk(_append({}, text="hello"))
-
-
-def test_duplex_an_upload_or_append_is_one_stream_item():
+def test_duplex_an_upload_is_one_stream_item():
     """A file streams whole, so a one-file upload is one encoder step, as the
     offline encoder ran it (a long item is not batched with other calls')."""
     model = _make_model()
     long = torch.rand(20 * model.config.stt.sample_rate + 777) - 0.5
-    for items in (
-        model.process_prompt(
-            None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [long]},
-        ).new_input_tensors["audio_in"],
-        model.process_stream_chunk(_append({"audio_inputs": [long]}, {"audio_inputs": [{}]}))["audio_in"],
-    ):
-        assert len(items) == 1 and torch.equal(items[0], long)
+    (item,) = model.process_prompt(
+        None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [long]},
+    ).new_input_tensors["audio_in"]
+    assert torch.equal(item, long)
 
 
 def test_duplex_load_audio_refuses_a_file_longer_than_a_session_without_decoding_it_all(tmp_path, monkeypatch):

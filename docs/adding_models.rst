@@ -2400,7 +2400,8 @@ producer ``CLIENT``:
 chunk policy, exactly as it would a stream from another partition. Its partition
 self-triggers from the stream, so its forward-pass args send no inputs. That node must be
 the only one, in any walk, that takes the edge; the conductor checks this at startup, and
-that the model implements ``process_stream_chunk``. A partition may take several client
+that the model implements ``process_stream_chunk`` unless each client stream declares
+``ClientAudio`` (below). A partition may take several client
 streams (audio and video, say): each has its own buffer and its own end.
 
 - ``process_stream_chunk(chunk)`` turns each append the client sends into stream items,
@@ -2430,9 +2431,14 @@ streams (audio and video, say): each has its own buffer and its own end.
   ``sample_rate``, whose consumer computes on frames of ``frame_samples``. ``/v1/realtime``
   then serves the model as a conversation (:doc:`clients`), when only one of its client
   streams declares it: the route decodes the caller's codec, resamples to
-  ``sample_rate`` and appends exactly one frame of ``frame_samples`` per item, holding a
-  partial frame for the next message, and turns the model's output back into the
-  caller's format from ``get_output_sample_rate``. Nemotron VoiceChat declares
+  ``sample_rate`` and turns the model's output back into the caller's format from
+  ``get_output_sample_rate``. On every route the data worker, the stream's producer,
+  sends it in whole frames: an append's whole frames (the opening's included) go as
+  one item and the rest waits for the next append, or goes with the stream's end. A
+  model whose client streams all declare ``ClientAudio`` needs no
+  ``process_stream_chunk``: the data worker takes appended audio files at
+  ``sample_rate`` (one at another rate is refused: resampling an append alone leaves a
+  seam), refuses non-finite samples and clamps to [-1, 1]. Nemotron VoiceChat declares
   ``ClientAudio(16000, 1280)``: its encoder's 80 ms frame, taken from the encoder's own
   hop and subsampling.
 - A model that declares ``ClientAudio`` decides when to speak (full duplex). To serve
