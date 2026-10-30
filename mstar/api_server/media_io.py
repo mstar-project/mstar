@@ -564,6 +564,11 @@ class StreamResampler:
         n = np.arange(-self.half, self.half + 1)
         cutoff = rolloff * 0.5 / max(self.up, self.down)          # cycles per upsampled sample
         self.kernel = 2 * cutoff * np.sinc(2 * cutoff * n) * np.kaiser(n.size, beta) * self.up
+        # the kernel by phase: row p weighs inputs -span..span around the one
+        # an output's center falls p upsampled samples past
+        self._span = self.half // self.up + 1
+        idx = np.arange(self.up)[:, None] - np.arange(-self._span, self._span + 1) * self.up + self.half
+        self._phases = np.where((idx >= 0) & (idx <= 2 * self.half), self.kernel[np.clip(idx, 0, 2 * self.half)], 0.0)
         self.reset()
 
     def reset(self) -> None:
@@ -593,16 +598,15 @@ class StreamResampler:
         if k_end <= self._k_out or not self._buf.size:
             n, self._k_out = max(0, k_end - self._k_out), max(self._k_out, k_end)
             return np.zeros(n, dtype=np.float32)
-        span = half // up + 1
-        taps = np.arange(-span, span + 1)[None, :]
+        span = self._span
+        # inputs before the stream and past what has arrived are silence
+        windows = np.lib.stride_tricks.sliding_window_view(
+            np.concatenate([np.zeros(span), self._buf, np.zeros(span + 1)]), 2 * span + 1)
         out = []
         for k0 in range(self._k_out, k_end, 4096):              # bounds the gather to 4096 rows
-            t = np.arange(k0, min(k0 + 4096, k_end))[:, None] * down   # centers, upsampled
-            ns = t // up + taps                                  # candidate input indices
-            idx = t - ns * up + half
-            ok = (idx >= 0) & (idx <= 2 * half) & (ns >= 0) & (ns < self._n_in)
-            vals = self._buf[np.clip(ns - self._base, 0, self._buf.size - 1)]
-            out.append((np.where(ok, vals * self.kernel[np.clip(idx, 0, 2 * half)], 0.0)).sum(axis=1))
+            t = np.arange(k0, min(k0 + 4096, k_end)) * down      # centers, upsampled
+            # row t // up - base holds the inputs within span of the center's
+            out.append(np.einsum("ij,ij->i", windows[t // up - self._base], self._phases[t % up]))
         self._k_out = k_end
         keep = max(self._base, -(-(k_end * down - half) // up))  # first input the next output needs
         self._buf = self._buf[keep - self._base:]

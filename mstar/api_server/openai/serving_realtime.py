@@ -109,9 +109,10 @@ G711_RATE = 8000
 # append costs (at most 6x its samples, about 100 taps each), which a bound on
 # the kernel's size alone does not.
 REALTIME_RATES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000)
-# Appends up to this many input samples (4 ms at 24 kHz) cost less to resample
-# than a thread hop, so they resample on the event loop; longer ones go to a thread.
-INLINE_RESAMPLE_SAMPLES = 96
+# Audio up to this many samples (80 ms at 24 kHz) resamples in under half a
+# millisecond, short enough for the event loop every socket shares, and
+# saves the thread hop; longer audio goes to a thread.
+INLINE_RESAMPLE_SAMPLES = 1920
 # Longest server_vad prefix padding or silence window.
 MAX_VAD_MS = 10_000
 DEFAULT_CHUNK_SECONDS = 2.0
@@ -1170,9 +1171,9 @@ class RealtimeConversation:
         """Resample ``audio`` to the stream's rate and append it to the call;
         False if the call has ended (the relay reports why)."""
         if self.in_resampler is not None and audio.size:
-            # off the event loop: a long append takes long enough to resample
-            # to stall every other socket
-            audio = await asyncio.to_thread(self.in_resampler.push, audio)
+            # a long append, off the event loop: it would stall every other socket
+            audio = (self.in_resampler.push(audio) if audio.size <= INLINE_RESAMPLE_SAMPLES
+                     else await asyncio.to_thread(self.in_resampler.push, audio))
         if not audio.size:
             return True
         try:
@@ -1294,7 +1295,8 @@ class RealtimeConversation:
         if turn is None:
             return   # silence between replies
         last = turn.end == step
-        audio = await asyncio.to_thread(self._encode_out, pcm, last)
+        audio = (self._encode_out(pcm, last) if len(pcm) <= 2 * INLINE_RESAMPLE_SAMPLES
+                 else await asyncio.to_thread(self._encode_out, pcm, last))
         if audio:
             await self.send(content_event("response.output_audio.delta", turn.response_id, turn.item_id, delta=audio))
         if last:
