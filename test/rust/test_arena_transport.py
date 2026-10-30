@@ -732,7 +732,20 @@ def test_a_sharded_edge_still_names_its_arena_segment(tmp_path):
     ] == [(0, 64, (2, 8)), (64, 64, (2, 8))]
 
 
-def test_a_peer_reads_its_own_half_of_a_sharded_edge(tmp_path):
+def _read_edges(cons, edges, batched: bool) -> None:
+    """Read ``edges`` and wait for the copies, inside a read batch if asked, as
+    the worker's message pass does."""
+    if batched:
+        cons.begin_read_batch()
+    futures = cons.start_read_tensors(7, edges, graph_walk="decode") or []
+    if batched:
+        futures = [*futures, *cons.end_read_batch()]
+    for fut in futures:
+        fut.result()
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["plain", "read-batch"])
+def test_a_peer_reads_its_own_half_of_a_sharded_edge(tmp_path, batched):
     """End to end: the descriptor the refresh produced is one a peer can
     actually read its shard out of."""
     prod = _manager("worker_0", tmp_path)
@@ -762,9 +775,7 @@ def test_a_peer_reads_its_own_half_of_a_sharded_edge(tmp_path):
         cons = _manager(worker, tmp_path)
         # get_ready_tensors acks the producer; _NullCommunicator refuses sends.
         cons.communicator = _RecordingCommunicator()
-        wire_edge = fanout[worker]
-        for f in cons.start_read_tensors(7, [wire_edge], graph_walk="decode") or []:
-            f.result()
+        _read_edges(cons, [fanout[worker]], batched)
         ready = cons.get_ready_tensors(graph_walk="decode")
         assert 7 in ready and len(ready[7]) == 1, f"rank {rank} read nothing"
         got = cons.get_tensor(ready[7][0].tensor_info[0].uuid)
@@ -777,7 +788,8 @@ def test_a_peer_reads_its_own_half_of_a_sharded_edge(tmp_path):
     pytest.param((4, 0), id="empty-rows"),
 ])
 @pytest.mark.parametrize("backend", ["python", "rust"])
-def test_two_slices_of_one_tensor_on_one_worker_do_not_alias(tmp_path, backend, shape):
+@pytest.mark.parametrize("batched", [False, True], ids=["plain", "read-batch"])
+def test_two_slices_of_one_tensor_on_one_worker_do_not_alias(tmp_path, backend, shape, batched):
     """``x`` goes from a TP=1 producer to a TP=2 ``B`` and a TP=4 ``C``, both
     with rank 0 on worker_1, which so receives rows [0, 2) and row 0 under one
     producer uuid. Keyed by the uuid alone, ``C`` got ``B``'s rows."""
@@ -817,8 +829,7 @@ def test_two_slices_of_one_tensor_on_one_worker_do_not_alias(tmp_path, backend, 
     prod.register_for_send_uuids(ParallelList([7], [[info.uuid]]))
     prod.refresh_shm_placement(edges)
 
-    for fut in cons.start_read_tensors(7, edges, graph_walk="decode") or []:
-        fut.result()
+    _read_edges(cons, edges, batched)
     ready = cons.get_ready_tensors(graph_walk="decode")[7]
     got = {e.next_node: cons.get_tensor(e.tensor_info[0].uuid) for e in ready}
     assert torch.equal(got["B"], x[:2])
@@ -832,7 +843,8 @@ def test_two_slices_of_one_tensor_on_one_worker_do_not_alias(tmp_path, backend, 
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
-def test_an_edge_mixing_a_reused_and_a_new_slice_is_read_in_full(tmp_path, backend):
+@pytest.mark.parametrize("batched", [False, True], ids=["plain", "read-batch"])
+def test_an_edge_mixing_a_reused_and_a_new_slice_is_read_in_full(tmp_path, backend, batched):
     """``x`` holds a tensor with rows and one with none. ``C``'s slice of the
     empty one is ``B``'s, so it is reused while its other slice is new: the
     new one still drops its transit ref."""
@@ -872,8 +884,7 @@ def test_an_edge_mixing_a_reused_and_a_new_slice_is_read_in_full(tmp_path, backe
     prod.register_for_send_uuids(ParallelList([7], [[i.uuid for i in infos]]))
     prod.refresh_shm_placement(edges)
 
-    for fut in cons.start_read_tensors(7, edges, graph_walk="decode") or []:
-        fut.result()
+    _read_edges(cons, edges, batched)
     ready = cons.get_ready_tensors(graph_walk="decode")[7]
     got = {e.next_node: cons.get_tensor(e.tensor_info[0].uuid) for e in ready}
     assert torch.equal(got["B"], full[:2])
@@ -1543,3 +1554,48 @@ def test_teardown_inside_a_batch_acks_the_reads_it_deferred(tmp_path, host_rows_
     assert [fp.request_id for fp in cons.pending] == [101] * 3
     cons.end_read_batch()
     assert [fp.request_id for fp in cons.pending] == [101] * 3
+
+
+def test_each_slice_read_twice_in_a_batch_is_stored_once_with_both_reads_refs(tmp_path):
+    """The batch's later reads of a slice take a reference on what its first read
+    stores, for the slice stored under the producer's uuid and for one of the
+    process's own."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes=["A"], tp_size=1, graph_walks=["decode"], _tp_rank=0),
+            ShardingGroup(nodes=["B"], tp_size=2, graph_walks=["decode"]),
+            ShardingGroup(nodes=["C"], tp_size=4, graph_walks=["decode"]),
+        ],
+        tp_enabled_nodes={"A", "B", "C"},
+        shard_dim={"x": 0},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["worker_0"],
+        NodeAndGraphWalk("B", "decode"): ["worker_1", "worker_2"],
+        NodeAndGraphWalk("C", "decode"): [f"worker_{i}" for i in range(1, 5)],
+    })
+    prod = _manager("worker_0", tmp_path)
+    cons = _consumer("worker_1", tmp_path, "python")
+    for mgr in (prod, cons):
+        mgr.register_request(7, cfg)
+
+    x = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    (info,) = prod.store_and_return_tensor_info(7, {"x": [x]}, node_name="A", graph_walk="decode")["x"]
+    edges = [
+        cfg.fanout_graph_edges(
+            GraphEdge(next_node=node, name="x", tensor_info=[info]),
+            source_node="A", source_graph_walk="decode", dest_graph_walk="decode",
+        )["worker_1"]
+        for node in ("B", "C", "B", "C")
+    ]
+    prod.register_for_send_uuids(ParallelList([7], [[info.uuid]]))
+    prod.refresh_shm_placement(edges)
+
+    _read_edges(cons, edges, batched=True)
+
+    ready = cons.get_ready_tensors(graph_walk="decode")[7]
+    uuids = {e.next_node: e.tensor_info[0].uuid for e in ready}
+    assert len(ready) == 4 and uuids["B"] != uuids["C"]
+    assert torch.equal(cons.get_tensor(uuids["B"]), x[:2]) and torch.equal(cons.get_tensor(uuids["C"]), x[:1])
+    assert [_ref_count(cons, uuids[node]) for node in "BC"] == [2, 2]  # two usages each; the transit refs are gone
+    assert [msg.body.successful_tensors for _, msg in cons.communicator.sent] == [{info.uuid: 4}]
