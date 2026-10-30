@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import repeat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 
@@ -46,6 +46,7 @@ from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     AdmitOutcome,
 )
+from mstar.engine.rows import NodeRows
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
@@ -509,6 +510,8 @@ class Engine:
         # that is not sharded is in neither: it owns its own eviction.
         self._tp_leader_nodes: set[str] = set()
         self._tp_follower_nodes: set[str] = set()
+        # node -> its walks that keep persistent rows (``mstar.engine.rows``)
+        self._rows: dict[str, NodeRows] = {}
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
@@ -699,6 +702,10 @@ class Engine:
                 node_name, submodule_mgmt
             )
 
+        # Row buffers too have the address the graphs record, so they are
+        # registered before any capture.
+        self._build_rows(ag_runners)
+
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
         # buffers an earlier node's graphs already recorded the address of.
@@ -753,6 +760,16 @@ class Engine:
             for bs, tokens in runner.dropped_shapes
         ])
 
+        for node_name, node_rows in self._rows.items():
+            for walk in node_rows.walks:
+                cap = self.get_max_batch_size(node_name, walk)
+                rows = node_rows.space(walk).max_rows
+                if cap is None or cap > rows:
+                    raise ValueError(
+                        f"{node_name}: walk {walk!r} may run steps of {cap} rows "
+                        f"but its persistent rows hold {rows}"
+                    )
+
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules()
@@ -762,6 +779,88 @@ class Engine:
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
+
+    def _build_rows(self, ag_runners: dict[str, AcceleratorGraphRunner]) -> None:
+        """Each node's persistent-row walks, sized to the most rows a step of
+        the walk may hold: its batch cap (the submodule's and the walk's
+        capture configs'), padded up to the capture that holds it."""
+        for node_name, submodule_mgmt in self._submodules.items():
+            walks = submodule_mgmt.submodule.persistent_row_walks()
+            if not walks:
+                continue
+            if node_name in self._tp_leader_nodes or node_name in self._tp_follower_nodes:
+                # every rank would have to agree on each step's row order
+                raise ValueError(
+                    f"{node_name}: persistent rows are not supported on a "
+                    "tensor- or sequence-parallel node yet"
+                )
+
+            shared = sorted(
+                key for key, resource in submodule_mgmt.resources.items()
+                if any(
+                    resource is theirs
+                    for other, mgmt in self._submodules.items() if other != node_name
+                    for theirs in mgmt.resources.values()
+                )
+            )
+            if shared:
+                # rows are checked in per node, so another node's step would
+                # read the resource's stale per-request state
+                raise ValueError(
+                    f"{node_name}: persistent rows need resources of their own, "
+                    f"but {shared} are shared with other nodes"
+                )
+
+            def max_rows(walk, submodule=submodule_mgmt.submodule, runner=ag_runners[node_name]):
+                caps = [submodule.max_batch_size(walk), runner.max_batch_size_for(walk)]
+                caps = [cap for cap in caps if cap is not None]
+                return runner.padded_batch_size_for(walk, min(caps)) if caps else None
+
+            self._rows[node_name] = NodeRows.build(
+                node_name, walks, max_rows, submodule_mgmt.resources, self._device,
+            )
+
+    def _enter_rows(self, batch: ExecutingBatch, preplan: bool = False) -> Sequence[int] | None:
+        """The step's rids in the order it runs: a persistent walk's in row
+        order, proposing its rows. On the gpu thread, put the batch in that
+        order and check in the rows any other step of the node runs. None for
+        a pre-plan that has to wait for that check-in.
+
+        A pre-plan leaves the batch as it is, since the main thread may still
+        be dropping rows from it; exec reorders it."""
+        node_rows = self._rows.get(batch.node_name)
+        if node_rows is None:
+            return batch.request_ids
+        ctx = batch.step_context
+        walk = ctx.graph_walk
+        if not node_rows.persistent(walk):
+            if preplan:
+                # the check-in lands in stream order on the gpu thread, and
+                # this step's plan reads what it writes back
+                return None if node_rows.holds_any(batch.request_ids) else batch.request_ids
+            node_rows.check_in(batch.request_ids)
+            return batch.request_ids
+        rids = batch.request_ids
+        # a request may hold a row of another persistent walk of the node
+        if preplan:
+            if node_rows.holds_any(rids, skip_walk=walk):
+                return None
+        else:
+            node_rows.check_in(rids, skip_walk=walk)
+        rows = ctx.rows
+        if rows is None or rows.stale or (
+            tuple(rows.order) != tuple(rids) and set(rows.order) != set(rids)
+        ):
+            rows = ctx.rows = node_rows.begin(walk, rids)
+        order = rows.order
+        if preplan:
+            return order
+        if tuple(order) != tuple(rids):
+            if batch.inputs is not None:
+                at = {rid: i for i, rid in enumerate(rids)}
+                batch.inputs = [batch.inputs[at[rid]] for rid in order]
+            batch.request_ids = list(order)
+        return batch.request_ids
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],
@@ -1320,6 +1419,8 @@ class Engine:
                 node_name=batch.node_name,
             ):
                 laps = PhaseLaps("engine.exec.")
+                self._enter_rows(batch)
+                laps.lap("rows")
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
                 laps.lap("reserve_slot")
@@ -1331,6 +1432,11 @@ class Engine:
                     batch.rows_only = False
                     batch.loopback_rids = frozenset()
                 if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
+                    if batch.step_context.rows is not None:
+                        raise RuntimeError(
+                            f"{batch.node_name}: walk {batch.graph_walk!r} keeps "
+                            "persistent rows, so its steps must run batched"
+                        )
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
@@ -1348,6 +1454,7 @@ class Engine:
             if batch.preplanned_rids is not None and self._runner.staged:
                 self._runner.clear_preplan()
                 batch.preplanned_rids = None
+            batch.step_context.rows = None
             raise
         finally:
             batch.preplan_event = None
@@ -1392,6 +1499,8 @@ class Engine:
                 nvtx=self._enable_nvtx, step=batch.step
             )
             if not admit.ok:
+                # the retry proposes its rows afresh
+                batch.step_context.rows = None
                 return BatchedModelOutput(
                     per_rid_outputs={rid: {} for rid in batch.request_ids}
                 )
@@ -1732,6 +1841,17 @@ class Engine:
             phase_end("engine.preprocess", t0)
             if nvtx:
                 range_pop()
+
+        rows = ctx.rows
+        if rows is not None:
+            t0 = phase_start()
+            # after every resource planned, so one upload carries all their
+            # writes; committed before the launch releases the main thread,
+            # which may then remove a request this step checked in
+            rows.stage()
+            self._rows[batch.node_name].commit(ctx.graph_walk, rows)
+            rows.apply()
+            phase_end("engine.rows", t0)
 
         if self._enable_profile and batch.exec_timings.fwd_start is None:
             batch.exec_timings.fwd_start = time.perf_counter()
@@ -2488,16 +2608,22 @@ class Engine:
     ) -> bool:
 
         laps = PhaseLaps("engine.pre_plan.")
+        rids = batch.request_ids
+        order = self._enter_rows(batch, preplan=True)
+        if order is None:
+            return False
+        laps.lap("rows")
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
-        inputs = (
-            cg_runner.declare_inputs_for(lease)
-            if batch.inputs is None
-            else cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
-        )
-        batch.step_context.set_padded_rids(
-            cg_runner.step_ids(lease, batch.request_ids)
-        )
+        if batch.inputs is None:
+            inputs = cg_runner.declare_inputs_for(lease)
+        else:
+            inputs = batch.inputs
+            if order is not rids and tuple(order) != tuple(rids):
+                at = {rid: i for i, rid in enumerate(rids)}
+                inputs = [inputs[at[rid]] for rid in order]
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
+        batch.step_context.set_padded_rids(cg_runner.step_ids(lease, order))
         laps.lap("pad")
         t0 = phase_start()
         step = submodule_mgmt.submodule.declare_step(
@@ -2536,7 +2662,7 @@ class Engine:
             laps.skip()
             batch.preplan_event = torch.Event(device=self._device)
             batch.preplan_event.record(stream)
-            batch.preplanned_rids = tuple(batch.request_ids)
+            batch.preplanned_rids = tuple(order)
             laps.lap("event")
         finally:
             batch.step_context.is_preplan = False
@@ -2544,10 +2670,13 @@ class Engine:
 
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
         """Whether the staged plan no longer describes this batch."""
-        return (
-            batch.preplanned_rids is not None
-            and batch.preplanned_rids != tuple(batch.request_ids)
-        )
+        if batch.preplanned_rids is None:
+            return False
+        rows = batch.step_context.rows
+        if rows is not None:
+            # planned in row order, which exec puts the batch in (_enter_rows)
+            return rows.stale or set(batch.preplanned_rids) != set(batch.request_ids)
+        return batch.preplanned_rids != tuple(batch.request_ids)
 
     def reset_pre_plan_for_batch(self, batch: ExecutingBatch | None = None) -> None:
         """Drop planned-ahead state, e.g. when its batch never dispatched.
@@ -2566,6 +2695,8 @@ class Engine:
                 batch.discarded_preplan_event = batch.preplan_event
             batch.preplan_event = None
             batch.preplanned_rids = None
+            # proposed against the rows the pre-plan saw; exec proposes afresh
+            batch.step_context.rows = None
             # The step was declared over the rows the pre-plan saw: template
             # rows for an unprepared batch, or a request set that has since
             # lost rows to prepare_inputs (preplan_is_stale). Either way exec
@@ -2609,6 +2740,14 @@ class Engine:
             # as a resident-set delta. TP followers can deadlock if they are not
             # given a single source of truth for eviction.
             return 0
+        node_rows = self._rows.get(node_name)
+        if node_rows is not None and node_rows.holds_any((request_id,)):
+            # Its state is in its row: check it in first, as a step of another
+            # walk does, so the resources offload what the row held. The
+            # worker evicts only after a refused admit, with no step of this
+            # node in flight on the gpu or plan thread, and on the stream the
+            # steps run on.
+            node_rows.check_in((request_id,))
         freed = sum(
             resource.offload(request_id)
             for resource in self._submodules[node_name].resources.values()
@@ -2842,6 +2981,8 @@ class Engine:
         a KV cache whose pages reach the free list or are left to the prefix
         index alone. An offloaded request, or one that never ran, frees none."""
         self._loopback_steps.pop(request_id, None)
+        for node_rows in self._rows.values():
+            node_rows.forget(request_id)
         freed = {
             key for key, resource in self._resources.items()
             if resource.reclaimable(request_id)

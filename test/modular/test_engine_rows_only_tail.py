@@ -32,6 +32,7 @@ def _engine(sub):
     eng = Engine.__new__(Engine)
     eng._submodules = {"llm": SimpleNamespace(submodule=sub, piecewise_runners=RUNNERS)}
     eng._loopback_steps = {}
+    eng._rows = {}
     eng.per_request_tails = []
     eng.postprocess_batch = lambda batch, outputs: eng.per_request_tails.append(batch)
     return eng
@@ -78,7 +79,7 @@ def test_an_unbatched_step_clears_rows_only(rids):
     eng._exec_single = _per_request
     batch = SimpleNamespace(
         node_name="llm", request_ids=rids, rows_only=True, running_batched=False,
-        step_context=SimpleNamespace(slot_lease=None, graph_walk="decode"),
+        step_context=SimpleNamespace(slot_lease=None, graph_walk="decode", rows=None),
         exec_timings=SimpleNamespace(start=None), admit_error=None,
         outputs_ready=threading.Event(), release_waiters=lambda: None,
         preplanned_rids=None, preplan_event=None,

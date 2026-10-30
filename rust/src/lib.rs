@@ -18,6 +18,8 @@ pub mod communicator;
 pub mod graph;
 #[cfg(feature = "python")]
 pub mod kv_plan;
+#[cfg(feature = "python")]
+pub mod rows;
 pub mod shm;
 #[cfg(feature = "python")]
 pub mod tensors;

@@ -1381,6 +1381,17 @@ class AcceleratorGraphRunner:
         ]
         return max(capped) if capped else None
 
+    def padded_batch_size_for(self, graph_walk: str, bs: int) -> int:
+        """Most rows a step of at most ``bs`` requests of this walk runs with:
+        the smallest batch size captured for it that holds ``bs``, which a
+        smaller step pads up to, or ``bs`` if none does (it runs eager)."""
+        holding = [
+            size for config in self._capture_configs
+            if graph_walk in config.replay_graph_walks
+            for size in self._batch_sizes(config) if size >= bs
+        ]
+        return min(holding, default=bs)
+
     def can_run(
         self, graph_walk: str, bs: int, num_tokens: int,
         cg_key_info: Any | None = None,

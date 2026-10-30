@@ -963,6 +963,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def persistent_row_walks(self) -> frozenset[str]:
+        """Walks whose steps keep each request in a fixed row across steps
+        (``mstar.engine.rows``): the engine runs such a step in row order and
+        every resource of the node keeps its per-row state there. Each needs a
+        batch cap, which sizes the rows. Empty by default."""
+        return frozenset()
+
     def max_rows_in_combined(self, graph_walk: str) -> int | None:
         """How many rows of this real walk a step mixing it with another walk
         of its combined walk may hold; None is uncapped. For a backend whose
