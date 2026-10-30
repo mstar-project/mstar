@@ -998,7 +998,7 @@ def test_the_scheduler_groups_streamed_rows_by_the_chunk_they_ingested():
 def test_a_walk_that_does_not_split_never_reads_stream_chunks():
     """The check asks for capture groups only of a node that splits by them:
     rows of a walk that does not split must not pay for the stream lookup."""
-    ready = SimpleNamespace(outcome=SimpleNamespace(reason=None, ok=True, ready=True))
+    ready = SimpleNamespace(outcome=SimpleNamespace(reason=None, ok=True, ready=True), queued=False)
     engine = SimpleNamespace(
         splits_by_capture_key=lambda node, walk: False,
         check_ready=lambda node, rid, info, allow_reload: ready,
@@ -1640,6 +1640,24 @@ def test_a_queued_request_is_not_asked_again_until_the_engine_admits_it():
     sched._unpark(_Manager(["b"]))
 
     assert sched._check_ready(NODE, "b", None), "an admitted request stayed parked"
+
+
+def test_a_scheduling_pass_parks_a_queued_request_as_the_readiness_check_does():
+    """Both cores' passes check rows through `_run_checks`: a queued row is not
+    ready, and not asked about again until the engine admits it."""
+    engine = _QueuingEngine(queued={"b"})
+    sched = _scheduler(engine)
+    manager = _Manager(["a", "b"])
+    request = CheckRequest(["a", "b"], None, [NODE], walks=[WALK])
+    for _ in range(3):
+        result = sched._run_checks(manager, request)
+        assert result.verdicts == bytes([Verdict.READY, Verdict.NOT_READY])
+    assert engine.checked.count("b") == 1, "every pass asked the engine about a request it had queued"
+
+    engine.admit("b")
+    sched._unpark(manager)
+
+    assert sched._run_checks(manager, request).verdicts == bytes([Verdict.READY, Verdict.READY])
 
 
 def test_removal_forgets_a_parked_request():

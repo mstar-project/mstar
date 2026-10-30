@@ -785,7 +785,8 @@ class MicroScheduler:
     ) -> CheckResult:
         """Engine readiness for a ``CheckRequest``'s rows, in order; the
         engine half of a pass, the same for both cores. A terminal failure is
-        reported and the rid failed (``_check_ready``), and comes back FAILED.
+        reported and the rid failed (``_check_ready``), and comes back FAILED;
+        a rid waiting for capacity is parked on its node, as there.
 
         A node that splits batches by capture key also reports each ready
         row's group, and the anchor's: the anchor row's when the request names
@@ -798,6 +799,8 @@ class MicroScheduler:
         # `_check_ready` per row, with the per-node lookups hoisted
         partitions = [request_state.get_partition_for_node(node) for node in nodes]
         checks = [engine.check_ready for engine in engines]
+        parked = self.parked
+        parked_at = [parked.get(node, ()) for node in nodes]
         split = [
             walks is not None and engine.splits_by_capture_key(node, walks[n])
             for n, (node, engine) in enumerate(zip(nodes, engines, strict=True))
@@ -813,7 +816,12 @@ class MicroScheduler:
                 verdicts[i:] = bytes((Verdict.UNCHECKED,)) * (len(rids) - i)
                 break
             n = 0 if node_idx is None else node_idx[i]
+            if rid in parked_at[n]:
+                continue
             full = checks[n](nodes[n], rid, get_fwd_info(rid, partitions[n]), allow_reload=True)
+            if full.queued:
+                parked.setdefault(nodes[n], set()).add(rid)
+                continue
             outcome = full.outcome
             if outcome.reason is not None and outcome.reason.terminal:
                 self._fail_unservable(nodes[n], rid, full)
