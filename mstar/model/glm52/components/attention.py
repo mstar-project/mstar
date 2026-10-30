@@ -132,6 +132,10 @@ class Glm52MLAAttention(MLAAttention):
     def _selects(self, dsa_selection=None) -> bool:
         return self._dsa_ctx() is not None
 
+    # mla_fused_prep serves the selecting path too: q_norm feeds the indexer's q_c, and
+    # kv_write_q_rope writes the step's latents before _attend_written reads them
+    _attends_written = True
+
     def _select(self, hidden_states, q_c, position_ids, dsa_selection=None):
         # None-guarded here (not just inside _dsa_update) so the default
         # flag-off path never crosses the compiler.disable boundary — dynamo
@@ -191,3 +195,16 @@ class Glm52MLAAttention(MLAAttention):
         self._kv.write_kv(latent, None, layer_idx=layer_idx)
         return paged.sparse_attend(
             q_nope, q_pe, self._kv.layer_view(layer_idx), slots, dsa_ctx, self.softmax_scale)
+
+    @torch.compiler.disable
+    def _attend_written(
+        self,
+        slots: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        dsa_selection: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``_attend_selected`` once the fused prep has written the step's latents."""
+        return paged.sparse_attend(
+            q_nope, q_pe, self._kv.layer_view(self.cache_layer_idx), slots, self._dsa_ctx(),
+            self.softmax_scale)
