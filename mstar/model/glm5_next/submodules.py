@@ -170,7 +170,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if pool is None:
             return None
         # A prefill takes only the slots free now, and waits while none are, so a
-        # TP follower refusing one has diverged from rank 0 (the engine raises).
+        # TP follower refusing one has diverged from rank 0 (its worker stops).
         # With prefill graphs, no more rows than one takes: an eager prefill's
         # last layer compiles the MoE decode kernels for its row count mid-serve.
         if graph_walk == "prefill":
@@ -178,6 +178,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             free = pool.num_free_slots
             return free if rows is None else min(free, rows)
         return pool.config.usable_slots
+
+    def batch_cap_varies(self, graph_walk: str) -> bool:
+        # the prefill cap follows the free KDA slots
+        return graph_walk == "prefill"
 
     def _captured_prefill_rows(self) -> int | None:
         """The most rows a captured prefill takes, or None while prefill runs eager."""

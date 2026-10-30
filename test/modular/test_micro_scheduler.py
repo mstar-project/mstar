@@ -237,6 +237,10 @@ class _Engine:
         del node_name
         return self._row_caps.get(graph_walk)
 
+    def batch_cap_varies(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return False
+
     def get_max_batch_size(self, node_name, graph_walk):
         del node_name
         if isinstance(self._max_bs, dict):
