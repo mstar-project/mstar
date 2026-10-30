@@ -369,9 +369,10 @@ def test_callable_built_inside_a_compiled_region():
 
 
 def test_a_compiled_region_attends_through_a_rebuilt_resource():
-    """The op names its manager by resource key: after the resource is rebuilt under
-    the same key, a region compiled against the old one attends through the new one's
-    plan, not the old one's."""
+    """Each manager's op key is its resource key plus a number unique in the process.
+    A region compiled against one manager, then called with a manager rebuilt under the
+    same resource key, attends through the rebuilt one's plan, not the old one's, though
+    the old one is still registered under its own op key."""
     q, k, v = qkv(224)
 
     def region(fn, q, k, v):
