@@ -17,13 +17,14 @@ import weakref
 from types import SimpleNamespace
 
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 
 from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
+from mstar.communication.event import EventWakeup
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import OutputInfo, RequestProfile
@@ -149,6 +150,7 @@ def test_result_reads_drain_ahead_of_preprocess():
 
 class _StubPreprocessWorker:
     def __init__(self, pending=False, final=True):
+        self.results_wakeup = EventWakeup()
         self.pending = pending
         self.final = final
         self.cleaned = []
@@ -569,10 +571,10 @@ def _deliver_result_chunks(server, *chunks):
         server.running = False
         return []
 
-    server.communicator = SimpleNamespace(get_all_new_messages=stop_after_this_pass)
+    server.communicator = StandInSocket(stop_after_this_pass)
     server.preprocess_worker = SimpleNamespace(
         get_profile_updates=lambda: [], get_result_chunks=lambda: chunks,
-        abort_request=lambda rid: None,
+        abort_request=lambda rid: None, results_wakeup=EventWakeup(),
     )
     server.running = True
     server._process_messages()

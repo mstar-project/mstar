@@ -159,12 +159,13 @@ def _video_frame_metadata(
         "frame_count": frame_count,
     }
 @dataclass
-class InlineToken:
-    """One request's value out of a RESULT_TOKENS frame, queued behind the
-    tensor results so sequences keep arrival order."""
-    request_id: str
-    value: int
-    loop_indices: NestedLoopIndices | None
+class InlineTokens:
+    """One RESULT_TOKENS frame's values for the requests still known here,
+    queued behind the tensor results so each request's chunks keep arrival
+    order. One item per frame, so the data worker wakes the message thread
+    once per step (``ResultQueue``)."""
+    request_ids: list[str]
+    values: list[int]
     modality: str
 
 
@@ -195,12 +196,14 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
 
 
 class ResultQueue(queue.Queue):
-    """The data worker's output chunks, for the API message thread.
+    """What the data worker hands the API message thread: output chunks, or
+    profile updates.
 
     A put doesn't wake that thread: ``flush`` signals ``wakeup`` once for
-    everything put since the last flush, and the data worker thread flushes
-    after each batch of outputs, so one step's chunks cost the message thread
-    one wake and one pass, however many rows the step had."""
+    everything put since the last flush. The data worker thread flushes the
+    chunks after each item it takes, and an item is one step's output (a
+    RESULT_TOKENS frame, or a result tensor), so a step costs the message
+    thread one wake and one pass however many rows it had."""
 
     def __init__(self, wakeup: EventWakeup):
         super().__init__()
@@ -237,10 +240,12 @@ class PreprocessWorker:
         self.abort_request_queue = queue.Queue()
         self.reads_done_queue = queue.Queue()
         self.discard_tensor_queue = queue.Queue()
-        # The API message thread polls this with its socket (``ResultQueue``).
+        # Ends the API message thread's poll: the flushes of these two queues,
+        # and the API server when a request handler changes what that
+        # thread's next pass reads, signal it.
         self.results_wakeup = EventWakeup()
         self.output_queue = ResultQueue(self.results_wakeup)
-        self.profile_queue = queue.Queue()
+        self.profile_queue = ResultQueue(self.results_wakeup)
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
         # Set by enable_worker_metrics(); the worker thread tells the conductor.
@@ -388,30 +393,28 @@ class PreprocessWorker:
         self.result_tensor_input_queue.put(input)
         self._signal()
 
-    def new_result_token(
-        self, request_id: str, value: int,
-        loop_indices: NestedLoopIndices | None, signal: str, modality: str,
-        wake: bool = True,
+    def new_result_tokens(
+        self, request_ids: list[str], values: list[int], signal: str, modality: str,
     ):
-        """A value that rode inline: same accounting as a result tensor, no
-        transport read and nothing to ack. ``wake=False`` queues without
-        ending the thread's idle wait: a frame's caller hands over every
-        request's value first and calls ``wake`` once."""
-        if request_id not in self.received_chunk_counts:
-            logger.debug("Late token for cleaned-up request %s dropped", request_id)
-            return
-        counts = self.received_chunk_counts[request_id]
-        counts[signal] = counts.get(signal, 0) + 1
-        self.per_request_reading_tensors[request_id] += 1
-        self.result_tensor_input_queue.put(
-            InlineToken(request_id, value, loop_indices, modality)
-        )
-        if wake:
+        """A frame's values that rode inline: the same accounting per request
+        as a result tensor, no transport read and nothing to ack. A request
+        already cleaned up is dropped."""
+        counts_by_rid = self.received_chunk_counts
+        reading = self.per_request_reading_tensors
+        kept_ids: list[str] = []
+        kept_values: list[int] = []
+        for rid, value in zip(request_ids, values, strict=True):
+            counts = counts_by_rid.get(rid)
+            if counts is None:
+                logger.debug("Late token for cleaned-up request %s dropped", rid)
+                continue
+            counts[signal] = counts.get(signal, 0) + 1
+            reading[rid] += 1
+            kept_ids.append(rid)
+            kept_values.append(value)
+        if kept_ids:
+            self.result_tensor_input_queue.put(InlineTokens(kept_ids, kept_values, modality))
             self._signal()
-
-    def wake(self):
-        """End the thread's idle wait after a batch of ``wake=False`` puts."""
-        self._signal()
 
     def discard_result_tensors(self, input: ResultTensors):
         """Ack and drop result tensors for an already-removed request.
@@ -1221,35 +1224,37 @@ class PreprocessWorkerThread:
             state.order[tensor_info.uuid] = (state.next_sequence, result.loop_indices)
             state.next_sequence += 1
 
-    def _emit_inline_token(self, item: InlineToken) -> None:
-        """Detokenize a value that arrived inline and queue its chunk."""
-        request_id = item.request_id
-        state = self.request_output_state.setdefault(
-            request_id, RequestOutputState()
-        )
-        sequence = state.next_sequence
-        state.next_sequence += 1
-        try:
-            tensor = torch.tensor([item.value], dtype=torch.int64)
-            postprocessed = self.model.postprocess(
-                tensor, item.modality,
-                request_kwargs=self.request_model_kwargs.get(request_id),
+    def _emit_inline_tokens(self, item: InlineTokens) -> None:
+        """Detokenize a frame's values and queue each request's chunk."""
+        for request_id, value in zip(item.request_ids, item.values, strict=True):
+            if request_id in self._draining_rids:
+                continue
+            state = self.request_output_state.setdefault(
+                request_id, RequestOutputState()
             )
-            self._queue_completed_output(
-                request_id,
-                sequence,
-                ResultChunk(
-                    request_id=request_id,
-                    modality=item.modality,
-                    data=postprocessed,
-                    metadata={},
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001 — must reach the client
-            self._fail_request(
-                request_id, exc, f"{item.modality} output postprocessing",
-                sequence=sequence,
-            )
+            sequence = state.next_sequence
+            state.next_sequence += 1
+            try:
+                tensor = torch.tensor([value], dtype=torch.int64)
+                postprocessed = self.model.postprocess(
+                    tensor, item.modality,
+                    request_kwargs=self.request_model_kwargs.get(request_id),
+                )
+                self._queue_completed_output(
+                    request_id,
+                    sequence,
+                    ResultChunk(
+                        request_id=request_id,
+                        modality=item.modality,
+                        data=postprocessed,
+                        metadata={},
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — must reach the client
+                self._fail_request(
+                    request_id, exc, f"{item.modality} output postprocessing",
+                    sequence=sequence,
+                )
 
     def _queue_completed_output(
         self,
@@ -1666,8 +1671,9 @@ class PreprocessWorkerThread:
         if not isinstance(self.communicator, OutboxCommunicator):
             self.communicator = OutboxCommunicator(self.communicator)
         idle_wait = self._idle_wait()
-        # a plain queue in tests that build the thread around their own
+        # plain queues in tests that build the thread around their own
         flush_results = getattr(self.out_queue, "flush", lambda: None)
+        flush_profiles = getattr(self.profile_queue, "flush", lambda: None)
         while not self.stop_event.is_set():
             did_work = False
             sends_pending = False
@@ -1680,39 +1686,32 @@ class PreprocessWorkerThread:
                 # queued read-starts / acks / cleanups must never wait behind a
                 # multi-second media preprocess. Drain them fully every pass
                 # before taking new input below.
-                batch = self.result_tensor_queue.qsize()
                 while not self.result_tensor_queue.empty():
-                    if batch == 0:
-                        # what came in meanwhile is the next batch: one wake
-                        # each, also when the queue refills faster than it drains
-                        flush_results()
-                        batch = self.result_tensor_queue.qsize()
-                    batch -= 1
                     did_work = True
                     result = self.result_tensor_queue.get()
-                    if isinstance(result, InlineToken):
+                    if isinstance(result, InlineTokens):
                         # Nothing to read or ack: postprocess in place, in
                         # arrival order with the tensor results.
-                        if result.request_id not in self._draining_rids:
-                            self._emit_inline_token(result)
-                        continue
-                    # Draining for teardown: don't start new reads — ack the
-                    # tensors back so the producing worker can free its buffers.
-                    if result.request_id in self._draining_rids:
+                        self._emit_inline_tokens(result)
+                    elif result.request_id in self._draining_rids:
+                        # Draining for teardown: don't start new reads — ack
+                        # the tensors back so the producing worker can free
+                        # its buffers.
                         self._discard_result_tensor(result)
-                        continue
-                    try:
-                        self._read_result_tensor(result)
-                    except Exception as exc:  # noqa: BLE001 — must reach the client
-                        # The read never started, so none of this edge's
-                        # tensors will ever produce a chunk; answer for all of
-                        # them at once.
-                        self._fail_request(
-                            result.request_id, exc,
-                            f"{result.modality} output transfer",
-                            count=len(result.graph_edge.tensor_info),
-                        )
-                flush_results()
+                    else:
+                        try:
+                            self._read_result_tensor(result)
+                        except Exception as exc:  # noqa: BLE001 — must reach the client
+                            # The read never started, so none of this edge's
+                            # tensors will ever produce a chunk; answer for all
+                            # of them at once.
+                            self._fail_request(
+                                result.request_id, exc,
+                                f"{result.modality} output transfer",
+                                count=len(result.graph_edge.tensor_info),
+                            )
+                    # one wake per item, and so per step
+                    flush_results()
                 did_work = self._process_releases() or did_work
                 while not self.discard_tensor_queue.empty():
                     did_work = True
@@ -1744,8 +1743,10 @@ class PreprocessWorkerThread:
                         logger.exception("Input for request %s failed", pre_input.request_id)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
-            # the error chunks of a failed input, and anything a raise skipped
+            # a new input's profile update or error chunks, and anything a
+            # raise skipped
             flush_results()
+            flush_profiles()
 
             # getattr: tests drive this loop with stand-in tensor managers
             transfers = getattr(self.tensor_manager, "transfer_stats", None)

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar.api_server.data_worker import InlineToken, PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorker, PreprocessWorkerThread
 from mstar.api_server.request_types import APIServerMessage, ResultChunk, ResultTokens
 from mstar.communication import wire
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -110,9 +110,9 @@ def _thread():
 
 def test_inline_tokens_are_detokenized_in_order_without_a_read():
     worker, stop = _thread()
-    for i, v in enumerate((11, 12, 13)):
-        worker.result_tensor_queue.put(InlineToken("req", v, _loop(i), "text"))
-    worker.result_tensor_queue.put(InlineToken("other", 99, None, "text"))
+    for v in (11, 12, 13):
+        worker.result_tensor_queue.put(InlineTokens(["req"], [v], "text"))
+    worker.result_tensor_queue.put(InlineTokens(["other"], [99], "text"))
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
@@ -130,8 +130,7 @@ def test_inline_tokens_are_detokenized_in_order_without_a_read():
 def test_a_draining_request_drops_its_inline_tokens():
     worker, stop = _thread()
     worker._draining_rids.add("gone")
-    worker.result_tensor_queue.put(InlineToken("gone", 1, None, "text"))
-    worker.result_tensor_queue.put(InlineToken("live", 2, None, "text"))
+    worker.result_tensor_queue.put(InlineTokens(["gone", "live"], [1, 2], "text"))
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
@@ -146,15 +145,16 @@ def test_a_draining_request_drops_its_inline_tokens():
 def test_the_facade_accounts_an_inline_token_like_a_tensor():
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.result_tensor_input_queue = queue.Queue()
-    facade.per_request_reading_tensors = {"r1": 0}
-    facade.received_chunk_counts = {"r1": {}}
-    facade.new_result_token("r1", 42, _loop(4), "text_inputs", "text")
-    facade.new_result_token("r1", 43, _loop(5), "text_inputs", "text")
-    facade.new_result_token("unknown", 1, _loop(0), "text_inputs", "text")  # dropped, no raise
-    assert facade.per_request_reading_tensors["r1"] == 2
+    facade.per_request_reading_tensors = {"r1": 0, "r2": 0}
+    facade.received_chunk_counts = {"r1": {}, "r2": {}}
+    facade.new_result_tokens(["r1", "r2"], [42, 7], "text_inputs", "text")
+    # the unknown request's value is dropped, no raise
+    facade.new_result_tokens(["unknown", "r1"], [1, 43], "text_inputs", "text")
+    facade.new_result_tokens(["unknown"], [2], "text_inputs", "text")  # nothing queued
+    assert facade.per_request_reading_tensors == {"r1": 2, "r2": 1}
     assert facade.received_chunk_counts["r1"] == {"text_inputs": 2}
     items = [facade.result_tensor_input_queue.get_nowait() for _ in range(2)]
-    assert [i.value for i in items] == [42, 43]
+    assert [(i.request_ids, i.values) for i in items] == [(["r1", "r2"], [42, 7]), (["r1"], [43])]
     assert facade.result_tensor_input_queue.empty()
 
 
