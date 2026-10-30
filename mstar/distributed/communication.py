@@ -1,9 +1,8 @@
-import logging
 import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import torch
@@ -13,8 +12,6 @@ from torch.distributed.distributed_c10d import _set_pg_timeout
 
 from mstar.distributed.all_reduce import AllReduce
 from mstar.distributed.utils import resolve_dist_timeout
-
-logger = logging.getLogger(__name__)
 
 
 def default_group_timeout(backend: str) -> timedelta:
@@ -57,6 +54,13 @@ def _all_to_all_single(
     return recv
 
 
+class ArFusionWorkspace(NamedTuple):
+    """A fused all-reduce workspace of a ``CommGroup``: its id in
+    ``ar_fusion``'s registry, for inputs of up to ``max_tokens`` rows."""
+    ws_id: int
+    max_tokens: int
+
+
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
 
@@ -83,11 +87,8 @@ class CommGroup:
         # NCCL: a gloo twin, or on XPU the mixed group's gloo side
         self.cpu_group = None
         self.initialized = False
-        # see ``init_allreduce_fusion``
-        self._ar_fusion_ws: int | None = None
-        self._ar_fusion_max_tokens = 0
-        self._ar_fusion_hidden = 0
-        self._ar_fusion_dtype: torch.dtype | None = None
+        # (dtype, hidden) -> its fused all-reduce workspace; see ``init_allreduce_fusion``
+        self._ar_fusion: dict[tuple[torch.dtype, int], ArFusionWorkspace] = {}
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce(self.device_group)
 
@@ -166,30 +167,32 @@ class CommGroup:
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
         """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs of ``dtype``; other inputs keep the NCCL path.
-        Collective: every member calls it at the same point. Returns whether it
-        is available for ``(hidden, dtype)``. Every lockstep node of an
-        instance shares its group, which keeps one workspace: the first one
-        built (a failed build leaves the next caller to try)."""
+        hidden]`` inputs of ``dtype``. Returns whether it is available for them.
+
+        Collective: every member calls it at the same point, with the same
+        arguments. Each node of a lockstep instance shares its group and calls
+        this at load for its own width and dtype, so the group keeps one
+        workspace per ``(dtype, hidden)``; a larger ``max_tokens`` for one it
+        has replaces it. Each holds a few ``max_tokens x hidden`` buffers per
+        rank in device memory (FlashInfer's IPC / multicast buffers, outside
+        torch's allocator). An input with no workspace for its width and dtype,
+        or longer than ``max_tokens``, takes NCCL all-reduce + a separate norm.
+        """
         if self.world_size == 1:
             return False
-        if self._ar_fusion_ws is not None:
-            same = (self._ar_fusion_hidden, self._ar_fusion_dtype) == (hidden, dtype)
-            if not same or max_tokens > self._ar_fusion_max_tokens:
-                logger.warning(
-                    "all-reduce fusion is set up for up to %d x %d %s on TP ranks %s; other "
-                    "inputs (here up to %d x %d %s) take NCCL all-reduce + separate norm",
-                    self._ar_fusion_max_tokens, self._ar_fusion_hidden, self._ar_fusion_dtype,
-                    self.group_members, max_tokens, hidden, dtype,
-                )
-            return same
-        from mstar.distributed.ar_fusion import create_workspace
+        key = (dtype, hidden)
+        have = self._ar_fusion.get(key)
+        if have is not None and have.max_tokens >= max_tokens:
+            return True
+        from mstar.distributed.ar_fusion import create_workspace, destroy_workspace
 
-        ws = create_workspace(self, max_tokens, hidden, dtype)
-        if ws is not None:
-            self._ar_fusion_ws, self._ar_fusion_max_tokens = ws, max_tokens
-            self._ar_fusion_hidden, self._ar_fusion_dtype = hidden, dtype
-        return ws is not None
+        ws_id = create_workspace(self, max_tokens, hidden, dtype)
+        if ws_id is None:
+            return have is not None
+        if have is not None:
+            destroy_workspace(have.ws_id)
+        self._ar_fusion[key] = ArFusionWorkspace(ws_id, max_tokens)
+        return True
 
     def allreduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
@@ -198,16 +201,12 @@ class CommGroup:
         """``r = all_reduce(x) + residual``; returns ``(rms_norm(r), r)``,
         scaling by ``weight + weight_bias``. ``x`` is a row-parallel
         projection's partial sum (its linear skipped ``reduce_results``)."""
-        if (self._ar_fusion_ws is not None
-                and x.shape[0] <= self._ar_fusion_max_tokens
-                and x.shape[-1] == self._ar_fusion_hidden
-                and x.dtype == self._ar_fusion_dtype
+        ws = self._ar_fusion.get((x.dtype, x.shape[-1]))
+        if (ws is not None and x.shape[0] <= ws.max_tokens
                 and x.is_contiguous() and residual.is_contiguous()):
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
-            return allreduce_add_rmsnorm(
-                x, residual, weight, eps, weight_bias, self._ar_fusion_ws,
-            )
+            return allreduce_add_rmsnorm(x, residual, weight, eps, weight_bias, ws.ws_id)
         r = self.all_reduce(x) + residual
         v = r.float()
         v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ws_id -> FlashInfer AllReduceFusionWorkspace
+# ws_id -> FlashInfer AllReduceFusionWorkspace (None once destroyed)
 _WORKSPACES: list = []
 
 # "auto" picks MNNVL whenever FlashInfer's capability vote passes, but mapping
@@ -76,6 +76,13 @@ def create_workspace(
     logger.warning("no FlashInfer all-reduce fusion backend works here; "
                    "keeping NCCL all-reduce + separate norm")
     return None
+
+
+def destroy_workspace(ws_id: int) -> None:
+    """Free a workspace ``create_workspace`` built. Every member of its group
+    frees it at the same point, once no captured graph still uses it."""
+    _WORKSPACES[ws_id].destroy()
+    _WORKSPACES[ws_id] = None
 
 
 @torch.library.custom_op("mstar::allreduce_add_rmsnorm", mutates_args=())

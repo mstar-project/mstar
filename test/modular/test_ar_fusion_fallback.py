@@ -77,29 +77,39 @@ def test_every_rank_agrees_on_backend(tmp_path, fails, expected):
         assert leaked == "", f"rank {rank} kept {leaked}"
 
 
-def test_a_second_width_on_a_shared_group_keeps_the_nccl_path(monkeypatch):
-    """Two lockstep nodes of one instance share its group. The workspace is
-    built for the first width and dtype set up; an input of another width or
-    dtype takes NCCL rather than overrunning it."""
+def test_a_shared_group_keeps_a_workspace_per_width_and_dtype(monkeypatch):
+    """Two lockstep nodes of one instance share its group, and each sets up
+    fusion for its own width and dtype. Each input takes the workspace built
+    for its (dtype, hidden); one with none, or longer than its workspace,
+    takes NCCL."""
     import torch
 
-    from mstar.distributed import ar_fusion
-    from mstar.distributed.communication import CommGroup
+    built, destroyed, used = [], [], []
 
-    used = []
-    monkeypatch.setattr(ar_fusion, "create_workspace", lambda group, max_tokens, hidden, dtype: 0)
+    def create(group, max_tokens, hidden, dtype):
+        built.append((dtype, hidden, max_tokens))
+        return len(built) - 1
+
+    monkeypatch.setattr(ar_fusion, "create_workspace", create)
+    monkeypatch.setattr(ar_fusion, "destroy_workspace", destroyed.append)
     monkeypatch.setattr(
         ar_fusion, "allreduce_add_rmsnorm",
-        lambda x, residual, weight, eps, bias, ws_id: used.append(x.shape[-1]) or (x, residual),
+        lambda x, residual, weight, eps, bias, ws_id: used.append(ws_id) or (x, residual),
     )
     group = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
     monkeypatch.setattr(group, "all_reduce", lambda x: used.append("nccl") or x)
-    assert group.init_allreduce_fusion(16, torch.float32)
-    assert not group.init_allreduce_fusion(8, torch.float32)
-    assert not group.init_allreduce_fusion(16, torch.bfloat16)
+    assert group.init_allreduce_fusion(16, torch.float32, max_tokens=8)
+    assert group.init_allreduce_fusion(8, torch.float32, max_tokens=8)
+    assert group.init_allreduce_fusion(16, torch.bfloat16, max_tokens=8)
+    assert group.init_allreduce_fusion(16, torch.float32, max_tokens=4)   # kept
+    assert group.init_allreduce_fusion(8, torch.float32, max_tokens=16)   # rebuilt
+    assert built == [(torch.float32, 16, 8), (torch.float32, 8, 8),
+                     (torch.bfloat16, 16, 8), (torch.float32, 8, 16)]
+    assert destroyed == [1]
 
-    for hidden, dtype in ((16, torch.float32), (8, torch.float32), (16, torch.bfloat16)):
-        x = torch.ones(4, hidden, dtype=dtype)
+    for rows, hidden, dtype in ((4, 16, torch.float32), (16, 8, torch.float32),
+                                (4, 16, torch.bfloat16), (4, 32, torch.float32),
+                                (9, 16, torch.float32)):
+        x = torch.ones(rows, hidden, dtype=dtype)
         group.allreduce_add_rmsnorm(x, torch.zeros_like(x), torch.ones(hidden, dtype=dtype), 1e-6)
-
-    assert used == [16, "nccl", "nccl"]
+    assert used == [0, 3, 2, "nccl", "nccl"]
