@@ -4,11 +4,12 @@ import logging
 import time
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources import Rebuild
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
 from mstar.model.submodule_base import InputMetadata
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
@@ -73,6 +74,8 @@ class ScheduledBatch:
     tp_seq: int = -1
     # rid -> real walk, set iff ``graph_walk`` is a combined walk
     request_walks: dict[int, str] = field(default_factory=dict)
+    # on a TP follower, the rows of rank 0's step that rebuild a dropped request
+    rebuild_rids: tuple[int, ...] = ()
     # real walk -> its output edge names, under a combined walk
     walk_output_signals: dict[str, list[str]] = field(default_factory=dict)
     # A TP follower's copy of ``ScheduleTPNode.read_check``: the leader's rows,
@@ -211,6 +214,11 @@ class PopReadyResult(NamedTuple):
     walk_output_signals: dict[str, list[str]] = {}
 
 
+def moves_alone(message: ScheduleTPNode) -> ScheduleTPNode:
+    """Return ``message`` without its rows, prefix hits and page trails, so it carries only rank 0's moves."""
+    return replace(message, request_ids=[], speculative=False, prefix_hits={}, page_trails={})
+
+
 class MicroScheduler:
     """
     Simple MVP scheduler: scans all worker graph queues for ready nodes,
@@ -253,6 +261,11 @@ class MicroScheduler:
         # here already holds handles. Defaults to the identity so a scheduler
         # driven directly with its own keys (tests) needs no table.
         self.rid_of: Callable[[str], int | None] = lambda r: r
+        # (node, handle) -> what the worker's kept ids would rebuild of the request on that node, or None. The
+        # worker installs it.
+        self.rebuild_of: Callable[[str, int], Rebuild | None] = lambda node, rid: None
+        # handles the worker moves off the device once their node's next step goes out, so their rebuild rows wait
+        self.moving: Collection[int] = frozenset()
         self._warned_removed_rid = False
         self.sched_type = sched_type
 
@@ -515,13 +528,17 @@ class MicroScheduler:
             return True
 
         engine = self.engine_manager.get_engine(node_name)
-        return engine.apply_resident_delta(node_name, delta)
+        return engine.apply_resident_delta(node_name, delta, functools.partial(self.rebuild_of, node_name))
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+        new_delta = None
         if self._last_resident_delta < message.spec_seq:
             self._last_resident_delta = message.spec_seq
-            return self._apply_resident_delta(message.node_name, message.resident_delta)
-        return self._apply_resident_delta(message.node_name)
+            new_delta = message.resident_delta
+        try:
+            return self._apply_resident_delta(message.node_name, new_delta)
+        except Exception as exc:
+            raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
     def settle_tp_follow_delta(self, caught_up: bool) -> bool:
         """Replay the front head's resident delta; True once every move landed.
@@ -552,18 +569,29 @@ class MicroScheduler:
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
-        # and the async follower's build / drop / void paths) pops here, so the
-        # drain refcount is discharged in one place.
+        # and the async follower's build path) pops here. `void_tp_follow_head`
+        # discharges the drain refcount of a head this rank won't build.
         message = self.tp_batches_pending_schedule.popleft()
         self._apply_delta_from_message(message)
         self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
-        for rid in message.request_ids:
+        self._discharge(message.request_ids)
+        return message
+
+    def void_tp_follow_head(self) -> None:
+        """Turn the front head, which this rank won't build, into a step of moves alone. Rank 0 made the head's
+        moves and stamps the removals it makes next with the head's seq, so the seq counts as consumed only when
+        the step is popped, after its moves land."""
+        head = self.tp_batches_pending_schedule[0]
+        self._discharge(head.request_ids)
+        self.tp_batches_pending_schedule[0] = moves_alone(head)
+
+    def _discharge(self, rids: list[str]) -> None:
+        for rid in rids:
             if rid not in self.pending_tp_follow_count:
                 continue
             self.pending_tp_follow_count[rid] -= 1
             if self.pending_tp_follow_count[rid] <= 0:
                 self.pending_tp_follow_count.pop(rid, None)
-        return message
 
     def pop_ready_rids(
         self, request_state: RequestStateManager,
@@ -648,6 +676,10 @@ class MicroScheduler:
         # leader's graph walk. No step of the node is in flight on this path.
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
+        if not first_tp_node.request_ids and not first_tp_node.rebuild_ids:
+            # a step with no rows, so pop it rather than build an empty batch
+            self.pop_tp_follow_head()
+            return
         rids = self.tp_rids(first_tp_node)
         unread = self.unread_rows(first_tp_node, rids)
         popped = self.pop_ready_rids(
@@ -678,6 +710,7 @@ class MicroScheduler:
             tp_seq=first_tp_node.spec_seq,
             request_walks=request_walks,
             walk_output_signals=walk_signals,
+            rebuild_rids=tuple(map(self.rid_of, first_tp_node.rebuild_ids)) if first_tp_node.rebuild_ids else (),
             read_check_rids=tuple(rids) if first_tp_node.read_check else None,
         )
 
@@ -877,7 +910,7 @@ class MicroScheduler:
         return {
             rid: row for rid, row in self.rebuilds.get(node_walk, {}).items()
             if self.held_until.get(rid, 0.0) <= now and rid not in self.failed_rids
-            and rid not in self.pending_removes
+            and rid not in self.pending_removes and rid not in self.moving
         }
 
     def _schedule_rebuilds(self, request_state: RequestStateManager) -> ScheduledBatch | None:

@@ -19,17 +19,30 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 sys.path.insert(0, ".")
 
+import test_kv_host_index as host
+from test_kv_preemption import _step
+from test_kv_prefix_lease import NODE, PAGE_SIZE, _StubTransfer
+
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
-from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
+from mstar.engine.resources.base import Rebuild
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.manager import Allotment, KVManager
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import FULL_ADMIT_OK, Segment, StepContext
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
+    Move,
+    MoveKind,
     OffloadDelta,
     RemoveRequest,
     ScheduleTPNode,
@@ -41,8 +54,12 @@ from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
-def _entries(delta: OffloadDelta) -> list[tuple[str, bool]]:
-    return list(zip(delta.rids, delta.is_offload, strict=True))
+def _no_rebuild(rid):
+    return None
+
+
+def _entries(delta: OffloadDelta) -> list[tuple[str, MoveKind]]:
+    return list(zip(delta.rids, delta.kinds, strict=True))
 
 
 # --- the queue itself -------------------------------------------------------
@@ -51,21 +68,21 @@ def _entries(delta: OffloadDelta) -> list[tuple[str, bool]]:
 def test_the_order_of_offloads_and_reloads_survives():
     """The reason this is a queue and not two sets."""
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("a")
-    delta.add_offloaded("a")
+    delta.add(MoveKind.OFFLOAD, "a")
+    delta.add(MoveKind.RELOAD, "a")
+    delta.add(MoveKind.OFFLOAD, "a")
 
-    assert _entries(delta) == [("a", True), ("a", False), ("a", True)]
+    assert _entries(delta) == [("a", MoveKind.OFFLOAD), ("a", MoveKind.RELOAD), ("a", MoveKind.OFFLOAD)]
 
 
 def test_pop_left_takes_the_oldest_entry():
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("b")
+    delta.add(MoveKind.OFFLOAD, "a")
+    delta.add(MoveKind.RELOAD, "b")
 
-    assert delta.pop_left() == ("a", True)
+    assert delta.pop_left() == Move("a", MoveKind.OFFLOAD)
     assert len(delta) == 1, "pop_left returned an entry without removing it"
-    assert delta.pop_left() == ("b", False)
+    assert delta.pop_left() == Move("b", MoveKind.RELOAD)
     assert len(delta) == 0
 
 
@@ -77,9 +94,9 @@ def test_pop_left_on_an_empty_queue_answers_none():
 
 def test_peek_left_does_not_consume():
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
+    delta.add(MoveKind.OFFLOAD, "a")
 
-    assert delta.peek_left() == ("a", True)
+    assert delta.peek_left() == Move("a", MoveKind.OFFLOAD)
     assert len(delta) == 1
     assert OffloadDelta.new().peek_left() is None
 
@@ -88,28 +105,28 @@ def test_take_hands_the_queue_over_and_leaves_it_empty():
     """What a leader does on every broadcast. The fields are a NamedTuple's, so
     this cannot work by reassigning them — only the deques can be mutated."""
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("b")
+    delta.add(MoveKind.OFFLOAD, "a")
+    delta.add(MoveKind.RELOAD, "b")
 
     taken = delta.take()
 
-    assert _entries(taken) == [("a", True), ("b", False)]
+    assert _entries(taken) == [("a", MoveKind.OFFLOAD), ("b", MoveKind.RELOAD)]
     assert len(delta) == 0, "the source kept the entries it handed over"
 
-    delta.add_offloaded("c")
-    assert _entries(taken) == [("a", True), ("b", False)]
+    delta.add(MoveKind.OFFLOAD, "c")
+    assert _entries(taken) == [("a", MoveKind.OFFLOAD), ("b", MoveKind.RELOAD)]
 
 
 def test_extend_appends_in_order():
     """A follower folds each message's delta onto whatever it still owes."""
     owed = OffloadDelta.new()
-    owed.add_offloaded("a")
+    owed.add(MoveKind.OFFLOAD, "a")
     arriving = OffloadDelta.new()
-    arriving.add_reloaded("b")
+    arriving.add(MoveKind.RELOAD, "b")
 
     owed.extend(arriving)
 
-    assert _entries(owed) == [("a", True), ("b", False)]
+    assert _entries(owed) == [("a", MoveKind.OFFLOAD), ("b", MoveKind.RELOAD)]
 
 
 def test_an_empty_delta_is_falsy():
@@ -117,7 +134,7 @@ def test_an_empty_delta_is_falsy():
     callers branch on the delta directly."""
     assert not OffloadDelta.new()
     delta = OffloadDelta.new()
-    delta.add_offloaded("a")
+    delta.add(MoveKind.OFFLOAD, "a")
     assert delta
 
 
@@ -191,12 +208,14 @@ class _Rids:
 class _Engine:
     """``Engine``'s eviction surface over one stub resource."""
 
+    _journal = Engine._journal
     apply_resident_delta = Engine.apply_resident_delta
     check_ready = Engine.check_ready
     is_offloaded = Engine.is_offloaded
     is_resident = Engine.is_resident
     admit_request = Engine.admit_request
     offload_request = Engine.offload_request
+    paged_kv_caches = Engine.paged_kv_caches
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
     take_resident_delta = Engine.take_resident_delta
@@ -257,14 +276,14 @@ def test_replay_is_exempt_from_both_guards():
     a follower must do, so it reaches the resources directly."""
     engine = _Engine("follower")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
 
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_rebuild) is True
     assert engine.is_offloaded("node", "a")
 
     back = OffloadDelta.new()
-    back.add_reloaded("wire-a")
-    assert engine.apply_resident_delta("node", back) is True
+    back.add(MoveKind.RELOAD, "wire-a")
+    assert engine.apply_resident_delta("node", back, _no_rebuild) is True
     assert not engine.is_offloaded("node", "a")
 
 
@@ -392,7 +411,7 @@ def test_both_directions_are_journalled_in_order():
     engine.offload_request("node", "b")
 
     assert _entries(engine.take_resident_delta("node")) == [
-        ("wire-a", True), ("wire-a", False), ("wire-b", True),
+        ("wire-a", MoveKind.OFFLOAD), ("wire-a", MoveKind.RELOAD), ("wire-b", MoveKind.OFFLOAD),
     ]
     assert len(engine.take_resident_delta("node")) == 0, "drained once only"
 
@@ -411,11 +430,11 @@ def test_a_rank_that_leads_nothing_journals_nothing():
 def test_replaying_a_delta_reproduces_the_leaders_state():
     engine = _Engine("follower")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
-    delta.add_reloaded("wire-a")
-    delta.add_offloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
+    delta.add(MoveKind.RELOAD, "wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
 
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_rebuild) is True
     assert engine.is_offloaded("node", "a"), (
         "replay ended with 'a' resident; the leader has it on the host"
     )
@@ -428,34 +447,43 @@ def test_a_refused_entry_stops_the_replay_where_it_is():
     engine = _Engine("follower")
     engine.resource.refuse_offload = True
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
-    delta.add_offloaded("wire-b")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-b")
 
-    assert engine.apply_resident_delta("node", delta) is False
+    assert engine.apply_resident_delta("node", delta, _no_rebuild) is False
     assert len(delta) == 2, "a refused entry must stay queued"
 
     engine.resource.refuse_offload = False
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_rebuild) is True
     assert engine.is_offloaded("node", "a") and engine.is_offloaded("node", "b")
 
 
-def test_a_move_for_a_request_this_rank_no_longer_has_is_spent():
-    """``get_rid_handle`` answers None for a rid this rank has already removed --
-    a real race, since the conductor's REMOVE and rank 0's delta come from
-    different peers. Its pages went with the teardown, so the move is moot.
-
-    It must be POPPED, not retried, or the replay wedges on an entry that can
-    never land; and it must not reach the resources, which is what an unguarded
-    None did -- ``offload(None)`` logged a move of "request None"."""
+def test_a_move_for_a_request_this_rank_has_not_taken_in_waits_for_it():
+    """Nothing behind the move jumps ahead while it waits."""
     engine = _Engine("follower")
+    engine._graph_runtime._live.discard("a")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-gone")     # _Rids answers None for unknown ids
-    delta.add_offloaded("wire-a")        # and the rest of the queue still lands
+    delta.add(MoveKind.OFFLOAD, "wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-b")
 
-    assert engine.apply_resident_delta("node", delta) is True
-    assert len(delta) == 0, "the moot entry was left to be retried for ever"
-    assert engine.is_offloaded("node", "a"), "it stopped short of the next move"
-    assert None not in engine.resource.offloaded, "None reached the resources"
+    assert engine.apply_resident_delta("node", delta, _no_rebuild) is False
+    assert len(delta) == 2 and not engine.is_offloaded("node", "b"), "a move ran ahead of one still owed"
+
+    engine._graph_runtime._live.add("a")
+    assert engine.apply_resident_delta("node", delta, _no_rebuild) is True
+    assert engine.is_offloaded("node", "a"), "the move was lost while it waited"
+
+
+@pytest.mark.parametrize("kind", [kind for kind in MoveKind if kind is not MoveKind.OFFLOAD])
+def test_a_move_of_any_kind_waits_for_a_request_this_rank_has_not_taken_in(kind):
+    engine = _Engine("follower")
+    engine._graph_runtime._live.discard("a")
+    delta = OffloadDelta.new()
+    delta.add(kind, "wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-b")
+
+    assert engine.apply_resident_delta("node", delta, _no_rebuild) is False
+    assert len(delta) == 2 and not engine.is_offloaded("node", "b"), "a move ran ahead of one still owed"
 
 
 def test_a_request_holding_nothing_is_not_a_refusal():
@@ -465,9 +493,9 @@ def test_a_request_holding_nothing_is_not_a_refusal():
     engine = _Engine("follower")
     engine.resource.holds_nothing = {"a"}
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
 
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_rebuild) is True
     assert len(delta) == 0
 
 
@@ -476,9 +504,9 @@ def test_replaying_does_not_journal_it_onward():
     journalled, a rank that both leads and follows would echo."""
     engine = _Engine("leader")  # journalling is on
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
 
-    engine.apply_resident_delta("node", delta)
+    engine.apply_resident_delta("node", delta, _no_rebuild)
 
     assert len(engine.take_resident_delta("node")) == 0
 
@@ -494,11 +522,11 @@ def test_each_replayed_move_is_logged(caplog):
     two ranks' lines could not be matched up if they named handles."""
     engine = _Engine("follower")
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")
-    delta.add_reloaded("wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-a")
+    delta.add(MoveKind.RELOAD, "wire-a")
 
     with caplog.at_level(logging.INFO, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta("node", delta) is True
+        assert engine.apply_resident_delta("node", delta, _no_rebuild) is True
 
     lines = [r.getMessage() for r in caplog.records]
     assert any("Replayed rank 0's offload of request wire-a from node" in ln for ln in lines), lines
@@ -511,10 +539,10 @@ def test_a_no_op_replay_is_not_logged_as_a_move(caplog):
     engine = _Engine("follower")
     engine.resource.offloaded = {"a"}
     delta = OffloadDelta.new()
-    delta.add_offloaded("wire-a")  # already off here
+    delta.add(MoveKind.OFFLOAD, "wire-a")  # already off here
 
     with caplog.at_level(logging.INFO, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta("node", delta) is True
+        assert engine.apply_resident_delta("node", delta, _no_rebuild) is True
 
     assert not [r for r in caplog.records if "Replayed" in r.getMessage()]
 
@@ -615,6 +643,8 @@ class _Leader:
         self.parallel_nodes = {"node"}
         self.parallel_leader_nodes = {"node"}
         self._tp_broadcast_seq = 0
+        self._tp_followers = {}
+        self._victims = {}
         group = SimpleNamespace(_workers=["rank0", *followers])
         # The runtime owns both the sharding config and the handle table now.
         # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
@@ -639,7 +669,7 @@ class _Leader:
 
 def _node_batch():
     return SimpleNamespace(
-        node_name="node", graph_walk="walk", request_ids=("r0",),
+        node_name="node", graph_walk="walk", request_ids=("r0",), rebuild_rids=frozenset(),
         step_context=StepContext(
             request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
         ),
@@ -657,7 +687,7 @@ def test_the_broadcast_carries_the_leaders_moves():
     body = leader.sent[0][1].body
     # wire ids, not local handles: the follower mints its own, so a broadcast
     # naming rank 0's would replay against the wrong requests
-    assert _entries(body.resident_delta) == [("wire-victim", True)]
+    assert _entries(body.resident_delta) == [("wire-victim", MoveKind.OFFLOAD)]
     assert body.request_ids == ["wire-r0"]
 
 
@@ -671,12 +701,33 @@ def test_every_follower_gets_the_same_moves_in_its_own_queue():
 
     deltas = [msg.body.resident_delta for _, msg in leader.sent]
     assert len(deltas) == 2
-    assert all(_entries(d) == [("wire-victim", True)] for d in deltas), (
+    assert all(_entries(d) == [("wire-victim", MoveKind.OFFLOAD)] for d in deltas), (
         "a follower was sent an empty delta"
     )
     # and one replaying does not drain another's
     deltas[0].pop_left()
     assert len(deltas[1]) == 1
+
+
+def test_the_broadcast_sends_the_rebuild_rows_apart_from_the_rows_the_follower_pops():
+    leader, node_batch = _Leader(), _node_batch()
+    node_batch.request_ids, node_batch.rebuild_rids = ("rb", "r0"), frozenset({"rb"})
+
+    leader.maybe_send_zmq_to_tp_followers(node_batch)
+
+    body = leader.sent[0][1].body
+    assert (body.request_ids, body.rebuild_ids) == (["wire-r0"], ["wire-rb"]), "the follower can't pop a rebuild row"
+
+
+def test_rank_0_drops_its_victim_before_it_drains_the_journal_for_the_step():
+    """A follower drops the victim before it builds the step, so rank 0's drop has to travel with that step."""
+    leader = _Leader()
+    leader._victims = {"v": None}
+    leader._move_victims = lambda node: leader.engine._resident_delta[node].add(MoveKind.DROP, "wire-v", count=8)
+
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+
+    assert leader.sent[0][1].body.resident_delta.kinds == [MoveKind.DROP], "rank 0 admits a step its followers don't"
 
 
 def test_the_journal_is_drained_by_the_broadcast():
@@ -805,7 +856,7 @@ def test_the_broadcast_ships_the_sequence_verbatim():
     engine.reload_request("node", "a")
 
     assert _entries(engine.take_resident_delta("node")) == [
-        ("wire-a", True), ("wire-a", False),
+        ("wire-a", MoveKind.OFFLOAD), ("wire-a", MoveKind.RELOAD),
     ]
 def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     """A follower that stops mid-delta and never finishes leaves rank 0 on a
@@ -814,10 +865,10 @@ def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     engine.resource.refuse_reload = True
     engine.resource.offloaded = {"a"}
     delta = OffloadDelta.new()
-    delta.add_reloaded("wire-a")
+    delta.add(MoveKind.RELOAD, "wire-a")
 
     with caplog.at_level(logging.WARNING, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta("node", delta) is False
+        assert engine.apply_resident_delta("node", delta, _no_rebuild) is False
 
     line = next(r.getMessage() for r in caplog.records if "does not fit" in r.getMessage())
     assert "reload of wire-a on node" in line
@@ -835,7 +886,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     """A refused replay leaves moves owed, so the rids the head names do not mean
     here what they meant on the leader. Wait rather than build."""
     engine = SimpleNamespace(
-        apply_resident_delta=lambda node, delta: False,  # refuses
+        apply_resident_delta=lambda node, delta, rebuild_of: False,  # refuses
         is_offloaded=lambda node, rid: False,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
@@ -847,7 +898,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     message = ScheduleTPNode(
         node_name="node", graph_walk="walk", request_ids=["r0"], spec_seq=5,
     )
-    message.resident_delta.add_offloaded("wire-victim")
+    message.resident_delta.add(MoveKind.OFFLOAD, "wire-victim")
     sched.register_tp_follow(message)
 
     assert sched._try_schedule_tp_follow(
@@ -1073,7 +1124,7 @@ class _FollowSpec:
     def __init__(self, *, replay_refuses: bool):
         self.worker_id = "worker_1"
         self.engine = SimpleNamespace(
-            apply_resident_delta=lambda node, delta: not replay_refuses,
+            apply_resident_delta=lambda node, delta, rebuild_of: not replay_refuses,
             is_offloaded=lambda node, rid: False,
             reclaimable=lambda node, rid: 0,
             check_ready=lambda *a, **kw: FULL_ADMIT_OK,
@@ -1096,7 +1147,7 @@ class _FollowSpec:
             node_name="node", graph_walk="walk", request_ids=["r0"],
             speculative=True, spec_seq=6, spec_from_seq=5,
         )
-        head.resident_delta.add_offloaded("victim")
+        head.resident_delta.add(MoveKind.OFFLOAD, "victim")
         self.scheduler.register_tp_follow(head)
 
 
@@ -1151,3 +1202,291 @@ def test_the_async_follow_path_proceeds_once_the_replay_lands():
 
     assert worker._try_follow_speculation(parent) is None
     assert parent.reads == 1, "the gate blocked a build it should have allowed"
+
+
+# --- rank 0's pool moves ------------------------------------------------------
+#
+# Rank 0 allots, earmarks, drops and rebuilds, and records each move in its journal.
+# A follower makes the same moves from the delta, so both ranks admit every step from
+# the same counts and free pages in the same order. If a grant past the room passes on
+# one rank and fails on the other, only the rank where it passed enters the next collective.
+
+
+# each rank's pool -> its engine, whose runner admits for it
+_ENGINES: dict[int, Engine] = {}
+
+
+def _admits(kv, rid: str, walk: str = "prefill") -> bool:
+    """A readiness check of ``rid`` through ``kv``'s runner, after it takes whatever has since been admitted."""
+    runner = _ENGINES[id(kv)]._runner
+    runner.admit_waiting(lambda other, node: None)
+    return runner.admit_retrieve(rid, NODE, walk).ready
+
+
+def _returns(kv, rid: str) -> bool:
+    """Whether ``kv``'s runner has admitted ``rid`` again, once it takes whatever has since been admitted."""
+    runner = _ENGINES[id(kv)]._runner
+    runner.admit_waiting(lambda other, node: None)
+    return runner.admit_request(rid, NODE, "decode") is None
+
+
+def _pool_rank(monkeypatch, rank: int) -> tuple[KVManager, Engine]:
+    """Rank ``rank`` of two: a pool of 10 pages for requests, under the `Engine` methods that journal
+    (rank 0) and replay (rank 1) its moves."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=11,
+                          page_size=PAGE_SIZE),
+        name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=2), transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.local_loops = {"decode"}
+    engine = Engine.__new__(Engine)
+    engine._resources, engine._resource_nodes = {"kv": kv}, {"kv": frozenset({NODE})}
+    engine._submodules = {NODE: SimpleNamespace(resources={"kv": kv}, submodule=SimpleNamespace(
+        cleanup_request=lambda rid: None))}
+    engine._runner, engine._loopback_steps = StepRunner({"kv": kv}), {}
+    engine._graph_runtime = SimpleNamespace(
+        get_rid_string=str, get_rid_handle=lambda rid: rid if rid in kv._streams else None,
+    )
+    engine._tp_follower_nodes = {NODE} if rank else set()
+    engine._resident_delta = {} if rank else {NODE: OffloadDelta.new()}
+    if not rank:
+        kv.journal = partial(engine._journal, NODE, "kv")
+    _ENGINES[id(kv)] = engine
+    return kv, engine
+
+
+def _ingest(kvs, rid: str, pages: int, arrival: int) -> None:
+    """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
+    tokens = pages * PAGE_SIZE
+    layout = StreamLayout(spans=(PrefixSpan(tokens, tokens, "prefill"),), growth=(("decode", 1),))
+    for kv in kvs:
+        _ENGINES[id(kv)]._runner.ingest_request(rid, {"kv": KVReqConfig(
+            kv_layout={"main": layout}, loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival,
+        )})
+
+
+def _counts(kv) -> tuple:
+    """What the next admit reads, and the order the next grant takes free pages in."""
+    return (
+        kv._unused, {rid: (a.pages, a.remaining, a.prompt) for rid, a in kv._allotments.items()},
+        {rid: (e.pages, sorted(e.victims), e.freed) for rid, e in kv._earmarks.items()},
+        sorted(rid for rid, earmark in kv._victims.items() if earmark is not None), sorted(kv._dropped),
+        list(kv._arena.allocator.free_pages.queue),
+    )
+
+
+def _kept(rid):
+    """v's rebuild: its 5-page prompt and the id its next decode reads."""
+    return Rebuild("prefill", [0] * (5 * PAGE_SIZE + 1))
+
+
+def _both_short_then_drop(monkeypatch):
+    """r (arrival 1) grows past its allotment until its next token finds no room, on both ranks.
+    Rank 0 then chooses v (arrival 2) and drops it."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r")
+    assert _admits(leader, "v")
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
+        assert _counts(leader) == _counts(follower)
+    assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
+    lead.drop_request(NODE, "v", len(_kept("v").ids))
+    return (leader, lead), (follower, follow)
+
+
+def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+
+    delta = lead.take_resident_delta(NODE)
+    assert delta.kinds == [MoveKind.EARMARK, MoveKind.DROP]
+    assert follow.apply_resident_delta(NODE, delta, _kept)
+
+    assert _counts(leader) == _counts(follower), "the follower's earmark or drop left other counts"
+    assert _step(leader, "r", 1).ok and _step(follower, "r", 1).ok, "the page v's drop freed went elsewhere on one rank"
+    assert _counts(leader) == _counts(follower)
+
+
+def test_a_follower_takes_a_dropped_request_back_and_lays_it_out_as_rank_0_did(monkeypatch):
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    for kv, engine in ((leader, lead), (follower, follow)):
+        assert _step(kv, "r", 1).ok
+        engine.remove_request("r")
+
+    assert _returns(leader, "v")
+    lead.prepare_rebuild(NODE, "v", _kept("v"))
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+
+    assert _counts(leader) == _counts(follower), "the follower holds another allotment for the return"
+    assert follower._overrides["v"].kv_layout == leader._overrides["v"].kv_layout, "the rebuild writes another span"
+
+
+def test_a_follower_takes_a_returning_request_as_rank_0s_victim_again(monkeypatch):
+    """A dropped request reserved again for its return holds pages a grant can take, so rank 0 may choose it."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    for engine in (lead, follow):
+        engine.remove_request("r")
+    assert _returns(leader, "v")
+    lead.prepare_rebuild(NODE, "v", _kept("v"))
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    _ingest((leader, follower), "x", 1, arrival=0)
+    leader._allotments["x"] = follower._allotments["x"] = Allotment(pages=1)
+
+    assert leader.preempt("x", 1, droppable=lambda rid: True) == ["v"]
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    assert _counts(leader) == _counts(follower)
+
+
+def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps_ahead(monkeypatch):
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    # r leaves, and its earmark leaves the journal with it, so v's history and a page fit
+    for engine in (lead, follow):
+        engine.remove_request("r")
+    assert _returns(leader, "v")
+    delta = lead.take_resident_delta(NODE)
+    step, ctx = KVStep(segments=(Segment("v", "main", 0),)), StepContext(("v",), "prefill", 0, False)
+    assert follower.admit(step, ctx).ok
+
+    assert not follow.apply_resident_delta(NODE, delta, _kept)
+    assert delta.kinds == [MoveKind.DROP, MoveKind.RESERVE], "the drop or the return behind it moved early"
+    assert "v" not in follower._dropped and "v" in follower._allotments
+
+    follower.rollback_admit(step, ctx)
+    assert follow.apply_resident_delta(NODE, delta, _kept)
+    # r left before v's drop here and after it on rank 0, so only the free list's order differs
+    assert _counts(leader)[:-1] == _counts(follower)[:-1]
+
+
+@pytest.mark.parametrize("in_step", [False, True], ids=["at once", "once its step there lands"])
+def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0_did(monkeypatch, in_step):
+    """Rank 0 journals a victim's move to the host when it chooses the victim, and again when the victim moves. The
+    follower gives up the victim's allotment as rank 0 does. Rank 0 admits the victim again from the head of the
+    queue, and the return reserves the same pages on both ranks."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    leader._cpu_pool, follower._cpu_pool = host._HostPool(64), host._HostPool(64)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r")
+    assert _admits(leader, "v")
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok
+    assert leader.preempt("r", 1, droppable=lambda rid: False) == ["v"] and leader.moves_to_host("v")
+    lead.offload_request(NODE, "v")
+    delta = lead.take_resident_delta(NODE)
+    assert delta.kinds == [MoveKind.EARMARK, MoveKind.OFFLOAD, MoveKind.OFFLOAD], "a choice or a move went unjournaled"
+    if in_step:
+        follower._streams["v"]["main"].step_in_flight = True
+        assert not follow.apply_resident_delta(NODE, delta, _kept), "the follower moved a victim its step holds"
+        assert "v" in follower._allotments, "a refused move gave up the victim's allotment"
+        follower._streams["v"]["main"].step_in_flight = False
+
+    assert follow.apply_resident_delta(NODE, delta, _kept)
+    assert follower.is_offloaded("v") and _counts(leader) == _counts(follower), "the follower's move left other counts"
+    assert follower._asks == leader._asks and list(leader._asks) == ["v"], "the follower asked for the victim elsewhere"
+    for kv, engine in ((leader, lead), (follower, follow)):
+        assert _step(kv, "r", 1).ok
+        engine.remove_request("r")
+    assert not follow.reload_request(NODE, "v"), "a follower would reload v ahead of rank 0's journal"
+    assert _returns(leader, "v") and lead.reload_request(NODE, "v") and leader.is_resident("v")
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    assert follower.is_resident("v"), "the follower didn't replay rank 0's return"
+    assert _counts(leader) == _counts(follower), "the follower holds another allotment for the return"
+
+
+def test_above_one_rank_a_host_victim_moves_when_a_fetch_retains_cached_host_pages_before_the_broadcast(
+    monkeypatch,
+):
+    """Rank 0 moves its victims as their node's next step goes out, after the readiness checks, and a host fetch
+    there can retain cached pages that only the host index held. If those pages counted as room, a victim sent to
+    the host would not fit, stay on the device, and keep the request it was chosen for waiting."""
+    leader, lead = _pool_rank(monkeypatch, 0)
+    cpu = leader._cpu_pool = host._HostPool(8)
+    cached, keys = cpu.arena.acquire(4), [bytes([i]) * 32 for i in range(4)]
+    cpu.index.insert_run(keys, cached, None)
+    cpu.arena.release(cached)
+    _ingest((leader,), "r", 2, arrival=1)
+    _ingest((leader,), "v", 6, arrival=2)
+    assert _admits(leader, "r")
+    assert _admits(leader, "v")
+    for rid, tokens in (("r", 2 * PAGE_SIZE), ("v", 6 * PAGE_SIZE), ("r", 2 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok
+    assert not _step(leader, "r", 1).ok
+    victims = leader.preempt("r", 1, droppable=lambda rid: False)
+    hosted = [rid for rid in victims if leader.moves_to_host(rid)]
+    cpu.retain_run(keys)
+    for rid in hosted:
+        lead.offload_request(NODE, rid)
+    assert hosted and all(leader.is_offloaded(rid) for rid in hosted), f"{hosted} chosen for the host stayed"
+
+
+def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):
+    """A node's second pool can hold a request back on every readiness check, undoing the first pool's allotment."""
+    leader, lead = _pool_rank(monkeypatch, 0)
+    _ingest((leader,), "x", 1, arrival=1)
+    assert _admits(leader, "x")
+    leader.unreserve("x")
+
+    assert not lead.take_resident_delta(NODE), "two moves per pass would pile up for each follower to replay"
+
+
+def test_rank_0_strips_a_removed_requests_moves_from_its_journal(monkeypatch):
+    leader, lead = _pool_rank(monkeypatch, 0)
+    _ingest((leader,), "x", 1, arrival=1)
+    _ingest((leader,), "y", 1, arrival=2)
+    assert _admits(leader, "x")
+    assert _admits(leader, "y")
+
+    lead.remove_request("x")
+
+    assert lead.take_resident_delta(NODE).rids == ["y"], "a follower would wait for a request it has torn down"
+
+
+def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
+    follower, follow = _pool_rank(monkeypatch, 1)
+    _ingest((follower,), "x", 1, arrival=1)
+    head = ScheduleTPNode(NODE, "prefill", ["x"], spec_seq=0)
+    for kind in (MoveKind.RESERVE, MoveKind.UNRESERVE, MoveKind.UNRESERVE):
+        head.resident_delta.add(kind, "x", "kv", 1)
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
+    scheduler.register_tp_follow(head)
+
+    with pytest.raises(SystemExit, match="TP ranks diverged"):
+        scheduler.settle_tp_follow_delta(caught_up=True)
+
+
+def test_a_follower_builds_rank_0s_rebuild_rows_and_runs_nothing_for_moves_alone():
+    engine = SimpleNamespace(apply_resident_delta=lambda node, delta, rebuild_of: True)
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: engine))
+    scheduler.rid_of = {"r0": 7}.get
+    moves = ScheduleTPNode(NODE, "prefill", [], spec_seq=3)
+    moves.resident_delta.add(MoveKind.DROP, "r0", count=8)
+    rebuild = ScheduleTPNode(NODE, "prefill", [], spec_seq=4, rebuild_ids=["r0"])
+    for message in (moves, rebuild):
+        scheduler.register_tp_follow(message)
+
+    assert scheduler._try_schedule_tp_follow(None) is None and scheduler.peek_tp_follow() is rebuild
+    batch = scheduler._try_schedule_tp_follow(None)
+    assert batch.rebuild_rids == (7,) and not batch.request_to_worker_graph, "the follower's step isn't rank 0's"
+
+
+def test_rank_0_holds_a_victim_and_the_request_it_was_chosen_for_until_the_drop(monkeypatch):
+    (leader, lead), (follower, _) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r")
+    assert _admits(leader, "v")
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        _step(leader, rid, tokens)
+    assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
+
+    for rid in ("r", "v"):
+        assert not _admits(leader, rid, "decode"), f"a step before the drop could take {rid}"
+    lead.drop_request(NODE, "v", len(_kept("v").ids))
+    assert _admits(leader, "r", "decode"), "r still waits after the drop went out"

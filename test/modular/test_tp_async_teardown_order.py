@@ -55,7 +55,7 @@ class _Stop(BaseException):
 def _batch(seq: int, rids: list[int]):
     """A step's scheduled and executing halves."""
     scheduled = SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, tp_seq=seq,
+        node_name=NODE, graph_walk=WALK, tp_seq=seq, rebuild_rids=(),
         request_to_worker_graph={rid: 0 for rid in rids},
         rids_by_walk=lambda: {WALK: list(rids)},
     )
@@ -87,6 +87,10 @@ class _Scheduler:
         self.last_consumed_tp_seq = -1
 
     def get_next_batch(self, request_state, **kwargs):
+        if self.heads and not self.heads[0].speculative:
+            # a step of moves alone, popped after its settle with no batch to build
+            self.pop_tp_follow_head()
+            return None
         if self.last_consumed_tp_seq + 1 >= len(self.steps):
             return None
         self.last_consumed_tp_seq += 1
@@ -97,6 +101,9 @@ class _Scheduler:
 
     def pop_tp_follow_head(self):
         self.last_consumed_tp_seq = self.heads.pop(0).spec_seq
+
+    def void_tp_follow_head(self):
+        self.heads[0].speculative = False
 
     def take_admit_errors(self):
         return {}
@@ -135,6 +142,7 @@ def _rank(
     w.streaming_buffers, w._last_active = {}, {}
     w._rebuilds = Rebuilds({}, {})
     w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
+    w._logged_pools = []
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -250,6 +258,31 @@ def test_rank_0_tears_down_after_admitting_the_step_its_stamp_names(monkeypatch)
     assert log.index(("admit", 1)) < log.index(("teardown", "gone")), log
 
 
+def test_rank_0_sends_an_owed_drop_before_the_loop_top_removes_its_victim(monkeypatch):
+    """A pass that raised can leave rank 0 owing its followers a victim's drop. The next loop top sends it before any
+    removal applies, so the removal is stamped with the step that carries the drop."""
+    w, log = _rank(monkeypatch, tp_rank=0, inbox=[])
+    w.parallel_nodes = w.parallel_leader_nodes = {NODE}
+    w._kv_caches = {"kv": SimpleNamespace(nodes={NODE}, cache=SimpleNamespace(head_on_host=lambda: None))}
+    w._victims = {HANDLES["gone"]: worker_mod.Victim("kv", 1)}
+    w._pending_removes = {HANDLES["gone"]: None}
+    w._make_executing_batch = lambda **kwargs: SimpleNamespace(node_name=kwargs["node_name"], request_ids=[])
+    broadcast = w.maybe_send_zmq_to_tp_followers
+
+    def _logged(node_batch, **kwargs):
+        log.append(("broadcast", broadcast(node_batch, **kwargs)))
+        return log[-1][1]
+
+    def _stop(pending, consecutive, fair):
+        raise _Stop
+
+    w.maybe_send_zmq_to_tp_followers = _logged
+    w._build_speculation = _stop
+    _run(w)
+
+    assert log.index(("broadcast", 0)) < log.index(("forward", "gone", 0)), log
+
+
 def test_a_follower_tears_down_after_admitting_the_step_rank_0_stamped(monkeypatch):
     """Here before this rank has even popped N+1: held until it has, then torn down behind
     the admit fence of the next pass."""
@@ -330,14 +363,15 @@ def test_a_follower_tears_down_what_it_deferred_before_it_takes_the_next_step(mo
 def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkeypatch, cache_open):
     """N fails "also", so both ranks drop the speculative N+1 built on it. Rank 0 stamped
     "gone" with N+1 and tore it down before it sent N+2. Here "gone" is held until this
-    rank pops N+1, which it does as it drops it, after building it when the prefix cache is
-    open, and goes before N+2's admit."""
+    rank pops N+1. On the serial path this rank pops N+1 once the voided head's moves land,
+    after building N+1 when the prefix cache is open. "gone" is then torn down before N+2's
+    admit."""
     removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
     w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [removal]])
     w.engine_manager.get_engine = lambda node: SimpleNamespace(
         prefix_cache_open=lambda node: cache_open, drop_cached_prefix=lambda head: None,
     )
-    # N+1 is dropped, so the serial path's next step is N+2
+    # N+1 is voided, so after it the serial path's next step is N+2
     w.scheduler.steps += [None, [HANDLES["kept"]]]
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation
 

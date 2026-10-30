@@ -138,6 +138,21 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     assert tokens.tolist() == [1, 2, 3, 4] and tokens.dtype == torch.long, "decode would read the last id twice"
 
 
+def test_a_requests_prompt_goes_to_the_host_once_however_often_its_rebuild_is_asked_for():
+    rebuilds, copies = Rebuilds({NODE: POLICY}, _graphs()), []
+    prompt = SimpleNamespace(tolist=lambda: copies.append(None) or [1, 2, 3])
+    rebuilds._kept[NODE][R] = KeptIds(prompt, array("i", [4]))
+
+    # a follower replays rank 0's drop and its rebuild, then builds the row
+    asked = [rebuilds.writes(R, NODE).ids for _ in range(3)]
+    rebuilds._kept[NODE][R].sampled.append(5)
+
+    assert len(copies) == 1, "each ask would wait on the device to copy the prompt again"
+    assert asked == [array("i", [1, 2, 3, 4])] * 3 and rebuilds.writes(R, NODE).ids == array("i", [1, 2, 3, 4, 5]), (
+        "a rebuild would write other ids than the request kept"
+    )
+
+
 def test_the_engine_keeps_no_sample_of_a_rebuild_row_whatever_the_model_declared():
     for kept_rids in (None, frozenset({R, A})):
         step = SubmoduleStep(segments=[], steps={"sampler": SamplerStep(kept_rids=kept_rids)})

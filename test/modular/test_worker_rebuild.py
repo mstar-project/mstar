@@ -11,6 +11,7 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict
 from concurrent.futures import Future
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -78,7 +79,8 @@ class _Scheduler:
 def _worker():
     eng = SimpleNamespace(dropped=[], landed=[], prepared=[], is_offloaded=lambda node, rid: False)
     eng.prepare_rebuild = lambda node, rid, rebuild: eng.prepared.append((rid, rebuild))
-    eng.is_resident, eng.drop_request = lambda _, rid: rid not in eng.dropped, lambda _, rid: eng.dropped.append(rid)
+    eng.is_resident = lambda _, rid: rid not in eng.dropped
+    eng.drop_request = lambda _, rid, kept: eng.dropped.append(rid)
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
@@ -87,7 +89,9 @@ def _worker():
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
     w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
+    w._logged_pools = []
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
+    w.parallel_nodes = w.parallel_leader_nodes = set()
     # holds no row, so any routing, stop or loop-count call fails the test
     w._graph_runtime = SimpleNamespace(cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None,
                                        get_rid_string=str, push_back_node=lambda node, rids, wgs: w.pushed.extend(rids))
@@ -360,3 +364,41 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
 
     assert engine._loopback_steps[R] == (NODE, DECODE), "the resumed decode would not read the last kept id"
 
+
+def test_a_follower_leaves_a_refused_rebuild_row_to_rank_0s_next_step():
+    """Rank 0 puts the row back and sends it again in a later step, and the follower builds the row from that step."""
+    w, _, batch, node_batch = _rebuilding(fresh={A: 0})
+    w.scheduler.take_rebuilds(node_batch.rebuild_rids)  # as the step's launch does
+    w.parallel_nodes = {NODE}
+    node_batch.admit_error = AllocationFailed("short", 1, "main", R)
+    w._handle_allocation_failure = lambda *a: w.held.append("base")
+
+    w._handle_admit_failure(batch, node_batch)
+
+    assert not w.scheduler.rows and w.held == ["base"], "the follower would schedule the rebuild row itself"
+
+
+def test_a_followers_yield_away_onto_rank_0s_rebuild_step_builds_its_rebuild_rows():
+    """A follower that also runs a node of its own can yield away onto rank 0's next step. That step's rebuild rows
+    aren't taken from a ready queue, so the follower builds them from its own kept ids, as the serial path does, or
+    the follower runs fewer rows than rank 0."""
+    rank_0s = ScheduledBatch(node_name=NODE, graph_walk=PREFILL, request_to_worker_graph={}, rebuild_rids=(7,))
+    built = []
+    w = SimpleNamespace(
+        _can_speculate=lambda batch: True, _choose_spec_target=lambda batch: None,
+        scheduler=SimpleNamespace(get_next_batch=lambda request_state, exclude_target=None: rank_0s),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
+        _tp_lead_needs_marker=lambda pending, spec: False, _span=lambda name: nullcontext(),
+        _build_executing_batch=lambda batch: built.append(dict(batch.rebuild_rows)) or SimpleNamespace(request_ids=[]),
+        maybe_send_zmq_to_tp_followers=lambda node_batch: -1, enable_nvtx=False, _phase_period=0, device=None,
+        _rebuilds=SimpleNamespace(rebuild=lambda rid, node, device: (None, (node, rid))),
+    )
+    w._follower_rebuild = lambda batch: Worker._follower_rebuild(w, batch)
+    own = SimpleNamespace(
+        node_name="own", graph_walk=DECODE, tp_seq=-1, node_batch=SimpleNamespace(admit_error=None),
+        batch=SimpleNamespace(request_to_worker_graph={1: 0}),
+    )
+
+    speculation, _ = Worker._build_speculation(w, own, 5, SimpleNamespace(peek=False, max_consecutive=1))
+
+    assert speculation.is_yield_away and built == [{7: (NODE, 7)}], "rank 0's rebuild row was left out"

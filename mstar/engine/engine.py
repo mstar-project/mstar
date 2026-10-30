@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import repeat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple, Sequence
@@ -68,7 +69,7 @@ from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.device import DeviceCapability
-from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
+from mstar.utils.ipc_format import MoveKind, OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
     PhaseLaps,
     mark,
@@ -592,6 +593,10 @@ class Engine:
             enable_nvtx=self._enable_nvtx,
             declared_by=declared_by,
         )
+
+        for kv in self.paged_kv_caches():
+            for node in kv.nodes & self._tp_leader_nodes:
+                kv.cache.journal = partial(self._journal, node, kv.key)
 
         self._open_prefix_caches(specs_by_key, model)
 
@@ -1200,10 +1205,12 @@ class Engine:
 
     def adopt_cached_prefix(self, head: ScheduleTPNode, caught_up: bool) -> bool:
         """On a TP follower, take rank 0's leases before building the step. False until this rank holds them all."""
-        ready = True
         for rid, walk, leases in self._resolve_hits(head):
-            ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up)
-        return ready
+            # stop at the first lease this rank doesn't hold yet, so it takes the leases in rank 0's order and
+            # counts their pages as rank 0 did
+            if not self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up):
+                return False
+        return True
 
     def release_cached_prefix(self, batch: ExecutingBatch) -> None:
         """Give back the leases of a step this rank built and won't run."""
@@ -2605,15 +2612,18 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
         )
 
-    def drop_request(self, node_name: str, request_id: int) -> int:
+    def drop_request(self, node_name: str, request_id: int, kept: int) -> int:
         """Discard the request's state on this node that can be recomputed from
-        its token ids, and return the pages freed."""
+        its token ids, and return the pages freed. ``kept`` is how many of those ids
+        this rank keeps, which rank 0 journals for its followers to check."""
         # check every resource before dropping any, so a refusal changes nothing,
         # as `reload_request` checks `can_reload`
         refusal = self.drop_refusal(node_name, request_id)
         if refusal is not None:
             raise RuntimeError(refusal)
         freed = sum(resource.drop(request_id) for resource in self._submodules[node_name].resources.values())
+        if node_name in self._resident_delta:
+            self._journal(node_name, "", MoveKind.DROP, request_id, kept)
         self._runner.readmit(request_id, node_name)
         return freed
 
@@ -2629,6 +2639,8 @@ class Engine:
         """Tell each of the node's resources what the dropped request's rebuild row writes."""
         for resource in self._submodules[node_name].resources.values():
             resource.prepare_rebuild(request_id, rebuild)
+        if node_name in self._resident_delta:
+            self._journal(node_name, "", MoveKind.REBUILD, request_id, 0)
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
         """Make the dropped request resident again, once its rebuild row has run."""
@@ -2653,11 +2665,10 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
+        # a victim can be offloaded without freeing a page
+        if (freed > 0 or self.is_offloaded(node_name, request_id)) and node_name in self._resident_delta:
+            self._journal(node_name, "", MoveKind.OFFLOAD, request_id, 0)
         self._runner.readmit(request_id, node_name)
-        if freed > 0 and node_name in self._resident_delta:
-            self._resident_delta[node_name].add_offloaded(
-                self._graph_runtime.get_rid_string(request_id)
-            )
         return freed
 
     def reload_request(self, node_name: str, request_id: int) -> bool:
@@ -2693,9 +2704,7 @@ class Engine:
             self._graph_runtime.get_rid_string(request_id), node_name,
         )
         if node_name in self._resident_delta:
-            self._resident_delta[node_name].add_reloaded(
-                self._graph_runtime.get_rid_string(request_id)
-            )
+            self._journal(node_name, "", MoveKind.RELOAD, request_id, 0)
         return True
 
     def _classify_tp_roles(
@@ -2721,6 +2730,21 @@ class Engine:
         for node in self._tp_leader_nodes:
             self._resident_delta[node] = OffloadDelta.new()
 
+    def _journal(
+        self, node_name: str, pool: str, kind: MoveKind, request_id: int, count: int, victims: Sequence[int] = (),
+    ) -> None:
+        wire_rid, journal = self._graph_runtime.get_rid_string(request_id), self._resident_delta[node_name]
+        # an UNRESERVE right after its RESERVE cancels it, so the followers don't replay both moves at every
+        # `check_ready` where a second KV cache on the node keeps the request not ready
+        if kind == MoveKind.UNRESERVE and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
+            return
+        wire_victims = [self._graph_runtime.get_rid_string(victim) for victim in victims]
+        journal.add(kind, wire_rid, pool, count, wire_victims)
+        if kind in (MoveKind.EARMARK, MoveKind.DROP):
+            # matched against the followers' replay lines to compare the ranks' victims
+            logger.debug("Journaled %s of request %s on %s (%d, victims %s)", kind.name, wire_rid, node_name, count,
+                        wire_victims)
+
     def take_resident_delta(
         self, node_name: str,
     ) -> OffloadDelta:
@@ -2735,37 +2759,58 @@ class Engine:
         return self._resident_delta[node_name].take()
 
     def apply_resident_delta(
-        self, node_name: str, delta: OffloadDelta,
+        self, node_name: str, delta: OffloadDelta, rebuild_of: Callable[[int], Rebuild | None],
     ) -> bool:
         """Match the leader's resident set on this node. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
+        ``rebuild_of`` gives what this rank's kept ids would rebuild of a request on the node.
         """
 
         resources = self._submodules[node_name].resources.values()
         for _ in range(len(delta)):
-            wire_rid, is_offload = delta.peek_left()
+            move = delta.peek_left()
+            wire_rid, kind = move.rid, move.kind
             # Wire strings, not handles: a handle is minted per worker, so rank
-            # 0's is meaningless here. None means this rank has no live request
-            # by that name -- it removed it already, on the other side of the
-            # step rank 0 recorded the move. Its pages are gone, so the move is
-            # moot and the entry is spent; logged because reaching this for a
-            # rid the rank has NOT YET admitted would silently lose a move and
-            # diverge the resident set for good.
+            # 0's is meaningless here. Rank 0 strips a request's moves from its
+            # journal when it removes the request, so None means this rank hasn't
+            # ingested the request yet, and the move waits for it.
             rid = self._graph_runtime.get_rid_handle(wire_rid)
             if rid is None:
                 logger.debug(
-                    "Replay: no live request named %s on %s; move is moot",
-                    wire_rid, node_name,
+                    "Replay: %s not ingested on %s yet; %d moves still owed",
+                    wire_rid, node_name, len(delta),
                 )
-                delta.pop_left()
-                continue
-            if is_offload:
+                return False
+            if move.pool:
+                victims = [self._graph_runtime.get_rid_handle(victim) for victim in move.victims]
+                self._resources[move.pool].replay(kind, rid, move.count, victims)
+                if kind == MoveKind.EARMARK:
+                    logger.debug("Replayed rank 0's EARMARK of request %s on %s (%d, victims %s)", wire_rid,
+                                node_name, move.count, move.victims)
+            elif kind == MoveKind.DROP:
+                if any(kv.cache.in_step(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes):
+                    logger.debug("Replay: %s's drop on %s waits for its step; %d moves still owed",
+                                 wire_rid, node_name, len(delta))
+                    return False
+                rebuild = rebuild_of(rid)
+                if rebuild is None or len(rebuild.ids) != move.count:
+                    raise RuntimeError(
+                        f"rank 0 dropped {wire_rid} keeping {move.count} ids, and this rank keeps "
+                        f"{None if rebuild is None else len(rebuild.ids)}"
+                    )
+                freed = self.drop_request(node_name, rid, move.count)
+                logger.debug("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
+                            move.count, freed)
+            elif kind == MoveKind.REBUILD:
+                self.prepare_rebuild(node_name, rid, rebuild_of(rid))
+            elif kind == MoveKind.OFFLOAD:
+                hosted = any(kv.cache.moves_to_host(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes)
                 if self.is_offloaded(node_name, rid):
                     logger.debug(
                         "Replay: %s already off %s", wire_rid, node_name,
                     )
-                elif self.reclaimable(node_name, rid) <= 0:
+                elif self.reclaimable(node_name, rid) <= 0 and not hosted:
                     # Nothing resident to move, so this rank already matches the
                     # leader. Distinct from the refusal below, and the difference
                     # matters: ``offload`` answers 0 for both, and treating
@@ -2780,7 +2825,7 @@ class Engine:
                         for resource in resources
                         if resource.supports_eviction
                     )
-                    if freed <= 0:
+                    if not self.is_offloaded(node_name, rid):
                         # Refused for now: a step still holds these pages and
                         # will release them when it commits.
                         logger.warning(
@@ -2881,6 +2926,10 @@ class Engine:
         held pages of that the teardown hands back, which `frees_on_remove`
         counts: a KV cache whose pages reach the free list or are left to the
         prefix index alone. An offloaded request, or one that never ran, frees none."""
+        if self._resident_delta:
+            wire_rid = self._graph_runtime.get_rid_string(request_id)
+            for journal in self._resident_delta.values():
+                journal.discard(wire_rid)
         self._loopback_steps.pop(request_id, None)
         freed = {
             key for key, resource in self._resources.items()

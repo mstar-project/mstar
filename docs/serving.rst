@@ -380,11 +380,11 @@ ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
 ranks. Loading fails otherwise.
 
-On a single rank, a request waits at the head of its pool's queue until its reservation fits
-beside the reservations already admitted, and no request behind it starts first. A cache hit on
-a page only the prefix index holds counts as a page the request takes. A request that can't fit
-in its pool at its full output length gets a 400 if it asked for that length, and otherwise has
-the model's default length cut until it fits. A request that can be rebuilt reserves only its
+A request waits at the head of its pool's queue until its reservation fits beside the
+reservations already admitted, and no request behind it starts first. A cache hit on a page
+only the prefix index holds counts as a page the request takes. A request that can't fit in its
+pool at its full output length gets a 400 if it asked for that length, and otherwise has the
+model's default length cut until it fits. A request that can be rebuilt reserves only its
 prompt, so a decode step can find no page outside the reservations. The worker then takes pages
 from the newest requests, those that arrived after the request that ran short, until they cover
 its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of
@@ -398,17 +398,18 @@ every cache hit counted, and is never dropped or moved to the host. So does a re
 pools of a node that keeps no token ids to rebuild it. Voice requests then queue when the pool
 is short and are never preempted mid-stream.
 
-Above one rank, a decode step that finds no page and nothing to offload holds its requests
-until they time out. At one rank, a request that runs short and can neither move to the host
-nor be dropped waits for room when moving or dropping the newer requests wouldn't cover its
-shortage. When ``cpu_offload_pages`` can't hold the request, that is the case for every request
-under ``MSTAR_SAMPLER_INGRAPH_SCATTER=1``, since the sampler then refuses every drop. Several
-such requests can wait on each other. ``max_concurrent_requests`` prevents both. It caps how
-many requests run at once, and the pool's pages divided by the pages one request needs, prompt
-and output together, is a safe value. ``cpu_offload_pages`` lets a full pool move a request to
-the host instead of dropping it. An offload frees only the device pages no other running
-request reads, though, so a request that shares most of its prompt frees little. Offload helps
-a pool that runs short now and then. It doesn't replace the cap.
+Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the
+step that follows, so every rank admits each step from the same reservations. A request that
+runs short and can neither move to the host nor be dropped waits for room when moving or
+dropping the newer requests wouldn't cover its shortage. When ``cpu_offload_pages`` can't hold
+the request, that is the case for every request under ``MSTAR_SAMPLER_INGRAPH_SCATTER=1``,
+since the sampler then refuses every drop. Several such requests can wait on each other.
+``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
+pool's pages divided by the pages one request needs, prompt and output together, is a safe
+value. ``cpu_offload_pages`` lets a full pool move a request to the host instead of dropping
+it. An offload frees only the device pages no other running request reads, though, so a request
+that shares most of its prompt frees little. Offload helps a pool that runs short now and then.
+It doesn't replace the cap.
 
 **Single GPU.** Everything on rank 0:
 

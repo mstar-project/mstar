@@ -680,7 +680,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.parallel_leader_nodes = {NODE} if rank == 0 else set()
     w.is_tp_follower = rank != 0
     w.tp_async_sched, w.tp_async_nodes = False, None
-    w._tp_broadcast_seq = 0
+    w._tp_broadcast_seq, w._tp_followers = 0, {}
     w._tp_nospec = RecentSet(64)
     w._tp_leader_gap_warned = False
     w.scheduler = MicroScheduler(w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)
@@ -703,7 +703,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._innermost_loop_by_node = {}
     w._metrics = None
     # the preemption state `Worker.__init__` sets up, here with no paged KV cache to preempt in
-    w._kv_keys, w._kv_caches = defaultdict(list), {}
+    w._kv_keys, w._kv_caches, w._logged_pools = defaultdict(list), {}, []
     w._rebuilding, w._dropped, w._victims = frozenset(), {}, {}
     w._preempted, w._preemptions, w._drop_logged = {}, defaultdict(PreemptionCounts), {}
     for setup in _DESIGN_SETUP:

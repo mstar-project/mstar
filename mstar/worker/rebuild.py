@@ -24,9 +24,14 @@ if TYPE_CHECKING:
 @dataclass(slots=True)
 class KeptIds:
     """A request's ids on one node: its prompt as the policy's walk read it, and each id sampled since,
-    as int32."""
+    as int32. ``host`` is the prompt's host copy, made the first time anything asks what the request's
+    rebuild writes."""
     prompt: torch.Tensor
     sampled: array
+    host: array | None = None
+
+    def __len__(self) -> int:
+        return self.prompt.numel() + len(self.sampled)
 
 
 class RebuildRow(NamedTuple):
@@ -167,15 +172,23 @@ class Rebuilds:
             return f"its {len(kept.sampled)} kept samples don't cover its KV"
         return None
 
+    def writes(self, rid: int, node: str) -> Rebuild | None:
+        """What ``rid``'s rebuild row on ``node`` writes, or None when it keeps no ids there."""
+        kept = self._kept.get(node, {}).get(rid)
+        if kept is None:
+            return None
+        if kept.host is None:
+            # the one copy of the prompt to the host, kept for the rebuild's later calls
+            kept.host = array("i", kept.prompt.tolist())
+        ids = array("i", kept.host)
+        ids.extend(kept.sampled)
+        return Rebuild(self._policies[node].walk, ids)
+
     def rebuild(self, rid: int, node: str, device: torch.device) -> tuple[Rebuild, RebuildRow]:
         """What ``rid``'s rebuild row on ``node`` writes, and the row."""
-        policy = self._policies[node]
-        kept = self._kept[node][rid]
-        # the one copy of the prompt to the host, made once per rebuild
-        ids = array("i", kept.prompt.tolist())
-        ids.extend(kept.sampled)
-        tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(device, dtype=kept.prompt.dtype)
-        return Rebuild(policy.walk, ids), RebuildRow(node, policy.walk, {policy.ids_input: [tokens]})
+        policy, rebuild, dtype = self._policies[node], self.writes(rid, node), self._kept[node][rid].prompt.dtype
+        tokens = torch.frombuffer(rebuild.ids, dtype=torch.int32)[:-1].to(device, dtype=dtype)
+        return rebuild, RebuildRow(node, policy.walk, {policy.ids_input: [tokens]})
 
     def remove_request(self, rid: int) -> None:
         for kept in self._kept.values():

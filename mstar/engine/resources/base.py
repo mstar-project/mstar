@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -107,6 +108,17 @@ class KeyedWalks(NamedTuple):
     writes are keyed, and the growth walks whose sampled ids extend the keys."""
     writes: tuple[str, ...]
     growth: tuple[str, ...] = ()
+
+
+class MoveKind(IntEnum):
+    """A kind of move that rank 0 of a TP node makes on a request and each TP follower replays."""
+    OFFLOAD = 0
+    RELOAD = 1
+    RESERVE = 2
+    UNRESERVE = 3
+    EARMARK = 4
+    DROP = 5
+    REBUILD = 6
 
 
 class Resource(ABC):

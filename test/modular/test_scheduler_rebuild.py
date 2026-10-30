@@ -78,7 +78,7 @@ def test_a_walks_cap_bounds_its_rebuild_rows_first():
     assert "p0" in runtime.ready, "a prompt row would be popped with no room to run"
 
 
-@pytest.mark.parametrize("why", ["held", "failed", "removing"])
+@pytest.mark.parametrize("why", ["held", "failed", "removing", "moving"])
 def test_a_rebuild_row_the_scheduler_wouldnt_run_waits(why):
     sched, _, state = _setup({"d0": DECODE}, max_bs=4)
     _queue(sched, "r0")
@@ -86,8 +86,10 @@ def test_a_rebuild_row_the_scheduler_wouldnt_run_waits(why):
         sched.hold_requests(["r0"])
     elif why == "failed":
         sched.failed_rids.add("r0")
-    else:
+    elif why == "removing":
         sched.pending_removes["r0"] = None
+    else:  # a TP node's victim, which moves as the node's next step goes out
+        sched.moving = {"r0"}
 
     batch = sched.get_next_batch(state)
 
