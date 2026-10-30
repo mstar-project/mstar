@@ -299,12 +299,11 @@ def _worker(chain: ChainPick, prep, taken=None) -> SimpleNamespace:
             pick_chain_step=lambda state, target, continuing: chain,
             take_chain_step=lambda state, chain: taken,
         ),
-        _graph_runtime=SimpleNamespace(prep_spec_rids=prep),
+        _spec_preparer=SimpleNamespace(prepare=prep),
         tensor_manager=SimpleNamespace(get_tensor=lambda uuid: None),
         request_state=SimpleNamespace(),
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
-        _streams_possible=lambda: False,
         _yield_away_speculation=lambda batch, gave_way=False: SimpleNamespace(
             scheduled_batch=batch, gave_way=gave_way,
         ),
@@ -324,17 +323,14 @@ def _pending():
 
 
 def test_prep_gets_the_chains_rows_in_line_and_the_room():
-    """``prep_spec_rids`` keeps the first ``room_for_continuing`` rows it is
-    handed that continue: the pick's line, so a row whose loop ends hands its
-    place to the next one in line."""
+    """Prep keeps the first ``room`` rows it is handed that continue: the
+    pick's line, so a row whose loop ends hands its place to the next one in
+    line."""
     seen = {}
 
-    def prep(inp):
-        seen["rids"], seen["room"] = list(inp.rids), inp.room_for_continuing
-        return SpeculationPrepOutput(
-            consumed_streaming_edge_idxs=[], ready_rids=[], wg_ids=[],
-            input_edges=ColumnarEdgeSpecs.empty(),
-        )
+    def prep(batch_N, node, walk, candidates, room, laps):
+        seen["rids"], seen["room"] = list(candidates), room
+        return SimpleNamespace(ready_rids=[])
 
     pick = StepPick(taken=[2, 9], continuing=[2, 3, 1], room=1, held_back=set(), ordered=True)
     worker = _worker(ChainPick(KEY, pick, []), prep)
