@@ -239,7 +239,7 @@ def _submodule_class():
             # the stand-in's decode reads routed tokens, not the sampler's
             self.device_loopback = None
 
-        # the real model's step, stop and emit settings, which read state this
+        # the real model's step and stop settings, which read state this
         # stand-in doesn't have
         def max_batch_size(self, graph_walk):
             return None

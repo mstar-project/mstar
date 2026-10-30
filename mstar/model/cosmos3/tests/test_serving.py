@@ -729,7 +729,7 @@ def test_video_postprocess_uses_request_fps(tmp_path) -> None:
     import torch
 
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
-    frames = torch.zeros(1, 3, 8, 32, 32, dtype=torch.uint8)
+    frames = torch.zeros(8, 3, 32, 32, dtype=torch.uint8)
     data = model.postprocess(frames, "video", request_kwargs={"fps": 12})
     (tmp_path / "v.mp4").write_bytes(data)
     with av.open(io.BytesIO(data)) as container:
@@ -789,7 +789,7 @@ def test_vae_decode_fast_routes_whole_clips_through_the_shared_decoder(monkeypat
     sub._decode_dtype_cached = torch.bfloat16
     out = sub.forward("video_gen", None, torch.zeros(1, 4, 3, 8, 8, dtype=torch.bfloat16))
     assert calls == ["channels_last", ("decode_causal", True, True)]
-    assert out["video_output"][0].shape == (1, 3, 9, 8, 8)
+    assert out["video_output"][0].shape == (9, 3, 8, 8)
     assert out["video_output"][0].dtype == torch.uint8
 
 

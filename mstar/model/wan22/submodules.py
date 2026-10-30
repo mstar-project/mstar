@@ -662,11 +662,13 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
 class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     """Wan2.2-VAE latent -> pixel decoder (tiled).
 
-    Consumes the loop's final ``latents`` and emits ``video_output``
-    ``[1, 3, num_frames, H, W]`` as uint8. Quantizing here, at the worker boundary,
+    Consumes the loop's final ``latents`` and emits ``video_output`` as uint8
+    ``[num_frames, H, W, 3]`` frames. Quantizing here, at the worker boundary,
     keeps the edge to the data worker at one byte per pixel instead of a 4x larger
     float tensor; the output is 8-bit mp4 either way, and ``Wan22Model.postprocess``
-    does the muxing.
+    does the muxing. The frames are laid out as PyAV's rgb24 frames here, on the
+    GPU, so the encoder reads them without copying each one out of a strided
+    view on the host.
 
     The node owns its own VAE instance because the decode dtype depends on the cuDNN
     version (see ``_decode_dtype``) while the I2V encode stays bf16 — one shared
@@ -838,6 +840,6 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
                 video = self._fast.decode(latents)
             else:
                 video = vae.decode(latents, return_dict=False)[0]
-            # Quantize to 8-bit at the worker boundary (see class docstring).
-            video = (video / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
-        return {"video_output": [video]}
+            # Quantize to 8-bit at the worker boundary, as rgb24 frames (see class docstring).
+            frames = (video[0] / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).permute(1, 2, 3, 0).contiguous()
+        return {"video_output": [frames]}

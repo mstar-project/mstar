@@ -76,10 +76,14 @@ def _windows(stream: torch.Tensor, start: int = 0):
 
 
 def _run(sub, rid, windows, frames, **md):
+    """Each window's emitted ``[T, C, H, W]`` frames, as ``[1, C, T, H, W]`` pixels
+    to compare with ``_decode_pixels``."""
     md = {"num_windows": len(windows), "overlap_latent_units": OVERLAP, "num_frames": frames,
           "stream_video": True, **md}
     infos = SimpleNamespace(request_ids=[rid], per_request_info={rid: SimpleNamespace(step_metadata=md)})
-    return [sub.forward(C.VIDEO_DECODE_AR_WALK, infos, w)["video_output"][0] for w in windows]
+    emitted = [sub.forward(C.VIDEO_DECODE_AR_WALK, infos, w)["video_output"][0] for w in windows]
+    assert all(f.is_contiguous() for f in emitted)
+    return [f.transpose(0, 1)[None] for f in emitted]
 
 
 def _u8_close(a: torch.Tensor, b: torch.Tensor, tol: int = 1) -> None:
@@ -224,9 +228,7 @@ def test_channels_last_decoder(monkeypatch) -> None:
     sub = _decoder(monkeypatch, _tiny_vae(), channels_last=True)
     assert is_channels_last(sub.vae)
     assert sub._vae_input(stream).is_contiguous(memory_format=torch.channels_last_3d)
-    chunks = _run(sub, "r", _windows(stream), 77)
-    video = torch.cat(chunks, dim=2)
-    assert all(c.is_contiguous() for c in chunks)
+    video = torch.cat(_run(sub, "r", _windows(stream), 77), dim=2)
     _u8_close(video, sub._decode_pixels(stream))
     plain = _decoder(monkeypatch, _tiny_vae())._decode_pixels(stream)
     assert (video.int() - plain.int()).abs().max() <= 1
