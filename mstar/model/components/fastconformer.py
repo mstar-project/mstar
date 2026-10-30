@@ -357,7 +357,8 @@ class ConvModule(nn.Module):
         return self._depthwise_pointwise(x)
 
     def _depthwise_pointwise(self, x: torch.Tensor) -> torch.Tensor:
-        """``(B, C, T')`` GLU outputs, left-padded by ``k - 1`` when causal, to ``(B, T, C)``."""
+        """``(B, C, k - 1 + T)`` GLU outputs when causal (zeros offline, the
+        cached inputs in a stream), else ``(B, C, T)``, to ``(B, T, C)``."""
         x = self.depthwise_conv(x).transpose(1, 2)
         if self.norm is not None:
             x = self.norm(x)
