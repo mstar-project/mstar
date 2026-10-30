@@ -205,14 +205,16 @@ def _reads_done(rid, *entities):
             for e in entities]
 
 
-def test_dispatch_tells_the_data_worker_the_consumers_ranks_once(tmp_path, monkeypatch):
-    """After the workers' NEW_REQUESTs, once dispatch can't fail: every rank
-    that gets items then holds the request and gets its REMOVE. (A rank parks
-    items that arrive before its NEW_REQUEST.) The conductor forwards none."""
-    c = _conductor(tmp_path, monkeypatch)
+@pytest.mark.parametrize("streams", [["audio_in"], ["audio_in", "video_in"]])
+def test_dispatch_tells_the_data_worker_the_consumers_ranks_once(tmp_path, monkeypatch, streams):
+    """For every client stream, after the workers' NEW_REQUESTs, once dispatch
+    can't fail: every rank that gets items then holds the request and gets its
+    REMOVE. (A rank parks items that arrive before its NEW_REQUEST.) The
+    conductor forwards none."""
+    c = _conductor(tmp_path, monkeypatch, model=_AudioAndVideo() if len(streams) == 2 else None)
     _run(c, [[_new_request("r")]])
 
-    assert _routes(c, "r") == [{"audio_in": ["worker_0"]}]
+    assert _routes(c, "r") == [dict.fromkeys(streams, ["worker_0"])]
     kinds = [kind for kind, _e, body in _sends(c, "NEW_REQUEST", "CLIENT_STREAM_ROUTE", "INPUT_SIGNALS")]
     assert kinds == ["NEW_REQUEST", "CLIENT_STREAM_ROUTE"]
 
@@ -389,13 +391,6 @@ class _AudioAndVideo(_DuplexToy):
         return PartitionTopology(partitions=["Ear"], connections=[
             _client_connection("audio_in"), _client_connection("video_in"),
         ])
-
-
-def test_every_client_stream_is_routed(tmp_path, monkeypatch):
-    c = _conductor(tmp_path, monkeypatch, model=_AudioAndVideo())
-    _run(c, [[_new_request("r")]])
-
-    assert _routes(c, "r") == [{"audio_in": ["worker_0"], "video_in": ["worker_0"]}]
 
 
 def test_a_client_streams_consumer_must_be_its_partitions_and_the_only_one():

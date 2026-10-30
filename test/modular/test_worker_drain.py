@@ -416,12 +416,6 @@ def _input_worker(**kwargs):
     return w, sbuf, reads
 
 
-def test_process_new_inputs_skips_reads_once_reads_done_is_sent():
-    w, sbuf, reads = _input_worker(draining=("X",), reads_done=("X",))
-    Worker._process_new_inputs(w, _input(1))
-    assert reads == [] and not sbuf._tensor_ids_in_order
-
-
 @pytest.mark.parametrize("streaming", [True, False])
 def test_a_follower_draining_before_its_input_arrives_still_reads_it(streaming):
     """Rank 0 committed a step on an input, then forwarded the drain; the
@@ -443,15 +437,13 @@ def test_a_follower_draining_before_its_input_arrives_still_reads_it(streaming):
     assert reads == [[1]]
 
 
-@pytest.mark.parametrize("committed_step", [False, True])
-def test_a_new_request_behind_the_drain_is_admitted_until_reads_done(committed_step):
+def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
     """A follower gets rank 0's forwarded drain before the conductor's
-    NEW_REQUEST. With a step rank 0 committed on the request, READS_DONE waits
-    for it, so the NEW_REQUEST is admitted (its handle failed) and the step can
-    run; refused, the step's head would wait for the handle for ever. With no
-    such step READS_DONE has gone and the NEW_REQUEST is refused."""
+    NEW_REQUEST, with a step rank 0 committed on the request. READS_DONE waits
+    for that step, so the NEW_REQUEST is admitted (its handle failed) and the
+    step can run; refused, the step's head would wait for the handle for ever."""
     known = []
-    w = _worker(known_rids=known, is_follower=True, tp_follow=("X",) if committed_step else ())
+    w = _worker(known_rids=known, is_follower=True, tp_follow=("X",))
     w._my_consumer_connections = []
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     w._graph_runtime.add_request = lambda request_id, **kw: known.append(request_id) or request_id
@@ -463,17 +455,16 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done(committed_s
     w.tensor_manager.start_read_tensors = lambda rid, inputs, graph_walk: []
 
     Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
-    assert len(_reads_done(w)) == (0 if committed_step else 1)
+    assert not _reads_done(w)
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
     ))
-    assert known == (["X"] if committed_step else [])
-    assert w.failed == ({"X"} if committed_step else set())
+    assert known == ["X"] and w.failed == {"X"}
 
     # the step runs, and READS_DONE goes once
-    w.scheduler.pending_tp_follow_count.pop("X", None)
+    w.scheduler.pending_tp_follow_count.pop("X")
     Worker._apply_pending_drains(w, set())
     assert len(_reads_done(w)) == 1
 

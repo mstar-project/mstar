@@ -617,15 +617,18 @@ def test_items_the_model_routes_to_an_ended_stream_are_late_and_neither_charged_
     assert list(tmp_path.iterdir()) == []
 
 
-def test_ends_that_reach_one_rank_together_each_name_their_partition():
-    """Two streams into two partitions, ended at once, with one rank
-    consuming both: one end per partition, so neither names the other's."""
+@pytest.mark.parametrize("ends", [{"audio_in"}, {"audio_in", "video_in"}])
+def test_an_opening_ends_just_the_streams_it_names(ends):
+    """A stream it leaves open makes the call live (refused, not queued, at
+    the cap). Each stream it ends gets its end in its own partition, even
+    beside another partition's on one rank."""
     wt, sent, _tm = _thread(_TwoStreams())
-    _open(wt, ends=frozenset({"audio_in", "video_in"}))
+    _open(wt, ends=frozenset(ends))
     _route(wt, audio_in=["w0"], video_in=["w0"])
 
-    ends = sorted((b.partition_name, b.producer_done_items) for b in _bodies(sent, WorkerMessageType.INPUT_SIGNALS))
-    assert ends == [("Ear", {"audio_in": 0}), ("Eye", {"video_in": 0})]
+    assert _bodies(sent, ConductorMessageType.NEW_REQUEST)[0].input_open == ("video_in" not in ends)
+    done = sorted((b.partition_name, b.producer_done_items) for b in _bodies(sent, WorkerMessageType.INPUT_SIGNALS))
+    assert done == [("Ear", {"audio_in": 0}), ("Eye", {"video_in": 0})][:len(ends)]
 
 
 class _RecordingPreprocess:
