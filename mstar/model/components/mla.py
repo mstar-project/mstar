@@ -11,16 +11,10 @@ optionally ``mla_fused_prep`` and the fp8 block-scale fields ``dense_fp8_block``
 * naive: per-head K/V padded to the attention backend's head size, the reduced-dims parity path.
 
 The decoupled RoPE is the position resource's (``pos_key``; the model's ``PositionConfig`` sets
-its layout and table), at the positions the caller passes. Optional ``config`` fields:
-
-* ``mla_use_nope``: no rotation, and no position resource (``pos_key=None``). With
-  ``qk_rope_head_dim`` > 0 the decoupled dims are kept unrotated (Kimi K3); with 0 there are none
-  (GLM-5.3), and the cache row's rope slot, ``mla_cache_kpe`` wide (0 or the 64 FlashInfer's MLA
-  kernel may need), is zeros. Its query part is ``kpe_query_fill``.
-* ``mla_use_output_gate``: ``o_proj`` reads the attention output times ``sigmoid(g_proj(x))``
-  (Kimi K3).
-* ``mla_latent_norm_eps``: the q and kv latent norms' eps, where it isn't ``rms_norm_eps``
-  (DeepSeek-V3's and Kimi's references build them at 1e-6).
+its layout and table), at the positions the caller passes. With ``mla_use_nope`` (an optional
+``config`` field) there are no decoupled dims (``qk_rope_head_dim`` 0, GLM-5.3), so no rotation and
+no position resource (``pos_key=None``); the cache row's rope slot, ``mla_cache_kpe`` wide (0 or
+the 64 FlashInfer's MLA kernel may need), is zeros, and its query part is ``kpe_query_fill``.
 
 ``kv_label`` names the cache stream a multi-label model writes and attends this layer under, and
 ``cache_layer`` the KV layer, where a model packs its attention layers' planes. A model's sparse
@@ -79,16 +73,12 @@ class MLAAttention(nn.Module):
         if self.use_rope and (pos_key is None or self.qk_rope_head_dim == 0):
             raise ValueError("MLAAttention rotates its decoupled dims through a position "
                              "resource: pass pos_key and qk_rope_head_dim, or set mla_use_nope")
+        if not self.use_rope and self.qk_rope_head_dim:
+            raise ValueError("mla_use_nope means no decoupled dims: qk_rope_head_dim must be 0")
         # the rope slot of a cache row: the decoupled key, or zeros without one
         self.mla_cache_kpe = getattr(config, "mla_cache_kpe", self.qk_rope_head_dim)
-        if self.qk_rope_head_dim and self.mla_cache_kpe != self.qk_rope_head_dim:
-            raise ValueError(f"mla_cache_kpe={self.mla_cache_kpe} must be qk_rope_head_dim="
-                             f"{self.qk_rope_head_dim} when the decoupled dims exist")
         # the query's rope part against a zero slot; a model may mark rows with that slot
         self.kpe_query_fill = 0.0
-        latent_eps = getattr(config, "mla_latent_norm_eps", None)
-        if latent_eps is None:
-            latent_eps = config.rms_norm_eps
 
         # dense_fp8: the checkpoint's fp8 weights and block scales, except kv_b_proj, which
         # the absorbed path folds into bf16 w_kc / w_vc.
@@ -98,7 +88,7 @@ class MLAAttention(nn.Module):
         self.q_a_proj = (
             nn.Linear(config.hidden_size, config.q_lora_rank, bias=False) if fp8 is None
             else Fp8Linear(config.hidden_size, config.q_lora_rank, fp8))
-        self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=latent_eps)
+        self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = (
             ColumnParallelLinear(comm_group, config.q_lora_rank, h * self.qk_head_dim, bias=False)
             if fp8 is None
@@ -108,7 +98,7 @@ class MLAAttention(nn.Module):
         self.kv_a_proj_with_mqa = (
             nn.Linear(config.hidden_size, kv_a_out, bias=False) if fp8 is None
             else Fp8Linear(config.hidden_size, kv_a_out, fp8))
-        self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, eps=latent_eps)
+        self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             comm_group, config.kv_lora_rank,
             h * (config.qk_nope_head_dim + config.v_head_dim), bias=False)
@@ -119,9 +109,6 @@ class MLAAttention(nn.Module):
                 bias=False, input_is_parallel=True, reduce_results=True) if fp8 is None
             else Fp8Linear(h * config.v_head_dim, config.hidden_size, fp8, comm_group,
                            shard=ROW, reduce_results=True))
-        self.g_proj = (
-            ColumnParallelLinear(comm_group, config.hidden_size, h * config.v_head_dim, bias=False)
-            if getattr(config, "mla_use_output_gate", False) else None)
 
         self.layer_idx = layer_idx
         # run_attention uses 1/sqrt(padded_head_dim); fold the intended
@@ -159,7 +146,7 @@ class MLAAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rotate ``q_pe`` / ``k_pe`` at ``position_ids`` through the position resource. Its
         kernel rotates whole rows in place, so the slices split off q and the latent are
-        copied out first. Unrotated (``mla_use_nope``), they pass through."""
+        copied out first. Without decoupled dims (``mla_use_nope``), they pass through."""
         if not self.use_rope:
             return q_pe, k_pe
         return self._pos.apply_qk(
@@ -223,7 +210,7 @@ class MLAAttention(nn.Module):
         q = q * self.softmax_scale_boost
         attn = self._attend_naive(q, k, v, **sparse)  # (T, H, Dpad)
         attn = attn[..., : self.v_head_dim].reshape(num_tokens, h * self.v_head_dim)
-        return self.o_proj(self._gate(attn, hidden_states))
+        return self.o_proj(attn)
 
     def _attend_naive(self, q, k, v, **sparse) -> torch.Tensor:
         """Naive-path attention of ``q`` over the padded ``k`` / ``v``: the cache's, by default."""
@@ -260,7 +247,7 @@ class MLAAttention(nn.Module):
             attn_latent = self._fused_prep_and_attend(fused, hidden_states, position_ids, **sparse)
         else:
             attn_latent = self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
-        return self.o_proj(self._gate(self._out(attn_latent), hidden_states))
+        return self.o_proj(self._out(attn_latent))
 
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
         """``attn_latent (T, H_local, L)`` through ``w_vc``: ``(T, H_local * Dv)``. Eager, bmm
@@ -274,12 +261,6 @@ class MLAAttention(nn.Module):
         out = attn_latent.new_empty(num_tokens, h, self.v_head_dim)
         torch.bmm(attn_latent.transpose(0, 1), self.w_vc.transpose(1, 2), out=out.transpose(0, 1))
         return out.view(num_tokens, h * self.v_head_dim)
-
-    def _gate(self, attn: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        """``attn * sigmoid(g_proj(hidden_states))`` with ``mla_use_output_gate``, else ``attn``."""
-        if self.g_proj is None:
-            return attn
-        return attn * torch.sigmoid(self.g_proj(hidden_states))
 
     def forward_block_row(
         self, hidden_states: torch.Tensor, position_ids: torch.Tensor, row: int,
@@ -320,7 +301,7 @@ class MLAAttention(nn.Module):
             q_nope_all.view(n * block, h, -1), latents.view(n * block, -1), None,
             q_pe=q_pe_all.view(n * block, h, -1))
         out = self._out(attn.view(n, block, h, -1)[:, row])
-        return self.o_proj(self._gate(out, hidden_states))
+        return self.o_proj(out)
 
     def _block_row_naive(self, hidden_states, position_ids, row, block, rows):
         """``forward_block_row`` on the naive path: padded per-head K/V rows instead of latents."""
@@ -344,7 +325,7 @@ class MLAAttention(nn.Module):
         attn = self._write_and_attend(
             q_all.view(n * block, h, pad), k_rows.view(n * block, h, pad), v_rows.view(n * block, h, pad))
         attn = attn.view(n, block, h, pad)[:, row, :, : self.v_head_dim]
-        return self.o_proj(self._gate(attn.reshape(n, h * self.v_head_dim), hidden_states))
+        return self.o_proj(attn.reshape(n, h * self.v_head_dim))
 
     def _prep_and_attend(
         self,
