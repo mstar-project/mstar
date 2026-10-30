@@ -127,14 +127,14 @@ class _StubTransfer:
 class _Harness:
     """What the engine does around a persistent walk's captured steps, by hand."""
 
-    def __init__(self, tensor_cores: bool, max_live: int | None = None):
+    def __init__(self, tensor_cores: bool, max_live: int | None = None, cpu_offload_pages: int = 0):
         from mstar.engine.resources.attn.flashinfer import FlashInferManager
         from mstar.engine.rows import NodeRows, RowWalk
 
         dev = torch.device("cuda")
         cfg = PagedKVConfig(
             num_layers=1, num_kv_heads=HEADS, head_dim=HEAD_DIM, max_seq_len=96,
-            max_num_pages=96, page_size=GRAPH_PAGE,
+            max_num_pages=96, page_size=GRAPH_PAGE, cpu_offload_pages=cpu_offload_pages,
         )
         self.kv = manager_mod.KVManager(
             cfg=cfg, name=KEY, joint_comm_group=None, transfer_engine_info=None,
@@ -328,6 +328,42 @@ def test_eager_steps_leave_the_rows_right_for_the_replays_after(monkeypatch, see
             scores = torch.einsum("hd,thd->ht", q[i], keys.float()) / HEAD_DIM ** 0.5
             want = torch.einsum("ht,thd->hd", scores.softmax(-1), values.float())
             torch.testing.assert_close(out[i], want, atol=2e-2, rtol=2e-2)
+    h.space.check_mirrors()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
+def test_a_request_evicted_from_its_row_rejoins_on_its_reloaded_pages(monkeypatch):
+    """What ``Engine.offload_request`` does to a request holding a row: check
+    the row in, then offload. Reloaded, it rejoins on its new pages."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    h = _Harness(tensor_cores=False, max_live=8, cpu_offload_pages=64)
+
+    def step(rids, slot):
+        order, out, k, v, q = h.step(rids, slot)
+        for i, rid in enumerate(order):
+            keys, values = h.stream_kv(rid)
+            assert torch.equal(keys[-1], k[i]) and torch.equal(values[-1], v[i]), rid
+            scores = torch.einsum("hd,thd->ht", q[i], keys.float()) / HEAD_DIM ** 0.5
+            want = torch.einsum("ht,thd->hd", scores.softmax(-1), values.float())
+            torch.testing.assert_close(out[i], want, atol=2e-2, rtol=2e-2)
+
+    for rid, n in ((0, 13), (1, 22), (2, 5)):
+        h.prefill(rid, n)
+    for i in range(4):
+        step([0, 1, 2], i % 2)
+    keys_before, _ = h.stream_kv(1)
+    h.node_rows.check_in([1])
+    assert not h.space.holds(1)
+    assert h.kv.offload(1) > 0
+    for i in range(3):
+        step([0, 2], i % 2)
+    # another request takes pages meanwhile, so the reload lands elsewhere
+    h.prefill(3, 30)
+    assert h.kv.reload(1)
+    keys_after, _ = h.stream_kv(1)
+    assert torch.equal(keys_before, keys_after)
+    for i in range(4):
+        step([2, 1, 3, 0], i % 2)
     h.space.check_mirrors()
 
 
