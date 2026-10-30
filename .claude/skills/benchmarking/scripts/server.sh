@@ -23,6 +23,9 @@
 # Environment for the command is inherited: e.g.
 #   CUDA_HOME=... PYTHONPATH=$WT server.sh start main 8100 -- mstar serve qwen3 --gpus 0
 # State: ${SERVER_STATE_DIR:-/tmp/servers_$USER}/<name>.{pid,port,log,cmd}
+# SERVER_STALL_CAPTURE=<capture script>: when a stop finds the server stalled (it ignored SIGINT for 60s, or
+# never got healthy), run `<script> <state>/capture-<name>-<time>/<pid> <pid>` for each root first, then
+# SIGABRT an mstar server's Python processes, so PYTHONFAULTHANDLER=1 writes their stacks to the log. Unset: none.
 set -uo pipefail
 
 STATE=${SERVER_STATE_DIR:-/tmp/servers_$USER}
@@ -113,11 +116,29 @@ cmd_start() {
     if [ $((SECONDS - t0)) -ge "$timeout" ]; then
       echo "server.sh: '$name' not healthy after ${timeout}s; stopping it" >&2
       tail -20 "$log" >&2
-      cmd_stop "$name" >/dev/null
+      STALLED=1 cmd_stop "$name" >/dev/null
       exit 1
     fi
     sleep 3
   done
+}
+
+stall_dump() {  # stall_dump <name> <pids...>: the capture script on the roots, then SIGABRT to an mstar server's Python
+  local name=$1 out p py; shift
+  [ -n "${SERVER_STALL_CAPTURE:-}" ] && [ -x "$SERVER_STALL_CAPTURE" ] || return 0
+  out="$STATE/capture-$name-$(date -u +%Y%m%dT%H%M%SZ)"
+  for p in $STALL_ROOTS; do
+    kill -0 "$p" 2>/dev/null || continue
+    CAPTURE_LEVEL=${CAPTURE_LEVEL:-light} timeout "${SERVER_STALL_CAPTURE_TIMEOUT:-300}" "$SERVER_STALL_CAPTURE" "$out/$p" "$p" \
+      >> "$out.log" 2>&1 || echo "server.sh: capture of '$name' pid $p rc=$?" >&2
+  done
+  grep -q 'mstar\.cli\.main' "$STATE/$name.cmd" 2>/dev/null || return 0  # containers: no faulthandler to dump
+  py=$(for p in "$@"; do ps -o comm= -p "$p" 2>/dev/null | grep -q '^python' && echo "$p"; done | sort -u)
+  if [ -n "$py" ]; then
+    echo "server.sh: '$name' stalled; captured in $out, SIGABRT to $(echo $py)" >&2
+    kill -ABRT $py 2>/dev/null
+    sleep 5
+  fi
 }
 
 cmd_stop() {
@@ -133,10 +154,12 @@ cmd_stop() {
   tree=$(for r in $roots; do descendants "$r"; done)  # before signalling, while parent links exist
   alive() { for r in $roots; do kill -0 "$r" 2>/dev/null && return 0; done; return 1; }
   if [ -n "$roots" ]; then
+    [ "${STALLED:-0}" = 1 ] && STALL_ROOTS=$roots stall_dump "$name" $roots $tree
     kill -INT $roots 2>/dev/null
     for _ in $(seq 60); do alive || break; sleep 1; done
     if alive; then
       echo "'$name' ignored SIGINT for 60s; SIGTERM to its process groups"
+      [ "${STALLED:-0}" = 1 ] || STALL_ROOTS=$roots stall_dump "$name" $roots $tree
       for r in $roots; do kill -TERM -- "-$(ps -o pgid= -p "$r" | tr -d ' ')" 2>/dev/null; done
       for _ in $(seq 20); do alive || break; sleep 1; done
     fi
