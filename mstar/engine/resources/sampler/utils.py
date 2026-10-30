@@ -70,7 +70,7 @@ def _xpu_generator_seed_offset(
         triton.Config({"BLOCK_SIZE": 32768}, num_warps=16, num_stages=2),
         triton.Config({"BLOCK_SIZE": 32768}, num_warps=32, num_stages=2),
     ],
-    key=["V", "APPLY_PENALTY", "INCLUDE_GREEDY", "WINDOW", "NUM_STOP"],
+    key=["V", "APPLY_PENALTY", "MASK_ROWS", "INCLUDE_GREEDY", "WINDOW", "NUM_STOP"],
 )
 @triton.jit
 def _fused_sampling_prep_kernel(
@@ -78,6 +78,7 @@ def _fused_sampling_prep_kernel(
     temperature_ptr,   # [B]
     penalty_ptr,       # [B] (only read when APPLY_PENALTY=True)
     seen_mask_ptr,     # [B, V] bool (only read when APPLY_PENALTY=True)
+    mask_rows_ptr,     # [B] int32: each row's mask row (only read when MASK_ROWS=True)
     hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,  # see _history_adjust
     probs_ptr,         # [B, V] float32 output
     V,
@@ -86,6 +87,7 @@ def _fused_sampling_prep_kernel(
     mask_stride_b, mask_stride_v,
     BLOCK_SIZE: tl.constexpr,
     APPLY_PENALTY: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
     INCLUDE_GREEDY: tl.constexpr,
     WINDOW: tl.constexpr,
     NUM_STOP: tl.constexpr,
@@ -111,6 +113,10 @@ def _fused_sampling_prep_kernel(
 
     if APPLY_PENALTY:
         penalty = tl.load(penalty_ptr + row)
+        if MASK_ROWS:
+            mask_row = tl.load(mask_rows_ptr + row).to(tl.int64)
+        else:
+            mask_row = row
 
     # Pass 1: scan over V, compute max of raw vals (post-penalty) + argmax.
     # argmax is only used by the greedy one-hot path; still tracked when
@@ -126,7 +132,7 @@ def _fused_sampling_prep_kernel(
         )
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
@@ -156,7 +162,7 @@ def _fused_sampling_prep_kernel(
         )
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
@@ -184,7 +190,7 @@ def _fused_sampling_prep_kernel(
         )
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
@@ -249,13 +255,14 @@ def _penalize(vals, seen, penalty):
 
 @triton.jit
 def _split_partials_kernel(
-    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
+    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr, mask_rows_ptr,
     hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
     chunk_max_ptr, chunk_sum_ptr, chunk_arg_ptr,
     V, CHUNK,
     stride_b, stride_v, mask_stride_b, mask_stride_v, part_stride_b,
     BLOCK_SIZE: tl.constexpr,
     APPLY_PENALTY: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
     INCLUDE_GREEDY: tl.constexpr,
     WINDOW: tl.constexpr,
     NUM_STOP: tl.constexpr,
@@ -269,6 +276,10 @@ def _split_partials_kernel(
         inv_temp = 1.0 / temp
     if APPLY_PENALTY:
         penalty = tl.load(penalty_ptr + row)
+        if MASK_ROWS:
+            mask_row = tl.load(mask_rows_ptr + row).to(tl.int64)
+        else:
+            mask_row = row
 
     lo = split * CHUNK
     hi = tl.minimum(lo + CHUNK, V)
@@ -286,7 +297,7 @@ def _split_partials_kernel(
         ).to(tl.float32)
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             vals = _penalize(vals, seen, penalty)
@@ -347,7 +358,7 @@ def _split_combine_kernel(
 
 @triton.jit
 def _split_write_kernel(
-    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
+    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr, mask_rows_ptr,
     hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
     row_max_ptr, row_inv_sum_ptr, row_arg_ptr, probs_ptr,
     V, CHUNK,
@@ -355,6 +366,7 @@ def _split_write_kernel(
     mask_stride_b, mask_stride_v,
     BLOCK_SIZE: tl.constexpr,
     APPLY_PENALTY: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
     INCLUDE_GREEDY: tl.constexpr,
     WINDOW: tl.constexpr,
     NUM_STOP: tl.constexpr,
@@ -370,6 +382,10 @@ def _split_write_kernel(
         inv_temp = 1.0 / temp
     if APPLY_PENALTY:
         penalty = tl.load(penalty_ptr + row)
+        if MASK_ROWS:
+            mask_row = tl.load(mask_rows_ptr + row).to(tl.int64)
+        else:
+            mask_row = row
     gmax = tl.load(row_max_ptr + row)
     inv_sum = tl.load(row_inv_sum_ptr + row)
 
@@ -384,7 +400,7 @@ def _split_write_kernel(
         ).to(tl.float32)
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             vals = _penalize(vals, seen, penalty)
@@ -420,8 +436,8 @@ def _split_count(batch: int, vocab: int, device: torch.device) -> int:
 
 
 def _split_v_softmax(
-    logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
-    apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
+    logits, temperature, pen_ptr, mask_ptr, rows_ptr, probs, nsplit,
+    apply_penalty, mask_rows, include_greedy, mask_stride_b, mask_stride_v, hist,
 ):
     """The three-kernel path; see the kernels above for why."""
     B, V = logits.shape
@@ -432,6 +448,7 @@ def _split_v_softmax(
     opts = dict(
         BLOCK_SIZE=block,
         APPLY_PENALTY=apply_penalty,
+        MASK_ROWS=mask_rows,
         INCLUDE_GREEDY=include_greedy,
         **hist_flags,
         num_warps=8,
@@ -446,7 +463,7 @@ def _split_v_softmax(
     rarg = torch.empty(B, device=logits.device, dtype=torch.int32)
     with torch.cuda.device(logits.device):
         _split_partials_kernel[(B, nsplit)](
-            logits, temperature, pen_ptr, mask_ptr, *hist_args, cmax, csum, carg,
+            logits, temperature, pen_ptr, mask_ptr, rows_ptr, *hist_args, cmax, csum, carg,
             V, chunk,
             logits.stride(0), logits.stride(1), mask_stride_b, mask_stride_v,
             cmax.stride(0), **opts,
@@ -459,7 +476,7 @@ def _split_v_softmax(
             num_warps=4,
         )
         _split_write_kernel[(B, nsplit)](
-            logits, temperature, pen_ptr, mask_ptr, *hist_args, rmax, rinv, rarg, probs,
+            logits, temperature, pen_ptr, mask_ptr, rows_ptr, *hist_args, rmax, rinv, rarg, probs,
             V, chunk,
             logits.stride(0), logits.stride(1),
             probs.stride(0), probs.stride(1),
@@ -491,11 +508,14 @@ def fused_temperature_softmax(
     logits: torch.Tensor,       # [B, V]
     temperature: torch.Tensor,  # [B]
     penalty: torch.Tensor | None = None,    # [B]
-    seen_mask: torch.Tensor | None = None,  # [B, V] bool
+    seen_mask: torch.Tensor | None = None,  # [B, V] bool, or [rows, V] with seen_rows
     include_greedy: bool = False,
     history: "HistoryRows | None" = None,
+    seen_rows: torch.Tensor | None = None,  # [B] int32
 ) -> torch.Tensor:
     """softmax(apply_penalty(logits) / temperature) fused, returns [B, V] float32.
+
+    With ``seen_rows``, row ``i`` of the logits reads mask row ``seen_rows[i]``.
 
     When include_greedy=True, rows with temperature == 0 produce a one-hot
     distribution at argmax (equivalent to argmax sampling via multinomial).
@@ -509,13 +529,15 @@ def fused_temperature_softmax(
     mask_ptr = seen_mask if apply_penalty else logits
     mask_stride_b = seen_mask.stride(0) if apply_penalty else 0
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
+    mask_rows = apply_penalty and seen_rows is not None
+    rows_ptr = seen_rows if mask_rows else logits
     hist = _history_kernel_args(history, logits)
 
     nsplit = _split_count(B, V, logits.device)
     if nsplit > 1:
         _split_v_softmax(
-            logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
-            apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
+            logits, temperature, pen_ptr, mask_ptr, rows_ptr, probs, nsplit,
+            apply_penalty, mask_rows, include_greedy, mask_stride_b, mask_stride_v, hist,
         )
         return probs
 
@@ -531,12 +553,13 @@ def fused_temperature_softmax(
         cache = getattr(_fused_sampling_prep_kernel, "cache", None)
         cache_size_before = len(cache) if cache is not None else 0
         _fused_sampling_prep_kernel[grid](
-            logits, temperature, pen_ptr, mask_ptr, *hist[0], probs,
+            logits, temperature, pen_ptr, mask_ptr, rows_ptr, *hist[0], probs,
             V,
             logits.stride(0), logits.stride(1),
             probs.stride(0), probs.stride(1),
             mask_stride_b, mask_stride_v,
             APPLY_PENALTY=apply_penalty,
+            MASK_ROWS=mask_rows,
             INCLUDE_GREEDY=include_greedy,
             **hist[1],
         )
@@ -1513,6 +1536,7 @@ def sample_accelerator_graphable_gpu(
     min_p: torch.Tensor | None = None,
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
+    seen_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
@@ -1540,7 +1564,8 @@ def sample_accelerator_graphable_gpu(
         top_p: ``[batch_size]`` float tensor. Use ``1.0`` to disable.
         apply_penalty: when True, ``rep_penalty`` + ``seen_tokens`` are applied.
         rep_penalty: ``[batch_size]`` float tensor (1.0 = disabled per row).
-        seen_tokens: ``[batch_size, vocab_size]`` bool mask of seen tokens.
+        seen_tokens: ``[batch_size, vocab_size]`` bool mask of seen tokens,
+            or rows of masks that ``seen_rows`` (``[batch_size]`` int32) index.
         min_p: ``[batch_size]`` float tensor (0.0 = disabled per row); None
             leaves the filter out of the captured graph entirely.
         history, order: the generation-aware processors (``HistoryRows``,
@@ -1555,6 +1580,8 @@ def sample_accelerator_graphable_gpu(
     if logits.device.type == "xpu":
         if history is not None or order is not None:
             raise ValueError("generation-aware sampling controls are CUDA-only")
+        if apply_penalty and seen_rows is not None:
+            seen_tokens = seen_tokens.index_select(0, seen_rows)
         with torch.xpu.device(logits.device):
             return _sample_xpu(
                 logits, temperature, top_k, top_p,
@@ -1576,6 +1603,7 @@ def sample_accelerator_graphable_gpu(
                 seen_mask=seen_tokens if apply_penalty else None,
                 include_greedy=True,
                 history=history,
+                seen_rows=seen_rows,
             )
             if min_p is not None:
                 probs = apply_min_p(probs, min_p)
@@ -1611,6 +1639,10 @@ class AcceleratorGraphableSampler(BaseSampler):
     # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
     rep_penalty_buf: torch.Tensor | None = None
     seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
+    # Persistent rows: ``seen_tokens_buf`` is the resident masks by slot, and
+    # row i reads slot ``seen_rows[i]`` and records its token in ``seen_write_rows[i]``
+    seen_rows: torch.Tensor | None = None
+    seen_write_rows: torch.Tensor | None = None
     # ``None`` for submodules whose ``SamplerSpec`` leaves ``enable_min_p`` off.
     min_p_buf: torch.Tensor | None = None
     # Views into ``SamplerBuffers``' per-step rows; each ``None`` unless the
@@ -1671,6 +1703,7 @@ class AcceleratorGraphableSampler(BaseSampler):
             min_p=self.min_p_buf,
             history=self.history,
             order=self.order,
+            seen_rows=self.seen_rows,
         )
         self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
         codes = self._broadcast_tokens(codes)
@@ -1688,7 +1721,11 @@ class AcceleratorGraphableSampler(BaseSampler):
             # CUDA-graph capturable; advanced-index assignment
             # (``buf[rows, codes] = True``) is not — it trips "operation not
             # permitted when stream is capturing".
-            self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
+            if self.seen_write_rows is None:
+                self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
+            else:
+                at = self.seen_write_rows.long() * self.seen_tokens_buf.shape[1] + codes
+                self.seen_tokens_buf.view(-1).scatter_(0, at, True)
         return codes
 
     @torch.compiler.disable
@@ -1706,6 +1743,8 @@ class AcceleratorGraphableSampler(BaseSampler):
         """
         if self.seen_tokens_buf is None:
             return
+        if self.seen_rows is not None:
+            raise RuntimeError("persistent rows keep their seen-token masks; there is nothing to sync")
         # One multi-tensor-apply instead of bs separate copy_ launches. The
         # masks are separately-owned tensors, so a single index_copy_ would
         # need them to be views into one buffer; _foreach_copy_ fuses the

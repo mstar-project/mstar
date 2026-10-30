@@ -288,3 +288,36 @@ def test_a_row_buffer_needs_a_dtype_numpy_has():
     for mirrored in (True, False):
         with pytest.raises(ValueError, match="numpy has no"):
             space.buffer(f"x{mirrored}", (), torch.bfloat16, mirrored=mirrored)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_an_unmoved_buffer_is_addressed_by_slot(device):
+    """Wide rows a step changes in part stay resident: the step's gather and
+    scatter leave them, and its slots say which resident row each dense row is."""
+    space = RowSpace(4, device)
+    lens = space.buffer("lens", (), torch.int32, step=1)
+    wide = space.buffer("wide", (6,), torch.bool, pad=False, mirrored=False, moved=False)
+    with pytest.raises(ValueError, match="unmoved"):
+        space.buffer("mirrored", (), torch.int32, moved=False)
+    rows = space.propose([5, 6])
+    d = rows.diff
+    rows.write(lens, d.join_slots, np.array([1, 2], np.int32))
+    rows.write(wide, d.join_slots, np.eye(2, 6, dtype=np.bool_))
+    rows.stage()
+    rows.commit()
+    rows.apply()
+    space.gather(4)
+    # the forward sets element 5 of every row it runs, padding rows into the trash slot
+    wide.resident.view(-1).scatter_(0, space.scatter_slots.long() * 6 + 5, True)
+    space.after_forward()
+    with pytest.raises(RuntimeError, match="resident"):
+        _ = wide.device
+    held = space.batch.held()
+    resident = wide.resident.cpu()
+    gather = space.gather_slots.cpu().tolist()
+    for i, rid in enumerate(space.batch.order):
+        assert gather[i] == held[rid]
+    for j, rid in enumerate(d.join_rids):
+        assert resident[held[rid]].tolist() == [k in (j, 5) for k in range(6)]
+    assert not resident[space.pad_slot].any()
+    assert lens.resident.cpu()[[held[5], held[6]]].tolist() == [2, 3]

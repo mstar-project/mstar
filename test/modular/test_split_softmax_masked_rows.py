@@ -50,3 +50,31 @@ def test_split_matches_fused_and_torch_with_masked_regions(masked):
     greedy = split[2]
     assert greedy.argmax().item() == logits[2].float().argmax().item()
     assert greedy.max().item() == 1.0
+
+
+@pytest.mark.parametrize("split", [True, False])
+def test_seen_rows_read_the_mask_rows_they_name(split):
+    """With ``seen_rows``, logits row i is penalised by mask row ``seen_rows[i]``,
+    as if the masks had been gathered into a dense batch first."""
+    from mstar.engine.resources.sampler import utils as U
+
+    torch.manual_seed(0)
+    B, V, slots = 4, 248320, 7
+    logits = torch.randn(B, V, device="cuda", dtype=torch.bfloat16)
+    temperature = torch.tensor([1.0, 0.7, 1.3, 0.0], device="cuda")
+    penalty = torch.tensor([2.0, 1.5, 1.0, 3.0], device="cuda")
+    masks = torch.rand(slots, V, device="cuda") < 0.01
+    at = torch.tensor([6, 0, 3, 3], device="cuda", dtype=torch.int32)
+    orig = U._split_count
+    if not split:
+        U._split_count = lambda b, v, d: 1
+    try:
+        by_slot = U.fused_temperature_softmax(
+            logits, temperature, penalty=penalty, seen_mask=masks, include_greedy=True, seen_rows=at,
+        )
+        dense = U.fused_temperature_softmax(
+            logits, temperature, penalty=penalty, seen_mask=masks[at.long()].contiguous(), include_greedy=True,
+        )
+    finally:
+        U._split_count = orig
+    assert torch.equal(by_slot, dense)
