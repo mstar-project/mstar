@@ -35,11 +35,18 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
 )
-from mstar.engine.resources import Segment, SubmoduleStep
-from mstar.engine.resources.kv.bounded import BoundedKVConfig, BoundedKVStep, SinkWindow, StreamPosition
-from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.resources import NodeResourceSpec, Segment, SubmoduleStep
+from mstar.engine.resources.kv.bounded import (
+    BoundedKVConfig,
+    BoundedKVSpec,
+    BoundedKVStep,
+    SinkWindow,
+    StreamPosition,
+)
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec, RecurrentStep
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 from mstar.model.components.audio_features import NemoLogMel
+from mstar.model.components.dft import stft_basis
 from mstar.model.components.fastconformer import FastConformerConfig, FastConformerEncoder
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
@@ -99,6 +106,24 @@ def encoder_kv_config(config: FastConformerConfig, max_slots: int) -> BoundedKVC
         max_source_len=0, retention=SinkWindow(0, config.left_context),
         query_window=config.left_context, max_slots=max_slots, dtype=None,
     )
+
+
+def stream_node_resources(
+    config: FastConformerConfig, hop_length: int, node: str, max_streams: int, *,
+    kv_key: str, conv_key: str, front_key: str,
+) -> list[NodeResourceSpec]:
+    """The stream node's resources for ``max_streams`` streams: the conv and
+    front pools, each with a sink slot for a capture's padding rows, and the
+    bounded KV, which padding rows leave alone."""
+    def pool(key: str, num_layers: int, blocks: dict[str, RecurrentBlockConfig]) -> RecurrentStateSpec:
+        return RecurrentStateSpec(resource_key=key, nodes={node}, config=RecurrentStateConfig(
+            num_layers=num_layers, blocks=blocks, max_slots=max_streams + 1))
+
+    return [
+        pool(conv_key, config.num_layers, encoder_state_blocks(config)),
+        pool(front_key, 1, front_state_blocks(config, hop_length)),
+        BoundedKVSpec(resource_key=kv_key, nodes={node}, config=encoder_kv_config(config, max_slots=max_streams)),
+    ]
 
 
 class FastConformerStreamSubmodule(NodeSubmodule):
@@ -179,6 +204,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # spans more than one hop and at most two (n_fft 512, hop 160); any
         # other runs every step through the front end and the blocks
         self.has_steady_step = -(-(log_mel.n_fft // 2) // log_mel.hop_length) == 2
+        # its STFT as a matmul, built here: before any capture, on the device
+        self.stft_basis = stft_basis(log_mel.window, log_mel.n_fft) if self.has_steady_step else None
 
     # -- frame counts ---------------------------------------------------------
 
@@ -234,7 +261,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         if is_final_stream_chunk and samples < shortest:
             # too short to featurize (offline can't either): fail rather than reply to nothing
             raise ValueError(
-                f"the call ended with {1000 * samples / rate:g} ms of audio; "
+                f"the stream ended with {1000 * samples / rate:g} ms of audio; "
                 f"it needs at least {1000 * shortest / rate:g} ms"
             )
         final = bool(is_final_stream_chunk)
@@ -386,7 +413,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         y = x - self.log_mel.preemphasis * torch.cat([last, x[:, :-1]], dim=1)
         win = torch.cat([sig, y], dim=1)                                    # samples S - fs .. S + fs
         # mel frames f(k-1)-1 .. fk-2 span samples [S - hop - pad, S + fs - 2 hop + pad)
-        mel_new = self.log_mel.windows(win[:, fs - hop - pad: 2 * fs - 2 * hop + pad], by_matmul=True)
+        mel_new = self.log_mel.windows(win[:, fs - hop - pad: 2 * fs - 2 * hop + pad], self.stft_basis)
         window = torch.cat([mel_tail[:, 1:], mel_new], dim=1)               # (B, 23, n_mels)
         new = self.encoder.subsample(window)[:, 2:3]
         self.front.scatter_("sig", y)

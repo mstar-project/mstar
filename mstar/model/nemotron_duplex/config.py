@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from mstar.model.components.fastconformer import FastConformerConfig, check_nemo_preprocessor
+from mstar.model.components.audio_features import NEMO_PREPROCESSOR_DEFAULTS, check_nemo_preprocessor
+from mstar.model.components.fastconformer import FastConformerConfig
 
 # Resource keys shared by the nano submodule, its layers and the model's
 # ``get_node_resources`` (a deployment YAML tunes them under ``resources:``).
@@ -372,7 +373,7 @@ class NemotronDuplexConfig:
         pre = perception["preprocessor"]
         encoder = FastConformerConfig.from_nemo(perception["encoder"])
         # no per-clip normalization: a stream can't
-        check_nemo_preprocessor(pre, features=encoder.num_mel_bins, normalize="NA")
+        check_nemo_preprocessor(pre, features=encoder.num_mel_bins, normalize="NA", pad_to=0)
         cfg.stt = PerceptionConfig(
             encoder=encoder,
             output_dim=perception["output_dim"],
@@ -380,7 +381,7 @@ class NemotronDuplexConfig:
             n_fft=pre["n_fft"],
             window_size=pre["window_size"],
             window_stride=pre["window_stride"],
-            preemph=pre.get("preemph", 0.97),
+            preemph=pre.get("preemph", NEMO_PREPROCESSOR_DEFAULTS["preemph"]),
         )
 
         cc = raw["model"]["speech_generation"]["model"]["codec_config"]

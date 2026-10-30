@@ -304,9 +304,16 @@ def test_duplex_checks_the_encoder_kv_against_the_checkpoint(monkeypatch):
         _make_model()._json_config("/nonexistent")
 
 
-def test_duplex_refuses_a_featurizer_that_normalizes_per_clip(tmp_path):
-    """A stream has no whole clip to standardize over, so a checkpoint whose
-    preprocessor normalizes per feature is refused when its config is read."""
+@pytest.mark.parametrize("key, value", [
+    # a stream has no whole clip to standardize over
+    ("normalize", "per_feature"),
+    # NemoLogMel's fixed settings, which NeMo's config leaves out as defaults
+    ("mag_power", 1.0), ("pad_to", None),
+])
+def test_duplex_refuses_a_featurizer_it_does_not_run(tmp_path, key, value):
+    """A checkpoint whose preprocessor computes other features than the
+    stream's featurizer is refused when its config is read; ``None`` leaves
+    the key out, which reads as NeMo's default."""
     import json
 
     encoder = {"d_model": 32, "n_layers": 2, "n_heads": 4, "ff_expansion_factor": 2, "conv_kernel_size": 9,
@@ -314,12 +321,14 @@ def test_duplex_refuses_a_featurizer_that_normalizes_per_clip(tmp_path):
                "subsampling_conv_channels": 8}
     preprocessor = {"sample_rate": 16000, "features": 16, "n_fft": 512, "window_size": 0.025,
                     "window_stride": 0.01, "window": "hann", "log": True, "frame_splicing": 1,
-                    "normalize": "per_feature"}
+                    "normalize": "NA", "pad_to": 0, key: value}
+    if value is None:
+        del preprocessor[key]
     raw = {"model": {"stt": {"model": {"perception": {
         "encoder": encoder, "preprocessor": preprocessor, "output_dim": 24,
     }}}}}
     (tmp_path / "config.json").write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="normalize"):
+    with pytest.raises(ValueError, match=key):
         NemotronDuplexConfig.from_pretrained(str(tmp_path))
 
 

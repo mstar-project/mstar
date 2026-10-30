@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
+from typing import Any
 
 import numpy as np
 import torch
@@ -27,7 +28,7 @@ from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
-from mstar.model.components.dft import stft_as_real, stft_basis
+from mstar.model.components.dft import stft_as_real
 from mstar.utils.h2d import to_device_nonblocking
 
 
@@ -223,8 +224,6 @@ class NemoLogMel:
             window = torch.hann_window(win_length, periodic=False)
         self.mel_filters = mel_filters.reshape(num_mel_bins, n_fft // 2 + 1).to(device=device, dtype=torch.float32)
         self.window = window.to(device=device, dtype=torch.float32)
-        # ``windows``' STFT as a matmul, built here: before any capture, on the device
-        self._stft_basis = stft_basis(self.window, n_fft)
 
     @staticmethod
     def frames(num_samples: int, hop_length: int, reflect_edges: bool) -> int:
@@ -251,6 +250,7 @@ class NemoLogMel:
         reflects ``n_fft/2`` samples past the stream's first, so it needs more
         than that. At the stream's end, every frame of the clip. ``reflect_edges``
         streams only."""
+        assert self.reflect_edges
         if num_samples <= self.n_fft // 2:
             return 0
         if final:
@@ -323,14 +323,14 @@ class NemoLogMel:
             mel = (mel - mean) / (std + 1e-5)
         return [mel[row, :, :f].T for row, f in enumerate(frames)]
 
-    def windows(self, x: torch.Tensor, by_matmul: bool = False) -> torch.Tensor:
+    def windows(self, x: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
         """``(B, samples)`` preemphasized samples -> ``(B, T, n_mels)`` log-mel
         frames, one per ``n_fft`` window at each hop, with no padding (a
-        stream's front end cuts the windows itself). ``by_matmul`` takes the
-        STFT as a matmul, for a captured graph, which must not hold a cuFFT
-        plan (see ``dft``)."""
-        if by_matmul:
-            spec = stft_as_real(x, self._stft_basis, self.n_fft, self.hop_length)
+        stream's front end cuts the windows itself). ``basis``
+        (``stft_basis(self.window, n_fft)``) takes the STFT as a matmul, for a
+        captured graph, which must not hold a cuFFT plan (see ``dft``)."""
+        if basis is not None:
+            spec = stft_as_real(x, basis, self.n_fft, self.hop_length)
         else:
             spec = torch.view_as_real(torch.stft(
                 x, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
@@ -346,6 +346,32 @@ class NemoLogMel:
         # autocast is off (offline); under the engine's autocast it runs in its dtype
         with fp32_precision_scope(Fp32Precision(matmul="highest", cudnn_allow_tf32=None)):
             return torch.log(self.mel_filters @ power + 2.0 ** -24)
+
+
+# NeMo ``preprocessor`` settings ``NemoLogMel`` runs for every checkpoint
+NEMO_MEL_SETTINGS = dict(
+    window="hann", log=True, frame_splicing=1, mag_power=2.0, exact_pad=False,
+    log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
+)
+# NeMo's ``AudioToMelSpectrogramPreprocessor`` defaults for the checked settings
+# its configs usually leave out
+NEMO_PREPROCESSOR_DEFAULTS = dict(
+    mag_power=2.0, exact_pad=False, log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
+    preemph=0.97, pad_to=16,
+)
+
+
+def check_nemo_preprocessor(preprocessor: dict[str, Any], **model_settings: Any) -> None:
+    """Refuse a NeMo ``preprocessor`` config whose settings differ from
+    ``NEMO_MEL_SETTINGS`` and the model's own, the only ones compared. A key it
+    leaves out reads as NeMo's default where ``NEMO_PREPROCESSOR_DEFAULTS``
+    has one, and is refused otherwise."""
+    expected = {**NEMO_MEL_SETTINGS, **model_settings}
+    got = {k: preprocessor.get(k, NEMO_PREPROCESSOR_DEFAULTS.get(k)) for k in expected}
+    unsupported = {k if k in preprocessor else f"{k} (not in config)": v
+                   for k, v in got.items() if v != expected[k]}
+    if unsupported:
+        raise ValueError(f"unsupported NeMo preprocessor settings {unsupported}; expected {expected}")
 
 
 @functools.cache
