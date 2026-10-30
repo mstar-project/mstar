@@ -24,6 +24,10 @@ from mstar.engine.rows.copy import copy_segments
 from mstar.engine.rows.stage import new_stage
 from mstar.utils.h2d import _H2D, _cuda_memcpy_async
 
+_FP8 = tuple(getattr(torch, name) for name in (
+    "float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz",
+) if hasattr(torch, name))
+
 
 class RowBuffer:
     """``max_rows`` rows of one per-row field, at a fixed device address."""
@@ -44,6 +48,8 @@ class RowBuffer:
         self._ptr = self.device.data_ptr()
         pad_row = torch.full(self.shape, pad, dtype=dtype)
         self.pad_bytes = pad_row.reshape(-1).view(torch.uint8).numpy().copy()
+        if mirrored and dtype in (torch.bfloat16, *_FP8):
+            raise ValueError(f"{name}: numpy has no {dtype} for a host mirror; keep it on the device")
         # the committed mirror; None for state with no host truth (it is
         # checked out from a device store instead)
         self.host: np.ndarray | None = (
@@ -126,7 +132,7 @@ class StepRows:
 
     def write(self, buf: RowBuffer, slots: np.ndarray, values: np.ndarray) -> None:
         """Whole rows from the host: ``buf[slots[i]] = values[i]``."""
-        slots = np.asarray(slots, dtype=np.int64)
+        slots = np.ascontiguousarray(slots, dtype=np.int64)
         if buf.host is not None:
             self._own(buf)[slots] = values
             self._rows.setdefault(buf, []).append((slots, None))
@@ -139,7 +145,7 @@ class StepRows:
         with ``index`` a tuple of per-element index arrays over the row shape."""
         if buf.host is None:
             raise ValueError(f"{buf.name}: write_at needs a mirrored buffer")
-        slots = np.asarray(slots, dtype=np.int64)
+        slots = np.ascontiguousarray(slots, dtype=np.int64)
         mirror = self._own(buf)
         mirror[(slots, *index)] = values
         flat = np.ravel_multi_index((slots, *index), mirror.shape)
@@ -151,13 +157,19 @@ class StepRows:
         if buf.host is not None:
             raise ValueError(f"{buf.name}: copy_in into a mirrored buffer; write its rows from the host")
         _check_store(buf, src)
-        self._copy_in.append((buf, np.asarray(slots, dtype=np.int64), src, np.asarray(src_rows, dtype=np.int64)))
+        self._copy_in.append((
+            buf, np.ascontiguousarray(slots, dtype=np.int64),
+            src, np.ascontiguousarray(src_rows, dtype=np.int64),
+        ))
 
     def copy_out(self, buf: RowBuffer, slots: np.ndarray, dst: torch.Tensor, dst_rows: np.ndarray) -> None:
         """Leaving rows back to a device store: ``dst[dst_rows[i]] = buf[slots[i]]``,
         read before this step moves or clears anything."""
         _check_store(buf, dst)
-        self._copy_out.append((buf, np.asarray(slots, dtype=np.int64), dst, np.asarray(dst_rows, dtype=np.int64)))
+        self._copy_out.append((
+            buf, np.ascontiguousarray(slots, dtype=np.int64),
+            dst, np.ascontiguousarray(dst_rows, dtype=np.int64),
+        ))
 
     def advance(self, buf: RowBuffer, delta) -> None:
         """Add ``delta`` to the active rows of ``buf``'s mirror at commit: the

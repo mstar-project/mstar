@@ -24,6 +24,12 @@ def _round(n: int) -> int:
     return -(-n // _ALIGN) * _ALIGN
 
 
+def _contiguous(a: np.ndarray, what: str) -> np.ndarray:
+    if not a.flags.c_contiguous:
+        raise ValueError(f"{what} must be C-contiguous")  # as the Rust stage requires
+    return a
+
+
 class PyRowStage:
     """See ``rust/src/rows.rs``'s ``RowStage``."""
 
@@ -44,6 +50,10 @@ class PyRowStage:
         """``dst_base + dst_idx[i] * dst_stride <- src_base + src_idx[i] * src_stride``, in ``phase``."""
         if not 0 <= phase < len(self._flat):
             raise ValueError(f"phase {phase} of a stage of {len(self._flat)}")
+        _contiguous(src_idx, "src_idx")
+        _contiguous(dst_idx, "dst_idx")
+        if len(src_idx) != len(dst_idx):
+            raise ValueError(f"{len(src_idx)} source rows for {len(dst_idx)} destinations")
         flat = self._flat[phase]
         for s, d in zip(src_idx.tolist(), dst_idx.tolist(), strict=True):
             flat += (src_base + s * src_stride, dst_base + d * dst_stride, nbytes)
@@ -54,10 +64,14 @@ class PyRowStage:
     ) -> None:
         """Host bytes into rows, one piece of ``elem_bytes`` a slot: whole rows,
         or with ``offsets``, that many bytes into each row."""
+        _contiguous(slots, "slots")
+        _contiguous(values, "values")
         if values.nbytes != elem_bytes * len(slots):
             raise ValueError(f"{values.nbytes} bytes for {len(slots)} pieces of {elem_bytes}")
         if offsets is None and elem_bytes != row_bytes:
             raise ValueError("a whole-row write's pieces must be rows")
+        if offsets is not None and len(_contiguous(offsets, "offsets")) != len(slots):
+            raise ValueError(f"{len(offsets)} offsets for {len(slots)} slots")
         at = self._put_bytes(values)
         offs = [0] * len(slots) if offsets is None else offsets.tolist()
         for k, (slot, off) in enumerate(zip(slots.tolist(), offs, strict=True)):
@@ -69,7 +83,8 @@ class PyRowStage:
 
     def _put_bytes(self, data: np.ndarray) -> int:
         at = self._size
-        self._payload.append((at, data))
+        # copied now, as the Rust stage does: a caller may reuse its buffer
+        self._payload.append((at, data.copy()))
         self._size = _round(at + data.nbytes)
         return at
 
