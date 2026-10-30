@@ -489,6 +489,7 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
     """Tokens that were waiting together leave as one body frame (one write
     on the socket), still one SSE event per token for the client; a chunk
     of another modality gets a frame of its own."""
+    from mstar.api_server.openai import reply
     from mstar.api_server.openai.serving_chat import _stream_events
 
     class _Batches:
@@ -500,8 +501,8 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
             yield [_Chunk("text", b"d"), _Chunk("audio", b"\x00\x01"), _Chunk("text", b"e")]
 
     async def _collect():
-        batches = _Batches().iter_result_chunk_batches("rid")
-        return [frame async for frame in _stream_events(batches, "bagel", "rid", 24000)]
+        events = reply.reply_events(_Batches(), "rid")
+        return [frame async for frame in _stream_events(events, "bagel", "rid")]
 
     frames = asyncio.run(_collect())
     # abc (the role rides on a), d, audio, e, stop, DONE

@@ -739,6 +739,7 @@ def test_a_stream_is_bound_to_its_submission_before_it_is_iterated():
 def test_an_openai_chat_stream_is_bound_before_it_is_iterated():
     """The chat stream is bound when it is made: Starlette first iterates it
     after the id is reused, and it still reads its own request's result."""
+    from mstar.api_server.openai import reply
     from mstar.api_server.openai.serving_chat import _stream_events
 
     pw = _PreprocessWorker()
@@ -746,7 +747,7 @@ def test_an_openai_chat_stream_is_bound_before_it_is_iterated():
     s.submit_request(text="first", request_id="X", **TEXT)
 
     async def run():
-        body = _stream_events(s.iter_result_chunk_batches("X"), "m", "X", 24000)
+        body = _stream_events(reply.reply_events(s, "X"), "m", "X")
         _complete(s, pw.inputs[0].request_id, b"first")
         s.submit_request(text="second", request_id="X", **TEXT)
         _complete(s, pw.inputs[1].request_id, b"second")

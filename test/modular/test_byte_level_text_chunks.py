@@ -225,10 +225,11 @@ class _BatchAPI:
 
 
 def _sse_content(chunks):
+    from mstar.api_server.openai import reply
     from mstar.api_server.openai.serving_chat import _stream_events
 
     async def run():
-        return [f async for f in _stream_events(_BatchAPI(chunks).iter_result_chunk_batches("r"), "m", "r", 24000)]
+        return [f async for f in _stream_events(reply.reply_events(_BatchAPI(chunks), "r"), "m", "r")]
 
     content = ""
     for frame in asyncio.run(run()):
