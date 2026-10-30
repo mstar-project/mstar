@@ -279,17 +279,23 @@ class Launch:
             raise FileNotFoundError(cfg)
         return cfg
 
+    @property
+    def model_kwargs(self) -> dict:
+        """model_kwargs the server gets on top of its config's: the row's, under the arm's own."""
+        return {**self.row.model_kwargs, **self.arm.model_kwargs}
+
     def mstar_config(self) -> Path:
-        """The serving config the server gets: the row's, or for an arm with model_kwargs a copy of it with them
-        merged into its model_kwargs: section."""
+        """The serving config the server gets: the row's, or when the row or the arm adds model_kwargs a copy of it
+        with them merged into its model_kwargs: section."""
         base = self.mstar_base_config()
-        if not self.arm.model_kwargs:
+        kwargs = self.model_kwargs
+        if not kwargs:
             return base
         data = yaml.safe_load(base.read_text()) or {}
-        data["model_kwargs"] = {**(data.get("model_kwargs") or {}), **self.arm.model_kwargs}
+        data["model_kwargs"] = {**(data.get("model_kwargs") or {}), **kwargs}
         cfg = self.run_dir / f"{base.stem}.{self.arm.name}.yaml"
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        cfg.write_text(f"# {base} with model_kwargs {self.arm.model_kwargs} (arm {self.arm.name})\n"
+        cfg.write_text(f"# {base} with model_kwargs {kwargs} (arm {self.arm.name})\n"
                        + yaml.safe_dump(data, sort_keys=False))
         return cfg
 
@@ -709,9 +715,9 @@ def collect_versions(launch: Launch, cmd: list[str], env: dict) -> dict:
                       "dirty": [ln for ln in git("status", "--porcelain").splitlines() if ln][:40]}
         rec["config"] = str(launch.mstar_config())
         rec["config_text"] = launch.mstar_config().read_text()
-        if launch.arm.model_kwargs:
+        if launch.model_kwargs:
             rec["config_base"] = str(launch.mstar_base_config())
-            rec["model_kwargs"] = dict(launch.arm.model_kwargs)
+            rec["model_kwargs"] = launch.model_kwargs
         p = _run([sys.executable, "-c", _MSTAR_VERSIONS], timeout=600, env=env, cwd=launch.worktree)
         rec["stack"] = _last_json_line(p.stdout + p.stderr)
         mfile = rec["stack"].get("mstar_file", "")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -339,6 +340,28 @@ def test_mstar_arms_serve_their_own_configs(tmp_path):
     (wt / "configs" / "qwen3tts_1p7b_split_bf16.yaml").unlink()
     with pytest.raises(FileNotFoundError):
         served("mstar")
+
+
+def test_row_model_kwargs_reach_every_mstar_arm_of_the_row(tmp_path):
+    import yaml
+
+    wt = tmp_path / "wt"
+    (wt / "configs").mkdir(parents=True)
+    (wt / "configs" / "wan22.yaml").write_text("model: wan22\nmodel_kwargs:\n  vae_decode_fast: true\n")
+    row = catalog.ROWS["wan22"]
+    assert row.model_kwargs == {"compile_dit_sizes": ["832x480x33"]}
+    for arm in ("mstar", "mstar-base"):
+        launch = Launch(catalog.ARMS[arm], row, [0], 8400, tmp_path / arm, worktree=wt)
+        data = yaml.safe_load(launch.mstar_config().read_text())
+        assert data["model_kwargs"] == {"vae_decode_fast": True, "compile_dit_sizes": ["832x480x33"]}
+    # An arm's own entries win over the row's.
+    arm = replace(catalog.ARMS["mstar"], name="mstar-x", model_kwargs={"compile_dit_sizes": ["1280x704x81"]})
+    launch = Launch(arm, row, [0], 8401, tmp_path / "x", worktree=wt)
+    assert launch.model_kwargs == {"compile_dit_sizes": ["1280x704x81"]}
+    # Rows without any keep the config untouched.
+    (wt / "configs" / "flux2_klein.yaml").write_text("model: flux2_klein\n")
+    plain = Launch(catalog.ARMS["mstar"], catalog.ROWS["flux2_klein"], [0], 8402, tmp_path / "p", worktree=wt)
+    assert plain.mstar_config() == (wt / "configs" / "flux2_klein.yaml").resolve()
 
 
 def test_base_arms_serve_the_base_tree(tmp_path, monkeypatch):
