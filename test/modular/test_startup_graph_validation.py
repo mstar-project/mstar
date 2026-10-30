@@ -48,11 +48,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class _ToyModel(Model):
-    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=()):
+    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=(), sp_enabled_nodes=()):
         self._walks = walks
         self._partitions = partitions
         self._topology = topology
         self._tp_enabled_nodes = set(tp_enabled_nodes)
+        self._sp_enabled_nodes = set(sp_enabled_nodes)
 
     def get_graph_walk_graphs(self):
         return self._walks()
@@ -64,7 +65,8 @@ class _ToyModel(Model):
         return self._topology() if self._topology else super().get_partition_topology()
 
     def get_default_sharding_config(self):
-        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={})
+        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={},
+                              sp_enabled_nodes=self._sp_enabled_nodes)
 
     def get_node_resources(self):
         return []

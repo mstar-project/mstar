@@ -56,18 +56,11 @@ class _Spec(NodeResourceSpec):
 class _Model(_ToyModel):
     """A toy model with resources, KV labels and a YAML hook to taste."""
 
-    def __init__(self, walks=_prefill_decode, specs=(), kv_labels=None, refuse_yaml=None,
-                 sp_enabled_nodes=(), **kw):
+    def __init__(self, walks=_prefill_decode, specs=(), kv_labels=None, refuse_yaml=None, **kw):
         super().__init__(walks, **kw)
         self._specs = list(specs)
         self._kv_labels = kv_labels or {}
         self._refuse_yaml = refuse_yaml
-        self._sp_enabled_nodes = set(sp_enabled_nodes)
-
-    def get_default_sharding_config(self):
-        sharding = super().get_default_sharding_config()
-        sharding.sp_enabled_nodes = self._sp_enabled_nodes
-        return sharding
 
     def get_node_resources(self):
         return list(self._specs)
@@ -428,7 +421,7 @@ def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, plac
     """Two instances on a worker are two leaders' step streams with no order
     between them."""
     cfg = _cfg(tmp_path, [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **b}])
-    model = _Model(_a_then_b, tp_enabled_nodes=["a", "b"], sp_enabled_nodes=["b"])
+    model = _Model(_a_then_b, tp_enabled_nodes=["a", "b"], sp_enabled_nodes=["b"] if "sp_size" in b else ())
     problems = _problems(model, cfg)
     assert len(problems) == 2
     for rank, problem in enumerate(problems):
