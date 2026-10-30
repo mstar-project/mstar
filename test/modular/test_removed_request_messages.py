@@ -48,7 +48,7 @@ class _TensorManager:
     def __init__(self):
         self.tensor_store = TensorStore()
         self.reads: list[tuple[str, int]] = []  # (edge name, uuid) reads started
-        self.acked: list[tuple[str, int]] = []  # (wire rid, uuid) acked unread
+        self.acked: list[int] = []  # uuids acked unread
 
     def register_request(self, rid, sharding_config):
         pass
@@ -60,8 +60,8 @@ class _TensorManager:
     def force_cleanup_request(self, rid):
         pass
 
-    def ack_unread_tensors(self, request_id, graph_edges):
-        self.acked += [(request_id, i.uuid) for e in graph_edges for i in e.tensor_info]
+    def ack_unread_tensors(self, graph_edges):
+        self.acked += [i.uuid for e in graph_edges for i in e.tensor_info]
 
 
 def _worker(is_tp_follower=False) -> Worker:
@@ -173,7 +173,7 @@ def test_late_messages_for_a_removed_request_are_dropped_and_acked():
     w._process_message_list([_signals("A#1", 1, streaming=True), _stop_loops("A#1")])
     assert _parked(w) == 0
     # the peer can free its source buffer instead of waiting on its own teardown
-    assert w.tensor_manager.acked == [("A#1", 1)]
+    assert w.tensor_manager.acked == [1]
     assert w.tensor_manager.reads == []
 
 
@@ -203,7 +203,7 @@ def test_conductor_remove_for_a_request_never_admitted_drops_what_was_parked():
 
     w._process_message_list([_remove("D#1")])
     assert not w._unprocessed_messages
-    assert w.tensor_manager.acked == [("D#1", 3)]
+    assert w.tensor_manager.acked == [3]
     assert "D#1" not in w._draining_rids and "D#1" not in w._reads_done_sent
     assert w.wire_rids_cleared == ["D#1"]
 
@@ -221,7 +221,7 @@ def test_a_remove_replayed_from_the_parking_lot_acks_what_trailed_it_once():
     w._process_message_list([_new("R#1")])
     assert w._rid("R#1") is None, "the replayed REMOVE tears the request down"
     assert not w._unprocessed_messages
-    assert w.tensor_manager.acked == [("R#1", 5)]
+    assert w.tensor_manager.acked == [5]
     assert w.tensor_manager.reads == []
 
 

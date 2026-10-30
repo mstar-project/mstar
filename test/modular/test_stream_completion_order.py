@@ -18,6 +18,8 @@ import pytest
 import torch
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
+from mstar.communication.edge_items import row_infos
+from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.communication.wire import decode
@@ -39,6 +41,7 @@ from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
     ConductorMessageType,
+    EdgeItems,
     InputSignals,
     WorkerGraphsDone,
     WorkerMessageType,
@@ -96,7 +99,7 @@ class _Producer:
     """``LLM`` on worker_0 streams ``new_token`` into ``snac_decoder`` on
     worker_1, each in its own walk and partition, as Orpheus splits them."""
 
-    def __init__(self, kind, tmp_path):
+    def __init__(self, kind, tmp_path, walk_driven_signals=frozenset()):
         llm = WorkerGraph(
             section=GraphNode(
                 name="LLM", input_names={"text_inputs"},
@@ -112,6 +115,7 @@ class _Producer:
             all_wg_ids_to_nodes={0: {"LLM"}, 1: {"snac_decoder"}},
             node_to_partition={"LLM": "LLM", "snac_decoder": "SNAC"},
             sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+            walk_driven_signals=walk_driven_signals,
         )
         self.kind = kind
         if kind == "python":
@@ -158,6 +162,7 @@ class _Producer:
             output_signals=[EDGE], wg_ids=ParallelList([self.rid], [0]),
             tensors=[uuid], num_tensors=[1],
         ))
+        self.route = out
         fwd = CurrentForwardPassInfo(
             request_id=RID, graph_walk="decode", fwd_index=0, random_seed=0,
             max_tokens=8, partition_name="LLM",
@@ -276,6 +281,7 @@ def _consumer(policy):
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     w.tensor_manager = SimpleNamespace(
         start_read_tensors=lambda *a, **k: [],
+        start_read_tensors_multi=lambda reads: [],
         get_tensor=lambda uuid: torch.tensor([uuid]),
         dereference_batch_uniform=lambda ids: None,
         increment_ref_batch_uniform=lambda ids: None,
@@ -288,8 +294,17 @@ def _consumer(policy):
 
 def _deliver(w, descriptor):
     """The descriptor arrives and its read completes."""
-    w._process_new_inputs(descriptor)
-    for edge in descriptor.inputs:
+    if isinstance(descriptor, EdgeItems):
+        w._process_edge_items(descriptor)
+        edges = [
+            GraphEdge(next_node=row.next_node, name=row.signal,
+                      tensor_info=row_infos(descriptor, row), is_streaming=True)
+            for row in stream_rows(descriptor)
+        ]
+    else:
+        w._process_new_inputs(descriptor)
+        edges = descriptor.inputs
+    for edge in edges:
         w.streams.route_tensor(1, edge)
 
 
@@ -307,6 +322,23 @@ def _chunks(w, buf):
 @pytest.fixture(params=["python", "rust"])
 def kind(request):
     return request.param
+
+
+@pytest.mark.parametrize("walk_driven", [False, True])
+def test_a_walk_driven_stream_keeps_input_signals(kind, tmp_path, walk_driven):
+    """A stream whose consumer walk the producer decides goes to its peer as
+    INPUT_SIGNALS with its request info, which carries that walk; any other
+    plain stream rides EDGE_ITEMS."""
+    producer = _Producer(
+        kind, tmp_path, walk_driven_signals=frozenset({EDGE}) if walk_driven else frozenset(),
+    )
+    to_consumer, _ = producer.step(1)
+    assert isinstance(to_consumer, InputSignals if walk_driven else EdgeItems)
+    if walk_driven:
+        # the row asks for its forward-pass info, which carries the walk
+        needs = producer.route.rids_needing_request_info
+        assert needs is None or producer.rid in needs
+        assert to_consumer.request_info is not None
 
 
 def test_done_before_the_last_item_waits_for_it(kind, tmp_path):

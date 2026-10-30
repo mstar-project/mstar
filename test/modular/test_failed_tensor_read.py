@@ -52,7 +52,7 @@ class _Communicator(BaseCommunicator):
 
 def _acked(comm):
     return [
-        (msg.body.request_id, dict(msg.body.successful_tensors))
+        dict(msg.body.successful_tensors)
         for _, msg in comm.sent
         if msg.message_type == WorkerMessageType.TENSOR_RECEIVED
     ]
@@ -133,7 +133,7 @@ def test_later_reads_of_a_failed_request_are_dropped_until_cleanup(tmp_path):
     assert dropped.error is first.error
     assert mgr.pending == [] and not mgr.has_inflight_reads(7)
     # the reads that completed are acked; the failed one is not
-    assert _acked(comm) == [("7", {13: 1}), ("7", {12: 1})]
+    assert _acked(comm) == [{13: 1}, {12: 1}]
 
     mgr.cleanup_request(7)
     fresh = _edge()

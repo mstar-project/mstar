@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server.request_types import APIServerMessage, ResultTensors, ResultTokens
 from mstar.communication.communicator import BaseCommunicator
+from mstar.communication.edge_items import EdgeItemsBuilder, edge_items_eligible
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
@@ -144,11 +145,16 @@ class PythonGraphRuntime(GraphRuntime):
         tensor_manager: TensorCommunicationManager,
         communicator: BaseCommunicator | None = None,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
+        walk_driven_signals: frozenset[str] = frozenset(),
     ):
         self._my_worker_id = my_worker_id
         # (node, real walk) -> the combined walk the scheduler batches it under;
         # a ready-scan target or exclusion may name either
         self._combined_walk_of = dict(combined_walk_of or {})
+        # streamed signals whose consumer walk the producer decides
+        # (``Connection.consumer_walk``): they keep INPUT_SIGNALS, whose
+        # request info carries that walk; EDGE_ITEMS has no room for it
+        self._walk_driven_signals = walk_driven_signals
         self._communicator = communicator
         # Refcount changes go through the manager rather than the bare store,
         # so a tensor that drops to zero is torn down (shm file, arena slot,
@@ -1567,6 +1573,8 @@ class PythonGraphRuntime(GraphRuntime):
             else dict(iter(input.resource_publish_info))
         )
         sent_rids: list[int] = []
+        # worker -> its EDGE_ITEMS, sent after the per-request frames
+        streamed: dict[str, EdgeItemsBuilder] = {}
 
         # counted before any WORKER_GRAPHS_DONE below reports them
         result_tokens = self._result_tokens(completion, input.failed_rids)
@@ -1578,6 +1586,10 @@ class PythonGraphRuntime(GraphRuntime):
             info = self._request_info.get(rid)
 
             for worker_id, edges in routing.to_workers.items():
+                # A sharded edge carries a CLONE of the store's descriptor, cloned
+                # during routing -- before staging stamped the arena placement onto
+                # the store's copy. Refresh it here, where the edge leaves the process.
+                self._tensor_manager.refresh_shm_placement(edges)
                 self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
 
             if routing.persist and info is not None:
@@ -1614,7 +1626,24 @@ class PythonGraphRuntime(GraphRuntime):
             # which take over the reference counted for it.
             # RouteOutput's local_streaming_by_signal is how the caller finds them.
             for worker_id, edges in routing.streaming_to_workers.items():
-                self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
+                self._tensor_manager.refresh_shm_placement(edges)
+                builder = streamed.get(worker_id)
+                if builder is None:
+                    builder = streamed[worker_id] = EdgeItemsBuilder(partition)
+                rest = [
+                    e for e in edges
+                    if not (
+                        edge_items_eligible(e) and e.name not in self._walk_driven_signals
+                        and builder.try_add(self.get_rid_string(rid), e)
+                    )
+                ]
+                if rest:
+                    # streamed edges only: the receiver reads the info only for
+                    # a walk-driven edge's consumer walk
+                    walk_driven = any(e.name in self._walk_driven_signals for e in rest)
+                    self._send_input_signals(
+                        rid, worker_id, rest, fwd_info if walk_driven else None, partition,
+                    )
 
             if info is not None:
                 for worker_id, edges in [
@@ -1653,6 +1682,11 @@ class PythonGraphRuntime(GraphRuntime):
                     profiling=profiling.get(rid),
                 )
                 sent_rids.append(rid)
+        for worker_id, builder in streamed.items():
+            if builder:
+                self._communicator.send(worker_id, WorkerMessage(
+                    message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build(),
+                ))
 
         for frame in result_tokens:
             self._communicator.send("api_server", APIServerMessage(message_type="result_tokens", body=frame))
@@ -1681,10 +1715,7 @@ class PythonGraphRuntime(GraphRuntime):
         self, rid: int, worker_id: str, edges: list[GraphEdge],
         fwd_info: CurrentForwardPassInfo | None, partition: str,
     ):
-        # A sharded edge carries a CLONE of the store's descriptor, cloned
-        # during routing -- before staging stamped the arena placement onto the
-        # store's copy. Refresh it here, where the edge leaves the process.
-        self._tensor_manager.refresh_shm_placement(edges)
+        # the caller refreshed the edges' arena placement
         self._communicator.send(worker_id, WorkerMessage(
             message_type=WorkerMessageType.INPUT_SIGNALS,
             body=InputSignals(

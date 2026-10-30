@@ -1264,10 +1264,7 @@ class PreprocessWorkerThread:
     ):
         # The request is gone, so don't start a read — just ack the tensors back
         # to the producing worker so it can free the source buffers.
-        self.tensor_manager.ack_unread_tensors(
-            request_id=result.request_id,
-            graph_edges=[result.graph_edge],
-        )
+        self.tensor_manager.ack_unread_tensors([result.graph_edge])
 
     def _fail_unread_outputs(self, failed: FailedRead) -> None:
         """Fail the request of a read that will not be delivered: one error

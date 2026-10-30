@@ -249,6 +249,7 @@ class RustGraphRuntime(GraphRuntime):
         bookkeeping: TensorBookkeeping,
         communicator=None,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
+        walk_driven_signals: frozenset[str] = frozenset(),
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
         combined_walk_of = combined_walk_of or {}
@@ -285,6 +286,8 @@ class RustGraphRuntime(GraphRuntime):
                 list(combined_walk_of.values()),
             ),
         )
+        if walk_driven_signals:
+            self._rust.set_walk_driven_signals(sorted(walk_driven_signals))
         self._node_to_partition = node_to_partition
         self._communicator = communicator
         self._bookkeeping = bookkeeping
