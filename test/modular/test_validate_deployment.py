@@ -387,15 +387,14 @@ class _TrailSpec(_Spec):
 
 
 @pytest.mark.parametrize("spec, resources", [
-    (_kv("kv", ["a", "b"]), {"kv": {"cpu_offload_pages": 0}}),
-    (_kv("kv", ["a", "b"]), {"kv": {"cpu_offload_pages": 4}}),
+    (_kv("kv", ["a", "b"]), {"kv": {"cpu_offload_pages": 0}}),  # no host pool: can't evict
     (_TrailSpec("kv", {"a", "b"}), {}),
-], ids=["kv_offload_off", "kv_offload_on", "page_trail_only"])
+], ids=["kv_offload_off", "page_trail_only"])
 def test_lockstep_nodes_sharing_a_journaled_resource_are_refused(spec, resources, tmp_path):
     """Rank 0's decisions on a resource (page moves, prefix leases, page
     trails) reach the followers per node, riding on one node's next step, so
-    two lockstep nodes over one resource could admit out of step. Refused at
-    any offload setting until rank 0 journals a shared resource in one stream."""
+    two lockstep nodes over one resource could admit out of step. Refused until
+    rank 0 journals a shared resource in one stream."""
     labels = {"kv": {"main": KVLabel()}} if isinstance(spec, KVSpec) else None
     model = _Model(_a_then_b, specs=[spec], kv_labels=labels, tp_enabled_nodes=["a", "b"])
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources=resources)

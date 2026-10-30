@@ -208,7 +208,9 @@ class Resource(ABC):
         """Whether rank 0 decides this resource's state for the other ranks of a lockstep
         instance outside the step that uses it (eviction, prefix leases, page trails). They
         replay each decision with the next step of the node it was journaled under, so
-        validation refuses lockstep nodes on one worker sharing such a resource."""
+        validation refuses lockstep nodes on one worker sharing such a resource. Asked of
+        the class a spec's ``resource_class`` names, so the hooks live there, not only on
+        a subclass its ``build`` returns."""
         return any(getattr(cls, hook) is not getattr(Resource, hook)
                    for hook in ("supports_eviction", "lease_cached_prefix", "page_trail"))
 
