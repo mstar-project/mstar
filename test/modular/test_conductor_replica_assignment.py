@@ -273,6 +273,25 @@ def test_a_hit_is_priced_as_its_share_of_the_whole_prompt():
     assert routing_cost(RoutingFacts(), weights) == 0
 
 
+def test_a_hit_runs_on_to_an_item_cached_inside_the_next_page():
+    def kwargs(after: bytes) -> dict:
+        # as BAGEL lays out an image that ends inside a page: a page of text, the
+        # image's last PAGE // 2 positions, keyed apart up to its end, then other text
+        spans = [(PAGE, PAGE, "prefill"), (PAGE // 2, PAGE // 2, "prefill", 0, b"image", b"image end"),
+                 (3 * PAGE // 2, 3 * PAGE // 2, "prefill")]
+        return {
+            "prefix_keys": {"kv": {"main": [b"text", after + b"1", after + b"2"]}},
+            "kv_layout": {"kv": {"main": (spans, (), 0, None, 3)}},
+        }
+
+    conductor = _kv_conductor()
+    a = int(_replica(conductor, "a", kwargs(b"A"))[-1])
+    (mirror,) = _mirrors(conductor._router)
+    assert mirror.facts(_configs(kwargs(b"B"))["kv"])[a].kv_hit == PAGE + PAGE // 2, (
+        "a prompt sharing an image cached up to its end inside a page was predicted to stop at the page before"
+    )
+
+
 def test_a_prefix_weight_of_0_picks_by_load_alone():
     picks = []
     for conductor in (_conductor({0: _wg(0, [0, 1])}), _kv_conductor(weights={"prefix": 0})):
