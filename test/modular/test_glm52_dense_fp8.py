@@ -117,7 +117,7 @@ def test_w8a16_within_the_rounding_bound(dense_fp8, rank_weights, name, tokens):
 
 
 @pytest.mark.parametrize("name", list(SHAPES))
-@pytest.mark.parametrize("path, tokens", [("fi", 33), ("fi", 300), ("cublas", 65),
+@pytest.mark.parametrize("path, tokens", [("fi", 3), ("fi", 8), ("fi", 33), ("fi", 300), ("cublas", 65),
                                           ("cublas", 1025), ("cublas", 2048)])
 def test_w8a8_within_the_rounding_bound(dense_fp8, rank_weights, name, path, tokens):
     """W8A8: x rounded to e4m3 under its 128-group scale (2^-4 relative, or 2^-9 of the
@@ -151,6 +151,14 @@ def test_dispatch_by_tokens(dense_fp8, rank_weights, monkeypatch):
         dense_fp8._linear(torch.zeros(tokens, SHAPES[name][1], device="cuda",
                                       dtype=torch.bfloat16), q, s, BLOCK, SHAPES[name][2])
     assert seen == ["_w8a16", "_fi", "_fi", "_w8a8", "_w8a16", "_fi"]
+
+
+def test_reserve_takes_the_gpu_models_limits(dense_fp8):
+    """An H200 with flashinfer's GEMM hands GLM-5.2's o_proj to it from 3 tokens; any other
+    GPU keeps the shape table."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    h200 = torch.cuda.get_device_name(device) == "NVIDIA H200" and dense_fp8._FI_OK[device]
+    assert dense_fp8._W8A16_MAX[device].get(SHAPES["o_proj"]) == (2 if h200 else None)
 
 
 def test_graph_replay_is_bitwise_and_leaves_the_counters_at_zero(dense_fp8, rank_weights):

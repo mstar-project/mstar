@@ -17,9 +17,6 @@ from mstar.model.base import Model
 
 
 class _Model:
-    def stop_token_ids(self):
-        return None
-
     def get_partition_topology(self):
         from mstar.streaming.topology import PartitionTopology
         return PartitionTopology(partitions=["default"])

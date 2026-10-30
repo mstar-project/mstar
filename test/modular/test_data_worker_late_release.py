@@ -51,9 +51,6 @@ class _Model:
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 
-    def stop_token_ids(self):
-        return None
-
 
 class _Conductor:
     """The data worker's socket: ``deliver`` queues a conductor message, and

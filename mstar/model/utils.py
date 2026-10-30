@@ -458,13 +458,28 @@ class TextChunkDetokenizer:
         return data
 
 
+class ByteIdDetokenizer:
+    """Token ids that are bytes, as a reduced model's byte tokenizer
+    (``tokenizer_mode: byte``) makes them: an id is its low byte."""
+
+    @staticmethod
+    def to_bytes(token_ids: list[int]) -> bytes:
+        return bytes(t & 0xFF for t in token_ids)
+
+    @staticmethod
+    def token_bytes(token_id: int) -> bytes:
+        return bytes((token_id & 0xFF,))
+
+
 class TextOutput(NamedTuple):
     """How a model's text output, token ids, becomes bytes: ``Model.text_output``
     declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
     derive their text paths from it."""
 
-    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer
-    # ids that end a reply, dropped unless the request sets ``ignore_eos``
+    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | ByteIdDetokenizer
+    # ids that end a reply, dropped unless the request sets ``ignore_eos``. The API
+    # reports a reply whose last token is not one as cut at its budget
+    # (``finish_reason: "length"``), and every reply of a model that names none as stopped.
     stop_token_ids: Container[int] = frozenset()
 
 

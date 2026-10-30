@@ -34,6 +34,7 @@ from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
+    KERNELS,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
@@ -41,13 +42,20 @@ from mstar.model.glm52.config import (
 )
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import ByteIdDetokenizer, ByteLevelDetokenizer, TextOutput
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
-# fused_add_rmsnorm fuses all-reduces up to this size; larger ones reduce, add and norm apart
+# kernels: auto fuses all-reduces up to this size into the next add + RMSNorm; larger ones
+# reduce, add and norm apart
 AR_FUSION_MAX_BYTES = 1 << 20
+# the switches kernels and the checkpoint's quantization replaced
+_RETIRED_KWARGS = (
+    "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
+    "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
+    "prefill_last_layer_rows")
 
 
 class Glm52Model(Model):
@@ -94,24 +102,16 @@ class Glm52Model(Model):
             self.config.dsa_shard_prefill = bool(kwargs.get("dsa_shard_prefill", False))
             # Guard + KV sizing move from index_topk to the serving window.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
-        if "moe_quant_kernel" in kwargs:
-            self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
-        if "moe_fused_allreduce" in kwargs:
-            self.config.moe_fused_allreduce = bool(kwargs["moe_fused_allreduce"])
-        if "moe_decode_kernel" in kwargs:
-            self.config.moe_decode_kernel = bool(kwargs["moe_decode_kernel"])
-        if "moe_prefill_kernel" in kwargs:
-            self.config.moe_prefill_kernel = bool(kwargs["moe_prefill_kernel"])
-        if "moe_router_kernel" in kwargs:
-            self.config.moe_router_kernel = bool(kwargs["moe_router_kernel"])
-        if "prefill_last_layer_rows" in kwargs:
-            self.config.prefill_last_layer_rows = bool(kwargs["prefill_last_layer_rows"])
-        if "dense_fp8" in kwargs:
-            self.config.dense_fp8 = bool(kwargs["dense_fp8"])
-        if "mla_fused_prep" in kwargs:
-            self.config.mla_fused_prep = bool(kwargs["mla_fused_prep"])
-        if "fused_add_rmsnorm" in kwargs:
-            self.config.fused_add_rmsnorm = bool(kwargs["fused_add_rmsnorm"])
+        retired = sorted(k for k in _RETIRED_KWARGS if k in kwargs)
+        if retired:
+            # a config that still names one would otherwise serve without what it asks for
+            raise ValueError(
+                f"{retired}: GLM-5.2 has no such switch; model_kwargs.kernels picks its kernels "
+                f"({' or '.join(KERNELS)}) and the checkpoint its fp8 linears")
+        if "kernels" in kwargs:
+            if kwargs["kernels"] not in KERNELS:
+                raise ValueError(f"kernels must be one of {KERNELS}, got {kwargs['kernels']!r}")
+            self.config.kernels = kwargs["kernels"]
         if "graph_compile" in kwargs:
             self.config.graph_compile = bool(kwargs["graph_compile"])
         for key in ("prefill_token_buckets", "prefill_batched_token_buckets",
@@ -129,7 +129,6 @@ class Glm52Model(Model):
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
-        self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     def _check_mtp(self, kwargs: dict) -> None:
@@ -513,9 +512,6 @@ class Glm52Model(Model):
         each iteration emits at least one token, so it bounds those loops too."""
         return self.context_limit() - 1
 
-    def stop_token_ids(self) -> frozenset[int]:
-        return frozenset(self.config.eos_token_ids)
-
     def get_max_output_tokens(self, **model_kwargs):
         budget = normalize_generation_kwargs(model_kwargs).get(
             "max_output_tokens", self.config.max_output_tokens)
@@ -530,6 +526,22 @@ class Glm52Model(Model):
     # Model ABC: postprocess
     # -------------------------------------------------------------------
 
+    # built on first use: the tokenizer it reads loads lazily
+    _text_output: TextOutput | None = None
+
+    def text_output(self) -> TextOutput:
+        if self._text_output is None:
+            # Synthetic reduced models emit byte ids, which never touch the HF
+            # tokenizer. Otherwise the tokens' raw bytes (byte-level BPE), so a
+            # character split across tokens reaches the client whole, where decoding
+            # each token alone gives U+FFFD; special tokens drop, as with
+            # skip_special_tokens.
+            detokenizer = (
+                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
+            )
+            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+        return self._text_output
+
     def postprocess(
         self,
         output: torch.Tensor,
@@ -537,19 +549,7 @@ class Glm52Model(Model):
         **kwargs,
     ) -> bytes:
         if modality == "text":
-            token_ids = output.flatten().tolist()
-            if self._tokenizer_mode == "byte":
-                # Synthetic reduced models emit arbitrary byte ids; return raw
-                # bytes without ever touching the HF tokenizer.
-                return bytes((t & 0xFF) for t in token_ids)
-            # The tokens' raw bytes (byte-level BPE): a character split across
-            # tokens reaches the client whole, where decoding each token alone
-            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
-            if self._detokenizer is None:
-                from mstar.model.utils import ByteLevelDetokenizer
-
-                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(token_ids)
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for GLM-5.2: {modality!r}")
 
     # -------------------------------------------------------------------
@@ -610,7 +610,7 @@ class Glm52Model(Model):
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
-        if self.config.fused_add_rmsnorm and tp_group is not None and tp_group.world_size > 1:
+        if self.config.tuned_kernels and tp_group is not None and tp_group.world_size > 1:
             # collective over the TP group; every rank builds the LLM here
             dtype = language_model.model.norm.weight.dtype
             tp_group.init_allreduce_fusion(
@@ -676,10 +676,10 @@ class Glm52Model(Model):
             raw.get("quantization_config"),
         )
         if quant is not None:
+            self.config.quantization_config = quant
             logger.info(
                 "Glm52Model: fp8 %s checkpoint (block %s) — non-expert linears "
-                "fp8=%s, routed experts fp8-resident=%s.",
+                "fp8=%s, routed experts fp8-resident=%s, kernels=%s.",
                 quant.fmt, quant.weight_block_size, self.config.dense_fp8,
-                self.config.moe_fp8_resident,
+                self.config.moe_fp8_resident, self.config.kernels,
             )
-            self.config.quantization_config = quant

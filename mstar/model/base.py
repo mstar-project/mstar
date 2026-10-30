@@ -785,7 +785,8 @@ class Model(ABC):
     def text_output(self) -> TextOutput | None:
         """How this model's text output, token ids, becomes bytes, or None for a
         model that encodes text in its own ``postprocess``. ``postprocess`` and
-        ``postprocess_inline`` derive their text paths from it."""
+        ``postprocess_inline`` derive their text paths from it, and the data
+        worker reads its stop ids, once, to tell the API why a reply ended."""
         return None
 
     _text_detokenizer: TextChunkDetokenizer | None = None
@@ -902,12 +903,6 @@ class Model(ABC):
         and the key logged as ignored. None (the default) declares nothing, so
         nothing is logged.
         """
-        return None
-
-    def stop_token_ids(self) -> frozenset[int] | None:
-        """Token ids that end a text reply. A reply whose last token is not one
-        ran out of budget, which the API reports as ``finish_reason: "length"``;
-        None leaves every reply reported as stopped."""
         return None
 
     def get_autocast_dtype(self):

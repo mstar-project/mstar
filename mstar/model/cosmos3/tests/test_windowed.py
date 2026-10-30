@@ -19,6 +19,7 @@ import torch
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3 import constants as C
+from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.sessions import SessionStore
@@ -511,6 +512,7 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
         denoise_step_batched=lambda reqs, label, attn: batched.append(reqs) or [
             (torch.zeros(latent_shape), torch.zeros(latent_shape)) for _ in reqs
         ],
+        denoise_step_row=Cosmos3OmniTransformer.denoise_step_row,
     )
     monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: sched)
     monkeypatch.setattr(

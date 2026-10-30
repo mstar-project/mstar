@@ -8,9 +8,9 @@ model: "glm52"
 # draft module proposes the next k. KV grows by one layer plane, the draft
 # module's own cache sharing the trunk's page table.
 #
-# The routed experts run the fused fp8 kernel (moe_quant_kernel: auto), so
-# a decode step (the draft chain, the trunk verify and the MTP pass) replays
-# as one CUDA graph.
+# The routed experts run the fused fp8 kernel (kernels: auto), so a decode
+# step (the draft chain, the trunk verify and the MTP pass) replays as one
+# CUDA graph.
 #
 # Limits: greedy only (requests asking for temperature > 0 or a repetition
 # penalty are refused per request), and contexts to index_topk (2048);
@@ -27,14 +27,8 @@ model_kwargs:
   # Drafts per step. k=3 was the best of k=2..4 on an 8xH200 node; re-sweep
   # on other hardware.
   mtp_num_draft_tokens: 3
-  # glm52_tp8.yaml's speedups; MTP's prefill ignores prefill_last_layer_rows
-  fused_add_rmsnorm: true
-  mla_fused_prep: true
-  dense_fp8: true
-  moe_decode_kernel: true
-  moe_prefill_kernel: true
-  moe_fused_allreduce: true
-  moe_router_kernel: true
+  # glm52_tp8.yaml's kernels (kernels: auto); MTP's prefill runs every row through the
+  # last layer
   prefill_token_buckets: [
     64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
     832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,

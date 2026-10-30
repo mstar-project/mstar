@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Container
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -195,7 +195,12 @@ def _text_usage(tokens: torch.Tensor, stop_ids, prompt_tokens: int | None) -> di
     if prompt_tokens is not None:
         usage["prompt_tokens"] = prompt_tokens
     if stop_ids is not None and tokens.numel():
-        usage["stop_token"] = int(tokens.flatten()[-1]) in stop_ids
+        # tolist keeps the GIL; a torch op (flatten, indexing, int) releases it, and with the
+        # event loop busy each release waits out the switch interval (~5 ms) to get it back
+        last = tokens.tolist()
+        while isinstance(last, list):
+            last = last[-1]
+        usage["stop_token"] = last in stop_ids
     return usage
 
 
@@ -1231,6 +1236,14 @@ class PreprocessWorkerThread:
             state.order[tensor_info.uuid] = (state.next_sequence, result.loop_indices)
             state.next_sequence += 1
 
+    @cached_property
+    def _text_stop_ids(self) -> Container[int] | None:
+        """The ids that end a text reply, as the model's ``text_output`` declares
+        them, read on the first text chunk. None for a model that names none,
+        whose replies are all reported as stopped."""
+        text = self.model.text_output() if self.model is not None else None
+        return (text.stop_token_ids or None) if text is not None else None
+
     def _emit_inline_tokens(self, item: InlineTokens) -> None:
         """Postprocess a frame's inline values in one model call and queue each
         request's chunk, in arrival order with its tensor results."""
@@ -1263,7 +1276,7 @@ class PreprocessWorkerThread:
                 else:
                     data = datas[i]
                 metadata = _token_usage(
-                    values[i], self.model.stop_token_ids(), state.prompt_tokens,
+                    values[i], self._text_stop_ids, state.prompt_tokens,
                 ) if is_text else {}
                 self._queue_completed_output(
                     request_id,
@@ -1344,7 +1357,7 @@ class PreprocessWorkerThread:
         if modality == "text" and self.model is not None:
             chunk_metadata = {
                 **chunk_metadata,
-                **_text_usage(tensor, self.model.stop_token_ids(),
+                **_text_usage(tensor, self._text_stop_ids,
                               self.request_output_state[request_id].prompt_tokens),
             }
         # Audio is emitted as headerless 16-bit PCM; surface the
