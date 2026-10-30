@@ -178,8 +178,7 @@ class Rebuilds:
         if kept is None:
             return None
         if kept.host is None:
-            # The one copy of the prompt to the host. A follower asks three times per rebuild: when it replays
-            # rank 0's drop, its rebuild, and when it builds the row.
+            # the one copy of the prompt to the host, kept for the rebuild's later calls
             kept.host = array("i", kept.prompt.tolist())
         ids = array("i", kept.host)
         ids.extend(kept.sampled)
