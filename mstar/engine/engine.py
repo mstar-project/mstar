@@ -878,10 +878,11 @@ class Engine:
     def _open_prefix_caches(
         self, specs_by_key, model, instance: Mapping[str, int], opened: frozenset[str], checkpoint: str | None,
     ) -> None:
-        """Open exactly the caches in ``opened``, `opening_prefix_caches` over
-        ``instance``, the lockstep instance of each node here, for ``model``'s
-        ``checkpoint``. Each is rooted in the weights, the preprocessing, and the
-        config of every resource its pages were planned against."""
+        """Open the caches built here that ``opened`` names, and close the rest.
+        ``opened`` is `opening_prefix_caches` over ``instance``, the lockstep
+        instance of each node here, for ``model``'s ``checkpoint``. Each cache is
+        rooted in the weights, the preprocessing, and the config of every
+        resource its pages were planned against."""
         shared = [
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
             model.preprocess_fingerprint() if model is not None else "",

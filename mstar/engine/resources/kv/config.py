@@ -434,8 +434,9 @@ def instance_size(spec: NodeResourceSpec, instance: Mapping[str, int]) -> int:
 
 def unrestorable(specs: Mapping[str, NodeResourceSpec], opened: Collection[str]) -> list[NodeResourceSpec]:
     """The resources that can't restore what a hit skips while ``opened`` open:
-    each `NodeResourceSpec.restores_prefix` with no open cache of its own, unless
-    it is over open caches that restore. Each keeps every cache on its nodes shut."""
+    those that set `NodeResourceSpec.restores_prefix` and keep no open cache of
+    their own, unless they are over open caches that restore. Each keeps every
+    cache on its nodes shut."""
     return [
         spec for spec in specs.values()
         if spec.restores_prefix and spec.resource_key not in opened and not (
