@@ -15,10 +15,12 @@ from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.utils.utf8_stream import Utf8Stream
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
+    """The response dict, or for ``req.stream`` the SSE response itself."""
     args = adapter.chat_to_request(req, api.upload_dir)
     parser = adapter.make_output_parser(req)
     # checked before the request runs: a raise after submit leaves it running with no reader
@@ -41,7 +43,13 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             request_id=request_id,
         )
         if req.stream:
-            return _stream(api, model_name, request_id, sample_rate, parser, include_usage)
+            # a request the engine refuses gets its status, not a 200
+            batches = await api.open_result_stream(request_id, raw_request, batches=True)
+            return ReleasingStreamingResponse(
+                _stream_events(batches, model_name, request_id, sample_rate, parser, include_usage),
+                release=lambda: api.release_request(request_id),
+                media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
+            )
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
@@ -117,12 +125,6 @@ def _build_response(model_name, request_id, chunks, sample_rate, parser=None) ->
         "choices": [{"index": 0, "message": message, "finish_reason": usage.finish_reason(parser)}],
         "usage": usage.as_dict(),
     }
-
-
-def _stream(api, model_name, request_id, sample_rate, parser=None, include_usage=False):
-    # Bound to the submission now: the body is iterated later, by Starlette.
-    batches = api.iter_result_chunk_batches(request_id)
-    return _stream_events(batches, model_name, request_id, sample_rate, parser, include_usage)
 
 
 async def _stream_events(batches, model_name, request_id, sample_rate, parser=None, include_usage=False):

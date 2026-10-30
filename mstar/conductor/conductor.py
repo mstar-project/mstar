@@ -9,7 +9,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Collection
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
 import numpy as np
@@ -256,6 +256,7 @@ def _worker_process_target(
     tcp_transfer_device="",
     status_interval_s: float | None = None,
     env: dict[str, str] | None = None,
+    all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
     picklability. ``status_interval_s`` turns on the worker's metrics."""
@@ -301,6 +302,7 @@ def _worker_process_target(
             all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+            all_worker_graph_ids_to_instances=all_worker_graph_ids_to_instances,
             sharding_config=sharding_config,
             parallel_groups=parallel_groups,
             hostname=hostname,
@@ -571,6 +573,13 @@ class Conductor:
         }
         self.default_sharding_config.assert_streams_keep_tp_size(sorted(stream_edges))
 
+        topology = model.get_partition_topology()
+        self.producer_triggered_partitions: set[str] = (
+            topology.producer_triggered_partitions() if topology else set()
+        )
+        if topology:
+            topology.check_walk_driving_connections()
+
         for group in self.default_sharding_config.groups:
             group_graph_walks = group.graph_walks or graph_walks
             group_key = group.key_str()
@@ -645,20 +654,30 @@ class Conductor:
                 )
         return {name: caps.get(name, n) for name, n in self._loop_max_iters.items()}
 
-    def _resource_specs(self) -> dict:
-        """The model's resource specs by key, after this deployment's YAML, for admission-time checks."""
+    def _resource_specs(self) -> list[dict]:
+        """Each worker's resource specs by key, after this deployment's YAML, for admission-time checks.
+        A spec's ``nodes`` is cut to the worker's own, as the worker's engine does when it builds the resource."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
-            built = self.model.get_node_resources() or []
-            apply_yaml_overrides(built, self.model_config)
-            specs = {s.resource_key: s for s in built}
-            self._resource_specs_cache = specs
+            built = self._node_resources()
+            specs = self._resource_specs_cache = [
+                {s.resource_key: replace(s, nodes=s.nodes & nodes) for s in built if s.nodes & nodes}
+                for nodes in {frozenset(self._worker_nodes(worker_id)) for worker_id in self._per_worker_graphs}
+            ]
         return specs
+
+    def _node_resources(self) -> list:
+        """The model's resource specs after this deployment's YAML, each with all of its nodes."""
+        built = getattr(self, "_node_resources_cache", None)
+        if built is None:
+            built = self._node_resources_cache = self.model.get_node_resources() or []
+            apply_yaml_overrides(built, self.model_config)
+        return built
 
     def _streamed_partitions(self) -> frozenset[str]:
         streamed = getattr(self, "_streamed_partitions_cache", None)
         if streamed is None:
-            streamed = streamed_partitions(list(self._resource_specs().values()), self.model)
+            streamed = streamed_partitions(self._node_resources(), self.model)
             self._streamed_partitions_cache = streamed
         return streamed
 
@@ -666,11 +685,11 @@ class Conductor:
         """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
         within what the request's resources hold. A loop that ``max_output_tokens`` doesn't drive is
         left as it is, and ``validate`` then refuses the request if it doesn't fit."""
-        specs = self._resource_specs()
         room: dict[str, int] = {}
-        for key, cfg in configs.items():
-            for name, n in cfg.loop_room(specs.get(key)).items():
-                room[name] = min(n, room.get(name, n))
+        for specs in self._resource_specs():
+            for key, cfg in configs.items():
+                for name, n in cfg.loop_room(specs.get(key)).items():
+                    room[name] = min(n, room.get(name, n))
 
         def overrun(caps: dict[str, int]) -> int:
             return max((caps[name] - n for name, n in room.items() if name in caps), default=0)
@@ -741,6 +760,15 @@ class Conductor:
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
+        # each worker graph's lockstep instances, as worker ids; a request of
+        # the worker graph runs on one of them
+        self._all_worker_graph_ids_to_instances: dict[int, list[list[str]]] = {
+            worker_graph_id: [
+                [f"worker_{rank}" for rank in instance]
+                for instance in (worker_graph._instance_ranks or [[r] for r in worker_graph.ranks])
+            ]
+            for worker_graph_id, worker_graph in self.worker_graphs.items()
+        }
         self._loop_max_iters: dict[str, int] = {}
         for worker_graph in self.worker_graphs.values():
             for name, loop in worker_graph.section.get_loops().items():
@@ -799,6 +827,7 @@ class Conductor:
                     "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
+                    "all_worker_graph_ids_to_instances": self._all_worker_graph_ids_to_instances,
                     "sharding_config": self.per_worker_sharding_config[worker_id],
                     "parallel_groups": self.parallel_config.per_worker_config[worker_id],
                     "hostname": self.hostname,
@@ -1372,9 +1401,9 @@ class Conductor:
             )
             for key, cfg in request_data.resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
-        specs = self._resource_specs()
-        for key, cfg in request_data.resource_configs.items():
-            cfg.validate(specs.get(key))
+        for specs in self._resource_specs():
+            for key, cfg in request_data.resource_configs.items():
+                cfg.validate(specs.get(key))
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True
@@ -1811,6 +1840,19 @@ class Conductor:
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
                     conn.consumed_count = max(conn.consumed_count, consumed)
 
+        # The stream moves a producer-triggered partition's walk on the
+        # worker; follow it so the completion check and the model's state
+        # machine see the walk this pass actually ran.
+        if (
+            partition_name in self.producer_triggered_partitions
+            and body.graph_walk
+            and body.graph_walk != pstate.metadata.graph_walk
+        ):
+            pstate.metadata.graph_walk = body.graph_walk
+            self._set_partition_worker_graph_ids(
+                body.request_id, partition_name, body.graph_walk,
+            )
+
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
             count = pstate.wg_rank_completions.get(wg_id, 0) + 1
@@ -1894,6 +1936,11 @@ class Conductor:
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
+                    # A finished consumer takes no more input; told its
+                    # producer is done, a continue_after_done stream would
+                    # keep feeding it empty chunks
+                    if request_data.partition_states[conn.to_partition].is_done:
+                        continue
                     if conn.to_partition not in consumers:
                         consumers.add(conn.to_partition)
                         self._send_producer_done(request_id, conn.from_partition, conn.to_partition)

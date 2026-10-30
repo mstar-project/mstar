@@ -120,6 +120,34 @@ def test_the_plan_describes_packed_rows():
     assert seen == {"kv": [0, 2, 5, 6], "lens": [2, 3, 1]}
 
 
+def test_the_plan_runs_on_one_intra_op_thread():
+    """FlashInfer's plan stages through a host copy ATen would split over every intra-op
+    thread: the plan narrows its own thread to one and gives the caller its count back, also
+    when the plan raises. The caller starts at two threads, so CI's OMP_NUM_THREADS=1 can't
+    pass it without the narrowing."""
+    seen = []
+
+    class Wrapper:
+        def plan(self, *args):
+            seen.append(torch.get_num_threads())
+
+    class Fails:
+        def plan(self, *args):
+            raise RuntimeError("plan failed")
+
+    before = torch.get_num_threads()
+    torch.set_num_threads(2)
+    try:
+        sparse_mla._plan(Wrapper(), torch.zeros(4, dtype=torch.int32), [2, 1], 4, 512, 64, 0.1)
+        assert seen == [1]
+        assert torch.get_num_threads() == 2
+        with pytest.raises(RuntimeError, match="plan failed"):
+            sparse_mla._plan(Fails(), torch.zeros(4, dtype=torch.int32), [2, 1], 4, 512, 64, 0.1)
+        assert torch.get_num_threads() == 2
+    finally:
+        torch.set_num_threads(before)
+
+
 def test_pack_lays_the_slots_out_as_the_plan_describes():
     slots = torch.tensor([[10, 11, 12], [20, 21, 22], [30, 31, 32]], dtype=torch.int32)
     dst = torch.full((3 * 3 + 1,), -7, dtype=torch.int32)

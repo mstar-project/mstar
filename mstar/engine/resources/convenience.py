@@ -249,8 +249,10 @@ class RaggedAttentionCallable:
 
     @torch.compiler.disable
     def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    ) -> torch.Tensor:
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if return_lse:
+            return self.attn.run(q, k, v, label=self.label, return_lse=True)
         return self.attn.run(q, k, v, label=self.label)
 
 

@@ -185,7 +185,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if pool is None:
             return None
         # A prefill takes only the slots free now, and waits while none are, so a
-        # TP follower refusing one has diverged from rank 0 (the engine raises).
+        # TP follower refusing one has diverged from rank 0 (its worker stops).
         # With prefill graphs, no more rows than one takes: an eager prefill's
         # last layer compiles the MoE decode kernels for its row count mid-serve.
         if graph_walk == "prefill":
@@ -193,6 +193,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             free = pool.num_free_slots
             return free if rows is None else min(free, rows)
         return pool.config.usable_slots
+
+    def batch_cap_varies(self, graph_walk: str) -> bool:
+        # the prefill cap follows the free KDA slots
+        return graph_walk == "prefill"
 
     def _captured_prefill_rows(self) -> int | None:
         """The most rows a captured prefill takes, or None while prefill runs eager."""
@@ -203,14 +207,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if getattr(self, "_prefill_captured", True) is False:
             return None
         return max(self.config.prefill_capture_batch_sizes or PREFILL_CAPTURE_BATCH_SIZES)
-
-    def max_step_tokens(self, graph_walk: str) -> int | None:
-        cap = self.config.prefill_max_step_tokens
-        if graph_walk != "prefill" or cap is None:
-            return None
-        if cap == "auto":
-            return max(self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS)
-        return cap
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,

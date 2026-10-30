@@ -1,10 +1,12 @@
-"""A TP follower refusing a step rank 0 cannot have refused fails loudly.
+"""A TP follower refusing a step rank 0 cannot have refused stops its worker.
 
 Each rank admits from its own pools, and rank 0 schedules within
-``get_max_batch_size``. A follower that refuses a batch past its own cap has
-capacity rank 0 does not: rank 0 admitted the step and is running its
-collectives, and a follower that re-queued it would leave rank 0 in them
-alone. Refusals within the cap are the ones both ranks share, and are retried.
+``get_max_batch_size``. The guard relies on a cap that follows free state, as
+GLM-5.3's prefill cap follows the free KDA slots: a follower that refuses a batch
+past its own such cap has capacity rank 0 does not, while rank 0 admitted the step
+and is running its collectives. Re-queueing it or failing its requests would leave
+rank 0 in them until the watchdog, so the worker exits. Refusals within that cap
+are ones rank 0 made too, and are retried.
 """
 
 from __future__ import annotations
@@ -46,8 +48,8 @@ def _refused(reason=None) -> FullAdmitOutcome:
     return FullAdmitOutcome(AdmitOutcome(ok=False, reason=reason), "kda_state")
 
 
-def test_a_follower_refusing_past_its_cap_raises():
-    with pytest.raises(RuntimeError, match=r"3 requests on LLM/prefill.*cap of 2.*kda_state.*diverged"):
+def test_a_follower_refusing_past_its_cap_exits():
+    with pytest.raises(SystemExit, match=r"TP ranks diverged.*3 requests on LLM/prefill.*cap of 2.*kda_state"):
         Engine._check_follower_refusal(_engine(cap=2), _batch(3), _refused())
 
 

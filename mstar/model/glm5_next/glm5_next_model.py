@@ -113,9 +113,6 @@ class Glm5NextModel(Model):
         for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
             if kwargs.get(key) is not None:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
-        if kwargs.get("prefill_max_step_tokens") is not None:
-            cap = kwargs["prefill_max_step_tokens"]
-            self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
         if kwargs.get("dsa_long_context", False):
             # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
@@ -491,6 +488,17 @@ class Glm5NextModel(Model):
         # a decode step writes one row, or under MTP its whole verify block (the rejected
         # drafts stay as holes), so the KV pool sizes a request at its worst case
         block = self.config.mtp_num_draft_tokens + 1
+        budget = kwargs.get("max_output_tokens")
+        if block > 1 and budget is not None:
+            # MTP decode stops two blocks short of the window (_mtp_check_stop), inside the
+            # cache rows the conductor checks, so a max_tokens past that is refused here, as
+            # one past the context is without MTP, rather than cut short
+            room = self.config.index_topk - 2 * block + 1 - n
+            if budget > room:
+                raise ValueError(
+                    f"max_tokens={budget} after a {n}-token prompt: GLM-5.3-Flash with MTP "
+                    f"emits at most {room} tokens after it"
+                )
         layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", block),))
         return ProcessPromptOutput(
             {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_CACHE: {"main": layout}}},

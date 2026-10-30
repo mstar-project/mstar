@@ -51,6 +51,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
      - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
        stochastic sampler); TP=2 deployments.
+   * - ``cosyvoice3``
+     - ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``
+     - Zero-shot voice-cloning TTS: Qwen2-0.5B speech-token LM with RAS sampling,
+       DiT flow-matching decoder and causal HiFT vocoder, streamed in chunks.
+       Clones from a preset or an uploaded clip. 24 kHz.
    * - ``glm5_next``
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
@@ -174,7 +179,16 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
-       rows for up to the 4,077-frame maximum. Needs ``flash-attn``; one rollout per GPU.
+       rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
+       through the engine's ragged attention resource, its blocks are compiled (Inductor's
+       deterministic mode), the condition encode runs channels-last, and the VAE decode is
+       channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).
+       ``model_kwargs: {reference_numerics: true}`` runs the reference's numerics instead
+       (FlashAttention-2, needs ``flash-attn``; an eager DiT; the fp32 contiguous encode and
+       decode), with which a rollout is bit-identical to the reference's.
+       ``lingbot_world_1_3b_fast.yaml`` compiles the DiT with autotuned kernels
+       (``dit_compile_autotune``): ~5% faster, but the rollout for a seed then differs from one
+       server process to the next.
        The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
        before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (``Robbyant/lingbot-world``).
    * - ``flux2_klein``
@@ -472,6 +486,34 @@ Qwen3-Omni notes
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
 
+CosyVoice3 notes
+----------------
+
+- Install with ``pip install -e '.[cosyvoice3]'`` and serve with
+  ``mstar serve cosyvoice3 --gpus 0``. Every request clones a voice: a
+  ``ref_audio`` clip (with its transcript in ``ref_text`` for zero-shot
+  cloning) or a preset from ``voices_dir`` (see ``configs/cosyvoice3.yaml``).
+  ``instructions`` carries a style instruction. Output is 24 kHz.
+- Keep the reference clip short, a few seconds like CosyVoice's own 3.5 s
+  prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
+  from 1.4% to 13.4%, with words dropped mid-sentence.
+- On ``/v1/audio/speech``, text longer than one piece is synthesized as ordered
+  sentence pieces, as the reference frontend does: about 80 tokens (320
+  characters) of English, or 80 characters of text with Chinese, each piece
+  cloning the same voice. In one request the LM ends long text early or
+  garbles its end. A Chinese sentence over 300 characters, which the
+  reference keeps whole, is also cut at its commas, so that each piece stays
+  under the LM's 512 tokens of transcript and text.
+  ``sentence_chunking: false`` sends the text whole.
+- Japanese written in kana alone, with spaces between words, is read poorly,
+  as it is by the official model: in tests both garbled common words such as
+  ゆっくり and ありがとうございました on every seed.
+- The flow's DiT estimator runs in bfloat16 by default; the Euler state, the
+  rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor
+  float64).
+  ``model_kwargs: {flow_estimator_dtype: float32}`` in the deployment YAML runs
+  the estimator at the reference's precision instead, at lower throughput.
+
 Qwen3-TTS notes
 ---------------
 
@@ -531,8 +573,9 @@ Qwen3-TTS notes
   overlap, which raised c=32 throughput by about a fifth on an H100.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
-  deployment YAML halves its GPU time when throughput matters more than
-  bit-exactness (the Talker is bf16 either way).
+  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
+  B300 that is slower, not faster: cuDNN's heuristics run several of its
+  convs on a kernel without tensor cores, so measure before switching.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 
@@ -924,11 +967,21 @@ Cosmos3 environment requirements
   (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
-  one matching your environment. When it is not importable, the engine logs a
-  warning at startup and automatically falls back to the paged ``flashinfer``
-  backend — serving still works, only the bs=1 dense fast path is lost.
-  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects
-  the paged backend explicitly.
+  one matching your environment. It ships kernels for sm_80 and sm_90a only.
+  Where it is not importable or has no kernel for the GPU (Blackwell), the
+  same dense pass runs on FlashInfer's ragged prefill, whose ``auto`` kernel on
+  a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
+  against 6.3 ms for the paged prefill. ``resources: attn_gen:
+  flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``); the
+  server checks it at startup with a tiny plan and run, and a backend this GPU or
+  FlashInfer build cannot run (a typo, ``fa3`` on Blackwell, ``cutlass`` on
+  Hopper) stops it with a ``ValueError`` naming the backend.
+  Without a usable FlashInfer either, the engine logs a warning and switches to
+  the paged backend, but that is FlashInfer too (the default backend on every
+  platform for now), so it cannot run there either: the dense pass needs
+  fa3-fwd (AITER on ROCm) or FlashInfer.
+  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects the
+  paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
@@ -991,6 +1044,32 @@ so an image or clip produced alongside other requests differs from its solo
 result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
 request at a time when outputs must be bitwise repeatable.
 
+The denoise step is compiled (``compile_denoise``) in Inductor's deterministic
+mode by default (``denoise_compile_mode: deterministic``, the engine's compile
+mode of that name): kernel configs are picked by rule, so a seed gives the same
+video from every server process. ``default`` is torch.compile's own defaults,
+and ``level`` takes the ``mstar serve -O`` level's options (``-O2``:
+max-autotune).
+
+Video clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
+one decoder call per latent, channels-last, in the decode dtype (bf16 with
+cuDNN >= 9.16, otherwise fp32; see above), on the decoder-only copy of the VAE
+the channels-last decoders on a GPU share. The first two calls (the clip-start latent and the one after it)
+run eager; every later call is compiled in Inductor's deterministic mode. An
+image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
+is faster for a single frame. False decodes everything with the compiled stock
+``vae.decode`` on the shared instance.
+
+Two or more requests at the same denoise step run one cross-request forward
+(``max_gen_batch_size``, default 8) for video, image and sound; the action step
+runs eager. With ``compile_denoise_batched`` (default on) its layer stack is
+compiled with the same mode, once, while the server starts, with the packed
+length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
+per-request patchify, rotary tables and unpatchify around it run eager. At
+832x480x121 one request's guidance pair is 24k tokens, which already fills the
+GPU's GEMM and attention throughput, so a batch of N costs about N single
+steps: batching keeps requests in step rather than adding throughput.
+
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``
@@ -1021,7 +1100,10 @@ own ``window_decoder`` partition; a request opts in per call:
    * - ``window_mode``
      - — (``chained`` with ``stream_video``)
      - ``chained``: every window is a full bidirectional denoise conditioned on
-       the previous window's tail (``overlap_frames`` pinned clean). ``kv``
+       the previous window's tail (``overlap_frames`` pinned clean: the last
+       frames are decoded and encoded again as a clip of their own, the
+       video-to-video conditioning layout, so the window's first latent frame
+       is a single-frame one as in training). ``kv``
        (experimental, see below): the finished window's clean K/V is committed
        to the cache and later windows attend to it block-causally; no overlap,
        and frames older than ``context_frames`` behind the frontier are
@@ -1032,8 +1114,9 @@ own ``window_decoder`` partition; a request opts in per call:
      - Pixel frames per window (quantized to latent frames).
    * - ``overlap_frames``
      - 32 on Edge, 8 elsewhere
-     - ``chained`` only: frames re-pinned from the previous window (at least two
-       latent frames).
+     - ``chained`` only: frames re-pinned from the previous window, as k = 1 +
+       (overlap_frames - 1) // 4 latent frames (at least two), which pin
+       1 + 4(k - 1) frames: 5 and 29 at the defaults.
    * - ``context_frames``
      - 61
      - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.
@@ -1233,44 +1316,57 @@ LTX-2.5 (``ltx2_5``)
 Text-to-audio+video on **Lightricks LTX-2.5** (``Lightricks/LTX-2.5-Diffusers``, gated):
 a 22B joint audio-video DiT, a Gemma-4 12B text encoder, and video/audio VAEs with a
 48 kHz vocoder. The distilled checkpoint runs the model card's recipes without
-guidance (single-stage: 8 sigmas); the two-stage recipe, the full (SFT) transformer,
-image-to-video and the duration head are not ported yet.
+guidance; the full (SFT) transformer, image-to-video and the duration head are not
+ported yet.
 
-Four nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
+Five nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
 DiT scaffold's denoise loop; video and audio latents carried in fp32; every attention
-through two ragged attention resources), ``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
+through two ragged attention resources), ``latent_upsampler`` (two-stage recipe only),
+``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
 modalities, so ``["video"]`` skips the audio decode (the model still denoises both).
 
 .. code-block:: bash
 
-   mstar serve ltx2_5            # configs/ltx2_5.yaml: DiT on GPU 0, the other nodes on GPU 1
+   mstar serve ltx2_5                             # configs/ltx2_5.yaml: DiT on GPU 0, the rest on GPU 1
+   mstar serve ltx2_5 --config configs/ltx2_5_tp2.yaml   # DiT tensor-parallel over 2 GPUs
+   mstar serve ltx2_5 --config configs/ltx2_5_sp2.yaml   # DiT sequence-parallel over 2 GPUs (fastest)
 
-Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32; default
-544x960), ``num_frames`` (8k+1; default 121), ``fps``, ``seed``. Frames above 720p
-decode in VAE tiles (``vae_tile_min_pixels``) to bound the decode's memory.
+Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32; 64 for the
+two-stage recipe), ``num_frames`` (8k+1), ``fps``, ``seed``, and ``recipe``:
+
+- ``single`` (default): 8 distilled sigmas at the requested size (default 544x960x121).
+- ``two_stage``: the card's better-quality path — 8 sigmas at half size, the x2 latent
+  upsampler, then 3 sigmas at full size (default 1088x1920). Frames above 720p decode
+  in VAE tiles, as the card does for this decode.
 
 Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
 ``POST /v1/videos/generations`` returns one mp4 with the audio muxed in as AAC
 (``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
 on the server's ``PATH`` and falls back to video only without it.
 
-Performance (2x H100, warm, against diffusers 0.41 with the same recipe and seeds):
+``ltx2_5_sp2`` shards the video tokens (Ulysses): each rank holds the whole DiT and
+half the tokens, and only the video self-attention exchanges them (one all-to-all
+each way); the cross-attentions run on each rank's own tokens, and the audio queries
+over the video merge the ranks' partial attentions. ``ltx2_5_tp2`` shards the
+weights instead and all-reduces after every block's attentions and feed-forwards.
 
-======================================  ==============  ==============
-                                        diffusers       ``ltx2_5``
-======================================  ==============  ==============
-544x960x121, one request                7.87 s          6.23 s
-544x960x121, 2 concurrent               7.6 videos/min  12.7 videos/min
-544x960x121, 4 concurrent               7.6 videos/min  14.0 videos/min
-======================================  ==============  ==============
+Performance (2x H100, warm; diffusers with the same recipe and seeds):
 
-Concurrency pays because the text encoder and decoders run on the second GPU while the
-DiT denoises another request; the DiT itself is GPU-bound (batching two requests costs
-two steps' time).
+======================================  ================  ================  ================
+                                        diffusers         ``ltx2_5_tp2``    ``ltx2_5_sp2``
+======================================  ================  ================  ================
+544x960x121, one request                7.87 s            3.70 s            3.15 s
+544x960x121, 4 concurrent               7.6 videos/min    19.6 videos/min   22.3 videos/min
+two-stage 1088x1920x121, one request    21.6 s            11.0 s            11.3 s
+two-stage, 2 concurrent                 2.8 videos/min    5.9 videos/min    6.1 videos/min
+======================================  ================  ================  ================
 
-The DiT is compiled and its denoise step captured per shape (``capture_shapes``);
-other shapes run the compiled eager path, and the first request of a new shape pays
-its compile.
+The DiT is compiled and its denoise step captured per shape (``capture_shapes``, which
+the two-stage recipe's stages replay too); other shapes run the compiled eager path, and the first
+request of a new shape pays its compile. ``vae_compile`` (on in these configs) compiles the
+video VAE's decoder at load for ``vae_compile_shapes``, by default the same shapes (~55 dB
+from the eager decode; other shapes decode eager). The SP2 config doesn't capture 1088x1920
+but lists it there, so its two-stage decode runs compiled too.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------
