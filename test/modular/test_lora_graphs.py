@@ -147,7 +147,7 @@ def test_a_delta_runs_only_between_its_steps_plan_and_commit(adapters):
         thread.join()
         return refused
 
-    with pytest.raises(RuntimeError, match="outside its node's planned step"):
+    with pytest.raises(RuntimeError, match="no planned step addressing its rows"):
         delta()
     for end in (pool.commit, pool.rollback_admit):
         s, c = P.step(["r"]), P.ctx(["r"])
