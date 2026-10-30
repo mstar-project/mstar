@@ -43,7 +43,6 @@ from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
-    EdgeSpec,
     GraphRuntime,
     InlineColumn,
     PostprocessNeed,
@@ -1401,7 +1400,9 @@ class Worker:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         # Every ready chunk is popped first and ingested in one call (and one
         # Python <> Rust roundtrip)
+        laps = PhaseLaps("worker.main.poll_stream_buffers.")
         polled = self.streams.poll()
+        laps.lap("scan_and_pop")
         if not polled:
             return
 
@@ -1412,7 +1413,7 @@ class Worker:
         # in _postprocess_batch — NOT here, where an earlier in-flight pass's
         # WGD could read it before the final output chunk is emitted.
         refused = set(self._graph_runtime.ingest_inputs_batch(
-            self._edge_block((rid, [se.edge]) for rid, se in polled),
+            self.streams.edge_block(polled),
             # important: only ingest for this loop iter!
             can_buffer=False,
             is_streaming=True,
@@ -1423,6 +1424,7 @@ class Worker:
                 self.streams.return_edge(rid, se)
             else:
                 self.streams.mark_ingested(rid, se)
+        laps.lap("ingest")
 
 
     # ------------------------------------------------------------------
@@ -1671,8 +1673,8 @@ class Worker:
         # sessions for one bad chunk. Take out just that rid and report it, so
         # the failure is attributed and loud.
         per_request_inputs, final_edges, unresolved = (
-            batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor, batch.request_to_worker_graph,
+            self.streams.input_tensors(
+                batch.input_edges, batch.node_name, batch.request_to_worker_graph,
                 skip_missing=True,
             )
         )
@@ -2738,8 +2740,8 @@ class Worker:
                 f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
-            fresh_inputs, fresh_final, _ = fresh_batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor,
+            fresh_inputs, fresh_final, _ = self.streams.input_tensors(
+                fresh_batch.input_edges, spec_node_name,
                 fresh_batch.request_to_worker_graph,
             )
             in_flight = set(continuing)
@@ -2975,13 +2977,7 @@ class Worker:
             graph_walk=spec_walk,
             rids=continuing,
             room_for_continuing=None,
-            streaming_edges=[
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                    is_final_streaming_chunk=e._final_stream_chunk,
-                ) for _r, (e, _chunk) in polled
-            ],
+            streaming_edges=self.streams.edge_specs(polled),
             streaming_edges_per_rid=per_rid_counts,
         ))
         if prep is None:
@@ -3005,12 +3001,11 @@ class Worker:
         # Both seeded with their rid lists, so the `in prep_inputs` test below
         # still separates prepped rids from fresh ones -- a ready rid with no
         # prepped edge gets an empty mapping, as a zero-length slice used to.
-        get_tensor = self.tensor_manager.get_tensor
-        prep_inputs = prep.input_edges.to_input_tensors(
-            get_tensor, prep.ready_rids,
+        prep_inputs = self.streams.input_tensors(
+            prep.input_edges, head.node_name, prep.ready_rids,
         ).by_rid
-        fresh_inputs, fresh_final_edges, _ = fresh_edges.to_input_tensors(
-            get_tensor, list(fresh_wg),
+        fresh_inputs, fresh_final_edges, _ = self.streams.input_tensors(
+            fresh_edges, head.node_name, list(fresh_wg),
         )
         prep_wg = dict(zip(prep.ready_rids, prep.wg_ids, strict=True))
 
@@ -3679,22 +3674,19 @@ class Worker:
                 batch_N.node_batch.request_ids,
                 batch_N.node_batch.exec_timings,
             )
-        # Before the local-streaming dereference below: numel() needs the
-        # tensors, and a new_token whose only other destination is a local
-        # stream holds a single reference, which that dereference drops to zero
-        # -- collecting the tensor this count is about to read.
+        laps = PhaseLaps("worker.postprocess.stream_send.")
         new_token_counts = self._count_new_tokens(
             route_output.new_token_output_idxs,
             stored.flat_rids, stored.flat_uuids, signals, stored.signal_idxs,
         )
+        laps.lap("count_tokens")
 
         # Before the sends below: remote consumers read the walks off the
         # fwd_info that rides with the streamed edges.
         self._assign_consumer_walks(batch_N)
 
-        # Local streaming stays here: a StreamBuffer holds real tensors, so it
-        # cannot move behind the runtime's contract.
-        streamed: list[int] = []
+        # The buffer holds each item by its uuid, taking over the routing
+        # reference the runtime counted for the local stream destination.
         for signal, per_signal in route_output.local_streaming_by_signal.items():
             consumer = self._walk_driven_edges.get(signal)
             for rid, uuid in per_signal:
@@ -3704,12 +3696,8 @@ class Worker:
                 stream_buf.pre_read_register(
                     uuid, walks.get(consumer) if consumer else None,
                 )
-                tensor = self.tensor_manager.get_tensor(uuid)
-                stream_buf.put(uuid, tensor.clone())
-                streamed.append(uuid)
-        # After the loop: one crossing for the batch rather than one per
-        # streamed tensor.
-        self.tensor_manager.dereference_batch_uniform(streamed)
+                stream_buf.put(uuid, uuid)
+        laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)
         needs_info = route_output.rids_needing_request_info
@@ -3735,6 +3723,7 @@ class Worker:
                         rid, batch_N.partition, published,
                     )
                     buffered_publish.add(rid)
+        laps.lap("publish")
         # Only the rids with something to report cross: a decode step has no
         # new-token counts (the inline token is not counted) and no stream
         # buffers, and an empty entry per rid cost a dict each to build and to
@@ -3742,6 +3731,7 @@ class Worker:
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
         consumed = self.streams.consumption_batch(send_rids)
+        laps.lap("consumption")
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(

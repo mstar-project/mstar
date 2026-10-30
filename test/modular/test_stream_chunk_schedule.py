@@ -11,7 +11,6 @@ consumer can rely on it instead of re-deriving the policy's schedule.
 import pytest
 import torch
 
-from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import (
     FixedChunkPolicy,
     LeftContextChunkPolicy,
@@ -124,9 +123,9 @@ def test_returned_streaming_edge_keeps_its_chunk_info():
     buffer = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker",
                           policy=FixedChunkPolicy(chunk_size=3))
     info = StreamChunkInfo(start_offset=7, context_items=3, num_items=12, is_final=True)
-    edge = GraphEdge(next_node="Codec", name="codec_tokens", _final_stream_chunk=True)
-    buffer.store_uningested_edge(StreamingEdge(edge, info))
-    assert buffer.pop_waiting_edge() == (edge, info)
+    edge = StreamingEdge("codec_tokens", "Codec", [7, 8, 9], info)
+    buffer.store_uningested_edge(edge)
+    assert buffer.pop_waiting_edge() == edge
     assert buffer.pop_waiting_edge() is None
 
 

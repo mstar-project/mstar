@@ -270,8 +270,13 @@ def test_the_store_does_not_forget_twice(bk):
     bk.forget_tensor = lambda uuid: (forgets.append(uuid), real_forget(uuid))[1]
 
     collectable, _ = store.dereference_batch_uniform([1], cleanup=True)
-    assert collectable == [1]
-    store.remove_tensor(1)  # what the caller's per-uuid teardown ends in
+    if store.frees_in_place:
+        # Nothing registered and nothing flagged: freed in that same pass,
+        # with no teardown left to report.
+        assert collectable == []
+    else:
+        assert collectable == [1]
+        store.remove_tensor(1)  # what the caller's per-uuid teardown ends in
 
     assert forgets == [], "the bookkeeper was asked to forget it twice"
     assert not store.check_uuid_presence(1)

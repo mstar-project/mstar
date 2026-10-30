@@ -62,6 +62,7 @@ class _StubTM:
     dereference = TensorCommunicationManager.dereference
     dereference_batch = TensorCommunicationManager.dereference_batch
     dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
+    increment_ref_batch_uniform = TensorCommunicationManager.increment_ref_batch_uniform
     cleanup_collectable = TensorCommunicationManager.cleanup_collectable
 
     def __init__(self, bookkeeping):
@@ -72,6 +73,9 @@ class _StubTM:
 
     def get_tensor(self, uuid):
         return self.tensor_store.get_tensor(uuid)
+
+    def get_tensors(self, uuids):
+        return self.tensor_store.get_tensors(uuids)
 
     def _cleanup_by_uuid(self, uuid, registered=None):
         if self.tensor_store.check_uuid_presence(uuid):

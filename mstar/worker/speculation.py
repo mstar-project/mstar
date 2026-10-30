@@ -22,7 +22,6 @@ from mstar.communication.tensors import NameToTensorList, TensorCommunicationMan
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import (
-    EdgeSpec,
     GraphRuntime,
     SpeculationOutput,
     SpeculationPrepInput,
@@ -137,8 +136,8 @@ class SpeculationPreparer:
         prep = PreparedSpeculation(rows.ready_rids, rows.spec_id, rows.wg_id)
         if rows.input_edges is not None and rows.ready_rids:
             # an input that is not the in-flight step's: per-row dicts
-            prep.per_request_inputs.update(rows.input_edges.to_input_tensors(
-                ctx.tensor_manager.get_tensor, rows.ready_rids,
+            prep.per_request_inputs.update(ctx.streams.input_tensors(
+                rows.input_edges, spec_node_name, rows.ready_rids,
             ).by_rid)
             prep.request_to_worker_graph.update(dict.fromkeys(rows.ready_rids, rows.wg_id))
             prep.rows_wg_id = None
@@ -152,7 +151,6 @@ class SpeculationPreparer:
         for the ready rids."""
         ctx = self._ctx
         streams = ctx.streams
-        # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
         if streams.possible():
@@ -169,13 +167,7 @@ class SpeculationPreparer:
             graph_walk=graph_walk,
             rids=candidates,
             room_for_continuing=max_continuing,
-            streaming_edges=[
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                    is_final_streaming_chunk=e._final_stream_chunk,
-                ) for _r, (e, _chunk) in polled
-            ],
+            streaming_edges=streams.edge_specs(polled),
             streaming_edges_per_rid=per_rid_counts,
         ))
         laps.lap("prep_spec_rids")
@@ -193,8 +185,8 @@ class SpeculationPreparer:
 
         # `ready_rids` seeds it, so a ready rid with no prepped edge still gets
         # an empty mapping -- what slicing a zero-length run used to give.
-        prepped_inputs = out.input_edges.to_input_tensors(
-            ctx.tensor_manager.get_tensor, out.ready_rids,
+        prepped_inputs = streams.input_tensors(
+            out.input_edges, spec_node_name, out.ready_rids,
         ).by_rid
         for i, r in enumerate(out.ready_rids):
             prep.per_request_inputs[r] = prepped_inputs[r]
@@ -310,7 +302,7 @@ class SpeculationBuilder:
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_edges={
-                rid: {se.edge.name for se in edges if se.chunk.is_final}
+                rid: {se.name for se in edges if se.chunk.is_final}
                 for rid, edges in consumed_streaming_edges.items()
                 if any(se.chunk.is_final for se in edges)
             } | fresh_final_edges,
