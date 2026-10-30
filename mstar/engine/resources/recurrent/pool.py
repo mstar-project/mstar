@@ -767,11 +767,30 @@ class RecurrentStatePool(Resource):
     def refuse_snapshots(self, reason: str) -> None:
         """A resource over this pool cannot write the snapshots a cached prefix
         restores (``reason``), so the pool keys none. The engine keeps the node's
-        caches shut with it, from the spec (`NodeResourceSpec.restore_refusal`)."""
+        caches shut with it, from the spec (`NodeResourceSpec.restore_refusal`), and
+        then builds the pool without snapshot slots; a pool that was sized with them
+        before this answer gives them back here."""
         if self._snapshot_refusal is None and self.config.prefix_slots:
             logger.info("recurrent state pool %r keeps no prefix snapshots: %s", self._name, reason)
         self._snapshot_refusal = reason
         self._kv = None
+        if not self.config.prefix_slots:
+            return
+        assert not self._slots and not self._snap_by_key, "refuse_snapshots after the pool was used"
+        with self._lock:
+            freed = 0
+            for name, block in self._blocks.items():
+                freed += block.nbytes - block[:, : self.config.max_slots].nbytes
+                self._blocks[name] = torch.zeros(
+                    (block.shape[0], self.config.max_slots, *block.shape[2:]),
+                    dtype=block.dtype, device=block.device,
+                )
+            self._snap_free = []
+            self.config = replace(self.config, prefix_slots=0)
+        if self._device.type == "cuda":
+            torch.cuda.empty_cache()
+        logger.info("recurrent state pool %r gave back its snapshot slots (%.2f MiB): %s",
+                    self._name, freed / 2**20, reason)
 
     def close_prefix_cache(self) -> None:
         self._kv = None
