@@ -408,8 +408,10 @@ def test_prompts_leave_two_blocks_of_index_topk():
 
 def test_vocab_parallel_argmax_equals_the_full_argmax():
     """``_argmax`` over 4 emulated TP ranks, ties across shards included, against the argmax
-    of the gathered logits."""
+    of the gathered logits; one gather of the ranks' (logit, id) pairs per call."""
     from types import SimpleNamespace
+
+    from mstar.model.glm5_next.submodules import _shard_best
 
     torch.manual_seed(0)
     tp, vocab, hidden = 4, 64, 16
@@ -426,18 +428,18 @@ def test_vocab_parallel_argmax_equals_the_full_argmax():
 
         def all_gather(self, t, dim=-1):
             self.calls += 1
-            per_rank = [loc.gather(-1, loc.argmax(-1, keepdim=True)).float() if self.calls == 1
-                        else loc.argmax(-1, keepdim=True) + r * shard
-                        for r, loc in enumerate(locals_)]
+            per_rank = [_shard_best(loc, r * shard) for r, loc in enumerate(locals_)]
+            assert t.dtype == per_rank[0].dtype and t.shape == per_rank[0].shape
             return torch.cat(per_rank, dim=dim)
 
     full = torch.nn.functional.linear(x, weight).argmax(-1)
     for rank in range(tp):
+        comm = _Comm()
         head = SimpleNamespace(weight=weight[rank * shard:(rank + 1) * shard], tp_size=tp,
-                               tp_rank=rank, output_size_per_partition=shard,
-                               comm_group=_Comm())
+                               tp_rank=rank, output_size_per_partition=shard, comm_group=comm)
         got = Glm5NextLLMSubmodule._argmax(SimpleNamespace(lm_head=head), x)
         assert torch.equal(got, full), (rank, got, full)
+        assert got.dtype == torch.int64 and comm.calls == 1
     assert full[0] == 5
 
 

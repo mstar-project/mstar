@@ -81,18 +81,25 @@ if _HAS_TRITON:
         row = proj + n * stride_proj
         cstate = conv_pool + slot * stride_conv
 
-        # Both gate up-projections first: they read only the projections, so their weight
-        # loads are issued before any store and overlap each other.
+        # Every load that depends on no other result is issued first, the state included, so
+        # their latencies overlap: at decode sizes the kernel is bound by its load chain.
+        # s[v, k]: the decay runs along k, the reads and the update reduce over it
+        sp = state_pool + slot * stride_state + h * D * D + d[:, None] * D + d[None, :]
+        s = tl.load(sp)
         f_a = tl.load(row + 3 * P + H + d).to(tl.float32)
         fb = tl.load(f_b + (h * D + d)[:, None] * D + d[None, :]).to(tl.float32)
         g_a = tl.load(row + 3 * P + H + D + d).to(tl.float32)
         gb = tl.load(g_b + (h * D + d)[:, None] * D + d[None, :]).to(tl.float32)
+        bias = tl.load(dt_bias + h * D + d)
+        a_exp = tl.exp(tl.load(a_log + h))
+        norm = tl.load(norm_w + d).to(tl.float32)
+        b = tl.load(row + 3 * P + h).to(tl.float32)
         # Forget gate: f_b(f_a) per head, + dt_bias, lower_bound * sigmoid(exp(A) * g).
         g = tl.sum(fb * f_a[None, :], 1).to(tl.bfloat16).to(tl.float32)
-        g = g + tl.load(dt_bias + h * D + d)
-        decay = tl.exp(lower_bound * tl.sigmoid(tl.exp(tl.load(a_log + h)) * g))
+        g = g + bias
+        decay = tl.exp(lower_bound * tl.sigmoid(a_exp * g))
         gate = tl.sum(gb * g_a[None, :], 1).to(tl.bfloat16).to(tl.float32)
-        beta = tl.sigmoid(tl.load(row + 3 * P + h).to(tl.float32))
+        beta = tl.sigmoid(b)
         beta = beta.to(tl.bfloat16).to(tl.float32)
 
         q, qs1, qs2, qx = _conv_silu(row, cstate, conv_w, h * D + d)
@@ -105,9 +112,7 @@ if _HAS_TRITON:
         q = q / tl.sqrt(tl.sum(q * q, 0) + 1e-6) * scale
         k = k / tl.sqrt(tl.sum(k * k, 0) + 1e-6)
 
-        # s[v, k]: the decay runs along k, the reads and the update reduce over it
-        sp = state_pool + slot * stride_state + h * D * D + d[:, None] * D + d[None, :]
-        s = tl.load(sp) * decay[None, :]
+        s = s * decay[None, :]
         delta = (v - tl.sum(s * k[None, :], 1)) * beta
         s = s + delta[:, None] * k[None, :]
         o = tl.sum(s * q[None, :], 1).to(tl.bfloat16).to(tl.float32)
@@ -115,7 +120,7 @@ if _HAS_TRITON:
 
         # The gated RMSNorm over the head.
         y = o * tl.rsqrt(tl.sum(o * o, 0) / D + norm_eps)
-        y = y * tl.load(norm_w + d).to(tl.float32) * tl.sigmoid(gate)
+        y = y * norm * tl.sigmoid(gate)
         tl.store(out + n * stride_out + h * D + d, y.to(out.dtype.element_ty))
 
 
