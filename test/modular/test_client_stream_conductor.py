@@ -391,7 +391,9 @@ def test_client_streams_without_process_stream_chunk_fail_at_startup():
 
 def test_a_client_stream_that_declares_audio_needs_looped_output():
     """/v1/realtime would fail such a call at the first chunk without a loop
-    step. Turn tokens are not needed to start: only a conversation needs them."""
+    step, and mis-pair its text and audio unless the loop steps once per item
+    from the stream. Turn tokens are not needed to start: only a conversation
+    needs them."""
     class _Unmarked(_DuplexToy):
         def get_partition_topology(self):
             conn = _client_connection("audio_in")
@@ -411,8 +413,15 @@ def test_a_client_stream_that_declares_audio_needs_looped_output():
                 name="listen_loop", max_iters=1000, section=super().get_graph_walk_graphs()["listen"].section,
                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="text", output_modality="text")])}
 
+    class _TwoFramesAStep(_Marked):
+        def get_partition_topology(self):
+            topology = super().get_partition_topology()
+            topology.connections[0].chunk_policy_factory = lambda: FixedChunkPolicy(chunk_size=2)
+            return topology
+
     assert _refused(_Unlooped(), "['ear'] emit outside one")
     assert _refused(_AtLoopExit(), "['listen_loop'] emit outside one")
+    assert _refused(_TwoFramesAStep(), "['Ear'] do not")
     assert check_client_streams(_Unmarked(), {}) == check_client_streams(_Marked(), {}) == []
 
 
