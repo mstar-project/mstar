@@ -5,9 +5,9 @@ without pulling FlashInfer in behind it.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
@@ -214,6 +214,13 @@ class RingKVConfig(KVConfig):
             self.num_sessions = num_sessions
 
 
+class SpanKind(StrEnum):
+    """What a span writes: token ``IDS``, a file's KV keyed by its ``DIGEST``, or ``ROWS`` of anything else."""
+    IDS = "ids"
+    DIGEST = "digest"
+    ROWS = "rows"
+
+
 @dataclass(frozen=True)
 class PrefixSpan:
     """One write to a keyed stream, as the preprocess worker laid it out.
@@ -227,9 +234,13 @@ class PrefixSpan:
     advance: int
     walk: str
     scratch: int = 0
-    kind: str = "ids"
+    kind: SpanKind = SpanKind.IDS
     digest: bytes | None = None
     end_key: bytes | None = None
+
+    def __post_init__(self):
+        # a layout row carries the kind as its string
+        object.__setattr__(self, "kind", SpanKind(self.kind))
 
 
 @dataclass
@@ -258,9 +269,6 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
-    # label -> the prompt's ids, without its digest spans, as int32 bytes, when it is the only label with spans
-    # and has no rows span
-    prompt_ids: dict[str, bytes] | None = None
     # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
     arrival: int | None = None
     # in a pool that decides admission, a guaranteed request reserves what it grows into and is never preempted
@@ -274,7 +282,6 @@ class KVReqConfig(ResourceReqConfig):
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
-        prompt_ids: dict[str, bytes] | None=None,
         arrival: int | None=None,
         **kwargs,
     ):
@@ -305,8 +312,6 @@ class KVReqConfig(ResourceReqConfig):
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
-        if prompt_ids is not None:
-            self.prompt_ids = prompt_ids
         if arrival is not None:
             self.arrival = arrival
 
@@ -420,15 +425,35 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
 
 
+def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
+    """Why a request's rebuild rows can't write its laid-out labels again, or None.
+
+    The rows write one label, grown by one loop, running its prefill steps again in order. They write the ids
+    spans from the request's kept ids, a digest span from host copies of what its step read, and the ids
+    sampled since at the end of the last span, which must be ids.
+    """
+    laid_out = [layout for layout in layouts if layout.spans]
+    if any(span.kind == SpanKind.ROWS for layout in laid_out for span in layout.spans):
+        return "it holds KV made from another node's outputs, which no rebuild recomputes"
+    if len(laid_out) > 1 or any(len(layout.growth) != 1 for layout in laid_out):
+        return "it writes more than one label or growth loop, which its rebuild rows can't lay out again"
+    for layout in laid_out:
+        if layout.spans[-1].kind != SpanKind.IDS:
+            return "its prompt ends on a digest span, where the ids it sampled can't follow"
+        if layout.keyed_spans not in (0, len(layout.spans)):
+            return "it keys only part of its prompt, which a rebuild can't key again"
+    return None
+
+
 def mark_guaranteed(
     configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
 ) -> None:
     """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause is a gap in
-    playback, or when any of them lays out rows, which no rebuild can recompute. A digest span is left to the
+    playback, or when any of them lays out rows, which no rebuild recomputes. A digest span is left to the
     worker, which guarantees the request on a node that keeps no host copies for its rebuild."""
     kv_configs = [config for config in configs.values() if isinstance(config, KVReqConfig)]
     guaranteed = (streaming and "audio" in output_modalities) or any(
-        span.kind == "rows"
+        span.kind == SpanKind.ROWS
         for config in kv_configs for layout in (config.kv_layout or {}).values() for span in layout.spans
     )
     for config in kv_configs:
@@ -436,11 +461,10 @@ def mark_guaranteed(
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
-    """Only the worker reads the layouts, caps and prompt ids, when it ingests the NewRequest, so
-    they are dropped before the configs go out with every frame between workers."""
+    """Only the KV manager's ingest reads the layouts and caps, so they are dropped
+    before the configs go out with every frame between workers."""
     return {
-        key: replace(config, kv_layout=None, loop_caps=None, prompt_ids=None) if isinstance(config, KVReqConfig)
-        else config
+        key: replace(config, kv_layout=None, loop_caps=None) if isinstance(config, KVReqConfig) else config
         for key, config in configs.items()
     }
 
@@ -512,6 +536,13 @@ class StreamLayout:
         return sum(span.advance for span in self.spans) + sum(
             slots * caps[loop] for loop, slots in self.growth
         )
+
+    def rebuilt(self, ids: int) -> "StreamLayout":
+        """This layout once its rebuild rows have written ``ids`` ids into it: the last span, which
+        `rebuild_refusal` requires to be ids, grows by the ids sampled since the layout was laid out."""
+        grown = ids - sum(span.length for span in self.spans if span.kind == SpanKind.IDS)
+        *spans, last = self.spans
+        return replace(self, spans=(*spans, replace(last, length=last.length + grown, advance=last.advance + grown)))
 
     def pages(self, caps: Mapping[str, int], page_size: int) -> int:
         """The most pages the stream can hold, where ``caps`` gives each growth loop's iterations.

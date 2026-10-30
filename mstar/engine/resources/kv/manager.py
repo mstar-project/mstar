@@ -19,6 +19,7 @@ from mstar.engine.resources.base import (
     EngineResourceInfo,
     KeyedWalks,
     PublishedInfo,
+    Rebuild,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import (
@@ -29,7 +30,9 @@ from mstar.engine.resources.kv.config import (
     PagedKVConfig,
     PrefixSpan,
     RetentionPolicy,
+    SpanKind,
     StreamLayout,
+    rebuild_refusal,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items, page_key
@@ -345,6 +348,13 @@ class Allotment:
     returning: int | None = None
 
 
+class Dropped(NamedTuple):
+    """A dropped request until its rebuild lands: the pages it asks to return with, and the slots its
+    laid-out label held, which its rebuild must write again."""
+    returns: int
+    held: int
+
+
 @dataclass(slots=True)
 class Earmark:
     """The pages ``rid`` ran short of, which the moves of ``victims`` free for it. ``freed`` counts the room
@@ -596,8 +606,8 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        # dropped request -> the pages it asks to return with
-        self._dropped: dict[str, int] = {}
+        # dropped request -> what it returns with, until its rebuild lands
+        self._dropped: dict[str, Dropped] = {}
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
@@ -3119,6 +3129,9 @@ class KVManager(AttentionResource):
                 return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
             if self._overrides[rid].guaranteed:
                 return f"KV {self.name}: {rid} is guaranteed, so it is never preempted"
+            why = rebuild_refusal((self._overrides[rid].kv_layout or {}).values())
+            if why is not None:
+                return f"KV {self.name}: {rid} can't be dropped, since {why}"
         return None
 
     def drop(self, rid: str) -> int:
@@ -3131,84 +3144,57 @@ class KVManager(AttentionResource):
                 raise RuntimeError(refusal)
             # under the lock, so no other step allocates between the two counts
             free, room = self._arena.num_free, self._room()
-            # It returns with its history laid out as its rebuild writes it, and one page more, at most its
-            # footprint.
-            label, spans = self._rebuilt_spans(rid, self._history(rid))
-            layout = self._overrides[rid].kv_layout[label]
-            pages = replace(layout, spans=spans).pages(dict.fromkeys(dict(layout.growth), 0), self.config.page_size)
-            returns = sum(self._one_more(pages, stream.footprint) for stream in self._streams[rid].values())
+            # A rebuild that hasn't landed wrote nothing, so a request dropped again keeps what its first drop
+            # recorded.
+            dropped = self._dropped.get(rid)
+            if dropped is None:
+                # It returns with its history (the tokens its KV held, released ones included, and the sample its
+                # next step writes) and one page more, at most its footprint.
+                streams = self._streams[rid].values()
+                written = max(stream.stored_len + stream.released for stream in streams)
+                history = -(-(written + 1) // self.config.page_size)
+                returns = sum(self._one_more(history, stream.footprint) for stream in streams)
+                # `check_drop` allows at most one laid-out label
+                laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
+                dropped = Dropped(returns, sum(self._streams[rid][label].stored_len for label in laid_out))
             self.reset_request(rid, free=True)
-            self._dropped[rid] = returns
+            self._dropped[rid] = dropped
             self._vacate(rid, room)
             return self._arena.num_free - free
 
-    def _history(self, rid: str) -> int:
-        """The ids ``rid``'s KV holds and the sample its next step writes: its label's positions, released ones
-        included, less the rows of its spans that aren't ids, and one more."""
-        overrides = self._overrides[rid]
-        ((label, layout),) = [(label, layout) for label, layout in overrides.kv_layout.items() if layout.spans]
-        stream, rows = self._streams[rid][label], sum(span.length for span in layout.spans if span.kind != "ids")
-        return stream.stored_len + stream.released - rows + 1
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+        """Lay ``rid``'s label out again as its rebuild rows write it over the rebuild's ids without the last
+        one: the label's spans, the last grown by the ids sampled since (`StreamLayout.rebuilt`). A keyed
+        label is keyed as a fresh prompt of those ids would be, with its digest spans where they were.
 
-    def _rebuilt_spans(self, rid: str, written: int) -> tuple[str, tuple[PrefixSpan, ...]]:
-        """``rid``'s label and its spans once a rebuild has written ``written`` ids. A layout of ids alone becomes
-        one ids span. A layout with a digest span keeps its own spans, and the samples extend its last span, which
-        holds ids."""
-        overrides = self._overrides[rid]
-        ((label, layout),) = [(label, layout) for label, layout in overrides.kv_layout.items() if layout.spans]
-        if all(span.kind == "ids" for span in layout.spans):
-            (walk,) = {span.walk for span in layout.spans}
-            return label, (PrefixSpan(written, written, walk),)
-        *spans, last = layout.spans
-        grown = written - sum(span.length for span in layout.spans if span.kind == "ids")
-        return label, (*spans, replace(last, length=last.length + grown, advance=last.advance + grown))
-
-    def lay_out_again(self, rid: str, ids: Sequence[int]) -> tuple[PrefixSpan, ...]:
-        """Lay ``rid``'s label out again for a rebuild over ``ids`` without the last id, and return its spans.
-        A label with keys is keyed as a prompt of those ids would be, with its digest spans where they were.
-
-        The growth loop's cap drops by the iterations the spans now cover, so the footprint stays
+        The growth loop's cap drops by the iterations the last span now covers, so the footprint stays
         the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
         overrides = self._overrides[rid]
-        (label,) = overrides.prompt_ids
+        laid_out = [label for label, layout in (overrides.kv_layout or {}).items() if layout.spans]
+        if not laid_out:
+            return
+        (label,) = laid_out
+        ids, layout = rebuild.ids, overrides.kv_layout[label]
         prompt, page_size = ids[:-1], self.config.page_size
         length = len(prompt)
-        layout = overrides.kv_layout[label]
-        ((loop, slots),) = layout.growth
-        # Only this call replaces `rid`'s overrides, so the spans and keys are worked out before the lock, as
-        # `resolve_cached_prefix` hashes outside it.
-        _, spans = self._rebuilt_spans(rid, length)
-        grown = sum(span.length for span in spans) - sum(span.length for span in layout.spans)
-        keyed = bool((overrides.prefix_keys or {}).get(label))
-        changes = {}
-        if keyed and any(span.kind == "digest" for span in layout.spans):
-            # Extend the keys by the samples, as the decode steps that sampled them did, and key the last
-            # partial page as a prompt's last page.
-            extended = PrefixChain.seed(
-                overrides.prefix_keys[label], list(overrides.prefix_tail[label]), layout.spans, page_size,
-            )
-            extended.extend(list(prompt[length - grown:]), page_size)
-            keys = extended.keys[:extended.keyed_pages]
-            if extended.unkeyed:
-                keys.append(page_key(keys[-1] if keys else b"", extended.unkeyed, extended.unkeyed_items))
-            changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
-            changes["prefix_tail"] = {**overrides.prefix_tail, label: extended.unkeyed}
-        elif keyed:
-            pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
-            changes["prefix_keys"] = {**overrides.prefix_keys, label: chain(pages)}
-            changes["prefix_tail"] = {
-                **(overrides.prefix_tail or {}), label: list(pages[-1]) if length % page_size else [],
-            }
+        rebuilt = layout.rebuilt(length)
+        written, held = sum(span.length for span in rebuilt.spans), self._dropped[rid].held
+        if written != held:
+            raise RuntimeError(f"KV {self.name}: {rid}'s rebuild writes {written} slots, but its label held {held}")
+        grown = written - sum(span.length for span in layout.spans)
+        # hashed before the lock, as `resolve_cached_prefix` hashes outside it
+        keys = self._rebuilt_keys(overrides, label, layout, prompt, grown)
         with self._lock:
+            ((loop, slots),) = layout.growth
             self._overrides[rid] = replace(
                 overrides,
                 kv_layout={
-                    **overrides.kv_layout, label: replace(layout, spans=spans, keyed_spans=len(spans) if keyed else 0),
+                    **overrides.kv_layout, label: replace(rebuilt, keyed_spans=len(rebuilt.spans) if keys else 0),
                 },
                 loop_caps={**overrides.loop_caps, loop: overrides.loop_caps[loop] - grown // slots},
-                **changes,
+                **keys,
             )
             stream = self._streams[rid][label]
             stream.forget_chain()
@@ -3216,19 +3202,35 @@ class KVManager(AttentionResource):
             self._seed_keys(rid, label, stream)
             if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
                 stream.chain.extend([ids[-1]], page_size)
-            return spans
+
+    def _rebuilt_keys(
+        self, overrides: KVReqConfig, label: str, layout: StreamLayout, prompt: Sequence[int], grown: int,
+    ) -> dict:
+        """The keys and tail of ``label`` once a rebuild has written ``prompt``, whose last ``grown`` ids
+        were sampled since ``layout`` was laid out, or nothing when the label isn't keyed. A label of ids
+        alone is keyed as a prompt of ``prompt``. A label with digest spans extends its keys by the samples,
+        as the decode steps that sampled them did, and keys its last partial page as a prompt's last page."""
+        if not (overrides.prefix_keys or {}).get(label):
+            return {}
+        page_size = self.config.page_size
+        if all(span.kind == SpanKind.IDS for span in layout.spans):
+            pages = [prompt[start:start + page_size] for start in range(0, len(prompt), page_size)]
+            keys, tail = chain(pages), list(pages[-1]) if len(prompt) % page_size else []
+        else:
+            extended = PrefixChain.seed(
+                overrides.prefix_keys[label], list(overrides.prefix_tail[label]), layout.spans, page_size,
+            )
+            extended.extend(list(prompt[len(prompt) - grown:]), page_size)
+            keys, tail = extended.keys[:extended.keyed_pages], extended.unkeyed
+            if tail:
+                keys.append(page_key(keys[-1] if keys else b"", tail, extended.unkeyed_items))
+        return {
+            "prefix_keys": {**overrides.prefix_keys, label: keys},
+            "prefix_tail": {**(overrides.prefix_tail or {}), label: tail},
+        }
 
     def land_rebuild(self, rid: str) -> None:
         self._dropped.pop(rid, None)
-        if _DEBUG_ASSERTS:
-            overrides = self._overrides[rid]
-            (label,) = overrides.prompt_ids
-            stream, spans = self._streams[rid][label], overrides.kv_layout[label].spans
-            assert stream.stored_len + stream.released == sum(span.length for span in spans), (
-                f"KV {self.name}: {rid}'s rebuild wrote {stream.stored_len + stream.released} slots of {label!r}, "
-                f"where its layout gives {sum(span.length for span in spans)}, so an input it was rebuilt from is "
-                "the wrong size"
-            )
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns the device pages
@@ -4120,7 +4122,7 @@ class KVManager(AttentionResource):
         """
         dropped = self._dropped.get(rid)
         if dropped is not None:
-            return dropped
+            return dropped.returns
         if self._on_host(rid):
             return self._reload_pages(rid) + self._return_pages(rid)
         if self._overrides[rid].guaranteed:

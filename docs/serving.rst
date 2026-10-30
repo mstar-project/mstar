@@ -398,12 +398,12 @@ every cache hit counted, and is never dropped or moved to the host. So does a re
 pools of a node that keeps no token ids to rebuild it. A request with media can be dropped at
 one rank: the worker keeps a host copy of what each prefill step read besides the token ids,
 the encoder's output included, and rebuilds the request from those copies in the order its
-prefill ran. That covers Qwen3.5 and Bagel image chats, Qwen3-Omni requests with audio, images
-or video in and text out, and Higgs Audio transcriptions. Requests that answer with audio,
-Bagel generations and edits, Qwen3.5 videos and requests with media above one rank keep no
-copies and stay guaranteed. The one exception is a Bagel edit in think mode with no guidance
-and the prefix cache off, which is rebuilt as a chat is. Voice requests then queue when the
-pool is short and are never preempted mid-stream.
+prefill ran. That covers Qwen3.5 and Bagel image chats, Bagel edits in think mode with no
+guidance and the prefix cache off, Qwen3-Omni requests with audio, images or video in and text
+out, and Higgs Audio transcriptions. Requests that answer with audio, other Bagel generations
+and edits, Qwen3.5 videos and requests with media above one rank keep no copies and stay
+guaranteed. Voice requests then queue when the pool is short and are never preempted
+mid-stream.
 
 Above one rank, a decode step that finds no page and nothing to offload holds its requests
 until they time out. At one rank, a request that runs short and can neither move to the host

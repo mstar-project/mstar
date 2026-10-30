@@ -109,8 +109,9 @@ from mstar.model.multimodal import (
     prefill_plan,
     split_around_spans,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
+from mstar.model.utils import TextOutput
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +274,6 @@ class BagelModel(Model):
     through interleaved text and image inputs.
     """
 
-    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -814,16 +814,16 @@ class BagelModel(Model):
         )
         return resized.squeeze(0)
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), (self.eos_token_id,))
+
     def postprocess(
         self, output: torch.Tensor,
         modality: str, # text | image | video | audio
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            ids = drop_stop_tokens(output, (self.eos_token_id,), request_kwargs)
-            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-            return self._text_detokenizer.to_bytes(ids)
+            return super().postprocess(output, modality, request_kwargs)
         if modality == "image":
             output = output[0].permute(1, 2, 0) * 255
             img = Image.fromarray((output).to(torch.uint8).cpu().numpy())
@@ -1039,6 +1039,14 @@ class BagelModel(Model):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # Understanding and a think-mode edit decode, and an image is rebuilt from host copies of the ViT's or the
+        # VAE's output. The CFG nodes run only image generation.
+        return {"LLM": RebuildPolicy(
+            walk="prefill_text", ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
+            copied_inputs={"prefill_vit": ("img_emb",), "prefill_vae": ("img_emb",)},
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --

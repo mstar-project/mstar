@@ -81,6 +81,16 @@ class RaggedAttentionConfig:
     # engine's KV dtype (which is actually a misnamed autocast dtype) is used.
     dtype: torch.dtype | None = None
 
+    # False keeps every head on each sequence-parallel rank (TP still shards
+    # them), for an attention a rank runs whole over its own tokens: one over a
+    # replicated stream, or a cross-attention from the rank's query shard.
+    shard_over_sp: bool = True
+
+    # Each label's FlashInfer workspace, per slot; None takes
+    # MSTAR_WORKSPACE_BUFFER_MB. A ragged prefill only spends it on split-KV
+    # partials (tens of MB), so a resource with many labels can declare less.
+    workspace_mb: int | None = None
+
     def __post_init__(self):
         if self.sm_scale is None:
             self.sm_scale = self.head_dim ** -0.5

@@ -61,6 +61,7 @@ import pytest
 import torch
 
 from mstar.utils.ipc_format import WorkerMessageType
+from mstar.worker.rebuild import Rebuilds
 
 HERE = Path(__file__).resolve().parent
 
@@ -644,6 +645,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._rebuilds = Rebuilds({}, {})
     w.worker_id = WORKERS[rank]
     w.device = torch.device("cpu")
     w.enable_nvtx = w.enable_prof = False
@@ -700,10 +702,9 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._innermost_loop_by_node = {}
     w._metrics = None
     # the preemption state `Worker.__init__` sets up, here with no paged KV cache to preempt in
-    w._kv_keys, w._kv_caches, w._kept_ids = defaultdict(list), {}, {}
-    w._rebuild_rows, w._rebuilding, w._dropped, w._victims = {}, frozenset(), {}, {}
+    w._kv_keys, w._kv_caches = defaultdict(list), {}
+    w._rebuilding, w._dropped, w._victims = frozenset(), {}, {}
     w._preempted, w._preemptions, w._drop_logged = {}, defaultdict(PreemptionCounts), {}
-    w._walk_inputs, w._growth_loops, w._copied_inputs = {}, {}, {}
     for setup in _DESIGN_SETUP:
         if hasattr(w, setup):
             getattr(w, setup)()

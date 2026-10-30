@@ -290,8 +290,7 @@ tensor or sequence parallel instance count once: the instance's first rank repor
    its client goes away.
 
 ``mstar_kv_rebuild_tokens_total{model_name, component}``
-   Counter. KV slots the rebuild rows prefilled from kept history, image slots and cache hits
-   included.
+   Counter. Tokens of kept history the rebuild rows prefilled, cache hits included.
 
 ``mstar_kv_rebuild_cached_pages_total{model_name, component}``
    Counter. Pages a rebuild row found in the prefix cache.

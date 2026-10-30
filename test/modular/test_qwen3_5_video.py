@@ -722,9 +722,8 @@ def test_adapter_maps_video_url_to_a_video_attachment(tmp_path):
 
 @pytest.mark.parametrize("samples", [0, 2])
 def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupted_run(model, samples):
-    from test_worker_rebuild import DECODE, NODE, R, _worker
+    from test_worker_rebuild import NODE, R, _worker
 
-    from mstar.api_server.data_worker import PreprocessWorkerThread
     from mstar.communication.tensors import LocalTransferEngine
     from mstar.engine.resources import StepContext
     from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
@@ -735,7 +734,8 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     from mstar.engine.resources.step import Segment
     from mstar.model.qwen3_5.config import KV_CACHE, ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
-    from mstar.worker.worker import PrefillCopies
+    from mstar.worker.micro_scheduler import ScheduledBatch
+    from mstar.worker.rebuild import Rebuilds
 
     modalities, _ = LAYOUTS["images"]
     texts = [f"Question {i}: what happens?" for i in range(modalities.count(TEXT))]
@@ -769,7 +769,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
         kv.commit(kv_step, ctx)
         rope.commit(PositionStep(segments=segments, advance=advance), ctx)
 
-    config = KVReqConfig(prompt_ids=PreprocessWorkerThread._prompt_ids(tensors, {"kv": {"main": layout}})["kv"])
+    config = KVReqConfig()
     config.apply_conductor_config(kv_layout={"main": layout.row()}, loop_caps={"decode_loop": 8})
     kv.ingest_request(R, config)
     rope.ingest_request(R)
@@ -783,19 +783,19 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     kv.drop(R)
     rope.drop(R)
     w, eng = _worker()
-    eng.lay_out_rebuild = lambda node, rid, ids: kv.lay_out_again(rid, ids)
-    w._walk_inputs[("prefill_vision", NODE)] = {"text_inputs", *copied}
-    w._copied_inputs = {("prefill_vision", NODE): set(copied)}
-    ((loop, _),) = layout.growth
-    w._growth_loops[(DECODE, NODE)], w.parallel_nodes = loop, set()
-    w._keep_ids(R, {"kv": config})
-    kept = w._kept_ids[NODE][R]
+    w._rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs())
+    eng.prepare_rebuild = lambda node, rid, rebuild: kv.prepare_rebuild(rid, rebuild)
+    assert w._rebuilds.keep(R, NODE, config.kv_layout.values()), "an image chat would be guaranteed"
+    w._rebuilds.keep_prefill(SimpleNamespace(
+        node_name=NODE, request_ids=[R], cached_rids=set(), rebuild_rids=frozenset(),
+        step_context=StepContext((R,), "prefill_vision", 0, False),
+        per_request_input_tensors={R: {"text_inputs": step.input_tensors["text_inputs"], **copied}},
+    ), lambda rid: metadata)
     # the samples before 9 are in the KV, and 9 is the next decode step's input
-    kept.sampled.extend([*[7, 8][:samples], 9])
-    kept.copies.append(PrefillCopies(copied, metadata))
+    w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])
     eng.dropped.append(R)
     w._rebuild(R, NODE)
-    batch = w._build_executing_batch(*w._schedule_rebuild())
+    batch = w._build_executing_batch(ScheduledBatch(NODE, "prefill_vision", rebuild_rows=dict(w.scheduler.rows)))
     rebuilt = llm._vision_inputs(batch.per_request_info[R], batch.per_request_input_tensors[R])
     write("prefill_vision", rebuilt)
 
@@ -804,7 +804,6 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     positions = torch.cat([prefill.custom_pos_ids.long(), after], dim=1)
     assert torch.equal(rebuilt.input_embeds[:, 0], torch.cat([prefill.input_embeds[:, 0], sampled]))
     assert torch.equal(rebuilt.custom_pos_ids.long(), positions), "decode would resume at another position"
-    assert w._preemptions[NODE].rebuild_tokens == rebuilt.input_seq_len, "the rebuild-token count would skip the image"
     stream = kv._streams[R]["main"]
     assert (stream.stored_len, len(stream.page_indices), rope.position(R, "main")) == held, (
         "the rebuilt KV would sit in other slots, or decode would resume at another position"

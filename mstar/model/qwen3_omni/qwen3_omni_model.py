@@ -95,8 +95,9 @@ from mstar.model.qwen3_omni.config import (
     THINKER_SAMPLER,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import Operation, TextChunkDetokenizer, WeightConverter, drop_stop_tokens
+from mstar.model.utils import Operation, TextOutput, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import (
     Connection,
@@ -181,7 +182,6 @@ class Qwen3OmniModel(Model):
 
     LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
 
-    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -369,6 +369,17 @@ class Qwen3OmniModel(Model):
         return {"Thinker": {THINKER_MIXED: {
             "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode",
         }}}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # Audio, images and video are rebuilt from host copies of the encoders' outputs. The Talker's KV is built
+        # from the Thinker's states, which no rebuild recomputes.
+        return {"Thinker": RebuildPolicy(
+            walk="prefill_text", ids_input="text_inputs", sample_output="new_token", loop="thinker_decode_loop",
+            copied_inputs={
+                "prefill_audio": ("audio_embeds",),
+                "prefill_vision": ("vision_embeds", "deepstack", "video_second_per_grid", "image_grid_thw"),
+            },
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.
@@ -1373,6 +1384,9 @@ class Qwen3OmniModel(Model):
     # Model ABC: postprocess
     # -----------------------------------------------------------------------
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), (self.config.im_end_token_id,))
+
     def postprocess(
         self,
         output: torch.Tensor,
@@ -1380,10 +1394,7 @@ class Qwen3OmniModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            ids = drop_stop_tokens(output, (self.config.im_end_token_id,), request_kwargs)
-            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-            return self._text_detokenizer.to_bytes(ids)
+            return super().postprocess(output, modality, request_kwargs)
         elif modality == "audio":
             if output.numel() == 0:
                 return b""

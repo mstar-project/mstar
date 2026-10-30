@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from array import array
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -20,8 +21,7 @@ import torch
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.engine import Engine, ExecutingBatch
-from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.base import EngineResourceInfo, Rebuild
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
@@ -52,9 +52,9 @@ def _manager() -> KVManager:
     return kv
 
 
-def _step(rid: str, span: int, walk: str = WALK) -> tuple[KVStep, StepContext]:
+def _step(rid: str, span: int) -> tuple[KVStep, StepContext]:
     step = KVStep(segments=(Segment(rid, "main", span),))
-    return step, StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False)
+    return step, StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False)
 
 
 def _config(tokens: list[int], cap: int = 50, kind: str = "ids") -> KVReqConfig:
@@ -66,21 +66,22 @@ def _config(tokens: list[int], cap: int = 50, kind: str = "ids") -> KVReqConfig:
         kv_layout={"main": StreamLayout(
             spans=(PrefixSpan(len(tokens), len(tokens), WALK, kind=kind),), growth=(("decode_loop", 1),), keyed_spans=1,
         )},
-        prompt_ids={"main": array("i", tokens).tobytes()},
     )
-
-
-def _write(kv: KVManager, rid: str, span: int, walk: str = WALK) -> None:
-    step, ctx = _step(rid, span, walk)
-    assert kv.admit(step, ctx).ok
-    kv.plan(step, ctx)
-    kv.commit(step, ctx)
 
 
 def _prefill(kv: KVManager, rid: str, length: int, kind: str = "ids") -> None:
     """Ingest a keyed prompt of ``length`` ids and write it."""
     kv.ingest_request(rid, _config(list(range(length)), kind=kind))
     _write(kv, rid, length)
+
+
+def _write(kv: KVManager, rid: str, *spans: int) -> None:
+    """Write ``rid``'s next tokens, ``spans[i]`` of them in step ``i``."""
+    for span in spans:
+        step, ctx = _step(rid, span)
+        assert kv.admit(step, ctx).ok
+        kv.plan(step, ctx)
+        kv.commit(step, ctx)
 
 
 def _engine(resources: dict) -> Engine:
@@ -125,6 +126,67 @@ def test_a_refused_drop_changes_nothing(refusal):
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
 
 
+IMAGE = PrefixSpan(6, 4, WALK, kind="digest")
+
+
+@pytest.mark.parametrize("layout, why", [
+    ("two labels", "more than one label"),
+    ("two loops", "more than one label or growth loop"),
+    ("image last", "ends on a digest span"),
+    ("keys short of the image", "keys only part of its prompt"),
+    ("rows", "no rebuild recomputes"),
+])
+def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout, why):
+    kv = _manager()
+    config = _config(list(range(PAGE_SIZE)))
+    main = config.kv_layout["main"]
+    (text,) = main.spans
+    if layout == "two labels":
+        config.kv_layout["uncond"] = main
+    elif layout == "two loops":
+        config.kv_layout["main"] = replace(main, growth=(*main.growth, ("other_loop", 1)))
+        config.loop_caps["other_loop"] = 4
+    else:
+        spans = {
+            "image last": (text, IMAGE),
+            "keys short of the image": (text, IMAGE, text),
+            "rows": (text, replace(IMAGE, kind="rows"), text),  # as a video's frames
+        }[layout]
+        keyed = 1 if layout == "keys short of the image" else 0
+        config.kv_layout["main"] = replace(main, spans=spans, keyed_spans=keyed)
+    kv.ingest_request("r", config)
+
+    with pytest.raises(RuntimeError, match=why):
+        kv.drop("r")
+    assert "r" not in kv._dropped, "a request its rebuild couldn't bring back would be dropped"
+
+
+class _Recording:
+    """A resource that records the rebuild hooks it is called with."""
+
+    def __init__(self):
+        self.calls = []
+
+    def prepare_rebuild(self, rid, rebuild):
+        self.calls.append(("prepare", rid, rebuild))
+
+    def land_rebuild(self, rid):
+        self.calls.append(("land", rid))
+
+
+def test_the_engine_tells_every_resource_of_the_node_about_a_rebuild():
+    first, second = _Recording(), _Recording()
+    engine, rebuild = Engine.__new__(Engine), Rebuild(WALK, array("i", [1, 2, 3]))
+    engine._submodules = {NODE: SimpleNamespace(resources={"first": first, "second": second})}
+
+    engine.prepare_rebuild(NODE, "r", rebuild)
+    engine.land_rebuild(NODE, "r")
+
+    assert first.calls == second.calls == [("prepare", "r", rebuild), ("land", "r")], (
+        "a resource the engine skipped would hold the layout from before the drop"
+    )
+
+
 def test_a_drop_keeps_the_sampler_and_starts_positions_and_recurrent_state_over():
     kv, rope = _manager(), RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)
     pool = RecurrentStatePool.build(RecurrentStateSpec("gdn_state", {NODE}, RecurrentStateConfig(
@@ -132,10 +194,8 @@ def test_a_drop_keeps_the_sampler_and_starts_positions_and_recurrent_state_over(
     )), EngineResourceInfo(device=CPU))
     sampler = SamplerResource(vocab_size=64, enable_repetion_penalty=True, device=CPU)
     engine = _engine({"kv": kv, "rope": rope, "gdn_state": pool, "sampler": sampler})
-    engine._runner.ingest_request("r", {
-        "sampler": SamplingReqConfig(temperature=1.0, repetition_penalty=1.3), "kv": _config(list(range(PAGE_SIZE))),
-    })
-    _write(kv, "r", PAGE_SIZE)
+    engine._runner.ingest_request("r", {"sampler": SamplingReqConfig(temperature=1.0, repetition_penalty=1.3)})
+    _prefill(kv, "r", PAGE_SIZE)
     rope._counters["r"]["main"] = PAGE_SIZE
     slot = pool._alloc("r", "main")
     pool._blocks["state"][:, slot.index] = 1.0
@@ -179,9 +239,10 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     prompt, sampled = list(range(20)), list(range(100, 130))
     kv.ingest_request("r", _config(prompt, cap=50))
     footprint = kv._streams["r"]["main"].footprint
+    _write(kv, "r", len(prompt), *[1] * (len(sampled) - 1))
     kv.drop("r")
 
-    assert kv.lay_out_again("r", array("i", prompt + sampled)) == (PrefixSpan(49, 49, WALK),)
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", prompt + sampled)))
     fresh.ingest_request("f", _config(prompt + sampled[:-1], cap=50 - 29))
     fresh._streams["f"]["main"].chain.extend(sampled[-1:], PAGE_SIZE)
     rebuilt, want = kv._streams["r"]["main"], fresh._streams["f"]["main"]
@@ -191,9 +252,50 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     )
 
 
+def _image_prompt(kv: KVManager, decoded: int) -> None:
+    """Ingest ``r`` with three ids, an image and two ids on one walk, as Qwen3.5 lays out an image chat, write
+    them and ``decoded`` tokens after them, then drop it."""
+    layout = StreamLayout(spans=(PrefixSpan(3, 3, WALK), IMAGE, PrefixSpan(2, 2, WALK)), growth=(("decode_loop", 1),))
+    kv.ingest_request("r", KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode_loop": 50}))
+    _write(kv, "r", 11, *[1] * decoded)
+    kv.drop("r")
+
+
+def test_a_rebuild_keeps_an_image_prompts_spans_and_writes_its_samples_after_its_last_text():
+    kv = _manager()
+    _image_prompt(kv, decoded=2)
+    footprint = kv._streams["r"]["main"].footprint
+
+    # the prompt's 5 ids, then the prefill's sample and one per decode step
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(5), 100, 101, 102])))
+
+    assert kv._overrides["r"].kv_layout["main"].spans == (PrefixSpan(3, 3, WALK), IMAGE, PrefixSpan(4, 4, WALK)), (
+        "the image would lose its slots or its advance, or the samples would land at other positions"
+    )
+    assert kv._overrides["r"].loop_caps["decode_loop"] == 48 and kv._streams["r"]["main"].footprint == footprint, (
+        "the rebuild would hold more pages than the request declared"
+    )
+
+
+def test_a_second_rebuild_of_an_image_prompt_counts_each_sample_once():
+    kv = _manager()
+    _image_prompt(kv, decoded=2)
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(5), 100, 101, 102])))
+    _write(kv, "r", 13)  # the rebuild row
+    kv.land_rebuild("r")
+    _write(kv, "r", 1, 1)
+    kv.drop("r")
+
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(5), *range(100, 105)])))
+
+    last = kv._overrides["r"].kv_layout["main"].spans[-1]
+    assert last == PrefixSpan(6, 6, WALK), "the first rebuild's samples would be laid out twice"
+    assert kv._overrides["r"].loop_caps["decode_loop"] == 46, "the samples would count twice in the footprint"
+
+
 def _keyed_chat(tokens: list[int], cap: int) -> KVReqConfig:
-    """A chat of three ids, an image whose walk is its own and the rest of ``tokens``, keyed as the data worker does
-    it. The image ends on a page boundary, so it has no end key."""
+    """A chat of three ids, an image whose walk is its own and the rest of ``tokens``, keyed as the data worker
+    keys it, as Bagel lays out an image chat. The image ends on a page boundary, so it has no end key."""
     spans = (Span("ids", WALK, 3, 3, "text_inputs"), Span("digest", "vit", PAGE_SIZE - 3, 1, ("image", 0)),
              Span("ids", WALK, len(tokens) - 3, len(tokens) - 3, "text_inputs"))
     digests, texts = [None, b"image", None], {"text_inputs": [torch.tensor(tokens[:3]), torch.tensor(tokens[3:])]}
@@ -208,7 +310,6 @@ def _keyed_chat(tokens: list[int], cap: int) -> KVReqConfig:
             PrefixSpan(span.length, span.advance, span.walk, kind=span.kind, digest=digest)
             for span, digest in zip(spans, digests, strict=True)
         ), growth=(("decode_loop", 1),), keyed_spans=3)},
-        prompt_ids={"main": array("i", tokens).tobytes()},
     )
 
 
@@ -216,11 +317,12 @@ def test_a_rebuilt_label_with_an_image_is_keyed_as_a_fresh_prompt_of_its_ids_and
     kv = _manager()
     prompt, sampled = list(range(10)), list(range(100, 160))
     kv.ingest_request("r", _keyed_chat(prompt, cap=80))
+    _write(kv, "r", 3, PAGE_SIZE - 3, 7, *[1] * 29)
 
     # the second rebuild starts from the keys and tail the first left
     for upto in (30, 60):
         kv.drop("r")
-        kv.lay_out_again("r", array("i", prompt + sampled[:upto]))
+        kv.prepare_rebuild("r", Rebuild(WALK, array("i", prompt + sampled[:upto])))
         fresh = _manager()
         fresh.ingest_request("f", _keyed_chat(prompt + sampled[:upto - 1], cap=80 - (upto - 1)))
         fresh._streams["f"]["main"].chain.extend(sampled[upto - 1:upto], PAGE_SIZE)
@@ -230,86 +332,41 @@ def test_a_rebuilt_label_with_an_image_is_keyed_as_a_fresh_prompt_of_its_ids_and
             f"after {upto} samples the rebuilt pages would be filed under keys no request with this image and these "
             "ids can match"
         )
+        # the rebuild rows, then 30 more decode steps
+        _write(kv, "r", 3, PAGE_SIZE - 3, 7 + upto - 1)
+        kv.land_rebuild("r")
+        _write(kv, "r", *[1] * 30)
 
 
-PROMPT = (PrefixSpan(3, 3, WALK), PrefixSpan(6, 4, WALK, kind="digest"), PrefixSpan(2, 2, WALK))
-
-
-def _image_prompt(kv: KVManager, spans: tuple[PrefixSpan, ...] = PROMPT) -> None:
-    """Ingest ``r`` with a prompt of text, an image and text on one walk, as Qwen3.5 lays it out, then drop it."""
-    kv.ingest_request("r", KVReqConfig(
-        kv_layout={"main": StreamLayout(spans=spans, growth=(("decode_loop", 1),))}, loop_caps={"decode_loop": 50},
-        prompt_ids={"main": array("i", range(5)).tobytes()},
-    ))
+def test_a_request_dropped_between_its_rebuild_rows_frees_their_pages_and_is_laid_out_the_same():
+    kv = _manager()
+    # the image on a walk of its own, as Bagel lays out an image chat
+    layout = StreamLayout(spans=(PrefixSpan(3, 3, WALK), replace(IMAGE, length=20, walk="vit"), PrefixSpan(2, 2, WALK)),
+                          growth=(("decode_loop", 1),))
+    kv.ingest_request("r", KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode_loop": 50}))
+    _write(kv, "r", 3, 20, 2, 1)
     kv.drop("r")
-
-
-def test_a_rebuild_keeps_an_image_prompts_spans_and_lays_its_samples_after_them():
-    kv = _manager()
-    _image_prompt(kv)
-    footprint = kv._streams["r"]["main"].footprint
-
-    spans = kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102]))
-
-    assert spans == (*PROMPT[:2], PrefixSpan(4, 4, WALK)), "the image would lose its advance, or the samples a slot"
-    assert kv._overrides["r"].loop_caps["decode_loop"] == 48 and kv._streams["r"]["main"].footprint == footprint, (
-        "the rebuild would hold more pages than the request declared"
-    )
-
-
-@pytest.mark.parametrize("first", [2, 0])
-def test_a_second_rebuild_of_an_image_prompt_counts_its_first_samples_once(first):
-    kv = _manager()
-    _image_prompt(kv)
-    # ``first`` samples in the KV, then the next decode step's input
-    kv.lay_out_again("r", array("i", [*range(5), *range(100, 101 + first)]))
-    _write(kv, "r", 11 + first)  # the rebuild row
-    kv.land_rebuild("r")
-    _write(kv, "r", 1)
-    _write(kv, "r", 1)
-    kv.drop("r")
-
-    spans = kv.lay_out_again("r", array("i", [*range(5), *range(100, 103 + first)]))
-
-    last = PROMPT[-1].length + first + 2
-    assert spans == (*PROMPT[:2], PrefixSpan(last, last, WALK)), "the first rebuild's samples would count twice"
-    assert kv._overrides["r"].loop_caps["decode_loop"] == 48 - first, "the samples would count twice in the footprint"
-
-
-def test_a_request_dropped_between_rebuild_rows_frees_their_pages_and_is_laid_out_the_same():
-    kv = _manager()
-    # the same prompt with its image on a walk of its own, as Bagel lays out an image chat
-    _image_prompt(kv, (PrefixSpan(3, 3, WALK), PrefixSpan(20, 1, "vit", kind="digest"), PrefixSpan(2, 2, WALK)))
-    free, ids = kv._arena.num_free, array("i", [*range(5), 100, 101])
-    spans = kv.lay_out_again("r", ids)
-    _write(kv, "r", 3)
-    _write(kv, "r", 20, "vit")
+    free, rebuild = kv._arena.num_free, Rebuild(WALK, array("i", [*range(5), 100, 101]))
+    kv.prepare_rebuild("r", rebuild)
+    spans = kv._overrides["r"].kv_layout["main"].spans
+    _write(kv, "r", 3, 20)  # the first two rows
 
     kv.drop("r")
+    kv.prepare_rebuild("r", rebuild)
 
     assert kv._arena.num_free == free, "the rows that ran would keep their pages"
-    assert kv.lay_out_again("r", ids) == spans and kv._streams["r"]["main"].span_cursor.done == 0, (
-        "the rebuild would resume past rows whose pages the drop gave up"
+    assert kv._overrides["r"].kv_layout["main"].spans == spans and kv._streams["r"]["main"].span_cursor.done == 0, (
+        "the rebuild would lay the samples out twice, or resume past rows whose pages the drop gave up"
     )
-
-
-def test_a_rebuild_that_writes_fewer_slots_than_its_layout_raises_under_debug_asserts(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
-    kv = _manager()
-    _image_prompt(kv)
-    kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102]))
-    _write(kv, "r", 12)  # one slot fewer than the layout's 13, as when the image copy is one row short
-
-    with pytest.raises(AssertionError, match="wrong size"):
-        kv.land_rebuild("r")
 
 
 def test_a_rebuild_row_beside_another_keyed_row_keys_none_of_its_discarded_sample():
     kv = _manager()
     kv.ingest_request("r", _config(list(range(20)), cap=50))
     kv.ingest_request("a", _config(list(range(50, 70)), cap=50))
+    _write(kv, "r", 20, 1)
     kv.drop("r")
-    kv.lay_out_again("r", array("i", [*range(20), 100, 101]))
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(20), 100, 101])))
     batch = ExecutingBatch(node_name=NODE, per_request_info={}, rebuild_rids=frozenset({"r"}),
                            step_context=StepContext(request_ids=("r", "a"), graph_walk=WALK, slot=0, capture=False))
 
@@ -336,13 +393,22 @@ def test_a_publish_that_arrives_while_dropped_restores_neither_positions_nor_pag
     assert rope._counters["r"] == {} and not kv._streams["r"]["main"].page_indices, "the rebuild would start past 0"
 
 
+@pytest.mark.parametrize("ids", [20, 22])
+def test_a_rebuild_that_would_write_other_than_what_the_label_held_raises(ids):
+    kv = _manager()
+    _prefill(kv, "r", 20)
+    kv.drop("r")
+
+    with pytest.raises(RuntimeError, match="held 20"):
+        kv.prepare_rebuild("r", Rebuild(WALK, array("i", range(ids))))
+
+
 def test_removing_a_dropped_or_relaid_request_leaks_no_page():
     kv = _manager()
     for rid in ("dropped", "relaid"):
         _prefill(kv, rid, 20)
         kv.drop(rid)
-    kv.lay_out_again("relaid", array("i", range(21)))
-    _write(kv, "relaid", 20)
+    kv.prepare_rebuild("relaid", Rebuild(WALK, array("i", range(21))))
     kv.land_rebuild("relaid")
     assert kv.is_resident("relaid"), "a rebuilt request would never be ready again"
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -93,6 +93,13 @@ class CachedPrefix(NamedTuple):
     label: str
     tokens: int
     position: int
+
+
+class Rebuild(NamedTuple):
+    """What a dropped request's rebuild rows write: ``ids`` without the last one, which the next decode
+    step reads. ``walk`` is the last row's, which writes the ids sampled since."""
+    walk: str
+    ids: Sequence[int]
 
 
 class KeyedWalks(NamedTuple):
@@ -423,6 +430,14 @@ class Resource(ABC):
     def is_resident(self, rid: str) -> bool:
         """False while the request's state is off the device, offloaded or dropped."""
         return True
+
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+        """Take in what the dropped request's rebuild rows write, before the first is queued."""
+        return
+
+    def land_rebuild(self, rid: str) -> None:
+        """The dropped request's last rebuild row has run."""
+        return
 
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""

@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class PreemptionCounts:
     """A node's preemptions since its worker started."""
-    # `rebuild_tokens`: KV slots the rebuild rows prefilled, image slots included.
+    # `rebuild_tokens`: tokens the rebuild rows prefilled.
     # `returns_preempted`: returned requests preempted again before they kept another token.
     victims: int = 0
     drops: int = 0

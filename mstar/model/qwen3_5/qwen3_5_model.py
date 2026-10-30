@@ -82,8 +82,9 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
+from mstar.model.utils import TextOutput
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -165,8 +166,6 @@ class Qwen3_5DenseModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
-
-    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -305,6 +304,14 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # A prompt with images is rebuilt from host copies of the encoder's output. A video's frames are rows,
+        # which no rebuild recomputes.
+        return {"LLM": RebuildPolicy(
+            walk="prefill_text", ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
+            copied_inputs={"prefill_vision": ("vision_embeds", "image_grid_thw")},
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(
@@ -597,18 +604,18 @@ class Qwen3_5DenseModel(Model):
         return self._resolve_weights()
 
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
+
     def postprocess(
-            self,
-            output: torch.Tensor,
-            modality: str,
-            request_kwargs: dict | None = None,
-        ) -> bytes:
-            if modality == "text":
-                ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-                if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                    self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-                return self._text_detokenizer.to_bytes(ids)
-            raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
+        self,
+        output: torch.Tensor,
+        modality: str,
+        request_kwargs: dict | None = None,
+    ) -> bytes:
+        if modality == "text":
+            return super().postprocess(output, modality, request_kwargs)
+        raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass args
