@@ -153,6 +153,7 @@ class Wan22Model(Model):
                     # one segment per guidance branch
                     max_segments_per_request=Wan22DitSubmodule.CFG_BRANCHES,
                     # the DiT is compiled, not captured: keep attention in its graph
+                    # (under SP, the fragment between the all-to-all breaks)
                     compile_op=True,
                     dtype=torch.bfloat16,
                 ),
