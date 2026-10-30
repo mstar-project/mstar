@@ -25,6 +25,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -87,6 +88,7 @@ def _worker(
         has_inflight_reads=lambda rid: inflight_reads,
         force_cleanup_request=lambda rid: w.forced.append(rid), # noqa: PLW0108
     )
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     return w
 
 
@@ -402,7 +404,6 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w.worker_id = "w0"
     w._draining_rids = set()
     w._unprocessed_messages = {}
-    w._my_consumer_connections = []
     w._last_active = {}
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
@@ -423,6 +424,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         per_request_info={}, add_request=_state_add,
     )
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         evictable_nodes=lambda: ["n"],
         add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )
@@ -431,6 +433,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.scheduler = SimpleNamespace(note_arrival=lambda rid: seen.setdefault("scheduler", rid))
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(

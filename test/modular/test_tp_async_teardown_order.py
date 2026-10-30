@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import sys
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,7 @@ from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 NODE, WALK = "LLM", "decode"
@@ -136,7 +138,7 @@ def _rank(
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
-    w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
+    w.streaming_buffers, w._last_active = {}, {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -167,6 +169,7 @@ def _rank(
         remove_request=lambda rid: None, get_partition_for_node=lambda node: "p",
     )
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.parallel_groups = SimpleNamespace(
         barrier_all=lambda: None, restore_default_timeout=lambda: None,
@@ -369,3 +372,31 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     _run(w)
 
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
+
+
+def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
+    """The fence waits past any number of warning intervals; it never gives up.
+    A lone-rank step (``tp_seq=-1``) is the case that used to."""
+    tp_seq = -1
+    monkeypatch.setattr(worker_mod, "_ADMIT_FENCE_WARN_S", 0.001)
+    admitted = threading.Event()
+    warnings = []
+
+    def warn(*args):
+        warnings.append(args)
+        if len(warnings) == 3:
+            admitted.set()  # the admit lands during the third interval
+
+    monkeypatch.setattr(worker_mod.logger, "warning", warn)
+    w = Worker.__new__(Worker)
+    w.worker_id = "rank0"
+    w._span = lambda name: nullcontext()
+    _, executing = _batch(tp_seq, [HANDLES["kept"]])
+    executing.launch_started_event = admitted
+    pending = SimpleNamespace(
+        tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, node_batch=executing,
+    )
+
+    w._await_admit_settled(pending)
+
+    assert admitted.is_set() and len(warnings) == 3
