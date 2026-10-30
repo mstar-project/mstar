@@ -35,3 +35,8 @@ node_groups:
   - node_names: [Codec]
     ranks: [0]
     graph_walks: [codec_chunk]
+# A large decode step keeps more young objects alive than CPython's 700-object
+# gen-0 threshold, so a collection runs almost every step and now and then a
+# full one (~8 ms), longer than a stream's 10 ms pause budget leaves room for.
+knobs:
+  gc_gen0_threshold: 10000
