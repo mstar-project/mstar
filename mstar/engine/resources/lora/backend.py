@@ -171,8 +171,9 @@ def gather_shrink_reference(
 def make_backend(kind: str, device: torch.device) -> LoraBackend:
     """The custom ops (``ops.LoraOpsBackend``) on every device, so ``torch.compile`` takes
     each kernel as one opaque node. ``"triton"`` (``"auto"`` on CUDA) registers the Triton
-    kernels for them; ``"torch"`` leaves the reference kernel, which a deployment's pools
-    then all run, since they share one ``lora:`` block."""
+    kernels for them; ``"torch"`` registers none. A deployment's pools share one ``lora:``
+    block, so they choose alike, but registration is process-wide: the reference runs only
+    while nothing else in the process has registered the Triton kernels."""
     if kind not in ("auto", "torch", "triton"):
         raise ValueError(f"unknown LoRA backend {kind!r}; expected auto, torch or triton")
     if kind == "triton" or (kind == "auto" and device.type == "cuda"):

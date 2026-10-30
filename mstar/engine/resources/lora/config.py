@@ -309,8 +309,9 @@ class LoraSpec(NodeResourceSpec):
     # the slot weights' dtype; None takes the nodes' compute dtype (the serving config's
     # ``autocast_dtype``), which is what their base linears run in
     dtype: torch.dtype | None = None
-    # the kernels behind the custom ops: "auto" picks Triton on CUDA and the torch
-    # reference elsewhere ("torch" forces the reference)
+    # the kernels behind the custom ops: "auto" registers Triton's on CUDA and leaves the
+    # torch reference elsewhere; "torch" registers none, so the reference runs unless
+    # something else in the process registered Triton's (registration is process-wide)
     backend: Literal["auto", "torch", "triton"] = "auto"
     convert_keys: Callable | None = None
     # checkpoint modules this spec neither loads nor refuses: another node's LoRA spec of
