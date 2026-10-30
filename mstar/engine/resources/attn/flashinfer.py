@@ -150,7 +150,7 @@ class FlashInferManager(AttentionManager):
 
     def _fmha_wrapper(self, workspace: torch.Tensor, num_rows: int) -> FmhaDecodeWrapper | None:
         """The fmha decode wrapper for a capture at ``num_rows``, or None to
-        stay on the paged decode kernel (not asked for, or none for this shape)."""
+        stay on the paged decode kernel (not asked for, or none for this geometry)."""
         if not self._decode_fmha:
             return None
         config = self._kv_config

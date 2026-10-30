@@ -48,7 +48,7 @@ def test_guard_refuses_cpu_and_older_gpus(monkeypatch, blackwell):
     assert not gdn_stage_applies(_CUDA, _geometry())
 
 
-def test_guard_refuses_shapes_the_kernel_does_not_take(blackwell):
+def test_guard_refuses_head_dims_the_kernel_does_not_take(blackwell):
     assert not gdn_stage_applies(_CUDA, _geometry(head_k_dim=64, head_v_dim=128))
     assert not gdn_stage_applies(_CUDA, _geometry(head_k_dim=1024, head_v_dim=1024))
 
@@ -152,6 +152,24 @@ def test_stage_matches_eager_on_strided_views(tokens, room, real):
         assert (x[:real].float() - y[:real].float()).abs().max() < _BF16_TOL, name
     assert (got.q[real:] == 0).all() and (got.v[real:] == 0).all()
     assert (got.alpha[real:] == 1).all() and (got.beta[real:] == 0).all()
+
+
+@_needs_gpu
+def test_a_poisoned_tail_does_not_reach_the_outputs():
+    tokens, real = 64, 40
+    q = torch.randn(tokens, 16, 128, dtype=torch.bfloat16, device=_CUDA)
+    v = torch.randn(tokens, 32, 128, dtype=torch.bfloat16, device=_CUDA)
+    a = torch.randn(tokens, 32, dtype=torch.bfloat16, device=_CUDA)
+    for t in (q, v, a):
+        t[real:] = float("inf")
+    mask = torch.zeros(tokens, device=_CUDA)
+    mask[:real] = 1
+    got = stage_gdn_prefill_inputs(
+        q, q, v, a, a, torch.zeros(32, device=_CUDA), torch.zeros(32, device=_CUDA), mask, 0,
+        normalize=True,
+    )
+    for t in got:
+        assert torch.isfinite(t.float()).all()
 
 
 @_needs_gpu

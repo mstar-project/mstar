@@ -384,7 +384,10 @@ class GDNPrefillWrapper(GDNWrapper):
 
         # The kernel allocates its output with `empty_like` and writes only the
         # `cu_seqlens` range, so a capture bucket's padded tail keeps whatever
-        # the previous replay left in that memory.
+        # the previous replay left in that memory. The stage reads through the
+        # same mask, so the tail never reaches a kernel.
+        if self._stage_inputs:
+            return out
         # Select rather than multiply because the tail can hold inf.
         return torch.where(
             self._plan_state.token_mask[: out.shape[0], None].bool(),
