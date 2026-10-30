@@ -3,7 +3,7 @@
 against the reference and write a verdict.
 
     python benchmark/correctness/run.py --config kokoro --gpus 0 --port 8731 \\
-        --worktree $WORK/amd/worktrees/ws-a [--override resources.attn.flashinfer_backend=fa2]
+        --worktree /path/to/mstar-worktree [--override resources.attn.flashinfer_backend=fa2]
 
 Results go to <results-root>/<config>/<run-id>/ (effective config, versions, server logs, outputs
 per restart, node health, report.md and report.json). Exit code 0 on PASS/WARN, 1 on

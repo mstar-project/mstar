@@ -395,7 +395,7 @@ def test_table_render(tmp_path):
         rec = d / "cells/text-chat-256/c8" / ("a1r1" if arm == "mstar" else "")
         rec.mkdir(exist_ok=True)
         (rec / "cotenants.json").write_text(json.dumps(
-            {"markers": ["ws-j", "ws-j-moe-tune"] if arm == "mstar" else ["ws-j"], "loadavg": [12.4, 9.0, 7.0]}))
+            {"markers": ["amd-bench", "moe-tune"] if arm == "mstar" else ["amd-bench"], "loadavg": [12.4, 9.0, 7.0]}))
     (run / "correctness.json").write_text(json.dumps({"qwen3_5_0.8b/mstar": {"verdict": "PASS",
                                                                              "exact_vs_reference": "30/32"}}))
     (run / "notes.txt").write_text("HIP 4 runs hot on this node.\n\n")
@@ -413,7 +413,7 @@ def test_table_render(tmp_path):
     assert ("resumed 2026-10-20T03:00:00-0500 on h (job 2), GPUs [0, 1, 4], lanes 2; measured qwen3_5_4b/mstar, "
             "qwen3_5_9b_tp2/mstar-tpasync; finished arms and cells kept") in md
     assert "  - NODE bare_metal: VM/SR-IOV slice (virt=none" in md
-    assert "| ws-j-moe-tune; peak load 12 |" in md and "| none; peak load 12 |" in md
+    assert "| moe-tune; peak load 12 |" in md and "| none; peak load 12 |" in md
     assert "PASS exact 30/32" in md and "output tokens/request 300 vs mstar 256" in md
     assert json.loads((run / "table.json").read_text())["meta"]["table"] == "qwen35-dense"
 
