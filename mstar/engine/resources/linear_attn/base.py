@@ -12,12 +12,17 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, Mamba2Geometry
+from mstar.engine.rows import RowState
 
 logger = logging.getLogger(__name__)
 
 
 class LinearAttnManager(AttentionResource):
     # Abstract except for `build`, which dispatches on the variant.
+
+    def row_state(self, space, node_name: str, graph_walk: str) -> RowState:
+        # plans from the pool's addressing, which the pool's rows hold
+        return RowState()
 
     @classmethod
     def build(cls, spec: LinearAttnSpec, info: EngineResourceInfo):
