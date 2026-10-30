@@ -6,6 +6,7 @@ The handler still owns completion, errors and the timeout."""
 import asyncio
 import types
 
+import pytest
 from api_server_helpers import make_test_api_server
 
 from mstar.api_server import entrypoint as ep
@@ -201,5 +202,27 @@ def test_a_relay_that_raises_fails_its_requests(monkeypatch):
         rest = [c async for c in handler]
         assert [(c.modality, c.metadata.get("status")) for c in rest] == [("error", 500)]
         assert server.preprocess_worker.aborted == ["A"]
+
+    asyncio.run(run())
+
+
+def test_an_aborted_request_releases_its_waiting_handler_at_once():
+    """The Rust frontend aborts a dropped submission from the bridge, not from
+    the handler: the abort wakes the handler, rather than leaving it to its
+    next backstop wake."""
+    async def run():
+        server = _server()
+        _register(server, "A")
+        handler = server.iter_result_chunks("A")
+        waiting = asyncio.ensure_future(handler.__anext__())
+        await asyncio.sleep(0)  # the handler is waiting
+        server.abort_submission("A")
+        for _ in range(10):  # a few loop turns, well inside the backstop
+            await asyncio.sleep(0)
+            if waiting.done():
+                break
+        assert waiting.done()
+        with pytest.raises(StopAsyncIteration):
+            waiting.result()
 
     asyncio.run(run())

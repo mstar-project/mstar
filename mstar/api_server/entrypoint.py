@@ -1643,6 +1643,9 @@ class APIServer:
             self._retire(key)
         if req is not None:
             self._record_end(req, outcome)
+            # release its stream handler now rather than at its next backstop
+            # wake (the Rust bridge's, when that frontend dropped the request)
+            req.notify()
         if not active:
             return
         logger.info("Client cancelled request %s; releasing resources", key)
