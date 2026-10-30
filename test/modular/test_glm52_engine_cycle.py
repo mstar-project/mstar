@@ -193,6 +193,8 @@ def test_batch_of_two_matches_single_streams(mla_absorb):
         texts[rid] = out["text_inputs"][0]
     live = set(prompts)
     steps = dict.fromkeys(prompts, 0)
+    # the request's decode cap, which ends a row the stop check lets run on
+    cap = Glm52Model(model_path_hf="", tokenizer_mode="byte").get_loop_caps(max_output_tokens=14)["decode_loop"]
     for _ in range(20):
         if not live:
             break
@@ -202,7 +204,7 @@ def test_batch_of_two_matches_single_streams(mla_absorb):
             texts[rid] = outs[rid]["text_inputs"][0]
             infos[rid].dynamic_loop_iter_counts["decode_loop"] = steps[rid]
             steps[rid] += 1
-            if sub.check_stop(rid, infos[rid], outs[rid]):
+            if sub.check_stop(rid, infos[rid], outs[rid]) or steps[rid] == cap:
                 live.discard(rid)
     for rid in prompts:
         got = torch.cat(emitted[rid])

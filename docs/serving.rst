@@ -309,10 +309,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker
        graphs is served by (the replicas the conductor picks from; a node group no
-       walk places adds none), so every replica warms. Past one copy, each run of
-       the entry starts with one request alone, so a node group with fewer replicas, such as one DiT
-       instance beside a replicated VAE, also warms its one-request shape before
-       the copies reach it together. ``concurrency: N`` submits N copies per replica at once, so they can batch, for a step that
+       walk places adds none), so every replica warms. When some worker graph has
+       fewer replicas than that, such as one DiT instance beside a replicated VAE,
+       the entry first runs once alone, so that graph also warms its one-request
+       shape before the copies reach it together; otherwise a batch size of 1 is
+       warmed only if ``concurrency`` includes 1. ``concurrency: N`` submits N copies per replica at once, so they can batch, for a step that
        compiles per batch size (whether they share a step is the scheduler's
        call); a list (``concurrency: [1, 2, 4]``) runs the entry once per size, in
        order. A malformed or failing warmup is logged and skipped.

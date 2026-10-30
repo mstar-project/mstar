@@ -70,8 +70,9 @@ def test_names_match_whispers_graph():
 
 
 def test_batched_stop_check_answers_decode_steps_only():
-    """As the per-request check: EOS or the token cap end the loop on a decode
-    step, while a prefill walk's EOS runs outside the loop and ends nothing."""
+    """As the per-request check: EOS ends the loop on a decode step (a row at
+    its token cap is the loop cap's to end), while a prefill walk's EOS runs
+    outside the loop and ends nothing."""
     node = _node()
     infos = {
         rid: SimpleNamespace(graph_walk=walk, resource_configs={"sampler": SimpleNamespace(ignore_eos=False)},
@@ -83,5 +84,5 @@ def test_batched_stop_check_answers_decode_steps_only():
     rows = HostRows(request_ids=("go", "limit", "eos", "prefill_eos"),
                     buffers={"new_token": torch.tensor([[7], [7], [3], [3]])})
     assert node.check_stop_batched(["eos", "limit", "go", "prefill_eos"], infos, rows) == {
-        "eos": {"decode_loop"}, "limit": {"decode_loop"},
+        "eos": {"decode_loop"},
     }

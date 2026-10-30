@@ -194,9 +194,10 @@ class _Scheduled:
 class _Batch:
     node_name = "LLM"
 
-    def __init__(self, walks=None, label="decode"):
+    def __init__(self, walks=None, label="decode", withheld=None):
         self.graph_walk = label
         self.batch = _Scheduled(walks or {})
+        self.node_batch = SimpleNamespace(withheld_outputs=withheld or {})
 
 
 def _worker(runtime=_Runtime()):
@@ -211,6 +212,18 @@ def test_inline_values_follow_the_batch_order_off_the_host_rows():
         _Engine({"text_inputs": "new_token"}), _Batch(), rows, [9, 7, 8], ["text_inputs", "kv"],
     )
     assert sig == "text_inputs" and vals == [90, 70, 80]
+
+
+def test_a_withheld_output_rides_no_inline_value():
+    """A token the stop check withheld (``StopCheck.withheld``, e.g. the step
+    closing a reply that ended at prefill) is not the client's: that row gets
+    None, which the runtime routes as the row's tensors, of which it has none."""
+    rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]])})
+    sig, vals = _worker()._inline_emit_values(
+        _Engine({"new_token": "new_token"}), _Batch(withheld={8: ("new_token",), 7: ("frame",)}),
+        rows, [7, 8], ["new_token"],
+    )
+    assert sig == "new_token" and vals == [70, None]
 
 
 def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():

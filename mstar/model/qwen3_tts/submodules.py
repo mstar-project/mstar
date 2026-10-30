@@ -162,11 +162,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.talker_config = config.talker
         self.cp_config = config.talker.code_predictor
         self.num_codes = config.talker.num_code_groups
-        # ``postprocess`` counts the frames, the prefill's included
         self.token_stop = TokenStop(
             loop="talker_decode_loop", buffer="layer0_codes",
             stop_ids=frozenset({config.talker.codec_eos_token_id}),
-            sampler=TALKER_SAMPLER, generated_key="generated_frames",
+            sampler=TALKER_SAMPLER,
             # EOS is not a codebook index: the codec never sees that frame
             withhold=("codec_tokens",),
         )

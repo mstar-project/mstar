@@ -59,7 +59,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     infos = {
         "a": _info(),
         "b": _info(),                      # stop token
-        "c": _info(decoded=7),             # out of budget
+        "c": _info(decoded=7),             # at its budget: the loop's cap ends it
         "d": _info(ignore_eos=True),       # stop token ignored
     }
     tokens = torch.tensor([[11], [eos], [11], [eos], [11]])  # a padded replay's extra row last
@@ -67,11 +67,11 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
         rid: stops for i, rid in enumerate(infos)
         if (stops := sub.check_stop(rid, infos[rid], {"new_token": [tokens[i]]}))
     }
-    assert want == {"b": {"decode_loop"}, "c": {"decode_loop"}}
+    assert want == {"b": {"decode_loop"}}
     rows = HostRows(("a", "b", "c", "d"), {"new_token": tokens})
     assert sub.check_stop_batched(["d", "c", "b", "a"], infos, rows) == want
-    # only decode rows end the loop: not on a prefill step, stop token or budget alike
+    # only decode rows end the loop: a prefill row's stop token doesn't
     prefill_step = {rid: _info(walk="prefill_audio", decoded=7) for rid in infos}
     assert sub.check_stop_batched(list(prefill_step), prefill_step, rows) == {}
-    prefill = {**infos, "b": _info(walk="prefill_audio")}
-    assert sub.check_stop_batched(list(prefill), prefill, rows) == {"c": {"decode_loop"}}
+    prefill = {**infos, "d": _info(walk="prefill_audio")}
+    assert sub.check_stop_batched(list(prefill), prefill, rows) == {"b": {"decode_loop"}}

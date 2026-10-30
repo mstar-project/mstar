@@ -521,6 +521,13 @@ Worker scheduling
        ``threading.TIMEOUT_MAX`` seconds is ignored with a warning when the
        worker starts and ``5`` is used; a negative value is raised to ``0``
        with a warning.
+   * - ``MSTAR_PY_SWITCH_INTERVAL_SEC``
+     - unset
+     - GIL switch interval, in seconds, of each worker process
+       (``sys.setswitchinterval``, set at the top of ``Worker.run`` in
+       ``mstar/worker/worker.py``); unset keeps Python's 5 ms, and a value
+       that is not a positive number is ignored with a warning. Workers only: the API
+       server's interval is the serving config's ``api_switch_interval_s``.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
      - ``32,64,128,256,512,1024,2048,4096,8192``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured

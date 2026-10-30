@@ -310,24 +310,19 @@ def test_glm52_check_stop_continues_on_normal_token():
     assert sub.check_stop("r0", _fwd_info(), outputs) == set()
 
 
-def test_glm52_check_stop_ignore_eos_runs_to_max_tokens():
+def test_glm52_check_stop_ignore_eos_runs_to_the_loop_cap():
+    # the cap (``get_loop_caps``) ends the loop at max_tokens, not the stop check
     sub = _make_submodule(Glm52ModelConfig())
     outputs = {"new_token": [torch.tensor([154820])]}
     assert sub.check_stop("r0", _fwd_info(ignore_eos=True), outputs) == set()
-    # max_tokens counts every generated token, the prefill's included: 1 +
-    # iters+1. For max 8 the stop fires at decode iter 6 (8 total), not 7.
-    assert sub.check_stop(
-        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=5), outputs,
-    ) == set()
-    assert sub.check_stop(
-        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=6), outputs,
-    ) == {"decode_loop"}
+    assert sub.check_stop("r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=6), outputs) == set()
 
 
 def test_glm52_check_stop_batched_agrees_with_check_stop():
     """One tolist for the batch, the same answer per request; a row the step has no token
-    for is skipped, as the per-request path skips a request without outputs."""
-    from mstar.model.submodule_base import HostRows
+    for is skipped, as the per-request path skips a request without outputs. A row at its
+    token budget goes on: the loop's cap ends it."""
+    from mstar.model.submodule_base import BatchedStopCheck, HostRows, StopCheck
 
     sub = _make_submodule(Glm52ModelConfig())
     infos = {
@@ -342,45 +337,30 @@ def test_glm52_check_stop_batched_agrees_with_check_stop():
         rid: loops for rid, token in zip(rows, tokens, strict=True)
         if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
     }
-    assert batched == per_request == {
-        "eos": {"decode_loop"}, "budget": {"decode_loop"}, "ended": {"decode_loop"},
-    }
-
-
-def _engine_postprocess(submodule, request_id, request_info, outputs):
-    """``postprocess`` as ``Engine._postprocess_batch`` runs it, the engine's own
-    tail included (it drops the closing token of a reply that ended at prefill)."""
-    from mstar.engine.engine import Engine
-    from mstar.model.submodule_base import BatchedModelOutput
-
-    failures = {}
-    batch = SimpleNamespace(
-        node_name="llm", request_ids=[request_id], inputs=[None],
-        per_request_info_wrapped={request_id: request_info}, failed_requests=failures,
-        register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk=request_info.graph_walk),
+    assert batched == BatchedStopCheck(
+        {"eos": {"decode_loop"}, "ended": {"decode_loop"}}, {"ended": ("new_token",)},
     )
-    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=submodule, piecewise_runners={})})
-    Engine._postprocess_batch(engine, batch, BatchedModelOutput(per_rid_outputs={request_id: outputs}))
-    assert not failures, failures
+    assert per_request == {"eos": {"decode_loop"}, "ended": StopCheck({"decode_loop"}, withheld=("new_token",))}
 
 
 @pytest.mark.parametrize("ignore_eos", [False, True])
 def test_glm52_stop_id_at_prefill_ends_the_reply_at_the_first_decode_step(ignore_eos):
     """The prefill walk has no loop to stop, so a stop id it samples ends the reply at the
-    first decode step, whose token postprocess drops; both stop checks agree on it."""
-    from mstar.model.submodule_base import HostRows
+    first decode step, which withholds its token; both stop checks agree on it."""
+    from mstar.model.submodule_base import BatchedStopCheck, HostRows, StopCheck
 
     sub = _make_submodule(Glm52ModelConfig())
     prefill = _fwd_info(ignore_eos=ignore_eos, walk="prefill")
     assert sub.check_stop("r0", prefill, {"new_token": [torch.tensor([154820])]}) == set()
     decode = _fwd_info(ignore_eos=ignore_eos)
     outputs = {"new_token": [torch.tensor([42])]}
-    _engine_postprocess(sub, "r0", decode, outputs)
-    expected = set() if ignore_eos else {"decode_loop"}
-    assert ("new_token" in outputs) == ignore_eos
-    assert sub.check_stop("r0", decode, outputs) == expected
+    sub.postprocess("r0", decode, outputs)
     batched = sub.check_stop_batched(["r0"], {"r0": decode}, HostRows(("r0",), {"new_token": torch.tensor([42])}))
-    assert batched.get("r0", set()) == expected
+    if ignore_eos:
+        assert sub.check_stop("r0", decode, outputs) == set() and batched == {}
+    else:
+        assert sub.check_stop("r0", decode, outputs) == StopCheck({"decode_loop"}, withheld=("new_token",))
+        assert batched == BatchedStopCheck({"r0": {"decode_loop"}}, {"r0": ("new_token",)})
 
 
 # ── submodule: graph configs ──
