@@ -1061,9 +1061,9 @@ past it. The slot wait does not arise while the adapters in rotation fit in ``ma
 and the copy wait is at most one read, which starts at the request's ingest. A slot is
 reserved for a request only once its adapter's host copy is in (even for an adapter
 resident in a slot, which a miss admitted ahead may evict), so its admit does not wait on a
-read there; a request whose adapter failed to read is let through at once, and its admit
-fails it. A reservation counts slots and pins none: which slot an admit takes follows from
-the slot table alone. An
+read there; a request whose adapter failed to read, and is in no slot, is let through at
+once, and its admit fails it. A reservation counts slots and pins none: which slot an
+admit takes follows from the slot table alone. An
 adapter with nothing for a pool's targets (a text-only adapter on a vision tower's pool)
 takes no slot there and runs no delta (its steps can replay the base-only capture): the
 pool knows it from the file's header at startup, or from a runtime load's read, and its

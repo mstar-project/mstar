@@ -682,6 +682,32 @@ def test_a_request_whose_read_fails_fails_without_waiting_for_a_slot(adapters):
     assert isinstance(reason, AdmitRuntimeError) and reason.request_ids == {"r2"}
 
 
+def test_a_request_on_a_resident_adapter_whose_read_failed_still_counts_a_slot(adapters):
+    """a1 sits in an unheld slot, out of the host tier, and its read fails: r may still run
+    on that slot, so it is counted like any request, not let through, which would promise
+    the one slot to y and r both."""
+    _, paths = adapters
+    pool = make_pool(paths, max_slots=1, cpu_capacity=1)
+    runner = lora_runner(pool)
+    ingest(pool, "h", "a1")
+    assert admitted(runner, "h") and run_step(pool, ["h"]).ok
+    runner.remove_request("h")
+    ingest(pool, "x", "a2")  # drops a1 from the tier
+    settle_reads(pool)
+    read = pool.store._read
+
+    def unreadable(name, path):
+        if name == "a1":
+            raise OSError("a1 is unreadable")
+        return read(name, path)
+    pool.store._read = unreadable
+    for rid, name in [("r", "a1"), ("y", "a3")]:
+        ingest(pool, rid, name)
+    settle_reads(pool)
+    assert pool.resident_slot("a1") is not None and "a1" not in pool.store
+    assert admitted(runner, "y") and runner.admit_retrieve("r", "LLM", "decode").queued
+
+
 def test_two_missing_adapters_cannot_both_take_the_last_slot(adapters):
     _, paths = adapters
     pool = make_pool(paths, max_slots=2)

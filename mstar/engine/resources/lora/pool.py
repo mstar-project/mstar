@@ -24,10 +24,10 @@ with every other resource that asks, so it holds no KV pages meanwhile and the r
 running never lose a step to it. A reservation counts slots and pins none: the slot an
 admit picks follows from the slot table alone, and the reservations never promise more
 slots than exist, so every reserved row finds one at its admit. A row whose adapter
-failed to read is the exception: it is let through at once, to fail at its admit, which
-fails it even with no slot free. Only the rank that chooses batches decides (a lockstep
-instance's leader), so no other rank keeps reservations; the admit refusal stays as a
-backstop.
+failed to read and is in no slot is the exception: it is let through at once, to fail at
+its admit, which fails it even with no slot free. Only the rank that chooses batches
+decides (a lockstep instance's leader), so no other rank keeps reservations; the admit
+refusal stays as a backstop.
 
 A model with LoRA specs on several nodes (an LLM and its vision encoder) has a pool per
 node, and each admits only its own node's rows. A request holds a slot in each until it
@@ -582,8 +582,10 @@ class LoraAdapterPool(Resource):
 
     def reserve(self, rid, node_name, graph_walk, published) -> int | None:
         """Count ``rid``'s adapter against the free slots once its host copy is in, so its
-        admit does not wait for a read on this rank. A row whose adapter failed to read is
-        let through at once, slots or not: its admit fails it, on every rank alike."""
+        admit does not wait for a read on this rank. A row whose adapter failed to read and
+        is in no slot is let through at once, slots or not: its admit fails it, on every
+        rank alike. One whose adapter is still resident may yet run on that slot, so it
+        counts like any other."""
         del node_name, graph_walk, published
         with self._lock:
             name = self._adapter_of[rid]
@@ -592,7 +594,10 @@ class LoraAdapterPool(Resource):
                     # its read, started at ingest, lands. An adapter resident in a slot waits
                     # for it too: a reservation pins no slot, so a miss admitted first may evict it
                     return self._changes
-            elif self._spare_slots(name) < 0:
+                if name not in self._resident:
+                    self._reserve(rid, name)
+                    return None
+            if self._spare_slots(name) < 0:
                 return self._changes
             self._reserve(rid, name)
             return None
