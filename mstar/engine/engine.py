@@ -1601,12 +1601,14 @@ class Engine:
     def _check_follower_refusal(
         self, batch: ExecutingBatch, outcome: FullAdmitOutcome,
     ) -> None:
-        """Raise when a TP follower refuses a step rank 0 cannot have refused.
+        """Stop this worker when a TP follower refuses a step rank 0 cannot have refused.
 
-        Rank 0 schedules within ``get_max_batch_size``, so a batch past this
-        rank's own cap, refused for capacity, means the ranks' capacity has
-        diverged: rank 0 admitted a step this rank cannot join, and re-queueing
-        it would leave rank 0 in that step's collectives alone.
+        Rank 0 schedules within ``get_max_batch_size``. Where that cap follows free
+        state (GLM-5.3's prefill takes only the free KDA slots), a batch past this
+        rank's own cap, refused for capacity, means the ranks' state has diverged:
+        rank 0 admitted a step this rank cannot join. Re-queueing it or failing its
+        requests would leave rank 0 in the step's collectives until the watchdog, so
+        the worker exits, as the micro-scheduler does on a diverged page trail.
         """
         node = batch.node_name
         if node not in self._tp_follower_nodes or not isinstance(outcome.reason, AllocationFailed):
@@ -1615,10 +1617,10 @@ class Engine:
         cap = self.get_max_batch_size(node, walk)
         rows = len(batch.request_ids)
         if cap is not None and rows > cap:
-            raise RuntimeError(
-                f"TP follower refused {rows} requests on {node}/{walk} that rank 0 "
-                f"scheduled, past this rank's cap of {cap}: the ranks' "
-                f"{outcome.failed_resource} state has diverged. {outcome.reason.message}"
+            raise SystemExit(
+                f"TP ranks diverged: a follower refused {rows} requests on {node}/{walk} "
+                f"that rank 0 scheduled, past this rank's cap of {cap}; their "
+                f"{outcome.failed_resource} state differs. {outcome.reason.message}"
             )
 
     def _maybe_lease_piecewise_regions(
