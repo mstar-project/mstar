@@ -381,13 +381,16 @@ cache's nodes must run on one TP group, with no replicas and no walks placed on 
 ranks. Loading fails otherwise.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
-beside the prompts already admitted, and no request behind it starts first. A cache hit on
-a page only the prefix index holds counts as a page the request takes. A request that
-can't fit in its pool at its full output length gets a 400 if it asked for that length,
-and otherwise has the model's default length cut until it fits. The pool
-reserves only prompts, so it still has to hold the decode of every request allowed to run
-at once, and a decode step that finds no page outside the admitted prompts holds its
-requests until they time out.
+beside what admitted requests have reserved. A request behind it starts first only if part
+of its prompt is cached on the GPU, running requests keep all of that part from eviction,
+and its own pages fit, output included. While the head waits, no request behind it starts
+in the pages such a request frees. A cache hit on a page only the prefix index holds
+counts as a page the request takes. A request that can't fit in its pool at its full
+output length gets a 400 if it asked for that length, and otherwise has the model's
+default length cut until it fits. For a request admitted at the head, the pool reserves
+only its prompt. So the pool still has to hold the decode of every request allowed to run
+at once, and a decode step that finds no page outside what admitted requests have reserved
+holds its requests until they time out.
 ``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a
 safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload

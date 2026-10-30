@@ -83,7 +83,9 @@ class Admission:
         entry.nodes.add(node_name)
         entry.published[node_name] = published
         tried = all(self._queues[key][0] == rid and key not in self._short for key in entry.asked)
-        if tried and (nodes := self._reserve(rid, entry.published.get)):
+        # a request that isn't first may pass a first request that can't start
+        nodes = self._reserve(rid, entry.published.get) if tried else self._pass(rid, entry.published.get)
+        if nodes:
             if nodes - {node_name}:
                 self._started.setdefault(rid, set()).update(nodes - {node_name})
             return None
@@ -127,6 +129,10 @@ class Admission:
                     admitted = True
         # the last sweep admitted nothing, so it tried every queue's first request
         self._untried = False
+        if any(self._resources[key].passes and self._resources[key].may_pass() for key in self._short):
+            for rid in sorted(self._waiting, key=self._arrival.__getitem__):
+                if rid in self._waiting and (nodes := self._pass(rid, lambda node, rid=rid: published_of(rid, node))):
+                    started.extend((node, rid) for node in nodes)
         return started
 
     def remove_request(self, rid: str) -> None:
@@ -153,27 +159,51 @@ class Admission:
 
     def _reserve(
         self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None],
+        passing: Collection[str] = (),
     ) -> set[str] | None:
         """Take everything waiting ``rid`` asked for and return the nodes waiting on it, or take
         nothing and return None. ``published_of`` gives what ``rid`` published for a node's
-        resources."""
+        resources, and ``passing`` names the resources where ``rid`` passes the first request."""
         entry = self._waiting[rid]
         taken: list[str] = []
         for key, (node_name, graph_walk) in entry.asked.items():
             published = published_of(node_name)
-            mark = self._resources[key].reserve(
-                rid, node_name, graph_walk, None if published is None else published.get(key),
-            )
+            args = (rid, node_name, graph_walk, None if published is None else published.get(key))
+            reserve = self._resources[key].reserve
+            mark = reserve(*args, passing=True) if key in passing else reserve(*args)
             if mark is not None:
                 for done in taken:
                     self._resources[done].unreserve(rid)
-                self._short[key] = mark
+                if key not in passing:
+                    self._short[key] = mark
                 return None
             taken.append(key)
         del self._waiting[rid]
         self._leave(rid, entry.asked)
         self._admitted.setdefault(rid, set()).update(entry.nodes)
         return entry.nodes
+
+    def _pass(
+        self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None],
+    ) -> set[str] | None:
+        """Admit ``rid`` past the first request of each queue it waits behind, when that request can't
+        start and the queue's resource `passes`, and ``rid`` is first wherever else it waits. Return the
+        nodes waiting on it, or None."""
+        passing = []
+        for key in self._waiting[rid].asked:
+            first = self._queues[key][0]
+            if first == rid:
+                if key in self._short:
+                    return None
+            elif self._resources[key].passes and self._blocked(first):
+                passing.append(key)
+            else:
+                return None
+        return self._reserve(rid, published_of, passing) if passing else None
+
+    def _blocked(self, rid: str) -> bool:
+        """Whether ``rid`` is first in a queue whose resource it didn't fit."""
+        return any(key in self._short and self._queues[key][0] == rid for key in self._waiting[rid].asked)
 
     def _leave(self, rid: str, keys: Collection[str]) -> None:
         """Take ``rid`` out of the queues of ``keys``. A queue it was first in drops its mark,

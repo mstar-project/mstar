@@ -249,11 +249,20 @@ class Resource(ABC):
         when it needs none, or the outcome that fails it when it can never fit."""
         return None
 
+    # whether a request may pass the first one waiting for this resource while that one can't start
+    passes = False
+
+    def may_pass(self) -> bool:
+        """Whether some request could pass the first one now, on a resource that `passes`."""
+        return False
+
     def reserve(
         self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
+        passing: bool = False,
     ) -> object | None:
         """Take what ``rid`` asked for and return None, or return a mark of what it didn't fit
-        against for `grew_since`."""
+        against for `grew_since`. ``passing`` asks for ``rid`` behind a first request that can't
+        start, on a resource that `passes`."""
         return None
 
     def unreserve(self, rid: str) -> None:

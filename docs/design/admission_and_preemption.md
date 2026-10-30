@@ -81,7 +81,8 @@ Rules:
 
 - **Ingest.** A request whose footprint is bigger than its pool gets a 400 at ingest. A request that asks for no length has its default cut to fit the pool (#808).
 - **Queue.** A request joins the runner's waiting list at its first readiness check, in the order requests first ask. It is admitted when it is first among the waiting requests of every pool it asks, and its reservation fits in each, in the free and evictable pages no admitted request has reserved.
-- **Size.** A preemptible request reserves its prompt. A guaranteed one also reserves its growth.
+- **Passing.** While the first request of a pool's queue can't start, a request behind it is admitted if part of its prompt is cached on the GPU, running requests keep all of that part from eviction, and its own pages fit, output included. While the first request waits, no request behind it is admitted into the pages such a request frees. A recurrent pool lets a request pass when a slot is left for the first one.
+- **Size.** A preemptible request reserves its prompt. A guaranteed one, and one admitted past the first request, also reserves its growth.
 - **Inside a reservation.** A grant always succeeds. A failure there is an accounting bug, and the manager raises.
 - **Past a reservation.** A grant takes only from the room, and fails with `AllocationFailed(pages_short=...)` when the room is short.
 - **Across pools.** A request takes its reservation in every pool its node asks, the recurrent pool's slot included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.
@@ -104,7 +105,7 @@ What a cache hit costs:
 Why this shape:
 
 - **The rule lives in `_alloc`.** Today it grants any free page, so a growing request could take a page a guaranteed request reserved, and that request's next grant would fail.
-- **Only the head is admitted.** Nothing newer passes the oldest request, so it can't wait forever behind a stream of small ones (§5.5).
+- **The head is passed only while it doesn't fit.** The pages that passing requests free are kept for it, so it can't wait forever behind a stream of small ones (§5.5).
 - **Evictable hits are charged as fresh.** Eviction could hand such a page to another request before the probe leases it.
 
 ---
@@ -287,7 +288,7 @@ A guaranteed request reserves its whole footprint and is never dropped, so it fi
 Take the oldest preemptible request:
 
 1. When it runs short, newer requests are dropped first, and it drops itself only when none of them can free a page for it.
-2. It then waits at the head of its queue, where nothing newer is admitted past it.
+2. It then waits at the head of its queue. Newer requests pass it only while it doesn't fit, and the pages they free during its wait are kept for it.
 3. It returns with its whole history and one more page reserved, so each time it is dropped again it has grown by at least a page.
 4. Its footprint fits the pool, so it finishes after a bounded number of returns.
 
