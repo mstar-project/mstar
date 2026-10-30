@@ -51,8 +51,8 @@ class AttentionManager(AttentionResource):
     # Label / layer cursors come from `AttentionResource`; `run` resolves them.
 
     def fingerprint(self) -> bytes:
-        # the class, not the declared backend: `build` degrades dense to paged
-        # where the FA3 kernel is unusable, and the two do not agree bit for bit
+        # the class, not the declared backend: `build` moves dense to another
+        # kernel where the FA3 one is unusable, and they do not agree bit for bit
         return fingerprint(type(self).__name__)
 
     @classmethod
@@ -86,26 +86,34 @@ class AttentionManager(AttentionResource):
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
         if backend == AttnBackend.DENSE:
-            # A dense backend needs the FlashAttention-3 kernel; where the
-            # wheel does not match the installed torch/CUDA build or has no
-            # kernel for the GPU, degrade to the paged backend AUTO picks
-            # rather than failing to serve.
-            # The two are drop-in for each other: the step declaration is
+            # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
+            # that has no kernel for the GPU or does not import, the same pass
+            # runs on FlashInfer's ragged prefill, and where FlashInfer cannot
+            # run either it degrades to the paged backend AUTO picks rather
+            # than failing to serve.
+            # All three are drop-in for each other: the step declaration is
             # identical (see DenseAttentionManager) and `requires_kv_write`
             # tells the layer which one it is talking to.
             from mstar.engine.resources.attn.dense import (
                 DenseAttentionManager,
-                _fa3_unavailable_reason,
+                _dense_unavailable_reason,
                 _warn_dense_fallback,
             )
+            from mstar.engine.resources.attn.ragged.base import dense_or_flashinfer
+            from mstar.engine.resources.attn.ragged.dense_wrappers import DensePrefixedPrefillWrapper
+            from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
 
-            reason = _fa3_unavailable_reason(info.device)
+            reason = _dense_unavailable_reason(info.device)
             if reason is None:
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
                     device=info.device,
                     dtype=info.kv_dtype,
                     kv_config=kv_config,
+                    wrapper_class=dense_or_flashinfer(
+                        info.device, DensePrefixedPrefillWrapper, FlashInferPrefixedPrefillWrapper, "Attention",
+                    ),
+                    flashinfer_backend=spec.config.flashinfer_backend,
                 )
             backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
             _warn_dense_fallback(reason, backend)
@@ -221,6 +229,11 @@ def captured_page_capacity(num_rows: int, num_tokens: int, kv_config: KVConfig) 
     )
 
 
+def workspace_bytes() -> int:
+    """Size of one FlashInfer workspace buffer (``MSTAR_WORKSPACE_BUFFER_MB``)."""
+    return int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024
+
+
 class WorkspacePool:
     """FlashInfer workspace buffers, one per (plan label, cg slot).
 
@@ -228,11 +241,9 @@ class WorkspacePool:
     these outlive any single step.
     """
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, size_mb: int | None = None):
         self._device = device
-        self._size = int(
-            os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")
-        ) * 1024 * 1024
+        self._size = workspace_bytes() if size_mb is None else size_mb * 1024 * 1024
         self._buffers: dict[str, torch.Tensor] = {}
 
     def get(self, label: str, cg_slot: int | None = None) -> torch.Tensor:

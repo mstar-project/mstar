@@ -46,6 +46,7 @@ import weakref
 from concurrent.futures import Future
 from typing import NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.communication.communicator import BaseCommunicator
@@ -845,6 +846,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # eviction OVER-cautious (skip a sweep), never unsafe.
         self._reads_active += 1
         try:
+            if not any(e.tensor_info for e in graph_edges):
+                # signal-only edges: no stream context to pay for, but the
+                # (time-gated) sweep of dead peers' segments still runs here
+                self._evict_dead_peers()
+                return []
             return self._start_read_tensors(request_id, graph_edges,
                                             graph_walk)
         finally:
@@ -971,12 +977,16 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             return t.to(self.device) if self.device != "cpu" else t
         view = self._peer_view(info.shm_segment)
         start = info.shm_offset + info.offset  # offset = TP-shard read offset
+        if self.device == "cpu":
+            # A CPU consumer owns a copy past reclaim. numpy copies with one
+            # memcpy; clone() would split it over torch's intra-op pool.
+            flat = torch.from_numpy(np.frombuffer(
+                view, dtype=np.uint8, count=info.nbytes, offset=start).copy())
+            return flat.view(info.dtype).reshape(info.dims)
         flat = torch.frombuffer(
             view[start:start + info.nbytes], dtype=torch.uint8)
         t = flat.view(info.dtype).reshape(info.dims)
-        if self.device != "cpu":
-            return t.to(self.device, non_blocking=True)
-        return t.clone()  # CPU consumer: own the bytes past reclaim
+        return t.to(self.device, non_blocking=True)
 
     # -- reclaim ----------------------------------------------------------
 

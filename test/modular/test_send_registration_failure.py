@@ -119,6 +119,8 @@ def test_the_worker_fails_only_the_refused_request():
         r7 = _store(mgr, 7, mine, bad)
         r8 = _store(mgr, 8, theirs)
         worker = Worker.__new__(Worker)
+        worker._walk_drivers = {}
+        worker._walk_driven_edges = {}
         worker.tensor_manager = mgr
         worker.scheduler = SimpleNamespace(failed_rids=set())
         reported = []
@@ -168,6 +170,8 @@ def _postprocess_worker(refuse, follower=False):
     graph runtime and transfer engine faked around it. The transfer engine
     refuses every tensor of the rids in ``refuse``, step after step."""
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
@@ -260,7 +264,7 @@ def _decode_step(rids, final_stream=()):
         request_ids=list(rids), per_request_info=dict.fromkeys(rids),
         failed_requests={}, completion_event=None,
         final_stream_rids=set(final_stream), resource_publish_info={},
-        stream_partition_done_rids=set(), cached_rids=set(),
+        stream_partition_done_rids=set(), cached_rids=set(), withheld_outputs={},
     )
     batch = ScheduledBatch(
         node_name="llm", graph_walk="decode",
@@ -453,6 +457,8 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
     assert mgr.transfer_engine.unregister_memory(t.data_ptr()) == 0
     released = []
     w = Worker.__new__(Worker)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     w.is_tp_follower = False
     w._rid = lambda wire: 3
     w._in_flight_rids = set()
