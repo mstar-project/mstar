@@ -55,6 +55,9 @@ class Row:
     i2v_frames: str | None = None
     # Options of the row's correctness family (its mode, a pinned size), which also set the requests' settings.
     correctness_opts: dict = field(default_factory=dict)
+    # Entries merged into the serving config's model_kwargs: section for every mstar arm of this row (an arm's own
+    # entries win): server settings the row's requests depend on, like the sizes a DiT compiles for.
+    model_kwargs: dict = field(default_factory=dict)
 
 
 def mstar_config_name(row: Row, arm: str) -> str:
@@ -121,8 +124,10 @@ ROWS: dict[str, Row] = {r.name: r for r in [
         correctness_opts={"mode": "t2i", "size": "480x832"},
         engine_args={"vllm-omni": ("--no-guardrails",), "vllm-omni-rc": ("--no-guardrails",)}),
     # mstar's wan22 takes only a frame of the request's size: i2v sends the reference's 480x832 conditioning frames.
+    # Wan2.2 compiles its DiT only for listed "WxHxF" shapes and runs every other one eager, so the row lists the
+    # clip size the table sends.
     Row("wan22", "video", "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22", cost=4.0, generator_device="cpu",
-        concurrency={"video-t2v": (1, 2, 4)},
+        concurrency={"video-t2v": (1, 2, 4)}, model_kwargs={"compile_dit_sizes": ["832x480x33"]},
         i2v_frames=f"{REFERENCES}/diffusers-Wan-AI--Wan2.2-TI2V-5B-Diffusers-480x832x33-s20-i2v/video_v1/conditioning"),
     # vllm-omni's Cosmos3 recipe serves without the guardrail models (recipes/cosmos3/Cosmos3-Nano.md).
     # i2v sends the reference's 480x832 conditioning frames (diffusers' cover-crop of the 320x180 set frames):
@@ -186,7 +191,8 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
     # between TP ranks times out; a host network setting, not a tuning knob.
     Arm("mstar", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai",
         env={"MSTAR_SHM_ARENA": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
-        recipe="the deployment config named in the engine column, unchanged; MSTAR_SHM_ARENA=1 as "
+        recipe="the deployment config named in the engine column, with the model_kwargs it lists where the row's "
+               "requests need them; MSTAR_SHM_ARENA=1 as "
                ".claude/skills/benchmarking asks for numbers"),
     # TP rows only: the worker's async scheduling for lockstep TP nodes, which defaults to off
     # (MSTAR_TP_ASYNC_SCHED, mstar/worker/worker.py).
