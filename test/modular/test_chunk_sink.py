@@ -12,6 +12,7 @@ from api_server_helpers import make_test_api_server
 from mstar.api_server import entrypoint as ep
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import ResultChunk
+from mstar.communication.event import EventWakeup
 
 
 class _PreprocessWorker:
@@ -20,6 +21,7 @@ class _PreprocessWorker:
     def __init__(self):
         self.chunks: list[ResultChunk] = []
         self.aborted: list[str] = []
+        self.results_wakeup = EventWakeup()
 
     def get_profile_updates(self):
         return []
