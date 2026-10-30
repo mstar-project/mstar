@@ -268,10 +268,15 @@ There are two ``ResourceReqConfig`` subclasses:
   metadata. The model passes ``return_logprobs`` into its ``SamplingReqConfig`` (the
   conductor refuses the request otherwise), its forward samples once per step and
   hands over row-addressed stop buffers (``BatchedModelOutput.check_stop_buffers``):
-  the log-probs ride the same copy to the host. ``logprobs_mode`` is ``"raw"`` only
-  for now. The captured sampler scores every step once it is on, so it is off by
-  default and a deployment turns it on with
+  the log-probs ride the same copy to the host. The captured sampler scores every
+  step once it is on, so it is off by default and a deployment turns it on with
   ``resources: {<sampler key>: {enable_logprobs: true}}``.
+  ``logprobs_mode: "processed"`` (``enable_processed_logprobs``, CUDA) scores the
+  distribution the token was drawn from instead: after the penalty, temperature,
+  min-p, top-k/top-p and min-tokens floor. A greedy token scores 0 there, so a
+  trainer sampling greedily wants ``"raw"``. It renorms every step's distribution
+  again, about 0.15 ms at batch 1 and 0.5 ms at batch 128 on a GB200 with a 248k
+  vocabulary, so it is a separate switch.
 
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.

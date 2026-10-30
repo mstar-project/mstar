@@ -20,7 +20,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -755,6 +755,31 @@ def token_logprobs(logits: torch.Tensor, tokens: torch.Tensor, temperature: torc
     return (scaled.gather(1, tokens.long().unsqueeze(1)) - norm).squeeze(1)
 
 
+def processed_logprobs(
+    probs: torch.Tensor, tokens: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
+    history: "HistoryRows | None" = None, order: "FilterOrder | None" = None,
+) -> torch.Tensor:
+    """Log-probs of ``tokens`` under the distribution they were drawn from:
+    ``probs`` (after the penalty, temperature and min-p) filtered and floored
+    as ``_filter_floor_and_draw`` does. 0 for greedy rows; graph-safe."""
+    import flashinfer
+
+    tokens = tokens.long().view(-1, 1)
+    floor = history is not None and history.stop_ids is not None
+    if order is not None or floor:
+        filtered = filter_top_k_top_p(probs, top_k, top_p, order)
+        if floor:
+            filtered = apply_min_tokens_floor(filtered, history)
+        picked = filtered.gather(1, tokens)
+    else:
+        # FlashInfer's own order, as the draw: two renorms and no counting pass
+        first = flashinfer.sampling.top_k_renorm_probs(probs, torch.where(top_k > 0, top_k, probs.shape[1]))
+        then = flashinfer.sampling.top_p_renorm_probs(first, top_p)
+        picked = torch.where(top_p[:, None] < 1.0, then.gather(1, tokens), first.gather(1, tokens))
+    # a renormed near-certain token can land a ulp above 1
+    return picked.squeeze(1).log().clamp_max(0)
+
+
 @triton.jit
 def _token_logprob_kernel(
     chunk_max_ptr, chunk_sum_ptr, logits_ptr, tokens_ptr, temperature_ptr, out_ptr,
@@ -976,6 +1001,7 @@ class SamplingConfig:
     # whether the penalty also counts the prompt's tokens; see ``SamplingReqConfig``
     penalize_prompt: bool = True
     return_logprobs: bool = False
+    logprobs_mode: str = "raw"
     _seed: int = 0 # set by the conductor
 
     def set_seed(self, seed: int):
@@ -1177,6 +1203,7 @@ class Sampler(BaseSampler):
                 [self._seen_token_mask[rid]._seen_token_mask for rid in request_ids], dim=0,
             )
 
+        processed = [c.return_logprobs and c.logprobs_mode == "processed" for c in configs]
         tokens = sample_tokens(
             logits=logits,
             temperature=temperature,
@@ -1191,7 +1218,9 @@ class Sampler(BaseSampler):
             min_p=min_p,
             history=history,
             order=order,
+            return_probs=any(processed),
         )
+        tokens, probs = tokens if any(processed) else (tokens, None)
 
         # TODO: make this scatter async. Currently runs 2 kernels per rid
         # (broadcast-True + index_put) on the default stream, serializing N=bs
@@ -1207,9 +1236,15 @@ class Sampler(BaseSampler):
         tokens = self._broadcast_tokens(tokens)
 
         want = [c.return_logprobs for c in configs]
-        self.logprobs = torch.where(
-            torch.tensor(want, device=logits.device), token_logprobs(logits, tokens, temperature), torch.nan,
-        ) if any(want) else None
+        self.logprobs = None
+        if any(want):
+            chosen = token_logprobs(logits, tokens, temperature)
+            if probs is not None:
+                chosen = torch.where(
+                    torch.tensor(processed, device=logits.device),
+                    processed_logprobs(probs, tokens, top_k, top_p, history, order), chosen,
+                )
+            self.logprobs = torch.where(torch.tensor(want, device=logits.device), chosen, torch.nan)
 
         if history is not None:
             advance_history(history, tokens)
@@ -1284,6 +1319,11 @@ class Sampler(BaseSampler):
         return FilterOrder(top_p_first=dev[0] != 0, min_keep=dev[1].to(torch.int32))
 
 
+class Draw(NamedTuple):
+    tokens: torch.Tensor
+    probs: torch.Tensor  # the distribution the filters ran on
+
+
 def _sample_cuda(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -1298,8 +1338,10 @@ def _sample_cuda(
     min_p: torch.Tensor | None = None,
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
-) -> torch.Tensor:
-    """Sample normalized CUDA inputs with FlashInfer."""
+    return_probs: bool = False,
+) -> torch.Tensor | Draw:
+    """Sample normalized CUDA inputs with FlashInfer; with ``return_probs``,
+    also the distribution the filters ran on."""
     import flashinfer
 
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
@@ -1322,8 +1364,8 @@ def _sample_cuda(
         if min_p is not None:
             probs = apply_min_p(probs, min_p)
         if _needs_explicit_filter(history, order):
-            return _filter_floor_and_draw(probs, top_k, top_p, seed, rand_offset, history, order)
-        if top_k_zero_count == logits.shape[0]:
+            result = _filter_floor_and_draw(probs, top_k, top_p, seed, rand_offset, history, order)
+        elif top_k_zero_count == logits.shape[0]:
             # top-k is off for every row
             result = flashinfer.sampling.top_p_sampling_from_probs(
                 probs, top_p,
@@ -1338,7 +1380,8 @@ def _sample_cuda(
                 deterministic=True,
                 seed=seed, offset=rand_offset,
             )
-        return result[0] if isinstance(result, tuple) else result
+        result = result[0] if isinstance(result, tuple) else result
+        return Draw(result, probs) if return_probs else result
 
 
 def _needs_explicit_filter(history: HistoryRows | None, order: FilterOrder | None) -> bool:
@@ -1464,7 +1507,8 @@ def sample_tokens(
     min_p: float | torch.Tensor | None = None,
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
-) -> torch.Tensor:
+    return_probs: bool = False,
+) -> torch.Tensor | Draw:
     """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
     Args:
@@ -1492,6 +1536,8 @@ def sample_tokens(
         history: Optional ``HistoryRows`` (CUDA only): the windowed penalty and
             the min-tokens floor.
         order: Optional ``FilterOrder`` (CUDA only): HF's top-p-first order.
+        return_probs: (CUDA only) also return the distribution the filters
+            ran on, for ``processed_logprobs``.
 
     Returns:
         tokens: [batch_size] sampled token IDs.
@@ -1525,6 +1571,7 @@ def sample_tokens(
             min_p=min_p,
             history=history,
             order=order,
+            return_probs=return_probs,
         )
     elif logits.device.type == "xpu":
         if history is not None or order is not None:
@@ -1586,7 +1633,8 @@ def sample_accelerator_graphable_gpu(
     min_p: torch.Tensor | None = None,
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
-) -> torch.Tensor:
+    return_probs: bool = False,
+) -> torch.Tensor | Draw:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
     Routes through the fused Triton prep kernel (``fused_temperature_softmax``)
@@ -1619,6 +1667,8 @@ def sample_accelerator_graphable_gpu(
         history, order: the generation-aware processors (``HistoryRows``,
             ``FilterOrder``); None leaves each out of the captured graph. The
             caller advances ``history`` with the sampled tokens.
+        return_probs: (CUDA only) also return the distribution the filters
+            ran on, for ``processed_logprobs``.
 
     Returns:
         ``[batch_size]`` int64 sampled token IDs. FlashInfer's default
@@ -1653,19 +1703,20 @@ def sample_accelerator_graphable_gpu(
             if min_p is not None:
                 probs = apply_min_p(probs, min_p)
             if _needs_explicit_filter(history, order):
-                return _filter_floor_and_draw(probs, top_k, top_p, seed, offset, history, order).to(torch.int64)
-            top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-            # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
-            # and offset and folds the row index into philox, so identical (probs,
-            # seed, offset) yield different tokens at different batch positions.
-            # Sampling is thus reproducible only within a fixed batch layout; under
-            # continuous batching (shifting positions) a request's stream is not.
-            # Measured in test/sampling_test/flashinfer_batch_test.py.
-            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, top_k, top_p, deterministic=True,
-                seed=seed, offset=offset,
-            )
-        return samples.to(torch.int64)
+                samples = _filter_floor_and_draw(probs, top_k, top_p, seed, offset, history, order)
+            else:
+                # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
+                # and offset and folds the row index into philox, so identical (probs,
+                # seed, offset) yield different tokens at different batch positions.
+                # Sampling is thus reproducible only within a fixed batch layout; under
+                # continuous batching (shifting positions) a request's stream is not.
+                # Measured in test/sampling_test/flashinfer_batch_test.py.
+                samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                    probs, torch.where(top_k > 0, top_k, logits.shape[1]), top_p, deterministic=True,
+                    seed=seed, offset=offset,
+                )
+        samples = samples.to(torch.int64)
+        return Draw(samples, probs) if return_probs else samples
     else:
         raise ValueError(
             f"Graph-captured sampling is unsupported on {logits.device.type!r}; "
@@ -1699,6 +1750,9 @@ class AcceleratorGraphableSampler(BaseSampler):
     # ask); both ``None`` unless the node's spec enables log-probs.
     return_logprobs_buf: torch.Tensor | None = None
     logprob_buf: torch.Tensor | None = None
+    # ``[bs]`` per-request ``logprobs_mode == "processed"``; ``None`` unless
+    # the spec enables processed log-probs.
+    processed_logprobs_buf: torch.Tensor | None = None
     tp_group: "CommGroup | None" = None  # noqa: F821
     # In-graph gather/scatter (``MSTAR_SAMPLER_INGRAPH_SCATTER``): the slot
     # masters and this slot's padded index row, all static, so the captured
@@ -1739,6 +1793,7 @@ class AcceleratorGraphableSampler(BaseSampler):
             top_k, top_p = torch.zeros_like(top_k), torch.ones_like(top_p)
         if self.ingraph_scatter:
             self.gather_in_graph()
+        processed = self.processed_logprobs_buf is not None
         codes = sample_accelerator_graphable_gpu(
             logits, self.temperature_buf,
             top_k, top_p,
@@ -1749,17 +1804,25 @@ class AcceleratorGraphableSampler(BaseSampler):
             min_p=self.min_p_buf,
             history=self.history,
             order=self.order,
+            return_probs=processed,
         )
+        codes, probs = codes if processed else (codes, None)
         self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
         codes = self._broadcast_tokens(codes)
+        if self.logprob_buf is not None:
+            # before the history moves on: the min-tokens floor reads its count
+            chosen = token_logprobs(logits, codes, self.temperature_buf)
+            if processed:
+                chosen = torch.where(
+                    self.processed_logprobs_buf,
+                    processed_logprobs(probs, codes, top_k, top_p, self.history, self.order), chosen,
+                )
+            self.logprob_buf.copy_(torch.where(self.return_logprobs_buf, chosen, torch.nan))
         if self.history is not None:
             # the TP-agreed token, so every rank's history stays the same
             advance_history(self.history, codes)
         if self.last_token_buf is not None:
             self.last_token_buf.copy_(codes)
-        if self.logprob_buf is not None:
-            chosen = token_logprobs(logits, codes, self.temperature_buf)
-            self.logprob_buf.copy_(torch.where(self.return_logprobs_buf, chosen, torch.nan))
         if self.ingraph_scatter:
             self.scatter_in_graph(codes)
         if apply_penalty and self.seen_tokens_buf is not None:
@@ -2096,6 +2159,8 @@ class SamplerBuffers:
     # log-prob rows the captured sample writes; only when the spec enables them.
     return_logprobs: "HostBuffer | None" = None
     logprob: torch.Tensor | None = None
+    # Per-request ``logprobs_mode == "processed"``; only when the spec enables it.
+    processed_logprobs: "HostBuffer | None" = None
     # Request rows in the masters, trash row excluded; doubles when registrations outgrow it.
     _master_capacity: int = field(default=0, repr=False)
     # Request rows of the device masters; lags ``_master_capacity`` until the gpu thread grows them.
@@ -2164,7 +2229,7 @@ class SamplerBuffers:
         bufs = [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
         for opt in (
             self.min_p, self.window, self.window_penalty, self.min_tokens,
-            self.top_p_first, self.top_p_min_keep, self.return_logprobs,
+            self.top_p_first, self.top_p_min_keep, self.return_logprobs, self.processed_logprobs,
         ):
             if opt is not None:
                 bufs.append(opt)
@@ -2186,6 +2251,7 @@ class SamplerBuffers:
         slots: int | None = None,
         loopback_state: "Mapping[str, LoopbackState] | None" = None,
         enable_logprobs: bool = False,
+        enable_processed_logprobs: bool = False,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -2250,6 +2316,7 @@ class SamplerBuffers:
             top_p_min_keep=mk(torch.int32, 1) if enable_top_p_first else None,
             return_logprobs=mk(torch.bool, False) if enable_logprobs else None,
             logprob=torch.zeros(cg_slots, max_batch_size, device=device) if enable_logprobs else None,
+            processed_logprobs=mk(torch.bool, False) if enable_processed_logprobs else None,
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
@@ -2284,6 +2351,9 @@ class SamplerBuffers:
                 self.return_logprobs.slot_view(cg_slot, bs) if self.return_logprobs is not None else None
             ),
             "logprob_buf": self.logprob[cg_slot, :bs] if self.logprob is not None else None,
+            "processed_logprobs_buf": (
+                self.processed_logprobs.slot_view(cg_slot, bs) if self.processed_logprobs is not None else None
+            ),
             "tp_group": self.tp_group,
             "offset_master": self.offset.master,
             "last_token_master": self.last_token.master,
@@ -2341,6 +2411,8 @@ class SamplerBuffers:
                 self.top_p_min_keep.write_master_row(slot, int(cfg.top_p_min_keep))
             if self.return_logprobs is not None:
                 self.return_logprobs.write_master_row(slot, bool(cfg.return_logprobs))
+            if self.processed_logprobs is not None:
+                self.processed_logprobs.write_master_row(slot, cfg.logprobs_mode == "processed")
         self._config_version += 1
 
     def _grow_master(self, new_capacity: int) -> None:
