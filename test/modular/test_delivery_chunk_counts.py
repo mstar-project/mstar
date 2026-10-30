@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.api_server.data_worker import PreprocessWorker
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorker
 from mstar.api_server.request_types import ResultTensors, ResultTokens
 from mstar.communication.tensor_store import TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
@@ -291,10 +291,12 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline):
     worker.profile_queue = queue.Queue()
     worker.reads_done_queue = queue.Queue()
     worker._signal = lambda: None
-    # the data worker's thread, collapsed: a queued read completes at once
-    worker.result_tensor_input_queue = SimpleNamespace(put=lambda item: worker.output_queue.put(
-        ResultChunk(request_id=item.request_id, modality="text", data=b"x", metadata={}),
-    ))
+    # the data worker's thread, collapsed: a queued read completes at once, and
+    # a frame's inline values (one InlineTokens per frame) give a chunk per request
+    def complete_at_once(item):
+        for rid in item.request_ids if isinstance(item, InlineTokens) else [item.request_id]:
+            worker.output_queue.put(ResultChunk(request_id=rid, modality="text", data=b"x", metadata={}))
+    worker.result_tensor_input_queue = SimpleNamespace(put=complete_at_once)
 
     server = object.__new__(APIServer)
     server.running = True
