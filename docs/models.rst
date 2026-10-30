@@ -224,9 +224,14 @@ or ``/generate``'s ``model_kwargs``; an adapter the deployment does not serve is
 Without the block a model runs exactly as before. The table lists the models that take
 one and their targets, by the names a ``targets:`` list in the block uses. Every row is
 validated on CPU (each model's own stack against merged weights at simulated tensor
-parallelism); the GPU checks are in ``benchmark/lora/README.md``. Qwen3.5, Orpheus and
-Higgs Audio pass them; the rows marked *not validated* do not yet, and serve adapters at
-your own risk:
+parallelism); the GPU checks are in ``benchmark/lora/README.md``. Qwen3.5 passes them,
+Orpheus agrees with transformers + PEFT on every row and misses the merged check on a
+few, and Higgs Audio passes them, though its transformers check has not been rerun since
+that reference moved to fp32 RoPE. The rows marked *not validated* do not yet, and serve
+adapters at your own risk. None of their misses in the eager checks so far is an adapter
+error: the checks are tighter than bf16 noise on these models, and when each layer is fed
+an fp32 reference's input, an adapter's median error is within about 10% of a bf16
+merge's.
 
 .. list-table::
    :header-rows: 1
@@ -251,20 +256,23 @@ your own risk:
    * - Qwen3-Omni (``Thinker``), *not validated*
      - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
      - Attention only on MoE layers: an adapter on the routed experts or the router is
-       refused. Talker, code predictor and encoders take none. Not validated: on GPU the
-       checks cannot yet separate an adapter's error from the base rows' own difference
-       to the reference on this MoE model.
+       refused. Talker, code predictor and encoders take none. Not validated: this MoE
+       model's bf16 noise is about 10x a dense model's (its router flips experts on
+       near-ties), so even base rows, run in a larger batch than the reference's, miss
+       the check against merged weights.
    * - Qwen3-TTS (``Talker``), *not validated*
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``codec_head``
      - Not the text projection (runs before the step) or the CodePredictor. Not
-       validated: transformers has no reference for the talker, and the check against
-       merged weights fails on some adapter rows.
+       validated: both checks fail on some rows, but against an fp32 reference LoRA
+       gets every row's top-1 right while a bf16 merge of the adapter (the merged
+       check's yardstick) flips one.
    * - Chatterbox (``T3``), *not validated*
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``speech_head``
      - English and multilingual; a request's guidance (uncond) rows run its adapter too.
        Not Turbo (GPT-2's fused ``c_attn``), nor the conditioning encoder. Not
-       validated: one adapter row disagrees with transformers + PEFT (cosine 0.65,
-       reproducibly) while agreeing with merged weights; which side is wrong is open.
+       validated: the check against merged weights fails on some rows, and an early
+       layer's massive activation (its largest value grows from 8 to about 1200)
+       amplifies bf16 noise.
 
 Not yet: Whisper (its encoder node plans no step rows, and the decoder's cross-attention
 K/V run over encoder rows, so the usual ``q_proj`` / ``v_proj`` adapters cannot be served
