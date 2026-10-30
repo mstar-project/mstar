@@ -12,6 +12,7 @@ import queue
 import random
 import sys
 import threading
+import time
 from datetime import timedelta
 
 import pytest
@@ -47,15 +48,15 @@ class _Barrier:
 
     def __init__(self, n: int, timeout: float = 5.0):
         self._barrier = threading.Barrier(n, timeout=timeout)
-        self._flags = [True] * n
+        self._values = [0] * n
         self.calls = [0] * n
 
     def for_rank(self, rank: int):
-        def agree(flag: bool) -> bool:
+        def agree(value: int) -> int:
             self.calls[rank] += 1
-            self._flags[rank] = flag
+            self._values[rank] = value
             self._barrier.wait()
-            result = all(self._flags)
+            result = min(self._values)
             self._barrier.wait()
             return result
         return agree
@@ -246,6 +247,59 @@ def test_the_host_tier_follows_the_ingests_not_when_reads_land(tmp_path):
     settle_reads(slow)
     assert list(fast.store._adapters) == list(slow.store._adapters) == ["a2", "a3"]
     assert "a2" in slow.store and "a3" in slow.store
+
+
+def test_no_rank_waits_on_a_retry_once_a_load_has_failed(tmp_path):
+    """r is let through to fail once a2's read fails on both ranks; n, ingested before r's
+    admit, starts a retry on the follower. The leader keeps its failure for r, and the ranks
+    agree where their copies stand before any waits, so r fails at once on both."""
+    paths = _write_adapters(tmp_path, ("a1", "a2"))
+    barrier = _Barrier(2, timeout=5.0)
+    leader, follower = ranks = [
+        LoraAdapterPool(make_spec(paths, cpu_capacity=1), "cpu", rank=r, world_size=2,
+                        agree=barrier.for_rank(r), decides=r == 0)
+        for r in (0, 1)
+    ]
+    first, retry = threading.Event(), threading.Event()
+    for pool in ranks:
+        _fail_reads(pool, "a2", first, retry)
+        ingest(pool, "r", "a2")
+    runner = lora_runner(leader)
+    assert runner.admit_retrieve("r", "LLM", "decode").queued  # for its copy
+    first.set()
+    for pool in ranks:
+        settle_reads(pool)
+    assert runner.admit_waiting(lambda rid, node: None) == [("LLM", "r")]
+    for pool in ranks:
+        ingest(pool, "n", "a2")
+
+    def admit(pool):
+        s, c = step(["r"]), ctx(["r"])
+        outcome = pool.admit(s, c)
+        pool.rollback_admit(s, c)
+        return _verdict(outcome)
+
+    started = time.monotonic()
+    try:
+        (v1, v2), errors = _on_both(lambda: admit(leader), lambda: admit(follower))
+        assert not errors and v1 == v2 == ("load", ("r",))
+        assert time.monotonic() - started < 5, "a rank waited for the retry"
+    finally:
+        retry.set()
+
+
+def _fail_reads(pool: LoraAdapterPool, name: str, first: threading.Event, then: threading.Event) -> None:
+    """``name``'s reads on ``pool`` fail: the first once ``first`` is set, any later once
+    ``then`` is (or after 10 s)."""
+    read, tries = pool.store._read, []
+
+    def unreadable(adapter, path):
+        if adapter != name:
+            return read(adapter, path)
+        tries.append(adapter)
+        (first if len(tries) == 1 else then).wait(10)
+        raise OSError(f"{adapter} is unreadable")
+    pool.store._read = unreadable
 
 
 # --- the worker's admit fence --------------------------------------------------------------

@@ -90,6 +90,9 @@ logger = logging.getLogger(__name__)
 
 ZERO_SLOT = 0
 _LABEL = "lora"
+# where a rank's copy of an adapter stands at an admit, ordered so that the lowest across
+# a lockstep instance is the instance's answer
+_FAILED, _READING, _IN = 0, 1, 2
 
 
 @dataclass(slots=True)
@@ -256,8 +259,8 @@ class LoraAdapterPool(Resource):
             # the base linears split over the TP group
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size
             if joint.world_size > 1:
-                def agree(flag: bool) -> bool:
-                    return bool(joint.agree([int(flag)])[0])
+                def agree(value: int) -> int:
+                    return joint.agree([value])[0]
                 # the instance's leader picks every batch; the others run what it picked
                 decides = joint.rank == 0
         return cls(
@@ -273,13 +276,14 @@ class LoraAdapterPool(Resource):
         world_size: int = 1,
         backend: LoraBackend | None = None,
         dtype: torch.dtype | None = None,
-        agree: Callable[[bool], bool] | None = None,
+        agree: Callable[[int], int] | None = None,
         decides: bool = True,
     ):
         """``dtype`` is the nodes' compute dtype, which the slot weights take unless the
-        spec names one. ``agree`` ANDs a flag across the pool's lockstep instance (a
-        collective); None on a single rank. ``decides`` says whether this rank chooses
-        batches, and so admits requests (``ask``): False on a lockstep instance's followers."""
+        spec names one. ``agree`` takes the lowest of a value across the pool's lockstep
+        instance (a collective); None on a single rank. ``decides`` says whether this rank
+        chooses batches, and so admits requests (``ask``): False on a lockstep instance's
+        followers."""
         self.spec = spec
         self._device = torch.device(device)
         self.dtype = spec.dtype or dtype
@@ -738,6 +742,8 @@ class LoraAdapterPool(Resource):
         On a lockstep instance every rank reaches the agreement for the same misses in
         the same order, into the same slots: ``admit`` picked them all from the slot
         table at its start, which is the same on every rank (see the module docstring).
+        The ranks agree where their copies stand before any waits for one, so no rank
+        holds the instance on a read once another rank's failure has decided the load.
         """
         with self._lock:
             served = self._serving.get(name) or self._retiring.get(name)
@@ -751,21 +757,25 @@ class LoraAdapterPool(Resource):
                 error = None if name in self._reads else self._read_errors.get(name)
                 if error is None:
                     pending = self._read_in(name)
-        if pending is not None:
-            try:
-                loaded = pending.result()
-            except Exception as exc:  # a bad checkpoint fails the request, not the worker
-                logger.error("LoRA adapter %s failed to load: %s", name, exc)
-                error = describe_load_error(exc)
         # all ranks install it or none does: a rank refusing alone would leave the rest
         # of its instance waiting in the forward's collectives
-        if self._agree is not None and not self._agree(error is None):
-            error = error or "it failed to load on another rank of its instance"
-        if error is not None:
+        state = self._agreed(_FAILED if error is not None else _READING if pending is not None else _IN)
+        if state == _READING:
+            if pending is not None:
+                try:
+                    loaded = pending.result()
+                except Exception as exc:  # a bad checkpoint fails the request, not the worker
+                    logger.error("LoRA adapter %s failed to load: %s", name, exc)
+                    error = describe_load_error(exc)
+            state = self._agreed(_FAILED if error is not None else _IN)
+        if state == _FAILED:
             return AdmitOutcome(
                 ok=False,
                 reason=AdmitRuntimeError(
-                    message=f"LoRA adapter {name!r} failed to load: {error}",
+                    message=(
+                        f"LoRA adapter {name!r} failed to load: "
+                        f"{error or 'it failed to load on another rank of its instance'}"
+                    ),
                     request_ids=frozenset(rids),
                 ),
             )
@@ -782,6 +792,11 @@ class LoraAdapterPool(Resource):
                     self._take(rid, slot)
         return ADMIT_OK
 
+    def _agreed(self, state: int) -> int:
+        """The lowest ``state`` across the lockstep instance (a collective every rank makes
+        at the same point), or this rank's own on a single rank."""
+        return state if self._agree is None else self._agree(state)
+
     # Host tier
 
     def _executor(self) -> ThreadPoolExecutor:
@@ -797,8 +812,11 @@ class LoraAdapterPool(Resource):
         adapters they name, the same on every rank, never from when a read lands. So a
         follower's read of an adapter always starts at the ingest the leader's does,
         and the leader never reserves on a copy a follower dropped long ago. An adapter
-        a live request names is never dropped."""
-        retry = self._read_errors.pop(name, None) is not None
+        a live request names is never dropped.
+
+        A failed read is retried, except while a row reserved on that failure waits for
+        the admit that fails it, which would otherwise wait for the retry."""
+        retry = name not in self._reserved_count and self._read_errors.pop(name, None) is not None
         if self._store.hold(name, keep=self._live):
             loaded = self._loaded.pop(name, None)
             if loaded is not None:
