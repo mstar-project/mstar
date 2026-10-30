@@ -3428,6 +3428,8 @@ class Worker:
             _pp_stage("route_and_send")
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+            engine.after_output_copy(batch_N.node_batch)
+            _pp_stage("after_output_copy")
             return
         stored, route_output, signals = self._store_and_route(
             batch_N, outputs, rids, walks, rid_walk_idx, cpu_outputs,
