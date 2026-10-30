@@ -17,6 +17,7 @@ torch = pytest.importorskip("torch")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.distributed.communication import WorkerParallelGroups  # noqa: E402
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.base import Resource  # noqa: E402
@@ -340,6 +341,26 @@ def test_a_pre_plan_leaves_the_batch_to_the_main_thread(drop):
         engine.prepare_inputs(batch)
         engine.exec_and_postprocess(batch)
         assert list(batch.request_ids) == [1, 2, 3]
+
+
+class _Captured(_Toy):
+    """Capture sizes past the cap, which doesn't cap eager steps."""
+
+    def get_accelerator_graph_configs(self, device, tp_world_size=1):
+        return [BatchedAcceleratorGraphConfig(
+            capture_graph_walk=ROWS_WALK,
+            single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+            capture_batch_sizes=[8, 16, 32], caps_eager_batch_size=False, compile=False,
+        )]
+
+
+@pytest.mark.parametrize("cap,rows", [(24, 32), (16, 16), (40, 40)])
+def test_rows_hold_the_capture_a_capped_step_pads_to(cap, rows):
+    engine = _engine("cpu", sub=_Captured(cap=cap))
+    space = engine._rows[NODE].space(ROWS_WALK)
+    assert space.max_rows == rows
+    with pytest.raises(ValueError, match="the space holds"):
+        space.buffers[0].rows(rows + 1)
 
 
 def test_a_resource_that_cannot_keep_rows_refuses_the_walk_at_startup():

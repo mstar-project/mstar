@@ -53,6 +53,9 @@ class RowBuffer:
 
     def rows(self, n: int) -> torch.Tensor:
         """The first ``n`` rows: what a step of ``n`` requests reads."""
+        if n > self.space.max_rows:
+            # a slice would silently hand the step fewer rows
+            raise ValueError(f"{self}: a step of {n} rows, but the space holds {self.space.max_rows}")
         return self.device[:n]
 
     def row_ptr(self, slot: int) -> int:
