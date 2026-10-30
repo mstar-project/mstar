@@ -283,6 +283,13 @@ cosyvoice3 = [
     "transformers",
 ]
 
+# CosyVoice3's text normalization as the reference frontend runs it: wetext's
+# grammars (fetched from ModelScope on first start). Without it, built-in rules
+# read English numbers, money, dates and times.
+cosyvoice3_wetext = [
+    "wetext==0.0.4",
+]
+
 orpheus = [
     "einops",
     "flashinfer-python==0.7.2",

@@ -228,7 +228,8 @@ def test_process_prompt_modes_and_token_limits(model):
         "one two three", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="ref words"
     )
     tok = _Tokenizer()
-    expected = torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}ref words"), tok("one two three")])
+    # the text frontend ends the text on a stop, as the reference's splitter does
+    expected = torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}ref words"), tok("one two three.")])
     assert set(zero.new_input_tensors) == {TEXT_INPUTS, "ref_audio"}
     assert torch.equal(zero.new_input_tensors[TEXT_INPUTS][0], expected)
     assert zero.new_input_tensors["ref_audio"][0].shape == clip.shape
@@ -243,7 +244,7 @@ def test_process_prompt_modes_and_token_limits(model):
     cross = model.process_prompt("one two", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
     cross_ids = cross.new_input_tensors[TEXT_INPUTS][0]
     assert cross.metadata[PROMPT_MODE] == "cross_lingual"
-    assert torch.equal(cross_ids, torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), tok("one two")]))
+    assert torch.equal(cross_ids, torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), tok("one two.")]))
     assert model.resolve_mode({}, uploaded=True) == ("cross_lingual", None)
 
     instruct = model.process_prompt(
