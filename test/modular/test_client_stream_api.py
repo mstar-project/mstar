@@ -555,15 +555,24 @@ def test_a_deployment_lowers_a_streams_max_items(tmp_path):
 
 
 class _TwoStreams(_ListeningModel):
-    """``audio_in`` and ``video_in``; a file that names no stream goes to video_in."""
+    """``audio_in`` into Ear and ``video_in`` into Eye; a file that names no
+    stream goes to video_in."""
 
     def get_partition_topology(self):
-        return PartitionTopology(partitions=["Ear"], connections=[
-            Connection(from_partition=CLIENT, to_partition="Ear", edge_name=name,
+        return PartitionTopology(partitions=["Ear", "Eye"], connections=[
+            Connection(from_partition=CLIENT, to_partition=partition, edge_name=name,
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
                        limits=ClientStreamLimits(max_items=10))
-            for name in ("audio_in", "video_in")
+            for name, partition in (("audio_in", "Ear"), ("video_in", "Eye"))
         ])
+
+    def get_graph_walk_graphs(self):
+        return {walk: GraphNode(name=node, input_names=[name], consumes_stream=True, outputs=[])
+                for walk, node, name in (("listen", "ear", "audio_in"), ("look", "eye", "video_in"))}
+
+    def get_partitions(self):
+        return [PartitionDefinition(name="Ear", graph_walks={"listen"}, initial_walk="listen"),
+                PartitionDefinition(name="Eye", graph_walks={"look"}, initial_walk="look")]
 
     def process_stream_chunk(self, chunk):
         self.chunk_calls.append(chunk)
@@ -600,6 +609,17 @@ def test_items_the_model_routes_to_an_ended_stream_are_late_and_neither_charged_
     ]
     assert wt._client_calls["r"].charged == {"video_in": 1, "audio_in": 1}
     assert list(tmp_path.iterdir()) == []
+
+
+def test_ends_that_reach_one_rank_together_each_name_their_partition():
+    """Two streams into two partitions, ended at once, with one rank
+    consuming both: one end per partition, so neither names the other's."""
+    wt, sent, _tm = _thread(_TwoStreams())
+    _open(wt, ends=frozenset({"audio_in", "video_in"}))
+    _route(wt, audio_in=["w0"], video_in=["w0"])
+
+    ends = sorted((b.partition_name, b.producer_done_items) for b in _bodies(sent, WorkerMessageType.INPUT_SIGNALS))
+    assert ends == [("Ear", {"audio_in": 0}), ("Eye", {"video_in": 0})]
 
 
 class _RecordingPreprocess:

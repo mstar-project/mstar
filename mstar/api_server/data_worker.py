@@ -943,16 +943,17 @@ class PreprocessWorkerThread:
 
     def _send_ends(self, request_id: str, call: ClientCall, names: Collection[str]) -> None:
         """Each rank of ``names``' consumers gets one ``producer_done`` from
-        ``CLIENT`` naming the streams it ends there, with the items each
-        carried, on the FIFO its items took, so it can't overtake them."""
-        per_rank: dict[str, dict[str, int]] = {}
+        ``CLIENT`` per partition, naming the streams it ends there, with the
+        items each carried, on the FIFO its items took, so it can't overtake
+        them."""
+        ends: dict[tuple[str, str], dict[str, int]] = {}
         for name in sorted(names):
+            partition = self._client_streams[name].partition
             for worker in call.route.workers.get(name, ()):
-                per_rank.setdefault(worker, {})[name] = call.items_sent.get(name, 0)
-        for worker, counts in per_rank.items():
+                ends.setdefault((worker, partition), {})[name] = call.items_sent.get(name, 0)
+        for (worker, partition), counts in ends.items():
             self.communicator.send(worker, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
-                request_id=request_id, inputs=[], request_info=None,
-                partition_name=self._client_streams[next(iter(counts))].partition,
+                request_id=request_id, inputs=[], request_info=None, partition_name=partition,
                 producer_done={CLIENT}, producer_done_items=counts,
             )))
 
