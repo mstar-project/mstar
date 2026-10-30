@@ -543,6 +543,17 @@ def test_a_chat_that_asks_for_a_tool_call_is_a_400_with_the_adapters_message(tmp
     assert not server.submitted, "the chat reached the model, which answers in plain text"
 
 
+def test_a_chat_with_a_stop_string_is_a_400(tmp_path):
+    """The native chat route ends a reply at a stop string (#813); the bridge streams the
+    model's text as it comes and applies none, so a chat that sends one is refused rather
+    than served past its stop."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    with pytest.raises(ValueError) as refused:
+        _chat_through_bridge(server, {"stop": ["\n"]}, "glm52")
+    assert (refused.value.code, refused.value.message) == (400, "stop is not supported on this endpoint")
+    assert not server.submitted
+
+
 def test_the_tool_fields_clients_send_by_default_reach_the_model(tmp_path):
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     _chat_through_bridge(server, {"tools": [], "tool_choice": "auto"})
