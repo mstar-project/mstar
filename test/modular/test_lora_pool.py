@@ -682,6 +682,34 @@ def test_a_request_whose_read_fails_fails_without_waiting_for_a_slot(adapters):
     assert isinstance(reason, AdmitRuntimeError) and reason.request_ids == {"r2"}
 
 
+def test_a_request_let_through_on_a_failed_read_takes_no_slot_a_counted_one_needs(adapters):
+    """rB is counted on the last slot before a2's read fails and r2 is let through, slots or
+    not. In a step that lists r2 ahead of rB, r2 fails and rB is not refused for the slot."""
+    _, paths = adapters
+    pool = make_pool(paths, max_slots=2, cpu_capacity=1)
+    runner = lora_runner(pool)
+    gate, read = threading.Event(), pool.store._read
+
+    def unreadable(name, path):
+        if name == "a2":
+            gate.wait(10)
+            raise OSError("a2 is unreadable")
+        return read(name, path)
+    pool.store._read = unreadable
+    for rid, name in [("r1", "a1"), ("rB", "a3")]:
+        ingest(pool, rid, name)
+    settle_reads(pool)
+    assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
+    assert admitted(runner, "rB")
+    ingest(pool, "r2", "a2")
+    assert runner.admit_retrieve("r2", "LLM", "decode").queued
+    gate.set()
+    settle_reads(pool)
+    assert runner.admit_waiting(_nothing_published) == [("LLM", "r2")]
+    reason = run_step(pool, ["r1", "r2", "rB"]).reason
+    assert isinstance(reason, AdmitRuntimeError) and reason.request_ids == {"r2"}
+
+
 def test_a_request_on_a_resident_adapter_whose_read_failed_still_counts_a_slot(adapters):
     """a1 sits in an unheld slot, out of the host tier, and its read fails: r may still run
     on that slot, so it is counted like any request, not let through, which would promise

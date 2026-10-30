@@ -1062,8 +1062,9 @@ and the copy wait is at most one read, which starts at the request's ingest. A s
 reserved for a request only once its adapter's host copy is in (even for an adapter
 resident in a slot, which a miss admitted ahead may evict), so its admit does not wait on a
 read there; a request whose adapter failed to read, and is in no slot, is let through at
-once, and its admit fails it. A reservation counts slots and pins none: which slot an
-admit takes follows from the slot table alone. An
+once, and its admit fails it before handing out any slot, so it takes none that a counted
+request needs. A reservation counts slots and pins none: which slot an admit takes follows
+from the slot table alone. An
 adapter with nothing for a pool's targets (a text-only adapter on a vision tower's pool)
 takes no slot there and runs no delta (its steps can replay the base-only capture): the
 pool knows it from the file's header at startup, or from a runtime load's read, and its
@@ -1093,8 +1094,9 @@ either side of a teardown. Which adapters are resident, which slot a miss takes 
 whether an admit refuses then follow from the same state on every rank. Reading an
 adapter from disk is the one step that can fail on one rank only, so the ranks agree where
 each one's copy stands (in, still being read, or failed) before any waits for one, and
-every rank installs it or refuses the request: one gloo all-reduce per adapter installed, a
-second when a rank was still reading, none in steady state. Files are read on the pool's
+every rank installs it or refuses the request: one gloo all-reduce per admit with an
+adapter to install (all of its misses at once), a second when a rank was still reading,
+none in steady state. Files are read on the pool's
 own reader thread: every rank starts reading an adapter into the host tier when it ingests
 a request that names it, the leader reserves a slot for the request only once its copy is
 in, and an admit never reads a file itself. A follower whose read is still in flight

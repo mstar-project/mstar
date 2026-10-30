@@ -24,10 +24,10 @@ with every other resource that asks, so it holds no KV pages meanwhile and the r
 running never lose a step to it. A reservation counts slots and pins none: the slot an
 admit picks follows from the slot table alone, and the reservations never promise more
 slots than exist, so every reserved row finds one at its admit. A row whose adapter
-failed to read and is in no slot is the exception: it is let through at once, to fail at
-its admit, which fails it even with no slot free. Only the rank that chooses batches
-decides (a lockstep instance's leader), so no other rank keeps reservations; the admit
-refusal stays as a backstop.
+failed to read and is in no slot is the exception: it is let through at once, and its
+admit fails it before handing out any slot, so it takes none that a counted row needs.
+Only the rank that chooses batches decides (a lockstep instance's leader), so no other
+rank keeps reservations; the admit refusal stays as a backstop.
 
 A model with LoRA specs on several nodes (an LLM and its vision encoder) has a pool per
 node, and each admits only its own node's rows. A request holds a slot in each until it
@@ -111,6 +111,29 @@ class SlotState:
     # Admits, not wall clock or commits: every rank of a lockstep instance releases a
     # request between the same two admits, while a commit may land on either side of it.
     last_used_step: int = -1
+
+
+class _Copy(NamedTuple):
+    """Where a rank's host copy of an adapter stands at an admit: in, still being read, or
+    failed to read."""
+
+    loaded: LoadedAdapter | None = None
+    pending: Future | None = None
+    error: str | None = None
+
+    @property
+    def state(self) -> int:
+        return _FAILED if self.error is not None else _READING if self.pending is not None else _IN
+
+    def landed(self, name: str) -> "_Copy":
+        """This copy once its read is done, waiting for it outside the pool's lock."""
+        if self.pending is None:
+            return self
+        try:
+            return _Copy(loaded=self.pending.result())
+        except Exception as exc:  # a bad checkpoint fails the request, not the worker
+            logger.error("LoRA adapter %s failed to load: %s", name, exc)
+            return _Copy(error=describe_load_error(exc))
 
 
 class _Served(NamedTuple):
@@ -268,8 +291,7 @@ class LoraAdapterPool(Resource):
             # the base linears split over the TP group
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size
             if joint.world_size > 1:
-                def agree(value: int) -> int:
-                    return joint.agree([value])[0]
+                agree = joint.agree  # MIN
                 # the instance's leader picks every batch; the others run what it picked
                 decides = joint.rank == 0
         return cls(
@@ -285,11 +307,11 @@ class LoraAdapterPool(Resource):
         world_size: int = 1,
         backend: LoraBackend | None = None,
         dtype: torch.dtype | None = None,
-        agree: Callable[[int], int] | None = None,
+        agree: Callable[[list[int]], list[int]] | None = None,
         decides: bool = True,
     ):
         """``dtype`` is the nodes' compute dtype, which the slot weights take unless the
-        spec names one. ``agree`` takes the lowest of a value across the pool's lockstep
+        spec names one. ``agree`` takes the lowest of each value across the pool's lockstep
         instance (a collective); None on a single rank. ``decides`` says whether this rank
         chooses batches, and so admits requests (``ask``): False on a lockstep instance's
         followers."""
@@ -574,10 +596,7 @@ class LoraAdapterPool(Resource):
                 return None
             error = self._read_errors.get(name)
             if error is not None and name not in self._resident and name not in self._store:
-                return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                    message=f"LoRA adapter {name!r} failed to load: {error}",
-                    request_ids=frozenset({rid}),
-                ))
+                return _load_failed({name: error}, [rid])
         return ASKS
 
     def reserve(self, rid, node_name, graph_walk, published) -> int | None:
@@ -654,8 +673,11 @@ class LoraAdapterPool(Resource):
 
         Every miss's slot is picked in that same locked section, before any wait: what
         is picked follows only from the slot table at the admit's start, which is the
-        same on every rank of a lockstep instance, whatever lands while a miss waits
-        for its copy or for the load agreement.
+        same on every rank of a lockstep instance, whatever lands while a rank waits for
+        its copy or for the load agreement. The ranks then agree, in one collective,
+        where each miss's copy stands, before any rank waits for one. Rows whose adapter
+        failed to read on any rank fail before any slot is handed out, so a row let
+        through on a failed read never takes the slot a counted row was promised.
         """
         if ctx.capture:
             return ADMIT_OK
@@ -679,44 +701,49 @@ class LoraAdapterPool(Resource):
                     self._take(rid, slot)
             if not misses:
                 return ADMIT_OK
-            reserved: list[int] = []
-            full = None
-            for name, rids in misses.items():
-                slot = self._pick_slot(exclude=reserved)
-                if slot is None:
-                    full = (name, rids)
-                    break
-                reserved.append(slot)
-        if full is not None:
-            # no slot is left for it: on every rank alike, before anything is installed
-            return self._refuse_full(*full)
-        for (name, rids), slot in zip(misses.items(), reserved, strict=True):
-            outcome = self._load_miss(name, rids, slot)
-            if not outcome.ok:
-                return outcome
-        return ADMIT_OK
-
-    def _refuse_full(self, name: str, rids: list) -> AdmitOutcome:
-        """The step's refusal when no slot is left for ``name``'s rows, or their failure if
-        its read failed on any rank: admission lets such rows through at once, so they do
-        not wait for a slot only to fail. Called without the lock; every rank of a lockstep
-        instance reaches it for the same miss, since all pick from the same slot table."""
-        with self._lock:
-            error = None if name in self._store else self._read_errors.get(name)
-        if self._agreed(_IN if error is None else _FAILED) == _FAILED:
-            return _load_failed(name, rids, error)
-        return AdmitOutcome(
-            ok=False,
-            reason=AllocationFailed(
-                message=(
-                    f"LoRA pool is full: all {self.spec.max_slots} slots hold "
-                    f"adapters of running requests, none free for {name!r}"
+            slots: list[int] = []
+            while len(slots) < len(misses) and (slot := self._pick_slot(exclude=slots)) is not None:
+                slots.append(slot)
+            copies = [self._copy_of(name) for name in misses]
+        # all ranks install an adapter or none does: a rank refusing alone would leave the
+        # rest of its instance waiting in the forward's collectives
+        states = self._agreed([copy.state for copy in copies])
+        if _READING in states and _FAILED not in states and len(slots) == len(misses):
+            # a rank waits for its read only for a step that installs, and agrees again
+            copies = [copy.landed(name) for copy, name in zip(copies, misses, strict=True)]
+            states = self._agreed([copy.state for copy in copies])
+        rows = list(misses.items())
+        failed = [i for i, state in enumerate(states) if state == _FAILED]
+        if failed:
+            return _load_failed({rows[i][0]: copies[i].error for i in failed},
+                                [rid for i in failed for rid in rows[i][1]])
+        if len(slots) < len(rows):
+            name, rids = rows[len(slots)]
+            return AdmitOutcome(
+                ok=False,
+                reason=AllocationFailed(
+                    message=(
+                        f"LoRA pool is full: all {self.spec.max_slots} slots hold "
+                        f"adapters of running requests, none free for {name!r}"
+                    ),
+                    pages_short=1,
+                    label=_LABEL,
+                    request_id=rids[0],
                 ),
-                pages_short=1,
-                label=_LABEL,
-                request_id=rids[0],
-            ),
-        )
+            )
+        with self._lock:
+            for (name, rids), slot, copy in zip(rows, slots, copies, strict=True):
+                if copy.loaded.rank == 0:
+                    # nothing for this spec: the same file, digest-pinned, on every rank, so
+                    # every rank leaves the slot it picked as it was
+                    self._empty.add(name)
+                    slot = ZERO_SLOT
+                else:
+                    self._install(slot, copy.loaded)
+                for rid in rids:
+                    if rid in self._awaiting:
+                        self._take(rid, slot)
+        return ADMIT_OK
 
     def rollback_admit(self, step: LoraStep, ctx: StepContext) -> None:
         """Give back the slots this step's admit took. An adapter it loaded stays resident
@@ -764,59 +791,23 @@ class LoraAdapterPool(Resource):
         # frees the slot its reservation counted
         self._admit_taken[rid] = (slot, self._unreserve(rid, frees=slot == ZERO_SLOT))
 
-    def _load_miss(self, name: str, rids: list, slot: int) -> AdmitOutcome:
-        """Load ``name`` into ``slot`` (picked by ``admit``) for ``rids``. Called without
-        the lock: waiting for a host copy and the load agreement both happen outside it,
-        so the main thread's ingests and removes never wait on a file or a collective.
+    def _copy_of(self, name: str) -> _Copy:
+        """Caller holds the lock. Where this rank's host copy of ``name`` stands."""
+        served = self._serving.get(name) or self._retiring.get(name)
+        if served is None:
+            return _Copy(error=f"{name!r} is not served")
+        loaded = self._store.get(name)
+        if loaded is not None:
+            return _Copy(loaded=loaded)
+        # the leader reserved once its copy was in (or its read failed); a follower may still
+        # be reading its own, or (rarely) start the read here
+        error = None if name in self._reads else self._read_errors.get(name)
+        return _Copy(error=error) if error is not None else _Copy(pending=self._read_in(name))
 
-        On a lockstep instance every rank reaches the agreement for the same misses in
-        the same order, into the same slots: ``admit`` picked them all from the slot
-        table at its start, which is the same on every rank (see the module docstring).
-        The ranks agree where their copies stand before any waits for one, so no rank
-        holds the instance on a read once another rank's failure has decided the load.
-        """
-        with self._lock:
-            served = self._serving.get(name) or self._retiring.get(name)
-            loaded = self._store.get(name)
-            pending, error = None, None
-            if served is None:
-                error = f"{name!r} is not served"
-            elif loaded is None:
-                # the leader reserved once its copy was in (or its read failed); a follower
-                # may still be reading its own, or (rarely) start the read here
-                error = None if name in self._reads else self._read_errors.get(name)
-                if error is None:
-                    pending = self._read_in(name)
-        # all ranks install it or none does: a rank refusing alone would leave the rest
-        # of its instance waiting in the forward's collectives
-        state = self._agreed(_FAILED if error is not None else _READING if pending is not None else _IN)
-        if state == _READING:
-            if pending is not None:
-                try:
-                    loaded = pending.result()
-                except Exception as exc:  # a bad checkpoint fails the request, not the worker
-                    logger.error("LoRA adapter %s failed to load: %s", name, exc)
-                    error = describe_load_error(exc)
-            state = self._agreed(_FAILED if error is not None else _IN)
-        if state == _FAILED:
-            return _load_failed(name, rids, error)
-        with self._lock:
-            if loaded.rank == 0:
-                # nothing for this spec: the same file, digest-pinned, on every rank, so
-                # every rank leaves the slot it picked as it was
-                self._empty.add(name)
-                slot = ZERO_SLOT
-            else:
-                self._install(slot, loaded)
-            for rid in rids:
-                if rid in self._awaiting:
-                    self._take(rid, slot)
-        return ADMIT_OK
-
-    def _agreed(self, state: int) -> int:
-        """The lowest ``state`` across the lockstep instance (a collective every rank makes
-        at the same point), or this rank's own on a single rank."""
-        return state if self._agree is None else self._agree(state)
+    def _agreed(self, states: list[int]) -> list[int]:
+        """The lowest of each of ``states`` across the lockstep instance (a collective every
+        rank makes at the same point), or this rank's own on a single rank."""
+        return states if self._agree is None else self._agree(states)
 
     # Host tier
 
@@ -1088,14 +1079,16 @@ class LoraAdapterPool(Resource):
         self._current = self._enclosing = None
 
 
-def _load_failed(name: str, rids, error: str | None) -> AdmitOutcome:
-    """Fails ``rids``: ``name`` failed to load, here with ``error`` or on another rank."""
+def _load_failed(errors: dict[str, str | None], rids) -> AdmitOutcome:
+    """Fails ``rids``: each adapter in ``errors`` failed to load, here with that error or on
+    another rank."""
     return AdmitOutcome(
         ok=False,
         reason=AdmitRuntimeError(
-            message=(
+            message="; ".join(
                 f"LoRA adapter {name!r} failed to load: "
                 f"{error or 'it failed to load on another rank of its instance'}"
+                for name, error in errors.items()
             ),
             request_ids=frozenset(rids),
         ),

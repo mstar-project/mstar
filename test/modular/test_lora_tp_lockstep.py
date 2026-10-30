@@ -26,12 +26,11 @@ except ImportError:  # collected without package context
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, settle_reads, step, write_adapter
 
+from mstar.engine.resources.lora import LoraStep  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     ADMIT_OK,
-    AdmitOutcome,
     AdmitRuntimeError,
-    AllocationFailed,
 )
 
 ADAPTERS = ("a1", "a2", "a3", "a4")
@@ -44,19 +43,19 @@ def _write_adapters(root, names):
 
 
 class _Barrier:
-    """``agree`` for ranks in threads: a MIN over a barrier; a missing peer raises."""
+    """``agree`` for ranks in threads: an elementwise MIN over a barrier; a missing peer raises."""
 
     def __init__(self, n: int, timeout: float = 5.0):
         self._barrier = threading.Barrier(n, timeout=timeout)
-        self._values = [0] * n
+        self._values: list[list[int]] = [[] for _ in range(n)]
         self.calls = [0] * n
 
     def for_rank(self, rank: int):
-        def agree(value: int) -> int:
+        def agree(values: list[int]) -> list[int]:
             self.calls[rank] += 1
-            self._values[rank] = value
+            self._values[rank] = list(values)
             self._barrier.wait()
-            result = min(self._values)
+            result = [min(column) for column in zip(*self._values, strict=True)]
             self._barrier.wait()
             return result
         return agree
@@ -305,29 +304,12 @@ def _fail_reads(pool: LoraAdapterPool, name: str, first: threading.Event, then: 
 # --- the worker's admit fence --------------------------------------------------------------
 
 class _PicksSlotPerMiss(LoraAdapterPool):
-    """Mechanism off: each miss picks its slot after the previous miss's agreement."""
+    """Mechanism off: each row is admitted on its own, so each miss picks its slot after the
+    previous miss's agreement."""
 
     def admit(self, step, ctx):
-        if ctx.capture:
-            return ADMIT_OK
-        self._admits += 1
-        misses: dict[str, list] = {}
-        with self._lock:
-            for seg in step.segments or ():
-                if seg.request_id in self._awaiting and seg.span > 0:
-                    name = self._adapter_of[seg.request_id]
-                    slot = self._resident.get(name)
-                    if slot is None:
-                        misses.setdefault(name, []).append(seg.request_id)
-                    else:
-                        self._take(seg.request_id, slot)
-        for name, rids in misses.items():
-            with self._lock:
-                slot = self._pick_slot()
-            if slot is None:
-                return AdmitOutcome(ok=False, reason=AllocationFailed(
-                    message="full", pages_short=1, label="lora", request_id=rids[0]))
-            outcome = self._load_miss(name, rids, slot)
+        for seg in step.segments:
+            outcome = super().admit(LoraStep(segments=(seg,)), ctx)
             if not outcome.ok:
                 return outcome
         return ADMIT_OK
@@ -358,15 +340,16 @@ def _on_both(*fns):
 
 @pytest.mark.parametrize("pool_cls,splits", [(LoraAdapterPool, False), (_PicksSlotPerMiss, True)])
 def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, pool_cls, splits):
-    """A follower's slow read holds the leader's admit in the load agreement while a
-    teardown lands on the leader alone. Every miss's slot is picked when the admit starts,
-    so the second miss cannot see the freed slot and both ranks refuse the step alike."""
+    """A teardown lands on the leader alone inside the load agreement of a two-miss admit,
+    while a follower's read of a2 is still in flight. Every miss's slot is picked when the
+    admit starts, so the second miss cannot see the freed slot and both ranks refuse the
+    step alike, before the follower waits for its read."""
     paths = _write_adapters(tmp_path, ADAPTERS)
     barrier = _Barrier(2, timeout=2.0)
     mid_admit: list = []  # a teardown the leader's main thread lands once, mid-admit
 
-    def leader_agree(flag):
-        agreed = barrier.for_rank(0)(flag)
+    def leader_agree(states):
+        agreed = barrier.for_rank(0)(states)
         while mid_admit:
             remove = threading.Thread(target=mid_admit.pop())
             remove.start()
@@ -408,8 +391,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
         return verdict
 
     (v1, v2), errors = _on_both(lambda: admit(leader, ["rA", "rB"]), follower_step)
-    while mid_admit:  # no agreement ran: the leader lands it once the admit settles
-        mid_admit.pop()()
+    assert not mid_admit  # landed inside the leader's agreement
     if splits:
         assert errors or v1 != v2 or _slots(leader) != _slots(follower)
         return
