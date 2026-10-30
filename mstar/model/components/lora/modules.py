@@ -196,6 +196,7 @@ class _Found(NamedTuple):
     path: str
     layer: int
     target: LoraTarget
+    role: str  # what `rows` / `names` match
 
 
 _EXCLUDED = "excluded by the model's LoRA declaration"
@@ -236,7 +237,9 @@ def module_lora_spec(
     cannot drift from loading. ``adapter_stacked_params`` adds rules only adapters need
     (Tinker's split projections). Module paths, ``rows`` / ``names`` keys and ``exclude``
     / ``deferred`` patterns are relative to ``root``; a role is the path below a stack
-    layer (``self_attn.qkv_proj``), or the whole path for a module outside the stacks.
+    layer (``self_attn.qkv_proj``), or the whole path for a module outside the stacks. A
+    stack whose entries differ in shape at a role gives each entry a target of its own,
+    named by its path, which ``rows`` still matches by the role (``names`` cannot name it).
 
     * ``rows``: role (fnmatch) -> ``PER_SEGMENT`` or a fold ``k``, for a target that sees
       other rows than the step's tokens (an LM head after the last-token select, a merger
@@ -310,16 +313,18 @@ def module_lora_spec(
             continue
         found = _in_stack(path, stacks)
         if found is None:
-            groups[(None, path)].append(_Found(path, 0, target))
+            groups[(None, path)].append(_Found(path, 0, target, path))
         else:
             stack, layer, role = found
-            groups[(stack, role)].append(_Found(path, layer, target))
+            groups[(stack, role)].append(_Found(path, layer, target, role))
     # a stack's entries that differ in shape at a role (UNet levels, vision stages) are
     # not one layer's target: each is a target of its own
     mixed = [k for k, fs in groups.items() if k[0] is not None and any(f.target != fs[0].target for f in fs)]
     for key in mixed:
+        if key[1] in names:
+            raise ValueError(f"`names` names role {key[1]!r}, whose entries differ in shape and are each a target")
         for f in groups.pop(key):
-            groups[(None, f.path)].append(_Found(f.path, 0, f.target))
+            groups[(None, f.path)].append(f._replace(layer=0))
     unmatched = [p for p in excluded if not any(_match(w, [p]) for w in walked)]
     if unmatched:
         raise ValueError(f"`exclude` patterns {unmatched} match no LoRA-capable module of {type(root).__name__}")
@@ -329,23 +334,24 @@ def module_lora_spec(
     stacked = [f.layer for (stack, _), found in groups.items() if stack is not None for f in found]
     num_layers = max(stacked, default=0) + 1
     target_names = _target_names(list(groups), names)
-    unused = set(names) - {role for _, role in groups}
+    roles = {found[0].role for found in groups.values()}
+    unused = set(names) - roles
     if unused:
         raise ValueError(f"`names` names roles {sorted(unused)} that {type(root).__name__} does not have")
 
     targets: dict[str, LoraTarget] = {}
     bindings: dict[str, LoraModuleRef] = {}
     for key, found in groups.items():
-        stack, role = key
+        stack = key[0]
         first = found[0].target
         layers = tuple(sorted(f.layer for f in found))
         if stack is not None and layers == tuple(range(num_layers)):
             layers = None
         name = target_names[key]
-        targets[name] = dataclasses.replace(first, layers=layers, **_row_fields(rows, role))
+        targets[name] = dataclasses.replace(first, layers=layers, **_row_fields(rows, found[0].role))
         for f in found:
             bindings[f.path] = LoraModuleRef(name, f.layer)
-    unmatched = [p for p in rows if not any(fnmatch.fnmatchcase(r, p) for _, r in groups)]
+    unmatched = [p for p in rows if not any(fnmatch.fnmatchcase(r, p) for r in roles)]
     if unmatched:
         raise ValueError(f"`rows` patterns {unmatched} match no LoRA target role")
     deferred_paths = frozenset(p for p in bindings if _match(p, deferred) is not None)

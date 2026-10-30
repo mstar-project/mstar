@@ -1046,7 +1046,7 @@ placed exactly as weights are.
   or ``Sequential`` in the path, whatever it is named; ``layers`` set where a role is on
   some layers only), named by the role's last component (``names`` overrides), plus one per
   other module: one outside the stacks, or at a role whose entries differ in shape (UNet
-  levels, vision stages).
+  levels, vision stages), which is named by its path but keeps its role for ``rows``.
 - **What the model states.** Only what modules cannot know. ``rows``: a target that sees
   one row per segment (``PER_SEGMENT``: a head after the last-token select) or one per
   ``k`` folded tokens. ``exclude`` (with a reason): modules called outside the planned

@@ -535,8 +535,11 @@ def test_a_module_list_whose_entries_differ_in_shape_gives_each_entry_a_target()
         root = nn.Module()
         root.stages = nn.ModuleList(
             _with(nn.Module(), lambda m, d=d: setattr(m, "fc", nn.Linear(d, d))) for d in (HIDDEN, 2 * HIDDEN))
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", rows={"fc": PER_SEGMENT})
     assert set(spec.targets) == {"stages_0_fc", "stages_1_fc"}
+    assert all(t.per_segment for t in spec.targets.values())  # `rows` keys the stack's role
+    with pytest.raises(ValueError, match="differ in shape"):  # one name cannot name several targets
+        module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", names={"fc": "fc"})
 
 
 # --- what the module walk refuses ----------------------------------------------------------
