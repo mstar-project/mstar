@@ -1542,7 +1542,8 @@ has checked, not that it fails.
      - Works
      - Text and image questions against transformers. Every divergence is a near tie (the
        token is in transformers' top 8, within 1 nat of its pick), and all long-context
-       needles are found.
+       needles are found. Prefix caching is off (AITER's GDN kernels keep no state
+       checkpoints).
      - 7-10 min
    * - ``whisper_large``
      - Works
