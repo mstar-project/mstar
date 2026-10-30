@@ -28,6 +28,7 @@ from mstar.engine.resources import (
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
+    Rebuild,
     Resource,
     ResourceReqConfig,
     SlotLease,
@@ -38,6 +39,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sampler.config import discard_samples
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -1579,6 +1581,9 @@ class Engine:
             # the submodule declared no step (a node owning no resources);
             # there is nothing to admit, and the forward still runs
             return ADMIT_OK, None
+        if batch.rebuild_rids:
+            # a rebuild row samples again an id the request already has, and decode reads the kept one
+            discard_samples(step, rids, batch.rebuild_rids)
         # admit reads the step's ctx, so bind it before the sweep rather than
         # in `_drive_step`
         step.set_ctx(ctx)
@@ -2610,19 +2615,15 @@ class Engine:
                 return refusal
         return None
 
-    def lay_out_rebuild(self, node_name: str, request_id: int, ids: Sequence[int]) -> str:
-        """Lay the dropped request's KV out over all of ``ids`` but the last, and return the walk
-        whose row writes it."""
-        (walk,) = {
-            kv.cache.lay_out_again(request_id, ids) for kv in self.paged_kv_caches() if node_name in kv.nodes
-        }
-        return walk
+    def prepare_rebuild(self, node_name: str, request_id: int, rebuild: Rebuild) -> None:
+        """Tell each of the node's resources what the dropped request's rebuild row writes."""
+        for resource in self._submodules[node_name].resources.values():
+            resource.prepare_rebuild(request_id, rebuild)
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
-        """Make the dropped request resident again, once its rebuild step has run."""
-        for kv in self.paged_kv_caches():
-            if node_name in kv.nodes:
-                kv.cache.land_rebuild(request_id)
+        """Make the dropped request resident again, once its rebuild row has run."""
+        for resource in self._submodules[node_name].resources.values():
+            resource.land_rebuild(request_id)
 
     def offload_request(self, node_name: str, request_id: int) -> int:
         """Move the request off-device across this node's resources.

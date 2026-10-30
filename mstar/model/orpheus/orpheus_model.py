@@ -44,6 +44,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -108,6 +109,10 @@ class OrpheusModel(Model):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {"mixed": {"prefill", "decode"}}}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        return {"LLM": RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token",
+                                     loop="decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
