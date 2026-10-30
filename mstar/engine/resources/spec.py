@@ -104,7 +104,7 @@ class NodeResourceSpec(ABC):
         """Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them."""
         return False
 
-    def prefix_cache_opens(self, world_size: int, checkpoint_named: bool) -> bool:
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
         """Whether the resource keeps a prefix cache of its own on a lockstep
         instance of ``world_size`` ranks, for a model that names its checkpoint
         or not. False (the default) keeps nothing across requests.

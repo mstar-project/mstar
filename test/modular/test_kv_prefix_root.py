@@ -405,7 +405,7 @@ class _Recording(_Plain):
 class _KeepingSpec(NodeResourceSpec):
     """Declares a prefix cache of its own, and is neither a KV cache nor a recurrent pool."""
 
-    def prefix_cache_opens(self, world_size, checkpoint_named):
+    def keeps_prefix_cache(self, world_size, checkpoint_named):
         return True
 
     @property

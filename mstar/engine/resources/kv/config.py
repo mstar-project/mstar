@@ -108,8 +108,8 @@ class PagedKVConfig(KVConfig):
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
 
-    def prefix_cache_opens(self, world_size: int, checkpoint_named: bool) -> bool:
-        """`NodeResourceSpec.prefix_cache_opens` for a pool of this config.
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
+        """`NodeResourceSpec.keeps_prefix_cache` for a pool of this config.
         Above one rank only with ``prefix_cache_tp``, and a model that names no
         checkpoint needs a salt, or builds that differ only in their weights
         could not be told apart."""
@@ -430,7 +430,7 @@ def opening_prefix_caches(
     specs: Iterable[NodeResourceSpec], instance: Mapping[str, int], checkpoint_named: bool,
 ) -> frozenset[str]:
     """The prefix caches that open: those each spec keeps of its own
-    (`NodeResourceSpec.prefix_cache_opens`), less those a resource on their
+    (`NodeResourceSpec.keeps_prefix_cache`), less those a resource on their
     nodes keeps from serving a hit. Every input is fixed at startup, so the
     engines, the conductor's routing and the data worker agree.
 
@@ -449,7 +449,7 @@ def opening_prefix_caches(
     def size(spec: NodeResourceSpec) -> int:
         return min((instance[node] for node in spec.nodes if node in instance), default=1)
 
-    opened = {spec.resource_key for spec in specs if spec.prefix_cache_opens(size(spec), checkpoint_named)}
+    opened = {spec.resource_key for spec in specs if spec.keeps_prefix_cache(size(spec), checkpoint_named)}
     while True:
         kept = {
             key for key in opened
@@ -513,8 +513,8 @@ class KVSpec(NodeResourceSpec):
         storage strategy, so the config answers for them."""
         self.config.apply_yaml_overrides(**kwargs)
 
-    def prefix_cache_opens(self, world_size: int, checkpoint_named: bool) -> bool:
-        return isinstance(self.config, PagedKVConfig) and self.config.prefix_cache_opens(world_size, checkpoint_named)
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
+        return isinstance(self.config, PagedKVConfig) and self.config.keeps_prefix_cache(world_size, checkpoint_named)
 
     def routing_mirror(self, ctx: RoutingContext):
         """A mirror of the prefix cache where it opens and a walk that keys it runs."""

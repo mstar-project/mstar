@@ -953,13 +953,13 @@ class Engine:
         for key in sorted(shut & self._resources.keys()):
             spec = specs_by_key[key]
             # the cache is on at all: it opens at one rank for a model that names its checkpoint
-            if not spec.prefix_cache_opens(1, checkpoint_named=True):
+            if not spec.keeps_prefix_cache(1, checkpoint_named=True):
                 continue
             size = min((instance[node] for node in spec.nodes if node in instance), default=1)
             nodes = ", ".join(sorted(spec.nodes))
-            if not spec.prefix_cache_opens(size, checkpoint_named=True):
+            if not spec.keeps_prefix_cache(size, checkpoint_named=True):
                 logger.info("KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)", key, size)
-            elif not spec.prefix_cache_opens(size, checkpoint_named):
+            elif not spec.keeps_prefix_cache(size, checkpoint_named):
                 logger.info(
                     "KV %s: prefix cache off: %s names no checkpoint, so "
                     "builds that differ only in their weights cannot be "
