@@ -1042,10 +1042,11 @@ placed exactly as weights are.
   projections, Qwen3-Omni's code-predictor QKV. Nothing else can tell such a child from
   one whose forward runs: an undeclared one is bound, and its delta silently never
   added, so code that reads a linear's weight directly declares it there.
-- **Targets.** One per role in a layer stack (``<stack>.N.<role>``, the first module list
-  in the path, whatever it is named; ``layers`` set where a role is on some layers only),
-  named by the role's last component (``names`` overrides), plus one per module outside
-  the stacks.
+- **Targets.** One per role in a layer stack (``<stack>.N.<role>``, the first ``ModuleList``
+  or ``Sequential`` in the path, whatever it is named; ``layers`` set where a role is on
+  some layers only), named by the role's last component (``names`` overrides), plus one per
+  other module: one outside the stacks, or at a role whose entries differ in shape (UNet
+  levels, vision stages).
 - **What the model states.** Only what modules cannot know. ``rows``: a target that sees
   one row per segment (``PER_SEGMENT``: a head after the last-token select) or one per
   ``k`` folded tokens. ``exclude`` (with a reason): modules called outside the planned

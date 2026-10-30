@@ -530,6 +530,15 @@ def test_a_stack_is_a_module_list_whatever_its_name():
     assert set(spec.targets) == {"fc", "head"} and spec.num_layers == 3
 
 
+def test_a_module_list_whose_entries_differ_in_shape_gives_each_entry_a_target():
+    with torch.device("meta"):
+        root = nn.Module()
+        root.stages = nn.ModuleList(
+            _with(nn.Module(), lambda m, d=d: setattr(m, "fc", nn.Linear(d, d))) for d in (HIDDEN, 2 * HIDDEN))
+    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+    assert set(spec.targets) == {"stages_0_fc", "stages_1_fc"}
+
+
 # --- what the module walk refuses ----------------------------------------------------------
 
 class _OwnForward(nn.Linear):

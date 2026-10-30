@@ -3,9 +3,10 @@
 ``module_lora_spec`` walks a node's weights root (the module its weight loader fills;
 built on the meta device at one rank, so any process can declare it), finds every
 LoRA-capable module (``capable.py``), groups them into targets by their role in a layer
-stack (``<stack>.N.<role>``, a stack being a module list; a module outside the stacks is
-a target of its own), and places checkpoint modules with the root's own ``CheckpointRules`` (the
-ones its weight loader uses). The model states only what its modules cannot: how a
+stack (``<stack>.N.<role>``, a stack being a ``ModuleList`` or ``Sequential`` whose
+entries agree in shape at that role; any other module is a target of its own), and
+places checkpoint modules with the root's own ``CheckpointRules`` (the ones its weight
+loader uses). The model states only what its modules cannot: how a
 target's rows relate to the step's tokens (``rows``), modules it calls outside the step
 (``exclude``, ``deferred``), names kept for compatibility (``names``), the prefixes
 adapters write the root under (``adapter_roots``) and adapter-only renames (``aliases``).
@@ -53,7 +54,7 @@ _STACKS = (nn.ModuleList, nn.Sequential)
 
 def _in_stack(path: str, stacks: set[str]) -> tuple[str, int, str] | None:
     """``(stack, layer, role)`` for ``path`` = ``<stack>.<layer>.<role>`` under the first
-    module list in it (``stacks``, by path), whatever the list is named."""
+    ``ModuleList`` or ``Sequential`` in it (``stacks``, by path), whatever it is named."""
     parts = path.split(".")
     for i in range(len(parts) - 1):
         if parts[i].isdigit() and ".".join(parts[:i]) in stacks:
@@ -313,6 +314,12 @@ def module_lora_spec(
         else:
             stack, layer, role = found
             groups[(stack, role)].append(_Found(path, layer, target))
+    # a stack's entries that differ in shape at a role (UNet levels, vision stages) are
+    # not one layer's target: each is a target of its own
+    mixed = [k for k, fs in groups.items() if k[0] is not None and any(f.target != fs[0].target for f in fs)]
+    for key in mixed:
+        for f in groups.pop(key):
+            groups[(None, f.path)].append(_Found(f.path, 0, f.target))
     unmatched = [p for p in excluded if not any(_match(w, [p]) for w in walked)]
     if unmatched:
         raise ValueError(f"`exclude` patterns {unmatched} match no LoRA-capable module of {type(root).__name__}")
@@ -331,12 +338,6 @@ def module_lora_spec(
     for key, found in groups.items():
         stack, role = key
         first = found[0].target
-        differ = [f.path for f in found if f.target != first]
-        if differ:
-            raise ValueError(
-                f"LoRA target {role!r} has other shapes at {differ[:3]} than at "
-                f"{found[0].path}; exclude them or give them a stack of their own"
-            )
         layers = tuple(sorted(f.layer for f in found))
         if stack is not None and layers == tuple(range(num_layers)):
             layers = None
