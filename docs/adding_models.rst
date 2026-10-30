@@ -1470,7 +1470,8 @@ NVIDIA sm_89+) with one scale per output channel, activations quantised per toke
 torch so the compiled forward fuses that into the producing norm, and the product on
 ``mstar::fp8_rowwise_mm``. Where the platform has no fp8 GEMM the linears stay bf16 with a
 warning. The output moves by e4m3 rounding, so keep the default ``bf16`` unless the model's
-correctness family passes with fp8 on.
+correctness family passes with fp8 on. On AMD GPUs a DiT's result also depends on the
+``dit_exact_ops`` knob, so measure fp8 with the knob set the way the deployment sets it.
 
 .. _step-5:
 

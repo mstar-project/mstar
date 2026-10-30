@@ -1584,6 +1584,13 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    1.18 times the bf16 images per second (1.39 times with every linear in fp8). Lists
    giving back 20% and 30% of the saving instead of 40% measured 25.2 dB, under the floor.
 
+   On AMD GPUs, fp8 needs ``knobs: dit_exact_ops: true`` too. The numbers above were
+   measured with the norms eager. The platform default compiles them, and then the 9B
+   keep-list scores 25.4 to 25.8 dB (floor 25.5) and klein-4B 22.5 to 22.7 (floor 22.4). With
+   the knob on they repeat across launches at 26.5 and 22.6 dB. At one request the knob
+   costs 8% and 7% of the fp8 images per second, which leaves 1.1 times bf16 with the knob
+   off (one MI325X, shared node).
+
 With the klein defaults every served image is within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
 images of the other engines are 10 to 16 dB from the diffusers reference for the same
