@@ -256,6 +256,23 @@ def test_cell_config_overrides_the_mstar_arms_only(tmp_path, monkeypatch):
         served("mstar")
 
 
+def test_numa_falls_back_to_sysfs_where_amd_smi_has_no_numa(tmp_path, monkeypatch):
+    def smi(*args):
+        if args[0] == "list":
+            return [{"gpu": 0, "bdf": "0000:83:00.0"}, {"gpu": 5, "bdf": "0000:ab:00.0"}]
+        return None  # amd-smi on the VF box rejects static --numa
+    monkeypatch.setattr(sweep, "amd_smi_json", smi)
+    monkeypatch.setattr(sweep, "smi_gpu", lambda hip: hip)
+    monkeypatch.setattr(sweep, "SYSFS_PCI", tmp_path)
+    for bdf, node in (("0000:83:00.0", "0"), ("0000:ab:00.0", "1")):
+        (tmp_path / bdf).mkdir()
+        (tmp_path / bdf / "numa_node").write_text(node + "\n")
+    assert sweep._numa_of(0) == 0 and sweep._numa_of(5) == 1
+    assert sweep._numa_of(3) is None  # no PCI device known
+    (tmp_path / "0000:83:00.0" / "numa_node").write_text("-1\n")
+    assert sweep._numa_of(0) is None
+
+
 def test_sglang_omni_launch(tmp_path):
     from benchmark.amd.launch import backends_in_log
 
