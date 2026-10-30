@@ -9,7 +9,7 @@ from typing import Any
 
 from mstar.distributed.base import ShardingConfig
 from mstar.model.base import Model
-from mstar.streaming.topology import ClientStreamLimits, Connection, find_client_streams
+from mstar.streaming.topology import ClientStreamLimits, Connection, find_client_stream
 
 # The limits a deployment may override, per client stream.
 _YAML_LIMITS = ("max_items",)
@@ -55,10 +55,13 @@ def _consumer_problems(model: Model, connections: list[Connection]) -> list[str]
         f"client stream {name!r} is declared twice; one consumer per stream"
         for name in sorted({name for name in names if names.count(name) > 1})
     ]
-    try:
-        find_client_streams(model)
-    except ValueError as e:
-        problems.append(str(e))
+    walks = model.get_graph_walk_graphs()
+    partitions = {p.name: p for p in model.get_partitions()}
+    for conn in connections:
+        try:
+            find_client_stream(conn, walks, partitions)
+        except ValueError as e:
+            problems.append(str(e))
     return problems
 
 

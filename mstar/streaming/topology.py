@@ -4,8 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
-from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.graph.base import GraphEdge
+from mstar.conductor.request_info import CurrentForwardPassInfo, PartitionDefinition
+from mstar.graph.base import GraphEdge, GraphSection
 from mstar.streaming.chunk_policy import ChunkPolicy, FixedChunkPolicy
 
 if TYPE_CHECKING:
@@ -176,31 +176,35 @@ class ClientStream(NamedTuple):
 
 
 def find_client_streams(model: Model) -> dict[str, ClientStream]:
-    """Each client stream's consumer: the one node, over every walk, that
-    takes the edge (as ``Worker._build_consumer_node_cache`` resolves it), in
-    a walk of the partition it flows into; ``ValueError`` for a stream without
-    one. The conductor reads it after the worker graphs are built (a model may
-    shape its walks from the deployment, as BAGEL does), and names each node
-    in its route to the data worker, whose copy of the model is unshaped."""
+    """Each client stream's consumer (``find_client_stream``). The conductor
+    reads it after the worker graphs are built (a model may shape its walks
+    from the deployment, as BAGEL does), and names each node in its route to
+    the data worker, whose copy of the model is unshaped."""
     connections = model.get_partition_topology().client_connections()
     if not connections:
         return {}
     walks = model.get_graph_walk_graphs()
     partitions = {p.name: p for p in model.get_partitions()}
-    streams: dict[str, ClientStream] = {}
-    for conn in connections:
-        name, partition = conn.edge_name, partitions.get(conn.to_partition)
-        if partition is None:
-            raise ValueError(f"client stream {name!r} flows into {conn.to_partition!r}, which is not a partition")
-        consumers = {
-            node.name for walk in walks.values() for node in walk.get_nodes().values()
-            if name in node.input_names
-        }
-        in_partition = [walk for walk in partition.graph_walks if consumers & walks[walk].get_nodes().keys()]
-        if len(consumers) != 1 or not in_partition:
-            raise ValueError(
-                f"client stream {name!r} needs exactly one consuming node, in "
-                f"partition {partition.name!r}; found {sorted(consumers) or 'none'}"
-            )
-        streams[name] = ClientStream(consumers.pop(), max(in_partition), partition.name)
-    return streams
+    return {conn.edge_name: find_client_stream(conn, walks, partitions) for conn in connections}
+
+
+def find_client_stream(
+    conn: Connection, walks: Mapping[str, GraphSection], partitions: Mapping[str, PartitionDefinition],
+) -> ClientStream:
+    """``conn``'s consumer: the one node, over every walk, that takes the edge
+    (as ``Worker._build_consumer_node_cache`` resolves it), in a walk of the
+    partition it flows into; ``ValueError`` for a stream without one."""
+    name, partition = conn.edge_name, partitions.get(conn.to_partition)
+    if partition is None:
+        raise ValueError(f"client stream {name!r} flows into {conn.to_partition!r}, which is not a partition")
+    consumers = {
+        node.name for walk in walks.values() for node in walk.get_nodes().values()
+        if name in node.input_names
+    }
+    in_partition = [walk for walk in partition.graph_walks if consumers & walks[walk].get_nodes().keys()]
+    if len(consumers) != 1 or not in_partition:
+        raise ValueError(
+            f"client stream {name!r} needs exactly one consuming node, in "
+            f"partition {partition.name!r}; found {sorted(consumers) or 'none'}"
+        )
+    return ClientStream(consumers.pop(), max(in_partition), partition.name)

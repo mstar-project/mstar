@@ -388,12 +388,16 @@ def test_client_streams_without_process_stream_chunk_fail_at_startup():
     assert _refused(_NoHook(), "process_stream_chunk")
 
 
-def test_a_client_stream_into_no_partition_fails_at_startup():
-    class _Nowhere(_DuplexToy):
+def test_each_client_stream_into_no_partition_fails_at_startup():
+    """Every one is reported: validate_deployment lists every problem at once."""
+    class _Nowhere(_AudioAndVideo):
         def get_partition_topology(self):
-            return PartitionTopology(partitions=["Ear"], connections=[_client_connection("audio_in", "Mouth")])
+            return PartitionTopology(partitions=["Ear"], connections=[
+                _client_connection("audio_in", "Mouth"), _client_connection("video_in", "Nose"),
+            ])
 
-    assert _refused(_Nowhere(), "'Mouth', which is not a partition")
+    mouth, nose = check_client_streams(_Nowhere(), {})
+    assert "'Mouth', which is not a partition" in mouth and "'Nose', which is not a partition" in nose
 
 
 class _AudioAndVideo(_DuplexToy):
