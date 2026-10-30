@@ -65,18 +65,26 @@ NOCFG_ORACLE_DIR = Path(_NOCFG_ENV) if _NOCFG_ENV else None
 
 # ---------------------------------------------------------------------------
 # Thresholds. NEVER loosen one to make a run pass — a regression is a finding.
-# mstar's only deliberate departure is batching the two CFG forwards into one
-# batch-2 call, so each bound below is either 0.0 or prices that batching's noise.
+# mstar's deliberate departures are batching the two CFG forwards into one batch-2
+# call and computing the time embedding per frame instead of per token, so each bound
+# below is either 0.0 or prices the noise of one of those.
 # ---------------------------------------------------------------------------
 # Same tokenizer, same UMT5 instance, same padded batch.
 TEXT_EMBEDS_MAX_ABS = 0.0
 # Identical fp32 ops on identical inputs.
 UNIPC_PORT_MAX_ABS = 0.0
-# Run CFG the reference's way and the whole path must match exactly at every step.
-SEQ_TRAJECTORY_MAX_ABS = 0.0
 # Batched-CFG trajectory: batch-2 kernel noise compounds over the 50 steps (1.6e-3
 # at step 0, 3.7 by step 49). ~1.2x that; a math bug passes 1e1 within a few steps.
 PER_STEP_MAX_ABS = 4.5
+# Run CFG the reference's way and only the per-frame time embedding is left. cuBLAS can
+# round its rows differently from the per-token ones (see
+# test_wan22_native_dit_equivalence.py), and that compounds like the batched-CFG noise
+# above: 2.1 by step 49 on B300 under this file's numerics (temb off by 3.1e-5), 3.7
+# with temb's fp32 rows perturbed by 1.1e-4, the size of a TF32 / non-TF32 kernel change.
+SEQ_TRAJECTORY_MAX_ABS = PER_STEP_MAX_ABS
+# The same with the time embedding at the reference's row count, which leaves nothing to
+# round differently: the whole path must match exactly at every step.
+SEQ_PER_TOKEN_ROWS_MAX_ABS = 0.0
 FINAL_LATENTS_MAX_ABS = 4.5
 # One step, batched vs sequential CFG (3.9e-1 on outputs whose abs max is 8.6): bf16
 # kernel noise, amplified up to 9x by the guidance combine. ~1.5x observed.
@@ -95,11 +103,12 @@ TILED_DECODE_MEAN_ABS = 3.0e-3
 # that compounds exactly like the batched-CFG kernel noise (1.6e-3 at step 0 growing
 # through step 49). Observed max over the trajectory: 2.66 (RTX 5090), 2.997 (H100),
 # 3.675 (H200). Bound = worst observed x ~1.3 headroom. The eager path stays the
-# bit-exact reference (SEQ/UNIPC gates); this only prices compile.
+# reference (SEQ/UNIPC gates); this only prices compile.
 COMPILED_VS_EAGER_MAX_ABS = 4.8
-# No-CFG (guidance_scale <= 1.0) batch-1 path vs a no-CFG oracle. Same discipline
-# as the sequential-CFG trajectory: one batch-1 forward per step, so BIT-EXACT.
-NO_CFG_TRAJECTORY_MAX_ABS = 0.0
+# No-CFG (guidance_scale <= 1.0) batch-1 path vs a no-CFG oracle: one batch-1 forward
+# per step, so the same departure as the sequential-CFG trajectory, over the oracle's
+# 8 small-grid steps. 0.48 on B300 and 0.76 with the perturbation above; ~1.3x that.
+NO_CFG_TRAJECTORY_MAX_ABS = 1.0
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 
@@ -240,13 +249,10 @@ def text_embeds(oracle_meta) -> dict[str, torch.Tensor]:
     return result
 
 
-# The bit-exact gates are defined against the EAGER transformer, so the shared
+# The trajectory gates are defined against the EAGER transformer, so the shared
 # dit_submodule is built with torch.compile OFF. Set WAN22_TEST_COMPILE_DIT=1 to
 # rebuild it compiled and re-run the whole suite once — a "nothing downstream
-# breaks" check: the priced/decode/structural tests still pass, while the bit-exact
-# 0.0 gates (sequential-CFG, no-CFG) then FAIL by exactly the compile fusion delta,
-# which is precisely why the default fixture keeps them on the eager path. The
-# compiled path's own numeric bound is pinned by
+# breaks" check. The compiled path's own numeric bound is pinned by
 # test_compiled_dit_matches_eager_per_step regardless of this switch.
 _TEST_COMPILE_DIT = os.environ.get("WAN22_TEST_COMPILE_DIT", "0").lower() in ("1", "true", "yes", "on")
 
@@ -447,28 +453,22 @@ def _sequential_noise_prediction(self, model_input, temp_ts, text_embeds_pos, te
     return uncond + guidance_scale * (cond - uncond)
 
 
-def test_sequential_cfg_trajectory_is_bitexact_vs_oracle(oracle_meta, text_embeds, dit_submodule):
-    """Drive the engine path with the reference's sequential batch-1 CFG:
-    every one of the 50 per-step latents must be BIT-EXACT vs the oracle.
-    This proves the whole mstar implementation (tokenize -> encode ->
-    per-frame timesteps -> transformer -> inline UniPC) identical to the
-    stock pipeline, leaving the batch-2 CFG kernel shape as the suite's ONLY
-    priced deviation (tests 2/3/4)."""
+def _sequential_trajectory_diffs(oracle_meta, text_embeds, dit_submodule) -> list[float]:
+    """Max-abs vs the oracle after each step, driving the engine path with the
+    reference's sequential batch-1 CFG."""
     meta = _step_metadata(oracle_meta)
     fwd_info = _fwd_info("video_gen", meta, seed=oracle_meta["seed"])
     persisted = {
         "text_embeds_pos": [text_embeds["ours_pos"]],
         "text_embeds_neg": [text_embeds["ours_neg"]],
     }
-    num_steps = oracle_meta["num_inference_steps"]
-
     original = Wan22DitSubmodule._noise_prediction
     Wan22DitSubmodule._noise_prediction = _sequential_noise_prediction
     diffs: list[float] = []
     try:
         carried: dict[str, list[torch.Tensor]] = {}
         with torch.no_grad():
-            for step in range(num_steps):
+            for step in range(oracle_meta["num_inference_steps"]):
                 fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME] = step
                 outputs = _drive(dit_submodule, "video_gen", fwd_info, {**persisted, **carried})
                 carried = {
@@ -479,15 +479,46 @@ def test_sequential_cfg_trajectory_is_bitexact_vs_oracle(oracle_meta, text_embed
                 diffs.append((outputs["latents"][0].cpu().float() - ref.float()).abs().max().item())
     finally:
         Wan22DitSubmodule._noise_prediction = original
+    return diffs
 
+
+def _report_trajectory(label: str, diffs: list[float]) -> str:
     nonzero = [(i, d) for i, d in enumerate(diffs) if d > 0]
-    print(f"sequential-CFG trajectory vs oracle: max_abs={max(diffs):.3e}, "
-          f"first nonzero step={nonzero[0] if nonzero else None}")
-    assert max(diffs) <= SEQ_TRAJECTORY_MAX_ABS, (
-        f"sequential-CFG trajectory diverged from the oracle: first nonzero "
-        f"step {nonzero[0][0]} (max_abs {nonzero[0][1]:.3e}) — implementation "
-        "regression, not kernel noise"
-    )
+    line = f"{label} vs oracle: max_abs={max(diffs):.3e}, first nonzero step={nonzero[0] if nonzero else None}"
+    print(line)
+    return line
+
+
+def test_sequential_cfg_trajectory_matches_oracle(oracle_meta, text_embeds, dit_submodule):
+    """Each of the 50 per-step latents must stay within ``SEQ_TRAJECTORY_MAX_ABS`` of
+    the oracle, over the whole mstar path (tokenize -> encode -> per-frame timesteps
+    -> transformer -> inline UniPC). The per-frame time embedding's rows are held to
+    the reference's in test_wan22_native_dit_equivalence.py."""
+    diffs = _sequential_trajectory_diffs(oracle_meta, text_embeds, dit_submodule)
+    line = _report_trajectory("sequential-CFG trajectory", diffs)
+    assert max(diffs) <= SEQ_TRAJECTORY_MAX_ABS, line
+
+
+def test_sequential_cfg_trajectory_is_bitexact_on_per_token_rows(oracle_meta, text_embeds, dit_submodule):
+    """With the time embedding run at the reference's row count, each of the 50
+    per-step latents must be BIT-EXACT vs the oracle. This holds everything but the
+    embedder's row count identical to the stock pipeline, leaving that and the
+    batch-2 CFG kernel shape as the suite's ONLY priced deviations."""
+    embedder = dit_submodule.transformer.condition_embedder
+    per_frame_rows = embedder.forward
+    tokens_per_frame = (oracle_meta["height"] // 32) * (oracle_meta["width"] // 32)
+
+    def per_token_rows(timestep, encoder_hidden_states):
+        temb, proj, text = per_frame_rows(timestep.repeat_interleave(tokens_per_frame, dim=1), encoder_hidden_states)
+        return temb[:, ::tokens_per_frame], proj[:, ::tokens_per_frame], text
+
+    embedder.forward = per_token_rows
+    try:
+        diffs = _sequential_trajectory_diffs(oracle_meta, text_embeds, dit_submodule)
+    finally:
+        del embedder.forward  # restore class-method lookup
+    line = _report_trajectory("sequential-CFG trajectory, per-token rows", diffs)
+    assert max(diffs) <= SEQ_PER_TOKEN_ROWS_MAX_ABS, line
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +582,7 @@ def test_i2v_first_frame_injection_semantics(oracle_meta, text_embeds, dit_submo
     """8-step small-resolution I2V run asserting the expand_timesteps
     conditioning contract:
       * the transformer INPUT's frame 0 equals the condition at every step, with
-        frame-0 per-token timesteps zeroed;
+        frame 0's timestep zeroed;
       * the loop-carried latents stay un-injected mid-loop;
       * the OUTPUT latents get the condition only at the final iteration.
     """
@@ -602,11 +633,11 @@ def test_i2v_first_frame_injection_semantics(oracle_meta, text_embeds, dit_submo
             assert torch.equal(hidden_states[b : b + 1, :, 0], cond_bf16[:, :, 0]), (
                 f"step {step} batch {b}: transformer input frame 0 != condition"
             )
-        # Per-token timesteps: frame-0 tokens 0, all later frames uniform t.
-        grid = timestep[0].reshape(t_lat, (h_lat + 1) // 2, (w_lat + 1) // 2)
-        assert torch.all(grid[0] == 0), f"step {step}: frame-0 timesteps not zeroed"
-        assert torch.all(grid[1:] == grid[1, 0, 0]), f"step {step}: non-uniform later timesteps"
-        assert grid[1, 0, 0].item() > 0
+        # One timestep per latent frame: frame 0 at 0, all later frames at a uniform t.
+        assert timestep.shape == (2, t_lat)
+        assert timestep[0, 0] == 0, f"step {step}: frame-0 timestep not zeroed"
+        assert torch.all(timestep[0, 1:] == timestep[0, 1]), f"step {step}: non-uniform later timesteps"
+        assert timestep[0, 1].item() > 0
 
 
 # ---------------------------------------------------------------------------
@@ -738,8 +769,8 @@ def test_compiled_dit_matches_eager_per_step(oracle_meta, text_embeds, dit_submo
       * the compiled trajectory stays within ``COMPILED_VS_EAGER_MAX_ABS`` of
         eager, a bound derived from the observed per-step max.
 
-    The eager path stays the bit-exact reference (the SEQ/UNIPC gates); this test
-    prices compile and nothing else.
+    The eager path stays the reference (the SEQ/UNIPC gates); this test prices
+    compile and nothing else.
     """
     import torch._dynamo
     from torch._inductor.compile_fx import compile_fx
@@ -810,7 +841,7 @@ def test_compiled_dit_matches_eager_per_step(oracle_meta, text_embeds, dit_submo
 
 # ---------------------------------------------------------------------------
 # 8. No-CFG batch-1 path — Feature 4. guidance_scale <= 1.0 takes the batch-1
-#    branch no other test exercises; it is bit-exact vs a no-CFG oracle.
+#    branch no other test exercises, against a no-CFG oracle.
 # ---------------------------------------------------------------------------
 
 
@@ -822,12 +853,11 @@ def test_compiled_dit_matches_eager_per_step(oracle_meta, text_embeds, dit_submo
         "--height 224 --width 384 --num-frames 9 --out-dir <dir>` (oracle venv, same torch)"
     ),
 )
-def test_no_cfg_batch1_trajectory_is_bitexact(oracle_meta, text_embeds, dit_submodule):
+def test_no_cfg_batch1_trajectory_matches_oracle(oracle_meta, text_embeds, dit_submodule):
     """guidance_scale <= 1.0 runs one batch-1 forward per step (no CFG), the branch
     no other test covered. Drive the full no-CFG oracle trajectory at guidance 1.0
-    and require BIT-EXACT latents at every step — the same discipline as the
-    sequential-CFG gate, since a no-CFG step is one batch-1 forward exactly like the
-    reference at guidance 1.0. A recorder PROVES the batch-1 branch is taken (the
+    and hold every step to the same bound as the sequential-CFG gate, since a no-CFG
+    step is one batch-1 forward like the reference at guidance 1.0. A recorder PROVES the batch-1 branch is taken (the
     transformer sees batch 1, not the CFG batch-2), so the test cannot pass while
     silently exercising the wrong path.
     """
@@ -879,11 +909,5 @@ def test_no_cfg_batch1_trajectory_is_bitexact(oracle_meta, text_embeds, dit_subm
             "batch-2 path was taken, so this test would not be exercising no-CFG"
         )
 
-    nonzero = [(i, d) for i, d in enumerate(diffs) if d > 0]
-    print(f"no-CFG batch-1 trajectory vs oracle: max_abs={max(diffs):.3e}, "
-          f"first nonzero step={nonzero[0] if nonzero else None}")
-    assert max(diffs) <= NO_CFG_TRAJECTORY_MAX_ABS, (
-        f"no-CFG trajectory diverged from the oracle: first nonzero step "
-        f"{nonzero[0][0]} (max_abs {nonzero[0][1]:.3e}) — the batch-1 path is not "
-        "bit-exact against the reference"
-    )
+    line = _report_trajectory("no-CFG batch-1 trajectory", diffs)
+    assert max(diffs) <= NO_CFG_TRAJECTORY_MAX_ABS, line

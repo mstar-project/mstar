@@ -1,13 +1,14 @@
 """Native Wan2.2-TI2V-5B video DiT (dense 5B transformer).
 
-Exact port of diffusers 0.39.0 ``WanTransformer3DModel``, restricted to the
-TI2V-5B checkpoint's configuration: no image-conditioning branch, and the
-per-token timestep path (``expand_timesteps``). Every token of a latent frame
-shares its frame's timestep (I2V zeroes frame 0 only), so the timestep comes in
-per frame, ``[batch, frames]``, and the time embedding and the modulation are
-computed once per frame and broadcast over the frame's tokens. Per-frame rows
-are the reference's per-token rows bit for bit (the rows of a GEMM do not
-depend on how many there are).
+Port of diffusers 0.39.0 ``WanTransformer3DModel``, restricted to the TI2V-5B
+checkpoint's configuration: no image-conditioning branch, and the per-token
+timestep path (``expand_timesteps``). Every token of a latent frame shares its
+frame's timestep (I2V zeroes frame 0 only), so the timestep comes in per frame,
+``[batch, frames]``, and the time embedding and the modulation are computed once
+per frame and broadcast over the frame's tokens. cuBLAS may pick a different
+GEMM kernel at the per-frame row count than at the reference's per-token one, so
+these rows match the reference's to rounding rather than bitwise; given the same
+rows, the blocks and the head are the reference's bits.
 
 Numerics contract (bf16 weights with fp32 islands):
 
@@ -184,9 +185,9 @@ class Wan22DiTAttention(nn.Module):
 
 
 class Wan22TimeTextEmbedding(nn.Module):
-    """Condition embedder: per-token timestep embedding + text projection
+    """Condition embedder: per-frame timestep embedding + text projection
     (reference ``WanTimeTextImageEmbedding``, image branch absent on
-    TI2V-5B).
+    TI2V-5B, its per-token rows computed once per frame).
 
     ``time_embedder`` is an fp32 island: the sinusoidal embedding and both
     its Linears run fp32; ``temb`` crosses to bf16 at ``type_as(text)``, so
