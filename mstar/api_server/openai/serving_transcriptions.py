@@ -60,11 +60,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.utils.utf8_stream import Utf8Stream
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
@@ -361,6 +362,13 @@ def _attempts(req, carry_over: str | None) -> list[tuple[float, str | None]]:
     return ladder
 
 
+def _reads(api, key: str) -> bool:
+    """Whether the model reads ``key``; one that declares nothing may."""
+    model = getattr(api, "model", None)
+    declared = model.request_kwargs() if model is not None else None
+    return declared is None or key in declared
+
+
 def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[str]) -> str:
     args = adapter.transcription_to_request(req, window.path)
     args.model_kwargs.pop("long_form", None)
@@ -460,11 +468,13 @@ async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[s
     language = req.language
     texts: list[str] = []     # accepted window texts, the conditioning source
     reset_since = 0           # texts before this index no longer condition
-    seeks = bool(adapter.seeks_by_timestamps) and not planner.single
+    # route-added conditioning and timestamps go only to a model that reads them
+    seeks = bool(adapter.seeks_by_timestamps) and not planner.single and _reads(api, "timestamps")
+    conditions = _reads(api, "initial_prompt")
     offset = 0.0
     while True:
         window = planner.whole() if planner.single else await asyncio.to_thread(planner.window_at, offset)
-        carry = _carry_over(texts[reset_since:]) if texts else None
+        carry = _carry_over(texts[reset_since:]) if texts and conditions else None
         for temperature, prompt in _attempts(req, carry):
             attempt = _window_request(req, language, prompt, timestamps=seeks)
             if temperature != (req.temperature or 0.0):
@@ -573,8 +583,9 @@ async def create_transcription(
 
     if req.stream:
         # the stream owns the files and windows from here
-        return StreamingResponse(
+        return ReleasingStreamingResponse(
             _stream(api, adapter, req, planner, mode, raw_request),
+            release=planner.cleanup,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )

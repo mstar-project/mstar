@@ -23,17 +23,30 @@ from __future__ import annotations
 
 import sys
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.engine.resources import StepRunner, SubmoduleStep  # noqa: E402
+from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
+from mstar.engine.resources.recurrent.config import (  # noqa: E402
+    RecurrentBlockConfig,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStep,
+)
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool  # noqa: E402
+from mstar.engine.resources.step import Segment, StepContext  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 NODE, WALK = "LLM", "decode"
@@ -129,7 +142,7 @@ def _rank(
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
-    w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
+    w.streaming_buffers, w._last_active = {}, {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -160,6 +173,7 @@ def _rank(
         remove_request=lambda rid: None, get_partition_for_node=lambda node: "p",
     )
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.parallel_groups = SimpleNamespace(
         barrier_all=lambda: None, restore_default_timeout=lambda: None,
@@ -296,6 +310,76 @@ def test_a_follower_tears_down_what_it_deferred_in_the_order_rank_0_did(monkeypa
     assert list(freed.free_pages.queue) == list(on_rank_0.free_pages.queue)
 
 
+def _slot_pool() -> tuple[RecurrentStatePool, StepRunner]:
+    """One TP rank's recurrent pool (GLM-5.3 keeps its KDA state in one): 5 slots and the
+    sink, sharded over two ranks, so it decides nothing alone."""
+    spec = RecurrentStateSpec("state", {NODE}, RecurrentStateConfig(
+        num_layers=1,
+        blocks={"state": RecurrentBlockConfig(shape=(2, 2), dtype=torch.float32, shard_dims=(0,))},
+        max_slots=6,
+    ))
+    joint = SimpleNamespace(world_size=2)
+    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
+    return pool, StepRunner({"state": pool}, node_resources={NODE: ["state"]})
+
+
+def _admit_slots(run: StepRunner, rids: list[str]) -> None:
+    """A prefill of ``rids``: each request not yet holding a slot takes one."""
+    segments = [Segment(rid, "main", 1) for rid in rids]
+    step = SubmoduleStep(segments=segments, steps={"state": RecurrentStep(segments=tuple(segments))})
+    step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False))
+    for rid in rids:
+        run.ingest_request(rid, {})
+    assert run.admit(step).ok
+    run.plan(step)
+    run.commit(step)
+
+
+def test_a_follower_admits_against_rank_0s_free_recurrent_slots(monkeypatch):
+    """As above, on each rank's real recurrent pool, and with a new request in N+1 that
+    takes a slot. Rank 0 had nothing in flight and tore "also" down, then "gone", before
+    it sent N+1; here both wait on N. At each admit this rank's free slots are rank 0's, in
+    rank 0's order, so N+1's new request gets the slot it got on rank 0 (the free list is
+    a stack: the other order hands out also's slot)."""
+    also, gone = (
+        RemoveRequest(request_id=rid, source=MessageSource.TP_RANK_0, after_tp_seq=0)
+        for rid in ("also", "gone")
+    )
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [also, gone]], serial=True)
+    w.scheduler.steps[1] = [HANDLES["kept"], HANDLES["idle"]]
+    rid_of = {handle: rid for rid, handle in HANDLES.items()}
+    pool, run = _slot_pool()
+    rank_0, run_0 = _slot_pool()
+    expected = [list(rank_0._free)]
+    _admit_slots(run_0, ["gone", "kept", "also"])
+    run_0.remove_request("also")
+    run_0.remove_request("gone")
+    expected.append(list(rank_0._free))
+    _admit_slots(run_0, ["kept", "idle"])
+
+    tear_down, gpu = w.engine_manager.remove_request, w._execute_on_gpu_thread
+    at_admit = []
+
+    def _release(handle):
+        tear_down(handle)
+        run.remove_request(rid_of[handle])
+
+    def _admit(batch, node_batch, plan_future=None):
+        out = gpu(batch, node_batch, plan_future)  # the admit, after any hold
+        at_admit.append(list(pool._free))
+        _admit_slots(run, [rid_of[h] for h in batch.request_to_worker_graph])
+        return out
+
+    w.engine_manager.remove_request, w._execute_on_gpu_thread = _release, _admit
+    _run(w)
+
+    assert [entry[1] for entry in log if entry[0] == "teardown"] == ["also", "gone"], log
+    assert log.index(("teardown", "gone")) < log.index(("admit", 1)), log
+    assert at_admit == expected
+    assert pool._slots["idle"]["main"].index == rank_0._slots["idle"]["main"].index
+    assert pool._free == rank_0._free and pool.num_free_slots == rank_0.num_free_slots
+
+
 def test_a_follower_tears_down_nothing_ahead_of_one_it_deferred(monkeypatch):
     """Rank 0 tore "gone" down, then "idle", after N. Here N still runs "gone", so it waits
     on N; "idle" runs in no step, but waits behind it, as on rank 0."""
@@ -362,3 +446,31 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     _run(w)
 
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
+
+
+def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
+    """The fence waits past any number of warning intervals; it never gives up.
+    A lone-rank step (``tp_seq=-1``) is the case that used to."""
+    tp_seq = -1
+    monkeypatch.setattr(worker_mod, "_ADMIT_FENCE_WARN_S", 0.001)
+    admitted = threading.Event()
+    warnings = []
+
+    def warn(*args):
+        warnings.append(args)
+        if len(warnings) == 3:
+            admitted.set()  # the admit lands during the third interval
+
+    monkeypatch.setattr(worker_mod.logger, "warning", warn)
+    w = Worker.__new__(Worker)
+    w.worker_id = "rank0"
+    w._span = lambda name: nullcontext()
+    _, executing = _batch(tp_seq, [HANDLES["kept"]])
+    executing.launch_started_event = admitted
+    pending = SimpleNamespace(
+        tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, node_batch=executing,
+    )
+
+    w._await_admit_settled(pending)
+
+    assert admitted.is_set() and len(warnings) == 3

@@ -340,7 +340,7 @@ def _stub_worker(sbuf):
     reads = []
     req_info = SimpleNamespace(stream_buffers={"audio_in": sbuf})
     stub = SimpleNamespace(
-        _draining_rids=set(), worker_id="worker_0", enable_nvtx=False,
+        _draining_rids=set(), worker_id="worker_0", enable_nvtx=False, _walk_driven_edges={},
         _rid=lambda rid: 7 if rid == "r" else None,
         request_state=SimpleNamespace(per_request_info={7: req_info}),
         tensor_manager=SimpleNamespace(
@@ -368,7 +368,7 @@ def test_the_worker_buffers_client_chunks_and_closes_on_producer_done():
     Worker._process_new_inputs(stub, InputSignals(
         request_id="r", inputs=[chunk], request_info=info, partition_name="Ear",
     ))
-    assert reads == [[1, 2]] and list(sbuf._tensor_ids_in_order) == [1, 2]
+    assert reads == [[1, 2]] and [tid for tid, _walk in sbuf._tensor_ids_in_order] == [1, 2]
     assert not sbuf.producer_done
 
     Worker._process_new_inputs(stub, InputSignals(

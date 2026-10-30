@@ -209,7 +209,7 @@ class Glm52SparseMoeBlock(nn.Module):
             # routed + shared partials in one tensor, so one reduction
             out = self._forward_decode(flat)
             if self.tp_size > 1 and self.reduce_results:
-                self.comm_group.all_reduce(out)
+                out = self.comm_group.all_reduce(out)
             return out.view(input_shape)
 
         # topk_weights stay fp32 into the combine, as in HF's experts.
@@ -218,7 +218,7 @@ class Glm52SparseMoeBlock(nn.Module):
             if self._use_fused and self._prefill_kernel and flat.shape[0] > _DECODE_MAX_TOKENS:
                 routed = self._dispatch_prefill(flat, topk_weights, topk_ids)
                 if self.tp_size > 1 and not self._sum_partials:
-                    self.comm_group.all_reduce(routed)
+                    routed = self.comm_group.all_reduce(routed)
             elif self._use_fused:
                 from mstar.utils.fused_moe import fused_experts_fp8
 
@@ -232,7 +232,7 @@ class Glm52SparseMoeBlock(nn.Module):
                     block_size=self.block_size,
                 )
                 if self.tp_size > 1 and not self._sum_partials:
-                    self.comm_group.all_reduce(routed)
+                    routed = self.comm_group.all_reduce(routed)
             else:
                 routed = self._dispatch_fp8_reference(
                     flat, topk_weights, topk_ids,
@@ -256,12 +256,12 @@ class Glm52SparseMoeBlock(nn.Module):
                 topk_weights,
             )
             if not self._sum_partials:
-                self.comm_group.all_reduce(routed)
+                routed = self.comm_group.all_reduce(routed)
         shared = self.shared_expert(flat)
         out = routed + shared
         if self._sum_partials and self.reduce_results:
             # Both terms are per-rank partials here; one reduce for the sum.
-            self.comm_group.all_reduce(out)
+            out = self.comm_group.all_reduce(out)
         return out.view(input_shape)
 
     def _use_decode(self, flat: torch.Tensor) -> bool:
@@ -363,7 +363,7 @@ class Glm52SparseMoeBlock(nn.Module):
             final.index_add_(0, token_idx, out.to(final.dtype))
 
         if reduce and self.tp_size > 1:
-            self.comm_group.all_reduce(final)
+            final = self.comm_group.all_reduce(final)
         return final
 
     def process_weights_after_loading(self, device) -> None:

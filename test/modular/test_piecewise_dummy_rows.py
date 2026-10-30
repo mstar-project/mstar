@@ -95,7 +95,8 @@ def _cpu_capture(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(
         cgr, "capture_into_graph",
-        lambda run, pool, device, dtype, keep_graph=False: (SimpleNamespace(replay=lambda: None), run()),
+        lambda run, pool, device, dtype, keep_graph=False, node_name=None: (
+            SimpleNamespace(replay=lambda: None), run()),
     )
 
 
