@@ -1,7 +1,7 @@
-"""STREAM_ITEMS: a step's streamed tensors to one peer worker, as columns.
+"""EDGE_ITEMS: a step's streamed tensors to one peer worker, as columns.
 
-The sender side (``StreamItemsBuilder``) mirrors the Rust runtime's
-``frames::StreamItems``: both runtimes send a step's plain streamed edges this
+The sender side (``EdgeItemsBuilder``) mirrors the Rust runtime's
+``frames::EdgeItems``: both runtimes send a step's plain streamed edges this
 way, so a receiver decodes, reads and routes them once per step instead of
 once per (request, worker) INPUT_SIGNALS. The reader side turns a frame back
 into rows, and a row back into what INPUT_SIGNALS carried, for the paths that
@@ -14,21 +14,21 @@ from typing import NamedTuple
 
 from mstar.communication.wire import _dtype_from_name, _dtype_name
 from mstar.graph.base import GraphEdge, TensorPointerInfo
-from mstar.utils.ipc_format import InputSignals, StreamItems
+from mstar.utils.ipc_format import EdgeItems, InputSignals
 
 
-def stream_items_eligible(edge: GraphEdge) -> bool:
-    """Whether a streamed edge can ride STREAM_ITEMS: unsharded, one
+def edge_items_eligible(edge: GraphEdge) -> bool:
+    """Whether a streamed edge can ride EDGE_ITEMS: unsharded, one
     producer, with items."""
     return bool(edge.tensor_info) and edge._shard_dim is None and edge._total_fanin == 1
 
 
-class StreamItemsBuilder:
-    """One frame's columns, row by row (``frames::StreamItems`` in Rust)."""
+class EdgeItemsBuilder:
+    """One frame's columns, row by row (``frames::EdgeItems`` in Rust)."""
 
     def __init__(self, partition_name: str):
         self._partition = partition_name
-        self._msg: StreamItems | None = None
+        self._msg: EdgeItems | None = None
         self._name_at: dict[str, int] = {}
         self._dtype_at: dict = {}
 
@@ -62,7 +62,7 @@ class StreamItemsBuilder:
             return False
         m = self._msg
         if m is None:
-            m = self._msg = StreamItems(
+            m = self._msg = EdgeItems(
                 partition_name=self._partition, source_session_id=shared[0],
                 source_entity=shared[1], tp_size=shared[3], tp_rank=shared[4],
                 source_node_name=shared[2],
@@ -91,7 +91,7 @@ class StreamItemsBuilder:
             m.shm_offsets.append(i.shm_offset)
         return True
 
-    def build(self) -> StreamItems:
+    def build(self) -> EdgeItems:
         return self._msg
 
 
@@ -108,7 +108,7 @@ class StreamRow(NamedTuple):
     dim_start: int
 
 
-def rows(frame: StreamItems) -> Iterator[StreamRow]:
+def rows(frame: EdgeItems) -> Iterator[StreamRow]:
     names, ndims = frame.names, frame.ndims
     start = dim_start = 0
     for index, (rid, s, n, count) in enumerate(zip(
@@ -119,12 +119,12 @@ def rows(frame: StreamItems) -> Iterator[StreamRow]:
         start += count
 
 
-def frame_dtypes(frame: StreamItems) -> list:
+def frame_dtypes(frame: EdgeItems) -> list:
     """The frame's dtypes, by ``dtype_idx``: once per frame, for ``row_infos``."""
     return [_dtype_from_name(n) for n in frame.dtype_names]
 
 
-def row_infos(frame: StreamItems, row: StreamRow, dtypes: list | None = None) -> list[TensorPointerInfo]:
+def row_infos(frame: EdgeItems, row: StreamRow, dtypes: list | None = None) -> list[TensorPointerInfo]:
     """The row's tensor descriptors, as INPUT_SIGNALS carried them
     (``dtypes`` from ``frame_dtypes``, or computed here)."""
     out = []
@@ -157,8 +157,8 @@ def row_infos(frame: StreamItems, row: StreamRow, dtypes: list | None = None) ->
     return out
 
 
-def row_input_signals(frame: StreamItems, row: StreamRow) -> InputSignals:
-    """The row as the INPUT_SIGNALS that carried it before STREAM_ITEMS."""
+def row_input_signals(frame: EdgeItems, row: StreamRow) -> InputSignals:
+    """The row as the INPUT_SIGNALS that carried it before EDGE_ITEMS."""
     return InputSignals(
         request_id=row.request_id,
         inputs=[GraphEdge(

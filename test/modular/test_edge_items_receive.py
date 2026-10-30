@@ -1,4 +1,4 @@
-"""A STREAM_ITEMS frame has the effect of the INPUT_SIGNALS it replaces: one
+"""An EDGE_ITEMS frame has the effect of the INPUT_SIGNALS it replaces: one
 per row, each a single streamed edge. Same reads started, same items
 registered with each stream buffer in the same order, the same rows parked
 (request not here yet) or dropped and ACKed (request removed), and nothing for
@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.communication.stream_items import StreamItemsBuilder, row_input_signals, rows
+from mstar.communication.edge_items import EdgeItemsBuilder, row_input_signals, rows
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -32,7 +32,7 @@ def _info(uuid):
 def _frame():
     """Two known requests (one with two items), one not here yet, one
     removed, one being drained."""
-    b = StreamItemsBuilder("snac")
+    b = EdgeItemsBuilder("snac")
     for wire_rid, uuids in [("r1", [1, 2]), ("later", [3]), ("removed", [4]), ("draining", [5]), ("r2", [6])]:
         assert b.try_add(wire_rid, GraphEdge(
             next_node=NODE, name=EDGE, tensor_info=[_info(u) for u in uuids], is_streaming=True,
@@ -88,7 +88,7 @@ def _state(w):
 def test_a_frame_does_what_its_rows_as_input_signals_did():
     frame = _frame()
     batched = _worker()
-    batched._process_stream_items(frame)
+    batched._process_edge_items(frame)
     one_by_one = _worker()
     for row in rows(frame):
         one_by_one._process_message_list([WorkerMessage(
@@ -106,7 +106,7 @@ def test_a_frame_starts_its_reads_in_one_call():
     w = _worker()
     calls = []
     w.tensor_manager.start_read_tensors_multi = lambda reads: calls.append(reads) or []
-    w._process_stream_items(_frame())
+    w._process_edge_items(_frame())
     assert [[(rid, [i.uuid for e in edges for i in e.tensor_info]) for rid, edges in c] for c in calls] == [
         [(1, [1, 2]), (2, [6])],
     ]
@@ -127,7 +127,7 @@ def test_a_known_request_with_no_stream_buffer_is_acked_unread(failed, caplog):
     frame = _frame()
     batched = worker()
     with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
-        batched._process_stream_items(frame)
+        batched._process_edge_items(frame)
     warned = [r for r in caplog.records if "no stream buffer" in r.getMessage()]
     caplog.clear()
     one_by_one = worker()
