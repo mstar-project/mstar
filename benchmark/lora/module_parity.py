@@ -18,8 +18,9 @@ writing JSON under ``--out``:
 ``hf``
     Models with a transformers reference for the LoRA node (``MODELS[...].hf``):
     Orpheus (``LlamaForCausalLM`` + ``PeftModel``), Higgs Audio's LLM (``Qwen3ForCausalLM``
-    over the checkpoint's text weights), the Qwen3-Omni Thinker (transformers' thinker)
-    and Chatterbox T3 (transformers' ``LlamaModel`` under the speech head); the adapter
+    over the checkpoint's text weights), the Qwen3-Omni Thinker (transformers' thinker),
+    the Qwen3-TTS Talker (``Qwen3ForCausalLM`` over its codec embedding, stack and
+    codec head) and Chatterbox T3 (transformers' ``LlamaModel`` under the speech head); the adapter
     goes in through PEFT (``inject_adapter_in_model`` where the reference is not a
     ``PreTrainedModel`` whose layout the adapter names). The stub applies the
     reference's own RoPE. Rule: top-1 in the reference's top-5, cosine at least 0.99,
@@ -338,11 +339,42 @@ def _qwen3_tts() -> ModelSpec:
         hidden = sub.model(sub.model.model.codec_embedding(ids), label="main")
         return sub.model.codec_head(_last(hidden, lengths)).float()
 
+    def hf(model):
+        """transformers' Qwen3 over the Talker's checkpoint tensors (the codec embedding as
+        its token embedding, the codec-group-0 head as its LM head): the stack the Talker
+        node runs."""
+        import torch
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+
+        t = model.config.talker
+        ref = Qwen3ForCausalLM(Qwen3Config(
+            vocab_size=t.vocab_size, hidden_size=t.hidden_size, intermediate_size=t.intermediate_size,
+            num_hidden_layers=t.num_hidden_layers, num_attention_heads=t.num_attention_heads,
+            num_key_value_heads=t.num_key_value_heads, head_dim=t.head_dim, rms_norm_eps=t.rms_norm_eps,
+            rope_theta=t.rope_theta, max_position_embeddings=t.max_position_embeddings,
+            tie_word_embeddings=False,
+        )).to(torch.bfloat16)
+        native = {"model.codec_embedding.weight": "model.embed_tokens.weight", "codec_head.weight": "lm_head.weight"}
+
+        def rename(name):
+            name = name.removeprefix("talker.") if name.startswith("talker.") else None
+            if name is None or name.startswith(("code_predictor.", "text_projection.", "model.text_embedding.")):
+                return None
+            return native.get(name, name)
+
+        _load_hf(ref, _snapshot(model), rename)
+        return HfReference(
+            forward=lambda m, ids: m(ids[None].cuda()).logits[0, -1].float(),
+            model=ref.cuda().eval(), rope=_hf_rope(ref.model.rotary_emb),
+            adapter_name=lambda module: module.removeprefix("talker."),
+        )
+
     return ModelSpec(
         "Talker", lambda model: _random_ids(2048), run,
         lambda sub, rids, ids: declared_step(sub, "talker_prefill", rids, _ar_inputs(ids)),
         config="configs/qwen3tts.yaml",
         request={"output_modalities": "audio", "model_kwargs": {"temperature": 0.0}},
+        hf=hf,
     )
 
 
