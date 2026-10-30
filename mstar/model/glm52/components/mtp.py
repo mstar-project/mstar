@@ -75,10 +75,11 @@ class Glm52MTPModule(nn.Module):
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(head_input, raw_hidden)``: the shared_head-normed
-        state for ``lm_head`` (applied by the caller that owns the head),
-        and the raw layer output for chaining the next draft iteration.
-        ``prev_hidden`` is the trunk's post-final-norm state, as the reference
-        pairs it (``hnorm`` normalizes it again), or a chained draft's raw output.
+        state, which ``lm_head`` reads (applied by the caller that owns the
+        head) and the next draft iteration chains, and the layer output under
+        that norm. ``prev_hidden`` is the trunk's post-final-norm state, as the
+        reference pairs it (``hnorm`` normalizes it again), or the previous
+        draft's head input, as the reference chains it.
         """
         hidden_states = self.fuse(token_embeds, prev_hidden)
         hidden_states = self.transformer_layer(hidden_states, position_ids)

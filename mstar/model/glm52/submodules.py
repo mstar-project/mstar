@@ -592,9 +592,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         nxt = torch.roll(input_ids, -1)
         nxt.index_copy_(0, last, new_tokens.to(nxt.dtype))
         # the MTP plane pairs the trunk's post-final-norm state, as the reference does
-        h_head, h_raw = lm.mtp(lm.model.embed_tokens(nxt), hidden, position_ids + 1)
-        self._mtp_seed(kwargs["mtp_slots"], h_head.index_select(0, last),
-                       h_raw.index_select(0, last), new_tokens)
+        h_head, _ = lm.mtp(lm.model.embed_tokens(nxt), hidden, position_ids + 1)
+        self._mtp_seed(kwargs["mtp_slots"], h_head.index_select(0, last), new_tokens)
         return {
             rid: {"new_token": [new_tokens[i : i + 1]]}
             for i, rid in enumerate(engine_inputs.request_ids)
@@ -616,9 +615,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         drafts = [d1]
         rows: dict[str, torch.Tensor] = {}
         for row in range(k - 1):
-            h_head, h = lm.mtp.forward_block_row(
+            h_head, _ = lm.mtp.forward_block_row(
                 embed(drafts[-1]), h, positions[:, row] + 1, row, block, rows)
             drafts.append(self._draft_tokens(h_head, drafts[-1]))
+            # the next pass's hnorm reads this pass's post-norm output, as d1's read the
+            # trunk's post-final-norm state: the reference chains it so (vLLM #45895)
+            h = h_head
         drafts = torch.stack(drafts, 1)
         ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
         hidden = self._hidden(ids, position_ids)
@@ -629,10 +631,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block].contiguous(), verdict[:, block]
         self._stage_verdict(engine_inputs, verdict, mtp_seq)
-        h_head, h_raw = lm.mtp(embed(target.view(-1)), hidden, position_ids + 1)
+        h_head, _ = lm.mtp(embed(target.view(-1)), hidden, position_ids + 1)
         at = torch.arange(n, device=accepted.device) * block + accepted
         next_input = target.view(-1).index_select(0, at)
-        self._mtp_seed(mtp_slots, h_head.index_select(0, at), h_raw.index_select(0, at), next_input)
+        self._mtp_seed(mtp_slots, h_head.index_select(0, at), next_input)
         return {
             rid: {"text_inputs": [next_input[i : i + 1]]}
             for i, rid in enumerate(engine_inputs.request_ids)
@@ -645,13 +647,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return self._mtp_seed_hidden.index_select(0, slots), self._mtp_seed_draft.index_select(0, slots)
 
     @torch.compiler.disable
-    def _mtp_seed(
-        self, slots: torch.Tensor, h_head: torch.Tensor, h_raw: torch.Tensor, prev: torch.Tensor,
-    ) -> None:
+    def _mtp_seed(self, slots: torch.Tensor, h_head: torch.Tensor, prev: torch.Tensor) -> None:
         """The next step's draft seed in each row's slot: the MTP state and d1, the draft for
-        the token after ``prev``. The head reads the shared_head-normed rows; the chain threads
-        the raw layer output."""
-        self._mtp_seed_hidden.index_copy_(0, slots, h_raw.to(self._mtp_seed_hidden.dtype))
+        the token after ``prev``. The head and the next draft pass's hnorm both read the
+        shared_head-normed rows."""
+        self._mtp_seed_hidden.index_copy_(0, slots, h_head.to(self._mtp_seed_hidden.dtype))
         self._mtp_seed_draft.index_copy_(0, slots, self._draft_tokens(h_head, prev))
 
     def _draft_tokens(self, h_head: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
