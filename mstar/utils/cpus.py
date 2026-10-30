@@ -415,11 +415,14 @@ _gpu_locks: dict[str, int] = {}
 
 def _open_lock(path: Path) -> int:
     try:
-        return os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
-    except PermissionError:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    except FileExistsError:
         # another user's file in a sticky directory refuses O_CREAT, and flock
         # needs no write access
         return os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # The umask narrows the mode above, and every user's servers open this file to lock it.
+    os.fchmod(fd, 0o644)
+    return fd
 
 
 def claim_gpus(addresses: Iterable[str | None]) -> str | None:

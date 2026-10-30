@@ -470,7 +470,8 @@ def test_an_existing_lock_file_of_another_user_still_locks(gpu_locks, monkeypatc
     real_open = os.open
 
     def refuse_create(path, flags, *mode):
-        if flags & os.O_CREAT:
+        # the kernel answers O_EXCL on an existing file before the sticky check
+        if flags & os.O_CREAT and not flags & os.O_EXCL:
             raise PermissionError("protected_regular")
         return real_open(path, flags, *mode)
 
