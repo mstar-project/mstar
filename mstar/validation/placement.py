@@ -130,7 +130,8 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
                 # guidance branches rode sp_size before they had an axis of their own
                 hint = (
                     "; split guidance branches with cfg_size instead"
-                    if any(node in sharding.cfg_enabled_nodes for node in unsupported) else ""
+                    if axis == "sp" and any(node in sharding.cfg_enabled_nodes for node in unsupported)
+                    else ""
                 )
                 yield (
                     f"node_groups[{i}] has {axis}_size {size} and contains nodes not "
