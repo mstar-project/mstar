@@ -28,6 +28,9 @@ model_kwargs:
   # each rank selects a block of a long prompt's rows (the indexer grows as the prompt squared)
   dsa_shard_prefill: true
   fused_add_rmsnorm: true
+  # q_a/kv_a norms, RoPE and the latent cache write in two kernels, same bits (the
+  # selecting path too)
+  mla_fused_prep: true
   dense_fp8: true
   moe_decode_kernel: true
   moe_prefill_kernel: true
