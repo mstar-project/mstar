@@ -370,8 +370,8 @@ _TP2 = {"ranks": [1, 2], "tp_size": 2}
     # on one worker the flag is shared, but self-triggered passes still overlap
     (_vocoder_then_post, _ONE, _ONE, False),
     (_gated_vocoder_then_post, _ONE, _ONE, True),
-    # each node_group picks its own replica, so a request can split across them
-    (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, False),
+    # node_groups on the same ranks, replica for replica, pick one replica together
+    (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, True),
 ], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_dp_replicas"])
 def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted, tmp_path, monkeypatch):
     cfg = _config(tmp_path, [

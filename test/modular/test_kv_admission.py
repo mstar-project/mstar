@@ -36,6 +36,7 @@ from test_kv_prefix_lease import (
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -47,7 +48,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.keys import chain, fingerprint
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
+from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,

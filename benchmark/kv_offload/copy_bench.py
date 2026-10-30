@@ -24,10 +24,10 @@ import time
 import torch
 
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import PageCopies
-from mstar.engine.resources.kv.manager import PageArena
 
 
 def sleep_cycles_per_ms() -> float:
