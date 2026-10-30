@@ -145,7 +145,7 @@ def test_the_callers_token_limit_still_applies():
 
 
 def _fusion(**kw) -> AiterARFusion:
-    args = dict(ca=None, cpu_group=None, hidden=64, dtype=BF16, max_tokens=8,
+    args = dict(ca=None, group=None, hidden=64, dtype=BF16, max_tokens=8,
                 register_in_capture=True)
     args.update(kw)
     return AiterARFusion(**args)
@@ -252,7 +252,7 @@ class _Peers:
         self.rounds = list(rounds)
         self.seen: list[list[int]] = []
 
-    def __call__(self, cpu_group, values):
+    def __call__(self, group, values):
         self.seen.append(list(values))
         peer = self.rounds.pop(0) if self.rounds else [0] * len(values)
         return [max(a, b) for a, b in zip(values, peer, strict=True)]
