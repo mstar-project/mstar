@@ -190,6 +190,19 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             rows.sort(key=line.key)  # stable: ties keep the order above
             strict = line.strict
         group_of = c.capture_group
+        if not ordered and group_of is None and c.one_walk is not None:
+            # every row fits and nothing splits them: the chain keeps its rows
+            # as they are, and the others join if ready
+            ready = c.ready
+            taken = [rid for rid in c.backlog if ready(rid)]
+            taken += c.continuing
+            taken += (rid for rid in c.queued if rid not in chain and ready(rid))
+            cap = c.walk_caps.get(c.one_walk)
+            return StepPick(
+                taken=taken, continuing=list(c.continuing),
+                room=len(c.continuing) if cap is not None else None,
+                held_back=set(), ordered=False,
+            )
         chain_group = _NO_GROUP
         if group_of is not None and c.continuing:
             chain_group = group_of(c.continuing[0])
