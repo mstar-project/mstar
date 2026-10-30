@@ -1053,9 +1053,17 @@ runner's admission (``LoraAdapterPool.ask`` / ``reserve``), in arrival order wit
 other resource that asks, so it holds no KV pages meanwhile and the rows already running
 keep stepping; the admit's ``AllocationFailed`` stays only as a backstop. Only the first
 waiting request is admitted, so a cold adapter is not starved by steady traffic on resident
-ones: requests behind it wait too, and the held slots drain. A slot is reserved for a request
-only once its adapter's host copy is in, so its admit never waits on a read. A reservation
-counts slots and pins none: which slot an admit takes follows from the slot table alone. An
+ones: requests behind it wait too, and the held slots drain. On one GPU, where KV admits
+every request as well, that holds back base-model requests too: a request waiting for a
+slot, or for its adapter's host copy, stops every newer admission on its node until a slot
+drains or the read lands. Under tensor parallelism KV does not ask, so base requests go on
+past it. The slot wait does not arise while the adapters in rotation fit in ``max_slots``,
+and the copy wait is at most one read, which starts at the request's ingest. A slot is
+reserved for a request only once its adapter's host copy is in (even for an adapter
+resident in a slot, which a miss admitted ahead may evict), so its admit does not wait on a
+read there; a request whose adapter failed to read is let through at once, and its admit
+fails it. A reservation counts slots and pins none: which slot an admit takes follows from
+the slot table alone. An
 adapter with nothing for a pool's targets (a text-only adapter on a vision tower's pool)
 takes no slot there and runs no delta (its steps can replay the base-only capture): the
 pool knows it from the file's header at startup, or from a runtime load's read, and its
@@ -1083,14 +1091,20 @@ forwarded remove, honoured on rank 0 by waiting for the admit of the step it is 
 behind). That is why the LRU clock counts admits rather than commits, which may land on
 either side of a teardown. Which adapters are resident, which slot a miss takes and
 whether an admit refuses then follow from the same state on every rank. Reading an
-adapter from disk is the one step that can fail on one rank only, so the pool ANDs its
-outcome across the instance (one gloo all-reduce per adapter installed, none in steady
-state) and every rank installs it or refuses the request. Files are read on the pool's own
-reader thread: every rank starts reading an adapter into the host tier when it ingests a
-request that names it, the leader reserves a slot for the request only once its copy is
-in, and an admit never reads a file itself (a follower whose read is still in flight
-waits for it). Neither that wait nor the agreement holds the pool's lock, so the main
-thread's ingests and removes go on meanwhile.
+adapter from disk is the one step that can fail on one rank only, so the ranks agree where
+each one's copy stands (in, still being read, or failed) before any waits for one, and
+every rank installs it or refuses the request: one gloo all-reduce per adapter installed, a
+second when a rank was still reading, none in steady state. Files are read on the pool's
+own reader thread: every rank starts reading an adapter into the host tier when it ingests
+a request that names it, the leader reserves a slot for the request only once its copy is
+in, and an admit never reads a file itself. A follower whose read is still in flight
+waits for it, unless another rank's read has failed. That wait is short when the
+follower's read started at the same ingest as the leader's, the usual case, but it can be
+a whole read: a tier keeps what the ingests and removes on its rank leave it, a follower
+takes removes from rank 0 and ingests from the conductor, and a remove that races an
+ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
+agreement holds the pool's lock, so the main thread's ingests and removes go on
+meanwhile.
 
 A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
 out per request, while each SP rank holds a shard of the tokens, so building the pool

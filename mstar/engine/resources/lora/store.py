@@ -204,10 +204,11 @@ def check_adapters(spec: LoraSpec, others: Sequence[LoraSpec] = ()) -> dict[str,
 class LoraAdapterStore:
     """Adapters held in pinned host memory.
 
-    Which adapters it holds follows from ``hold`` calls alone, in their order: each makes
-    an adapter the most recent, dropping the least recent past ``capacity``. A held
-    adapter's copy arrives later, by ``put``, once read. So when a read lands or fails
-    never changes what is held, and ranks that hold in the same order hold the same set.
+    Which adapters it holds follows from the ``hold`` calls alone, in their order: each
+    makes an adapter the most recent, dropping the least recent past ``capacity`` but none
+    the call's ``keep`` names. A held adapter's copy arrives later, by ``put``, once read.
+    So when a read lands or fails never changes what is held, and ranks that make the same
+    calls hold the same set.
     """
 
     def __init__(

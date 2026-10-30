@@ -39,9 +39,13 @@ cannot form a cycle.
 Files are read on the pool's reader thread, never on the GPU thread or under the lock: a
 request names an adapter, and every rank holds it in the host tier and starts reading it
 as it ingests the request; the leader reserves a slot for a request only once its own copy
-is in. What the host tier holds follows from the ingests alone, so a follower's read
-started when the leader's did, and a follower whose copy is still in flight when the
-leader's step admits waits for it outside the lock.
+is in. A follower whose copy is still in flight when the leader's step admits waits for
+it outside the lock, once the instance has agreed that no rank's read failed. Its read
+usually started with the leader's, at the same ingest, but not always: a tier keeps what
+the ingests and removes on its rank leave it, and nothing orders the two against each
+other across ranks (a follower takes removes from the leader, ingests from the
+conductor). A remove that races an ingest can leave a follower without a copy the leader
+kept, and the next request on that adapter then waits there for a whole read.
 
 Adapters are also loaded and unloaded at runtime (``load_adapter`` / ``unload_adapter``),
 which each rank applies whenever its control message arrives, not at a seq every rank
@@ -578,8 +582,8 @@ class LoraAdapterPool(Resource):
 
     def reserve(self, rid, node_name, graph_walk, published) -> int | None:
         """Count ``rid``'s adapter against the free slots once its host copy is in, so its
-        admit never waits for a read. A row whose adapter failed to read is let through at
-        once, slots or not: its admit fails it, on every rank alike."""
+        admit does not wait for a read on this rank. A row whose adapter failed to read is
+        let through at once, slots or not: its admit fails it, on every rank alike."""
         del node_name, graph_walk, published
         with self._lock:
             name = self._adapter_of[rid]
@@ -820,11 +824,11 @@ class LoraAdapterPool(Resource):
         """Caller holds the lock. Hold ``name`` in the host tier as a request on it is
         ingested, and read it in if its copy isn't (or its last read failed).
 
-        What the tier holds follows only from the order requests are ingested and the
-        adapters they name, the same on every rank, never from when a read lands. So a
-        follower's read of an adapter always starts at the ingest the leader's does,
-        and the leader never reserves on a copy a follower dropped long ago. An adapter
-        a live request names is never dropped.
+        What the tier holds follows from the order of the ingests and removes on this
+        rank (an adapter a live request names is never dropped), never from when a read
+        lands. Ranks that saw them in the same order hold the same adapters, so a
+        follower's read usually starts at the ingest the leader's does; a remove that
+        raced an ingest can leave them different for a while (see the module docstring).
 
         A failed read is retried, except while a row reserved on that failure waits for
         the admit that fails it, which would otherwise wait for the retry."""
