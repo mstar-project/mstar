@@ -4,6 +4,7 @@ base-only captures, on CPU."""
 from __future__ import annotations
 
 import itertools
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -121,36 +122,42 @@ def test_a_refusal_unwinds_the_pools_partial_takes_through_the_runner(adapters):
     assert pool.resident_slot("a1") == 1
 
 
-def test_a_delta_runs_only_inside_its_planned_steps_compute_scope(adapters):
-    """A delta outside a step (prepare_inputs, a cached output) would read the last step's
-    addressing. The engine brackets preprocess, forward and capture in
-    ``StepRunner.compute_scope``, and an engine-built pool refuses a delta outside one."""
-    pool = LoraAdapterPool.build(P.make_spec(adapters[1]), ENGINE_INFO)
+def test_a_delta_runs_only_between_its_steps_plan_and_commit(adapters):
+    """A delta outside a step (prepare_inputs, a cached output) would read another step's
+    addressing: the pool keeps a step's addressing from its plan to its commit or rollback,
+    for the thread that planned it, and a delta called outside that refuses. The async
+    worker runs prepare_inputs on the main thread while the GPU thread's step is planned."""
+    pool = P.make_pool(adapters[1])
     P.ingest(pool, "r", "a1")
-    assert P.run_step(pool, ["r"]).ok  # committed: the pool keeps its addressing
 
     def delta():
         x, y = torch.randn(1, P.HIDDEN, dtype=F64), torch.zeros(1, P.Q_OUT + 2 * P.KV_OUT, dtype=F64)
         pool.layer_delta("qkv", 0)(x, y)
 
+    def on_another_thread():
+        refused = []
+
+        def run():
+            try:
+                delta()
+            except RuntimeError as exc:
+                refused.append(exc)
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join()
+        return refused
+
     with pytest.raises(RuntimeError, match="outside its node's planned step"):
         delta()
-    runner = StepRunner({"lora": pool, "plain": _Plain()})
-    with runner.compute_scope(_runner_step(["r"], ["lora"])):
+    for end in (pool.commit, pool.rollback_admit):
+        s, c = P.step(["r"]), P.ctx(["r"])
+        assert pool.admit(s, c).ok
+        pool.plan(s, c)
+        assert on_another_thread(), "a delta on another thread ran against this step's rows"
         delta()
-        with runner.compute_scope(_runner_step(["r"], ["lora", "plain"])):  # a nested region's step
+        end(s, c)
+        with pytest.raises(RuntimeError, match="outside"):
             delta()
-        delta()
-    with pytest.raises(RuntimeError, match="outside"):
-        delta()
-    with pytest.raises(ValueError), runner.compute_scope(_runner_step(["r"], ["lora"])):
-        raise ValueError
-    with pytest.raises(RuntimeError, match="outside"):  # a raising forward still leaves the scope
-        delta()
-    # a piecewise region whose own step leaves the LoRA resource out is refused at its capture
-    with runner.compute_scope(_runner_step(["r"], ["plain"])), pytest.raises(RuntimeError, match="outside"):
-        delta()
-    assert runner.compute_scope(None) is runner.compute_scope(_runner_step(["r"], ["plain"]))  # the shared no-op
 
 
 # --- base-only captures ------------------------------------------------------------------
@@ -315,15 +322,15 @@ def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapter
 
 
 def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
-    """It reads only which adapter each request named: two ranks whose ingests landed in
-    another order, whose slots and empty-adapter reads differ, pick the same capture."""
+    """It reads only which adapter each request named (and which adapters the files say
+    are empty, the same on every rank): two ranks whose ingests landed in another order,
+    and whose slots differ, pick the same capture."""
     named = {"b0": None, "b1": None, "r1": "a1", "r2": "a2"}
     ranks = [P.make_pool(adapters[1], max_slots=2), P.make_pool(adapters[1], max_slots=2)]
     for pool, order in zip(ranks, (list(named), list(reversed(named))), strict=True):
         for rid in order:
             P.ingest(pool, rid, named[rid])
     assert P.run_step(ranks[0], ["r1", "r2"]).ok  # rank 0 has both resident
-    ranks[1]._empty.add("a2")
     for n in range(1, 5):
         for rows in itertools.permutations(named, n):
             want = any(named[r] is not None for r in rows)
@@ -332,4 +339,4 @@ def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
     for pool in ranks:
         pool.remove_request("r1")
         pool.remove_request("r2")
-        assert pool._adapter_rows == 0 and not pool.runs_adapters(list(named))
+        assert not pool._live and not pool.runs_adapters(list(named))

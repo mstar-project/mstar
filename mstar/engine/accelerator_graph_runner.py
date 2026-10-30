@@ -25,6 +25,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
+from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.step import PIECEWISE_WALK
@@ -122,12 +123,15 @@ def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[s
     return sorted(key for key in step.steps if not resources[key].can_capture())
 
 
-def autocast_scope(dtype: torch.dtype | None, device_type: str):
+@contextmanager
+def autocast_scope(dtype: torch.dtype | None, device_type: str, node_name: str | None = None):
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
-    submodule in its own dtype and shuts out any ambient autocast."""
-    return torch.amp.autocast(
+    submodule in its own dtype and shuts out any ambient autocast.
+    ``node_name`` names the node in implicit-downcast warnings."""
+    with node_scope(node_name, dtype), torch.amp.autocast(
         device_type, enabled=dtype is not None, dtype=dtype or torch.bfloat16
-    )
+    ):
+        yield
 
 
 #: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
@@ -171,7 +175,10 @@ def dummy_metadata(
     }
 
 
-def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False):
+def capture_into_graph(
+    run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
+    node_name: str | None = None,
+):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
@@ -200,7 +207,7 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, 
     torch.backends.cudnn.benchmark = False
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
-                autocast_scope(autocast_dtype, backend.device_type):
+                autocast_scope(autocast_dtype, backend.device_type, node_name):
             with backend.capture(graph, pool=pool):
                 output = run()
     except BaseException:
@@ -216,6 +223,7 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, 
 
 def capture_with_static_outputs(
     run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
+    node_name: str | None = None,
 ):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
@@ -244,7 +252,7 @@ def capture_with_static_outputs(
             static_outputs[name].copy_(value)
         return static_outputs
 
-    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph)
+    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph, node_name=node_name)
     return graph, static_outputs
 
 
@@ -874,7 +882,7 @@ class AcceleratorGraphRunner:
                             CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
-                                autocast_dtype=self._autocast_dtype,
+                                autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
@@ -910,7 +918,7 @@ class AcceleratorGraphRunner:
                     memory = _capture_thrown_away(
                         partial(
                             capture_into_graph, warmed.run, device=self._device,
-                            autocast_dtype=self._autocast_dtype,
+                            autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
                         ),
                         f"{self._submodule_name} {spec}",
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
@@ -1092,6 +1100,7 @@ class AcceleratorGraphRunner:
             torch.accelerator.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+                node_name=self._submodule_name,
             )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
@@ -1141,12 +1150,11 @@ class AcceleratorGraphRunner:
                         f"capture admit failed for {spec.bucket}: {outcome.reason}"
                     )
                 self._step_runner.plan(step)
-            with self._step_runner.compute_scope(step):
-                return self._submodule.preprocess(
-                    graph_walk=walk,
-                    engine_inputs=engine_inputs,
-                    inputs=dummy_inputs,
-                )
+            return self._submodule.preprocess(
+                graph_walk=walk,
+                engine_inputs=engine_inputs,
+                inputs=dummy_inputs,
+            )
 
         try:
             static_inputs = prepare()
@@ -1169,12 +1177,11 @@ class AcceleratorGraphRunner:
             forward = self._forward_for(spec)
 
             def run_forward():
-                with self._step_runner.compute_scope(step):
-                    return forward(
-                        graph_walk=walk,
-                        engine_inputs=engine_inputs,
-                        **static_inputs,
-                    )
+                return forward(
+                    graph_walk=walk,
+                    engine_inputs=engine_inputs,
+                    **static_inputs,
+                )
 
             self._graph_backend.set_device()
             self._graph_backend.synchronize()
@@ -1183,7 +1190,7 @@ class AcceleratorGraphRunner:
                 # the last forward's peak, not the first's: that one may compile and autotune
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type):
+                with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
                     returned = _tensor_bytes(run_forward())
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
@@ -1828,6 +1835,7 @@ class PiecewiseAcceleratorGraphRunner:
                                 partial(
                                     capture_with_static_outputs, warmed.run, warmed.warm_outputs,
                                     device=self._device, autocast_dtype=self._autocast_dtype,
+                                    node_name=self._node_name,
                                 ),
                                 f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                             )
@@ -1862,6 +1870,7 @@ class PiecewiseAcceleratorGraphRunner:
                         partial(
                             capture_with_static_outputs, warmed.run, self._outputs_like(bucket),
                             device=self._device, autocast_dtype=self._autocast_dtype,
+                            node_name=self._node_name,
                         ),
                         f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                     )
@@ -1983,6 +1992,7 @@ class PiecewiseAcceleratorGraphRunner:
             graph, static_outputs = capture_with_static_outputs(
                 warmed.run, warmed.warm_outputs if forwards else self._outputs_like(self._bucket(shape)),
                 self._memory_pool, self._device, self._autocast_dtype,
+                node_name=self._node_name,
             )
 
         self._graphs[PiecewiseGraphKey(
@@ -2018,8 +2028,7 @@ class PiecewiseAcceleratorGraphRunner:
             )
 
         def run_fn():
-            with self._step_runner.compute_scope(step):
-                return self._normalize_output(fn(call))
+            return self._normalize_output(fn(call))
 
         try:
             self._plan(step, shape)
@@ -2029,7 +2038,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # as in `AcceleratorGraphRunner._warmed`
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type):
+                with autocast_scope(self._autocast_dtype, self._device.type, self._node_name):
                     warm_outputs = run_fn()
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the

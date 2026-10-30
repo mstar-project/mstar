@@ -21,17 +21,16 @@ import torch
 pytest.importorskip("safetensors")
 
 try:
-    from .test_lora_pool import ctx, ingest, make_spec, step, write_adapter
+    from .test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, settle_reads, step, write_adapter
 except ImportError:  # collected without package context
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from test_lora_pool import ctx, ingest, make_spec, step, write_adapter
+    from test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, settle_reads, step, write_adapter
 
+from mstar.engine.resources.lora import LoraStep  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     ADMIT_OK,
-    AdmitOutcome,
     AdmitRuntimeError,
-    AllocationFailed,
 )
 
 ADAPTERS = ("a1", "a2", "a3", "a4")
@@ -44,19 +43,19 @@ def _write_adapters(root, names):
 
 
 class _Barrier:
-    """``agree`` for ranks in threads: a MIN over a barrier; a missing peer raises."""
+    """``agree`` for ranks in threads: an elementwise MIN over a barrier; a missing peer raises."""
 
     def __init__(self, n: int, timeout: float = 5.0):
         self._barrier = threading.Barrier(n, timeout=timeout)
-        self._flags = [True] * n
+        self._values: list[list[int]] = [[] for _ in range(n)]
         self.calls = [0] * n
 
     def for_rank(self, rank: int):
-        def agree(flag: bool) -> bool:
+        def agree(values: list[int]) -> list[int]:
             self.calls[rank] += 1
-            self._flags[rank] = flag
+            self._values[rank] = list(values)
             self._barrier.wait()
-            result = all(self._flags)
+            result = [min(column) for column in zip(*self._values, strict=True)]
             self._barrier.wait()
             return result
         return agree
@@ -70,19 +69,10 @@ def _verdict(outcome):
     return ("full", outcome.reason.request_id)
 
 
-def _settle_reads(pool: LoraAdapterPool, timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while pool._reads:
-        assert time.monotonic() < deadline, f"reads never completed: {list(pool._reads)}"
-        time.sleep(0.001)
-    with pool._lock:  # a completion stores its copy under the lock
-        pass
-
-
 class _Rank:
     def __init__(self, paths, rank: int, agree, seed: int):
         self.pool = LoraAdapterPool(make_spec(paths, max_slots=2, cpu_capacity=1), "cpu", rank=rank,
-                                    world_size=2, agree=agree, screens=rank == 0)
+                                    world_size=2, agree=agree, decides=rank == 0)
         self.rng = random.Random(seed * 2 + rank)
         self.log: list = []  # (seq, rows, verdict, slot table) per admit
         self.pending: list = []
@@ -106,15 +96,21 @@ class _Rank:
             self.pool.commit(*self.pending.pop())
 
 
-def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int = 60, timeout: float = 5.0):
+def _simulate(paths, seed: int, admits: bool, fenced: bool = True, steps: int = 60, timeout: float = 5.0):
     """A leader sending ingests, steps, stamped removes and an unload to a follower in FIFO
-    order. ``screened`` picks rows as the scheduler does; ``fenced=False`` lands some removes
-    on the leader before the admit of the step they are stamped behind."""
+    order. ``admits`` picks rows through the leader's admission, as the scheduler does;
+    ``fenced=False`` lands some removes on the leader before the admit of the step they are
+    stamped behind."""
     barrier = _Barrier(2, timeout)
     leader, follower = (_Rank(paths, r, barrier.for_rank(r), seed) for r in (0, 1))
     wire: queue.Queue = queue.Queue()
     errors: list = []
     rng = random.Random(seed)
+    runner = lora_runner(leader.pool)
+
+    def remove(rid):
+        runner.remove_request(rid)
+        wire.put(("remove", rid))
 
     def run_leader():
         active: dict[str, int] = {}
@@ -130,14 +126,10 @@ def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int 
                     wire.put(("ingest", rid, adapter))
                     waiting.append(rid)
                 fresh = waiting[:3]
-                if screened:
-                    _settle_reads(leader.pool)  # a step outlasts a small adapter's read
-                    fresh = []
-                    for rid in waiting:
-                        if len(fresh) == 3:
-                            break  # a step's worth; the screen claims slots for what it passes
-                        if leader.pool.admit_retrieve(rid, "LLM", "decode", None).ready:
-                            fresh.append(rid)
+                if admits:
+                    settle_reads(leader.pool)  # a step outlasts a small adapter's read
+                    runner.admit_waiting(lambda rid, node: None)
+                    fresh = [rid for rid in waiting if admitted(runner, rid)][:3]
                 rows = list(active) + fresh
                 if not rows:
                     continue
@@ -148,8 +140,7 @@ def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int 
                     leader.pool.unload_adapter("a4")
                     wire.put(("unload", "a4"))
                 for rid in late:
-                    leader.pool.remove_request(rid)
-                    wire.put(("remove", rid))
+                    remove(rid)
                 late = []
                 outcome = leader.admit(seq, rows)
                 done: list[str] = []
@@ -170,8 +161,7 @@ def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int 
                     if not fenced and rng.random() < 0.5:
                         late.append(rid)
                         continue
-                    leader.pool.remove_request(rid)
-                    wire.put(("remove", rid))
+                    remove(rid)
                 leader.land_commit(maybe=True)
             leader.land_commit()
         except Exception as exc:  # noqa: BLE001
@@ -205,15 +195,15 @@ def _simulate(paths, seed: int, screened: bool, fenced: bool = True, steps: int 
     return leader, follower, barrier, errors
 
 
-@pytest.mark.parametrize("screened", [False, True])
-def test_ranks_agree_step_by_step_under_adapter_churn(tmp_path, screened):
+@pytest.mark.parametrize("admits", [False, True])
+def test_ranks_agree_step_by_step_under_adapter_churn(tmp_path, admits):
     """Four adapters through two slots, one unloaded, each rank landing commits and the
     unload at its own moment: every admit has the same verdict and slot table on both ranks.
-    Screened, no step is refused for want of a slot."""
+    With the leader's admission, no step is refused for want of a slot."""
     paths = _write_adapters(tmp_path, ADAPTERS)
     full = evict = 0
     for seed in range(12):
-        leader, follower, barrier, errors = _simulate(paths, seed, screened)
+        leader, follower, barrier, errors = _simulate(paths, seed, admits)
         assert not errors, (seed, errors)
         assert leader.log == follower.log, seed
         assert barrier.calls[0] == barrier.calls[1]
@@ -222,47 +212,104 @@ def test_ranks_agree_step_by_step_under_adapter_churn(tmp_path, screened):
                      for t0, t1 in zip(tables, tables[1:], strict=False) for a, b in zip(t0, t1, strict=True))
         refused = sum(entry[2] != "ok" for entry in leader.log)
         full += refused
-        if screened:
+        if admits:
             assert refused == 0, seed
-            assert not follower.pool._claims and not follower.pool._waiting_since
-    assert evict > 0 and (screened or full > 0), (evict, full)  # not vacuous
+            assert not follower.pool._reserved
+    assert evict > 0 and (admits or full > 0), (evict, full)  # not vacuous
 
 
 def test_the_churn_run_diverges_without_the_fence(tmp_path):
     paths = _write_adapters(tmp_path, ADAPTERS)
     for seed in range(12):
-        leader, follower, _, errors = _simulate(paths, seed, screened=False, fenced=False, timeout=0.5)
+        leader, follower, _, errors = _simulate(paths, seed, admits=False, fenced=False, timeout=0.5)
         if errors or leader.log != follower.log:
             return
     pytest.fail("no seed diverged with the leader's teardowns unfenced")
 
 
+def test_the_host_tier_follows_the_ingests_not_when_reads_land(tmp_path):
+    """A request on a2 is removed before its read lands on one rank and after on the other.
+    Ingested and removed in the same order, each rank holds the same adapters whenever its
+    reads land, so the leader does not reserve on a copy a follower dropped."""
+    paths = _write_adapters(tmp_path, ("a1", "a2", "a3"))
+    fast, slow = (LoraAdapterPool(make_spec(paths, cpu_capacity=1), "cpu", rank=r, world_size=2,
+                                  decides=r == 0) for r in (0, 1))
+    gate, read = threading.Event(), slow.store._read
+    slow.store._read = lambda name, path: gate.wait(10) and read(name, path)
+    for pool in (fast, slow):
+        ingest(pool, "x", "a2")
+        settle_reads(fast)
+        ingest(pool, "y", "a3")
+        settle_reads(fast)
+        pool.remove_request("x")
+    gate.set()
+    settle_reads(slow)
+    assert list(fast.store._adapters) == list(slow.store._adapters) == ["a2", "a3"]
+    assert "a2" in slow.store and "a3" in slow.store
+
+
+def test_no_rank_waits_on_a_retry_once_a_load_has_failed(tmp_path):
+    """r is let through to fail once a2's read fails on both ranks; n, ingested before r's
+    admit, starts a retry on the follower. The leader keeps its failure for r, and the ranks
+    agree where their copies stand before any waits, so r fails at once on both."""
+    paths = _write_adapters(tmp_path, ("a1", "a2"))
+    barrier = _Barrier(2, timeout=5.0)
+    leader, follower = ranks = [
+        LoraAdapterPool(make_spec(paths, cpu_capacity=1), "cpu", rank=r, world_size=2,
+                        agree=barrier.for_rank(r), decides=r == 0)
+        for r in (0, 1)
+    ]
+    first, retry = threading.Event(), threading.Event()
+    for pool in ranks:
+        _fail_reads(pool, "a2", first, retry)
+        ingest(pool, "r", "a2")
+    runner = lora_runner(leader)
+    assert runner.admit_retrieve("r", "LLM", "decode").queued  # for its copy
+    first.set()
+    for pool in ranks:
+        settle_reads(pool)
+    assert runner.admit_waiting(lambda rid, node: None) == [("LLM", "r")]
+    for pool in ranks:
+        ingest(pool, "n", "a2")
+
+    def admit(pool):
+        s, c = step(["r"]), ctx(["r"])
+        outcome = pool.admit(s, c)
+        pool.rollback_admit(s, c)
+        return _verdict(outcome)
+
+    started = time.monotonic()
+    try:
+        (v1, v2), errors = _on_both(lambda: admit(leader), lambda: admit(follower))
+        assert not errors and v1 == v2 == ("load", ("r",))
+        assert time.monotonic() - started < 5, "a rank waited for the retry"
+    finally:
+        retry.set()
+
+
+def _fail_reads(pool: LoraAdapterPool, name: str, first: threading.Event, then: threading.Event) -> None:
+    """``name``'s reads on ``pool`` fail: the first once ``first`` is set, any later once
+    ``then`` is (or after 10 s)."""
+    read, tries = pool.store._read, []
+
+    def unreadable(adapter, path):
+        if adapter != name:
+            return read(adapter, path)
+        tries.append(adapter)
+        (first if len(tries) == 1 else then).wait(10)
+        raise OSError(f"{adapter} is unreadable")
+    pool.store._read = unreadable
+
+
 # --- the worker's admit fence --------------------------------------------------------------
 
 class _PicksSlotPerMiss(LoraAdapterPool):
-    """Mechanism off: each miss picks its slot after the previous miss's agreement."""
+    """Mechanism off: each row is admitted on its own, so each miss picks its slot after the
+    previous miss's agreement."""
 
     def admit(self, step, ctx):
-        if ctx.capture:
-            return ADMIT_OK
-        self._admits += 1
-        misses: dict[str, list] = {}
-        with self._lock:
-            for seg in step.segments or ():
-                if seg.request_id in self._awaiting and seg.span > 0:
-                    name = self._adapter_of[seg.request_id]
-                    slot = self._resident.get(name)
-                    if slot is None:
-                        misses.setdefault(name, []).append(seg.request_id)
-                    else:
-                        self._take(seg.request_id, slot)
-        for name, rids in misses.items():
-            with self._lock:
-                slot = self._pick_slot()
-            if slot is None:
-                return AdmitOutcome(ok=False, reason=AllocationFailed(
-                    message="full", pages_short=1, label="lora", request_id=rids[0]))
-            outcome = self._load_miss(name, rids, slot)
+        for seg in step.segments:
+            outcome = super().admit(LoraStep(segments=(seg,)), ctx)
             if not outcome.ok:
                 return outcome
         return ADMIT_OK
@@ -293,15 +340,16 @@ def _on_both(*fns):
 
 @pytest.mark.parametrize("pool_cls,splits", [(LoraAdapterPool, False), (_PicksSlotPerMiss, True)])
 def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, pool_cls, splits):
-    """A follower's slow read holds the leader's admit in the load agreement while a
-    teardown lands on the leader alone. Every miss's slot is picked when the admit starts,
-    so the second miss cannot see the freed slot and both ranks refuse the step alike."""
+    """A teardown lands on the leader alone inside the load agreement of a two-miss admit,
+    while a follower's read of a2 is still in flight. Every miss's slot is picked when the
+    admit starts, so the second miss cannot see the freed slot and both ranks refuse the
+    step alike, before the follower waits for its read."""
     paths = _write_adapters(tmp_path, ADAPTERS)
     barrier = _Barrier(2, timeout=2.0)
     mid_admit: list = []  # a teardown the leader's main thread lands once, mid-admit
 
-    def leader_agree(flag):
-        agreed = barrier.for_rank(0)(flag)
+    def leader_agree(states):
+        agreed = barrier.for_rank(0)(states)
         while mid_admit:
             remove = threading.Thread(target=mid_admit.pop())
             remove.start()
@@ -310,7 +358,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
 
     leader, follower = ranks = [
         pool_cls(make_spec(paths, max_slots=2, cpu_capacity=1), "cpu", rank=r, world_size=2,
-                 agree=agree, screens=r == 0)
+                 agree=agree, decides=r == 0)
         for r, agree in ((0, leader_agree), (1, barrier.for_rank(1)))
     ]
 
@@ -323,7 +371,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
     for pool in ranks:  # a1's slot unheld, a4's held by "k"
         ingest(pool, "h", "a1")
         ingest(pool, "k", "a4")
-        _settle_reads(pool)
+        settle_reads(pool)
     (v1, v2), errors = _on_both(lambda: admit(leader, ["h", "k"]), lambda: admit(follower, ["h", "k"]))
     assert not errors and v1 == v2 == "ok"
     for pool in ranks:
@@ -333,7 +381,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
     for pool in ranks:
         ingest(pool, "rA", "a2")
         ingest(pool, "rB", "a3")
-    _settle_reads(leader)
+    settle_reads(leader)
     mid_admit.append(lambda: leader.remove_request("k"))
     threading.Timer(0.2, gate.set).start()
 
@@ -343,13 +391,12 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
         return verdict
 
     (v1, v2), errors = _on_both(lambda: admit(leader, ["rA", "rB"]), follower_step)
-    while mid_admit:  # no agreement ran: the leader lands it once the admit settles
-        mid_admit.pop()()
+    assert not mid_admit  # landed inside the leader's agreement
     if splits:
         assert errors or v1 != v2 or _slots(leader) != _slots(follower)
         return
     assert not errors and v1 == v2 == ("full", "rB") and _slots(leader) == _slots(follower)
-    _settle_reads(follower)  # the retry, k gone on both, loads both adapters on both
+    settle_reads(follower)  # the retry, k gone on both, loads both adapters on both
     (v1, v2), errors = _on_both(lambda: admit(leader, ["rA", "rB"]), lambda: admit(follower, ["rA", "rB"]))
     assert not errors and v1 == v2 == "ok" and _slots(leader) == _slots(follower)
     assert {leader.slot_state(i).adapter for i in (1, 2)} == {"a2", "a3"}

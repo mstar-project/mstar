@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from contextlib import contextmanager
 
 import torch
 from safetensors.torch import save_file
@@ -115,19 +114,6 @@ def serve(spec: LoraSpec, adapters: dict[str, str], max_rank: int = 4, **kw) -> 
 
 def pool(spec: LoraSpec, rank: int = 0, world: int = 1) -> LoraAdapterPool:
     return LoraAdapterPool(spec, "cpu", rank=rank, world_size=world)
-
-
-@contextmanager
-def compute(*pools):
-    """The engine's compute scope around a planned step's preprocess and forward
-    (``StepRunner.compute_scope``), on the given pools: deltas called outside one raise."""
-    for p in pools:
-        p.enter_compute()
-    try:
-        yield
-    finally:
-        for p in pools:
-            p.exit_compute()
 
 
 def plan(pools, rows: list[tuple[str, str | None, int]]) -> None:

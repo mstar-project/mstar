@@ -18,32 +18,44 @@ worker fixes by landing each between the same two admits on every rank (``after_
 The one decision that can differ per rank, whether an adapter loaded, is agreed across the
 instance before anything is installed.
 
-A full pool is backpressure, not a refused step: ``admit_retrieve`` keeps a request out of
-the batches the scheduler builds until a slot can take its adapter, so rows already running
-never lose a step to it. Only the rank that chooses batches screens (a lockstep instance's
-leader); the admit refusal stays as a backstop.
+A full pool is backpressure, not a refused step: a request on an adapter waits at the
+runner's admission (``ask`` / ``reserve``) until a slot can take its adapter, in one queue
+with every other resource that asks, so it holds no KV pages meanwhile and the rows already
+running never lose a step to it. A reservation counts slots and pins none: the slot an
+admit picks follows from the slot table alone, and the reservations never promise more
+slots than exist, so every reserved row finds one at its admit. A row whose adapter
+failed to read and is in no slot is the exception: it is let through at once, and its
+admit fails it before handing out any slot, so it takes none that a counted row needs.
+Only the rank that chooses batches decides (a lockstep instance's leader), so no other
+rank keeps reservations; the admit refusal stays as a backstop.
 
 A model with LoRA specs on several nodes (an LLM and its vision encoder) has a pool per
-node, and each screens only its own node's rows. A request holds a slot in each until it
+node, and each admits only its own node's rows. A request holds a slot in each until it
 is removed (none in a pool whose targets its adapter has nothing for), but where the
 graph runs the encoder once, before the LLM (Qwen3.5), it takes them in that order and a
 row holding an LLM slot never waits on the encoder's pool, so the two pools' waits
 cannot form a cycle.
 
 Files are read on the pool's reader thread, never on the GPU thread or under the lock: a
-request names an adapter, and every rank starts reading it into the host tier as it ingests
-the request; the leader's screen holds the request back until its own copy is in. A
-follower whose copy is still in flight when the leader's step admits waits for it outside
-the lock.
+request names an adapter, and every rank holds it in the host tier and starts reading it
+as it ingests the request; the leader reserves a slot for a request only once its own copy
+is in. A follower whose copy is still in flight when the leader's step admits waits for
+it outside the lock, once the instance has agreed that no rank's read failed. Its read
+usually started with the leader's, at the same ingest, but not always: a tier keeps what
+the ingests and removes on its rank leave it, and nothing orders the two against each
+other across ranks (a follower takes removes from the leader, ingests from the
+conductor). A remove that races an ingest can leave a follower without a copy the leader
+kept, and the next request on that adapter then waits there for a whole read.
 
 Adapters are also loaded and unloaded at runtime (``load_adapter`` / ``unload_adapter``),
 which each rank applies whenever its control message arrives, not at a seq every rank
 agrees on. That is safe because neither touches what an admit decides from (slot
-refcounts, which slot holds an adapter, the LRU clock): a load only fills the host tier,
-and an unload only forgets the adapter's name, its host copy and its name -> slot entry,
-once no live request names it. An admit consults that entry only for a request naming the
-adapter, and the next such request is ingested after a reload, which reaches every rank
-after the unload did. The slot keeps the old weights, unheld, until LRU eviction reuses it.
+refcounts, which slot holds an adapter, the LRU clock): a load only makes the adapter
+servable (the host tier holds it from its first request), and an unload only forgets the
+adapter's name, its host copy and its name -> slot entry, once no live request names it.
+An admit consults that entry only for a request naming the adapter, and the next such
+request is ingested after a reload, which reaches every rank after the unload did. The
+slot keeps the old weights, unheld, until LRU eviction reuses it.
 """
 
 from __future__ import annotations
@@ -67,10 +79,11 @@ from mstar.engine.resources.lora.config import (
     LoraStep,
     describe_load_error,
 )
-from mstar.engine.resources.lora.store import LoadedAdapter, LoraAdapterStore
+from mstar.engine.resources.lora.store import LoadedAdapter, LoraAdapterStore, adapter_targets
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    ASKS,
     PIECEWISE_WALK,
     AdmitOutcome,
     AdmitRuntimeError,
@@ -83,7 +96,9 @@ logger = logging.getLogger(__name__)
 
 ZERO_SLOT = 0
 _LABEL = "lora"
-_NOT_READY = AdmitOutcome(ok=True, ready=False)
+# where a rank's copy of an adapter stands at an admit, ordered so that the lowest across
+# a lockstep instance is the instance's answer
+_FAILED, _READING, _IN = 0, 1, 2
 
 
 @dataclass(slots=True)
@@ -98,13 +113,27 @@ class SlotState:
     last_used_step: int = -1
 
 
-@dataclass(slots=True)
-class _Wait:
-    """A row held back for want of a slot: since when (in the pool's admits), and the
-    pool's screen count when it was last screened."""
+class _Copy(NamedTuple):
+    """Where a rank's host copy of an adapter stands at an admit: in, still being read, or
+    failed to read."""
 
-    since: int
-    screened: int
+    loaded: LoadedAdapter | None = None
+    pending: Future | None = None
+    error: str | None = None
+
+    @property
+    def state(self) -> int:
+        return _FAILED if self.error is not None else _READING if self.pending is not None else _IN
+
+    def landed(self, name: str) -> "_Copy":
+        """This copy once its read is done, waiting for it outside the pool's lock."""
+        if self.pending is None:
+            return self
+        try:
+            return _Copy(loaded=self.pending.result())
+        except Exception as exc:  # a bad checkpoint fails the request, not the worker
+            logger.error("LoRA adapter %s failed to load: %s", name, exc)
+            return _Copy(error=describe_load_error(exc))
 
 
 class _Served(NamedTuple):
@@ -155,12 +184,16 @@ class LoraLayerDelta:
         self._embedding = declared.kind == "embedding"
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        if self._pool.outside_compute() and not torch.compiler.is_compiling():
+        # compile check first, so a traced forward installs no guard on the pool
+        if not torch.compiler.is_compiling() and (
+            self._pool._current is None or self._pool._plan_thread != threading.get_ident()
+        ):
             raise RuntimeError(
                 "a LoRA delta was called outside its node's planned step (e.g. from "
-                "prepare_inputs, or on an output cached from an earlier step): it would "
-                "address another step's rows. Call the module's base computation there "
-                "and add the delta in preprocess or the forward"
+                "prepare_inputs, which the async worker runs while the GPU thread's step "
+                "is planned, or on an output cached from an earlier step): there is no "
+                "addressing for its rows. Call the module's base computation there and "
+                "add the delta in preprocess or the forward"
             )
         if not self._pool.active:
             # a base-only step: no row names an adapter, so nothing is launched
@@ -244,7 +277,7 @@ class LoraAdapterPool(Resource):
 
     @classmethod
     def build(cls, spec: LoraSpec, info: EngineResourceInfo) -> "LoraAdapterPool":
-        rank, world_size, agree, screens = 0, 1, None, True
+        rank, world_size, agree, decides = 0, 1, None, True
         joint = info.joint_comm_group
         if joint is not None:
             if joint.sp_group.world_size > 1:
@@ -258,18 +291,13 @@ class LoraAdapterPool(Resource):
             # the base linears split over the TP group
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size
             if joint.world_size > 1:
-                def agree(flag: bool) -> bool:
-                    return bool(joint.agree([int(flag)])[0])
+                agree = joint.agree  # MIN
                 # the instance's leader picks every batch; the others run what it picked
-                screens = joint.rank == 0
-        pool = cls(
+                decides = joint.rank == 0
+        return cls(
             spec, info.device, rank=rank, world_size=world_size, dtype=info.compute_dtype,
-            agree=agree, screens=screens,
+            agree=agree, decides=decides,
         )
-        # the engine brackets every planned step's compute (`enter_compute`), so a delta
-        # called outside one is a bug from the start
-        pool._scoped = True
-        return pool
 
     def __init__(
         self,
@@ -279,13 +307,14 @@ class LoraAdapterPool(Resource):
         world_size: int = 1,
         backend: LoraBackend | None = None,
         dtype: torch.dtype | None = None,
-        agree: Callable[[bool], bool] | None = None,
-        screens: bool = True,
+        agree: Callable[[list[int]], list[int]] | None = None,
+        decides: bool = True,
     ):
         """``dtype`` is the nodes' compute dtype, which the slot weights take unless the
-        spec names one. ``agree`` ANDs a flag across the pool's lockstep instance (a
-        collective); None on a single rank. ``screens`` says whether this rank chooses
-        batches (see ``admit_retrieve``): False on a lockstep instance's followers."""
+        spec names one. ``agree`` takes the lowest of each value across the pool's lockstep
+        instance (a collective); None on a single rank. ``decides`` says whether this rank
+        chooses batches, and so admits requests (``ask``): False on a lockstep instance's
+        followers."""
         self.spec = spec
         self._device = torch.device(device)
         self.dtype = spec.dtype or dtype
@@ -296,7 +325,7 @@ class LoraAdapterPool(Resource):
             )
         self.backend = backend if backend is not None else make_backend(spec.backend, self._device)
         self._agree = agree
-        self._screens = screens
+        self._decides = decides
         self.targets = {name: t.shard(world_size) for name, t in spec.targets.items()}
         num_slots, max_rank = spec.num_slots, spec.max_rank
         # the row groupings the targets read; per token always, first
@@ -325,10 +354,6 @@ class LoraAdapterPool(Resource):
 
         self._slots = [SlotState(index=i) for i in range(num_slots)]
         self._resident: dict[str, int] = {}  # adapter -> slot
-        # adapters with nothing for this spec's targets (rank 0 here, e.g. a text-only
-        # adapter on a vision tower's pool): their rows address the zero adapter and
-        # hold no slot. Known from the first admit that read one, on every rank alike.
-        self._empty: set[str] = set()
         # adapter -> where it is read from: those a new request may name, and those
         # unloaded while live requests still named them, kept until the last of those
         # requests is removed
@@ -336,33 +361,32 @@ class LoraAdapterPool(Resource):
             name: _Served(path, spec.adapter_digests.get(name))
             for name, path in spec.adapters.items()
         }
+        # adapters with nothing for this spec's targets (rank 0 here, e.g. a text-only
+        # adapter on a vision tower's pool): their rows address the zero adapter, take
+        # no slot and run no delta. Known before any request names one, from its file's
+        # header (or a runtime load's read), so the same on every rank.
+        self._empty: set[str] = {
+            name for name, served in self._serving.items() if not adapter_targets(spec, served.path)
+        }
         self._retiring: dict[str, _Served] = {}
         self._store = LoraAdapterStore(spec, rank=rank, world_size=world_size, dtype=self.dtype)
         # (target, layer) -> its bound delta, one per binding so compiled code guards on it
         self._layer_deltas: dict[tuple[str, int], LoraLayerDelta] = {}
-        # Depth of the engine's compute scopes (a planned step's preprocess and forward,
-        # a capture), and whether the engine drives them (an engine-built pool, or one a
-        # scope was entered on): then a delta called outside one raises, since
-        # `_current` still holds the last step's rows.
-        self._compute_depth = 0
-        self._scoped = False
 
         # Handle-keyed request state, all purged by `remove_request`.
         self._adapter_of: dict = {}   # rid -> adapter name, None for the base model
-        self._adapter_rows = 0  # live rids naming an adapter
+        self._live: dict[str, int] = {}  # adapter -> live rids naming it
         self._row_slot: dict = {}     # rid -> slot held, read by `plan`
         self._awaiting: set = set()   # rids with an adapter but no slot yet
-        self._admit_taken: dict = {}  # rid -> slot the live admit took, for rollback
-        # rid -> adapter: awaiting rows `admit_retrieve` let through, counted against the
-        # free slots until their admit takes one
-        self._claims: dict = {}
-        self._claim_count: dict[str, int] = {}  # adapter -> rows claiming it
-        # rid -> when `admit_retrieve` first held it back for want of a slot; insertion
-        # order is age order, so the first entry is the longest waiting
-        self._waiting_since: dict = {}
-        self._screen_count = 0  # screens run, the clock that tells a row out of the scans
-        # (starving adapter, slot): the held slot drained for it while it starves
-        self._drain: tuple[str, int] | None = None
+        # rid -> (slot the live admit took, the adapter it reserved), for rollback
+        self._admit_taken: dict = {}
+        # rid -> adapter: awaiting rows admission reserved for, counted against the free
+        # slots until their admit takes one (the deciding rank only)
+        self._reserved: dict = {}
+        self._reserved_count: dict[str, int] = {}  # adapter -> rows reserved on it
+        # bumped whenever a request that didn't fit may fit now (`grew_since`): a slot
+        # released, a reservation given back, a read landed or failed
+        self._changes = 0
         # Reads into the host tier run on one background thread: a host-tier miss and
         # a runtime load never read a file on the GPU thread or under the lock.
         self._reader: ThreadPoolExecutor | None = None
@@ -377,8 +401,10 @@ class LoraAdapterPool(Resource):
         self._stager = PinnedStager(torch.int32)
         self._eager: _Buffers | None = None
         self._cg: dict[CGSlotKey, _Buffers] = {}
-        # row grouping -> this step's addressing
+        # row grouping -> this step's addressing, from its plan until its commit, and the
+        # thread that planned it, where its forward runs
         self._current: dict[int, LoraAddressing] | None = None
+        self._plan_thread: int | None = None
         # whether this step adds deltas (`plan`); a plain bool, which compiled forwards
         # guard on
         self.active = True
@@ -387,7 +413,7 @@ class LoraAdapterPool(Resource):
         self._enclosing: tuple[dict[int, LoraAddressing], bool] | None = None
 
         # read adapters ahead, so a first request finds its adapter in the host tier
-        for name in list(self._serving)[:spec.cpu_capacity]:
+        for name in [n for n in self._serving if n not in self._empty][:spec.cpu_capacity]:
             served = self._serving[name]
             adapter = self._store.load(name, served.path, served.digest)
             self._pin_digest(name, served, adapter.digest)
@@ -421,18 +447,6 @@ class LoraAdapterPool(Resource):
                 )
             found = self._layer_deltas[(target, layer_idx)] = LoraLayerDelta(self, target, layer_idx)
         return found
-
-    def enter_compute(self) -> None:
-        self._compute_depth += 1
-        self._scoped = True
-
-    def exit_compute(self) -> None:
-        self._compute_depth -= 1
-
-    def outside_compute(self) -> bool:
-        """A delta called now would run outside a planned step's compute, once the
-        engine has started bracketing them (``enter_compute``)."""
-        return self._scoped and not self._compute_depth
 
     def addressing(self, grouping: int = 1) -> LoraAddressing:
         """This step's addressing for rows of ``grouping`` (``LoraTarget.row_grouping``),
@@ -474,21 +488,22 @@ class LoraAdapterPool(Resource):
             if adapter is None:
                 self._row_slot[rid] = ZERO_SLOT
             else:
-                self._adapter_rows += 1
+                self._live[adapter] = self._live.get(adapter, 0) + 1
                 self._awaiting.add(rid)
-                # every rank, so a follower has its copy when the leader's step needs it
-                self._read_errors.pop(adapter, None)
-                self._prefetch(adapter)
+                if adapter not in self._empty:
+                    self._hold(adapter)
 
     def remove_request(self, rid):
         with self._lock:
             adapter = self._adapter_of.pop(rid, None)
             if adapter is not None:
-                self._adapter_rows -= 1
+                if self._live[adapter] == 1:
+                    del self._live[adapter]
+                else:
+                    self._live[adapter] -= 1
             self._awaiting.discard(rid)
             self._admit_taken.pop(rid, None)
-            self._unclaim(rid)
-            self._waiting_since.pop(rid, None)
+            self._unreserve(rid)
             slot = self._row_slot.pop(rid, None)
             if slot:
                 self._release(slot)
@@ -507,11 +522,12 @@ class LoraAdapterPool(Resource):
 
     def load_adapter_async(self, name: str, path: str, digest: bytes | None = None) -> Future:
         """Serve ``name`` from ``path``: read it on the reader thread, check it against the
-        spec (and against ``digest``, the weights the API server checked), shard it for
-        this rank into the host tier, and only then make it servable. The future fails if
-        it is served already, is still retiring from an unload, or cannot be read; a
-        refusal visible now raises here. A request that names it takes a slot on its
-        first admit, as for an adapter configured at startup."""
+        spec (and against ``digest``, the weights the API server checked), and only then
+        make it servable. The read is not kept, since the host tier holds only what
+        requests name: the first request on it reads it again as it is ingested. The
+        future fails if it is served already, is still retiring from an unload, or cannot
+        be read; a refusal visible now raises here. A request that names it takes a slot
+        on its first admit, as for an adapter configured at startup."""
         with self._lock:
             self._refuse_reload(name)
             return self._executor().submit(self._load, name, path, digest)
@@ -520,7 +536,9 @@ class LoraAdapterPool(Resource):
         adapter = self._store.read(name, path, digest)
         with self._lock:
             self._refuse_reload(name)
-            self._store.put(adapter, keep=self._wanted())
+            if adapter.rank == 0:
+                # no request can name it before it is served, below
+                self._empty.add(name)
             self._serving[name] = _Served(path, adapter.digest)
         logger.info("LoRA pool: loaded %s from %s", name, path)
 
@@ -561,145 +579,80 @@ class LoraAdapterPool(Resource):
             "LoRA pool: dropped %s%s", name, "" if slot is None else f" (its slot {slot} is free to reuse)",
         )
 
-    # Readiness
+    # Admission: a slot for a request's adapter, all or nothing with the other resources
 
-    def admit_retrieve(self, rid, node_name, graph_walk, published) -> AdmitOutcome:
-        """Whether ``rid`` should go into a step now: not before its adapter can get a
-        slot, so the scheduler leaves it out instead of building a step its admit would
-        refuse whole (the refusal in ``_load_miss`` stays as a backstop).
-
-        Only the rank that chooses batches screens. A lockstep instance's followers run
-        the batches its leader chose and admit them from the same slot state, so they
-        answer ready and keep no screening state; the leader's answers never have to
-        agree with anything another rank computes.
-
-        A row it lets through is claimed: counted against the free slots until its admit
-        takes one, so two rows on different missing adapters cannot both be promised the
-        last free slot. A claim is made by any readiness check, the scheduler's probes
-        included, and lasts until the row's admit or removal.
-
-        Once a row has been held back for want of a slot for ``slot_wait_steps`` admits,
-        its adapter is starving: until it gets a slot, no other row may take one, and new
-        rows on the held slot with the fewest holders are held back too, so that slot
-        drains to refcount 0 and the starving adapter takes it (an adapter whose requests
-        keep its slot held cannot starve the others). Rows on the other held slots keep
-        flowing. Only rows held for want of a slot age, and only rows the scheduler still
-        screens hold the others back. Ages count this pool's admits, never wall clock.
-        """
-        del node_name, graph_walk, published
-        # the steady state: a set check, on the scheduler's hottest sweep
-        if rid not in self._awaiting or rid in self._claims or not self._screens:
-            return ADMIT_OK
+    def ask(self, rid, node_name, graph_walk) -> AdmitOutcome | None:
+        """`ASKS` for a row that will need a slot, or the outcome that fails a row whose
+        adapter failed to read. None on a rank that doesn't decide, and for a base row, a
+        row that holds its slot or a reservation (asked again by another node the pool
+        serves), and an adapter with nothing for this pool."""
+        del node_name, graph_walk
+        # the steady state: a set check
+        if not self._decides or rid not in self._awaiting or rid in self._reserved:
+            return None
         with self._lock:
-            if rid not in self._awaiting:  # admitted or removed meanwhile
-                return ADMIT_OK
-            return self._screen(rid)
-
-    def _screen(self, rid) -> AdmitOutcome:
-        """Caller holds the lock."""
-        name = self._adapter_of[rid]
-        if name in self._empty:
-            # takes no slot; and no longer waits for one, so it ages nothing
-            self._waiting_since.pop(rid, None)
-            return ADMIT_OK
-        self._screen_count += 1
-        waiting = self._waiting_since.get(rid)
-        if waiting is not None:
-            waiting.screened = self._screen_count
-        claimed = self._claim_count
-        # its admit would read the file
-        unread = name not in claimed and name not in self._resident and name not in self._store
-        # an adapter that failed to read fails its rows before they wait for, or drain, a slot
-        error = self._read_errors.get(name) if unread else None
-        if error is not None:
-            self._waiting_since.pop(rid, None)
-            return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                message=f"LoRA adapter {name!r} failed to load: {error}",
-                request_ids=frozenset({rid}),
-            ))
-        starving = self._starving_adapter()
-        if starving is not None and name != starving and not self._may_flow(name, starving):
-            return _NOT_READY  # held for another adapter's drain, so not aged
-        # a new claim on a missing adapter, or on one resident in an unheld slot, takes
-        # a slot that no other claim may count on
-        if name not in claimed and self._free_slots(name) < 0:
-            if waiting is None:
-                self._waiting_since[rid] = _Wait(since=self._admits, screened=self._screen_count)
-            return _NOT_READY
-        if unread:
-            # read it in the background instead
-            self._prefetch(name)
-            return _NOT_READY
-        self._claims[rid] = name
-        claimed[name] = claimed.get(name, 0) + 1
-        self._waiting_since.pop(rid, None)
-        return ADMIT_OK
-
-    def _unclaim(self, rid) -> None:
-        name = self._claims.pop(rid, None)
-        if name is not None:
-            count = self._claim_count[name] - 1
-            if count:
-                self._claim_count[name] = count
-            else:
-                del self._claim_count[name]
-
-    def _starving_adapter(self) -> str | None:
-        """The adapter of the longest-waiting row the scheduler still screens, once it
-        has waited ``slot_wait_steps``.
-
-        A scan screens every waiting row it reaches, so between two screens of a row in
-        the scans, each other unclaimed row is screened about once. A row passed over for
-        twice that is out of the scans (failed and awaiting its teardown, in a backoff):
-        it cannot take a slot, so it holds no one back until it is screened again. Counted
-        in screens, not admits, since holding everyone back may leave nothing to admit."""
-        live = self._screen_count - 2 * len(self._awaiting) - 2
-        for rid, waiting in self._waiting_since.items():
-            if waiting.screened < live:
-                continue
-            if self._admits - waiting.since < self.spec.slot_wait_steps:
+            name = self._adapter_of.get(rid)
+            if name is None or name in self._empty:
                 return None
-            return self._adapter_of.get(rid)
-        return None
+            error = self._read_errors.get(name)
+            if error is not None and name not in self._resident and name not in self._store:
+                return _load_failed({name: error}, [rid])
+        return ASKS
 
-    def _may_flow(self, name: str | None, starving: str) -> bool:
-        """Whether a row on ``name`` may be claimed while ``starving`` waits for a slot:
-        only on a slot that stays held anyway, and not the one being drained for it. A
-        missing adapter, or one resident in an unheld slot, would take a slot the
-        starving adapter needs."""
-        slot = self._resident.get(name)
-        if slot is None or not (self._slots[slot].refcount or name in self._claim_count):
-            return False
-        return slot != self._drain_slot(starving)
-
-    def _drain_slot(self, starving: str) -> int | None:
-        """The held slot drained for ``starving``: none while a slot is free for it, else
-        the one it was given, while still held, else the held slot with the fewest
-        holders (the quickest to drain)."""
-        if self._free_slots(starving) >= 0:
-            self._drain = None
+    def reserve(self, rid, node_name, graph_walk, published) -> int | None:
+        """Count ``rid``'s adapter against the free slots once its host copy is in, so its
+        admit does not wait for a read on this rank. A row whose adapter failed to read and
+        is in no slot is let through at once, slots or not: its admit fails it, on every
+        rank alike. One whose adapter is still resident may yet run on that slot, so it
+        counts like any other."""
+        del node_name, graph_walk, published
+        with self._lock:
+            name = self._adapter_of[rid]
+            if name not in self._store:
+                if name not in self._read_errors:
+                    # its read, started at ingest, lands. An adapter resident in a slot waits
+                    # for it too: a reservation pins no slot, so a miss admitted first may evict it
+                    return self._changes
+                if name not in self._resident:
+                    self._reserve(rid, name)
+                    return None
+            if self._spare_slots(name) < 0:
+                return self._changes
+            self._reserve(rid, name)
             return None
-        if self._drain is not None and self._drain[0] == starving:
-            state = self._slots[self._drain[1]]
-            if state.refcount or self._claim_count.get(state.adapter):
-                return state.index
-        holders = {}
-        for state in self._slots[1:]:
-            count = state.refcount + self._claim_count.get(state.adapter, 0)
+
+    def unreserve(self, rid) -> None:
+        with self._lock:
+            self._unreserve(rid)
+
+    def grew_since(self, mark: int) -> bool:
+        return self._changes != mark
+
+    def _reserve(self, rid, name: str) -> None:
+        """Caller holds the lock."""
+        self._reserved[rid] = name
+        self._reserved_count[name] = self._reserved_count.get(name, 0) + 1
+
+    def _unreserve(self, rid, frees: bool = True) -> str | None:
+        """Caller holds the lock. ``frees``: whether what the reservation counted is free
+        again, so a request that didn't fit may now."""
+        name = self._reserved.pop(rid, None)
+        if name is not None:
+            count = self._reserved_count[name] - 1
             if count:
-                holders[state.index] = count
-        if not holders:
-            return None
-        slot = min(holders, key=lambda i: (holders[i], i))
-        self._drain = (starving, slot)
-        return slot
+                self._reserved_count[name] = count
+            else:
+                del self._reserved_count[name]
+            if frees:
+                self._changes += 1
+        return name
 
-    def _free_slots(self, name: str) -> int:
-        """Slots left once every held slot, every claimed adapter and ``name`` have one:
+    def _spare_slots(self, name: str) -> int:
+        """Slots left once every held slot, every reserved adapter and ``name`` have one:
         negative when that promises more slots than exist."""
         pinned = {state.index for state in self._slots[1:] if state.refcount}
         misses = 0
-        for adapter in self._claim_count.keys() | {name}:
+        for adapter in self._reserved_count.keys() | {name}:
             slot = self._resident.get(adapter)
             if slot is None:
                 misses += 1
@@ -720,8 +673,11 @@ class LoraAdapterPool(Resource):
 
         Every miss's slot is picked in that same locked section, before any wait: what
         is picked follows only from the slot table at the admit's start, which is the
-        same on every rank of a lockstep instance, whatever lands while a miss waits
-        for its copy or for the load agreement.
+        same on every rank of a lockstep instance, whatever lands while a rank waits for
+        its copy or for the load agreement. The ranks then agree, in one collective,
+        where each miss's copy stands, before any rank waits for one. Rows whose adapter
+        failed to read on any rank fail before any slot is handed out, so a row let
+        through on a failed read never takes the slot a counted row was promised.
         """
         if ctx.capture:
             return ADMIT_OK
@@ -745,49 +701,78 @@ class LoraAdapterPool(Resource):
                     self._take(rid, slot)
             if not misses:
                 return ADMIT_OK
-            reserved: list[int] = []
-            for name, rids in misses.items():
-                slot = self._pick_slot(exclude=reserved)
-                if slot is None:
-                    # refused on every rank alike, before any rank reaches an agreement
-                    return AdmitOutcome(
-                        ok=False,
-                        reason=AllocationFailed(
-                            message=(
-                                f"LoRA pool is full: all {self.spec.max_slots} slots hold "
-                                f"adapters of running requests, none free for {name!r}"
-                            ),
-                            pages_short=1,
-                            label=_LABEL,
-                            request_id=rids[0],
-                        ),
-                    )
-                reserved.append(slot)
-        for (name, rids), slot in zip(misses.items(), reserved, strict=True):
-            outcome = self._load_miss(name, rids, slot)
-            if not outcome.ok:
-                return outcome
+            slots: list[int] = []
+            while len(slots) < len(misses) and (slot := self._pick_slot(exclude=slots)) is not None:
+                slots.append(slot)
+            copies = [self._copy_of(name) for name in misses]
+        # all ranks install an adapter or none does: a rank refusing alone would leave the
+        # rest of its instance waiting in the forward's collectives
+        states = self._agreed([copy.state for copy in copies])
+        if _READING in states and _FAILED not in states and len(slots) == len(misses):
+            # a rank waits for its read only for a step that installs, and agrees again
+            copies = [copy.landed(name) for copy, name in zip(copies, misses, strict=True)]
+            states = self._agreed([copy.state for copy in copies])
+        rows = list(misses.items())
+        failed = [i for i, state in enumerate(states) if state == _FAILED]
+        if failed:
+            return _load_failed({rows[i][0]: copies[i].error for i in failed},
+                                [rid for i in failed for rid in rows[i][1]])
+        if len(slots) < len(rows):
+            name, rids = rows[len(slots)]
+            return AdmitOutcome(
+                ok=False,
+                reason=AllocationFailed(
+                    message=(
+                        f"LoRA pool is full: all {self.spec.max_slots} slots hold "
+                        f"adapters of running requests, none free for {name!r}"
+                    ),
+                    pages_short=1,
+                    label=_LABEL,
+                    request_id=rids[0],
+                ),
+            )
+        with self._lock:
+            for (name, rids), slot, copy in zip(rows, slots, copies, strict=True):
+                if copy.loaded.rank == 0:
+                    # nothing for this spec: the same file, digest-pinned, on every rank, so
+                    # every rank leaves the slot it picked as it was
+                    self._empty.add(name)
+                    slot = ZERO_SLOT
+                else:
+                    self._install(slot, copy.loaded)
+                for rid in rids:
+                    if rid in self._awaiting:
+                        self._take(rid, slot)
         return ADMIT_OK
 
     def rollback_admit(self, step: LoraStep, ctx: StepContext) -> None:
         """Give back the slots this step's admit took. An adapter it loaded stays resident
         in its now-unheld slot, as a cache."""
         del step
+        if ctx.graph_walk != PIECEWISE_WALK:
+            self._current = None
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
             for rid in [r for r in self._admit_taken if ctx.is_real_row(r)]:
-                slot = self._admit_taken.pop(rid)
+                slot, reserved = self._admit_taken.pop(rid)
                 if self._row_slot.get(rid) != slot:
                     continue  # removed under us; the slot went with it
                 del self._row_slot[rid]
                 self._awaiting.add(rid)
+                if reserved is not None:
+                    # admitted already, so the next admit finds its slot still counted
+                    self._reserve(rid, reserved)
                 if slot:
                     self._release(slot)
 
     def commit(self, step: LoraStep, ctx: StepContext) -> None:
         del step
-        if self._enclosing is not None and ctx.graph_walk == PIECEWISE_WALK:
+        if ctx.graph_walk != PIECEWISE_WALK:
+            # nothing reads the addressing past the step's forward: a delta called
+            # before the next plan refuses rather than add these rows' adapters
+            self._current = None
+        elif self._enclosing is not None:
             # the region is done; the eager code after it reads the enclosing plan
             (self._current, self.active), self._enclosing = self._enclosing, None
         if ctx.capture or not self._admit_taken:
@@ -802,62 +787,27 @@ class LoraAdapterPool(Resource):
             self._slots[slot].refcount += 1
         self._row_slot[rid] = slot
         self._awaiting.discard(rid)
-        self._unclaim(rid)
-        self._waiting_since.pop(rid, None)
-        self._admit_taken[rid] = slot
+        # held now, which counts it as the reservation did: only a row on the zero slot
+        # frees the slot its reservation counted
+        self._admit_taken[rid] = (slot, self._unreserve(rid, frees=slot == ZERO_SLOT))
 
-    def _load_miss(self, name: str, rids: list, slot: int) -> AdmitOutcome:
-        """Load ``name`` into ``slot`` (picked by ``admit``) for ``rids``. Called without
-        the lock: waiting for a host copy and the load agreement both happen outside it,
-        so the main thread's ingests and removes never wait on a file or a collective.
-
-        On a lockstep instance every rank reaches the agreement for the same misses in
-        the same order, into the same slots: ``admit`` picked them all from the slot
-        table at its start, which is the same on every rank (see the module docstring).
-        """
-        with self._lock:
-            served = self._serving.get(name) or self._retiring.get(name)
-            loaded = self._store.get(name)
-            pending = None
-            if loaded is None and served is not None:
-                # the leader's screen saw this copy in already; a follower may still be
-                # reading its own, or (rarely) start the read here
-                pending = self._reads.get(name, (None,))[0] or self._prefetch(name)
-        error = None
+    def _copy_of(self, name: str) -> _Copy:
+        """Caller holds the lock. Where this rank's host copy of ``name`` stands."""
+        served = self._serving.get(name) or self._retiring.get(name)
         if served is None:
-            error = f"{name!r} is not served"
-        elif loaded is None and pending is None:
-            error = "it is not in the host tier and no read of it is running"
-        elif loaded is None:
-            try:
-                loaded = pending.result()
-            except Exception as exc:  # a bad checkpoint fails the request, not the worker
-                logger.error("LoRA adapter %s failed to load: %s", name, exc)
-                error = describe_load_error(exc)
-        # all ranks install it or none does: a rank refusing alone would leave the rest
-        # of its instance waiting in the forward's collectives
-        if self._agree is not None and not self._agree(error is None):
-            error = error or "it failed to load on another rank of its instance"
-        if error is not None:
-            return AdmitOutcome(
-                ok=False,
-                reason=AdmitRuntimeError(
-                    message=f"LoRA adapter {name!r} failed to load: {error}",
-                    request_ids=frozenset(rids),
-                ),
-            )
-        with self._lock:
-            if loaded.rank == 0:
-                # nothing for this spec: the same file, digest-pinned, on every rank, so
-                # every rank leaves the slot it picked as it was
-                self._empty.add(name)
-                slot = ZERO_SLOT
-            else:
-                self._install(slot, loaded)
-            for rid in rids:
-                if rid in self._awaiting:
-                    self._take(rid, slot)
-        return ADMIT_OK
+            return _Copy(error=f"{name!r} is not served")
+        loaded = self._store.get(name)
+        if loaded is not None:
+            return _Copy(loaded=loaded)
+        # the leader reserved once its copy was in (or its read failed); a follower may still
+        # be reading its own, or (rarely) start the read here
+        error = None if name in self._reads else self._read_errors.get(name)
+        return _Copy(error=error) if error is not None else _Copy(pending=self._read_in(name))
+
+    def _agreed(self, states: list[int]) -> list[int]:
+        """The lowest of each of ``states`` across the lockstep instance (a collective every
+        rank makes at the same point), or this rank's own on a single rank."""
+        return states if self._agree is None else self._agree(states)
 
     # Host tier
 
@@ -866,16 +816,29 @@ class LoraAdapterPool(Resource):
             self._reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lora-read")
         return self._reader
 
-    def _prefetch(self, name: str) -> Future | None:
-        """Caller holds the lock. Start reading ``name`` into the host tier unless it is
-        resident, held there, empty for this pool, or already being read; returns the
-        read in flight."""
+    def _hold(self, name: str) -> None:
+        """Caller holds the lock. Hold ``name`` in the host tier as a request on it is
+        ingested, and read it in if its copy isn't (or its last read failed).
+
+        What the tier holds follows from the order of the ingests and removes on this
+        rank (an adapter a live request names is never dropped), never from when a read
+        lands. Ranks that saw them in the same order hold the same adapters, so a
+        follower's read usually starts at the ingest the leader's does; a remove that
+        raced an ingest can leave them different for a while (see the module docstring).
+
+        A failed read is retried, except while a row is reserved on the adapter: a row let
+        through on the failure would otherwise have its admit wait for the retry."""
+        retry = name not in self._reserved_count and self._read_errors.pop(name, None) is not None
+        if self._store.hold(name, keep=self._live) or retry:
+            self._read_in(name)
+
+    def _read_in(self, name: str) -> Future:
+        """Caller holds the lock. Read ``name`` on the reader thread, unless that read is
+        already running; returns the read in flight."""
         found = self._reads.get(name)
         if found is not None:
             return found[0]
         served = self._serving.get(name) or self._retiring.get(name)
-        if served is None or name in self._empty or name in self._resident or name in self._store:
-            return None
         future = self._executor().submit(self._store.read, name, served.path, served.digest)
         self._reads[name] = (future, served)
         future.add_done_callback(lambda f: self._read_done(name, f))
@@ -891,6 +854,8 @@ class LoraAdapterPool(Resource):
                 return
             served = entry[1]
             exc = future.exception()
+            # a request waiting at admission for this copy may go ahead now
+            self._changes += 1
             if exc is not None:
                 logger.error("LoRA adapter %s failed to load: %s", name, exc)
                 self._read_errors[name] = describe_load_error(exc)
@@ -902,12 +867,7 @@ class LoraAdapterPool(Resource):
             ):
                 return  # unloaded, or reloaded with other weights, while it was read
             self._pin_digest(name, current, adapter.digest)
-            self._store.put(adapter, keep=self._wanted())
-
-    def _wanted(self) -> set[str]:
-        """Caller holds the lock. Adapters a request still waits on: the host tier keeps
-        them past ``cpu_capacity``, so a copy read for an admit is there when it runs."""
-        return {self._adapter_of[rid] for rid in self._awaiting}
+            self._store.put(adapter)
 
     def _pin_digest(self, name: str, served: _Served, digest: bytes) -> None:
         """An adapter that arrived with no digest takes its first read's, so a file
@@ -941,17 +901,14 @@ class LoraAdapterPool(Resource):
             logger.info("LoRA pool: evicting %s from slot %d for %s", evicted, slot, adapter.name)
         # an unloaded adapter's slot keeps its name with no entry in `_resident`, which a
         # reload of that name may have pointed at another slot since: then this slot was
-        # not where it lived, and its claims and reads stand
+        # not where it lived, and its reservations and reads stand
         if evicted is not None and self._resident.get(evicted) == slot:
+            # a row reserved on it while it was resident (which the pick cannot see: only
+            # the deciding rank reserves) now misses, still counting one slot, and loads the
+            # host copy it was reserved on, or fails if that copy's read failed
             del self._resident[evicted]
-            # A row may still want it (claimed while it was resident, which the pick
-            # cannot see on a follower, so does not consult anywhere): its admit would
-            # read the file on the GPU thread. Screen such rows again, and read the
-            # adapter back meanwhile, on every rank alike.
-            for rid in [r for r, name in self._claims.items() if name == evicted]:
-                self._unclaim(rid)
-            if evicted in self._wanted():
-                self._prefetch(evicted)
+            # a request waiting on it whose read failed is let through now, to fail
+            self._changes += 1
         for name in self._a:
             a, b = adapter.a.get(name), adapter.b.get(name)
             if a is None:
@@ -976,16 +933,18 @@ class LoraAdapterPool(Resource):
         assert state.refcount >= 0, f"LoRA slot {slot} released more often than taken"
         if state.refcount == 0:
             state.last_used_step = self._admits
+            self._changes += 1
 
     # Addressing
 
     def runs_adapters(self, rids) -> bool:
-        """Whether any of ``rids`` names an adapter: set at ingest, so the same on every
-        rank of a lockstep instance."""
-        if not self._adapter_rows:
+        """Whether any of ``rids`` names an adapter with something for this pool: set at
+        ingest and from the adapters' files, so the same on every rank of a lockstep
+        instance."""
+        if not self._live:
             return False
-        get = self._adapter_of.get
-        return any(get(rid) is not None for rid in rids)
+        get, empty = self._adapter_of.get, self._empty
+        return any((name := get(rid)) is not None and name not in empty for rid in rids)
 
     def _adds_deltas(self, segments, ctx: StepContext) -> bool:
         """Whether this step's deltas run: under a capture lease, unless its bucket is a
@@ -1005,6 +964,7 @@ class LoraAdapterPool(Resource):
         return False
 
     def plan(self, step: LoraStep, ctx: StepContext) -> LoraAddressing | None:
+        self._plan_thread = threading.get_ident()
         if ctx.graph_walk == PIECEWISE_WALK and not ctx.capture and self._current is not None:
             # before the memoized return below, which a region's repeat plan takes too
             self._enclosing = (self._current, self.active)
@@ -1117,6 +1077,22 @@ class LoraAdapterPool(Resource):
         self._layer_deltas.clear()
         self._eager = None
         self._current = self._enclosing = None
+
+
+def _load_failed(errors: dict[str, str | None], rids) -> AdmitOutcome:
+    """Fails ``rids``: each adapter in ``errors`` failed to load, here with that error or on
+    another rank."""
+    return AdmitOutcome(
+        ok=False,
+        reason=AdmitRuntimeError(
+            message="; ".join(
+                f"LoRA adapter {name!r} failed to load: "
+                f"{error or 'it failed to load on another rank of its instance'}"
+                for name, error in errors.items()
+            ),
+            request_ids=frozenset(rids),
+        ),
+    )
 
 
 def _next_pow2(n: int) -> int:

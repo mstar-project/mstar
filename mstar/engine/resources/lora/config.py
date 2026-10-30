@@ -290,11 +290,9 @@ class LoraSpec(NodeResourceSpec):
 
     ``max_slots`` adapters are resident on the device at once, beside a zero adapter that
     base-model rows use, and up to ``cpu_capacity`` are kept pinned on the host.
-    ``adapters`` maps the names requests ask for to safetensors paths. ``slot_wait_steps``
-    bounds how long a request waits for a device slot while others keep slots busy: past
-    it, requests on other adapters are held back until a slot drains (counted in the
-    pool's steps). ``module_map`` places each checkpoint module on a target; a node's
-    spec comes from ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
+    ``adapters`` maps the names requests ask for to safetensors paths. ``module_map``
+    places each checkpoint module on a target; a node's spec comes from
+    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
     ``ModuleLoraMap`` is what binds the node's modules, and a pool built with any other
     resolver is refused at bind. ``convert_keys`` rewrites a model-native checkpoint
     layout first.
@@ -306,7 +304,6 @@ class LoraSpec(NodeResourceSpec):
     max_slots: int = 4
     max_rank: int = 16
     cpu_capacity: int = 16
-    slot_wait_steps: int = 256
     adapters: dict[str, str] = field(default_factory=dict)
     # adapter name -> the digest (``identity.adapter_digest``) its weights were checked
     # and prefix-keyed under; every read must match it. The conductor fills these in for
@@ -315,7 +312,9 @@ class LoraSpec(NodeResourceSpec):
     # the slot weights' dtype; None takes the nodes' compute dtype (the serving config's
     # ``autocast_dtype``), which is what their base linears run in
     dtype: torch.dtype | None = None
-    # "auto" picks Triton on CUDA and the torch reference elsewhere
+    # the kernels behind the custom ops: "auto" registers Triton's on CUDA and leaves the
+    # torch reference elsewhere; "torch" registers none, so the reference runs unless
+    # something else in the process registered Triton's (registration is process-wide)
     backend: Literal["auto", "torch", "triton"] = "auto"
     convert_keys: Callable | None = None
     # checkpoint modules this spec neither loads nor refuses: another node's LoRA spec of
@@ -351,23 +350,21 @@ class LoraSpec(NodeResourceSpec):
         max_rank: int | None = None,
         cpu_capacity: int | None = None,
         adapters: dict[str, str] | None = None,
-        slot_wait_steps: int | None = None,
         adapter_digests: dict[str, str] | None = None,
         targets: list[str] | None = None,
     ):
-        """How many adapters stay resident, the largest rank served, which adapters this
-        deployment serves, and how long a request may wait for a slot before others are
-        held back. ``targets`` keeps only those of the model's targets (one list for every
-        LoRA spec of the model, so a name another spec declares is not an error here;
-        ``serving_resources`` checks the list as a whole): dropping the LM head and
-        embedding saves their vocabulary-sized slots, and an adapter that touches a
-        dropped target is refused.
+        """How many adapters stay resident, the largest rank served, and which adapters
+        this deployment serves. ``targets`` keeps only those of the model's targets (one
+        list for every LoRA spec of the model, so a name another spec declares is not an
+        error here; ``serving_resources`` checks the list as a whole): dropping the LM
+        head and embedding saves their vocabulary-sized slots, and an adapter that
+        touches a dropped target is refused.
 
         Every value is checked before any is set, so a refused override leaves the spec
         as declared."""
         sizes = {
             name: value
-            for name, value in zip(_SIZES, (max_slots, max_rank, cpu_capacity, slot_wait_steps), strict=True)
+            for name, value in zip(_SIZES, (max_slots, max_rank, cpu_capacity), strict=True)
             if value is not None
         }
         _check_sizes(sizes)
@@ -463,7 +460,7 @@ class LoraSpec(NodeResourceSpec):
         self._info.pop(name, None)
 
 
-_SIZES = ("max_slots", "max_rank", "cpu_capacity", "slot_wait_steps")
+_SIZES = ("max_slots", "max_rank", "cpu_capacity")
 
 
 def _check_sizes(sizes: Mapping[str, Any]) -> None:

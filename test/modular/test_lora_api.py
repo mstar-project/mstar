@@ -78,9 +78,11 @@ class _StubAPI:
         self.upload_dir = Path(tempfile.mkdtemp())
         self.last_submit = None
 
+    # the real APIServer's adapter selection, on this stub's ServedModels
+    lora_kwargs = APIServer.lora_kwargs
+
     def submit_request(self, **kw):
-        # the real APIServer's adapter selection, on this stub's ServedModels
-        kw["model_kwargs"] = APIServer.lora_kwargs(self, kw.pop("model", None), kw.get("model_kwargs"))
+        kw["model_kwargs"] = self.lora_kwargs(kw.pop("model", None), kw.get("model_kwargs"))
         self.last_submit = kw
         return kw["request_id"]
 
@@ -147,8 +149,10 @@ def test_every_route_maps_the_model_field_to_an_adapter(monkeypatch, route):
         assert response.json()["model"] == "sql"
     refused = [{"model": "nope"}]
     if route in ("chat", "speech"):  # an extra-body adapter is checked like the model field
-        post(client, {LORA_ADAPTER_KWARG: "sql"})
+        response = post(client, {LORA_ADAPTER_KWARG: "sql"})
         assert stub.last_submit["model_kwargs"][LORA_ADAPTER_KWARG] == "sql"
+        if route == "chat":
+            assert response.json()["model"] == "sql"
         refused += [{LORA_ADAPTER_KWARG: "nope"}, {"model": "sql", LORA_ADAPTER_KWARG: "other"}]
     for body in refused:
         stub.last_submit = None

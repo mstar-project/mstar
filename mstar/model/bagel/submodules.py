@@ -651,8 +651,8 @@ def _init_latents_and_time_index(
         generator=g,
         device=device,
     )
-    if torch.is_autocast_enabled():
-        latents = latents.to(torch.get_autocast_gpu_dtype())
+    if torch.is_autocast_enabled(latents.device.type):
+        latents = latents.to(torch.get_autocast_dtype(latents.device.type))
     time_idx = torch.zeros(latents.shape[0], device=device)
     return latents, time_idx
 
@@ -1466,8 +1466,8 @@ class LLMSubmodule(ARNodeSubmodule):
 
         # Euler step: x_{t-dt} = x_t - v * dt  (velocity points data -> noise)
         latents = latents - v_final * dt
-        if torch.is_autocast_enabled():
-            latents = latents.to(torch.get_autocast_gpu_dtype())
+        if torch.is_autocast_enabled(latents.device.type):
+            latents = latents.to(torch.get_autocast_dtype(latents.device.type))
         return {
             "latents": [latents],
             "time_index": [time_index + 1]
@@ -1896,8 +1896,8 @@ class CombineCFGSubmodule(NodeSubmodule):
 
         # Euler step
         new_latents = latents - v_final * dt
-        if torch.is_autocast_enabled():
-            new_latents = new_latents.to(torch.get_autocast_gpu_dtype())
+        if torch.is_autocast_enabled(new_latents.device.type):
+            new_latents = new_latents.to(torch.get_autocast_dtype(new_latents.device.type))
 
         new_time_index = time_index + 1
         return {

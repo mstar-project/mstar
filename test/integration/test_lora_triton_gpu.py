@@ -14,6 +14,7 @@ if not torch.cuda.is_available():
     pytest.skip("needs a CUDA device", allow_module_level=True)
 pytest.importorskip("triton")
 
+import mstar.engine.resources.lora.triton_backend  # noqa: E402, F401  (registers the CUDA kernels)
 from mstar.engine.resources.lora import backend as ref_ops  # noqa: E402
 from mstar.engine.resources.lora import ops  # noqa: E402
 

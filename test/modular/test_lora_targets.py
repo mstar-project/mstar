@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 
 pytest.importorskip("safetensors")
-from lora_module_helpers import DTYPE, compute, plan, pool, rand, run_ranks, serve, write_peft  # noqa: E402
+from lora_module_helpers import DTYPE, plan, pool, rand, run_ranks, serve, write_peft  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
@@ -280,12 +280,11 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
         plan([lora_pool], ROWS)
         assert bind_module_lora(_Node(root), {"lora": lora_pool}) == ("lora",)
         off_vocab = None
-        with compute(lora_pool):
-            bound = [m(_local_input(case, x, rank, world)) for m in root.modules_run(case)]
-            if case.kind == "embedding":
-                ids = x.clone()
-                ids[0] = -1  # an adapter row's id outside the vocabulary (an image position)
-                off_vocab = root.embed_tokens.lora_delta(ids, torch.zeros(TOKENS, HIDDEN, dtype=DTYPE))
+        bound = [m(_local_input(case, x, rank, world)) for m in root.modules_run(case)]
+        if case.kind == "embedding":
+            ids = x.clone()
+            ids[0] = -1  # an adapter row's id outside the vocabulary (an image position)
+            off_vocab = root.embed_tokens.lora_delta(ids, torch.zeros(TOKENS, HIDDEN, dtype=DTYPE))
         return unbound, bound, off_vocab
 
     on = torch.tensor([a is not None for a in _row_adapters(case)])

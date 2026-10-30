@@ -5,11 +5,11 @@ and ``lora_apply_``, the two as one op, which is what a linear target runs.
 functionalization then keeps every read of ``y`` on the right side of the add and never
 drops it, whatever Inductor reorders around it.
 
-The kernel registered here is the plain-torch reference ``TorchLoraBackend`` also runs
-(``backend.shrink_reference`` / ``expand_reference_``), on any device, with no host sync
-and no data-dependent shape; ``triton_backend`` registers the CUDA kernels
-over it. Both read the same arguments with the same meaning, so the fake (shape)
-implementations and ``torch.library.opcheck`` can be checked on a CPU.
+The kernel registered here is the plain-torch reference (``backend.shrink_reference`` /
+``expand_reference_``), on any device, with no host sync and no data-dependent shape;
+``triton_backend`` registers the CUDA kernels over it. Both read the same arguments with
+the same meaning, so the fake (shape) implementations and ``torch.library.opcheck`` can
+be checked on a CPU.
 
 Rows of ``h`` the expand does not read (tokens on the zero adapter, columns past a
 slot's rank) are unspecified; the reference writes zeros there.
@@ -95,8 +95,8 @@ def _lora_gather_shrink_fake(ids, a, token_order, slot_indptr, ranks):
 
 
 class LoraOpsBackend(LoraBackend):
-    """The custom ops: on CUDA the Triton kernels (``TritonLoraBackend``), elsewhere the
-    reference above, so a CPU test runs exactly the graph a GPU compiles."""
+    """The custom ops: on CUDA the Triton kernels once ``triton_backend`` is imported,
+    elsewhere the reference above, so a CPU test runs exactly the graph a GPU compiles."""
 
     def shrink(self, x, a, addressing: "LoraAddressing", ranks, num_slices=1):
         return lora_shrink(x, a, addressing.token_order, addressing.slot_indptr, ranks, num_slices)

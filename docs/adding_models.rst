@@ -217,6 +217,14 @@ You must implement these abstract methods:
    data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
    lists its prompt layout, speaker, language, clip digest and codec stream lead.
 
+.. note::
+
+   The conductor merges each walk's ``ForwardPassArgs.step_metadata`` into the
+   request's ``metadata.kwargs``, so a request fact stored under a key that a
+   later walk's step metadata also uses is overwritten by that walk's value. Keep
+   such facts under their own key: LTX-2.5 nests the request's geometry under
+   ``kwargs["request"]``, since its stage-1 walk sends a half-size ``height``.
+
 The following methods have defaults and are optional to override:
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,
@@ -616,7 +624,14 @@ The spec types are:
        ``flashinfer_backend``, and the
        two CUDA-graph ceilings ``max_segments_per_request`` and
        ``max_tokens_per_request``. ``DENSE`` runs FA3 ``flash_attn_varlen`` (AITER on ROCm)
-       and falls back to FlashInfer if that kernel is missing. See `Cacheless attention (encoder towers)`_.
+       and falls back to FlashInfer if that kernel is missing. By default the heads are split
+       across all TP × SP ranks of the node; ``shard_over_sp=False`` splits them across the
+       TP ranks only, for an attention each sequence-parallel rank runs whole over its own
+       tokens (one over a replicated stream, or a cross-attention from the rank's query
+       shard). ``workspace_mb`` sizes each label's FlashInfer workspace per slot (default
+       ``MSTAR_WORKSPACE_BUFFER_MB``, 512); a node with many labels can declare less, since a
+       ragged prefill only uses it for split-KV partials. See `Cacheless attention (encoder
+       towers)`_.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
        (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
@@ -902,6 +917,13 @@ span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
 
+Called with ``return_lse=True``, a ragged or ragged cross-attention callable on the FlashInfer
+backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32, natural log)
+from the same plan, which is what merging attentions over disjoint key sets needs. Under sequence parallelism
+LTX-2.5's audio queries attend each rank's share of the video tokens, and
+``attention_over_sharded_keys`` (``mstar/model/components/distributed/sequence_parallel.py``)
+merges them.
+
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -1049,14 +1071,14 @@ placed exactly as weights are.
   them (Qwen3.5's vision encoder: one segment per frame, the merger's rows folding
   them). A node whose step is ``None`` declares no rows, so one that serves adapters
   returns a step with its segments even when nothing else needs one.
-- **Only inside the step.** The pool keeps the last step's addressing after commit, so
-  a delta called outside a step would add another step's adapters to these rows. The
-  engine brackets every planned step's ``preprocess`` and forward, and every capture, in
-  ``StepRunner.compute_scope`` (``Resource.enter_compute`` / ``exit_compute``); an
-  engine-built pool refuses a delta called outside one when run eagerly.
+- **Only inside the step.** The pool holds a step's addressing from its plan to its
+  commit (or rollback), for the thread that planned it, so a delta called outside a step
+  (``prepare_inputs``, which the async worker runs on the main thread while the GPU
+  thread's step is planned; an output cached from an earlier step) refuses when run
+  eagerly instead of adding another step's adapters to these rows.
   ``warmup_compiles`` runs outside any step, so a node serving adapters runs no adapted
-  linear there. A piecewise region that runs
-  adapted modules declares their rows in its own step, or its capture is refused.
+  linear there. A piecewise region that runs adapted modules declares their rows in its
+  own step, or its capture is refused.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
@@ -1117,20 +1139,29 @@ A request takes its adapter's slot on its first admit and holds it until it is r
 Slot 0 is a zero adapter (rank 0) that base-model rows and capture padding rows address,
 and the kernels skip it. A miss loads the adapter from the host tier into a free slot, or
 into the unheld slot released longest ago. A request whose adapter cannot get a slot (every
-slot held by running requests, or promised to requests already let through) is not ready
-(``LoraAdapterPool.admit_retrieve``), so the scheduler leaves it out of the steps it builds
-and the rows already running keep stepping; the admit's ``AllocationFailed`` stays only as
-a backstop. Once a request has waited ``slot_wait_steps`` of the pool's steps for a slot,
-no other adapter may take one, and new requests on one held slot (the one with the fewest
-holders) are held back until it drains and the cold adapter takes it, so a cold adapter is
-not starved by steady traffic on resident ones; requests on the other held slots keep
-running meanwhile. Only a request held for want of a slot ages, and a waiting request the
-scheduler no longer screens (failed, in a backoff) holds no one back. An adapter with
-nothing for a pool's targets (a text-only adapter on a vision tower's pool) takes no slot
-there once an admit has read it: its rows address the zero adapter. Only the rank that
-chooses batches screens:
-on a lockstep instance the leader, whose choice the followers run as sent, so the
-screening needs no agreement across ranks.
+slot held by running requests, or reserved for requests admitted ahead of it) waits at the
+runner's admission (``LoraAdapterPool.ask`` / ``reserve``), in arrival order with every
+other resource that asks, so it holds no KV pages meanwhile and the rows already running
+keep stepping; the admit's ``AllocationFailed`` stays only as a backstop. Only the first
+waiting request is admitted, so a cold adapter is not starved by steady traffic on resident
+ones: requests behind it wait too, and the held slots drain. On one GPU, where KV admits
+every request as well, that holds back base-model requests too: a request waiting for a
+slot, or for its adapter's host copy, stops every newer admission on its node until a slot
+drains or the read lands. Under tensor parallelism KV does not ask, so base requests go on
+past it. The slot wait does not arise while the adapters in rotation fit in ``max_slots``,
+and the copy wait is at most one read, which starts at the request's ingest. A slot is
+reserved for a request only once its adapter's host copy is in (even for an adapter
+resident in a slot, which a miss admitted ahead may evict), so its admit does not wait on a
+read there; a request whose adapter failed to read, and is in no slot, is let through at
+once, and its admit fails it before handing out any slot, so it takes none that a counted
+request needs. A reservation counts slots and pins none: which slot an admit takes follows
+from the slot table alone. An
+adapter with nothing for a pool's targets (a text-only adapter on a vision tower's pool)
+takes no slot there and runs no delta (its steps can replay the base-only capture): the
+pool knows it from the file's header at startup, or from a runtime load's read, and its
+rows address the zero adapter. Only the
+rank that chooses batches admits: on a lockstep instance the leader, whose choice the
+followers run as sent, so its reservations need no agreement across ranks.
 The plan writes each step's addressing (for each row grouping its targets read, per token,
 per segment or per fold, the rows grouped by slot: the only thing the kernels read) into
 one fixed buffer per capture slot, sized to its bucket, so a captured replay
@@ -1138,9 +1169,11 @@ reads stable addresses; a replay's padding rows address the zero adapter and its
 tokens no slot. The pool admits and plans on the GPU thread only (no pre-plan), in step
 order, and every write it makes to the device (an adapter load, the addressing) goes on
 the stream the forwards run on, so a load into a slot lands after every step queued
-before it. ``backend`` picks the kernels: ``"triton"`` (slot-grouped shrink and expand,
-the default on CUDA) or ``"torch"`` (a reference with no data-dependent shapes, the
-default elsewhere).
+before it. ``backend`` picks the kernels a pool registers behind the custom ops, which
+every device runs: ``"triton"`` (slot-grouped shrink and expand, the default on CUDA) or
+``"torch"``, which registers none and leaves the reference (no data-dependent shapes, the
+default elsewhere). Registration is process-wide: once anything in the process has
+registered the Triton kernels, every pool on CUDA runs them.
 
 Under tensor parallelism each rank of the node's lockstep instance keeps its own pool and
 makes its own slot decisions, with nothing journalled from rank 0, and they come out the
@@ -1150,14 +1183,21 @@ forwarded remove, honoured on rank 0 by waiting for the admit of the step it is 
 behind). That is why the LRU clock counts admits rather than commits, which may land on
 either side of a teardown. Which adapters are resident, which slot a miss takes and
 whether an admit refuses then follow from the same state on every rank. Reading an
-adapter from disk is the one step that can fail on one rank only, so the pool ANDs its
-outcome across the instance (one gloo all-reduce per adapter installed, none in steady
-state) and every rank installs it or refuses the request. Files are read on the pool's own
-reader thread: every rank starts reading an adapter into the host tier when it ingests a
-request that names it, the leader's screen keeps the request out of steps until its copy
-is in, and an admit never reads a file itself (a follower whose read is still in flight
-waits for it). Neither that wait nor the agreement holds the pool's lock, so the main
-thread's ingests and removes go on meanwhile.
+adapter from disk is the one step that can fail on one rank only, so the ranks agree where
+each one's copy stands (in, still being read, or failed) before any waits for one, and
+every rank installs it or refuses the request: one gloo all-reduce per admit with an
+adapter to install (all of its misses at once), a second when a rank was still reading,
+none in steady state. Files are read on the pool's
+own reader thread: every rank starts reading an adapter into the host tier when it ingests
+a request that names it, the leader reserves a slot for the request only once its copy is
+in, and an admit never reads a file itself. A follower whose read is still in flight
+waits for it, unless another rank's read has failed. That wait is short when the
+follower's read started at the same ingest as the leader's, the usual case, but it can be
+a whole read: a tier keeps what the ingests and removes on its rank leave it, a follower
+takes removes from rank 0 and ingests from the conductor, and a remove that races an
+ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
+agreement holds the pool's lock, so the main thread's ingests and removes go on
+meanwhile.
 
 A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
 out per request, while each SP rank holds a shard of the tokens, so building the pool
@@ -2037,10 +2077,8 @@ that a misspelled setting is never silently ignored:
        targets to allocate; by default the targets the configured adapters touch; a
        secondary node's spec
        left with none builds no pool, while a YAML list leaving the model's first spec
-       (its LLM's) none is an error),
-       ``slot_wait_steps`` (default 256: how many of the pool's steps a request may
-       wait for a slot before a held slot is drained for it). One ``lora:`` block sizes
-       every LoRA spec of the model
+       (its LLM's) none is an error). One ``lora:`` block sizes every LoRA spec of the
+       model
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,

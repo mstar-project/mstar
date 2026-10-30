@@ -23,6 +23,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
+from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
@@ -134,6 +135,8 @@ class SubmoduleManagement:
     forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
+    # cast and autocast dtype, None if the node opted out; resolved once at load
+    node_dtype: torch.dtype | None = None
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
@@ -596,6 +599,8 @@ class Engine:
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
+                # the dtype the engine manager cast this node to
+                node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
@@ -676,12 +681,12 @@ class Engine:
     ) -> torch.dtype | None:
         """The dtype ``nodes`` were cast to and run in, or None if they differ or one keeps
         its own (``disable_autocast``)."""
-        dtypes = {submodules[n].compute_dtype(self._autocast_dtype) for n in nodes}
+        dtypes = {resolve_node_dtype(submodules[n], self._autocast_dtype) for n in nodes}
         return dtypes.pop() if len(dtypes) == 1 else None
 
-    def _autocast_dtype_for(self, submodule: NodeSubmodule) -> torch.dtype | None:
-        """This node's autocast dtype, or None for one that opted out."""
-        return None if submodule.disable_autocast else self._autocast_dtype
+    def _autocast_dtype_for(self, node_name: str) -> torch.dtype | None:
+        """This node's resolved dtype, or None for one that opted out."""
+        return self._submodules[node_name].node_dtype
 
     def warmup(self) -> None:
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -694,7 +699,7 @@ class Engine:
                 resources=submodule_mgmt.resources,
                 step_runner=self._runner,
                 device=self._device,
-                autocast_dtype=self._autocast_dtype_for(submodule),
+                autocast_dtype=self._autocast_dtype_for(node_name),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
@@ -858,7 +863,7 @@ class Engine:
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
         """
-        node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
+        node_dtype = self._autocast_dtype_for(node_name)
         configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
@@ -1311,8 +1316,9 @@ class Engine:
         try:
             # inference-only, under the same scope the capture path used
             with torch.no_grad(), autocast_scope(
-                self._autocast_dtype_for(self._submodules[batch.node_name].submodule),
+                self._autocast_dtype_for(batch.node_name),
                 device_type=self._device.type,
+                node_name=batch.node_name,
             ):
                 laps = PhaseLaps("engine.exec.")
                 # a caller that pre-planned already reserved one; otherwise take it here
@@ -1713,31 +1719,6 @@ class Engine:
             per_request_input_metadata=batch.per_request_input_metadata,
         )
         laps.lap("engine_inputs")
-        with self._runner.compute_scope(step):
-            raw = self._preprocess_and_forward(
-                batch, submodule_mgmt, cg_runner, engine_inputs, inputs, ctx,
-                lease, running_batched, request_ids, set_launch,
-            )
-
-        if step is not None:
-            if nvtx:
-                range_push("engine.commit")
-            t0 = phase_start()
-            try:
-                self._runner.commit(step)
-            finally:
-                phase_end("engine.commit", t0)
-                if nvtx:
-                    range_pop()
-        return raw, step
-
-    def _preprocess_and_forward(
-        self, batch, submodule_mgmt, cg_runner, engine_inputs, inputs, ctx,
-        lease, running_batched, request_ids, set_launch,
-    ):
-        """``preprocess`` then the forward, inside the step's compute scope."""
-        nvtx = self._enable_nvtx
-        submodule = submodule_mgmt.submodule
         if nvtx:
             range_push("engine.preprocess")
         t0 = phase_start()
@@ -1764,7 +1745,7 @@ class Engine:
         try:
             # eager, compiled (its first call traces under it too) or replayed
             with fp32_precision_scope(submodule_mgmt.fp32_precision):
-                return self._forward(
+                raw = self._forward(
                     batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                     lease, running_batched, request_ids, release_event,
                 )
@@ -1772,6 +1753,18 @@ class Engine:
             phase_end("engine.forward", t0)
             if nvtx:
                 range_pop()
+
+        if step is not None:
+            if nvtx:
+                range_push("engine.commit")
+            t0 = phase_start()
+            try:
+                self._runner.commit(step)
+            finally:
+                phase_end("engine.commit", t0)
+                if nvtx:
+                    range_pop()
+        return raw, step
 
     def _forward(
         self,

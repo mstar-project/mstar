@@ -2465,10 +2465,11 @@ def _hold_namespace_lock(shm_dir: str, namespace: str) -> None:
 
 
 def _sweep_dead_namespaces(shm_dir: str, own_namespace: str) -> None:
-    """Delete every ``mstar_<ns>_*`` file in ``shm_dir`` of each of this
-    uid's namespaces whose lock there this process can take exclusively,
-    then the lock file. A per-launch namespace never collides with a dead
-    run's files, so nothing else reclaims them."""
+    """Delete every ``mstar_<ns>_*`` entry in ``shm_dir`` (files, and this
+    uid's directories with their contents) of each of this uid's namespaces
+    whose lock there this process can take exclusively, then the lock file.
+    A per-launch namespace never collides with a dead run's files, so
+    nothing else reclaims them."""
     try:
         names = os.listdir(shm_dir)
     except OSError:
@@ -2498,13 +2499,20 @@ def _sweep_dead_namespaces(shm_dir: str, own_namespace: str) -> None:
             swept = 0
             for stale in os.listdir(shm_dir):
                 if stale.startswith(prefix):
+                    stale_path = os.path.join(shm_dir, stale)
                     try:
-                        os.unlink(os.path.join(shm_dir, stale))
+                        st = os.lstat(stale_path)
+                        if not stat.S_ISDIR(st.st_mode):
+                            os.unlink(stale_path)
+                        elif st.st_uid == uid:
+                            shutil.rmtree(stale_path)
+                        else:
+                            continue
                         swept += 1
                     except OSError:
                         pass
             os.unlink(path)
-            logger.info("SHM: swept %d file(s) of dead deployment namespace "
+            logger.info("SHM: swept %d entries of dead deployment namespace "
                         "%s", swept, m[1])
         except OSError as e:
             logger.debug("SHM: cannot sweep %s: %s", name, e)
