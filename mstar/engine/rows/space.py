@@ -146,7 +146,10 @@ class StepRows:
         self._elements.setdefault(buf, []).append((slots, flat))
 
     def copy_in(self, buf: RowBuffer, slots: np.ndarray, src: torch.Tensor, src_rows: np.ndarray) -> None:
-        """Whole rows from a device store: ``buf[slots[i]] = src[src_rows[i]]``."""
+        """Whole rows from a device store: ``buf[slots[i]] = src[src_rows[i]]``.
+        Only into a buffer with no host mirror, which would not see them."""
+        if buf.host is not None:
+            raise ValueError(f"{buf.name}: copy_in into a mirrored buffer; write its rows from the host")
         _check_store(buf, src)
         self._copy_in.append((buf, np.asarray(slots, dtype=np.int64), src, np.asarray(src_rows, dtype=np.int64)))
 
@@ -161,6 +164,10 @@ class StepRows:
         host side of what the replay does to the device rows."""
         if buf.host is None:
             raise ValueError(f"{buf.name} keeps no host mirror")
+        if any(b is buf for b, _ in self._advance):
+            # a resource planned this step twice (pre-plan, then exec) and
+            # wrote both times: it has to write on one of them
+            raise ValueError(f"{buf.name} advanced twice in one step")
         self._advance.append((buf, delta))
 
     def on_commit(self, fn: Callable[[np.ndarray], None]) -> None:

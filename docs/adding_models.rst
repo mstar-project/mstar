@@ -1835,7 +1835,10 @@ node_name, graph_walk)``, called once at startup before capture:
   The base ``RowState()`` is for a resource that keeps nothing per row.
 - While planning, it writes the step's changes through ``ctx.rows``:
   ``write_at`` for single elements, ``advance`` for what the forward adds to
-  every active row.
+  every active row. A step planned ahead is planned again at exec with the
+  same ``ctx.rows``, so a resource that pre-plans writes on one of the two
+  passes (``ctx.is_preplan`` tells them apart); ``advance`` refuses a second
+  call for a buffer.
 
 The engine refuses the walk at startup if any resource returns None (the
 default), if the walk has no batch cap to size the rows, or if the node is
