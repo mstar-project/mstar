@@ -173,6 +173,11 @@ class Resource(ABC):
         every step."""
         return False
 
+    def after_output_copy(self, step: ResourceStep) -> None:
+        """Called on the worker's main thread once ``step`` has finished on the device and its outputs are
+        sent. A copy to the host queued here runs behind that step's own output copy."""
+        return
+
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return

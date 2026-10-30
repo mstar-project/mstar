@@ -6,7 +6,14 @@ import torch
 
 from mstar.engine import accelerator_graph_runner
 from mstar.model.cosmos3.config import DENOISE_COMPILE_MODES, Cosmos3Config
-from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule, denoise_compile_kwargs
+from mstar.model.cosmos3.submodules import (
+    CFG_BATCHED_LABEL,
+    COND_LABEL,
+    UNCOND_LABEL,
+    Cosmos3DiTSubmodule,
+    denoise_compile_kwargs,
+)
+from mstar.model.cosmos3.tests.test_rotary_table import _tiny
 
 
 def test_deterministic_mode_turns_on_inductors_deterministic_option():
@@ -81,59 +88,42 @@ def test_no_compile_leaves_every_forward_eager():
     assert not {"denoise_step", "denoise_step_batched_cfg", "gen_layers_batched"} & set(vars(t))
 
 
-class _RecordingTransformer(_Transformer):
-    """Records what the batched step is handed; a real layer stack would see
-    the attention through ``_gen_attend``."""
+def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(monkeypatch):
+    """The warmup runs one two-request step through the real step at the
+    default size with the layer stack compiled, so no request pays for it: a
+    row of another size, against the attention a served step binds, runs what
+    the warmup built."""
+    sub, model, _, res = _tiny(compile_denoise=True, video_size_default=(64, 64), num_frames_video=9)
+    step, calls = model.denoise_step_batched, []
 
-    def __init__(self):
-        super().__init__()
-        self.proj_in = torch.nn.Linear(2, 2)
-        self.batched_calls = []
+    def recording_step(requests, label, attn):
+        results = step(requests, label, attn)
+        calls.append((requests, label, results))
+        return results
 
-    # what the real step indexes per request; a warmup row missing one would raise here as it did on a server
-    REQ_KEYS = ("latents", "vision_timesteps", "rotary_cond", "rotary_uncond", "vision_token_shapes",
-                "vision_noisy_frame_indexes", "vision_mse_loss_indexes")
+    monkeypatch.setattr(model, "denoise_step_batched", recording_step)
+    with torch.no_grad():  # as the engine calls it
+        sub.warmup_compiles()
+    [(requests, label, results)] = calls
+    latent_size = sub._latent_shape(64, 64, 9)
+    assert len(requests) == 2 and label == CFG_BATCHED_LABEL and requests[0]["latents"].shape == latent_size
+    assert [v.shape for branches in results for v in branches] == [latent_size] * 4
 
-    def denoise_step_batched(self, requests, label, attn):
-        for req in requests:
-            for key in self.REQ_KEYS:
-                req[key]
-        self.batched_calls.append((requests, label, attn))
-        return [(None, None)] * len(requests)
+    static = sub._build_static(list(range(5)), 32, 64, 5, 24.0, False, "cpu")
+    latents = torch.randn(sub._latent_shape(32, 64, 5))
+    timesteps = torch.full((static["num_noisy_vision_tokens"],), 500.0)
+    row = model.denoise_step_row(static, latents, timesteps, static["rotary"], static["rotary"])
+    n = static["num_vision_tokens"]
+    res.plan(CFG_BATCHED_LABEL, [(COND_LABEL, n), (UNCOND_LABEL, n)], causal=False)
+    with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
+        ((cond_v, uncond_v),) = step([row], CFG_BATCHED_LABEL, res.attn)
+    assert cond_v.shape == uncond_v.shape == latents.shape
 
 
-@pytest.mark.parametrize("batched", [True, False])
-def test_warmup_compiles_runs_one_two_request_step_at_the_default_size(monkeypatch, batched):
-    from mstar.model.cosmos3 import submodules
-
-    cfg = Cosmos3Config(compile_denoise_batched=batched, video_size_default=(832, 480), num_frames_video=121)
-    t = _RecordingTransformer()
-    sub = Cosmos3DiTSubmodule(t, cfg)
-    built = []
-    rotary = (torch.zeros(4, 2), torch.zeros(4, 2))
-
-    def fake_static(ids, height, width, num_frames, fps, has_image_condition, device):
-        built.append((height, width, num_frames, has_image_condition))
-        return {
-            "num_noisy_vision_tokens": 4, "rotary": rotary,
-            "vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.zeros(1)],
-            "mse_gen_indexes": torch.arange(4),
-        }
-
-    monkeypatch.setattr(sub, "_build_static", fake_static)
+def test_warmup_compiles_is_a_no_op_without_the_compiled_layer_stack(monkeypatch):
+    sub, model, _, _ = _tiny(compile_denoise=True, compile_denoise_batched=False)
+    monkeypatch.setattr(model, "denoise_step_batched", lambda *a: pytest.fail("no compile to warm"))
     sub.warmup_compiles()
-    if not batched:
-        assert t.batched_calls == [] and built == []
-        return
-    assert built == [(480, 832, 121, False)]
-    [(requests, label, attn)] = t.batched_calls
-    assert len(requests) == 2 and label == submodules.CFG_BATCHED_LABEL
-    assert requests[0]["latents"].shape == sub._latent_shape(480, 832, 121)
-    # both branches take the statics' table, as a served window's rows do
-    assert requests[0]["rotary_cond"] is rotary and requests[1]["rotary_uncond"] is rotary
-    # the stand-in reads no plan and answers with the query's shape
-    q = torch.randn(5, 2, 3)
-    assert not attn.requires_kv_write and torch.equal(attn.run(q, k=q, v=q), torch.zeros_like(q))
 
 
 def test_defaults_pass_validation():

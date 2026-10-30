@@ -81,11 +81,15 @@ class CPUPagePool:
 
         # copies run here so they don't serialize with compute
         self._stream: torch.cuda.Stream | None = None
+        self._write_stream: torch.cuda.Stream | None = None
+        self._copied_since_write = False
         self._copier = make_page_copier()
 
         self._refused_logged_at: float | None = None
         self._refused_unlogged = 0
         self.dropped = 0
+        self.written = 0
+        self.cancelled = 0
         self._dropped_logged_at: float | None = None
 
     def _get_stream(self) -> torch.cuda.Stream:
@@ -100,6 +104,12 @@ class CPUPagePool:
         pages = self.index.lookup(keys)
         self.arena.retain(pages)
         return pages
+
+    def take(self, n: int) -> list[int]:
+        """Up to ``n`` free pages, evicting cached pages when too few are free."""
+        if n > self.arena.num_free:
+            self.index.evict(n - self.arena.num_free)
+        return self.arena.acquire(min(n, self.arena.num_free))
 
     def place(
         self,
@@ -116,12 +126,9 @@ class CPUPagePool:
         # retained before evicting, so the eviction passes over them
         found = self.retain_run(keys)
         n_pages = len(gpu_page_indices) - len(found)
-        cpu_pages = self.arena.acquire(n_pages)
-        if cpu_pages is None:
-            self.index.evict(n_pages - self.arena.num_free)
-            cpu_pages = self.arena.acquire(n_pages)
-        if cpu_pages is None:
-            self.arena.release(found)
+        cpu_pages = self.take(n_pages)
+        if len(cpu_pages) < n_pages:
+            self.arena.release(cpu_pages + found)
             self._log_refusal(rid, label, n_pages)
             return None
         self.offloaded.setdefault(rid, {})[label] = OffloadedStream(
@@ -157,13 +164,32 @@ class CPUPagePool:
 
     def count_dropped(self, keys: list[bytes]) -> None:
         dropped = sum(self.index.page_for(key) is None for key in keys)
-        if not dropped:
-            return
-        self.dropped += dropped
+        if dropped:
+            self.dropped += dropped
+            self._log_counts()
+
+    def file_writes(
+        self, keys: list[bytes], pages: list[int], parents: list[bytes | None], cancelled: set[bytes],
+    ) -> None:
+        """File each of ``pages`` under its key in ``keys``, except the keys in ``cancelled``, then
+        release ``pages``. Where an offload filed a key during the copy, the index keeps the offload's
+        page, and this write's page goes back to the free list."""
+        filed = 0
+        for key, page, parent in zip(keys, pages, parents, strict=True):
+            if key not in cancelled:
+                filed += self.index.insert(key, page, None if parent is None else self.index.page_for(parent))
+        self.arena.release(pages)
+        self.written += filed
+        self.cancelled += len(cancelled)
+        self._log_counts()
+
+    def _log_counts(self) -> None:
         now = time.monotonic()
         if self._dropped_logged_at is None or now - self._dropped_logged_at >= _EXHAUSTED_LOG_INTERVAL:
             logger.info(
-                "CPU page pool: %d cached device pages evicted with no copy here so far", self.dropped,
+                "CPU page pool: %d cached device pages evicted with no copy here so far, %d cached "
+                "pages copied here, %d copies cancelled",
+                self.dropped, self.written, self.cancelled,
             )
             self._dropped_logged_at = now
 
@@ -175,6 +201,7 @@ class CPUPagePool:
         # these pages (a commit hands pages on right after the launch). Queue
         # the copies behind it, or they could read a page mid-write.
         stream.wait_stream(torch.cuda.current_stream())
+        self._copied_since_write = True
         self._copier.copy(self.cpu_kv_cache, copies.cpu, gpu_kv_cache, copies.gpu, stream)
 
     def copy_in(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
@@ -184,7 +211,30 @@ class CPUPagePool:
         # Same ordering as the offload: the device pages we write may have
         # been released by a commit whose kernels are still reading them.
         stream.wait_stream(torch.cuda.current_stream())
+        self._copied_since_write = True
         self._copier.copy(gpu_kv_cache, copies.gpu, self.cpu_kv_cache, copies.cpu, stream)
+
+    def _get_write_stream(self) -> torch.cuda.Stream:
+        if self._write_stream is None:
+            self._write_stream = torch.cuda.Stream()
+        return self._write_stream
+
+    def write(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
+        """Copy cached device pages here on a stream of their own, so `sync` never waits for them. The
+        caller has seen the steps that wrote the pages finish, so the write adds no wait on the compute stream."""
+        stream = self._get_write_stream()
+        # Wait for the copies still queued on `_stream`, because `reload` and `_abandon_claims` release host
+        # pages while those copies read or write them.
+        if self._copied_since_write:
+            self._copied_since_write = False
+            stream.wait_stream(self._stream)
+        self._copier.copy(self.cpu_kv_cache, copies.cpu, gpu_kv_cache, copies.gpu, stream)
+
+    def record_write(self) -> torch.cuda.Event:
+        """An event that completes once every write queued so far has landed."""
+        event = torch.cuda.Event()
+        event.record(self._get_write_stream())
+        return event
 
     def record(self) -> torch.cuda.Event:
         """An event that completes once every copy queued so far has landed."""
