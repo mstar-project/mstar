@@ -283,6 +283,18 @@ cosyvoice3 = [
     "transformers",
 ]
 
+# VoxCPM2: soundfile reads reference clips and soxr resamples them to 16 kHz
+# the way the reference's librosa.load does.
+voxcpm2 = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "safetensors",
+    "soundfile",
+    "soxr",
+    "transformers",
+]
+
 orpheus = [
     "einops",
     "flashinfer-python==0.7.2",
@@ -455,6 +467,7 @@ all = [
     "spacy>=3.8",
     "num2words",
     "audioseal>=0.2,<0.3",  # see the audioseal extra
+    "soxr",  # see the voxcpm2 extra
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
     # has to come from git, which PyPI will not accept in requires_dist.
     # See docs/installation.rst.
