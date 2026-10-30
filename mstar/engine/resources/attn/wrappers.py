@@ -420,16 +420,17 @@ class FlashInferMixedWrapper:
     so the step's leading run of one-token rows is its first tokens, row i
     token i. The decode half plans the bucket's ``batch_size`` rows: a row of
     the run attends its own pages, and any other reads the sink page and its
-    output is dropped (the tensor-core half gives those rows no query, and
-    its last row takes the leftover tokens). The prefill wrapper takes every
+    output is dropped (with tensor cores those rows get no query, except the
+    last, which takes the tokens past the run). The prefill wrapper takes every
     token: the run as one row on the sink page, at most ``max_prefill_rows``
     prompt rows, and a sink-page tail row over the bucket's padding. Both
     read the step's queries in place, at static shapes, and the decode
     outputs overwrite the run's.
 
     A mixed step plans inline on the gpu thread, behind the step in flight,
-    so every host array is staged page-locked: in this wrapper's buffers, or
-    for the tensor-core half in its own (``_stage_pinned``).
+    so every host array is staged page-locked: the CUDA-core decode half's in
+    this wrapper's buffers, the prefill wrapper's and the tensor-core half's in
+    their own (``_stage_pinned``).
     """
 
     def __init__(
@@ -546,9 +547,9 @@ class FlashInferMixedWrapper:
         if len(prompt) > self._max_prefill_rows:
             raise RuntimeError(
                 f"FlashInferMixedWrapper: {len(prompt)} prompt rows in a step "
-                f"captured for {self._max_prefill_rows}: more than the scheduler "
-                "lets in, a decode row behind a prompt row (a broken row order), "
-                "or a CombinedSplit that leaves out a multi-token walk"
+                f"captured for {self._max_prefill_rows}. Possible causes: more than "
+                "the scheduler lets in, a decode row behind a prompt row (a broken "
+                "row order), or a CombinedSplit that leaves out a multi-token walk"
             )
         dec = np.arange(rows) < run
 
