@@ -1,10 +1,7 @@
-"""MLAAttention's options against Kimi K3's ``KimiMLAAttention`` (``modeling_kimi_linear.py``, HF
-f831ab66814), transcribed: the decoupled dims are never rotated (``mla_use_nope``), the output is
-gated by ``sigmoid(g_proj(x))`` (``mla_use_output_gate``) and the latent norms are ``KimiRMSNorm``'s
-default 1e-6 (``mla_latent_norm_eps``). Both the naive and the absorbed path run on CPU, with the
-attention itself supplied through the class's hooks (as a sparse attention plugs in), so no KV or
-attention resource is needed. The same for GLM-5.3's layout, no decoupled dims at all, whose cache
-rows carry a zero rope slot."""
+"""MLAAttention's options for GLM-5.3's layout, no decoupled dims (``mla_use_nope``), whose cache
+rows carry a zero rope slot: the naive and the absorbed path on CPU against plain attention from
+the same weights, with the attention itself supplied through the class's hooks (as a sparse
+attention plugs in), so no KV or attention resource is needed."""
 import sys
 import types
 from types import SimpleNamespace
@@ -65,81 +62,20 @@ class _DenseAbsorbed(MLAAttention):
         return torch.einsum("hqk,kl->qhl", _causal_softmax(scores), kv_c)
 
 
-def _k3_reference(params, x, eps=1e-6):
-    """KimiMLAAttention.forward, eager attention, one sequence. Its latent norms are
-    ``KimiRMSNorm(q_lora_rank)`` / ``KimiRMSNorm(kv_lora_rank)``: eps 1e-6, not rms_norm_eps."""
-    def rms(v, w):
-        v32 = v.float()
-        return w * (v32 * torch.rsqrt(v32.pow(2).mean(-1, keepdim=True) + eps)).to(v.dtype)
-
-    q = rms(x @ params["q_a_proj.weight"].T, params["q_a_layernorm.weight"])
-    q = (q @ params["q_b_proj.weight"].T).view(T, HEADS, NOPE + ROPE)
-    q_pass, q_rot = q.split([NOPE, ROPE], dim=-1)
-    compressed = x @ params["kv_a_proj_with_mqa.weight"].T
-    k_pass, k_rot = compressed.split([KV_LORA, ROPE], dim=-1)
-    kv = (rms(k_pass, params["kv_a_layernorm.weight"]) @ params["kv_b_proj.weight"].T)
-    k_pass, value = kv.view(T, HEADS, NOPE + V).split([NOPE, V], dim=-1)
-    k_rot = k_rot.view(T, 1, ROPE).expand(T, HEADS, ROPE)
-    query, key = torch.cat([q_pass, q_rot], -1), torch.cat([k_pass, k_rot], -1)
-    scores = torch.einsum("qhd,khd->hqk", query, key) * (NOPE + ROPE) ** -0.5
-    out = torch.einsum("hqk,khd->qhd", _causal_softmax(scores), value).reshape(T, HEADS * V)
-    out = out * torch.sigmoid(x @ params["g_proj.weight"].T)
-    return out @ params["o_proj.weight"].T
-
-
-def _module(cls, absorb, params=None):
-    m = cls(_config(absorb, mla_use_nope=True, mla_use_output_gate=True, mla_latent_norm_eps=1e-6),
-            layer_idx=0, kv_key="kv", attn_key="attn", pos_key=None)
-    if params is None:
-        with torch.no_grad():
-            for name, p in m.named_parameters():
-                p.copy_(1.0 + 0.1 * torch.randn_like(p) if "layernorm" in name
-                        else 0.1 * torch.randn_like(p))
-    else:
-        m.load_state_dict(params, strict=False)
-    return m
-
-
-def test_k3_mla_naive_and_absorbed_match_the_reference():
-    naive = _module(_DenseNaive, absorb=False)
-    params = {k: v.clone() for k, v in naive.state_dict().items()}
-    absorbed = _module(_DenseAbsorbed, absorb=True, params=params)
-    absorbed.process_weights_after_loading()
-    x = torch.randn(T, HIDDEN)
-    pos = torch.arange(T)
-    ref = _k3_reference(params, x)
-    with torch.no_grad():
-        torch.testing.assert_close(naive(x, pos), ref, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(absorbed(x, pos), ref, rtol=1e-5, atol=1e-6)
-
-
-def test_the_gate_and_nope_are_what_change_the_output():
-    m = _module(_DenseNaive, absorb=False)
-    x, pos = torch.randn(T, HIDDEN), torch.arange(T)
-    with torch.no_grad():
-        gated = m(x, pos)
-        g = m.g_proj
-        m.g_proj = None
-        ungated = m(x, pos)
-        m.g_proj = g
-    assert not torch.allclose(gated, ungated)
-
-
-def test_defaults_are_the_rotating_ungated_mla():
+def test_defaults_are_the_rotating_mla():
     m = MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key="pos")
-    assert m.use_rope and m.g_proj is None
+    assert m.use_rope
     assert m.q_a_layernorm.variance_epsilon == m.kv_a_layernorm.variance_epsilon == 1e-5
     with pytest.raises(ValueError, match="pos_key"):
         MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key=None)
-    eps = MLAAttention(_config(False, mla_latent_norm_eps=1e-6), kv_key="kv", attn_key="attn",
-                       pos_key="pos")
-    assert eps.q_a_layernorm.variance_epsilon == eps.kv_a_layernorm.variance_epsilon == 1e-6
+    with pytest.raises(ValueError, match="no decoupled dims"):
+        MLAAttention(_config(False, mla_use_nope=True), kv_key="kv", attn_key="attn", pos_key=None)
 
 
-def test_unrotated_mla_binds_no_position_resource():
-    m = _module(_DenseNaive, absorb=False)
+def test_nope_mla_binds_no_position_resource():
+    m = _DenseNaive(_latent_only_config(False, 0), kv_key="kv", attn_key="attn", pos_key=None)
     m.bind_resources({"kv": object(), "attn": object()})
-    q, k = torch.randn(T, HEADS, ROPE), torch.randn(T, 1, ROPE)
+    q, k = torch.randn(T, HEADS, 0), torch.randn(T, 1, 0)
     q2, k2 = m._rope(torch.arange(T), q, k)
     assert q2 is q and k2 is k
 

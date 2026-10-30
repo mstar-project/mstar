@@ -8,7 +8,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
+from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block, fp8_reference
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import Glm52ModelConfig
 
@@ -48,7 +48,7 @@ def build_dense_mlp(
     if block is not None:
         return Fp8ParallelGatedMLP(
             config.hidden_size, config.intermediate_size, block, comm_group=comm_group,
-            reduce_results=reduce_results)
+            reduce_results=reduce_results, reference=fp8_reference(config))
     return ParallelGatedMLP(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,

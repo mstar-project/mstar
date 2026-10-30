@@ -216,16 +216,14 @@ def test_batched_prefill_buckets_get_their_own_capture():
             for c in prefill] == [([1], [64, 128, 192]), ([4, 16], [1024, 2048])]
 
 
-# ── the router's top-k kernel (moe_router_kernel) ──
+# ── the router's top-k kernel (kernels: auto) ──
 
 
-def test_router_kernel_flag_defaults_off_and_reaches_the_block():
+def test_router_kernel_reaches_the_block_under_auto():
     from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 
-    assert Glm52ModelConfig().moe_router_kernel is False
-    model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced_fp8",
-                       moe_router_kernel=True)
-    assert model.config.moe_router_kernel is True
+    model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced_fp8")
+    assert model.config.kernels == "auto"
     block = Glm52SparseMoeBlock(model.config)
     assert block._router_kernel is True
     block.process_weights_after_loading("cpu")  # no fused path on the host: torch top-k
@@ -252,19 +250,13 @@ def test_router_kernel_matches_the_torch_top_k(tokens):
                                rtol=1e-6, atol=1e-7)
 
 
-# ── the last layer's FFN on the sampled rows (prefill_last_layer_rows) ──
-
-
-def test_last_layer_rows_flag_defaults_off_and_reaches_the_config():
-    assert Glm52ModelConfig().prefill_last_layer_rows is False
-    model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced",
-                       prefill_last_layer_rows=True)
-    assert model.config.prefill_last_layer_rows is True
+# ── the last layer's FFN on the sampled rows (kernels: auto) ──
 
 
 def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
-    """Two packed requests: the last layer's MLP sees their two last rows, every other
-    layer all of them, and the sampled tokens and logits match the full forward."""
+    """Two packed requests: under kernels: auto the last layer's MLP sees their two last
+    rows, every other layer all of them, and the sampled tokens and logits match the full
+    forward the reference runs."""
     from types import SimpleNamespace
 
     from mstar.engine.resources import StepContext
@@ -288,8 +280,8 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     logits = []
     lm.lm_head.register_forward_hook(lambda m, a, out: logits.append(out))
 
-    def prefill(flag, rids):
-        cfg.prefill_last_layer_rows = flag
+    def prefill(rows_only, rids):
+        cfg.kernels = "auto" if rows_only else "reference"
         sub = Glm52LLMSubmodule(lm, cfg)
         resources, runner = build_cpu_resources(cfg, rids)
         sub.bind_node_resources(resources)
