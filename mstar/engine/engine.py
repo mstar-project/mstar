@@ -522,6 +522,10 @@ class Engine:
         node_names = set(submodules.keys())
         node_to_resources = {}
         specs_by_key = resolve_spec_dependencies(specs)
+        instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
+        prefix_caches = opening_prefix_caches(
+            specs, instance, checkpoint_named=model is not None and model.checkpoint_path() is not None,
+        )
 
         self._classify_tp_roles(node_names, parallel_groups)
 
@@ -557,6 +561,7 @@ class Engine:
                     max_rows_in_combined=self._max_rows_in_combined(
                         spec.resource_key, relevant_nodes, submodules, model,
                     ),
+                    prefix_caches=prefix_caches,
                 ),
             )
 
@@ -575,9 +580,7 @@ class Engine:
             enable_nvtx=self._enable_nvtx,
         )
 
-        self._open_prefix_caches(specs_by_key, model, {
-            node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names
-        })
+        self._open_prefix_caches(specs_by_key, model, instance)
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and

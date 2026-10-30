@@ -26,7 +26,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
-from mstar.engine.resources.kv.config import opening_prefix_caches
+from mstar.engine.resources.kv.config import prefix_caches_by_rank
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -131,14 +131,13 @@ class ReplicaRouter:
             key: {label: kv_label.keys.walks for label, kv_label in labels.items()}
             for key, labels in keyed_labels(model).items()
         }
-        checkpoint_named = names_checkpoint(model)
+        by_rank = prefix_caches_by_rank(
+            specs, ((wg.ranks, wg.tp_size, wg.section.get_nodes()) for wg in worker_graphs), names_checkpoint(model),
+        )
         self._units: list[_Unit] = []
         for instances, wgs in units.items():
-            # the unit's nodes at its instance size, as its engines see their own
-            opened = opening_prefix_caches(
-                specs, {node: len(instances[0]) for wg in wgs for node in wg.section.get_nodes()},
-                checkpoint_named,
-            )
+            # what every replica's engines open
+            opened = frozenset.intersection(*(by_rank[rank] for instance in instances for rank in instance))
             mirrors = []
             for spec in specs if len(instances) > 1 else ():
                 holding = [wg for wg in wgs if not spec.nodes.isdisjoint(wg.section.get_nodes())]

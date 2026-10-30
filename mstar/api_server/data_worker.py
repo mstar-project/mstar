@@ -44,7 +44,7 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
-from mstar.engine.resources.kv.config import KVSpec, opening_prefix_caches
+from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
@@ -190,16 +190,15 @@ def _preprocess_loop(**kwargs):
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource whose prefix cache can open, after this deployment's YAML has been applied."""
+    """Page size per KV resource whose prefix cache some rank's engine opens, after this deployment's
+    YAML has been applied."""
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
-    # each node's smallest lockstep instance among the node groups that run it
-    instance: dict[str, int] = {}
-    for group in model_config.get("node_groups") or []:
-        size = int(group.get("tp_size", 1)) * int(group.get("sp_size", 1))
-        for node in group.get("node_names") or []:
-            instance[node] = min(size, instance.get(node, size))
-    opened = opening_prefix_caches(specs, instance, names_checkpoint(model))
+    groups = [
+        (group["ranks"], int(group.get("tp_size", 1)) * int(group.get("sp_size", 1)), group["node_names"])
+        for group in model_config.get("node_groups") or []
+    ]
+    opened = frozenset().union(*prefix_caches_by_rank(specs, groups, names_checkpoint(model)).values())
     return {
         spec.resource_key: spec.config.page_size for spec in specs
         if isinstance(spec, KVSpec) and spec.resource_key in opened

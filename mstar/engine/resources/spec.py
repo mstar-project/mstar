@@ -45,8 +45,8 @@ class RoutingContext(NamedTuple):
     walks: frozenset[str]
     # the resource's keyed labels, each with the walks whose writes it keys
     keyed: Mapping[str, Collection[str]]
-    # whether these replicas' workers open the resource's prefix cache: `opening_prefix_caches`
-    # at their instance size, derived by the router rather than declared
+    # whether every replica's engine opens the resource's prefix cache (`prefix_caches_by_rank`),
+    # derived by the router rather than declared
     prefix_cache_opens: bool
 
 

@@ -70,10 +70,12 @@ def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool
     kv = _specs(0)["kv"]
     kv.config.prefix_cache = prefix_cache
     group = type("Group", (), {"world_size": world_size})() if world_size > 1 else None
-    return RecurrentStatePool.build(
-        RecurrentStateSpec(resource_key="state", nodes=set(kv.nodes), config=config),
-        EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=group, dependencies={"kv": kv}),
-    )
+    spec = RecurrentStateSpec(resource_key="state", nodes=set(kv.nodes), config=config)
+    return RecurrentStatePool.build(spec, EngineResourceInfo(
+        device=torch.device("cpu"), joint_comm_group=group, dependencies={"kv": kv},
+        # as the engine decides it for a node with the pool and its cache
+        prefix_caches=opening_prefix_caches([spec, kv], dict.fromkeys(kv.nodes, world_size), checkpoint_named=True),
+    ))
 
 
 def _pool(prefix_slots: int = 2, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
@@ -173,6 +175,21 @@ def test_snapshots_stay_off_and_unallocated_where_the_cache_cant_open(closed):
     assert pool._kv is None, "a pool that can't restore keys snapshots"
     assert pool.block("state", 0).shape[0] == pool.config.max_slots, "allocated snapshot slots nothing can use"
     assert _pool()._kv is not None
+
+
+def test_a_pool_keeps_snapshot_slots_only_for_a_cache_the_engine_opens():
+    # its own cache would open, but the engine shuts it, as for a node whose other pool keeps no snapshots
+    kv = _specs(0)["kv"]
+    pool = RecurrentStatePool.build(
+        RecurrentStateSpec(resource_key="state", nodes=set(kv.nodes), config=RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
+            max_slots=4, prefix_slots=2, kv_cache="kv",
+        )),
+        EngineResourceInfo(device=torch.device("cpu"), dependencies={"kv": kv}, prefix_caches=frozenset({"kv"})),
+    )
+    assert pool.block("state", 0).shape[0] == pool.config.max_slots, (
+        "allocated snapshot slots for a pool the engine keeps shut"
+    )
 
 
 def test_a_negative_prefix_slots_override_is_refused():
@@ -409,6 +426,7 @@ def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, 
             engine._resources[spec.resource_key] = RecurrentStatePool.build(spec, EngineResourceInfo(
                 device=torch.device("cpu"), joint_comm_group=group,
                 dependencies={dep: by_key[dep] for dep in spec.depends_on()},
+                prefix_caches=opening_prefix_caches(specs, instance, checkpoint_named=False),
             ))
         else:
             engine._resources[spec.resource_key] = _StubGDN()

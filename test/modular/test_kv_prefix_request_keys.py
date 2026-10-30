@@ -20,13 +20,14 @@ import pytest
 import torch
 from test_ingest_unpersist import _conductor, _ToyModel
 
-from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorkerThread, _kv_page_sizes
 from mstar.api_server.request_types import PreprocessInput
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
@@ -333,6 +334,32 @@ def test_each_resource_config_is_handed_only_its_own_chain():
     )
     assert configs["other_kv"].prefix_keys is None, (
         "a resource was handed another resource's chain"
+    )
+
+
+def test_a_cache_one_rank_opens_is_keyed_though_another_rank_keeps_its_copy_shut():
+    class _Split:
+        """kv on A at one rank, and on B at two, where B's recurrent pool keeps no snapshots."""
+
+        def get_node_resources(self):
+            return [
+                KVSpec("kv", {"A", "B"}, PagedKVConfig(
+                    num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=PAGE_SIZE,
+                )),
+                RecurrentStateSpec("state", {"B"}, RecurrentStateConfig(
+                    num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
+                    prefix_slots=2, kv_cache="kv",
+                )),
+            ]
+
+        def checkpoint_path(self):
+            return "/a/checkpoint"
+
+    config = {"node_groups": [
+        {"node_names": ["A"], "ranks": [0]}, {"node_names": ["B"], "ranks": [1, 2], "tp_size": 2},
+    ]}
+    assert _kv_page_sizes(_Split(), config) == {"kv": PAGE_SIZE}, (
+        "the prompts of a cache rank 0's engine opens went unkeyed, so it never hits"
     )
 
 

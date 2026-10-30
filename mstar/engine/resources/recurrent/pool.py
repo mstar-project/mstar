@@ -23,7 +23,6 @@ from mstar.engine.resources.base import (
     EngineResourceInfo,
     Resource,
 )
-from mstar.engine.resources.kv.config import opening_prefix_caches
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.manager import _DEBUG_ASSERTS
 from mstar.engine.resources.recurrent.config import (
@@ -140,12 +139,8 @@ class RecurrentStatePool(Resource):
         config = spec.config
         config.shard(info.head_shards)
         world_size = 1 if info.joint_comm_group is None else info.joint_comm_group.world_size
-        specs = [spec, *info.dependencies.values()]
-        # no snapshot slots where they can't serve a hit. A model that names no
-        # checkpoint keeps them here and has the engine close the pool.
-        if spec.resource_key not in opening_prefix_caches(
-            specs, {node: world_size for s in specs for node in s.nodes}, checkpoint_named=True,
-        ):
+        # no snapshot slots where the engine keeps them from serving a hit
+        if spec.resource_key not in info.prefix_caches:
             config = replace(config, prefix_slots=0)
         # resolved here, not written back: the config is the model's, shared by its specs
         return cls(

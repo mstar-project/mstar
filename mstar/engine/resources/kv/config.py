@@ -5,7 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -466,6 +466,23 @@ def opening_prefix_caches(
         if now == opened:
             return frozenset(now)
         opened = now
+
+
+def prefix_caches_by_rank(
+    specs: Iterable[NodeResourceSpec],
+    groups: Iterable[tuple[Sequence[int], int, Collection[str]]],
+    checkpoint_named: bool,
+) -> dict[int, frozenset[str]]:
+    """The caches each rank's engine opens: `opening_prefix_caches` over the
+    nodes on the rank, each at its lockstep instance size, as `Engine.load_model`
+    evaluates it. ``groups`` gives each node group's ranks, instance size and
+    nodes."""
+    specs = list(specs)
+    local: dict[int, dict[str, int]] = {}
+    for ranks, size, nodes in groups:
+        for rank in ranks:
+            local.setdefault(rank, {}).update(dict.fromkeys(nodes, size))
+    return {rank: opening_prefix_caches(specs, nodes, checkpoint_named) for rank, nodes in local.items()}
 
 
 @dataclass
