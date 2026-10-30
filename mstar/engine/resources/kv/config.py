@@ -109,11 +109,10 @@ class PagedKVConfig(KVConfig):
         super().__post_init__()
 
     def prefix_cache_opens(self, world_size: int, checkpoint_named: bool) -> bool:
-        """Whether a pool of this config opens its prefix cache. Every input is
-        fixed at startup: ``world_size`` is the pool's lockstep instance, and a
-        model that names no checkpoint needs a salt, or builds that differ only
-        in their weights could not be told apart. ``opening_prefix_caches``
-        adds what the other resources on its nodes decide."""
+        """`NodeResourceSpec.prefix_cache_opens` for a pool of this config.
+        Above one rank only with ``prefix_cache_tp``, and a model that names no
+        checkpoint needs a salt, or builds that differ only in their weights
+        could not be told apart."""
         return (
             self.prefix_cache
             and (world_size == 1 or self.prefix_cache_tp)
@@ -430,44 +429,43 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
 def opening_prefix_caches(
     specs: Iterable[NodeResourceSpec], instance: Mapping[str, int], checkpoint_named: bool,
 ) -> frozenset[str]:
-    """The prefix caches that open: paged KV caches, and the recurrent pools
-    whose snapshots serve their hits. Every input is fixed at startup, so the
+    """The prefix caches that open: those each spec keeps of its own
+    (`NodeResourceSpec.prefix_cache_opens`), less those a resource on their
+    nodes keeps from serving a hit. Every input is fixed at startup, so the
     engines, the conductor's routing and the data worker agree.
 
     ``instance`` is the lockstep instance of each node the caller places; a
     spec is sized by the smallest of its nodes there, 1 where it has none. A
-    KV cache opens where its ``prefix_cache_opens`` says so and none of its
-    nodes carries a pool that keeps no snapshots, or a resource over pools
-    alone that don't all keep them: a hit there would skip tokens the state
-    never saw. A pool keeps snapshots with ``prefix_slots``, at one rank, over
-    an opening cache on every node of the pool.
+    cache over other caches, such as a recurrent pool's snapshots over its KV
+    cache's pages, keeps only where they open on all of its nodes. A node
+    carrying a resource that can't restore what a hit skips
+    (`NodeResourceSpec.restores_prefix`) keeps every cache on it shut: a hit
+    there would skip tokens its state never saw. Closing one cache can close
+    others, so the rule runs until nothing changes.
     """
-    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
-
     specs = list(specs)
+    by_key = {spec.resource_key: spec for spec in specs}
 
     def size(spec: NodeResourceSpec) -> int:
         return min((instance[node] for node in spec.nodes if node in instance), default=1)
 
-    opens = {
-        spec.resource_key: spec.nodes for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
-        and spec.config.prefix_cache_opens(size(spec), checkpoint_named)
-    }
-    pools = {spec.resource_key: spec for spec in specs if isinstance(spec, RecurrentStateSpec)}
-    keeping = {
-        key for key, spec in pools.items()
-        if spec.config.prefix_slots and size(spec) == 1
-        and spec.nodes <= opens.get(spec.config.kv_cache, frozenset())
-    }
-    unrestorable = {
-        node for spec in specs
-        if spec.resource_key in pools.keys() - keeping
-        or (spec.depends_on() and spec.depends_on() <= pools.keys() and not spec.depends_on() <= keeping)
-        for node in spec.nodes
-    }
-    kv = {key for key, nodes in opens.items() if nodes.isdisjoint(unrestorable)}
-    return frozenset(kv | {key for key in keeping if pools[key].config.kv_cache in kv})
+    opened = {spec.resource_key for spec in specs if spec.prefix_cache_opens(size(spec), checkpoint_named)}
+    while True:
+        kept = {
+            key for key in opened
+            if all(dep in opened and by_key[key].nodes <= by_key[dep].nodes for dep in by_key[key].depends_on())
+        }
+        unrestorable = {
+            node for spec in specs
+            if spec.restores_prefix and spec.resource_key not in kept and not (
+                spec.depends_on() and all(dep in kept and by_key[dep].restores_prefix for dep in spec.depends_on())
+            )
+            for node in spec.nodes
+        }
+        now = {key for key in kept if by_key[key].nodes.isdisjoint(unrestorable)}
+        if now == opened:
+            return frozenset(now)
+        opened = now
 
 
 @dataclass
@@ -492,6 +490,9 @@ class KVSpec(NodeResourceSpec):
         """Forwarded to the config: which keys are legal is a property of the
         storage strategy, so the config answers for them."""
         self.config.apply_yaml_overrides(**kwargs)
+
+    def prefix_cache_opens(self, world_size: int, checkpoint_named: bool) -> bool:
+        return isinstance(self.config, PagedKVConfig) and self.config.prefix_cache_opens(world_size, checkpoint_named)
 
     def routing_mirror(self, ctx: RoutingContext):
         """A mirror of the prefix cache where it opens and a walk that keys it runs."""

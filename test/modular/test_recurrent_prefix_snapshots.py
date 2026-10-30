@@ -334,15 +334,17 @@ def _kv_spec(key: str, nodes: set[str], **overrides) -> KVSpec:
     ))
 
 
-def _pool_specs(nodes: set[str], kv_cache: str = "kv", prefix_slots: int = 2) -> list[NodeResourceSpec]:
-    """A pool and the GDN resource over it."""
+def _pool_specs(
+    nodes: set[str], kv_cache: str = "kv", prefix_slots: int = 2, suffix: str = "",
+) -> list[NodeResourceSpec]:
+    """A pool and the GDN resource over it, keyed ``state`` and ``gdn`` with ``suffix``."""
     return [
-        RecurrentStateSpec(resource_key="state", nodes=nodes, config=RecurrentStateConfig(
+        RecurrentStateSpec(resource_key=f"state{suffix}", nodes=nodes, config=RecurrentStateConfig(
             num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
             max_slots=4, prefix_slots=prefix_slots, kv_cache=kv_cache,
         )),
-        LinearAttnSpec(resource_key="gdn", nodes=nodes, config=LinearAttnConfig(
-            recurrent_state="state", variant=LinearAttnVariant.GDN,
+        LinearAttnSpec(resource_key=f"gdn{suffix}", nodes=nodes, config=LinearAttnConfig(
+            recurrent_state=f"state{suffix}", variant=LinearAttnVariant.GDN,
         )),
     ]
 
@@ -376,6 +378,12 @@ _SHAPES = {
     # the pool's cache is on a node another engine holds, so nothing here keys its snapshots
     "cross_engine_pool": (
         [_kv_spec("kv", {"Y"}), _kv_spec("kv2", {"X"}), *_pool_specs({"X"})], {"kv2"}, {"X": 1}, set(),
+    ),
+    # B's pool keeps no snapshots, which shuts kv, so A's pool keeps none either, and kv2 beside it stays shut
+    "a_cache_shut_beside_a_pool_its_cache_closed": (
+        [_kv_spec("kv", {"A", "B"}), _kv_spec("kv2", {"A"}), *_pool_specs({"A"}),
+         *_pool_specs({"B"}, prefix_slots=0, suffix="_b")],
+        {"kv", "kv2"}, {"A": 1, "B": 1}, set(),
     ),
 }
 

@@ -36,10 +36,9 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
-from mstar.engine.resources.kv.config import PagedKVConfig, opening_prefix_caches
+from mstar.engine.resources.kv.config import opening_prefix_caches
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.recurrent.config import RecurrentStateSpec
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -951,14 +950,14 @@ class Engine:
         """Say why each keyed cache here that asks for a prefix cache stays shut."""
         for key in sorted(shut & self._resources.keys()):
             spec = specs_by_key[key]
-            config = spec.config
-            if not isinstance(config, PagedKVConfig) or not config.prefix_cache:
+            # the cache is on at all: it opens at one rank for a model that names its checkpoint
+            if not spec.prefix_cache_opens(1, checkpoint_named=True):
                 continue
             size = min((instance[node] for node in spec.nodes if node in instance), default=1)
             nodes = ", ".join(sorted(spec.nodes))
-            if not config.prefix_cache_opens(size, checkpoint_named=True):
+            if not spec.prefix_cache_opens(size, checkpoint_named=True):
                 logger.info("KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)", key, size)
-            elif not config.prefix_cache_opens(size, checkpoint_named):
+            elif not spec.prefix_cache_opens(size, checkpoint_named):
                 logger.info(
                     "KV %s: prefix cache off: %s names no checkpoint, so "
                     "builds that differ only in their weights cannot be "
@@ -966,14 +965,13 @@ class Engine:
                     key, self._prefix_model,
                 )
             else:
-                pools = sorted(
-                    other for other, pool in specs_by_key.items()
-                    if isinstance(pool, RecurrentStateSpec) and other not in opened
-                    and not pool.nodes.isdisjoint(spec.nodes)
+                restoring = sorted(
+                    other for other, over in specs_by_key.items()
+                    if over.restores_prefix and other not in opened and not over.nodes.isdisjoint(spec.nodes)
                 )
                 logger.info(
                     "KV %s: prefix cache off: %s on %s can't restore a cached prefix",
-                    key, ", ".join(pools) or "a recurrent state pool", nodes,
+                    key, ", ".join(restoring) or "a resource", nodes,
                 )
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:

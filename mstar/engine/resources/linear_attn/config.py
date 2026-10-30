@@ -70,6 +70,11 @@ class LinearAttnSpec(NodeResourceSpec):
         return self.config.variant is LinearAttnVariant.GDN
 
     @property
+    def restores_prefix(self) -> bool:
+        # its state is the pool's
+        return True
+
+    @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.linear_attn.base import LinearAttnManager
 

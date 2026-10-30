@@ -459,7 +459,10 @@ closes the pool with its cache. Every cache on the node of a pool without snapsh
 shut, and the engine logs which pool kept it shut. ``opening_prefix_caches`` in
 ``mstar/engine/resources/kv/config.py`` is that rule over the specs: the engine opens
 exactly the caches it returns, and the conductor's routing and the API server's prompt
-hashing read it too.
+hashing read it too. Each spec answers for itself: ``NodeResourceSpec.prefix_cache_opens``
+says whether the resource keeps a prefix cache of its own, and ``restores_prefix`` marks
+one whose state a hit must restore (the pool, and the resource over it), so another
+resource takes part through its spec alone.
 
 A model with a keyed label is checked at load time. Loading fails in two more cases:
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -30,7 +31,7 @@ import torch
 
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
-from mstar.engine.resources import Resource
+from mstar.engine.resources import NodeResourceSpec, Resource
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
@@ -376,12 +377,44 @@ class _Plain(Resource):
         raise NotImplementedError
 
 
-def _open(resources: dict) -> None:
+class _Recording(_Plain):
+    """Keeps state across requests of its own, and records the root it is handed."""
+
+    def __init__(self):
+        self.roots: list[bytes] = []
+
+    def enable_prefix_cache(self, root, walks=None):
+        self.roots.append(root)
+
+
+@dataclass
+class _KeepingSpec(NodeResourceSpec):
+    """Declares a prefix cache of its own, and is neither a KV cache nor a recurrent pool."""
+
+    def prefix_cache_opens(self, world_size, checkpoint_named):
+        return True
+
+    @property
+    def resource_class(self):
+        return _Recording
+
+
+def _open(resources: dict, specs: dict | None = None) -> None:
     engine = Engine.__new__(Engine)
     engine._resources = resources
     kv = resources[KV]
     engine._open_prefix_caches(
-        {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config)}, _Model(), {"LLM": 1},
+        {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config), **(specs or {})}, _Model(), {"LLM": 1},
+    )
+
+
+def test_a_resource_whose_spec_keeps_a_cache_is_offered_the_root():
+    other = _Recording()
+
+    _open({KV: _kv(), "other": other}, {"other": _KeepingSpec(resource_key="other", nodes={"LLM"})})
+
+    assert len(other.roots) == 1 and isinstance(other.roots[0], bytes), (
+        "a resource that keeps a cache, but is not a KV cache or a pool, was never asked to open it"
     )
 
 

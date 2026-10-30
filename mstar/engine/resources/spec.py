@@ -104,6 +104,20 @@ class NodeResourceSpec(ABC):
         """Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them."""
         return False
 
+    def prefix_cache_opens(self, world_size: int, checkpoint_named: bool) -> bool:
+        """Whether the resource keeps a prefix cache of its own on a lockstep
+        instance of ``world_size`` ranks, for a model that names its checkpoint
+        or not. False (the default) keeps nothing across requests.
+        `opening_prefix_caches` weighs it against the resources on its nodes."""
+        return False
+
+    @property
+    def restores_prefix(self) -> bool:
+        """A hit needs state the resource holds from the skipped tokens, so it
+        serves one only from a prefix cache of its own, or, keeping none, from
+        those of the resources it depends on that restore."""
+        return False
+
     @property
     @abstractmethod
     def resource_class(self) -> "type[Resource]":
