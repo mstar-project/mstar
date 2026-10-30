@@ -657,12 +657,16 @@ class KVManager(AttentionResource):
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
         # A read-only step (every segment span 0, e.g. a decoder attending an
         # encoder context it wrote at prefill) plans the same as the last one
-        # while its segments are the same and nothing touched their streams:
-        # (key, plan). The epoch moves with `_plan_epoch`, and when a stream of
-        # one of the cached step's real rows changes (`_readonly_rows`).
+        # on its slot with the same segments and bucket while nothing touched
+        # their streams: slot -> ((segments, bucket), epochs, plan). One entry
+        # per replay slot, as `_staged_outputs` keeps, so the slot count bounds
+        # the cache; replay slots pad with rows of their own, and an unpadded
+        # batch builds its plan once per slot. The epoch moves with
+        # `_plan_epoch`, and when a stream of a cached step's real row changes
+        # (`_readonly_rows`).
         self._readonly_epoch = 0
-        self._readonly_plan: tuple | None = None
-        self._readonly_rows: frozenset | None = None
+        self._readonly_plans: dict[int | None, tuple] = {}
+        self._readonly_rows: frozenset = frozenset()
         # (slot, label) -> the plan output whose state that slot's static
         # buffers hold, so a reused plan skips re-staging them
         self._staged_outputs: dict[tuple, KVPlanOutput] = {}
@@ -2310,56 +2314,62 @@ class KVManager(AttentionResource):
                 self._current_plan_states[label] = plan_state
 
 
-    def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
+    def _plan_output(self, views: list[SequenceView], ring: PinnedIndexRing | None) -> KVPlanOutput:
         return KVPlanOutput(
-            cpu_indptrs=build_paged_indptrs(
-                views, self.kv_cache.page_size, ring=self._indptr_ring,
-            ),
+            cpu_indptrs=build_paged_indptrs(views, self.kv_cache.page_size, ring=ring),
             views=views,
         )
 
     @staticmethod
     def _is_readonly(step: KVStep, ctx: StepContext) -> bool:
         # no sink rows: they change the views without changing the segments
-        # the reuse key holds; the read-only steps that repeat have none
+        # the reuse key holds; the read-only steps that repeat have none.
+        # Pre-planned steps too: a decoder that pre-plans gets most of its
+        # steps there.
         return (
-            not ctx.is_preplan and not ctx.capture and bool(step.segments)
+            not ctx.capture and bool(step.segments)
             and not step.pre_forks and not step.post_forks and not step.sink
             and all(seg.span == 0 for seg in step.segments)
         )
 
-    def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple:
+    def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple[tuple, tuple]:
+        """(segments, bucket), and the epochs a plan under that key holds for."""
         lease = ctx.slot_lease
         return (
-            tuple(step.segments), lease.bucket if lease is not None else None,
-            self._plan_epoch, self._readonly_epoch,
+            (tuple(step.segments), lease.bucket if lease is not None else None),
+            (self._plan_epoch, self._readonly_epoch),
         )
 
-    def _reuse_readonly_plan(self, step: KVStep, ctx: StepContext) -> "KVPlanOutputs | None":
-        """The last read-only step's plan, when this step is the same read-only
-        step over untouched streams. Its views and indptrs are reused as they
-        are, and a slot whose static buffers already hold it is not re-staged."""
-        cached = self._readonly_plan
-        if cached is None or not self._is_readonly(step, ctx) or cached[0] != self._readonly_key(step, ctx):
-            return None
-        res = cached[1]
+    def _reuse_readonly_plan(self, res: "KVPlanOutputs", step: KVStep, ctx: StepContext) -> "KVPlanOutputs":
+        """A cached read-only plan for this step, its views and indptrs as they
+        are; a slot whose static buffers already hold it is not re-staged."""
         lease = ctx.slot_lease
         if lease is not None and all(
             self._staged_outputs.get((lease.slot, label)) is out for label, out in res.items()
         ):
+            states = self._preplan_states if ctx.is_preplan else self._current_plan_states
             for label in res:
-                self._current_plan_states[label] = self._static_plan_state(lease.slot, label)
+                states[label] = self._static_plan_state(lease.slot, label)
         else:
             self._setup_plan_states(res, ctx, lease)
+        self._mark_preplanned(step, ctx, res)
         return res
+
+    def _drop_readonly_plans(self) -> None:
+        self._readonly_epoch += 1
+        # The epochs are what retire an entry: a plan thread mid-build stores
+        # the epochs it read before this bump, which never match again. The
+        # dict is rebound rather than cleared only so that thread keeps a
+        # consistent one to write into.
+        self._readonly_plans = {}
+        self._readonly_rows = frozenset()
 
     def _touch_plan_cache(self, rid: str | None = None) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
         commit: the plan caches no longer describe the streams if they hold
         that request. A padding row's reset after a replay holds nothing."""
-        rows = self._readonly_rows
-        if rows is not None and (rid is None or rid in rows):
-            self._readonly_epoch += 1
+        if rid is None or rid in self._readonly_rows:
+            self._drop_readonly_plans()
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
@@ -2686,9 +2696,20 @@ class KVManager(AttentionResource):
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
 
-        reused = self._reuse_readonly_plan(step, ctx)
-        if reused is not None:
-            return reused
+        readonly = self._is_readonly(step, ctx)
+        if readonly:
+            key, epochs = self._readonly_key(step, ctx)
+            slot = ctx.slot_lease.slot if ctx.slot_lease is not None else None
+            cached = self._readonly_plans.get(slot)
+            if cached is not None and cached[0] == key and cached[1] == epochs:
+                return self._reuse_readonly_plan(cached[2], step, ctx)
+            # The epochs and rows before the views: a touch from here on moves
+            # an epoch, so a plan built across it is never reused. A pre-plan
+            # builds on the plan thread while the main thread can tear
+            # requests down.
+            self._readonly_rows = self._readonly_rows | frozenset(
+                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
+            )
 
         # Forks run ahead of the views, which record length and generation;
         # staging only reads what the fork will land.
@@ -2699,8 +2720,10 @@ class KVManager(AttentionResource):
             self._maybe_apply_forks(step, ctx)
             self._copy_image_ends()
 
-        if self._indptr_ring is not None:
-            self._indptr_ring.begin_plan()
+        # a cached read-only plan outlives the ring's turn, so it takes none
+        ring = None if readonly else self._indptr_ring
+        if ring is not None:
+            ring.begin_plan()
         laps.lap("forks")
         res = None
         if self._plan_cache_mode and not pending:
@@ -2710,7 +2733,7 @@ class KVManager(AttentionResource):
             full = KVPlanOutputs(
                 {
                     plan_label: self._plan_output(
-                        self._sequence_views(segments, pending, ctx, step.sink)
+                        self._sequence_views(segments, pending, ctx, step.sink), ring,
                     )
                     for plan_label, segments in group_by_plan_label(
                         step.segments, step.combined_labels
@@ -2734,17 +2757,16 @@ class KVManager(AttentionResource):
             laps.lap("full")
         self._setup_plan_states(res, ctx, ctx.slot_lease, eager_write=step.eager_write)
         laps.lap("setup_states")
-        if self._is_readonly(step, ctx):
-            # the rows first: a touch from here on invalidates the entry
-            self._readonly_rows = frozenset(
-                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
-            )
-            self._readonly_plan = (self._readonly_key(step, ctx), res)
+        if readonly:
+            self._readonly_plans[slot] = (key, epochs, res)
+        self._mark_preplanned(step, ctx, res)
+        return res
+
+    def _mark_preplanned(self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs") -> None:
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
             self._cached_plan_output = res
-        return res
 
     @property
     def supports_preplan(self):
@@ -2883,8 +2905,8 @@ class KVManager(AttentionResource):
         if not step.commit:
             self._plan_epoch += 1
         rows = self._readonly_rows
-        if rows is not None and any(seg.span and seg.request_id in rows for seg in step.segments):
-            self._readonly_epoch += 1
+        if rows and any(seg.span and seg.request_id in rows for seg in step.segments):
+            self._drop_readonly_plans()
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread

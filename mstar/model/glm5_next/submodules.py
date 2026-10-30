@@ -93,6 +93,14 @@ def _real_row_values(last: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
     return values.index_select(0, torch.cummax(rows, 0).values)
 
 
+def _shard_best(local: torch.Tensor, first_id: int) -> torch.Tensor:
+    """Each row's best logit over one rank's vocab shard and its id, as an int32 pair: the
+    logit's fp32 bits, then the id (``first_id`` is the shard's first)."""
+    idx = local.argmax(-1, keepdim=True)
+    val = local.gather(-1, idx).float().view(torch.int32)
+    return torch.cat([val, (idx + first_id).to(torch.int32)], -1)
+
+
 class Glm5NextLLMSubmodule(ARNodeSubmodule):
     """Embed + 45 hybrid decoder layers + lm_head, one fat TP node, and with MTP the
     layer-45 draft module."""
@@ -598,18 +606,17 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def _argmax(self, hidden: torch.Tensor) -> torch.Tensor:
         """The LM head's argmax without gathering the logits: each rank's best over its
-        contiguous vocab shard, then the best of those. A tie goes to the lower rank, so the
-        lower id, as with a full argmax."""
+        contiguous vocab shard, then the best of those, from one gather of every rank's
+        (logit, id) pair. A tie goes to the lower rank, so the lower id, as with a full
+        argmax."""
         head = self.lm_head
         local = F.linear(hidden, head.weight)
-        idx = local.argmax(-1)
         if head.tp_size == 1:
-            return idx
-        val = local.gather(-1, idx[:, None]).float()
-        idx = idx[:, None] + head.tp_rank * head.output_size_per_partition
-        vals = head.comm_group.all_gather(val, dim=-1)
-        ids = head.comm_group.all_gather(idx, dim=-1)
-        return ids.gather(-1, vals.argmax(-1, keepdim=True)).squeeze(-1)
+            return local.argmax(-1)
+        best = _shard_best(local, head.tp_rank * head.output_size_per_partition)
+        pairs = head.comm_group.all_gather(best, dim=-1).view(best.shape[0], head.tp_size, 2)
+        win = pairs[..., 0].contiguous().view(torch.float32).argmax(-1, keepdim=True)
+        return pairs[..., 1].gather(-1, win).squeeze(-1).long()
 
     def _draft_tokens(self, hidden: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         """The draft for the token after ``prev``, from the MTP state ``hidden``."""
