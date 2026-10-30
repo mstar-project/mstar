@@ -146,3 +146,23 @@ def test_fp8_compiles_whole_with_symbolic_tokens(num_tokens):
     topk_weights, topk_ids = _route(x, seed=2)
     torch.testing.assert_close(compiled(x, topk_weights, topk_ids), moe(x, topk_weights, topk_ids),
                                rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [3, 40, 600])
+def test_int64_ids_align_as_int32_ids_do(num_tokens):
+    """The router's int64 ids reach the alignment without a cast kernel."""
+    from mstar.utils.fused_moe.align import moe_align_block_size
+
+    torch.manual_seed(6)
+    ids = torch.stack([torch.randperm(128, device=DEVICE)[:8] for _ in range(num_tokens)])
+    got = moe_align_block_size(ids, 16, 128)
+    want = moe_align_block_size(ids.to(torch.int32), 16, 128)
+    assert torch.equal(got[1], want[1]) and torch.equal(got[2], want[2])
+    # slot order within an expert is atomics-ordered: compare (expert, slot) pairs as sets
+    n = int(want[2])
+
+    def pairs(sorted_ids, expert_ids):
+        expert = expert_ids[torch.arange(n, device=DEVICE) // 16].to(torch.int64)
+        return sorted((expert * 10**6 + sorted_ids[:n].to(torch.int64)).tolist())
+
+    assert pairs(got[0], got[1]) == pairs(want[0], want[1])

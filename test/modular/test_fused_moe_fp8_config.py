@@ -235,7 +235,8 @@ def test_fused_experts_fp8_decode_tiles_per_launch(fp8_fakes):
     }
     # Both launches share the alignment built for BLOCK_SIZE_M=16.
     assert up["sorted_token_ids"] is down["sorted_token_ids"]
-    assert up["topk_ids"].dtype == torch.int32
+    # the router's int64 ids reach the alignment as they are, without a cast kernel
+    assert up["topk_ids"].dtype == torch.int64
     assert up["compute_type"] == down["compute_type"] == "tl:torch.bfloat16"
 
 

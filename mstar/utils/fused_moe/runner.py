@@ -41,6 +41,14 @@ def moe_block_m(num_tokens: int, w1: torch.Tensor, top_k: int) -> int:
     return get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k)[0]["BLOCK_SIZE_M"]
 
 
+def _align_ids(topk_ids: torch.Tensor) -> torch.Tensor:
+    """``topk_ids`` as ``moe_align_block_size`` reads them: int32 or int64 as they come (a
+    router's int64 ids need no cast kernel), any other integer type cast to int32."""
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        topk_ids = topk_ids.to(torch.int32)
+    return topk_ids.contiguous()
+
+
 def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
     if dtype == torch.bfloat16:
         return tl.bfloat16
@@ -116,8 +124,7 @@ def fused_experts(
     assert two_inter == 2 * inter, f"w1 dim[1] {two_inter} != 2 * w2 dim[2] {2 * inter}"
 
     top_k = topk_ids.shape[1]
-    # moe_align_block_size expects int32; torch.topk returns int64.
-    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_ids = _align_ids(topk_ids)
     topk_weights = topk_weights.contiguous()
 
     config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
@@ -321,7 +328,7 @@ def _fused_experts_fp8_impl(
     assert tuple(w2_scale_inv.shape) == expect2, f"w2_scale_inv {tuple(w2_scale_inv.shape)} != {expect2}"
 
     top_k = topk_ids.shape[1]
-    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_ids = _align_ids(topk_ids)
     topk_weights = topk_weights.contiguous()
 
     config = get_default_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
