@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.engine.resources.lora.config import LoraStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 
@@ -601,7 +602,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # would pay for nothing.
     reads_device_loopback: bool = False
 
-    # the LoRA pools among this node's resources; set by `bind_node_resources`
+    # A node serving LoRA from its modules (``module_lora_spec``) must say how its rows
+    # meet the pool: True when ``declare_step``'s segments are, in order, the rows its
+    # adapted linears see, each a request's span of tokens (a request may have several,
+    # as CFG's cond and uncond copies); ``engine_step`` then adds the pools'
+    # ``LoraStep``. A piecewise region that runs adapted modules must declare its rows in
+    # its own step too (a ``LoraStep`` per pool): nothing checks one that does not, whose
+    # deltas read whichever plan is current (an earlier capture's, the enclosing step's).
+    lora_segment_rows: bool = False
+    # the LoRA pools bound to this node's modules; set by `bind_node_resources`
     lora_keys: tuple[str, ...] = ()
 
     def __init__(self):
@@ -633,9 +642,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
                 bind(resources)
-        from mstar.engine.resources.lora.pool import LoraAdapterPool
+        from mstar.model.components.lora.modules import bind_module_lora
 
-        self.lora_keys = tuple(k for k, r in resources.items() if isinstance(r, LoraAdapterPool))
+        self.lora_keys = bind_module_lora(self, resources)
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1128,6 +1137,32 @@ class NodeSubmodule(torch.nn.Module, ABC):
         this on request removal; overrides with extra internal state should
         call super()."""
         self.request_states.pop(request_id, None)
+
+
+def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
+    """What the engine calls for a node's step: its ``declare_step``, plus the LoRA
+    pools' steps for a node whose segments lay out its rows (``lora_segment_rows``), so
+    a model declaring LoRA from its modules writes no LoRA step."""
+    step = submodule.declare_step(*args, **kwargs)
+    # the engine drives duck-typed submodules too; one with pools bound is a NodeSubmodule,
+    # whose binding required lora_segment_rows
+    keys = getattr(submodule, "lora_keys", ())
+    if step is None or not keys:
+        return step
+    if step.segments is None:
+        raise ValueError(
+            f"{type(submodule).__name__} has lora_segment_rows but its step declares "
+            "no SubmoduleStep.segments to lay its LoRA rows out from"
+        )
+    segments = tuple(step.segments)
+    for key in keys:
+        if key in step.steps:
+            raise ValueError(
+                f"{type(submodule).__name__} declares its own step under {key!r}, which "
+                "engine_step adds from its segments"
+            )
+        step.steps[key] = LoraStep(segments=segments)
+    return step
 
 
 class ARNodeSubmodule(NodeSubmodule):

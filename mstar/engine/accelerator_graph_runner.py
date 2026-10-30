@@ -29,7 +29,13 @@ from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.step import PIECEWISE_WALK
-from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    BatchedModelOutput,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+    engine_step,
+)
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.utils import profiler
@@ -814,7 +820,8 @@ class AcceleratorGraphRunner:
                     continue
                 checked_configs.add(spec.config_idx)
                 rids = self._dummy_rows.handles(f"{spec.config_idx}_slot0", spec.bs)
-                step = self._submodule.declare_step(
+                step = engine_step(
+                    self._submodule,
                     graph_walk=spec.bucket.graph_walk,
                     request_ids=rids,
                     inputs=spec.config.get_node_inputs(spec.bs, spec.num_tokens),
@@ -1118,7 +1125,8 @@ class AcceleratorGraphRunner:
         engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
 
         lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
-        step = self._submodule.declare_step(
+        step = engine_step(
+            self._submodule,
             graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
             slot_lease=lease, per_request_info=engine_inputs.per_request_info,
         )

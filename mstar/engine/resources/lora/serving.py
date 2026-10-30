@@ -32,6 +32,14 @@ def declared_lora_specs(model: Model, model_config: Mapping[str, Any]) -> list[L
             f"the serving config has a `resources: {LORA_RESOURCE_KEY}:` block, but "
             f"{type(model).__name__} serves no LoRA adapters"
         )
+    from mstar.model.components.lora.modules import ModuleLoraMap
+
+    hand = [s.resource_key for s in lora if not isinstance(s.module_map, ModuleLoraMap)]
+    if hand:
+        raise ValueError(
+            f"{type(model).__name__}'s LoRA specs {hand} were not declared with "
+            "`module_lora_spec`, so nothing would bind the nodes' modules to them"
+        )
     if lora[0].resource_key != LORA_RESOURCE_KEY:
         raise ValueError(
             f"{type(model).__name__}'s first LoRA spec declares {lora[0].resource_key!r}; "

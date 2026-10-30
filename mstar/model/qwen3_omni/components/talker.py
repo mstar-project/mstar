@@ -257,6 +257,8 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
     Uses QK-norm, standard 1D RoPE (no 3D MRoPE).
     """
 
+    lora_unservable = {"self_attn.qkv_proj": "run as F.linear over its weight in the unrolled depth loop"}
+
     def __init__(self, hidden_size: int, intermediate_size: int,
                  num_heads: int, num_kv_heads: int, head_dim: int,
                  rms_norm_eps: float, rope_theta: float):
@@ -362,6 +364,8 @@ class Qwen3OmniCodePredictor(nn.Module):
         every layer with per-token position IDs and a static KV cache tensor.
         This is what the unrolled CUDA graph captures.
     """
+
+    lora_unservable = {"lm_head": "stacked into lm_head_weight at load, which the unrolled depth loop indexes"}
 
     def __init__(self, config: Qwen3OmniModelConfig):
         super().__init__()

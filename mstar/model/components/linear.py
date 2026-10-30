@@ -18,8 +18,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.resources.lora.config import LoraTarget
+from mstar.model.components.lora.capable import LoraCapable, LoraOutputAdd
 
-class FusedColumnLinear(nn.Module):
+
+class FusedColumnLinear(nn.Module, LoraCapable):
     """Linear whose output is the concatenation of several shards along
     dim 0, fused into a single weight (and optional bias).
 
@@ -36,6 +39,9 @@ class FusedColumnLinear(nn.Module):
     ``shard_sizes``). Wire the per-shard checkpoint keys to it with the
     loader's stacked-param rules.
     """
+
+    # bound: the delta whole on every rank, like the fused linear
+    lora_twin = LoraOutputAdd
 
     def __init__(
         self,
@@ -99,3 +105,12 @@ class FusedColumnLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
+
+    def lora_target(self) -> LoraTarget:
+        # a slice per shard, named by the shard ids the stacked rules route by
+        return LoraTarget(
+            in_features=self.weight.shape[1],
+            out_slices=tuple(self._shard_sizes.values()),
+            parallel="none",
+            slice_names=tuple(self._shard_sizes),
+        )
