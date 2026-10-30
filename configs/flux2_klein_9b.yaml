@@ -29,7 +29,8 @@ model_kwargs:
   # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.34x images/s at
   # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst)
   # Under linear_dtype: fp8 these stay bf16: the linears with the most image error per ms of fp8 saving on MI325X,
-  # about 40% of the saving (ignored under bf16)
+  # about 40% of the saving (ignored under bf16). One-GPU MI325X A/B: median 26.5 dB from diffusers, over the ROCm
+  # floor, at ~1.18x bf16 images/s; lists giving back 20-30% fell under the floor (25.2 dB)
   fp8_keep_bf16:
     - double_blocks.*.attn.*
     - double_blocks.*.img_ff.*
