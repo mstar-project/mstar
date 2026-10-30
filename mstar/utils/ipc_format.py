@@ -118,7 +118,7 @@ class ClientStreamRoute(MessageBody):
     # client stream edge -> the consuming node's ranks for this request
     workers: dict[str, list[str]]
     # client stream edge -> that node, from the walks as the deployment shaped
-    # them, which only the conductor's copy of the model has
+    # them; the data worker's copy of the model is the unshaped one
     nodes: dict[str, str]
 
 
