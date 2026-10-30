@@ -145,11 +145,16 @@ class PythonGraphRuntime(GraphRuntime):
         tensor_manager: TensorCommunicationManager,
         communicator: BaseCommunicator | None = None,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
+        walk_driven_signals: frozenset[str] = frozenset(),
     ):
         self._my_worker_id = my_worker_id
         # (node, real walk) -> the combined walk the scheduler batches it under;
         # a ready-scan target or exclusion may name either
         self._combined_walk_of = dict(combined_walk_of or {})
+        # streamed signals whose consumer walk the producer decides
+        # (``Connection.consumer_walk``): they keep INPUT_SIGNALS, whose
+        # request info carries that walk; EDGE_ITEMS has no room for it
+        self._walk_driven_signals = walk_driven_signals
         self._communicator = communicator
         # Refcount changes go through the manager rather than the bare store,
         # so a tensor that drops to zero is torn down (shm file, arena slot,
@@ -1627,11 +1632,18 @@ class PythonGraphRuntime(GraphRuntime):
                     builder = streamed[worker_id] = EdgeItemsBuilder(partition)
                 rest = [
                     e for e in edges
-                    if not (edge_items_eligible(e) and builder.try_add(self.get_rid_string(rid), e))
+                    if not (
+                        edge_items_eligible(e) and e.name not in self._walk_driven_signals
+                        and builder.try_add(self.get_rid_string(rid), e)
+                    )
                 ]
                 if rest:
-                    # streamed edges only: the receiver doesn't read the info
-                    self._send_input_signals(rid, worker_id, rest, None, partition)
+                    # streamed edges only: the receiver reads the info only for
+                    # a walk-driven edge's consumer walk
+                    walk_driven = any(e.name in self._walk_driven_signals for e in rest)
+                    self._send_input_signals(
+                        rid, worker_id, rest, fwd_info if walk_driven else None, partition,
+                    )
 
             if info is not None:
                 for worker_id, edges in [

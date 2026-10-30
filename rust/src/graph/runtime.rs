@@ -182,6 +182,10 @@ pub struct GraphRuntime {
     /// (node, real walk) -> the combined walk the scheduler batches it under;
     /// a ready-scan target or exclusion may name either.
     combined_walk_of: FxHashMap<(Sym, Sym), Sym>,
+    /// Streamed signals whose consumer walk the producer decides
+    /// (`Connection.consumer_walk`): they keep INPUT_SIGNALS, whose request
+    /// info carries that walk; EDGE_ITEMS has no room for it.
+    walk_driven_signals: FxHashSet<String>,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -1643,11 +1647,18 @@ impl GraphRuntime {
             staged_specs: FxHashMap::default(),
             spec_counter: 0,
             combined_walk_of,
+            walk_driven_signals: FxHashSet::default(),
             sched: sched::SchedState::default(),
             postprocess: None,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
         })
+    }
+
+    /// The streamed signals that stay off EDGE_ITEMS (see
+    /// `walk_driven_signals`). Set once, at construction.
+    fn set_walk_driven_signals(&mut self, signals: Vec<String>) {
+        self.walk_driven_signals = signals.into_iter().collect();
     }
 
     /// The three sets are node NAMES. A name this worker does not host is
@@ -2989,9 +3000,10 @@ impl GraphRuntime {
 
             // Which rids will actually produce a frame carrying
             // `per_request_info`: an INPUT_SIGNALS to a peer with a
-            // non-streamed edge, or a WORKER_GRAPHS_DONE. EmitToClient does
-            // not carry it, and neither does a streamed edge: the receiver
-            // reads the info only alongside a non-streamed one
+            // non-streamed or walk-driven edge, or a WORKER_GRAPHS_DONE.
+            // EmitToClient does not carry it, and neither does any other
+            // streamed edge: the receiver reads the info only alongside a
+            // non-streamed one, or for a walk-driven one's consumer walk
             // (`Worker._process_new_inputs`).
             //
             // `is_local` is the whole point. A node in a SIBLING worker graph
@@ -3003,7 +3015,7 @@ impl GraphRuntime {
             // take_send_plan's own skip.
             let me_now = self.shard.me;
             for (e, &is_local) in edges.iter().zip(&ingested_locally) {
-                if e.streaming {
+                if e.streaming && !self.walk_driven_signals.contains(self.interner.name(e.name)) {
                     continue;
                 }
                 let dest = match e.dest {
@@ -3983,7 +3995,9 @@ impl GraphRuntime {
                         stream_items.push((
                             w.rid, w.signal.clone(), w.worker, infos.len() as i64,
                         ));
-                        if w.shard_dim.is_none() && w.total_fanin == 1 {
+                        if w.shard_dim.is_none() && w.total_fanin == 1
+                            && !self.walk_driven_signals.contains(&w.signal)
+                        {
                             let request_id = self.rids.name(w.rid).ok_or_else(|| {
                                 PyValueError::new_err(format!("unknown rid handle {}", w.rid))
                             })?;

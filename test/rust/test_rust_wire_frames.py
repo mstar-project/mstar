@@ -1129,10 +1129,12 @@ def test_a_streamed_row_unlike_the_frame_goes_as_input_signals(tmp_path):
     assert [i.uuid for i in frame.body.inputs[0].tensor_info] == [1, 2]
 
 
-@pytest.mark.parametrize("streaming", [True, False])
-def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, streaming):
+@pytest.mark.parametrize("edge", ["streamed", "walk_driven", "not_streamed"])
+def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, edge):
     """A loop pass that sends a peer only streamed items needs no forward-pass
-    info: the receiver reads it only alongside a non-streamed edge."""
+    info: the receiver reads it only alongside a non-streamed edge, or for a
+    walk-driven stream's consumer walk, which also keeps INPUT_SIGNALS."""
+    streaming = edge != "not_streamed"
     book = RustTensorBookkeeping()
     comm = ZmqCommunicator(ME, str(tmp_path))
     peer = ZmqCommunicator(PEER, str(tmp_path))
@@ -1158,6 +1160,8 @@ def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, stre
                   "tp_enabled_nodes": [], "sp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
+    if edge == "walk_driven":
+        rt.set_walk_driven_signals(["out"])
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
                          [ME, PEER], [1, 1], [], [])
     rt.ingest_inputs_batch(_one_signal(rid, "token", "ar_decode"))
@@ -1170,9 +1174,9 @@ def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, stre
         "node_name": "ar_decode", "output_signals": signals, "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1 if s == "out" else 0 for s in signals],
     })
-    assert (rid in out.rids_needing_request_info) is not streaming
+    assert (rid in out.rids_needing_request_info) is (edge != "streamed")
     _send(rt, out.completion_id)
     (frame,) = _collect(peer)
     assert frame.message_type == (
-        WorkerMessageType.EDGE_ITEMS if streaming else WorkerMessageType.INPUT_SIGNALS
+        WorkerMessageType.EDGE_ITEMS if edge == "streamed" else WorkerMessageType.INPUT_SIGNALS
     )
