@@ -80,7 +80,7 @@ class SpeculationContext:
     request_state: RequestStateManager
     scheduler: MicroScheduler
     streams: StreamBufferManager
-    # orders a mixed step's rows for its split kernels; None keeps them as given
+    # orders a mixed step's rows for its split kernels
     engine_manager: EngineManager | None = None
 
 
@@ -320,7 +320,7 @@ class SpeculationBuilder:
             } | fresh_final_edges,
             per_request_input_metadata=input_meta,
             request_walks=request_walks,
-            engine=ctx.engine_manager.get_engine(spec_node) if ctx.engine_manager else None,
+            engine=ctx.engine_manager.get_engine(spec_node) if request_walks else None,
         )
         return Speculation(
             scheduled_batch=spec_batch,
