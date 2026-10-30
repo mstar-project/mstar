@@ -34,6 +34,16 @@ model_kwargs:
   vae_compile: true
   # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.34x images/s at
   # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst)
+  # Under linear_dtype: fp8 these stay bf16: the linears with the most image error per ms of fp8 saving on MI325X,
+  # about 40% of the saving (ignored under bf16)
+  fp8_keep_bf16:
+    - double_blocks.*.attn.*
+    - double_blocks.*.img_ff.*
+    - single_blocks.0-13.out
+    - single_blocks.15-16.out
+    - single_blocks.18.out
+    - single_blocks.0.qkv_mlp
+    - single_blocks.3.qkv_mlp
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
 
