@@ -606,8 +606,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # meet the pool: True when ``declare_step``'s segments are, in order, the rows its
     # adapted linears see, each a request's span of tokens (a request may have several,
     # as CFG's cond and uncond copies); ``engine_step`` then adds the pools'
-    # ``LoraStep``. A piecewise region that runs adapted modules declares its rows in its
-    # own step too; its capture refuses a delta called without one.
+    # ``LoraStep``. A piecewise region that runs adapted modules must declare its rows in
+    # its own step too (a ``LoraStep`` per pool): nothing checks one that does not, whose
+    # deltas read whichever plan is current (an earlier capture's, the enclosing step's).
     lora_segment_rows: bool = False
     # the LoRA pools bound to this node's modules; set by `bind_node_resources`
     lora_keys: tuple[str, ...] = ()
