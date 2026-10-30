@@ -43,6 +43,9 @@ def test_matches_pydub(seed, reference):
     np.zeros((1, 7), np.float32),
     np.zeros((1, RATE), np.float32),
     np.full((1, 13), 0.5, np.float32),
+    # full scale both ways between silences: the int16 conversion clips
+    np.concatenate([np.zeros(RATE // 5), np.ones(RATE // 10), -np.ones(RATE // 10), np.zeros(RATE // 2)])
+    .astype(np.float32)[None],
 ])
 def test_edge_cases_match_pydub(audio, reference):
     want = reference.remove_silence(audio, RATE, mid_sil=500, lead_sil=100, trail_sil=100)

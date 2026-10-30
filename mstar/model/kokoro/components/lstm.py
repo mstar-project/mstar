@@ -21,7 +21,8 @@ class MaskedBiLSTM(nn.Module):
     """Single-layer bidirectional LSTM, ``[B, T, in] -> [B, T, 2 * hidden]``.
 
     ``fwd`` and ``bwd`` hold the checkpoint's ``*_l0`` and ``*_l0_reverse``
-    parameters respectively (see the weight loader).
+    parameters respectively (see the weight loader) until ``fuse`` replaces
+    them with ``fused``.
     """
 
     def __init__(self, input_size: int, hidden_size: int):
@@ -29,12 +30,11 @@ class MaskedBiLSTM(nn.Module):
         self.hidden_size = hidden_size
         self.fwd = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.bwd = nn.LSTM(input_size, hidden_size, batch_first=True)
-        # Set by ``fuse``; kept out of the state dict, which stays the checkpoint's.
-        self._fused: list[nn.LSTM] = []
+        self.fused: nn.LSTM | None = None
 
     @torch.no_grad()
     def fuse(self) -> None:
-        """Run both directions as one LSTM of twice the width.
+        """Replace the two directions with one LSTM of twice the width.
 
         Its weights are block-diagonal: each gate's first ``hidden`` rows read
         the forward input and state, the second the reversed input and the
@@ -43,6 +43,10 @@ class MaskedBiLSTM(nn.Module):
         latency-bound kernels per step, so this halves the number of those
         steps. The result matches the two LSTMs to float rounding, not bit for bit
         (the wider GEMMs may reduce in another order).
+
+        It runs once the checkpoint is in ``fwd`` and ``bwd``, and the fused
+        LSTM takes their place in the module tree: a later ``.to()`` moves the
+        weights that run, and the state dict holds them.
         """
         h, i = self.hidden_size, self.fwd.input_size
         ref = self.fwd.weight_ih_l0
@@ -60,12 +64,13 @@ class MaskedBiLSTM(nn.Module):
                     else:
                         dst[r : r + h, cols : cols + block.shape[1]] = block
         fused.flatten_parameters()
-        self._fused = [fused.eval().requires_grad_(False)]
+        self.fused = fused.eval().requires_grad_(False)
+        del self.fwd, self.bwd
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        if not self._fused:
+        if self.fused is None:
             raise ValueError("MaskedBiLSTM.fuse() must run once its weights are loaded")
-        out, _ = self._fused[0](torch.cat([x, reverse_padded(x, lengths)], dim=-1))
+        out, _ = self.fused(torch.cat([x, reverse_padded(x, lengths)], dim=-1))
         forward_out, backward_out = out.split(self.hidden_size, dim=-1)
         out = torch.cat([forward_out, reverse_padded(backward_out, lengths)], dim=-1)
         return mask_features(out, length_mask(lengths, x.shape[1]))

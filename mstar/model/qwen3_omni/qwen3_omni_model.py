@@ -36,6 +36,7 @@ import torch
 from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
+from mstar.api_server.media_io import MAX_AUDIO_SECONDS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -68,6 +69,8 @@ from mstar.model.base import (
     TensorAndMetadata,
 )
 from mstar.model.components import MoeParallelConfig
+from mstar.model.components.aut_encoder_submodule import aut_attention_spec, load_aut_encoder_submodule
+from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -81,7 +84,6 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
-from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
@@ -96,7 +98,7 @@ from mstar.model.qwen3_omni.config import (
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import Operation, TextChunkDetokenizer, WeightConverter, drop_stop_tokens
+from mstar.model.utils import Operation, TextOutput, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import (
     Connection,
@@ -181,7 +183,6 @@ class Qwen3OmniModel(Model):
 
     LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
 
-    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -265,6 +266,8 @@ class Qwen3OmniModel(Model):
         )
 
         return [
+            # the longest clip's mel frames, 100 a second
+            aut_attention_spec(self.config.audio_encoder, {"audio_encoder"}, MAX_AUDIO_SECONDS * 100),
             KVSpec(
                 resource_key=THINKER_KV,
                 nodes={"Thinker"},
@@ -353,11 +356,6 @@ class Qwen3OmniModel(Model):
     def checkpoint_path(self) -> str:
         return self.local_dir
 
-    def _audio_frames(self, seqlens: torch.Tensor) -> torch.Tensor:
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
-
-        return _get_feat_extract_output_lengths(seqlens, n_window=self.config.audio_encoder.n_window)
-
     def _get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
@@ -417,10 +415,9 @@ class Qwen3OmniModel(Model):
         prefill_audio = Sequential([
             GraphNode(
                 name="audio_encoder",
-                # audio_seqlens carries the original (pre-padding) length of
-                # each audio clip, used by the encoder to compute attention
-                # masks and output position IDs.
-                input_names=["audio_features", "audio_seqlens"],
+                # a clip's unpadded log-mel features: its frame count is the
+                # tensor's last dim
+                input_names=["audio_features"],
                 outputs=[GraphEdge(next_node="Thinker", name="audio_embeds")],
             ),
             GraphNode(
@@ -782,10 +779,7 @@ class Qwen3OmniModel(Model):
     # tensor first, then that encoder's auxiliary tensors. Video rides the
     # vision encoder, so its tensors arrive under the vision input names.
     _MM_WALKS: dict[str, tuple[str, dict[str, str]]] = {
-        "audio": ("prefill_audio", {
-            "audio_features": "audio_features",
-            "audio_seqlens": "audio_seqlens",
-        }),
+        "audio": ("prefill_audio", {"audio_features": "audio_features"}),
         "image": ("prefill_vision", {
             "pixel_values": "pixel_values",
             "image_grid_thw": "image_grid_thw",
@@ -843,7 +837,7 @@ class Qwen3OmniModel(Model):
 
         Each schedule entry maps an ``(walk_name, {input_name: tensor_info})``.
         We emit one GraphEdge per input so that auxiliary tensors like
-        ``audio_seqlens`` and ``image_grid_thw`` reach the encoder node
+        ``image_grid_thw`` reach the encoder node
         alongside the primary feature tensor.
         """
         schedule = metadata.kwargs["prefill_schedule"]
@@ -948,7 +942,7 @@ class Qwen3OmniModel(Model):
             # Still in prefill -- delegate to _get_thinker_prefill_inputs
             # which handles the (walk_name, {input_name: tensor_info}) schedule
             # entry format and emits one GraphEdge per input (so auxiliary
-            # tensors like image_grid_thw / audio_seqlens reach the encoder
+            # tensors like image_grid_thw reach the encoder
             # alongside the primary feature tensor).
             schedule = metadata.kwargs["prefill_schedule"]
             step = metadata.kwargs["prefill_step"]
@@ -1144,7 +1138,7 @@ class Qwen3OmniModel(Model):
            assistant response.
         3. Run the image_processor / feature_extractor on the raw modality
            tensors to produce ``pixel_values`` / ``image_grid_thw`` /
-           ``audio_features`` / ``audio_seqlens``.
+           ``audio_features``.
         4. Expand the single ``<|image_pad|>`` / ``<|audio_pad|>`` /
            ``<|video_pad|>`` placeholder in the tokenized text to N copies
            where N = number of patches after spatial merge (this is what
@@ -1239,7 +1233,6 @@ class Qwen3OmniModel(Model):
 
         result["pixel_values"] = []
         result["image_grid_thw"] = []
-        result["audio_seqlens"] = []
         result["audio_features"] = []
         result["video_second_per_grid"] = []
         result["video_grid_thw"] = []
@@ -1267,9 +1260,6 @@ class Qwen3OmniModel(Model):
                 aud_out["input_features"]
                 .permute(0, 2, 1)[aud_out["attention_mask"].bool()]
                 .permute(1, 0)
-            )
-            result["audio_seqlens"].append(
-                aud_out["attention_mask"].sum(-1).to(torch.long)
             )
             result["audio_features"].append(
                 aud_out["input_features"]
@@ -1315,7 +1305,8 @@ class Qwen3OmniModel(Model):
                 kept = int(talker_text_mask(ids, self.config).sum())
             elif step.modality == "audio":
                 # the encoder's rows between two sentinels
-                rows = int(self._audio_frames(tensors["audio_seqlens"][step.index])) + 2
+                frames = tensors["audio_features"][step.index].shape[-1]
+                rows = self.config.audio_encoder.tokens_for_frames(frames) + 2
                 span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
                 kept = rows
             elif step.modality == "image":
@@ -1373,6 +1364,9 @@ class Qwen3OmniModel(Model):
     # Model ABC: postprocess
     # -----------------------------------------------------------------------
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), (self.config.im_end_token_id,))
+
     def postprocess(
         self,
         output: torch.Tensor,
@@ -1380,10 +1374,7 @@ class Qwen3OmniModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            ids = drop_stop_tokens(output, (self.config.im_end_token_id,), request_kwargs)
-            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-            return self._text_detokenizer.to_bytes(ids)
+            return super().postprocess(output, modality, request_kwargs)
         elif modality == "audio":
             if output.numel() == 0:
                 return b""
@@ -1468,7 +1459,7 @@ class Qwen3OmniModel(Model):
         elif node_name == "Code2Wav":
             return self._create_code2wav_submodule(device)
         elif node_name == "audio_encoder":
-            return self._create_audio_encoder_submodule(device)
+            return self._create_audio_encoder_submodule(device, autocast_dtype)
         elif node_name == "vision_encoder":
             return self._create_vision_encoder_submodule(device)
         return None
@@ -1645,8 +1636,13 @@ class Qwen3OmniModel(Model):
         )
         talker_model.eval()
 
+        from mstar.model.qwen3_omni.submodules import TalkerSubmodule
         with torch.device("meta"):
-            code_predictor = Qwen3OmniCodePredictor(self.config)
+            # its inputs and codec embeddings are in the Talker's width, which
+            # Qwen3-Omni's code predictor shares (it has no input projection)
+            code_predictor = ResidualCodePredictor(
+                self.config.code_predictor, self.config.code_predictor.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
+            )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:
@@ -1660,7 +1656,6 @@ class Qwen3OmniModel(Model):
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
 
-        from mstar.model.qwen3_omni.submodules import TalkerSubmodule
         talker_sub = TalkerSubmodule(
             talker_model=talker_model,
             code_predictor=code_predictor,
@@ -1700,46 +1695,10 @@ class Qwen3OmniModel(Model):
             config=self.config,
         )
 
-    def _create_audio_encoder_submodule(self, device: str) -> NodeSubmodule:
-        """Load the audio encoder (AuT) from HF weights."""
-        # Reuse HF audio encoder directly (Whisper-style, not perf-critical)
-        from transformers import AutoConfig
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeAudioEncoder,
-        )
-
-        from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
-        from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
-
-        # Load config only (no weights)
-        config = AutoConfig.from_pretrained(
-            self.local_dir,
-            trust_remote_code=False,
-        )
-
-        # This should be a Qwen3OmniMoeConfig
-        audio_config = config.thinker_config.audio_config
-
-        # Build the audio encoder from config.
-        # IMPORTANT: pass attn_implementation="flash_attention_2" so the
-        # encoder uses the cu_seqlens FA2 path. With the HF default
-        # (which resolves to "sdpa"), Qwen3OmniMoeAudioAttention runs
-        # SDPA on the full packed sequence (no per-segment fusion),
-        # which is significantly slower than FA2's varlen path.
-        patch_hf_fa2_int_maxlen()
-        audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
-            audio_config, attn_implementation="flash_attention_2"
-        )
-
-        load_weights_from_hf_shards(
-            repo_dir=self.local_dir,
-            modules=[ModuleAndPrefix(audio_encoder, prefix="thinker.audio_tower")],
-            device=device,
-        )
-        audio_encoder.eval()
-
-        from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule
-        return AudioEncoderSubmodule(audio_encoder=audio_encoder, config=self.config)
+    def _create_audio_encoder_submodule(self, device: str, autocast_dtype: torch.dtype | None) -> NodeSubmodule:
+        """The audio encoder: the shared AuT node (Qwen3-ASR's encoder is this
+        checkpoint's, unchanged), fed the API server's log-mel features."""
+        return load_aut_encoder_submodule(self.local_dir, self.config.audio_encoder, device, autocast_dtype)
 
     def _create_vision_encoder_submodule(self, device: str) -> NodeSubmodule:
         """Load the vision encoder (SigLIP2 ViT) from HF weights."""

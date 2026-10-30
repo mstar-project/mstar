@@ -557,6 +557,11 @@ it. Then opt in:
    mstar serve qwen3_omni --rust-frontend
    # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
 
+Use it when benchmarking or tuning streaming throughput: its output path costs
+about 8 µs of API-server CPU per streamed token against 18 µs for the Python
+frontend (``benchmark/api_output_path``), so at high token rates the Python
+frontend, not the model, can be the limit.
+
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
 are listed in :doc:`environment_variables`.

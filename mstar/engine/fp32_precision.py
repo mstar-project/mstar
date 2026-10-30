@@ -57,6 +57,25 @@ def node_fp32_precision(node_name: str, submodule) -> Fp32Precision | None:
     return Fp32Precision(matmul, cudnn)
 
 
+@contextlib.contextmanager
+def cudnn_benchmark(enabled: bool):
+    """Within the block, let cuDNN time its conv algorithms per new shape
+    (once, then cached) instead of taking its heuristic pick; restores the
+    process-wide flag on exit. Not safe against convs on other threads, like
+    the scope below: the engine applies it around a node's capture warm-up
+    (``NodeSubmodule.capture_cudnn_benchmark``), and the VAE decoders around
+    their forward on the worker's one GPU thread."""
+    if not enabled:
+        yield
+        return
+    previous = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = previous
+
+
 def fp32_precision_scope(precision: Fp32Precision | None):
     """Apply ``precision`` for the duration of the block, then restore what
     was there before, also when the block raises."""

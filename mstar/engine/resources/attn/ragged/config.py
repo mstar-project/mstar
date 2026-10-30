@@ -66,9 +66,12 @@ class RaggedAttentionConfig:
     # Per-request ceiling sizing a CUDA-graph bucket: a capture at batch size
     # `bs` gets `bs` times this. A "segment" is an independently-attending
     # span, not a request — a request carrying several images contributes
-    # several. A `one_row_per_step` region replays a whole step as one row,
-    # so there this is the ceiling for every segment of the step.
+    # several.
     max_segments_per_request: int = 1
+    # For a resource whose captured region replays a whole step as one row
+    # (`one_row_per_step`): every segment of the step, every request's, that
+    # one replay's plan holds, in place of the per-request ceiling.
+    max_segments_per_step: int | None = None
     # Only for a runner that buckets by batch size alone; elsewhere the
     # bucket's own token count is the ceiling and this stays None.
     max_tokens_per_request: int | None = None
@@ -88,6 +91,16 @@ class RaggedAttentionConfig:
     # KV cache, so it is free to declare a separate dtype here; when None, the
     # engine's KV dtype (which is actually a misnamed autocast dtype) is used.
     dtype: torch.dtype | None = None
+
+    # False keeps every head on each sequence-parallel rank (TP still shards
+    # them), for an attention a rank runs whole over its own tokens: one over a
+    # replicated stream, or a cross-attention from the rank's query shard.
+    shard_over_sp: bool = True
+
+    # Each label's FlashInfer workspace, per slot; None takes
+    # MSTAR_WORKSPACE_BUFFER_MB. A ragged prefill only spends it on split-KV
+    # partials (tens of MB), so a resource with many labels can declare less.
+    workspace_mb: int | None = None
 
     def __post_init__(self):
         if self.sm_scale is None:
@@ -110,6 +123,8 @@ class RaggedAttentionConfig:
         self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
 
     def max_segments_for(self, bs: int) -> int:
+        if self.max_segments_per_step is not None:
+            return self.max_segments_per_step
         return bs * self.max_segments_per_request
 
     def max_tokens_for(self, bs: int) -> int | None:
@@ -129,20 +144,31 @@ class _RaggedSpecBase(NodeResourceSpec):
         backend: str | RaggedAttnBackend | None = None,
         flashinfer_backend: str | None = None,
         max_segments_per_request: int | None = None,
+        max_segments_per_step: int | None = None,
         max_tokens_per_request: int | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the model's —
         an image that cannot build FA3 pins FA2 here.
 
-        The two ceilings are here rather than on the model because they size
-        CUDA-graph buckets, which is a deployment's memory/coverage trade.
+        The ceilings are here rather than on the model because they size
+        CUDA-graph buckets, which is a deployment's memory/coverage trade. A
+        resource sized per step (``max_segments_per_step``) never reads the
+        per-request segment ceiling, so an override of that is refused.
         """
+        per_step = self.config.max_segments_per_step if max_segments_per_step is None else max_segments_per_step
+        if max_segments_per_request is not None and per_step is not None:
+            raise ValueError(
+                f"resource {self.resource_key!r} is sized per step: set max_segments_per_step, "
+                "not max_segments_per_request"
+            )
         if backend is not None:
             self.config.backend = RaggedAttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
         if max_segments_per_request is not None:
             self.config.max_segments_per_request = max_segments_per_request
+        if max_segments_per_step is not None:
+            self.config.max_segments_per_step = max_segments_per_step
         if max_tokens_per_request is not None:
             self.config.max_tokens_per_request = max_tokens_per_request
 

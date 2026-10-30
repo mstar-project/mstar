@@ -41,11 +41,12 @@ from mstar.utils.h2d import to_device_nonblocking
 logger = logging.getLogger(__name__)
 
 # The private surface this integration rides on, all of it read by
-# ``OmniVoiceBackbone``. Checked once at load: the module's names before
-# ``apply_flashinfer`` runs, and the model's members and the fused weights it
-# leaves on every layer's attention and MLP after.
+# ``OmniVoiceBackbone`` except the packed runner, which the loader deletes.
+# Checked once at load: the module's names before ``apply_flashinfer`` runs,
+# and the model's members and the fused weights it leaves on every layer's
+# attention and MLP after.
 _REQUIRED_FI_NAMES = ("apply_flashinfer",)
-_REQUIRED_MODEL_ATTRS = ("_prepare_embed_inputs", "audio_heads")
+_REQUIRED_MODEL_ATTRS = ("_prepare_embed_inputs", "audio_heads", "_fi_runner")
 _REQUIRED_FI_LAYER_ATTRS = {
     "self_attn": ("_fi_w_qkv", "_fi_qkv_split", "_fi_rope_theta"),
     "mlp": ("_fi_w_gate_up",),
@@ -82,9 +83,10 @@ def assert_flashinfer_api():
 
 
 def assert_flashinfer_patched(model: nn.Module) -> None:
-    """Fail at boot if the patched model no longer has what
+    """Fail at boot, not at capture, if the patched model no longer has what
     ``OmniVoiceBackbone`` reads (its embedding merge and audio head, and the
-    fused weights ``apply_flashinfer`` leaves), rather than at capture."""
+    fused weights ``apply_flashinfer`` leaves) or the packed runner the loader
+    deletes."""
     missing = sorted({name for name in _REQUIRED_MODEL_ATTRS if not hasattr(model, name)} | {
         f"{part}.{name}"
         for layer in model.llm.layers
@@ -95,7 +97,7 @@ def assert_flashinfer_patched(model: nn.Module) -> None:
     if missing:
         raise SystemExit(
             f"the patched OmniVoice model is missing {missing}; mstar's OmniVoice "
-            "layer loop reads them. Pin the omnivoice version, or port them into mstar."
+            "backbone relies on them. Pin the omnivoice version, or port them into mstar."
         )
 
 
@@ -261,10 +263,9 @@ class OmniVoiceBackbone(nn.Module):
     the engine's ragged attention resource.
     """
 
-    def __init__(self, model: nn.Module, plan_dtype: torch.dtype):
+    def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
-        self.plan_dtype = plan_dtype
 
     def encode(
         self,

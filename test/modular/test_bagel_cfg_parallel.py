@@ -7,6 +7,7 @@ import pytest
 import torch
 import yaml
 
+from mstar.communication import tensors
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
@@ -729,23 +730,22 @@ def test_kv_shm_directory_is_private_to_the_deployment(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("MSTAR_KV_SHM_DIR", str(tmp_path))
-    owner_pid = os.getpid()
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    stale = tmp_path / f"mstar_kv_{uid}_99999999_stale"
+    held: dict[str, int] = {}
+    monkeypatch.setattr(tensors, "_held_namespace_locks", held)
+    stale = tmp_path / f"mstar_{'d' * 12}_kv"
     stale.mkdir()
     (stale / "orphan.pt").touch()
+    (tmp_path / f"mstar_{'d' * 12}.lock").touch()
 
-    first = make_deployment_kv_shm_dir(
-        "/tmp/server-a", "tcp://host:1234", owner_pid=owner_pid,
-    )
-    second = make_deployment_kv_shm_dir(
-        "/tmp/server-b", "tcp://host:5678", owner_pid=owner_pid,
-    )
+    first = make_deployment_kv_shm_dir("a" * 12)
+    second = make_deployment_kv_shm_dir("b" * 12)
 
     assert first != second
     assert not stale.exists()
     assert Path(first).stat().st_mode & 0o777 == 0o700
     assert Path(second).stat().st_mode & 0o777 == 0o700
+    for fd in held.values():
+        os.close(fd)
 
 
 def test_local_only_cpu_cache_does_not_publish_shm_snapshots():

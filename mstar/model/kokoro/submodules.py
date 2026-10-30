@@ -120,9 +120,9 @@ class KokoroSynthSubmodule(NodeSubmodule):
     # fp32 end to end, as the reference: the phase-sensitive vocoder does not
     # tolerate reduced precision.
     disable_autocast = True
-    # cuDNN times the frame half's conv algorithms once per captured bucket;
-    # the eager fallback keeps its heuristic pick, so a new frame count does
-    # not search again
+    # cuDNN times the conv algorithms of both captured halves once per bucket,
+    # in their capture warm-up; eager steps keep its heuristic pick, so a new
+    # frame count does not search again
     capture_cudnn_benchmark = True
 
     def __init__(self, model: KokoroTTS, config: KokoroModelConfig):

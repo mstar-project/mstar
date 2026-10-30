@@ -138,7 +138,7 @@ class OmnilingualASRModel(Model):
                     dtype=self.dtype,
                     # one segment per request, and a captured step packs a
                     # whole batch into one row
-                    max_segments_per_request=self.max_batch_size,
+                    max_segments_per_step=self.max_batch_size,
                 ),
             ),
         ]

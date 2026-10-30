@@ -35,3 +35,6 @@ node_groups:
       - 2
     graph_walks:
       - image_gen
+      - image_gen_head
+      - image_gen_guided2
+      - image_gen_guided3

@@ -367,7 +367,7 @@ def _packed_logits(backbone, canvas):
     from omnivoice.models import omnivoice_flashinfer as fi
 
     model = backbone.model
-    model._fi_runner.plan(canvas.doc_lens, backbone.plan_dtype)
+    model._fi_runner.plan(canvas.doc_lens, next(model.llm.parameters()).dtype)
     fi._CTX["wrapper"] = model._fi_runner.wrapper
     fi._CTX["pos_ids"] = canvas.position_ids[0].to(torch.int32)
     fi._CTX["doc_slots"] = None
@@ -386,7 +386,7 @@ def test_encode_head_matches_the_packed_reference():
 
     model = OmniVoice.from_pretrained(MODEL_PATH, dtype=torch.float16).eval().cuda()
     apply_flashinfer(model, enable_cuda_graph=False)
-    backbone = OmniVoiceBackbone(model, torch.float16).eval()
+    backbone = OmniVoiceBackbone(model).eval()
 
     gen = torch.Generator().manual_seed(0)
     items = []
@@ -522,7 +522,7 @@ def test_packed_parity_single():
     specs = [("Xin chào, đây là một câu thử.", "Vietnamese", 60)]
 
     theirs = _run_reference(model, specs)[0]
-    ours = _run_ours(OmniVoiceBackbone(model, torch.float16).eval(), config, specs)[0]
+    ours = _run_ours(OmniVoiceBackbone(model).eval(), config, specs)[0]
 
     assert (ours != config.audio_mask_id).all(), "canvas left masked cells"
     assert torch.equal(ours, theirs), (
@@ -553,7 +553,7 @@ def test_packed_parity_batched():
     from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
 
     config = OmniVoiceConfig()
-    backbone = OmniVoiceBackbone(_load_patched(), torch.float16).eval()
+    backbone = OmniVoiceBackbone(_load_patched()).eval()
 
     a = ("Xin chào, đây là một câu thử.", "Vietnamese", 60)
     b = ("Hello world.", "English", 25)
@@ -630,7 +630,7 @@ def test_dense_agreement():
     del dense
     torch.cuda.empty_cache()
 
-    backbone = OmniVoiceBackbone(_load_patched(), torch.float16).eval()
+    backbone = OmniVoiceBackbone(_load_patched()).eval()
     ours = _run_ours(backbone, config, specs, num_step=1)[0]
 
     agreement = float((ours == theirs).float().mean())

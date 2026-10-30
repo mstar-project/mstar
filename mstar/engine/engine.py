@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from itertools import repeat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
@@ -22,7 +23,8 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
-from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
+from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
+from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
@@ -97,21 +99,6 @@ _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
 
 
-@contextmanager
-def _cudnn_benchmark(enabled: bool) -> Iterator[None]:
-    """``torch.backends.cudnn.benchmark`` on for the block when ``enabled``
-    (``NodeSubmodule.capture_cudnn_benchmark``), restored after."""
-    if not enabled:
-        yield
-        return
-    previous = torch.backends.cudnn.benchmark
-    torch.backends.cudnn.benchmark = True
-    try:
-        yield
-    finally:
-        torch.backends.cudnn.benchmark = previous
-
-
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -147,6 +134,8 @@ class SubmoduleManagement:
     forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
+    # cast and autocast dtype, None if the node opted out; resolved once at load
+    node_dtype: torch.dtype | None = None
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
@@ -226,6 +215,16 @@ class SubmoduleManagement:
             slot = self._next_slot
             self._next_slot = (self._next_slot + 1) % self._num_slots
             return slot
+
+    def runners_for(self, leases: Mapping[str, SlotLease]) -> dict[str, PiecewiseAcceleratorGraphRunner]:
+        """The regions a forward may replay on a step holding ``leases``: a
+        ``lease_before_step`` region only when the step leased it. Without the
+        lease the step's own declaration covers the region's resources, and a
+        replay would declare and plan them a second time."""
+        runners = self.piecewise_runners
+        if not runners:
+            return runners
+        return {label: r for label, r in runners.items() if label in leases or not r.lease_before_step}
 
     def set_piecewise_slot(self, slot: int) -> None:
         """Point the region runners at this batch's slot, on the GPU thread just
@@ -390,15 +389,14 @@ class ExecutingBatch:
     exec_timings: ExecTimings = field(default_factory=ExecTimings)
 
     def __post_init__(self):
-        self.per_request_info_wrapped = {
-            rid: ForwardPassInfoWrapper(
-                # Sparse: only rids with stream chunks or loop counters get an
-                # entry, so default like the .get() at prepare_inputs does.
-                info=info, metadata=self.per_request_input_metadata.get(
-                    rid, EMPTY_INPUT_METADATA,
-                ),
-            ) for rid, info in self.per_request_info.items()
-        }
+        # Sparse metadata: only rids with stream chunks or loop counters get
+        # an entry, so default like the .get() at prepare_inputs does. Built
+        # with C-level maps: this runs for every step, on every row.
+        rids = self.per_request_info.keys()
+        self.per_request_info_wrapped = dict(zip(rids, map(
+            ForwardPassInfoWrapper, self.per_request_info.values(),
+            map(self.per_request_input_metadata.get, rids, repeat(EMPTY_INPUT_METADATA)),
+        ), strict=True))
 
     @property
     def request_ids(self):
@@ -536,6 +534,8 @@ class Engine:
 
         node_names = set(submodules.keys())
         node_to_resources = {}
+        # resource -> every node declaring it, on this worker or another
+        declared_by: dict[str, frozenset[str]] = {}
         specs_by_key = resolve_spec_dependencies(specs)
 
         self._classify_tp_roles(node_names, parallel_groups)
@@ -575,6 +575,7 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
+            declared_by[spec.resource_key] = frozenset(spec.nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -585,6 +586,7 @@ class Engine:
             # absent node would fall back to the full sweep
             node_resources={n: node_to_resources.get(n, []) for n in node_names},
             enable_nvtx=self._enable_nvtx,
+            declared_by=declared_by,
         )
 
         self._open_prefix_caches(specs_by_key, model)
@@ -604,18 +606,16 @@ class Engine:
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
+                # the dtype the engine manager cast this node to
+                node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
-            stop = submodule.token_stop if isinstance(submodule, ARNodeSubmodule) else None
-            if stop is not None and stop.loopback_signal is not None:
-                if stop.walk is None:
-                    raise ValueError(
-                        f"{node_name}: TokenStop.loopback_signal needs the walk whose token loops back"
-                    )
+            loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
+            if loopback is not None:
                 # the sampler keeps its slot masters only for a node that
-                # reads them back on the device (see TokenStop)
-                resources[stop.sampler].enable_device_loopback_reader()
+                # reads them back on the device (see DeviceLoopback)
+                resources[loopback.sampler].enable_device_loopback_reader()
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -698,15 +698,15 @@ class Engine:
                 # an instance attribute shadows the method for every caller
                 setattr(owner, name, with_inductor_overrides(torch.compile(target, dynamic=True)))
                 with torch.no_grad(), fp32_precision_scope(submodule_mgmt.fp32_precision), autocast_scope(
-                    self._autocast_dtype_for(submodule), self._device.type,
+                    self._autocast_dtype_for(node_name), self._device.type, node_name,
                 ):
                     for args in examples:
                         getattr(owner, name)(*args)
                 logger.info("Engine: torch.compile applied to %s.%s", node_name, path)
 
-    def _autocast_dtype_for(self, submodule: NodeSubmodule) -> torch.dtype | None:
-        """This node's autocast dtype, or None for one that opted out."""
-        return None if submodule.disable_autocast else self._autocast_dtype
+    def _autocast_dtype_for(self, node_name: str) -> torch.dtype | None:
+        """This node's resolved dtype, or None for one that opted out."""
+        return self._submodules[node_name].node_dtype
 
     def warmup(self) -> None:
         # before capture: a region inside a captured graph compiles in its warm-up
@@ -721,7 +721,7 @@ class Engine:
                 resources=submodule_mgmt.resources,
                 step_runner=self._runner,
                 device=self._device,
-                autocast_dtype=self._autocast_dtype_for(submodule),
+                autocast_dtype=self._autocast_dtype_for(node_name),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
@@ -749,7 +749,7 @@ class Engine:
             # the kernels a capture (and the compile inside it) picks are what
             # every replay runs, so it happens under the node's precision
             with self._capture_into(plan, node_name) as planned, \
-                    fp32_precision_scope(submodule_mgmt.fp32_precision), _cudnn_benchmark(benchmark):
+                    fp32_precision_scope(submodule_mgmt.fp32_precision), cudnn_benchmark(benchmark):
                 runner.warmup_and_capture(planned)
             if plan is not None or runner.any_graphs:
                 submodule_mgmt.capture_runner = runner
@@ -759,7 +759,7 @@ class Engine:
             captured: dict[str, PiecewiseAcceleratorGraphRunner] = {}
             with self._capture_into(plan, f"{node_name} piecewise") as planned:
                 for label, pw_runner in piecewise[node_name].items():
-                    with fp32_precision_scope(submodule_mgmt.fp32_precision), _cudnn_benchmark(benchmark):
+                    with fp32_precision_scope(submodule_mgmt.fp32_precision), cudnn_benchmark(benchmark):
                         pw_runner.warmup_and_capture(
                             None if planned is None else {bucket for region, bucket in planned if region == label}
                         )
@@ -886,7 +886,7 @@ class Engine:
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
         """
-        node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
+        node_dtype = self._autocast_dtype_for(node_name)
         configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
@@ -1339,8 +1339,9 @@ class Engine:
         try:
             # inference-only, under the same scope the capture path used
             with torch.no_grad(), autocast_scope(
-                self._autocast_dtype_for(self._submodules[batch.node_name].submodule),
+                self._autocast_dtype_for(batch.node_name),
                 device_type=self._device.type,
+                node_name=batch.node_name,
             ):
                 laps = PhaseLaps("engine.exec.")
                 # a caller that pre-planned already reserved one; otherwise take it here
@@ -1729,8 +1730,7 @@ class Engine:
             request_ids=rids,
             per_request_info=req_info,
             resources=submodule_mgmt.resources,
-            piecewise_runners=submodule_mgmt.piecewise_runners,
-            piecewise_leases=ctx.piecewise_leases,
+            piecewise_runners=submodule_mgmt.runners_for(ctx.piecewise_leases),
             # padding rows get their own states, like their cache streams:
             # the submodule indexes this by step id, not by real rid
             per_request_states=LazyRequestStates(submodule, rids),
@@ -2830,6 +2830,19 @@ class Engine:
         except Exception:
             self.remove_request(request_id)
             raise
+
+    @property
+    def publisher_nodes(self) -> Mapping[str, frozenset[str]]:
+        """Each publishing resource's declaring nodes, across the deployment."""
+        return self._runner.publisher_nodes
+
+    def skip_publish(self, request_id, keys) -> None:
+        """Never publish ``keys`` for this request (see ``StepRunner.skip_publish``)."""
+        self._runner.skip_publish(request_id, keys)
+
+    def never_publish(self, keys) -> None:
+        """Never publish ``keys`` for any request (see ``StepRunner.never_publish``)."""
+        self._runner.never_publish(keys)
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down on every resource. Returns the resources it

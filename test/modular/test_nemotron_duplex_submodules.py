@@ -307,7 +307,7 @@ def _captured_on_cpu(config, label, resources=None, step_runner=None, bs=(1, 2, 
     # memory readings are the accelerator's, which a CPU device has none of
     no_memory_stats = dict(memory_allocated=lambda device=None: 0, max_memory_allocated=lambda device=None: 0,
                            reset_peak_memory_stats=lambda device=None: None, empty_cache=lambda: None)
-    with mock.patch.object(cgr, "capture_into_graph", lambda fn, *a: (_Replay(fn), fn())), \
+    with mock.patch.object(cgr, "capture_into_graph", lambda fn, *a, **_: (_Replay(fn), fn())), \
             mock.patch.multiple(torch.accelerator, **no_memory_stats):
         runner.prepare_for_capture()
         runner.warmup_and_capture(None)
@@ -419,6 +419,7 @@ class _Encoder:
         self.resources = {ENCODER_STATE: self.pool, ENCODER_FRONT: self.front, ENCODER_KV: self.kv}
         self.runner = StepRunner(self.resources)
         self.regions = {}       # the piecewise runners, captured on CPU, by label, when a test sets them
+        self.leases = {}        # the regions the last declaration's step leased
 
     def prepare(self, handle, chunk, final=False):
         inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
@@ -433,6 +434,7 @@ class _Encoder:
         engine._submodules = {"conformer_encoder": SimpleNamespace(piecewise_runners=self.regions)}
         ctx = StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False)
         engine._maybe_lease_piecewise_regions("conformer_encoder", ctx, inputs)
+        self.leases = ctx.piecewise_leases
         return self.node.declare_step("encode", rids, inputs, piecewise_leases=ctx.piecewise_leases)
 
     def step(self, rids, inputs) -> BatchedModelOutput:
@@ -454,9 +456,13 @@ class _Encoder:
             step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))
             assert self.runner.admit(step).ok
             self.runner.plan(step)
+        from mstar.engine.engine import SubmoduleManagement
+
+        # the regions the engine hands this step's forward
+        runners = SubmoduleManagement.runners_for(SimpleNamespace(piecewise_runners=self.regions), self.leases)
         engine_inputs = ModelInputsFromEngine(
             request_ids=list(rids), per_request_info={}, resources=dict(self.resources),
-            piecewise_runners=dict(self.regions), step=step,
+            piecewise_runners=runners, step=step,
         )
         with torch.no_grad():
             out = self.node.forward_batched("encode", engine_inputs,

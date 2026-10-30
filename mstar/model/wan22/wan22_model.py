@@ -767,8 +767,6 @@ class Wan22Model(Model):
             self._refresh_checkpoint_defaults()
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
-                # serving numerics, like the compile: the reference gates build with compile_dit off
-                fuse_ffn_gelu=self.config.compile_dit,
             )
             return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)

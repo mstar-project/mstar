@@ -223,7 +223,7 @@ class T3Submodule(ARNodeSubmodule):
         self.supports_cfg = not config.is_turbo
         self.token_stop = TokenStop(
             loop=DECODE_LOOP, buffer=SPEECH_TOKENS, stop_ids=frozenset({config.t3.stop_speech_token}),
-            sampler=T3_SAMPLER,
+            sampler=T3_SAMPLER, prefill_walks=frozenset(PREFILL_WALKS),
         )
 
     # -- request knobs -------------------------------------------------------

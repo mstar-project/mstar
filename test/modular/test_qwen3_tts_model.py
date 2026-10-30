@@ -21,10 +21,8 @@ from mstar.engine.resources.attn.wrappers import (
 )
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.sampler.config import SamplerSpec
-from mstar.model.qwen3_tts.components.talker import (
-    Qwen3TTSCodePredictor,
-    Qwen3TTSTalkerModel,
-)
+from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     CODE_PRED_SAMPLER,
     LANGUAGE_ID_KEY,
@@ -796,10 +794,14 @@ def _tiny_model_config() -> Qwen3TTSModelConfig:
     )
 
 
+def _code_predictor(config: Qwen3TTSModelConfig) -> ResidualCodePredictor:
+    return ResidualCodePredictor(config.code_predictor, config.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE)
+
+
 def test_qwen3_tts_talker_builds_official_streaming_prefill():
     config = _tiny_model_config()
     talker = Qwen3TTSTalkerModel(config)
-    predictor = Qwen3TTSCodePredictor(config)
+    predictor = _code_predictor(config)
     submodule = TalkerSubmodule(talker, predictor, config)
     submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
     submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
@@ -824,7 +826,7 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
 def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
-        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+        Qwen3TTSTalkerModel(config), _code_predictor(config), config
     )
     submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
     submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
@@ -856,7 +858,7 @@ def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
 def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
-        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+        Qwen3TTSTalkerModel(config), _code_predictor(config), config
     )
     submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
     submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
@@ -888,7 +890,7 @@ def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
 def test_qwen3_tts_talker_builds_in_context_clone_prefill():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
-        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+        Qwen3TTSTalkerModel(config), _code_predictor(config), config
     )
     submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
     submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
@@ -945,7 +947,7 @@ def test_qwen3_tts_talker_builds_in_context_clone_prefill():
 def test_qwen3_tts_clone_prefill_streams_reference_frames_first():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
-        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+        Qwen3TTSTalkerModel(config), _code_predictor(config), config
     )
     # Three reference frames, left context 2: the stream carries the last two
     # (all a window can use as context) ahead of the first generated frame.
@@ -968,7 +970,7 @@ def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
         Qwen3TTSTalkerModel(config),
-        Qwen3TTSCodePredictor(config),
+        _code_predictor(config),
         config,
     )
     submodule.request_state("request").add("generated_frames", 0)
@@ -996,7 +998,7 @@ def test_qwen3_tts_talker_withholds_eos_frames_from_the_codec_stream(ignore_eos)
     including under ``ignore_eos`` where the loop runs on past it. The stop
     check decides both off one read."""
     config = _tiny_model_config()
-    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     request_info = SimpleNamespace(
         graph_walk="talker_decode",
         max_tokens=8192,
@@ -1017,7 +1019,7 @@ def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
         Qwen3TTSTalkerModel(config),
-        Qwen3TTSCodePredictor(config),
+        _code_predictor(config),
         config,
     )
     submodule.request_state("request").add("generated_frames", 0)
@@ -1042,7 +1044,7 @@ def test_qwen3_tts_batched_stop_check_agrees_with_the_per_request_one():
     ``ignore_eos``; a row at its frame limit is the loop cap's to end), rows
     matched by request id."""
     config = _tiny_model_config()
-    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     eos = config.talker.codec_eos_token_id
 
     def info(ignore_eos: bool, limit: int) -> SimpleNamespace:
@@ -1079,34 +1081,11 @@ def test_qwen3_tts_batched_stop_check_agrees_with_the_per_request_one():
     assert submodule.check_stop_batched(list(cases), infos, host_rows) == BatchedStopCheck(stops, withheld)
 
 
-def test_qwen3_tts_depth_loop_replays_only_on_a_step_that_leased_it():
-    """``declare_step`` leaves the depth loop's sampler to the region only when
-    the step leased it, so the forward replays the region exactly then: a
-    runner that could take the batch is not enough."""
-    from mstar.model.qwen3_tts.submodules import DEPTH_LOOP_REGION
-
-    runs = []
-    runner = SimpleNamespace(
-        can_run=lambda **kwargs: True,
-        run=lambda **kwargs: runs.append(kwargs) or {"all_codes": "codes", "codec_embed_sum": "sum"},
-    )
-    hidden, codes = torch.zeros(2, 4), torch.zeros(2, dtype=torch.long)
-
-    def step(leases):
-        engine_inputs = SimpleNamespace(
-            piecewise_runners={DEPTH_LOOP_REGION: runner}, piecewise_leases=leases, request_ids=["a", "b"],
-        )
-        return TalkerSubmodule._run_depth_loop_piecewise(None, engine_inputs, hidden, codes)
-
-    assert step({}) is None and runs == []
-    assert step({DEPTH_LOOP_REGION: object()}) == ("codes", "sum") and len(runs) == 1
-
-
-def test_qwen3_tts_talker_returns_row_outputs_except_for_the_clone_prefill():
-    """A decode or plain prefill step is one frame per row, handed back as
-    batch tensors; the codec reads a ``[1, groups]`` row view as one frame."""
+def test_qwen3_tts_talker_returns_row_outputs():
+    """A decode, prefill or clone prefill step is one frame per row, handed back
+    as batch tensors; the codec reads a ``[1, groups]`` row view as one frame."""
     config = _tiny_model_config()
-    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     groups = config.talker.num_code_groups
     frame = {
         "talker_input_embeds": torch.zeros(2, 16),
@@ -1146,7 +1125,7 @@ def test_qwen3_tts_suppresses_eos_for_official_minimum_frames():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
         Qwen3TTSTalkerModel(config),
-        Qwen3TTSCodePredictor(config),
+        _code_predictor(config),
         config,
     )
     inputs = [
@@ -1168,7 +1147,7 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
         Qwen3TTSTalkerModel(config),
-        Qwen3TTSCodePredictor(config),
+        _code_predictor(config),
         config,
     )
     real_state = submodule.request_state("real")
@@ -1206,7 +1185,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
         Qwen3TTSTalkerModel(config),
-        Qwen3TTSCodePredictor(config),
+        _code_predictor(config),
         config,
     )
     info = {
@@ -1300,7 +1279,7 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
     """
     torch.manual_seed(0)
     config = _tiny_model_config()
-    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
     submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
     hidden = config.talker.hidden_size
@@ -1404,7 +1383,7 @@ def _fake_cp_kernels(monkeypatch, calls=None):
     positions so far."""
     import mstar.model.components.code_predictor_kernels as kernels
 
-    def prologue(qkv, wq, wk, pos, kv_layer, cache_pos, seq_len, eps_q, eps_k, theta, hq, hkv, d):
+    def prologue(qkv, wq, wk, kv_layer, cache_pos, seq_len, eps_q, eps_k, theta, hq, hkv, d):
         k, v = qkv[:, hq * d:].view(-1, seq_len, 2, hkv, d).unbind(2)
         kv_layer[:, 0, cache_pos:cache_pos + seq_len] = k
         kv_layer[:, 1, cache_pos:cache_pos + seq_len] = v
@@ -1422,20 +1401,16 @@ def _fake_cp_kernels(monkeypatch, calls=None):
 
 
 def _cpu_predictor(monkeypatch, config=None, bs=2, calls=None):
-    """A code predictor with identity norms over the fake kernels, a zeroed
-    depth KV cache for ``bs`` rows, and one depth step's input."""
+    """A code predictor with identity norms over the fake kernels, and one
+    depth step's input for ``bs`` rows."""
     config = config or _tiny_model_config()
-    predictor = Qwen3TTSCodePredictor(config)
+    predictor = _code_predictor(config)
     for layer in predictor.model.layers:
         layer.input_layernorm = _IdentityNorm()
         layer.post_attention_layernorm = _IdentityNorm()
     predictor.model.norm = _IdentityNorm()
     _fake_cp_kernels(monkeypatch, calls)
-    cp = config.talker.code_predictor
-    kv_cache = torch.zeros(
-        cp.num_hidden_layers, bs, 2, config.talker.num_code_groups, cp.num_key_value_heads, cp.head_dim,
-    )
-    return predictor, kv_cache, torch.randn(bs, 1, config.talker.hidden_size)
+    return predictor, torch.randn(bs, 1, config.talker.hidden_size)
 
 
 def test_qwen3_tts_code_predictor_projects_wider_talker_inputs(monkeypatch):
@@ -1443,12 +1418,12 @@ def test_qwen3_tts_code_predictor_projects_wider_talker_inputs(monkeypatch):
     every depth input; 0.6B (equal widths) -> identity, no extra parameters."""
     narrow = _tiny_model_config()
     assert isinstance(
-        Qwen3TTSCodePredictor(narrow).small_to_mtp_projection, torch.nn.Identity
+        _code_predictor(narrow).small_to_mtp_projection, torch.nn.Identity
     )
 
     wide = _tiny_model_config()
     wide.talker.hidden_size = 32
-    predictor, kv_cache, x = _cpu_predictor(monkeypatch, wide)
+    predictor, x = _cpu_predictor(monkeypatch, wide)
     projection = predictor.small_to_mtp_projection
     assert isinstance(projection, torch.nn.Linear)
     assert projection.weight.shape == (16, 32)
@@ -1460,7 +1435,7 @@ def test_qwen3_tts_code_predictor_projects_wider_talker_inputs(monkeypatch):
         dict(predictor.named_parameters())
     )
 
-    predictor.depth.bind_step(kv_cache, torch.zeros(2, 1, dtype=torch.long), cache_pos=0)
+    predictor.depth.bind_step(0)
     out = predictor.forward_depth_unrolled(x)
     assert out.shape == (2, 1, 16)
 
@@ -1469,10 +1444,10 @@ def test_qwen3_tts_code_predictor_leaves_its_input_alone(monkeypatch):
     """The fused add + norm updates the residual stream in place, and on 0.6B
     the predictor's input projection is the identity: the stream must not be
     the caller's tensor, which the Talker's captured step reads again."""
-    predictor, kv_cache, inputs = _cpu_predictor(monkeypatch)
+    predictor, inputs = _cpu_predictor(monkeypatch)
     assert isinstance(predictor.small_to_mtp_projection, torch.nn.Identity)
     before = inputs.clone()
-    predictor.depth.bind_step(kv_cache, torch.zeros(2, 1, dtype=torch.long), cache_pos=0)
+    predictor.depth.bind_step(0)
     predictor.forward_depth_unrolled(inputs)
     assert torch.equal(inputs, before)
 
@@ -1481,8 +1456,8 @@ def test_qwen3_tts_code_predictor_uses_the_shared_kernels(monkeypatch):
     # FlashInfer RMSNorm and the Triton kernels are CUDA-only, so replace them
     # without changing attention geometry.
     config, calls = _tiny_model_config(), []
-    predictor, kv_cache, x = _cpu_predictor(monkeypatch, config, bs=1, calls=calls)
-    predictor.depth.bind_step(kv_cache, torch.zeros(1, 1, dtype=torch.long), cache_pos=0)
+    predictor, x = _cpu_predictor(monkeypatch, config, bs=1, calls=calls)
+    predictor.depth.bind_step(0)
     output = predictor.forward_depth_unrolled(x)
 
     query_shape, key_shape, value_shape, cache_len = calls[0]
@@ -1498,8 +1473,8 @@ def test_qwen3_tts_code_predictor_uses_the_shared_kernels(monkeypatch):
 def test_code_predictor_depth_step_is_bound_once_per_pass(monkeypatch):
     """A pass whose step was not bound must fail, not write and attend over
     the previous step's depth positions."""
-    predictor, kv_cache, x = _cpu_predictor(monkeypatch)
-    predictor.depth.bind_step(kv_cache, torch.zeros(2, 1, dtype=torch.long), cache_pos=0)
+    predictor, x = _cpu_predictor(monkeypatch)
+    predictor.depth.bind_step(0)
     predictor.forward_depth_unrolled(x)
     with pytest.raises(ValueError, match="bind_step"):
         predictor.forward_depth_unrolled(x)
@@ -1508,10 +1483,10 @@ def test_code_predictor_depth_step_is_bound_once_per_pass(monkeypatch):
 def test_code_predictor_attention_keeps_its_depth_kv_when_the_node_binds(monkeypatch):
     """The engine binds the node's resources into every module; the code
     predictor's attention attends through its own ``DepthKV`` regardless."""
-    predictor, kv_cache, x = _cpu_predictor(monkeypatch)
+    predictor, x = _cpu_predictor(monkeypatch)
     NodeSubmodule.bind_node_resources(predictor, {"attn": object(), "kv": object(), "rope": object()})
     assert all(layer.self_attn.attend is predictor.depth for layer in predictor.model.layers)
-    predictor.depth.bind_step(kv_cache, torch.zeros(2, 1, dtype=torch.long), cache_pos=0)
+    predictor.depth.bind_step(0)
     predictor.forward_depth_unrolled(x)
 
 
@@ -1527,75 +1502,54 @@ class _OpaqueKernel:
         return _opaque_launch
 
 
-def _depth_loop(model, monkeypatch):
-    """The code predictor, and ``n -> (fn, args)``: the talker's captured depth
-    loop over ``n`` steps."""
+@torch.compiler.disable
+def _fake_embed_accumulate(tokens, weight, emb_sum, codes, group):
+    """``cp_embed_accumulate`` on CPU."""
+    codes[:, group] = tokens
+    emb = weight[tokens]
+    emb_sum.add_(emb)
+    return emb
+
+
+def _depth_loop(monkeypatch, groups=4):
+    """A code predictor of ``groups`` codec groups over the kernels' opaque
+    launches, and ``(fn, args)``: its depth loop over one frame."""
     import mstar.model.components.code_predictor_kernels as kernels
 
     monkeypatch.setattr(kernels, "_cp_qk_norm_rope_kv_kernel", _OpaqueKernel())
     monkeypatch.setattr(kernels, "_cp_attn_kernel", _OpaqueKernel())
-    if model == "qwen3_tts":
-        config = _tiny_model_config()
-        predictor = Qwen3TTSCodePredictor(config)
-        cp, hidden = config.talker.code_predictor, config.talker.hidden_size
-    else:
-        from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
-        from mstar.model.qwen3_omni.config import CodePredictorConfig, Qwen3OmniModelConfig
-
-        cp = CodePredictorConfig(
-            vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
-            num_attention_heads=1, num_key_value_heads=1, head_dim=16, num_code_groups=4,
-        )
-        predictor = Qwen3OmniCodePredictor(Qwen3OmniModelConfig(code_predictor=cp))
-        hidden = cp.hidden_size
+    monkeypatch.setattr(kernels, "cp_embed_accumulate", _fake_embed_accumulate)
+    config = _tiny_model_config()
+    config.talker.code_predictor.num_code_groups = groups
+    predictor = _code_predictor(config)
     for layer in predictor.model.layers:
         layer.input_layernorm = _IdentityNorm()
         layer.post_attention_layernorm = _IdentityNorm()
     predictor.model.norm = _IdentityNorm()
-    bs, max_depth = 2, 5
-    kv_cache = torch.zeros(cp.num_hidden_layers, bs, 2, max_depth, cp.num_key_value_heads, cp.head_dim)
-    pos = torch.arange(max_depth, dtype=torch.int32)[:, None, None].expand(max_depth, bs, 1).contiguous()
-    pair_pos = torch.arange(2, dtype=torch.int32).expand(bs, 2).contiguous()
+    bs, hidden = 2, config.talker.hidden_size
 
-    def walk(n):
-        def depth_loop(x, pos, pair_pos, kv_cache):
-            if model == "qwen3_tts":
-                for cache_pos in range(n):
-                    predictor.depth.bind_step(kv_cache, pos[cache_pos], cache_pos=cache_pos)
-                    predictor.forward_depth_unrolled(x)
-            else:
-                # Qwen3-Omni opens with a two-token pass at cache_pos 0
-                predictor.depth.bind_step(kv_cache, pair_pos, cache_pos=0)
-                predictor.forward_depth_unrolled(torch.cat([x, x], dim=1))
-                for cache_pos in range(2, n + 1):
-                    predictor.depth.bind_step(kv_cache, pos[cache_pos], cache_pos=cache_pos)
-                    predictor.forward_depth_unrolled(x)
+    def depth_loop(last_hidden, layer0_codes, layer0_embed):
+        return predictor.depth_loop(last_hidden, layer0_codes, layer0_embed, lambda logits: logits.argmax(-1))
 
-        return depth_loop, (torch.randn(bs, 1, hidden), pos, pair_pos, kv_cache)
-
-    return predictor, walk
+    return predictor, depth_loop, (torch.randn(bs, hidden), torch.zeros(bs, dtype=torch.long), torch.randn(bs, hidden))
 
 
-@pytest.mark.parametrize("model", ["qwen3_tts", "qwen3_omni"])
-def test_code_predictor_depth_loop_compiles_no_frame_per_position(model, monkeypatch, dynamo_counts):
+def test_code_predictor_depth_loop_compiles_no_frame_per_position(monkeypatch, dynamo_counts):
     """The engine compiles a captured forward with static ints, so a compiled
     frame that holds a depth step's ``cache_pos`` recompiles at every depth
-    position (and batch bucket) until the recompile limit: four steps must
-    compile no more frames than two."""
-    _, walk = _depth_loop(model, monkeypatch)
-    fn4, args4 = walk(4)
-    fn2, args2 = walk(2)
+    position (and batch bucket) until the recompile limit: a frame of four
+    passes over the layers must compile no more frames than one of two."""
+    _, fn4, args4 = _depth_loop(monkeypatch, groups=5)
+    _, fn2, args2 = _depth_loop(monkeypatch, groups=3)
     assert dynamo_counts(fn4, *args4).compiles == dynamo_counts(fn2, *args2).compiles
 
 
-@pytest.mark.parametrize("model", ["qwen3_tts", "qwen3_omni"])
-def test_code_predictor_attention_projections_compile(model, monkeypatch, dynamo_counts):
+def test_code_predictor_attention_projections_compile(monkeypatch, dynamo_counts):
     """``DepthKV`` runs eager (it holds the depth ints), but the qkv and o
     projections around it must compile: at -O1 Inductor turns a one-row GEMM
     into a fused reduction, which eager cuBLAS misses."""
-    predictor, walk = _depth_loop(model, monkeypatch)
+    predictor, fn, args = _depth_loop(monkeypatch)
     attn = predictor.model.layers[0].self_attn
-    fn, args = walk(2)
     traced = dynamo_counts(fn, *args).traced
     assert {attn.qkv_proj.weight.data_ptr(), attn.o_proj.weight.data_ptr()} <= traced
 
@@ -2166,7 +2120,7 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
     boundary the final chunk carries the last frames; a stream whose first
     frame was EOS ends with an empty chunk that emits nothing."""
     config = _tiny_model_config()
-    talker = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    talker = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     info = SimpleNamespace(
         graph_walk="talker_decode", max_tokens=8192,
         resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=False)},

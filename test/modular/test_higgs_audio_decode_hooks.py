@@ -9,7 +9,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
 from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import BatchedStopCheck, HostRows
 
 
 def _submodule(slot_masters=True):
@@ -70,8 +70,11 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     assert want == {"b": {"decode_loop"}}
     rows = HostRows(("a", "b", "c", "d"), {"new_token": tokens})
     assert sub.check_stop_batched(["d", "c", "b", "a"], infos, rows) == want
-    # only decode rows end the loop: a prefill row's stop token doesn't
-    prefill_step = {rid: _info(walk="prefill_audio", decoded=7) for rid in infos}
+    # A prefill row's stop token has no loop to end yet: the reply ends at the
+    # loop's first step, which sends the client nothing.
+    prefill_step = {rid: _info(walk="prefill_audio") for rid in infos}
     assert sub.check_stop_batched(list(prefill_step), prefill_step, rows) == {}
-    prefill = {**infos, "d": _info(walk="prefill_audio")}
-    assert sub.check_stop_batched(list(prefill), prefill, rows) == {"b": {"decode_loop"}}
+    first = HostRows(("a", "b"), {"new_token": torch.tensor([[11], [11]])})
+    assert sub.check_stop_batched(["a", "b"], infos, first) == BatchedStopCheck(
+        {"b": {"decode_loop"}}, {"b": ("new_token", "text_inputs")},
+    )

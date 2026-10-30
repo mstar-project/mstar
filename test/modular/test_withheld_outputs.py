@@ -20,6 +20,7 @@ from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput, BatchedStopCheck, HostRows, NodeSubmodule, StopCheck
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker, _LazyPerRid
 
 NODE, WALK, STOP_TOKEN, LOOP = "producer", "decode", 9, "loop"
@@ -201,6 +202,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
         get_fwd_info=lambda rid, partition: None,
         get_pending_publish_info=lambda rid, partition: {},
     )
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])  # no streams
     pending = SimpleNamespace(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK, request_to_worker_graph={KEEP: 0, DROP: 0},

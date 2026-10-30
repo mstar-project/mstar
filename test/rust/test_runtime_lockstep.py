@@ -621,7 +621,20 @@ def test_same_node_speculation_with_a_held_external_input_agrees():
     prep = lock._both("prep_spec_rids(ar_decode)",
                       lambda rt, b, s: _prep_same_node(rt, "ar_decode", rid))
     assert prep == ([rid], [("ctx", [301])])
+    rows = lock._both("prep_spec_rows(ar_decode)",
+                      lambda rt, b, s: _prep_rows_same_node(rt, "ar_decode", rid))
+    assert rows == ([rid], WG_ID, 0, [("ctx", [301])])
     lock.refcounts([101, 201, 301])
+
+
+def _prep_rows_same_node(rt, node, rid, room=None):
+    out = rt.prep_spec_rows(node, node, WALK, [rid], room)
+    return (
+        list(out.ready_rids), out.wg_id, out.spec_id,
+        None if out.input_edges is None else sorted(
+            (sig, list(uuids)) for _r, sig, uuids, _f in out.input_edges.edge_tuples()
+        ),
+    )
 
 
 def test_speculative_flag_survives_completion(lock):

@@ -517,7 +517,7 @@ def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
     (spec,) = model._vision_resources()
-    limit = spec.config.max_segments_per_request
+    limit = spec.config.max_segments_per_step
     n = 2 * (limit + 1)
     video = torch.randint(0, 256, (n, 3, 32, 32), dtype=torch.uint8)
     frames, metadata = sampled(video, 2.0, model.video_processor)
@@ -542,8 +542,27 @@ def _encoder(max_segments: int):
         num_position_embeddings=16, out_hidden_size=64,
     )
     encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, (torch.zeros(1), torch.ones(1)))
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_request=max_segments)}
+    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
     return encoder
+
+
+def test_the_vision_compile_regions_take_their_start_up_examples():
+    """The engine compiles and warms `compile_regions` with these calls at
+    start-up, on an accelerator only. Run eagerly here: a call a region
+    refuses would first fail a GPU worker's boot, and a merger row unlike the
+    block loop's output would compile again on the first image."""
+    from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
+    from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
+
+    config = _encoder(max_segments=4).config
+    encoder = VisionEncoderSubmodule(Qwen3_5VisionModel(config), config, (torch.zeros(1), torch.ones(1)))
+    regions = encoder.compile_regions()
+    assert set(regions) == {"model.embed", "model.merger"}
+    with torch.no_grad():
+        hidden, _, _ = encoder.model.embed(*regions["model.embed"][0])
+        (rows,) = regions["model.merger"][0]
+        assert rows.shape == hidden.shape and rows.dtype == hidden.dtype
+        encoder.model.merger(rows)
 
 
 def test_vision_block_loop_leases_only_what_a_replay_holds():
@@ -589,32 +608,6 @@ def test_vision_batch_that_overflows_one_replay_runs_request_by_request():
 def test_vision_encoder_refuses_patches_it_would_not_normalize():
     with pytest.raises(ValueError, match="uint8"):
         _encoder(max_segments=4)._normalize(torch.zeros(2, 3))
-
-
-def test_vision_block_loop_replays_exactly_when_leased():
-    """The forward replays the block loop when the step leased it and runs
-    eagerly otherwise, whatever the runner's buckets allow."""
-    from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP
-
-    class Runner:
-        def run(self, **kwargs):
-            self.ran = kwargs
-            return SimpleNamespace(get_view=lambda name: "replayed")
-
-    encoder, runner = _encoder(max_segments=4), Runner()
-    hidden = cos = sin = torch.zeros(8, 32)
-
-    def replay(leases):
-        engine_inputs = SimpleNamespace(
-            piecewise_runners={VISION_BLOCK_LOOP: runner}, piecewise_leases=leases, request_ids=["r"],
-        )
-        return encoder._replay_block_loop(engine_inputs, hidden, cos, sin, (4, 4))
-
-    # not leased: `can_lease` refused the batch, or a forward driven outside the engine
-    assert replay({}) is None
-    assert not hasattr(runner, "ran")
-    assert replay({VISION_BLOCK_LOOP: object()}) == "replayed"
-    assert runner.ran["seq_lens"] == [4, 4]
 
 
 def test_a_bad_layout_is_refused_before_the_video_is_preprocessed(model, monkeypatch):
@@ -706,6 +699,22 @@ def test_a_video_with_no_frame_size_is_refused(model, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="no frame size"):
         sample_video(str(path), model.video_processor)
     assert decoded == []
+
+
+def test_the_vision_node_boots_on_an_image_processor_the_video_one_disagrees_with(tmp_path):
+    """Only a video needs the video processor: a checkpoint whose image
+    processor normalizes otherwise than its video processor (one with no video
+    config gets the class defaults) still builds the vision node's normalizer,
+    and refuses a video."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    root = write_synthetic_checkpoint(tmp_path)
+    (root / "preprocessor_config.json").write_text(json.dumps({**PREPROCESSOR_CONFIG, "image_mean": [0.4] * 3}))
+    model = Qwen3_5DenseModel(str(root))
+    mean, _ = model.pixel_normalizer()
+    assert torch.allclose(mean, torch.full_like(mean, 0.4 * 255))
+    with pytest.raises(ValueError, match="image_mean"):
+        _ = model.video_processor
 
 
 def test_still_refuses_audio(model):

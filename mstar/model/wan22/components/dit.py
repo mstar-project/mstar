@@ -233,13 +233,13 @@ class Wan22DiTBlock(nn.Module):
     residual stays bf16. All three follow the reference exactly.
     """
 
-    def __init__(self, dim: int, ffn_dim: int, num_heads: int, eps: float, fuse_ffn_gelu: bool = False):
+    def __init__(self, dim: int, ffn_dim: int, num_heads: int, eps: float):
         super().__init__()
         self.norm1 = WanFP32LayerNorm(dim, eps, elementwise_affine=False)
         self.self_attn = Wan22DiTAttention(dim, num_heads, eps)
         self.cross_attn = Wan22DiTAttention(dim, num_heads, eps)
         self.norm2 = WanFP32LayerNorm(dim, eps, elementwise_affine=True)
-        self.ffn = MLP(dim, ffn_dim, dim, activation="gelu_tanh", bias=True, gelu_epilogue=fuse_ffn_gelu)
+        self.ffn = MLP(dim, ffn_dim, dim, activation="gelu_tanh", bias=True)
         self.norm3 = WanFP32LayerNorm(dim, eps, elementwise_affine=False)
         self.scale_shift_table = nn.Parameter(torch.empty(1, 6, dim))
 
@@ -275,11 +275,9 @@ class Wan22DiT(nn.Module):
     """The dense 5B TI2V video DiT: Conv3d patchify -> 30 blocks -> adaLN
     output head + unpatchify. Built on the meta device and materialized by
     ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
-    ``to_empty(device)`` -> checkpoint load). ``fuse_ffn_gelu`` runs every
-    FFN GELU in its GEMM's epilogue (``MLP.gelu_epilogue``), the serving
-    numerics; off, the module is the reference port."""
+    ``to_empty(device)`` -> checkpoint load)."""
 
-    def __init__(self, config: Wan22Config, fuse_ffn_gelu: bool = False):
+    def __init__(self, config: Wan22Config):
         super().__init__()
         if config.qk_norm != "rms_norm_across_heads" or not config.cross_attn_norm:
             # These two config facts are baked into Wan22DiTAttention /
@@ -298,7 +296,7 @@ class Wan22DiT(nn.Module):
         )
         self.condition_embedder = Wan22TimeTextEmbedding(dim, config.freq_dim, config.text_dim)
         self.blocks = nn.ModuleList(
-            Wan22DiTBlock(dim, config.ffn_dim, config.num_attention_heads, config.eps, fuse_ffn_gelu)
+            Wan22DiTBlock(dim, config.ffn_dim, config.num_attention_heads, config.eps)
             for _ in range(config.num_layers)
         )
         self.norm_out = WanFP32LayerNorm(dim, config.eps, elementwise_affine=False)

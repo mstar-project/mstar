@@ -348,9 +348,10 @@ def test_callable_built_inside_a_compiled_region():
 
 
 def test_a_compiled_region_attends_through_a_rebuilt_resource():
-    """The op names its manager by resource key: after the resource is rebuilt under
-    the same key, a region compiled against the old one attends through the new one's
-    plan, not the old one's."""
+    """Each manager's op key is its resource key plus a number unique in the process.
+    A region compiled against one manager, then called with a manager rebuilt under the
+    same resource key, attends through the rebuilt one's plan, not the old one's, though
+    the old one is still registered under its own op key."""
     q, k, v = qkv(224)
 
     def region(fn, q, k, v):
@@ -797,3 +798,76 @@ def test_cross_pair_under_a_lease_gets_a_graph_wrapper_sized_for_its_keys():
     w = mgr._current_plan_states[cross_label("video", "text")]
     assert isinstance(w, FlashInferRaggedCrossPrefillWrapper) and w.accelerator_graph
     assert w.max_total_kv_tokens == MAX_TOKENS
+
+
+# --- log-sum-exp out, for merging attentions over disjoint key sets ------------
+
+def lse_ref(q, k, q_cu, kv_cu):
+    """Per-segment log-sum-exp (natural log) of query segment i's scaled scores over
+    key segment i, ``[T, H]`` fp32."""
+    lse = torch.full((q.shape[0], HEADS), float("-inf"), device=q.device)
+    q_off, kv_off = q_cu.tolist(), kv_cu.tolist()
+    for qs, qe, ks, ke in zip(q_off[:-1], q_off[1:], kv_off[:-1], kv_off[1:], strict=True):
+        if qe > qs and ke > ks:
+            scores = torch.einsum("qhd,khd->hqk", q[qs:qe].float(), k[ks:ke].float()) * HEAD_DIM ** -0.5
+            lse[qs:qe] = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+    return lse
+
+
+def close_lse(got, want):
+    assert got.dtype == torch.float32 and got.shape == want.shape
+    torch.testing.assert_close(got, want, atol=2e-2, rtol=1e-3)
+
+
+def test_eager_cross_returns_the_lse():
+    q_lens, kv_lens = [128, 7], [32, 300]
+    w = cross_wrapper()
+    q = qkv(sum(q_lens), seed=1)[0]
+    _, k, v = qkv(sum(kv_lens), seed=2)
+    w.plan(cu(q_lens), cu(kv_lens))
+    out, lse = w.run(q, k, v, return_lse=True)
+    close(out, cross_ref(q, k, v, cu(q_lens), cu(kv_lens)))
+    close_lse(lse, lse_ref(q, k, cu(q_lens), cu(kv_lens)))
+
+
+def test_graph_cross_replay_returns_the_lse():
+    """The log-sum-exp out of a captured graph, re-planned to another layout before
+    the replay."""
+    w = cross_wrapper(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True)
+    sq, sk, sv = (torch.zeros(MAX_TOKENS, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) for _ in range(3))
+    w.plan(cu([MAX_TOKENS // MAX_SEGMENTS] * MAX_SEGMENTS), cu([64] * MAX_SEGMENTS))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            w.run(sq, sk, sv, return_lse=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = w.run(sq, sk, sv, return_lse=True)
+    torch.cuda.synchronize()
+
+    q_lens, kv_lens = [100, 60, 30, 0], [200, 10, 30, 0]
+    q = qkv(sum(q_lens), seed=3)[0]
+    _, k, v = qkv(sum(kv_lens), seed=4)
+    w.plan(cu(q_lens), cu(kv_lens))
+    for buf, real in ((sq, q), (sk, k), (sv, v)):
+        buf.zero_()
+        buf[: real.shape[0]].copy_(real)
+    graph.replay()
+    torch.cuda.synchronize()
+    total = sum(q_lens)
+    close(out[:total], cross_ref(q, k, v, cu(q_lens), cu(kv_lens)))
+    close_lse(lse[:total], lse_ref(q, k, cu(q_lens), cu(kv_lens)))
+
+
+def test_label_bound_run_hands_back_the_lse():
+    mgr = cross_manager()
+    step_ = RaggedCrossAttentionStep(segments=av_segments([96, 64], [32, 32], [16, 8]), pairs=(("audio", "video"),))
+    mgr.plan(step_, ctx(["r0", "r1"]))
+    q = qkv(24, seed=5)[0]
+    _, k, v = qkv(160, seed=6)
+    attend = functools.partial(mgr.run, label=cross_label("audio", "video"))
+    out, lse = attend(q, k, v, return_lse=True)
+    close(out, attend(q, k, v))
+    close_lse(lse, lse_ref(q, k, cu([16, 8]), cu([96, 64])))

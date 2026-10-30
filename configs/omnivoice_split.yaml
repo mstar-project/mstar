@@ -1,7 +1,8 @@
 # configs/omnivoice.yaml with code2wav on its own worker. Both workers run on
 # GPU 0 (rank_devices), so the backbone's unmask loop no longer stops for each
-# finished request's codec decode and host-side post-processing; run a CUDA
-# MPS daemon for the two workers' kernels to overlap.
+# finished request's codec decode and host-side post-processing. `mps: true`
+# runs both as clients of one MPS daemon so their kernels overlap rather than
+# time-slice.
 model: "omnivoice"
 max_seq_len: 8192
 node_groups:
@@ -10,5 +11,6 @@ node_groups:
   - node_names: [code2wav]
     ranks: [1]
 rank_devices: {1: 0}
+mps: true
 # Two workers share the GPU; each plans its captures within its share.
 gpu_memory_fraction: 0.45

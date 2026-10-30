@@ -11,9 +11,9 @@ captured at each of ``geometric_batch_sizes(max_batch_size)``: powers of two bel
 ``max_batch_size``, then ``max_batch_size``.
 
 Only the masked (padded-prompt) path is captured. Whether a prompt has padding is
-``text_len`` in the step metadata, which the model sets at intake from the prompt
-tensor's length; a batch holding a prompt that fills all S tokens runs the encoder's
-unmasked path eagerly.
+``text_len`` in the step metadata, which the model must set at intake from the prompt
+tensor's length (a row without it is a ValueError); a batch holding a prompt that fills
+all S tokens runs the encoder's unmasked path eagerly.
 """
 
 from __future__ import annotations
@@ -86,12 +86,14 @@ class Qwen3TextEncoderSubmodule(NodeSubmodule):
         return self._max_batch_size
 
     def cg_key_info(self, graph_walk: str, per_request_info, per_request_input_metadata=None, **kwargs):
-        """True when every real row is a padded prompt: the masked path, the only captured
-        one. Padding rows of a captured bucket carry no step metadata."""
+        """True when every row is a padded prompt: the masked path, the only captured one."""
         del graph_walk, per_request_input_metadata, kwargs
         width = self.text_config.max_sequence_length
-        lengths = [info.step_metadata.get(TEXT_LEN) for info in per_request_info.values() if info.step_metadata]
-        return bool(lengths) and all(n is not None and n < width for n in lengths)
+        lengths = [info.step_metadata.get(TEXT_LEN) for info in per_request_info.values()]
+        if None in lengths:
+            # without it no batch would ever replay, silently
+            raise ValueError(f"{type(self).__name__} needs the prompt's token count in step metadata {TEXT_LEN!r}")
+        return all(n < width for n in lengths)
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
         width = self.text_config.max_sequence_length
