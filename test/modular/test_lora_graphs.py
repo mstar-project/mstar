@@ -306,15 +306,15 @@ def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapter
 
 
 def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
-    """It reads only which adapter each request named: two ranks whose ingests landed in
-    another order, whose slots and empty-adapter reads differ, pick the same capture."""
+    """It reads only which adapter each request named (and which adapters the files say
+    are empty, the same on every rank): two ranks whose ingests landed in another order,
+    and whose slots differ, pick the same capture."""
     named = {"b0": None, "b1": None, "r1": "a1", "r2": "a2"}
     ranks = [P.make_pool(adapters[1], max_slots=2), P.make_pool(adapters[1], max_slots=2)]
     for pool, order in zip(ranks, (list(named), list(reversed(named))), strict=True):
         for rid in order:
             P.ingest(pool, rid, named[rid])
     assert P.run_step(ranks[0], ["r1", "r2"]).ok  # rank 0 has both resident
-    ranks[1]._empty.add("a2")
     for n in range(1, 5):
         for rows in itertools.permutations(named, n):
             want = any(named[r] is not None for r in rows)
