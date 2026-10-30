@@ -182,6 +182,9 @@ class NoAuxTcRouter(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
+        # a fused top-k op (logits, bias, top_k, scale, renormalize) -> (weights, ids), set by a
+        # block whose kernels provide one (GLM-5.2's kernels: auto: mstar::moe_router_topk)
+        self._topk_op = None
         # fp32 copy of ``weight``, built once by ``finalize_weights``: the
         # forward needs fp32 and the router never changes, so casting it once
         # per layer per step is pure waste. A plain attribute, not a buffer,
@@ -207,6 +210,11 @@ class NoAuxTcRouter(nn.Module):
                 if w is None or w.device != self.weight.device:
                     w = self.weight.float()
                 logits = F.linear(flat.float(), w)
+        if self._topk_op is not None and logits.is_cuda:
+            topk_weights, topk_ids = self._topk_op(
+                logits, self.e_score_correction_bias, self.top_k, self.routed_scaling_factor,
+                self.norm_topk_prob)
+            return topk_weights, topk_ids, None
         scores = logits.sigmoid()  # (T, E)
 
         biased = scores + self.e_score_correction_bias.unsqueeze(0)

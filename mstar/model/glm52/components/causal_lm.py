@@ -19,6 +19,10 @@ class Glm52LanguageModel(nn.Module):
         self, config: Glm52ModelConfig, comm_group: CommGroup | None = None
     ) -> None:
         super().__init__()
+        self.comm_group = comm_group or CommGroup.trivial()
+        # kernels: auto fuses each all-reduce into the next add + RMSNorm: each layer takes and
+        # returns (FFN partial, residual), and the last norm reduces
+        self.fused_add_rmsnorm = config.tuned_kernels
         self.embed_tokens = build_embedding(config, comm_group=comm_group)
         self.layers = nn.ModuleList(
             [
@@ -32,13 +36,29 @@ class Glm52LanguageModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
+        rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Layer order IS the IndexShare order under dsa_long_context: each FULL
         layer's pick is the one the SHARED layers after it reuse, until the next
-        FULL layer (the DSA resource keeps it for the forward)."""
+        FULL layer (the DSA resource keeps it for the forward). ``rows``: the
+        only rows the caller reads; the last layer's FFN runs on them alone.
+        """
         hidden_states = self.embed_tokens(input_ids)
-        for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, position_ids)
+        last = len(self.layers) - 1
+        residual = None
+        for i, decoder_layer in enumerate(self.layers):
+            out = decoder_layer(
+                hidden_states, position_ids,
+                rows=rows if i == last else None, residual=residual,
+            )
+            if self.fused_add_rmsnorm:
+                hidden_states, residual = out
+            else:
+                hidden_states = out
+        if self.fused_add_rmsnorm:
+            # forward_residual returns (norm(r), r)
+            normed, _ = self.norm.forward_residual(hidden_states, residual, self.comm_group)
+            return normed
         return self.norm(hidden_states)
 
 
@@ -50,6 +70,13 @@ class Glm52ForCausalLM(nn.Module):
         self.config = config
         self.model = Glm52LanguageModel(config, comm_group=comm_group)
         self.lm_head = build_lm_head(config, comm_group=comm_group)
+        # Build the draft module only when drafting is on, so the parameter
+        # set and the weight load are unchanged when it is off.
+        self.mtp = None
+        if config.mtp_num_draft_tokens > 0:
+            from mstar.model.glm52.components.mtp import Glm52MTPModule
+
+            self.mtp = Glm52MTPModule(config, comm_group=comm_group)
 
     def forward(
         self,
@@ -76,6 +103,9 @@ class Glm52ForCausalLM(nn.Module):
             ),
             num_hidden_layers=self.config.num_hidden_layers,
             load_indexer=load_indexer,
+            dense_fp8=self.config.dense_fp8,
+            fp8_shared_expert=self.config.fp8_shared_expert,
+            load_mtp=self.mtp is not None,
         )
         if load_indexer:
             missing = {

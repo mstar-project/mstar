@@ -69,6 +69,12 @@ logger = logging.getLogger(__name__)
 # request after each admit, commit, reset and remove, and after each change to
 # an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
+# A step whose rows each write at most HOST_PLAN_MAX_SPAN tokens (decode, an MTP
+# verify's k + 1), up to HOST_PLAN_MAX_TOKENS in all, builds its write addressing
+# on the host: a Python loop per token beats the packed path's kernels there.
+# Wider rows (prefills) keep the packed path.
+HOST_PLAN_MAX_TOKENS = 512
+HOST_PLAN_MAX_SPAN = 8
 
 
 class RoomMark(NamedTuple):
@@ -2247,13 +2253,13 @@ class KVManager(AttentionResource):
             empty = self._empty_locations = torch.empty(0, dtype=torch.long, device=self._device)
         return KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
 
-    def _decode_plan_state(self, views: list[SequenceView]) -> KVPlanState:
-        """Write addressing for a step appending one token per request.
+    def _host_plan_state(self, views: list[SequenceView]) -> KVPlanState:
+        """Write addressing for a step appending a few tokens per request.
 
         The packed path needs the indptrs on device and ~a dozen kernels to
-        unpack them per token. A decode step's slot is just the end of each
-        stream, so build it in the same CPU pass the views came from and send
-        it over as one H2D.
+        unpack them per token. A small step's slots are the last few of each
+        stream, so build them in the same CPU pass the views came from and
+        send them over as one H2D.
         """
         pages, offsets = self._decode_locations(views)
         locations = torch.tensor(
@@ -2262,27 +2268,34 @@ class KVManager(AttentionResource):
         return KVPlanState(
             token_to_page=locations[0],
             token_to_cache=locations[1],
-            total_tokens=len(views),
+            total_tokens=len(pages),
         )
 
     def _decode_locations(
         self, views: list[SequenceView],
     ) -> tuple[list[int], list[int]]:
-        """Each decode row's (page, offset-in-page) for the token it writes.
+        """(page, offset-in-page) for each token a row writes: the last
+        ``to_compute`` of its stream (one for decode, k+1 for an MTP verify).
 
         Off the stream's page count, not its logical length: that is what
         `build_paged_indptrs` hands attention, so a stream holding more pages
         than its length needs stays self-consistent."""
         page_size = self.kv_cache.page_size
-        pages = [view.page_idxs[-1] for view in views]
-        offsets = [(view.last_page_len(page_size) or page_size) - 1 for view in views]
+        pages: list[int] = []
+        offsets: list[int] = []
+        for view in views:
+            end = (len(view.page_idxs) - 1) * page_size + (
+                view.last_page_len(page_size) or page_size)
+            for pos in range(end - view.to_compute, end):
+                pages.append(view.page_idxs[pos // page_size])
+                offsets.append(pos % page_size)
         return pages, offsets
 
     def _stage_decode_plan_state(
         self, views: list[SequenceView] | None, static_state: KVPlanState,
         capture_len: int, pages=None, offsets=None,
     ) -> KVPlanState:
-        """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
+        """``_host_plan_state`` + ``KVPlanState.copy_`` with no device staging
         tensor; rows past the real tokens get SINK_PAGE / 0."""
         if pages is None or offsets is None:
             pages, offsets = self._decode_locations(views)
@@ -2322,14 +2335,14 @@ class KVManager(AttentionResource):
                 else:
                     self._current_plan_states[label] = plan_state
                 continue
-            total_tokens = None if indptrs.is_decode else indptrs.get_total_len()
-            if indptrs.is_decode:
-                plan_state = self._decode_plan_state(indptrs.views)
-            elif total_tokens == 0:
+            total_tokens = indptrs.get_total_len()
+            if total_tokens == 0:
                 # every segment span 0 (a decoder reading the encoder context
                 # it wrote at prefill): nothing is written, so there is no
                 # addressing to upload and unpack
                 plan_state = self._empty_plan_state()
+            elif total_tokens <= HOST_PLAN_MAX_TOKENS and indptrs.max_span() <= HOST_PLAN_MAX_SPAN:
+                plan_state = self._host_plan_state(indptrs.views)
             else:
                 indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
                 plan_state = self._compute_plan_state(
@@ -2872,6 +2885,56 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._preplan_states = {}
         self._cached_plan_output = None
+
+    def correct_len(self, rid: str, label: str, delta: int) -> None:
+        """Move a stream's stored length by ``delta`` tokens, pages kept: a
+        speculative verify step commits its whole block and its rejected tail
+        is taken back here once the acceptance is known. The generation moves
+        so an offload claimed against the old length fails its guard."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None:
+                raise KeyError(f"KV {self.name}: no stream {label!r} for request {rid}")
+            # an admitted step's addressing was planned from the old length
+            assert not stream.step_in_flight, (
+                f"KV {self.name}: correct_len on {rid}/{label} between admit and commit"
+            )
+            if delta == 0:
+                return
+            stream.stored_len = max(0, stream.stored_len + delta)
+            stream.generation += 1
+            # the plan caches assume the stream moved by a commit
+            self._touch_plan_cache(rid)
+            if delta < 0:
+                self._drop_sealed_tail(rid, label, stream)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def _drop_sealed_tail(self, rid: str, label: str, stream: CacheStream) -> None:
+        """#279's rule for a rewind: the next write must not land on a sealed
+        page its other owners still read. Pages from the write position on are
+        dropped, and the one the length ends inside is replaced by a copy. The
+        dropped pages leave through `_release` and the request is recounted, as
+        for any page a stream gives up."""
+        page_size = self.config.page_size
+        first = stream.stored_len // page_size
+        tail = stream.page_indices[first:]
+        if not self._arena.any_sealed(tail):
+            return
+        keep: list[int] = []
+        if stream.stored_len % page_size:
+            keep = self._arena.acquire(1)
+            if keep is None:
+                raise RuntimeError(
+                    f"KV {self.name}: no free page to copy the sealed page "
+                    f"{rid}/{label} rewound into"
+                )
+            self._arena.copy_pages(tail[:1], keep)
+        stream.page_indices[first:] = keep
+        self._release(rid, stream, tail)
+        # its keys and cursor name pages this stream no longer holds
+        stream.chain = None
+        self._recount(rid)
 
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams

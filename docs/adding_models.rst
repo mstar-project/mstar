@@ -603,7 +603,9 @@ The spec types are:
        with the rope part as ``q_pe``, and returns the output in the latent space, so
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
-       fallback, which cannot be captured in a CUDA graph.
+       fallback, which cannot be captured in a CUDA graph. The layer is ``MLAAttention``
+       (``mstar/model/components/mla.py``); its config picks rotated decoupled dims (GLM-5.2)
+       or none (GLM-5.3).
        ``sliding_window=N`` lets each query attend to the last ``N`` positions, its
        own included. It needs the FlashInfer backend and causal attention, and the
        pages behind the window stay allocated.
@@ -660,7 +662,8 @@ The spec types are:
        ``apply_qk(q, k, label)``. ``pos_ids=`` rotates at positions the model passes
        instead of the label's plan, and ``k=None`` rotates one tensor. ``interleave``
        selects GPT-J pairing, ``rotary_dim`` a partial rotation, and ``rope_table_dtype``
-       a cos/sin table built once (GLM-5.2 uses float32). A model with learned position
+       a cos/sin table built once (GLM-5.2 uses float32); ``cos_sin_table`` hands it to a
+       kernel that rotates inside a larger fusion. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``

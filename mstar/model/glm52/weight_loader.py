@@ -28,9 +28,25 @@ _EXPERT_BASE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)$")
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.")
 
+# Non-expert linears that dense_fp8 keeps fp8 (checkpoint names). kv_b_proj is not one: the
+# absorbed MLA folds it into bf16 w_kc / w_vc.
+_DENSE_FP8_BASE_RE = re.compile(
+    r"\.(self_attn\.(q_a_proj|kv_a_proj_with_mqa|q_b_proj|o_proj)"
+    r"|mlp\.(gate_proj|up_proj|down_proj))$"
+)
+_SHARED_EXPERT_BASE_RE = re.compile(r"\.mlp\.shared_experts\.(gate_proj|up_proj|down_proj)$")
+
 
 def _is_routed_expert_base(base: str) -> bool:
     return _EXPERT_BASE_RE.search(base) is not None
+
+
+def _is_dense_fp8_base(base: str) -> bool:
+    return _DENSE_FP8_BASE_RE.search(base) is not None
+
+
+def _is_shared_expert_base(base: str) -> bool:
+    return _SHARED_EXPERT_BASE_RE.search(base) is not None
 
 
 def glm52_name_remapper(name: str) -> str | None:
@@ -46,6 +62,7 @@ def skip_phase_b_keys(
     weights: Iterable[tuple[str, torch.Tensor]],
     num_hidden_layers: int,
     load_indexer: bool = True,
+    load_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Drop MTP-layer keys — and, with ``load_indexer=False``, indexer keys —
     before any dequant buffering.
@@ -57,7 +74,7 @@ def skip_phase_b_keys(
             skipped_indexer += 1
             continue
         m = _LAYER_RE.match(name)
-        if m and int(m.group(1)) >= num_hidden_layers:
+        if not load_mtp and m and int(m.group(1)) >= num_hidden_layers:
             skipped_mtp += 1
             continue
         yield name, tensor
@@ -134,6 +151,7 @@ def build_glm52_read_plan(
     tp_rank: int,
     tp_size: int,
     load_indexer: bool | None = None,
+    load_mtp: bool = False,
 ) -> tuple[set[str], "dict[str, tuple[int, int, int]]"]:
     """Keys-to-read + per-key slice specs for the TP fast read path.
 
@@ -158,8 +176,8 @@ def build_glm52_read_plan(
     for key in checkpoint_keys:
         m_layer = _LAYER_RE.match(key)
         layer = int(m_layer.group(1)) if m_layer else None
-        if layer is not None and layer >= config.num_hidden_layers:
-            continue  # the MTP layer: never read, never transfer
+        if layer is not None and layer >= config.num_hidden_layers and not load_mtp:
+            continue  # MTP module off: never read, never transfer
         if ".self_attn.indexer." in key and (
             not load_indexer
             or layer is None
@@ -187,6 +205,31 @@ def build_glm52_read_plan(
     return keys, specs
 
 
+def _make_glm52_name_remapper(num_hidden_layers: int, load_mtp: bool):
+    """Trunk remapping, plus layer-78 routing onto the ``mtp.``
+    submodule: strip the layer prefix, apply ``remap_mtp_key`` (glue keys
+    direct, the rest under ``transformer_layer.``), then the trunk naming
+    conventions — the expert/shared-expert regexes are prefix-agnostic, so
+    the fused stacked-param rules apply to the MTP MoE unchanged.
+    """
+    if not load_mtp:
+        return glm52_name_remapper
+
+    from mstar.model.glm52.components.mtp import remap_mtp_key
+
+    def remap(name: str) -> str | None:
+        m = _LAYER_RE.match(name)
+        if m and int(m.group(1)) >= num_hidden_layers:
+            if int(m.group(1)) > num_hidden_layers:
+                # one draft module: a second next-token layer silently overwrote the first
+                raise ValueError(f"{name}: MTP serves one next-token layer, "
+                                 f"{num_hidden_layers}; the checkpoint has more")
+            return glm52_name_remapper("mtp." + remap_mtp_key(name[m.end():]))
+        return glm52_name_remapper(name)
+
+    return remap
+
+
 def load_glm52_hf_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
@@ -195,15 +238,28 @@ def load_glm52_hf_weights(
     fp8_experts: bool = False,
     num_hidden_layers: int = 78,
     load_indexer: bool = True,
+    dense_fp8: bool = False,
+    fp8_shared_expert: bool = False,
+    load_mtp: bool = False,
 ) -> set[str]:
     from mstar.model.loader import load_hf_weights
 
-    weights = skip_phase_b_keys(weights, num_hidden_layers, load_indexer=load_indexer)
+    weights = skip_phase_b_keys(
+        weights, num_hidden_layers, load_indexer=load_indexer, load_mtp=load_mtp,
+    )
     if quant_config is not None:
-        keep = _is_routed_expert_base if fp8_experts else None
-        weights = dequant_fp8_block_stream(weights, quant_config, keep_fp8=keep)
+        def keep(base: str) -> bool:
+            return ((fp8_experts and _is_routed_expert_base(base))
+                    or (dense_fp8 and _is_dense_fp8_base(base))
+                    or (fp8_shared_expert and _is_shared_expert_base(base)))
+
+        weights = dequant_fp8_block_stream(
+            weights, quant_config,
+            keep_fp8=keep if fp8_experts or dense_fp8 or fp8_shared_expert else None)
     elif fp8_experts:
         raise ValueError("fp8_experts=True requires a quant_config")
+    elif dense_fp8 or fp8_shared_expert:
+        raise ValueError("dense_fp8=True requires a quant_config")
     else:
         weights = _refuse_fp8(weights)
 
@@ -214,7 +270,7 @@ def load_glm52_hf_weights(
         stacked_params=build_glm52_stacked_params(
             n_routed_experts, fp8_experts=fp8_experts,
         ),
-        name_remapper=glm52_name_remapper,
+        name_remapper=_make_glm52_name_remapper(num_hidden_layers, load_mtp),
     )
 
 

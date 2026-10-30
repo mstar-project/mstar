@@ -206,6 +206,13 @@ class RopeManager(PositionManager):
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
 
+    def correct_len(self, rid: str, label: str, delta: int) -> None:
+        """Move a stream's position by ``delta``, beside ``KVManager.correct_len``: a speculative
+        verify step advances by its whole block, and its rejected tail is taken back from both
+        once the acceptance is known."""
+        counters = self._counters.setdefault(rid, {})
+        counters[label] = max(0, counters.get(label, 0) + delta)
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
         prefix: CachedPrefix | None,
@@ -473,6 +480,13 @@ class RopeManager(PositionManager):
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
+
+    @property
+    def cos_sin_table(self) -> torch.Tensor | None:
+        """The fp32 ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` builds, each row
+        ``rotary_dim / 2`` cosines then as many sines, for a kernel that rotates inside a
+        larger fusion (GLM-5.2's MLA prep); None without ``rope_table_dtype``."""
+        return self._rope_table
 
     def _check_rope_table_args(
         self,
