@@ -9,7 +9,6 @@ from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
-    NameAndDest,
     NodeCompletionOutput,
 )
 from mstar.graph.graph_io import WorkerGraphIO
@@ -154,23 +153,14 @@ class WorkerGraphQueues:
         """
         self.per_request_queues[request_id].clear()
 
-    def stop_loops(
-        self, request_id: int, loop_names: set[str]
-    ) -> set[NameAndDest]:
-        """Register a finish signal for each named loop and return the union
-        of their ``_loop_back_inputs`` so the caller can drop those (name, dest)
-        edges from the current iter's output routing.
-        """
+    def stop_loops(self, request_id: int, loop_names: set[str]):
+        """Register a finish signal for each named loop this worker graph
+        carries."""
         assert request_id in self.per_request_queues, \
             f"Tried to stop loops for unknown request ID {_rid_name(self.rid_str, request_id)}"
         queue = self.per_request_queues[request_id]
-        loop_back_signals: set[NameAndDest] = set()
         for name in loop_names:
-            if name not in queue.loops:
-                continue
             queue.register_loop_finish_signal(name)
-            loop_back_signals.update(queue.loops[name]._loop_back_inputs)
-        return loop_back_signals
 
     def mark_node_complete(
         self, request_id: int, node_name: str
