@@ -1059,6 +1059,16 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># engine's KV dtype (which is actually a misnamed autocast dtype) is used.</span>
     <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># False keeps every head on each sequence-parallel rank (TP still shards</span>
+    <span class="c1"># them), for an attention a rank runs whole over its own tokens: one over a</span>
+    <span class="c1"># replicated stream, or a cross-attention from the rank's query shard.</span>
+    <span class="n">shard_over_sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="c1"># Each label's FlashInfer workspace, per slot; None takes</span>
+    <span class="c1"># MSTAR_WORKSPACE_BUFFER_MB. A ragged prefill only spends it on split-KV</span>
+    <span class="c1"># partials (tens of MB), so a resource with many labels can declare less.</span>
+    <span class="n">workspace_mb</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sm_scale</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">sm_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>

@@ -1008,8 +1008,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_build_ragged</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">manager_cls</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
     <span class="n">config</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
-    <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
+    <span class="n">joint</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span>
+    <span class="k">if</span> <span class="n">joint</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">joint</span><span class="o">.</span><span class="n">world_size</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">shard_over_sp</span> <span class="k">else</span> <span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
     <span class="n">dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span>
     <span class="k">if</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -1336,15 +1337,19 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""One layer's attention through the plan for ``label``.</span>
+        <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">return_lse</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""One layer's attention through the plan for ``label``; with ``return_lse``</span>
+<span class="sd">        also the log-sum-exp ``[total_tokens, H]`` (fp32, natural log), for merging</span>
+<span class="sd">        attentions over disjoint key sets. The plan is the same either way.</span>
 
 <span class="sd">        Not behind a custom op, unlike the paged backend's ``run``: the ragged</span>
 <span class="sd">        caller (an encoder tower) has no per-layer KV write to keep in the same</span>
 <span class="sd">        graph, so the break this costs is one per layer of a region that is</span>
 <span class="sd">        CUDA-graph captured rather than compiled.</span>
 <span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">return_lse</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">)</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">return_lse</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">)</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
 
 
