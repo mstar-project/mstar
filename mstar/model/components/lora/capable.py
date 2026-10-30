@@ -89,22 +89,26 @@ class _LoraLinearMixin(LoraOutputAdd, LoraCapable):
 
 
 class _LoraPatchConvMixin(LoraBound, LoraCapable):
-    """A convolution whose kernel is its stride, over inputs one kernel wide: a linear
-    over each flattened patch, as PEFT's conv LoRA (``A [r, c, *kernel]``, ``B [out, r,
-    1, ...]``) is over it."""
+    """A convolution whose kernel is its stride: a linear over each flattened patch, as
+    PEFT's conv LoRA (``A [r, c, *kernel]``, ``B [out, r, 1, ...]``) is over it. Each
+    output position is a row, in the order ``flatten(2).transpose(1, 2)`` makes tokens of
+    them (one per input when a patch embedding is fed pre-cut patches)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = super().forward(x)
         if self.lora_delta is None:
             return y
-        if math.prod(y.shape[2:]) != 1:
-            raise ValueError(
-                f"{type(self).__name__}: LoRA on a convolution needs one patch per "
-                f"row (output {tuple(y.shape)}), as a patch embedding feeds it"
-            )
-        rows = y.shape[0]
-        patch = math.prod(x.shape[1:])
-        return apply_lora(self.lora_delta, x.reshape(rows, patch), y.view(rows, self.out_channels)).view_as(y)
+        n, out, *grid = y.shape
+        kernel = self.kernel_size
+        # the patches the conv read ([N, C, G1, K1, G2, K2, ...], less any remainder it
+        # dropped), each flattened as the weight is: [N * G1 * G2 ..., C * K1 * K2 ...]
+        x = x[(..., *(slice(0, g * k) for g, k in zip(grid, kernel)))]
+        x = x.reshape(n, self.in_channels, *(d for g, k in zip(grid, kernel) for d in (g, k)))
+        dims = range(len(grid))
+        x = x.permute(0, *(2 + 2 * i for i in dims), 1, *(3 + 2 * i for i in dims))
+        rows = y.movedim(1, -1).reshape(-1, out)
+        rows = apply_lora(self.lora_delta, x.reshape(rows.shape[0], -1), rows)
+        return rows.view(n, *grid, out).movedim(-1, 1).contiguous()
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(

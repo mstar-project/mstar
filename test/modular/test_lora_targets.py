@@ -305,6 +305,28 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
             torch.testing.assert_close(off_vocab[1:], (bound[0] - unbound[0])[1:], rtol=0, atol=1e-10)
 
 
+def test_a_patch_conv_over_a_whole_input_adds_each_output_positions_delta(tmp_path):
+    """A patch conv fed a whole volume (a grid of patches, and a remainder it drops) adds
+    at each output position, in token order, the delta it adds to that patch fed alone;
+    a base-only step runs it too."""
+    case = CASES["patch_conv"]  # Conv3d(2, 12, kernel 2, stride 2)
+    paths, _ = _adapters(case, tmp_path)
+    spec = serve(_spec(case), paths)
+    root = _build(case, CommGroup.trivial(), _weights(case))
+    lora_pool = pool(spec)
+    bind_module_lora(_Node(root), {"lora": lora_pool})
+    conv = root.layers[1].proj
+    volume = rand(1, 2, 3, 7, 7, seed=5)  # a 1 x 3 x 3 grid of patches: the step's 9 tokens
+    patches = (volume[:, :, :2, :6, :6].reshape(1, 2, 1, 2, 3, 2, 3, 2)
+               .permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(TOKENS, 2, 2, 2, 2))
+    plan([lora_pool], ROWS)
+    alone = conv(patches).reshape(TOKENS, 12)
+    whole = conv(volume)
+    torch.testing.assert_close(whole.flatten(2).transpose(1, 2)[0], alone, rtol=1e-10, atol=1e-10)
+    plan([lora_pool], [("b0", None, TOKENS)])
+    torch.testing.assert_close(conv(volume), F.conv3d(volume, conv.weight, conv.bias, stride=2))
+
+
 # --- unbound: exactly the forward before LoRA ---------------------------------------------
 
 def _old_column(self, input_):
