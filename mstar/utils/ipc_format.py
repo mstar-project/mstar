@@ -8,7 +8,6 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
-from mstar.streaming.topology import ClientStream
 
 
 class Status(Enum):
@@ -74,8 +73,8 @@ class RemoveRequest(MessageBody):
 class DrainRequest(MessageBody):
     # Phase-1 teardown: stop scheduling this request, and ACK READS_DONE once no
     # read of it is in flight, starting none after (the data worker also stops
-    # reading its results). Hard cleanup (RemoveRequest) follows once every
-    # reader has ACKed.
+    # reading its results and sending its client stream items). Hard cleanup
+    # (RemoveRequest) follows once every reader has ACKed.
     request_id: str
     source: int = MessageSource.CONDUCTOR
 
@@ -112,14 +111,15 @@ class UnpersistTensors(MessageBody):
 @dataclass
 class ClientStreamRoute(MessageBody):
     """The conductor telling the API server's data worker, the producer of a
-    request's client streams, which ranks consume each one: once at dispatch,
-    and again with an empty list for a stream whose consuming partition has
-    ended, which then takes no more items."""
+    request's client streams, where each one goes: once at dispatch, and
+    again with no ranks for a stream whose consuming partition has ended,
+    which then takes no more items."""
     request_id: str
     # client stream edge -> the consuming node's ranks for this request
     workers: dict[str, list[str]]
-    # client stream edge -> its consumer, which addresses the sends
-    consumers: dict[str, ClientStream]
+    # client stream edge -> that node, from the walks as the deployment shaped
+    # them; the data worker's copy of the model is the unshaped one
+    nodes: dict[str, str]
 
 
 @dataclass

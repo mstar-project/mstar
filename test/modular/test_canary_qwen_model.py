@@ -156,6 +156,8 @@ def test_config(tmp_path):
     assert CanaryQwenModelConfig.from_pretrained(tmp_path / "nemo", tmp_path / "qwen").encoder.scale_input
     for section, key, value in (("encoder", "att_context_size", [70, 13]), ("preprocessor", "window_size", 0.02),
                                 ("preprocessor", "normalize", "all_features"), ("preprocessor", "features", 80),
+                                # NemoLogMel's fixed settings, which NeMo's config leaves out as defaults
+                                ("preprocessor", "mag_power", 1.0), ("preprocessor", "preemph", 0.5),
                                 # one part of the encoder causal, the rest not: not one this encoder runs
                                 ("encoder", "conv_norm_type", "layer_norm"),
                                 ("encoder", "causal_downsampling", True)):

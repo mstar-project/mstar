@@ -1,10 +1,10 @@
 """Client streams: a ``Connection`` from ``CLIENT`` feeds a running request.
 
 The API server's data worker sends a call's items and their end straight to
-the consuming node's ranks. The conductor tells it those ranks once, at
-dispatch (``CLIENT_STREAM_ROUTE``), and again with none once the consuming
-partition ends. At ``max_concurrent_requests`` a call with open input is
-refused rather than queued.
+the consuming node's ranks. The conductor tells it that node and its ranks
+once, at dispatch (``CLIENT_STREAM_ROUTE``), and again with no ranks once the
+consuming partition ends. At ``max_concurrent_requests`` a call with open
+input is refused rather than queued.
 
 Drives the real ``Conductor.__init__`` and ``Conductor.run`` with worker
 launch and ZMQ stubbed, as ``test_ingest_unpersist.py`` does. The worker test
@@ -37,7 +37,6 @@ from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
     CLIENT,
     ClientAudio,
-    ClientStream,
     ClientStreamLimits,
     Connection,
     PartitionTopology,
@@ -81,6 +80,8 @@ class _ScriptDoneError(Exception):
 class _DuplexToy(Model):
     """One partition whose loop consumes a stream the client feeds."""
 
+    consumer = "ear"
+
     def __init__(self, consumer_input="audio_in"):
         self._consumer_input = consumer_input
 
@@ -89,7 +90,7 @@ class _DuplexToy(Model):
 
     def get_graph_walk_graphs(self):
         return {"listen": Loop(name="listen_loop", max_iters=1000, outputs=[], section=GraphNode(
-            name="ear", input_names=[self._consumer_input], consumes_stream=True,
+            name=self.consumer, input_names=[self._consumer_input], consumes_stream=True,
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="text", output_modality="text")],
         ))}
 
@@ -207,15 +208,35 @@ def _reads_done(rid, *entities):
             for e in entities]
 
 
-def test_dispatch_tells_the_data_worker_the_consumers_ranks_once(tmp_path, monkeypatch):
-    """After the workers' NEW_REQUESTs, which the items must not overtake on a
-    rank; the conductor forwards none itself."""
-    c = _conductor(tmp_path, monkeypatch)
+@pytest.mark.parametrize("streams", [["audio_in"], ["audio_in", "video_in"]])
+def test_dispatch_tells_the_data_worker_the_consumers_ranks_once(tmp_path, monkeypatch, streams):
+    """For every client stream, after the workers' NEW_REQUESTs, once dispatch
+    can't fail: every rank that gets items then holds the request and gets its
+    REMOVE. (A rank parks items that arrive before its NEW_REQUEST.) The
+    conductor forwards none."""
+    c = _conductor(tmp_path, monkeypatch, model=_AudioAndVideo() if len(streams) == 2 else None)
     _run(c, [[_new_request("r")]])
 
-    assert _routes(c, "r") == [{"audio_in": ["worker_0"]}]
+    assert _routes(c, "r") == [dict.fromkeys(streams, ["worker_0"])]
+    assert [body.nodes for _k, _e, body in _sends(c, "CLIENT_STREAM_ROUTE")] == [dict.fromkeys(streams, "ear")]
     kinds = [kind for kind, _e, body in _sends(c, "NEW_REQUEST", "CLIENT_STREAM_ROUTE", "INPUT_SIGNALS")]
     assert kinds == ["NEW_REQUEST", "CLIENT_STREAM_ROUTE"]
+
+
+def test_the_route_names_the_consumer_as_the_deployment_shaped_it(tmp_path, monkeypatch):
+    """A model may shape its walks from the deployment, as BAGEL's
+    get_worker_graphs does, and only the conductor's copy of it is shaped:
+    the data worker addresses items to the node the route names."""
+    class _Placed(_DuplexToy):
+        def get_worker_graphs(self, config_path):
+            self.consumer = "placed_ear"
+            return super().get_worker_graphs(config_path)
+
+    c = _conductor(tmp_path, monkeypatch, model=_Placed(), node_groups=[{"node_names": ["placed_ear"], "ranks": [0]}])
+    _run(c, [[_new_request("r")]])
+
+    (route,) = [body for _k, _e, body in _sends(c, "CLIENT_STREAM_ROUTE")]
+    assert (route.nodes, route.workers) == ({"audio_in": "placed_ear"}, {"audio_in": ["worker_0"]})
 
 
 def test_the_consuming_partitions_end_sends_the_route_again_empty(tmp_path, monkeypatch):
@@ -253,8 +274,8 @@ def test_a_call_with_open_input_is_refused_at_the_cap(tmp_path, monkeypatch):
 
 
 def test_completion_drains_the_workers_too(tmp_path, monkeypatch):
-    # A chunk forwarded just before the model ended the request may still be
-    # in a worker's read, so teardown waits for the workers' READS_DONE.
+    # An item the data worker sent just before the model ended the request may
+    # still be in a worker's read, so teardown waits for the workers' READS_DONE.
     c = _conductor(tmp_path, monkeypatch)
     _run(c, [[_new_request("r")], [_partition_done(c, "r")]])
 
@@ -285,14 +306,11 @@ def test_a_client_stream_with_a_shard_dim_is_refused(tmp_path, monkeypatch):
 
 
 def test_the_route_encodes_without_pickle():
-    consumers = find_client_streams(_DuplexToy())
-    body = ClientStreamRoute(request_id="r", workers={"audio_in": ["worker_0", "worker_1"]}, consumers=consumers)
+    body = ClientStreamRoute(request_id="r", workers={"audio_in": ["worker_0", "worker_1"]}, nodes={"audio_in": "ear"})
     msg = WorkerMessage(message_type=WorkerMessageType.CLIENT_STREAM_ROUTE, body=body)
     # typed fields, not the pickle fallback; the envelope finds it by its tag
     assert wire._encoder(ClientStreamRoute).__name__ == "_encode_dataclass"
-    decoded = wire.decode(wire.encode(msg))
-    assert decoded.body.request_id == "r" and decoded.body.workers == {"audio_in": ["worker_0", "worker_1"]}
-    assert decoded.body.consumers == consumers == {"audio_in": ClientStream("ear", "listen", "Ear")}
+    assert wire.decode(wire.encode(msg)).body == body
 
 
 def _stub_worker(sbuf):
@@ -398,12 +416,16 @@ def test_a_client_stream_that_declares_audio_needs_looped_output():
     assert check_client_streams(_Unmarked(), {}) == check_client_streams(_Marked(), {}) == []
 
 
-def test_a_client_stream_into_no_partition_fails_at_startup():
-    class _Nowhere(_DuplexToy):
+def test_each_client_stream_into_no_partition_fails_at_startup():
+    """Every one is reported: validate_deployment lists every problem at once."""
+    class _Nowhere(_AudioAndVideo):
         def get_partition_topology(self):
-            return PartitionTopology(partitions=["Ear"], connections=[_client_connection("audio_in", "Mouth")])
+            return PartitionTopology(partitions=["Ear"], connections=[
+                _client_connection("audio_in", "Mouth"), _client_connection("video_in", "Nose"),
+            ])
 
-    assert _refused(_Nowhere(), "'Mouth', which is not a partition")
+    mouth, nose = check_client_streams(_Nowhere(), {})
+    assert "'Mouth', which is not a partition" in mouth and "'Nose', which is not a partition" in nose
 
 
 class _AudioAndVideo(_DuplexToy):
@@ -419,13 +441,6 @@ class _AudioAndVideo(_DuplexToy):
         return PartitionTopology(partitions=["Ear"], connections=[
             _client_connection("audio_in"), _client_connection("video_in"),
         ])
-
-
-def test_every_client_stream_is_routed(tmp_path, monkeypatch):
-    c = _conductor(tmp_path, monkeypatch, model=_AudioAndVideo())
-    _run(c, [[_new_request("r")]])
-
-    assert _routes(c, "r") == [{"audio_in": ["worker_0"], "video_in": ["worker_0"]}]
 
 
 def test_a_client_streams_consumer_must_be_its_partitions_and_the_only_one():

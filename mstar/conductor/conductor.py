@@ -560,20 +560,16 @@ class Conductor:
             for walk in wg.graph_walks
         }
         self.default_sharding_config.assert_streams_keep_tp_size(sorted(stream_edges))
-        # The data worker sends each rank of a client stream's consumer the whole item.
-        sharded = sorted(
-            name for name in self._client_streams
-            if self.default_sharding_config.shard_dim.get(name) is not None
-        )
-        if sharded:
-            raise ValueError(
-                f"client stream(s) {sharded} have a shard_dim; a client stream reaches "
-                "every rank of its consumer whole: drop its sharding_config.shard_dim entry"
-            )
 
         topology = model.get_partition_topology()
         self.producer_triggered_partitions: set[str] = (
             topology.producer_triggered_partitions() if topology else set()
+        )
+        # Fed by a stream, from another partition or the client: such a
+        # partition self-triggers via StreamBuffer, and its worker signals
+        # partition_done directly.
+        self._stream_fed_partitions: set[str] = (
+            {conn.to_partition for conn in topology.connections} if topology else set()
         )
         if topology:
             topology.check_walk_driving_connections()
@@ -993,13 +989,6 @@ class Conductor:
                     node_to_workers[NodeAndGraphWalk(node_name, walk)] = worker_ids
         cfg.setup(node_to_workers)
         cfg.assert_stream_consumer_compatibility(self.streaming_consumers)
-        # an unmapped consumer would fan its client stream out to the entity ""
-        unmapped = sorted(
-            name for name, stream in self._client_streams.items()
-            if NodeAndGraphWalk(stream.node, stream.graph_walk) not in cfg.group_mapping
-        )
-        if unmapped:
-            raise ValueError(f"client stream(s) {unmapped} have a consumer in no worker group")
         return cfg
 
     def _split_inputs_to_workers(
@@ -1427,9 +1416,11 @@ class Conductor:
         request_data.resource_configs = without_layouts(request_data.resource_configs)
 
         if self._client_streams:
-            # After the workers' NEW_REQUESTs; a stream whose partition this
-            # request doesn't run takes nothing. Each item goes whole to the
-            # ranks a one-rank source fans a replicated edge out to.
+            # Once dispatch can no longer fail, so every rank the data worker
+            # sends items to holds the request and gets its REMOVE (a rank
+            # parks items that beat its NEW_REQUEST). A stream whose partition
+            # this request doesn't run takes nothing. Each item goes whole to
+            # the ranks a one-rank source fans a replicated edge out to.
             cfg = request_data.sharding_config
             self._send_client_route(body.request_id, {
                 name: [] if partition_states[stream.partition].is_done
@@ -1871,11 +1862,7 @@ class Conductor:
         pstate = request_data.partition_states[partition_name]
 
         incoming_connections = request_data.get_incoming_connections(partition_name)
-        # A partition that self-triggers via StreamBuffer, fed by another
-        # partition or the client: the worker signals partition_done directly.
-        stream_fed = bool(incoming_connections) or any(
-            stream.partition == partition_name for stream in self._client_streams.values()
-        )
+        stream_fed = partition_name in self._stream_fed_partitions
         if stream_fed and partition_done_from_worker:
             pstate.is_done = True
 
@@ -2058,11 +2045,14 @@ class Conductor:
 
     def _send_client_route(self, request_id: str, workers: dict[str, list[str]]) -> None:
         """Tell the data worker, which sends a request's client stream items to
-        their consumers itself, where each of ``workers``' streams goes."""
+        their consumers itself, where each of ``workers``' streams goes: its
+        consuming node, which the data worker's own copy of the model can't
+        resolve (the deployment never shaped its walks), and the node's ranks."""
         self.communicator.send(self.PREPROCESS_WORKER, WorkerMessage(
             message_type=WorkerMessageType.CLIENT_STREAM_ROUTE,
             body=ClientStreamRoute(
-                request_id=request_id, workers=workers, consumers=self._client_streams,
+                request_id=request_id, workers=workers,
+                nodes={name: self._client_streams[name].node for name in workers},
             ),
         ))
 

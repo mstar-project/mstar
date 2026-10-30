@@ -3,10 +3,11 @@
 ``/generate/ws`` keeps a client-stream request's input open and feeds its
 ``append`` messages to ``APIServer.stream_input``; the preprocess thread turns
 each append into stream items with ``Model.process_stream_chunk``, stores
-them, and sends them as ``INPUT_SIGNALS`` straight to the ranks the
-conductor's ``CLIENT_STREAM_ROUTE`` names, then each stream's end with its
-count. Tensors ``process_prompt`` returns under a client edge's name become
-the stream's first chunk, so a one-shot request is a stream of one chunk.
+them, and sends them as ``INPUT_SIGNALS`` straight to the consuming node and
+ranks the conductor's ``CLIENT_STREAM_ROUTE`` names, then each stream's end
+with its count. Tensors ``process_prompt`` returns under a client edge's name
+become the stream's first chunk, so a one-shot request is a stream of one
+chunk.
 """
 from __future__ import annotations
 
@@ -34,8 +35,8 @@ from mstar.api_server.request_types import (  # noqa: E402
     PreprocessInput,
     RequestComplete,
 )
-from mstar.conductor.request_info import PartitionDefinition  # noqa: E402
-from mstar.graph.base import GraphNode, TensorPointerInfo  # noqa: E402
+from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
+from mstar.graph.base import TensorPointerInfo  # noqa: E402
 from mstar.model.base import TensorAndMetadata  # noqa: E402
 from mstar.profile.format import RequestProfile, RequestTiming  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
@@ -44,7 +45,6 @@ from mstar.streaming.topology import (  # noqa: E402
     ClientStreamLimits,
     Connection,
     PartitionTopology,
-    find_client_streams,
 )
 from mstar.utils.ipc_format import (  # noqa: E402
     ClientStreamRoute,
@@ -56,6 +56,8 @@ from mstar.utils.ipc_format import (  # noqa: E402
 
 # the end of every stream _ListeningModel takes
 END = frozenset({"audio_in"})
+# each client stream's consuming node, as the conductor's route names it
+CONSUMERS = {"audio_in": "ear", "video_in": "eye"}
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +68,8 @@ def _headerless_audio(monkeypatch):
 
 
 class _ListeningModel:
-    """Raw float32 files in; ``audio_in`` stream items out."""
+    """Raw float32 files in; ``audio_in`` stream items out. No walks: the
+    data worker addresses items to the node the conductor's route names."""
 
     def __init__(self):
         self.chunk_calls = []
@@ -82,13 +85,6 @@ class _ListeningModel:
             Connection(from_partition=CLIENT, to_partition="Ear", edge_name="audio_in",
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1)),
         ])
-
-    def get_graph_walk_graphs(self):
-        streams = [conn.edge_name for conn in self.get_partition_topology().client_connections()]
-        return {"listen": GraphNode(name="ear", input_names=streams, consumes_stream=True, outputs=[])}
-
-    def get_partitions(self):
-        return [PartitionDefinition(name="Ear", graph_walks={"listen"}, initial_walk="listen")]
 
     def load_audio(self, filepath, device):
         data = torch.frombuffer(bytearray(open(filepath, "rb").read()), dtype=torch.float32)
@@ -158,20 +154,18 @@ def _thread(model=None, is_pending=None, model_config=None, routed=()):
     NEW_REQUEST has gone, as its dispatch does."""
     sent = []
     tm = _TensorManager()
-    model = model or _ListeningModel()
     queues = {name: queue.Queue() for name in (
         "in_queue", "result_tensor_queue", "out_queue", "profile_queue", "cleanup_request_queue",
         "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
     )}
     wt = PreprocessWorkerThread(
         **queues, stop_event=threading.Event(),
-        communicator=SimpleNamespace(
-            send=lambda entity, msg: sent.append((entity, msg)),
+        communicator=OutboxCommunicator(SimpleNamespace(
             codec=SimpleNamespace(encode=lambda msg: msg),  # sends arrive as objects
             try_send_bytes=lambda entity, msg: sent.append((entity, msg)) or True,
-            get_all_new_messages=_routed_once_opened(sent, model, *routed),
-        ),
-        tensor_manager=tm, model=model, is_pending=is_pending,
+            get_all_new_messages=_routed_once_opened(sent, *routed),
+        )),
+        tensor_manager=tm, model=model or _ListeningModel(), is_pending=is_pending,
         model_config=model_config,
     )
     return wt, sent, tm
@@ -187,18 +181,19 @@ def _bodies(sent, kind):
     return [msg.body for _entity, msg in sent if msg.message_type == kind]
 
 
-def _route_msg(model, rid="r", **workers):
+def _route_msg(rid="r", **workers):
     """The conductor's route for ``rid``; ``audio_in`` to ``w0`` by default."""
+    workers = workers or {"audio_in": ["w0"]}
     return WorkerMessage(WorkerMessageType.CLIENT_STREAM_ROUTE, ClientStreamRoute(
-        request_id=rid, workers=workers or {"audio_in": ["w0"]}, consumers=find_client_streams(model),
+        request_id=rid, workers=workers, nodes={name: CONSUMERS[name] for name in workers},
     ))
 
 
 def _route(wt, rid="r", **workers):
-    wt._route_client_streams(_route_msg(wt.model, rid, **workers).body)
+    wt._route_client_streams(_route_msg(rid, **workers).body)
 
 
-def _routed_once_opened(sent, model, *rids):
+def _routed_once_opened(sent, *rids):
     """An inbox that delivers each of ``rids``' routes once its NEW_REQUEST
     has gone, as the conductor's dispatch does."""
     due = list(rids)
@@ -208,7 +203,7 @@ def _routed_once_opened(sent, model, *rids):
         ready = [rid for rid in due if rid in opened]
         for rid in ready:
             due.remove(rid)
-        return [_route_msg(model, rid) for rid in ready]
+        return [_route_msg(rid) for rid in ready]
 
     return inbox
 
@@ -249,6 +244,7 @@ def test_an_append_goes_straight_to_each_rank_of_its_consumer(tmp_path):
     assert _signals(sent) == [("w0", "audio_in", [[4]], {}), ("w1", "audio_in", [[4]], {})]
     (_entity, msg), _ = [(e, m) for e, m in sent if m.message_type == WorkerMessageType.INPUT_SIGNALS]
     (edge,) = msg.body.inputs
+    # the node from the route, the partition from the topology
     assert (edge.next_node, edge.is_streaming, msg.body.partition_name) == ("ear", True, "Ear")
     assert msg.body.request_info is None
     (info,) = edge.tensor_info
@@ -302,20 +298,28 @@ def test_input_before_the_route_is_held_then_sent_in_order(tmp_path):
     assert set(tm.refs.values()) == {1}  # one reader each, the hold gone
 
 
-def test_a_stream_whose_partition_ended_answers_later_appends_as_late(tmp_path):
-    """The conductor's route names no rank for it any more."""
+@pytest.mark.parametrize("held", [False, True])
+def test_a_stream_whose_partition_ended_answers_later_appends_as_late(tmp_path, held):
+    """The conductor's route names no rank for it any more. An append held
+    for the first route is answered once that route names none (the
+    partition never ran), as one sent after it is."""
     wt, sent, tm = _thread()
     _open(wt)
-    _route(wt)
-    _route(wt, audio_in=[])
+    if not held:
+        _route(wt)
+        _route(wt, audio_in=[])
     late = []
 
     wt._process_stream_input(ClientAppend(
         "r", file_paths={"audio": [_audio_file(tmp_path, "c.raw", 4)]}, on_late=late.append,
     ))
+    if held:
+        _route(wt, audio_in=[])
 
     assert late == ["the call's 'audio_in' input has ended"]
-    assert _signals(sent) == [] and tm.refs == {}
+    assert _signals(sent) == []
+    # stored only to be held for the route, which then frees them
+    assert (not any(tm.refs.values())) if held else tm.refs == {}
 
 
 def test_a_call_that_drains_before_its_route_sends_nothing(tmp_path):
@@ -344,7 +348,7 @@ def test_a_route_that_fails_fails_its_call_alone(tmp_path):
         raise RuntimeError("the store refused")
 
     tm.increment_ref_batch_uniform = refuse
-    batch = [_route_msg(wt.model, "r"), WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("q"))]
+    batch = [_route_msg("r"), WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("q"))]
     wt.communicator.get_all_new_messages = lambda: batch
     wt._process_messages()
 
@@ -557,14 +561,15 @@ def test_a_deployment_lowers_a_streams_max_items(tmp_path):
 
 
 class _TwoStreams(_ListeningModel):
-    """``audio_in`` and ``video_in``; a file that names no stream goes to video_in."""
+    """``audio_in`` into Ear and ``video_in`` into Eye; a file that names no
+    stream goes to video_in."""
 
     def get_partition_topology(self):
-        return PartitionTopology(partitions=["Ear"], connections=[
-            Connection(from_partition=CLIENT, to_partition="Ear", edge_name=name,
+        return PartitionTopology(partitions=["Ear", "Eye"], connections=[
+            Connection(from_partition=CLIENT, to_partition=partition, edge_name=name,
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
                        limits=ClientStreamLimits(max_items=10))
-            for name in ("audio_in", "video_in")
+            for name, partition in (("audio_in", "Ear"), ("video_in", "Eye"))
         ])
 
     def process_stream_chunk(self, chunk):
@@ -602,6 +607,20 @@ def test_items_the_model_routes_to_an_ended_stream_are_late_and_neither_charged_
     ]
     assert wt._client_calls["r"].charged == {"video_in": 1, "audio_in": 1}
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("ends", [{"audio_in"}, {"audio_in", "video_in"}])
+def test_an_opening_ends_just_the_streams_it_names(ends):
+    """A stream it leaves open makes the call live (refused, not queued, at
+    the cap). Each stream it ends gets its end in its own partition, even
+    beside another partition's on one rank."""
+    wt, sent, _tm = _thread(_TwoStreams())
+    _open(wt, ends=frozenset(ends))
+    _route(wt, audio_in=["w0"], video_in=["w0"])
+
+    assert _bodies(sent, ConductorMessageType.NEW_REQUEST)[0].input_open == ("video_in" not in ends)
+    done = sorted((b.partition_name, b.producer_done_items) for b in _bodies(sent, WorkerMessageType.INPUT_SIGNALS))
+    assert done == [("Ear", {"audio_in": 0}), ("Eye", {"video_in": 0})][:len(ends)]
 
 
 class _RecordingPreprocess:

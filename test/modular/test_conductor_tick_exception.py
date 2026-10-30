@@ -116,6 +116,7 @@ def _conductor(*ticks, requests):
     c._drain_ttl_s = 120.0
     c.worker_graphs = {0: SimpleNamespace(graph_walks={"decode"})}
     c.producer_triggered_partitions = set()
+    c._stream_fed_partitions = set()
     c._client_streams = {}
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}}
     c._wait_for_workers_ready = lambda: None

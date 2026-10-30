@@ -11,7 +11,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from mstar.model.components.fastconformer import FastConformerConfig, check_nemo_preprocessor
+from mstar.model.components.audio_features import check_nemo_preprocessor
+from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
 
 KV_CACHE = "kv_cache"
@@ -25,6 +26,7 @@ DECODE_LOOP = "decode_loop"
 # the featurizer this model serves with: NemoLogMel's defaults, unpadded
 MEL_SETTINGS = dict(
     sample_rate=16_000, n_fft=512, window_size=0.025, window_stride=0.01, normalize="per_feature", pad_to=0,
+    preemph=0.97,
 )
 
 

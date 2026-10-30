@@ -212,6 +212,7 @@ def _conductor(passes=1):
     c = object.__new__(Conductor)
     c.model = _EndsLLM(passes)
     c.producer_triggered_partitions = set()
+    c._stream_fed_partitions = {"SNAC"}
     c._client_streams = {}
     c.enable_prof = False
     c.communicator = _Capture()

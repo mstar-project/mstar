@@ -174,6 +174,13 @@ class InlineToken:
     modality: str
 
 
+def _answer_late(on_late: Callable[[str], None] | None, streams: list[str]) -> None:
+    """Answer a client's append as late, naming ``streams``, which take no
+    more items."""
+    if streams and on_late is not None:
+        on_late(f"the call's {', '.join(map(repr, sorted(streams)))} input has ended")
+
+
 def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
     """Delete a message's uploaded files; one already gone or unremovable is skipped."""
     for paths in (file_paths or {}).values():
@@ -528,8 +535,11 @@ class ClientCall:
     # the conductor's dispatch CLIENT_STREAM_ROUTE, with a later route's rank
     # lists merged in; None until it arrives
     route: ClientStreamRoute | None = None
-    # items stored before the route arrived, sent in this order once it does
-    held: list[dict[str, list[TensorPointerInfo]]] = field(default_factory=list)
+    # items stored before the route arrived, each with its append's on_late,
+    # sent in this order once it does
+    held: list[tuple[dict[str, list[TensorPointerInfo]], Callable[[str], None] | None]] = field(
+        default_factory=list,
+    )
     # stream edge -> items sent to each of its ranks
     items_sent: dict[str, int] = field(default_factory=dict)
     # streams that take no more items: the client ended them, or their
@@ -583,10 +593,13 @@ class PreprocessWorkerThread:
         self._keyed_labels = {
             key: by_label for key, by_label in declared.items() if key in self._prefix_page_sizes
         }
+        # client stream edge -> the partition it flows into, which its items and
+        # ends name; the consuming node comes in the conductor's route
+        self._client_partitions = {
+            conn.edge_name: conn.to_partition for conn in model.get_partition_topology().client_connections()
+        } if model is not None else {}
         # tensors under these names are client stream items, not prompt signals
-        self._client_edges = frozenset(
-            conn.edge_name for conn in model.get_partition_topology().client_connections()
-        ) if model is not None else frozenset()
+        self._client_edges = frozenset(self._client_partitions)
         self._model_config = model_config
         # per request of a model with client streams, those streams' state
         self._client_calls: dict[str, ClientCall] = {}
@@ -788,7 +801,7 @@ class PreprocessWorkerThread:
             self._charge_stream_items(call, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
         if stream_items:
-            call.held.append(self._store_held(input.request_id, stream_items))
+            call.held.append((self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         self.request_output_state[input.request_id] = RequestOutputState()
@@ -870,7 +883,7 @@ class PreprocessWorkerThread:
                 self._charge_stream_items(call, items)
             items = {name: tensors for name, tensors in items.items() if tensors}
             if items:
-                self._send_stream_items(request_id, call, self._store_held(request_id, items))
+                self._send_stream_items(request_id, call, self._store_held(request_id, items), chunk.on_late)
             ending = chunk.ends - call.ended
             call.ended |= ending
             if ending and call.route is not None:  # else they go once the route arrives
@@ -886,11 +899,10 @@ class PreprocessWorkerThread:
         any more: they are neither charged nor sent, and the append is
         answered as late, as one that names an ended stream is. The API server
         can't tell for a file that names no stream: the model routes it."""
-        late = sorted(name for name, tensors in items.items() if tensors and name in call.ended)
+        late = [name for name, tensors in items.items() if tensors and name in call.ended]
         if not late:
             return items
-        if chunk.on_late is not None:
-            chunk.on_late(f"the call's {', '.join(map(repr, late))} input has ended")
+        _answer_late(chunk.on_late, late)
         return {name: tensors for name, tensors in items.items() if name not in late}
 
     def _route_client_streams(self, body: ClientStreamRoute) -> None:
@@ -910,47 +922,54 @@ class PreprocessWorkerThread:
         if not first or self._torn_down(request_id):
             return  # torn down: REMOVE frees what is held
         held, call.held = call.held, []
-        for signals in held:
-            self._send_stream_items(request_id, call, signals)
+        for signals, on_late in held:
+            self._send_stream_items(request_id, call, signals, on_late)
         self._send_ends(request_id, call, call.ended)
 
     def _send_stream_items(
         self, request_id: str, call: ClientCall, signals: dict[str, list[TensorPointerInfo]],
+        on_late: Callable[[str], None] | None,
     ) -> None:
         """Send stored items to their streams' consumer ranks, each rank one
         reader of them, and drop the store's own hold; before the route
-        arrives, hold them."""
+        arrives, hold them. Items held for a stream the route gives no rank
+        (its partition never ran, which no model's does yet) are dropped and
+        their append answered as late; an append that also carried items for
+        a stream already ended gets a second answer."""
         if call.route is None:
-            call.held.append(signals)
+            call.held.append((signals, on_late))
             return
+        late = []
         for name, infos in signals.items():
             uuids = [info.uuid for info in infos]
             ranks = call.route.workers.get(name, ())
             if ranks:
                 self.tensor_manager.increment_ref_batch_uniform(uuids, len(ranks))
-                stream = call.route.consumers[name]
+                edge = GraphEdge(next_node=call.route.nodes[name], name=name, tensor_info=infos, is_streaming=True)
                 body = InputSignals(
-                    request_id=request_id,
-                    inputs=[GraphEdge(next_node=stream.node, name=name, tensor_info=infos, is_streaming=True)],
-                    request_info=None, partition_name=stream.partition,
+                    request_id=request_id, inputs=[edge], request_info=None,
+                    partition_name=self._client_partitions[name],
                 )
-                for worker in ranks:
-                    self.communicator.send(worker, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, body))
+                self.communicator.send_each(ranks, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, body))
                 call.items_sent[name] = call.items_sent.get(name, 0) + len(infos)
+            else:
+                late.append(name)
             self.tensor_manager.dereference_batch_uniform(uuids)
+        _answer_late(on_late, late)
 
     def _send_ends(self, request_id: str, call: ClientCall, names: Collection[str]) -> None:
         """Each rank of ``names``' consumers gets one ``producer_done`` from
-        ``CLIENT`` naming the streams it ends there, with the items each
-        carried, on the FIFO its items took, so it can't overtake them."""
-        per_rank: dict[str, dict[str, int]] = {}
+        ``CLIENT`` per partition, naming the streams it ends there, with the
+        items each carried, on the FIFO its items took, so it can't overtake
+        them."""
+        ends: dict[tuple[str, str], dict[str, int]] = {}
         for name in sorted(names):
+            partition = self._client_partitions[name]
             for worker in call.route.workers.get(name, ()):
-                per_rank.setdefault(worker, {})[name] = call.items_sent.get(name, 0)
-        for worker, counts in per_rank.items():
+                ends.setdefault((worker, partition), {})[name] = call.items_sent.get(name, 0)
+        for (worker, partition), counts in ends.items():
             self.communicator.send(worker, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
-                request_id=request_id, inputs=[], request_info=None,
-                partition_name=call.route.consumers[next(iter(counts))].partition,
+                request_id=request_id, inputs=[], request_info=None, partition_name=partition,
                 producer_done={CLIENT}, producer_done_items=counts,
             )))
 
@@ -1829,13 +1848,15 @@ class PreprocessWorkerThread:
                     # sees it set, so the conductor gets ENABLE_METRICS first
                     self._send_enable_metrics_if_requested()
                     # Releases queued before this request was submitted belong
-                    # to an earlier request under its id: apply them first. And
-                    # a call's route, so its items wait behind no other input.
+                    # to an earlier request under its id: apply them first.
                     self._process_releases()
-                    try:
-                        self._process_messages()
-                    except Exception:  # noqa: BLE001 — the pass's inputs still go
-                        logger.exception("PreprocessWorkerThread message handling failed")
+                    if self._client_edges:
+                        # Routes too, so a call's held items go out before this
+                        # input, which may be a multi-second media preprocess.
+                        try:
+                            self._process_messages()
+                        except Exception:  # noqa: BLE001 — the pass's inputs still go
+                            logger.exception("PreprocessWorkerThread message handling failed")
                     try:
                         self._process_waiting_input(pre_input)
                     except Exception:  # noqa: BLE001 — the pass's other input still goes
