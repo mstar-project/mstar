@@ -213,6 +213,12 @@ def test_a_lockstep_instance_refuses_a_device_collective():
         instance.all_gather(torch.zeros(2))
 
 
+def test_a_group_init_dist_has_not_set_up_refuses_a_barrier():
+    """torch reads ``group=None`` as the whole world, which may be wider."""
+    with pytest.raises(ValueError, match="cpu_group"):
+        _tp([0, 1]).barrier()
+
+
 @pytest.mark.parametrize(
     ("device_type", "device_backend", "expected_backend"),
     [

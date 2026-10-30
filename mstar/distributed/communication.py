@@ -157,6 +157,11 @@ class CommGroup:
         """On the host: waits on the other ranks, never on a device."""
         if self.world_size == 1:
             return
+        if self.cpu_group is None:
+            # torch reads ``group=None`` as the whole world
+            raise ValueError(
+                f"barrier over ranks {self.group_members} before init_dist set up their cpu_group"
+            )
         dist.barrier(group=self.cpu_group)
 
     def all_reduce_buffer(
