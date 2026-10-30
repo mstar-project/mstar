@@ -1143,9 +1143,10 @@ def declared_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     pools' steps for a node whose segments lay out its rows (``lora_segment_rows``), so
     a model declaring LoRA from its modules writes no LoRA step."""
     step = submodule.declare_step(*args, **kwargs)
-    # the engine drives duck-typed submodules too; a node with pools bound is a NodeSubmodule
+    # the engine drives duck-typed submodules too; one with pools bound is a NodeSubmodule,
+    # whose binding required lora_segment_rows
     keys = getattr(submodule, "lora_keys", ())
-    if step is None or not keys or not submodule.lora_segment_rows:
+    if step is None or not keys:
         return step
     if step.segments is None:
         raise ValueError(
