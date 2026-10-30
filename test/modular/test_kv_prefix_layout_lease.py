@@ -27,7 +27,8 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.engine.resources import StepContext
 from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, Span
@@ -282,3 +283,70 @@ def test_a_prompt_prefilled_beside_a_decode_is_matched_by_its_repeat():
     assert node.walk(TEXT_WALK, len(prompt)) == 2 * PAGE_SIZE, (
         "a prompt prefilled in a step of a combined walk filed no pages, so its repeat recomputed it"
     )
+
+
+class _OneRowNode(_TextNode):
+    """A prefill that writes every part of the prompt as one row, after an earlier request did."""
+
+    def __init__(self, parts: list = PARTS):
+        super().__init__()
+        self.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((TEXT_WALK,), ("decode",))})
+        self.runner.ingest_request("seed", {"kv": _config(PARTS, image_walk=TEXT_WALK)})
+        self.step("seed", sum(slots for _, slots in _walks(PARTS)), TEXT_WALK)
+        self.runner.ingest_request(RID, {"kv": _config(parts, image_walk=TEXT_WALK)})
+
+    def probe(self, length: int, **inputs):
+        row = ARNodeInputs(input_seq_len=length, **inputs)
+        prefix = self.runner.resolve_cached_prefix(RID, NODE, TEXT_WALK, row)
+        self.runner.apply_cached_prefix(RID, NODE, TEXT_WALK, row, prefix)
+        return prefix
+
+
+def test_one_row_over_several_spans_is_served_its_share_and_runs_the_rest():
+    node, slots = _OneRowNode(), len(TEXT) + IMAGE + len(TAIL)
+
+    prefix = node.probe(slots, custom_pos_ids=torch.zeros(3, slots))
+
+    # four pages: the text, the image, which moves the position by one, and 14 of the tail's slots
+    assert (prefix.tokens, prefix.position) == (64, len(TEXT) + 1 + 14)
+    assert node.kv._streams[RID]["main"].lease is not None, "the row's probe gave up the lease it answered from"
+    node.step(RID, slots - prefix.tokens, TEXT_WALK)
+    stream = node.kv._streams[RID]["main"]
+    assert stream.stored_len == slots and stream.chain is not None, "the row's tail dropped the request's chain"
+    assert stream.span_cursor.done == len(PARTS)
+
+
+def test_a_row_the_layout_does_not_add_up_to_ends_the_chain():
+    node = _OneRowNode()
+
+    assert node.probe(len(TEXT) + IMAGE + 1) is None
+    assert node.kv._streams[RID]["main"].chain is None
+
+
+@pytest.mark.parametrize(("present", "tokens", "position"), [
+    (0, 0, 0),
+    (16, 16, 16),
+    # inside the image: a partly held item doesn't move the position, as its write still runs
+    (48, 48, 20),
+    (50, 50, 21),
+    (64, 64, 35),
+    (75, 75, 46),
+])
+def test_a_row_answers_for_the_spans_it_fills_up_to_what_the_stream_holds(present, tokens, position):
+    cursor = manager_mod.SpanCursor((
+        PrefixSpan(20, 20, TEXT_WALK), PrefixSpan(30, 1, TEXT_WALK, digest=DIGEST), PrefixSpan(25, 25, TEXT_WALK),
+    ))
+
+    answer = KVManager._answer("main", cursor, present, cursor.spans_of_write(TEXT_WALK, 75))
+
+    assert (answer.tokens, answer.position) == (tokens, position)
+    assert cursor.probed == 0 and cursor.probed_spans == 3
+
+
+def test_a_write_fills_spans_only_of_its_walk_and_only_whole():
+    cursor = manager_mod.SpanCursor((
+        PrefixSpan(10, 10, TEXT_WALK), PrefixSpan(5, 1, TEXT_WALK), PrefixSpan(7, 7, IMAGE_WALK),
+    ))
+
+    assert [cursor.spans_of_write(TEXT_WALK, n) for n in (10, 15, 12, 22)] == [1, 2, None, None]
+    assert cursor.spans_of_write(IMAGE_WALK, 10) is None
