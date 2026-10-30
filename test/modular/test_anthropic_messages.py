@@ -283,6 +283,29 @@ def test_a_stream_the_engine_refuses_answers_with_its_status(client_and_stub):
     assert stub.aborted == []
 
 
+@pytest.mark.parametrize("model_name", ["glm52", "glm5_next"])
+def test_count_tokens_counts_what_the_real_model_returns(client_and_stub, model_name):
+    """Both GLM models answer process_prompt with a ProcessPromptOutput (their KV layout beside
+    the tensors), not a dict: the route counts its text_inputs (it was a 500)."""
+    from mstar.api_server.openai import serving_messages
+    from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+    from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
+    from mstar.model.glm52.glm52_model import Glm52Model
+
+    client, stub = client_and_stub
+    stub.model_name = model_name
+    stub.model = (Glm52Model("", tokenizer_mode="byte", config_variant="full") if model_name == "glm52"
+                  else Glm5NextModel(model_path_hf="", tokenizer_mode="byte"))
+    body = {"model": "glm", "messages": [{"role": "user", "content": "how many tokens is this?"}]}
+    req, _ = serving_messages.to_chat_request(body, counting=True)
+    args = ADAPTER_REGISTRY[model_name].chat_to_request(req, None)
+    out = stub.model.process_prompt(args.text, args.input_modalities, args.output_modalities, **args.model_kwargs)
+
+    r = client.post("/v1/messages/count_tokens", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"input_tokens": out.new_input_tensors["text_inputs"][0].numel()}
+
+
 def test_count_tokens_renders_the_prompt_the_model_would_get(client_and_stub):
     import torch
 

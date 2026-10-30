@@ -38,6 +38,7 @@ from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import rid, sse
 from mstar.api_server.openai.protocol import ChatCompletionRequest
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.model.base import ProcessPromptOutput
 
 _FIELDS = {"model", "messages", "system", "max_tokens", "stop_sequences", "stream", "temperature", "top_p",
            "top_k", "tools", "tool_choice", "thinking", "metadata"}
@@ -270,6 +271,8 @@ async def count_tokens(api, adapter, body) -> dict:
     args = adapter.chat_to_request(req, api.upload_dir)
     tensors = await asyncio.to_thread(
         api.model.process_prompt, args.text, args.input_modalities, args.output_modalities, **args.model_kwargs)
+    if isinstance(tensors, ProcessPromptOutput):  # a model that lays out its KV, both GLMs
+        tensors = tensors.new_input_tensors
     return {"input_tokens": sum(t.numel() for t in tensors.get("text_inputs", []))}
 
 
