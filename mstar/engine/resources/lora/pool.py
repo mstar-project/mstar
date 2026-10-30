@@ -558,10 +558,11 @@ class LoraAdapterPool(Resource):
     def ask(self, rid, node_name, graph_walk) -> AdmitOutcome | None:
         """`ASKS` for a row that will need a slot, or the outcome that fails a row whose
         adapter failed to read. None on a rank that doesn't decide, and for a base row, a
-        row that holds its slot, and an adapter with nothing for this pool."""
+        row that holds its slot or a reservation (asked again by another node the pool
+        serves), and an adapter with nothing for this pool."""
         del node_name, graph_walk
         # the steady state: a set check
-        if not self._decides or rid not in self._awaiting:
+        if not self._decides or rid not in self._awaiting or rid in self._reserved:
             return None
         with self._lock:
             name = self._adapter_of.get(rid)

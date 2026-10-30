@@ -621,6 +621,20 @@ def test_admission_holds_back_only_rows_that_need_a_slot_and_only_on_the_leader(
     assert not follower._reserved
 
 
+def test_a_request_asked_again_by_a_second_node_is_reserved_once(adapters):
+    """A pool serving two nodes is asked on the second once the first has admitted the
+    request: a second reservation would count a1 for good once the first is taken."""
+    _, paths = adapters
+    pool = make_pool(paths, max_slots=1)
+    runner = StepRunner({"lora": pool}, {"LLM": ["lora"], "vision": ["lora"]})
+    for rid, name in [("r1", "a1"), ("r2", "a2")]:
+        ingest(pool, rid, name)
+    assert admitted(runner, "r1") and admitted(runner, "r1", node="vision")
+    assert run_step(pool, ["r1"]).ok
+    runner.remove_request("r1")
+    assert admitted(runner, "r2")
+
+
 def test_a_request_on_a_resident_adapter_waits_for_its_host_copy(adapters):
     """a1 sits in an unheld slot but out of the host tier. A reservation pins no slot, so a
     miss admitted first could evict a1 and leave r's admit to read it: r is reserved only
