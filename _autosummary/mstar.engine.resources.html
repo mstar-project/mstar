@@ -832,6 +832,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep"><code class="docutils literal notranslate"><span class="pre">KVStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.combined_labels"><code class="docutils literal notranslate"><span class="pre">KVStep.combined_labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.commit"><code class="docutils literal notranslate"><span class="pre">KVStep.commit</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.commits"><code class="docutils literal notranslate"><span class="pre">KVStep.commits</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.eager_write"><code class="docutils literal notranslate"><span class="pre">KVStep.eager_write</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.fork_rids"><code class="docutils literal notranslate"><span class="pre">KVStep.fork_rids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.post_forks"><code class="docutils literal notranslate"><span class="pre">KVStep.post_forks</span></code></a></li>
@@ -963,6 +964,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.admit"><code class="docutils literal notranslate"><span class="pre">Resource.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">Resource.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.adopt_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.after_output_copy"><code class="docutils literal notranslate"><span class="pre">Resource.after_output_copy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.ask"><code class="docutils literal notranslate"><span class="pre">Resource.ask()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.bind_dependencies"><code class="docutils literal notranslate"><span class="pre">Resource.bind_dependencies()</span></code></a></li>
@@ -1111,6 +1113,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.admit_waiting"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_waiting()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.adopt_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.after_output_copy"><code class="docutils literal notranslate"><span class="pre">StepRunner.after_output_copy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.build_accelerator_graph_buffers"><code class="docutils literal notranslate"><span class="pre">StepRunner.build_accelerator_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.clear_preplan"><code class="docutils literal notranslate"><span class="pre">StepRunner.clear_preplan()</span></code></a></li>
@@ -2165,6 +2168,11 @@ resource stays free of the manager and its kernels.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.KVStep.commits">
+<span class="sig-name descname"><span class="pre">commits</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.resources.KVStep.commits" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.KVStep.eager_write">
 <span class="sig-name descname"><span class="pre">eager_write</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.KVStep.eager_write" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -2984,6 +2992,21 @@ raises if it still lacks them once <code class="docutils literal notranslate"><s
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.Resource.after_output_copy">
+<span class="sig-name descname"><span class="pre">after_output_copy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.after_output_copy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.after_output_copy" title="Link to this definition">#</a></dt>
+<dd><p>Called on the worker’s main thread once <code class="docutils literal notranslate"><span class="pre">step</span></code> has finished on the device and its outputs are
+sent. A copy to the host queued here runs behind that step’s own output copy.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.ResourceStep" title="mstar.engine.resources.step.ResourceStep"><em>ResourceStep</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -4382,6 +4405,19 @@ cache.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.StepRunner.after_output_copy">
+<span class="sig-name descname"><span class="pre">after_output_copy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.after_output_copy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.StepRunner.after_output_copy" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.StepRunner.apply_cached_prefix">
 <span class="sig-name descname"><span class="pre">apply_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.apply_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.StepRunner.apply_cached_prefix" title="Link to this definition">#</a></dt>
 <dd><p>Give every resource the agreed prefix, with the untrimmed inputs.</p>
@@ -5209,6 +5245,7 @@ conductor validates a deployment.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep"><code class="docutils literal notranslate"><span class="pre">KVStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.combined_labels"><code class="docutils literal notranslate"><span class="pre">KVStep.combined_labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.commit"><code class="docutils literal notranslate"><span class="pre">KVStep.commit</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.commits"><code class="docutils literal notranslate"><span class="pre">KVStep.commits</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.eager_write"><code class="docutils literal notranslate"><span class="pre">KVStep.eager_write</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.fork_rids"><code class="docutils literal notranslate"><span class="pre">KVStep.fork_rids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep.post_forks"><code class="docutils literal notranslate"><span class="pre">KVStep.post_forks</span></code></a></li>
@@ -5340,6 +5377,7 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.admit"><code class="docutils literal notranslate"><span class="pre">Resource.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">Resource.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.adopt_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.after_output_copy"><code class="docutils literal notranslate"><span class="pre">Resource.after_output_copy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.ask"><code class="docutils literal notranslate"><span class="pre">Resource.ask()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.bind_dependencies"><code class="docutils literal notranslate"><span class="pre">Resource.bind_dependencies()</span></code></a></li>
@@ -5488,6 +5526,7 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.admit_waiting"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_waiting()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.adopt_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.after_output_copy"><code class="docutils literal notranslate"><span class="pre">StepRunner.after_output_copy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.build_accelerator_graph_buffers"><code class="docutils literal notranslate"><span class="pre">StepRunner.build_accelerator_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.clear_preplan"><code class="docutils literal notranslate"><span class="pre">StepRunner.clear_preplan()</span></code></a></li>

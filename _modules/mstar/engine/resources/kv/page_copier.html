@@ -975,13 +975,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Both caches are laid out ``[layers, pages, ...]``, so a page is one contiguous</span>
 <span class="sd">block per layer, a layer stride apart. ``copy_`` of that strided view between</span>
 <span class="sd">device and pinned host memory blocks the host until the copy stream drains and</span>
-<span class="sd">runs at a fraction of the link's bandwidth. On CUDA and ROCm each page is</span>
-<span class="sd">instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync`` with the layer stride</span>
-<span class="sd">as its pitch: async, and run on the copy engines.</span>
+<span class="sd">runs at a fraction of the link's bandwidth. On CUDA and ROCm each run of pages</span>
+<span class="sd">adjacent in both caches is instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync``</span>
+<span class="sd">with the layer stride as its pitch: async, and run on the copy engines.</span>
 
 <span class="sd">`make_page_copier` picks the first copier that loads and passes a round trip,</span>
-<span class="sd">once per process: on CUDA `CudaBindingsCopier`, then `CudartCopier`; on ROCm</span>
-<span class="sd">`HipCopier`; then `TorchCopier`.</span>
+<span class="sd">once per process: on CUDA `CudartCopier`, then `CudaBindingsCopier`, whose calls</span>
+<span class="sd">drop the GIL; on ROCm `HipCopier`; then `TorchCopier`.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -989,6 +989,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">functools</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -1057,13 +1059,32 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">_Layout</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+    <span class="n">dst</span><span class="p">:</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span>
+    <span class="n">src</span><span class="p">:</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span>
+    <span class="n">width</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">height</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">dst_ptr</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">dst_pitch</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">dst_page</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">src_ptr</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">src_pitch</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">src_page</span><span class="p">:</span> <span class="nb">int</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">_Memcpy2DCopier</span><span class="p">(</span><span class="n">PageCopier</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""One ``cudaMemcpy2DAsync`` per page; subclasses supply the call and the</span>
-<span class="sd">    device's maximum pitch."""</span>
+<span class="w">    </span><span class="sd">"""One ``cudaMemcpy2DAsync`` per run of adjacent pages; subclasses supply the call and the device's</span>
+<span class="sd">    maximum pitch."""</span>
 
     <span class="c1"># Pitches above this are rejected by the runtime, e.g. a layer stride of a</span>
     <span class="c1"># cache over 2 GiB a layer; such copies go one row at a time instead.</span>
     <span class="n">_max_pitch</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># Each pair of caches is checked once, keyed by the two tensors' ids. The tensors are held weakly, so</span>
+        <span class="c1"># this process-wide copier doesn't keep a freed cache alive, and a later tensor with the same id is</span>
+        <span class="c1"># checked again.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_layouts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">_Layout</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_memcpy_2d</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">dpitch</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">spitch</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span>
@@ -1081,21 +1102,37 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">err</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"cudaMemcpy2DAsync failed with error </span><span class="si">{</span><span class="n">err</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">dst_pages</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">src_pages</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">src</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_Layout</span><span class="p">:</span>
         <span class="k">assert</span> <span class="n">dst</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span> <span class="ow">and</span> <span class="n">src</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span>
         <span class="k">assert</span> <span class="n">dst</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">src</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">and</span> <span class="n">dst</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">src</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
         <span class="k">assert</span> <span class="n">dst</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">:]</span> <span class="o">==</span> <span class="n">src</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">:]</span>
+        <span class="k">assert</span> <span class="n">dst</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">==</span> <span class="n">dst</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="ow">and</span> <span class="n">src</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">==</span> <span class="n">src</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">numel</span><span class="p">(),</span> <span class="p">(</span>
+            <span class="s2">"pages must sit back to back in each layer for a run of adjacent pages to be one copy"</span>
+        <span class="p">)</span>
         <span class="n">elt</span> <span class="o">=</span> <span class="n">dst</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
-        <span class="n">width</span> <span class="o">=</span> <span class="n">dst</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">elt</span>
-        <span class="n">dst_pitch</span><span class="p">,</span> <span class="n">dst_page</span> <span class="o">=</span> <span class="n">dst</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span> <span class="n">dst</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span>
-        <span class="n">src_pitch</span><span class="p">,</span> <span class="n">src_page</span> <span class="o">=</span> <span class="n">src</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span> <span class="n">src</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span>
-        <span class="n">dst_ptr</span><span class="p">,</span> <span class="n">src_ptr</span> <span class="o">=</span> <span class="n">dst</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">src</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span>
-        <span class="n">handle</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">cuda_stream</span>
+        <span class="k">return</span> <span class="n">_Layout</span><span class="p">(</span>
+            <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="n">dst</span><span class="p">),</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="n">src</span><span class="p">),</span> <span class="n">dst</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span> <span class="n">dst</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+            <span class="n">dst</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">dst</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span> <span class="n">dst</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span>
+            <span class="n">src</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">src</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span> <span class="n">src</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">dst_pages</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">src_pages</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
+        <span class="n">layout</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_layouts</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="nb">id</span><span class="p">(</span><span class="n">dst</span><span class="p">),</span> <span class="nb">id</span><span class="p">(</span><span class="n">src</span><span class="p">)))</span>
+        <span class="k">if</span> <span class="n">layout</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">layout</span><span class="o">.</span><span class="n">dst</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">dst</span> <span class="ow">or</span> <span class="n">layout</span><span class="o">.</span><span class="n">src</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">src</span><span class="p">:</span>
+            <span class="n">layout</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_layouts</span><span class="p">[</span><span class="nb">id</span><span class="p">(</span><span class="n">dst</span><span class="p">),</span> <span class="nb">id</span><span class="p">(</span><span class="n">src</span><span class="p">)]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_check</span><span class="p">(</span><span class="n">dst</span><span class="p">,</span> <span class="n">src</span><span class="p">)</span>
+        <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">dst_ptr</span><span class="p">,</span> <span class="n">dst_pitch</span><span class="p">,</span> <span class="n">dst_page</span><span class="p">,</span> <span class="n">src_ptr</span><span class="p">,</span> <span class="n">src_pitch</span><span class="p">,</span> <span class="n">src_page</span> <span class="o">=</span> <span class="n">layout</span>
+        <span class="n">runs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">dst_idx</span><span class="p">,</span> <span class="n">src_idx</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">dst_pages</span><span class="p">,</span> <span class="n">src_pages</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">runs</span> <span class="ow">and</span> <span class="n">dst_idx</span> <span class="o">==</span> <span class="n">runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">2</span><span class="p">]</span> <span class="ow">and</span> <span class="n">src_idx</span> <span class="o">==</span> <span class="n">runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">2</span><span class="p">]:</span>
+                <span class="n">runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">2</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">runs</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="n">dst_idx</span><span class="p">,</span> <span class="n">src_idx</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
+        <span class="n">handle</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">cuda_stream</span>
+        <span class="k">for</span> <span class="n">dst_idx</span><span class="p">,</span> <span class="n">src_idx</span><span class="p">,</span> <span class="n">pages</span> <span class="ow">in</span> <span class="n">runs</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_copy_2d</span><span class="p">(</span>
                 <span class="n">dst_ptr</span> <span class="o">+</span> <span class="n">dst_idx</span> <span class="o">*</span> <span class="n">dst_page</span><span class="p">,</span> <span class="n">dst_pitch</span><span class="p">,</span>
                 <span class="n">src_ptr</span> <span class="o">+</span> <span class="n">src_idx</span> <span class="o">*</span> <span class="n">src_page</span><span class="p">,</span> <span class="n">src_pitch</span><span class="p">,</span>
-                <span class="n">width</span><span class="p">,</span> <span class="n">dst</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">handle</span><span class="p">,</span>
+                <span class="n">pages</span> <span class="o">*</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">handle</span><span class="p">,</span>
             <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">copy_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
@@ -1119,6 +1156,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">cuda.bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">runtime</span>
 
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_runtime</span> <span class="o">=</span> <span class="n">runtime</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_default</span> <span class="o">=</span> <span class="n">runtime</span><span class="o">.</span><span class="n">cudaMemcpyKind</span><span class="o">.</span><span class="n">cudaMemcpyDefault</span>
         <span class="n">err</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_pitch</span> <span class="o">=</span> <span class="n">runtime</span><span class="o">.</span><span class="n">cudaDeviceGetAttribute</span><span class="p">(</span>
@@ -1142,8 +1180,10 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">_lib</span> <span class="o">=</span> <span class="n">_symbol</span> <span class="o">=</span> <span class="n">_attr_symbol</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">_max_pitch_attr</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">_dll</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">init</span><span class="p">()</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="s2">"/proc/self/maps"</span><span class="p">)</span> <span class="k">as</span> <span class="n">maps</span><span class="p">:</span>
             <span class="n">paths</span> <span class="o">=</span> <span class="p">{</span>
@@ -1151,7 +1191,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">}</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">paths</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">OSError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"expected one </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_lib</span><span class="si">}</span><span class="s2"> mapped by torch, found </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">paths</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="n">lib</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="n">paths</span><span class="o">.</span><span class="n">pop</span><span class="p">())</span>
+        <span class="n">lib</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dll</span><span class="p">(</span><span class="n">paths</span><span class="o">.</span><span class="n">pop</span><span class="p">())</span>
         <span class="n">max_pitch</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span><span class="p">()</span>
         <span class="n">err</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">lib</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_attr_symbol</span><span class="p">)(</span>
             <span class="n">ctypes</span><span class="o">.</span><span class="n">byref</span><span class="p">(</span><span class="n">max_pitch</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_pitch_attr</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">()</span>
@@ -1176,11 +1216,14 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="CudartCopier">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.page_copier.html#mstar.engine.resources.kv.page_copier.CudartCopier">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">CudartCopier</span><span class="p">(</span><span class="n">_MappedRuntimeCopier</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""libcudart, for torch 2.9, which ships no ``cuda.bindings``."""</span>
+<span class="w">    </span><span class="sd">"""libcudart, the runtime torch loaded, through ``ctypes.PyDLL`` so each call keeps the GIL. Dropping it</span>
+<span class="sd">    costs up to a switch interval per call while another thread runs Python. A call that waits on the</span>
+<span class="sd">    driver stalls every Python thread."""</span>
 
     <span class="n">name</span> <span class="o">=</span> <span class="s2">"libcudart"</span>
     <span class="n">_lib</span><span class="p">,</span> <span class="n">_symbol</span> <span class="o">=</span> <span class="s2">"libcudart"</span><span class="p">,</span> <span class="s2">"cudaMemcpy2DAsync"</span>
-    <span class="n">_attr_symbol</span><span class="p">,</span> <span class="n">_max_pitch_attr</span> <span class="o">=</span> <span class="s2">"cudaDeviceGetAttribute"</span><span class="p">,</span> <span class="mi">11</span>  <span class="c1"># cudaDevAttrMaxPitch</span></div>
+    <span class="n">_attr_symbol</span><span class="p">,</span> <span class="n">_max_pitch_attr</span> <span class="o">=</span> <span class="s2">"cudaDeviceGetAttribute"</span><span class="p">,</span> <span class="mi">11</span>  <span class="c1"># cudaDevAttrMaxPitch</span>
+    <span class="n">_dll</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">PyDLL</span></div>
 
 
 
@@ -1196,16 +1239,16 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_round_trips</span><span class="p">(</span><span class="n">copier</span><span class="p">:</span> <span class="n">PageCopier</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Two strided pages to pinned host memory and back, bit for bit."""</span>
+<span class="w">    </span><span class="sd">"""Three strided pages, two of them adjacent, to pinned host memory and back, bit for bit."""</span>
     <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">3</span> <span class="o">*</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">6</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">6</span><span class="p">)</span>
     <span class="n">host</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">6</span><span class="p">)</span><span class="o">.</span><span class="n">pin_memory</span><span class="p">()</span>
     <span class="n">back</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
     <span class="n">stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">()</span>
     <span class="n">stream</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">())</span>
-    <span class="n">copier</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">host</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">device</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span> <span class="n">stream</span><span class="p">)</span>
-    <span class="n">copier</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">back</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span> <span class="n">host</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">stream</span><span class="p">)</span>
+    <span class="n">copier</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">host</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span> <span class="n">device</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">stream</span><span class="p">)</span>
+    <span class="n">copier</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">back</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="n">host</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span> <span class="n">stream</span><span class="p">)</span>
     <span class="n">stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">back</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">device</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">])</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">back</span><span class="p">[:,</span> <span class="mi">2</span><span class="p">],</span> <span class="n">device</span><span class="p">[:,</span> <span class="mi">3</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">back</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">:],</span> <span class="n">device</span><span class="p">[:,</span> <span class="p">:</span><span class="mi">3</span><span class="p">])</span>
 
 
 <div class="viewcode-block" id="make_page_copier">
@@ -1214,7 +1257,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">make_page_copier</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">PageCopier</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The fastest copier that works here; `TorchCopier` off CUDA and ROCm."""</span>
     <span class="k">if</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">is_cuda</span><span class="p">():</span>
-        <span class="n">candidates</span> <span class="o">=</span> <span class="p">(</span><span class="n">CudaBindingsCopier</span><span class="p">,</span> <span class="n">CudartCopier</span><span class="p">)</span>
+        <span class="n">candidates</span> <span class="o">=</span> <span class="p">(</span><span class="n">CudartCopier</span><span class="p">,</span> <span class="n">CudaBindingsCopier</span><span class="p">)</span>
     <span class="k">elif</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">is_rocm</span><span class="p">():</span>
         <span class="n">candidates</span> <span class="o">=</span> <span class="p">(</span><span class="n">HipCopier</span><span class="p">,)</span>
     <span class="k">else</span><span class="p">:</span>
@@ -1223,7 +1266,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">try</span><span class="p">:</span>
             <span class="n">copier</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">_round_trips</span><span class="p">(</span><span class="n">copier</span><span class="p">):</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"KV page copies: one 2D async memcpy a page, via </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="bp">cls</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"KV page copies: one 2D async memcpy a run of pages, via </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="bp">cls</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
                 <span class="k">return</span> <span class="n">copier</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"KV page copies: </span><span class="si">%s</span><span class="s2"> returned wrong data; not using it"</span><span class="p">,</span> <span class="bp">cls</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
         <span class="k">except</span> <span class="p">(</span><span class="ne">ImportError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">,</span> <span class="ne">AttributeError</span><span class="p">,</span> <span class="ne">RuntimeError</span><span class="p">)</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>

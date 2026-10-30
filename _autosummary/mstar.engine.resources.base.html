@@ -732,6 +732,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.admit"><code class="docutils literal notranslate"><span class="pre">Resource.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">Resource.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.adopt_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.after_output_copy"><code class="docutils literal notranslate"><span class="pre">Resource.after_output_copy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.ask"><code class="docutils literal notranslate"><span class="pre">Resource.ask()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.bind_dependencies"><code class="docutils literal notranslate"><span class="pre">Resource.bind_dependencies()</span></code></a></li>
@@ -1197,6 +1198,21 @@ raises if it still lacks them once <code class="docutils literal notranslate"><s
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.after_output_copy">
+<span class="sig-name descname"><span class="pre">after_output_copy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.after_output_copy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.after_output_copy" title="Link to this definition">#</a></dt>
+<dd><p>Called on the worker’s main thread once <code class="docutils literal notranslate"><span class="pre">step</span></code> has finished on the device and its outputs are
+sent. A copy to the host queued here runs behind that step’s own output copy.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.ResourceStep" title="mstar.engine.resources.step.ResourceStep"><em>ResourceStep</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2022,6 +2038,7 @@ lease converted onto a stream, belongs to whoever else holds it.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.admit"><code class="docutils literal notranslate"><span class="pre">Resource.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">Resource.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.adopt_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.adopt_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.after_output_copy"><code class="docutils literal notranslate"><span class="pre">Resource.after_output_copy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.ask"><code class="docutils literal notranslate"><span class="pre">Resource.ask()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.bind_dependencies"><code class="docutils literal notranslate"><span class="pre">Resource.bind_dependencies()</span></code></a></li>

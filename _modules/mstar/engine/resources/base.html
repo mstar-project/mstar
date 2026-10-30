@@ -1194,6 +1194,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        every step."""</span>
         <span class="k">return</span> <span class="kc">False</span>
 
+<div class="viewcode-block" id="Resource.after_output_copy">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.after_output_copy">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">after_output_copy</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Called on the worker's main thread once ``step`` has finished on the device and its outputs are</span>
+<span class="sd">        sent. A copy to the host queued here runs behind that step's own output copy."""</span>
+        <span class="k">return</span></div>
+
+
 <div class="viewcode-block" id="Resource.complete_cached_walk">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.complete_cached_walk">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">complete_cached_walk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>

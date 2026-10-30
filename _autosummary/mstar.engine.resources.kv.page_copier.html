@@ -721,12 +721,12 @@ two device caches (CUDA IPC KV transfer).</p>
 <p>Both caches are laid out <code class="docutils literal notranslate"><span class="pre">[layers,</span> <span class="pre">pages,</span> <span class="pre">...]</span></code>, so a page is one contiguous
 block per layer, a layer stride apart. <code class="docutils literal notranslate"><span class="pre">copy_</span></code> of that strided view between
 device and pinned host memory blocks the host until the copy stream drains and
-runs at a fraction of the link’s bandwidth. On CUDA and ROCm each page is
-instead one <code class="docutils literal notranslate"><span class="pre">cudaMemcpy2DAsync</span></code> / <code class="docutils literal notranslate"><span class="pre">hipMemcpy2DAsync</span></code> with the layer stride
-as its pitch: async, and run on the copy engines.</p>
+runs at a fraction of the link’s bandwidth. On CUDA and ROCm each run of pages
+adjacent in both caches is instead one <code class="docutils literal notranslate"><span class="pre">cudaMemcpy2DAsync</span></code> / <code class="docutils literal notranslate"><span class="pre">hipMemcpy2DAsync</span></code>
+with the layer stride as its pitch: async, and run on the copy engines.</p>
 <p><cite>make_page_copier</cite> picks the first copier that loads and passes a round trip,
-once per process: on CUDA <cite>CudaBindingsCopier</cite>, then <cite>CudartCopier</cite>; on ROCm
-<cite>HipCopier</cite>; then <cite>TorchCopier</cite>.</p>
+once per process: on CUDA <cite>CudartCopier</cite>, then <cite>CudaBindingsCopier</cite>, whose calls
+drop the GIL; on ROCm <cite>HipCopier</cite>; then <cite>TorchCopier</cite>.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -743,7 +743,7 @@ once per process: on CUDA <cite>CudaBindingsCopier</cite>, then <cite>CudartCopi
 <td><p>Through <code class="docutils literal notranslate"><span class="pre">cuda.bindings</span></code>, which Linux CUDA builds of torch 2.10+ require.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.page_copier.CudartCopier" title="mstar.engine.resources.kv.page_copier.CudartCopier"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CudartCopier</span></code></a>()</p></td>
-<td><p>libcudart, for torch 2.9, which ships no <code class="docutils literal notranslate"><span class="pre">cuda.bindings</span></code>.</p></td>
+<td><p>libcudart, the runtime torch loaded, through <code class="docutils literal notranslate"><span class="pre">ctypes.PyDLL</span></code> so each call keeps the GIL.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.page_copier.HipCopier" title="mstar.engine.resources.kv.page_copier.HipCopier"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HipCopier</span></code></a>()</p></td>
 <td><p>libamdhip64 on ROCm, where <code class="docutils literal notranslate"><span class="pre">copy_</span></code> of a strided page blocks the host too.</p></td>
@@ -773,7 +773,9 @@ once per process: on CUDA <cite>CudaBindingsCopier</cite>, then <cite>CudartCopi
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.page_copier.CudartCopier">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.page_copier.</span></span><span class="sig-name descname"><span class="pre">CudartCopier</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/page_copier.html#CudartCopier"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.page_copier.CudartCopier" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">_MappedRuntimeCopier</span></code></p>
-<p>libcudart, for torch 2.9, which ships no <code class="docutils literal notranslate"><span class="pre">cuda.bindings</span></code>.</p>
+<p>libcudart, the runtime torch loaded, through <code class="docutils literal notranslate"><span class="pre">ctypes.PyDLL</span></code> so each call keeps the GIL. Dropping it
+costs up to a switch interval per call while another thread runs Python. A call that waits on the
+driver stalls every Python thread.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.page_copier.CudartCopier.name">
 <span class="sig-name descname"><span class="pre">name</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'libcudart'</span></span><a class="headerlink" href="#mstar.engine.resources.kv.page_copier.CudartCopier.name" title="Link to this definition">#</a></dt>

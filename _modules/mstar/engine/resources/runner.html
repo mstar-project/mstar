@@ -1091,6 +1091,10 @@ window.runMermaid = runMermaid;</script>
         <span class="p">]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_cap_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cap_order</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_trail_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_trail_order</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_after_output_copy_keys</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span>
+            <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span>
+            <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">])</span><span class="o">.</span><span class="n">after_output_copy</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">Resource</span><span class="o">.</span><span class="n">after_output_copy</span>
+        <span class="p">)</span>
         <span class="c1"># publisher key -&gt; every node of the deployment that declares it</span>
         <span class="c1"># (``declared_by``): a replica on another worker, under another node</span>
         <span class="c1"># name, reads what this one publishes. This runner's own nodes when</span>
@@ -1257,6 +1261,14 @@ window.runMermaid = runMermaid;</script>
                         <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span>
                         <span class="n">walk_of</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">walk_of</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="n">walk_of</span><span class="p">(</span><span class="n">rid</span><span class="p">),</span> <span class="n">per_rid</span><span class="p">,</span>
                     <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="StepRunner.after_output_copy">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.after_output_copy">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">after_output_copy</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_after_output_copy_keys</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">after_output_copy</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">))</span></div>
 
 
 <div class="viewcode-block" id="StepRunner.complete_cached_walk">

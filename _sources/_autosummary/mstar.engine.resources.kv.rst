@@ -31,6 +31,7 @@ mstar.engine.resources.kv
    cache
    config
    cpu_page_pool
+   host_writes
    keys
    manager
    page_copier
