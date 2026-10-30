@@ -658,3 +658,12 @@ def test_a_pool_keeps_snapshots_only_while_its_gdn_kernels_write_checkpoints(wri
     )
     gdn.bind_dependencies({"state": pool})
     assert pool.enable_prefix_cache(b"a root") is writes
+
+
+def test_refusing_snapshots_gives_the_slots_back():
+    pool = _pool(prefix_slots=2)
+    assert all(b.shape[1] == 6 for b in pool._blocks.values())
+    pool.refuse_snapshots("the kernels keep no checkpoints")
+    assert all(b.shape[1] == 4 for b in pool._blocks.values())
+    assert pool.config.prefix_slots == 0
+    assert pool.enable_prefix_cache(b"root") is False
