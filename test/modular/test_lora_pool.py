@@ -302,7 +302,7 @@ def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
     store = LoraAdapterStore(make_spec(paths, cpu_capacity=2))
     for name in ("a1", "a2"):
         store.load(name, paths[name])
-    store.get("a1")  # a1 now most recent
+    assert not store.hold("a1")  # a1 now most recent
     store.load("a3", paths["a3"])
     assert "a1" in store and "a3" in store and "a2" not in store
     assert store.get("a3").digest != whole.digest == store.get("a1").digest

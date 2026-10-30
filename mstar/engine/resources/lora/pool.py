@@ -35,19 +35,21 @@ row holding an LLM slot never waits on the encoder's pool, so the two pools' wai
 cannot form a cycle.
 
 Files are read on the pool's reader thread, never on the GPU thread or under the lock: a
-request names an adapter, and every rank starts reading it into the host tier as it ingests
-the request; the leader reserves a slot for a request only once its own copy is in. A
-follower whose copy is still in flight when the leader's step admits waits for it outside
-the lock.
+request names an adapter, and every rank holds it in the host tier and starts reading it
+as it ingests the request; the leader reserves a slot for a request only once its own copy
+is in. What the host tier holds follows from the ingests alone, so a follower's read
+started when the leader's did, and a follower whose copy is still in flight when the
+leader's step admits waits for it outside the lock.
 
 Adapters are also loaded and unloaded at runtime (``load_adapter`` / ``unload_adapter``),
 which each rank applies whenever its control message arrives, not at a seq every rank
 agrees on. That is safe because neither touches what an admit decides from (slot
-refcounts, which slot holds an adapter, the LRU clock): a load only fills the host tier,
-and an unload only forgets the adapter's name, its host copy and its name -> slot entry,
-once no live request names it. An admit consults that entry only for a request naming the
-adapter, and the next such request is ingested after a reload, which reaches every rank
-after the unload did. The slot keeps the old weights, unheld, until LRU eviction reuses it.
+refcounts, which slot holds an adapter, the LRU clock): a load only makes the adapter
+servable (the host tier holds it from its first request), and an unload only forgets the
+adapter's name, its host copy and its name -> slot entry, once no live request names it.
+An admit consults that entry only for a request naming the adapter, and the next such
+request is ingested after a reload, which reaches every rank after the unload did. The
+slot keeps the old weights, unheld, until LRU eviction reuses it.
 """
 
 from __future__ import annotations
@@ -338,7 +340,7 @@ class LoraAdapterPool(Resource):
 
         # Handle-keyed request state, all purged by `remove_request`.
         self._adapter_of: dict = {}   # rid -> adapter name, None for the base model
-        self._adapter_rows = 0  # live rids naming an adapter
+        self._live: dict[str, int] = {}  # adapter -> live rids naming it
         self._row_slot: dict = {}     # rid -> slot held, read by `plan`
         self._awaiting: set = set()   # rids with an adapter but no slot yet
         # rid -> (slot the live admit took, the adapter it reserved), for rollback
@@ -356,6 +358,8 @@ class LoraAdapterPool(Resource):
         self._reads: dict[str, tuple[Future, _Served]] = {}  # adapter -> read in flight
         # adapter -> why its last background read failed; a new request on it retries
         self._read_errors: dict[str, str] = {}
+        # adapter -> the copy its runtime load read, until its first request holds it
+        self._loaded: dict[str, LoadedAdapter] = {}
         # admit runs on the GPU thread, remove on the main thread, a read's completion on
         # the reader (or inline, if it completed before its callback was added: reentrant)
         self._lock = threading.RLock()
@@ -449,17 +453,19 @@ class LoraAdapterPool(Resource):
             if adapter is None:
                 self._row_slot[rid] = ZERO_SLOT
             else:
-                self._adapter_rows += 1
+                self._live[adapter] = self._live.get(adapter, 0) + 1
                 self._awaiting.add(rid)
-                # every rank, so a follower has its copy when the leader's step needs it
-                self._read_errors.pop(adapter, None)
-                self._prefetch(adapter)
+                if adapter not in self._empty:
+                    self._hold(adapter)
 
     def remove_request(self, rid):
         with self._lock:
             adapter = self._adapter_of.pop(rid, None)
             if adapter is not None:
-                self._adapter_rows -= 1
+                if self._live[adapter] == 1:
+                    del self._live[adapter]
+                else:
+                    self._live[adapter] -= 1
             self._awaiting.discard(rid)
             self._admit_taken.pop(rid, None)
             self._unreserve(rid)
@@ -482,7 +488,8 @@ class LoraAdapterPool(Resource):
     def load_adapter_async(self, name: str, path: str, digest: bytes | None = None) -> Future:
         """Serve ``name`` from ``path``: read it on the reader thread, check it against the
         spec (and against ``digest``, the weights the API server checked), shard it for
-        this rank into the host tier, and only then make it servable. The future fails if
+        this rank, and only then make it servable; its first request holds that copy in
+        the host tier. The future fails if
         it is served already, is still retiring from an unload, or cannot be read; a
         refusal visible now raises here. A request that names it takes a slot on its
         first admit, as for an adapter configured at startup."""
@@ -498,7 +505,8 @@ class LoraAdapterPool(Resource):
                 # no request can name it before it is served, below
                 self._empty.add(name)
             else:
-                self._store.put(adapter, keep=self._wanted())
+                # its first request holds it in the host tier (`_hold`), with this copy
+                self._loaded[name] = adapter
             self._serving[name] = _Served(path, adapter.digest)
         logger.info("LoRA pool: loaded %s from %s", name, path)
 
@@ -533,6 +541,7 @@ class LoraAdapterPool(Resource):
         admit decides from is unchanged; ``_install`` reuses the slot like any other."""
         self._retiring.pop(name, None)
         self._store.drop(name)
+        self._loaded.pop(name, None)
         self._empty.discard(name)
         slot = self._resident.pop(name, None)
         logger.info(
@@ -572,8 +581,7 @@ class LoraAdapterPool(Resource):
                 return self._changes
             if (name not in self._reserved_count and name not in self._resident
                     and name not in self._store and name not in self._read_errors):
-                self._prefetch(name)
-                return self._changes
+                return self._changes  # its read, started at ingest, lands
             self._reserved[rid] = name
             self._reserved_count[name] = self._reserved_count.get(name, 0) + 1
             return None
@@ -744,13 +752,9 @@ class LoraAdapterPool(Resource):
             elif loaded is None:
                 # the leader reserved once its copy was in (or its read failed); a follower
                 # may still be reading its own, or (rarely) start the read here
-                pending = self._reads.get(name, (None,))[0]
-                if pending is None:
-                    error = self._read_errors.get(name)
-                if pending is None and error is None:
-                    pending = self._prefetch(name)
-                    if pending is None:
-                        error = "it is not in the host tier and no read of it is running"
+                error = None if name in self._reads else self._read_errors.get(name)
+                if error is None:
+                    pending = self._read_in(name)
         if pending is not None:
             try:
                 loaded = pending.result()
@@ -789,16 +793,32 @@ class LoraAdapterPool(Resource):
             self._reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lora-read")
         return self._reader
 
-    def _prefetch(self, name: str) -> Future | None:
-        """Caller holds the lock. Start reading ``name`` into the host tier unless it is
-        resident, held there, empty for this pool, or already being read; returns the
-        read in flight."""
+    def _hold(self, name: str) -> None:
+        """Caller holds the lock. Hold ``name`` in the host tier as a request on it is
+        ingested, and read it in if its copy isn't (or its last read failed).
+
+        What the tier holds follows only from the order requests are ingested and the
+        adapters they name, the same on every rank, never from when a read lands. So a
+        follower's read of an adapter always starts at the ingest the leader's does,
+        and the leader never reserves on a copy a follower dropped long ago. An adapter
+        a live request names is never dropped."""
+        retry = self._read_errors.pop(name, None) is not None
+        if self._store.hold(name, keep=self._live):
+            loaded = self._loaded.pop(name, None)
+            if loaded is not None:
+                self._store.put(loaded)
+                return
+        elif not retry:
+            return
+        self._read_in(name)
+
+    def _read_in(self, name: str) -> Future:
+        """Caller holds the lock. Read ``name`` on the reader thread, unless that read is
+        already running; returns the read in flight."""
         found = self._reads.get(name)
         if found is not None:
             return found[0]
         served = self._serving.get(name) or self._retiring.get(name)
-        if served is None or name in self._empty or name in self._resident or name in self._store:
-            return None
         future = self._executor().submit(self._store.read, name, served.path, served.digest)
         self._reads[name] = (future, served)
         future.add_done_callback(lambda f: self._read_done(name, f))
@@ -827,12 +847,7 @@ class LoraAdapterPool(Resource):
             ):
                 return  # unloaded, or reloaded with other weights, while it was read
             self._pin_digest(name, current, adapter.digest)
-            self._store.put(adapter, keep=self._wanted())
-
-    def _wanted(self) -> set[str]:
-        """Caller holds the lock. Adapters a request still waits on: the host tier keeps
-        them past ``cpu_capacity``, so a copy read for an admit is there when it runs."""
-        return {self._adapter_of[rid] for rid in self._awaiting}
+            self._store.put(adapter)
 
     def _pin_digest(self, name: str, served: _Served, digest: bytes) -> None:
         """An adapter that arrived with no digest takes its first read's, so a file
@@ -868,12 +883,10 @@ class LoraAdapterPool(Resource):
         # reload of that name may have pointed at another slot since: then this slot was
         # not where it lived, and its reservations and reads stand
         if evicted is not None and self._resident.get(evicted) == slot:
+            # a row reserved on it while it was resident (which the pick cannot see: only
+            # the deciding rank reserves) now misses, still counting one slot, and finds
+            # the copy the host tier holds for as long as a request names it
             del self._resident[evicted]
-            # A row reserved on it while it was resident (which the pick cannot see:
-            # only the deciding rank reserves) now misses, and still counts one slot.
-            # Read the adapter back meanwhile, so its admit finds the copy.
-            if evicted in self._wanted():
-                self._prefetch(evicted)
         for name in self._a:
             a, b = adapter.a.get(name), adapter.b.get(name)
             if a is None:
@@ -906,7 +919,7 @@ class LoraAdapterPool(Resource):
         """Whether any of ``rids`` names an adapter with something for this pool: set at
         ingest and from the adapters' files, so the same on every rank of a lockstep
         instance."""
-        if not self._adapter_rows:
+        if not self._live:
             return False
         get, empty = self._adapter_of.get, self._empty
         return any((name := get(rid)) is not None and name not in empty for rid in rids)

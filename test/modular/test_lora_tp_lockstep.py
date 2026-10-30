@@ -237,6 +237,27 @@ def test_the_churn_run_diverges_without_the_fence(tmp_path):
     pytest.fail("no seed diverged with the leader's teardowns unfenced")
 
 
+def test_the_host_tier_follows_the_ingests_not_when_reads_land(tmp_path):
+    """A request on a2 is removed before its read lands on one rank and after on the other.
+    Each rank holds the same adapters, so the leader never reserves on a copy a follower
+    dropped and its admit never waits for a whole read there."""
+    paths = _write_adapters(tmp_path, ("a1", "a2", "a3"))
+    fast, slow = (LoraAdapterPool(make_spec(paths, cpu_capacity=1), "cpu", rank=r, world_size=2,
+                                  decides=r == 0) for r in (0, 1))
+    gate, read = threading.Event(), slow.store._read
+    slow.store._read = lambda name, path: gate.wait(10) and read(name, path)
+    for pool in (fast, slow):
+        ingest(pool, "x", "a2")
+        _settle_reads(fast)
+        ingest(pool, "y", "a3")
+        _settle_reads(fast)
+        pool.remove_request("x")
+    gate.set()
+    _settle_reads(slow)
+    assert list(fast.store._adapters) == list(slow.store._adapters) == ["a2", "a3"]
+    assert "a2" in slow.store and "a3" in slow.store
+
+
 # --- the worker's admit fence --------------------------------------------------------------
 
 class _PicksSlotPerMiss(LoraAdapterPool):

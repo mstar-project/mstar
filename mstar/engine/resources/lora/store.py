@@ -201,7 +201,13 @@ def check_adapters(spec: LoraSpec, others: Sequence[LoraSpec] = ()) -> dict[str,
 
 
 class LoraAdapterStore:
-    """Adapters held in pinned host memory, least recently used dropped past ``capacity``."""
+    """Adapters held in pinned host memory.
+
+    Which adapters it holds follows from ``hold`` calls alone, in their order: each makes
+    an adapter the most recent, dropping the least recent past ``capacity``. A held
+    adapter's copy arrives later, by ``put``, once read. So when a read lands or fails
+    never changes what is held, and ranks that hold in the same order hold the same set.
+    """
 
     def __init__(
         self, spec: LoraSpec, rank: int = 0, world_size: int = 1, pin: bool | None = None,
@@ -219,26 +225,46 @@ class LoraAdapterStore:
             name: {layer: row for row, layer in enumerate(_target_layers(spec, t))}
             for name, t in spec.targets.items()
         }
-        self._adapters: OrderedDict[str, LoadedAdapter] = OrderedDict()
+        # held adapters, least recent first; None until a held adapter's copy is put
+        self._adapters: OrderedDict[str, LoadedAdapter | None] = OrderedDict()
 
     def __contains__(self, name: str) -> bool:
-        return name in self._adapters
-
-    def __len__(self) -> int:
-        return len(self._adapters)
+        """Whether ``name``'s copy is in."""
+        return self._adapters.get(name) is not None
 
     def get(self, name: str) -> LoadedAdapter | None:
-        adapter = self._adapters.get(name)
-        if adapter is not None:
-            self._adapters.move_to_end(name)
-        return adapter
+        return self._adapters.get(name)
+
+    def hold(self, name: str, keep: Collection[str] = ()) -> bool:
+        """Make ``name`` the most recent adapter held, dropping the least recent past
+        ``capacity``, but none named in ``keep`` (which may hold the tier past capacity for
+        a while). True when it was not held, so its copy is the caller's to read in."""
+        new = name not in self._adapters
+        if new:
+            self._adapters[name] = None
+        self._adapters.move_to_end(name)
+        excess = len(self._adapters) - self._spec.cpu_capacity
+        if excess > 0:
+            for dropped in [n for n in self._adapters if n not in keep and n != name][:excess]:
+                del self._adapters[dropped]
+                logger.info("LoRA store: dropped %s from the host tier", dropped)
+        return new
+
+    def put(self, adapter: LoadedAdapter) -> bool:
+        """``adapter``'s copy, kept if it is still held."""
+        if adapter.name not in self._adapters:
+            return False
+        self._adapters[adapter.name] = adapter
+        return True
 
     def load(self, name: str, path: str, digest: bytes | None = None) -> LoadedAdapter:
-        """The adapter under ``name``, read from ``path`` unless it is already held."""
+        """Hold ``name`` and read it from ``path`` unless its copy is in."""
+        self.hold(name)
         adapter = self.get(name)
-        if adapter is not None:
-            return adapter
-        return self.put(self.read(name, path, digest))
+        if adapter is None:
+            adapter = self.read(name, path, digest)
+            self.put(adapter)
+        return adapter
 
     def read(self, name: str, path: str, digest: bytes | None = None) -> LoadedAdapter:
         """``path`` read, checked against the spec and sharded for this rank, without
@@ -252,18 +278,6 @@ class LoraAdapterStore:
                 f"LoRA adapter {name!r} changed on disk since it was loaded (digest "
                 f"{adapter.digest.hex()[:16]}, expected {digest.hex()[:16]}); load it again"
             )
-        return adapter
-
-    def put(self, adapter: LoadedAdapter, keep: Collection[str] = ()) -> LoadedAdapter:
-        """Hold ``adapter``, dropping the least recently used past ``capacity``, but none
-        named in ``keep`` (which may hold the tier past capacity for a while)."""
-        self._adapters[adapter.name] = adapter
-        self._adapters.move_to_end(adapter.name)
-        excess = len(self._adapters) - self._spec.cpu_capacity
-        if excess > 0:
-            for dropped in [n for n in self._adapters if n not in keep and n != adapter.name][:excess]:
-                del self._adapters[dropped]
-                logger.info("LoRA store: dropped %s from the host tier", dropped)
         return adapter
 
     def drop(self, name: str) -> None:
