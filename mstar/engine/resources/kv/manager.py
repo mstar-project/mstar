@@ -647,13 +647,15 @@ class KVManager(AttentionResource):
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
         # A read-only step (every segment span 0, e.g. a decoder attending an
         # encoder context it wrote at prefill) plans the same as the last one
-        # with its segments and bucket while nothing touched their streams:
-        # (segments, bucket) -> (epochs, plan). Replay slots pad with rows of
-        # their own, so steps that alternate slots (pre-planned) keep an entry
-        # each. The epoch moves with `_plan_epoch`, and when a stream of a
-        # cached step's real row changes (`_readonly_rows`).
+        # on its slot with the same segments and bucket while nothing touched
+        # their streams: slot -> ((segments, bucket), epochs, plan). One entry
+        # per replay slot, as `_staged_outputs` keeps, so the slot count bounds
+        # the cache; replay slots pad with rows of their own, and an unpadded
+        # batch builds its plan once per slot. The epoch moves with
+        # `_plan_epoch`, and when a stream of a cached step's real row changes
+        # (`_readonly_rows`).
         self._readonly_epoch = 0
-        self._readonly_plans: dict[tuple, tuple] = {}
+        self._readonly_plans: dict[int | None, tuple] = {}
         self._readonly_rows: frozenset = frozenset()
         # (slot, label) -> the plan output whose state that slot's static
         # buffers hold, so a reused plan skips re-staging them
@@ -2338,7 +2340,10 @@ class KVManager(AttentionResource):
 
     def _drop_readonly_plans(self) -> None:
         self._readonly_epoch += 1
-        # rebound, not cleared: a plan thread building an entry may hold them
+        # The epochs are what retire an entry: a plan thread mid-build stores
+        # the epochs it read before this bump, which never match again. The
+        # dict is rebound rather than cleared only so that thread keeps a
+        # consistent one to write into.
         self._readonly_plans = {}
         self._readonly_rows = frozenset()
 
@@ -2677,9 +2682,10 @@ class KVManager(AttentionResource):
         readonly = self._is_readonly(step, ctx)
         if readonly:
             key, epochs = self._readonly_key(step, ctx)
-            cached = self._readonly_plans.get(key)
-            if cached is not None and cached[0] == epochs:
-                return self._reuse_readonly_plan(cached[1], step, ctx)
+            slot = ctx.slot_lease.slot if ctx.slot_lease is not None else None
+            cached = self._readonly_plans.get(slot)
+            if cached is not None and cached[0] == key and cached[1] == epochs:
+                return self._reuse_readonly_plan(cached[2], step, ctx)
             # The epochs and rows before the views: a touch from here on moves
             # an epoch, so a plan built across it is never reused. A pre-plan
             # builds on the plan thread while the main thread can tear
@@ -2735,10 +2741,7 @@ class KVManager(AttentionResource):
         self._setup_plan_states(res, ctx, ctx.slot_lease, eager_write=step.eager_write)
         laps.lap("setup_states")
         if readonly:
-            plans = self._readonly_plans
-            if len(plans) >= 8:
-                plans.clear()  # a slot's entry each in steady state
-            plans[key] = (epochs, res)
+            self._readonly_plans[slot] = (key, epochs, res)
         self._mark_preplanned(step, ctx, res)
         return res
 

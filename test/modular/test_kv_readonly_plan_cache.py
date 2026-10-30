@@ -173,14 +173,17 @@ def test_a_step_with_sink_rows_plans_its_own_views(kv):
     assert kv._staged_outputs[(0, "main")] is first["main"]
 
 
-def test_another_slot_stages_the_reused_plan(kv):
+def test_each_slot_keeps_a_plan_of_its_own(kv):
+    """One entry per slot, as the staged outputs: the same step on another
+    slot builds and stages its own plan once, then reuses it there."""
     first = _read(kv, ("a", "b"), slot=0)
-    # the same step on slot 1 reuses the plan, but slot 1's static buffers
-    # do not hold it yet, so it is staged there
     assert (1, "main") not in kv._staged_outputs
-    assert _read(kv, ("a", "b"), slot=1) is first
-    assert kv._staged_outputs[(1, "main")] is first["main"]
+    other = _read(kv, ("a", "b"), slot=1)
+    assert other is not first
+    assert kv._staged_outputs[(1, "main")] is other["main"]
     assert kv._current_plan_states["main"] is kv._static_plan_state(1, "main")
+    assert _read(kv, ("a", "b"), slot=1) is other
+    assert _read(kv, ("a", "b"), slot=0) is first
 
 
 def test_slots_that_pad_with_rows_of_their_own_keep_a_plan_each(kv):
@@ -223,15 +226,14 @@ def test_a_preplan_that_is_not_promoted_plans_again(kv):
 
 def test_the_cached_plan_keeps_its_indptrs_while_the_ring_turns(kv):
     """Index arrays from the pinned ring are rewritten two plans later; a
-    cached plan staged on a new slot reads its own."""
+    cached plan reads its own."""
     kv._indptr_ring = PinnedIndexRing(numel=256, depth=2)
     first = _read(kv, ("a", "b"))
     qo = first["main"].cpu_indptrs.qo_indptr.clone()
     _write(kv, "c", 5)
     _write(kv, "d", 7)
-    assert _read(kv, ("a", "b"), slot=1) is first
+    assert _read(kv, ("a", "b")) is first
     assert torch.equal(first["main"].cpu_indptrs.qo_indptr, qo)
-    assert kv._static_plan_state(1, "main").total_tokens == 0
 
 
 def test_a_plan_built_across_a_touch_of_its_rows_is_not_reused(kv, monkeypatch):
