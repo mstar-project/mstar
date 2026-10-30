@@ -3373,6 +3373,16 @@ class Worker:
                 _t_rt = _time.perf_counter() if self._phase_period else 0.0
                 step = rt.resume_postprocess(stops=stops, dropped=dropped)
             elif step.need is PostprocessNeed.STORE:
+                # What the stop check withheld (``StopCheck.withheld``), and an
+                # output cut to an empty span, is not stored, so not routed: a
+                # streaming edge then carries no item for the row, and the
+                # producer's item count leaves it out as well.
+                for withheld in (batch_N.node_batch.withheld_outputs, empty_spans):
+                    for rid, names in withheld.items():
+                        rid_outputs = outputs.get(rid)
+                        if rid_outputs:
+                            for name in names:
+                                rid_outputs.pop(name, None)
                 stored, route_tensors = self._store_outputs(
                     batch_N, outputs, request, step, cpu_outputs, host_rows, engine,
                 )

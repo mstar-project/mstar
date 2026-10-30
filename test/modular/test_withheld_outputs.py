@@ -17,7 +17,7 @@ from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
-from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput, BatchedStopCheck, HostRows, NodeSubmodule, StopCheck
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -147,7 +147,9 @@ class _Communicator(BaseCommunicator):
         return []
 
 
-class _RecordingRuntime:
+class _RecordingRuntime(PhasedPostprocess):
+    """Recording phase stubs under the reference begin / resume."""
+
     def __init__(self):
         self.routes = []
         self.stops = []
@@ -185,6 +187,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     w._last_active = {}
     w._innermost_loop_by_node = {}
     w._walk_drivers = {}  # no producer-driven walk transitions here
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._graph_runtime = _RecordingRuntime()
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SharedMemoryCommunicationManager(
@@ -195,6 +198,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
         check_stop_for_batch=engine.check_stop_for_batch,
         extend_prefix_chains=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
+        step_finished=lambda batch, outputs, **kwargs: None,
     ))
     w.request_state = SimpleNamespace(
         per_request_info={},
