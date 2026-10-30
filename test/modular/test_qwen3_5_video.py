@@ -791,6 +791,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     info = SimpleNamespace(graph_walk="prefill_vision", step_metadata=metadata)
     w._rebuilds.keep_copies(SimpleNamespace(
         node_name=NODE, request_ids=[R], per_request_info={R: info}, per_request_input_tensors=inputs,
+        step_context=StepContext((R,), "prefill_vision", 0, False),
     ))
     # the samples before 9 are in the KV, and 9 is the next decode step's input
     w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])

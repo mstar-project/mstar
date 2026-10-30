@@ -144,8 +144,21 @@ def _vision_step(rids, walks: dict, **fields) -> SimpleNamespace:
     infos = {rid: SimpleNamespace(graph_walk=walks.get(rid, VISION), step_metadata={"prefill_order": (rid,)})
              for rid in rids}
     inputs = {rid: {"text_inputs": [torch.tensor([rid])], "embeds": [torch.full((2,), rid)]} for rid in rids}
+    ctx = StepContext(request_ids=tuple(rids), graph_walk="mixed", slot=0, capture=False,
+                      request_walks={rid: info.graph_walk for rid, info in infos.items()})
     return SimpleNamespace(node_name=NODE, request_ids=list(rids), per_request_info=infos,
-                           per_request_input_tensors=inputs, **fields)
+                           per_request_input_tensors=inputs, step_context=ctx, **fields)
+
+
+def test_a_step_of_no_copied_walk_copies_nothing_and_reads_no_row():
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs())
+    rebuilds._kept[NODE] = {R: KeptIds(torch.tensor([1]), array("i"), None, HostCopies(VISION))}
+    ctx = StepContext(request_ids=(R,), graph_walk=DECODE, slot=0, capture=False)
+
+    # the step carries no rows' inputs, so reading one would raise
+    rebuilds.keep_copies(SimpleNamespace(node_name=NODE, request_ids=[R], step_context=ctx))
+
+    assert rebuilds._kept[NODE][R].copies.inputs is None, "a decode step would be taken for the image's step"
 
 
 def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids_and_of_its_step_metadata():

@@ -171,6 +171,10 @@ class Rebuilds:
         policy, kept_ids = self._policies.get(node), self._kept.get(node)
         if policy is None or not policy.copied_inputs or not kept_ids:
             return
+        # a step of no copied walk, such as every decode step, has no row to copy
+        ctx, walks = node_batch.step_context, policy.copied_inputs.keys()
+        if ctx.graph_walk not in walks and walks.isdisjoint(ctx.request_walks.values()):
+            return
         rows = []
         for rid in node_batch.request_ids:
             kept = kept_ids.get(rid)
