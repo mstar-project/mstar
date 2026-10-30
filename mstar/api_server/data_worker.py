@@ -195,7 +195,12 @@ def _text_usage(tokens: torch.Tensor, stop_ids, prompt_tokens: int | None) -> di
     if prompt_tokens is not None:
         usage["prompt_tokens"] = prompt_tokens
     if stop_ids is not None and tokens.numel():
-        usage["stop_token"] = int(tokens.flatten()[-1]) in stop_ids
+        # tolist keeps the GIL; a torch op (flatten, indexing, int) releases it, and with the
+        # event loop busy each release waits out the switch interval (~5 ms) to get it back
+        last = tokens.tolist()
+        while isinstance(last, list):
+            last = last[-1]
+        usage["stop_token"] = last in stop_ids
     return usage
 
 

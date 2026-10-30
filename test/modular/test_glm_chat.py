@@ -332,6 +332,8 @@ def test_text_chunks_carry_their_usage():
     assert _text_usage(torch.tensor([5, 6]), frozenset({9}), 12)["stop_token"] is False
     # a model that names no stop tokens leaves the reason alone
     assert _text_usage(torch.tensor([5]), None, None) == {"tokens": 1}
+    # the last token of a chunk of any shape
+    assert _text_usage(torch.tensor([[5, 9]]), frozenset({9}), 12)["stop_token"] is True
 
 
 def test_the_data_worker_tags_text_chunks_with_usage():
