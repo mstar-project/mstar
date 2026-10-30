@@ -2400,10 +2400,9 @@ context is reused across calls, so a hook must not keep it.
   arrive, so send them only once the stream has moved the consumer through the walk
   before it.
 
-Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
-``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
-ones run ``talker_decode``; the conductor feeds ``talker_decode`` its first input once
-``talker_last_prefill`` has run.
+Qwen3-Omni's Talker (``_talker_walk``) is the reference: the Thinker's prefill pass runs
+``talker_prefill``, and its decode passes run ``talker_decode``; the conductor feeds
+``talker_decode`` its first input once ``talker_prefill`` has run.
 
 Streams from the client
 ~~~~~~~~~~~~~~~~~~~~~~~
