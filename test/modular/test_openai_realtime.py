@@ -1132,7 +1132,12 @@ class _DuplexAPI:
         self.aborted: list = []
         self.outputs = list(outputs)
 
+    refuse = 0   # opens refused (at capacity) before one is taken
+
     def submit_request(self, **kw):
+        if self.refuse:
+            self.refuse -= 1
+            raise HTTPException(503, "at capacity")
         self.submits.append(kw)
         return kw["request_id"]
 
@@ -1225,6 +1230,24 @@ def test_conversation_audio_reaches_the_stream_resampled(duplex, fmt):
     assert len(api.submits) == 1 and api.submits[0]["end_input"] is False
     assert all(a.dtype == np.float32 for a in api.appends)
     np.testing.assert_allclose(np.concatenate(api.appends), expected, atol=1 / 32768)
+
+
+def test_a_refused_open_keeps_none_of_its_append(duplex):
+    """An append whose call could not open is not taken, its half sample
+    included, so the retry is read from its own first byte."""
+    client, api = duplex()
+    api.refuse = 1
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 16000}}})
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\x01\x02\x03").decode())
+        assert "at capacity" in json.loads(ws.receive_text())["error"]["message"]
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(np.array([1000, -2000, 7], "<i2").tobytes()
+                                                                       + b"\x09").decode())
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    (heard,) = api.appends
+    np.testing.assert_array_equal(heard, np.array([1000, -2000, 7], np.float32) / 32768)
 
 
 def _text(step, data=b"", mark=None):

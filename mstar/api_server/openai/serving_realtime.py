@@ -1162,9 +1162,9 @@ class RealtimeConversation:
         if (error := _append_error(audio, self.input_format.rate)) is not None:
             await self.send(error)
             return False
-        self.odd_byte = odd_byte
         if self.key is None and not await self.open():
-            return False
+            return False   # not taken, its half sample neither: before the call, formats may still change
+        self.odd_byte = odd_byte
         return await self._put(audio)
 
     async def _put(self, audio: np.ndarray) -> bool:
