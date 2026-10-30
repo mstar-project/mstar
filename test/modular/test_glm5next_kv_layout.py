@@ -107,11 +107,15 @@ def test_a_request_that_asks_no_length_fills_the_cache_rows(tmp_path, monkeypatc
 
 
 @_K
-@pytest.mark.parametrize("max_tokens", [1024, 1600, 2048 - PROMPT])
+@pytest.mark.parametrize("max_tokens", [1024, 1600, None], ids=["1024", "1600", "room"])
 def test_mtp_admits_what_the_context_holds(tmp_path, monkeypatch, k, max_tokens):
     """A request the context holds is dispatched with or without MTP: the rows its rejected
-    drafts could take never refuse it first (1024 was past the rows, 1600 past the loop cap)."""
+    drafts could take never refuse it first (1024 was past the rows, 1600 past the loop cap).
+    The room is what decode emits after the prompt: the window's, or under MTP two verify
+    blocks short of it."""
     model = _model(mtp_num_draft_tokens=k)
+    if max_tokens is None:
+        max_tokens = model.config.index_topk - PROMPT - (2 * (k + 1) - 1 if k else 0)
 
     sent = _conduct(model, _preprocess(model, {"max_output_tokens": max_tokens}), tmp_path, monkeypatch)
 
@@ -119,9 +123,29 @@ def test_mtp_admits_what_the_context_holds(tmp_path, monkeypatch, k, max_tokens)
     assert _dispatched(sent).loop_caps["decode_loop"] == max_tokens - 1
 
 
-@_K
 @pytest.mark.parametrize("past", [0, 1])
-def test_max_tokens_past_the_rows_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past, k):
+def test_mtp_refuses_a_max_tokens_the_window_cant_hold(past):
+    """Under MTP decode stops two verify blocks short of the window, inside the cache rows
+    the conductor holds a request to, so process_prompt refuses a max_tokens past that (a
+    400), as the conductor refuses one past the context without MTP. A 1000-token prompt
+    leaves 1,041; before, max_tokens 1100 was admitted and cut short there."""
+    model = _model(mtp_num_draft_tokens=3)
+    prompt = 1000
+    room = model.config.index_topk - 2 * 4 + 1 - prompt
+    assert room == 1041
+    for budget in (1100, room + past):
+        if budget > room:
+            with pytest.raises(ValueError, match=f"emits at most {room} tokens"):
+                model.process_prompt("x" * prompt, ["text"], ["text"], max_output_tokens=budget)
+        else:
+            model.process_prompt("x" * prompt, ["text"], ["text"], max_output_tokens=budget)
+
+
+@pytest.mark.parametrize("past", [0, 1])
+def test_max_tokens_past_the_rows_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past):
+    """Without MTP; with it the window binds before the rows
+    (test_mtp_refuses_a_max_tokens_the_window_cant_hold)."""
+    k = 0
     model = _model(mtp_num_draft_tokens=k)
     # the prompt's rows and a block per decode step fill the cache; the last token is never stored
     fits = (model.config.kv_rows - PROMPT) // (k + 1) + 1
