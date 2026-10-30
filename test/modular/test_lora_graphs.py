@@ -4,6 +4,7 @@ base-only captures, on CPU."""
 from __future__ import annotations
 
 import itertools
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -124,7 +125,8 @@ def test_a_refusal_unwinds_the_pools_partial_takes_through_the_runner(adapters):
 def test_a_delta_runs_only_between_its_steps_plan_and_commit(adapters):
     """A delta outside a step (prepare_inputs, a cached output) would read another step's
     addressing: the pool keeps a step's addressing from its plan to its commit or rollback,
-    and a delta called outside that refuses."""
+    for the thread that planned it, and a delta called outside that refuses. The async
+    worker runs prepare_inputs on the main thread while the GPU thread's step is planned."""
     pool = P.make_pool(adapters[1])
     P.ingest(pool, "r", "a1")
 
@@ -132,12 +134,26 @@ def test_a_delta_runs_only_between_its_steps_plan_and_commit(adapters):
         x, y = torch.randn(1, P.HIDDEN, dtype=F64), torch.zeros(1, P.Q_OUT + 2 * P.KV_OUT, dtype=F64)
         pool.layer_delta("qkv", 0)(x, y)
 
+    def on_another_thread():
+        refused = []
+
+        def run():
+            try:
+                delta()
+            except RuntimeError as exc:
+                refused.append(exc)
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join()
+        return refused
+
     with pytest.raises(RuntimeError, match="outside its node's planned step"):
         delta()
     for end in (pool.commit, pool.rollback_admit):
         s, c = P.step(["r"]), P.ctx(["r"])
         assert pool.admit(s, c).ok
         pool.plan(s, c)
+        assert on_another_thread(), "a delta on another thread ran against this step's rows"
         delta()
         end(s, c)
         with pytest.raises(RuntimeError, match="outside"):

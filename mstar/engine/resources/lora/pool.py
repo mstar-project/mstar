@@ -158,12 +158,15 @@ class LoraLayerDelta:
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         # compile check first, so a traced forward installs no guard on the pool
-        if not torch.compiler.is_compiling() and self._pool._current is None:
+        if not torch.compiler.is_compiling() and (
+            self._pool._current is None or self._pool._plan_thread != threading.get_ident()
+        ):
             raise RuntimeError(
                 "a LoRA delta was called outside its node's planned step (e.g. from "
-                "prepare_inputs, or on an output cached from an earlier step): there is "
-                "no addressing for its rows. Call the module's base computation there "
-                "and add the delta in preprocess or the forward"
+                "prepare_inputs, which the async worker runs while the GPU thread's step "
+                "is planned, or on an output cached from an earlier step): there is no "
+                "addressing for its rows. Call the module's base computation there and "
+                "add the delta in preprocess or the forward"
             )
         if not self._pool.active:
             # a base-only step: no row names an adapter, so nothing is launched
@@ -372,8 +375,10 @@ class LoraAdapterPool(Resource):
         self._stager = PinnedStager(torch.int32)
         self._eager: _Buffers | None = None
         self._cg: dict[CGSlotKey, _Buffers] = {}
-        # row grouping -> this step's addressing, from its plan until its commit
+        # row grouping -> this step's addressing, from its plan until its commit, and the
+        # thread that planned it, where its forward runs
         self._current: dict[int, LoraAddressing] | None = None
+        self._plan_thread: int | None = None
         # whether this step adds deltas (`plan`); a plain bool, which compiled forwards
         # guard on
         self.active = True
@@ -953,6 +958,7 @@ class LoraAdapterPool(Resource):
         return False
 
     def plan(self, step: LoraStep, ctx: StepContext) -> LoraAddressing | None:
+        self._plan_thread = threading.get_ident()
         if ctx.graph_walk == PIECEWISE_WALK and not ctx.capture and self._current is not None:
             # before the memoized return below, which a region's repeat plan takes too
             self._enclosing = (self._current, self.active)

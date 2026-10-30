@@ -981,9 +981,11 @@ request puts through the adapted linears, in the order they are packed), and eac
 adapted linear adds ``pool.layer_delta(target, layer)(x, y)`` to its base output before
 anything reads it: before a column-parallel gather, before a row-parallel all-reduce.
 
-The pool holds a step's addressing from its plan to its commit (or rollback), so a delta
-called outside a step (``prepare_inputs``, an output cached from an earlier step) refuses
-when run eagerly instead of adding another step's adapters to these rows.
+The pool holds a step's addressing from its plan to its commit (or rollback), for the
+thread that planned it, so a delta called outside a step (``prepare_inputs``, which the
+async worker runs on the main thread while the GPU thread's step is planned; an output
+cached from an earlier step) refuses when run eagerly instead of adding another step's
+adapters to these rows.
 ``warmup_compiles`` runs outside any step, so a node serving adapters runs no adapted
 linear there.
 
