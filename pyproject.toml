@@ -465,12 +465,13 @@ where = ["."]
 include = ["mstar*"]
 exclude = ["tests*", "benchmark*", "examples*"]
 
-# Ship the vendored CUDA source so it can be JIT-compiled on first use, and the
-# default deployment configs (copied from repo-root configs/ into
-# mstar/default_configs/ at build time; see setup.py) so `mstar serve <model>`
-# works from a pip install.
+# Ship the vendored CUDA source so it can be JIT-compiled on first use, the tuned
+# kernel-config tables, and the default deployment configs (copied from repo-root
+# configs/ into mstar/default_configs/ at build time; see setup.py) so
+# `mstar serve <model>` works from a pip install.
 [tool.setuptools.package-data]
-"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp", "configs/*.json"]
+"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.kernels" = ["tables/*/*.json"]
 "mstar.default_configs" = ["*.yaml"]
 
 [tool.ruff]

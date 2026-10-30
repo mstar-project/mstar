@@ -25,15 +25,14 @@ Triton-specific boilerplate out of the runner.
 
 from __future__ import annotations
 
-import functools
-import json
-from pathlib import Path
 from typing import Any, Dict
 
 import torch
 import triton
 import triton.language as tl
 
+from mstar.kernels import Impl, KernelOp, TableEntry, Target, Tolerance, register
+from mstar.kernels.registry import on_reset
 from mstar.utils.quant_fp8 import FP8_DTYPE
 
 # ---------------------------------------------------------------------------
@@ -622,37 +621,90 @@ def moe_sum_reduce_triton(
 # ---------------------------------------------------------------------------
 
 
-def config_path(E: int, N: int, K: int, device_name: str | None = None) -> Path:
-    """Where ``mstar.utils.fused_moe.tune`` writes configs for this shape and GPU."""
-    if device_name is None:
-        device_name = torch.cuda.get_device_name()
-    device_name = device_name.replace(" ", "_")
-    return Path(__file__).parent / "configs" / f"E={E},N={N},K={K},device_name={device_name}.json"
+def _triton_unavailable(target: Target) -> str | None:
+    if target.device.type != "cuda":
+        return f"needs a CUDA or ROCm device, not {target.device.type}"
+    if target.dtype not in (torch.bfloat16, torch.float16):
+        return f"runs bf16 and fp16 activations, not {target.dtype}"
+    return None
 
 
-@functools.lru_cache(maxsize=None)
-def _tuned_configs(E: int, N: int, K: int) -> dict[int, dict] | None:
-    path = config_path(E, N, K)
-    if not path.is_file():
-        return None
-    return {int(m): cfg for m, cfg in json.loads(path.read_text()).items()}
+# fused_experts' two grouped GEMMs: gate/up (N = 2 * the per-rank expert intermediate size,
+# K = hidden) and down. Rows are keyed by the token count M. A row's config holds the gate/up
+# tiles, and its "down" holds the down GEMM's differences, except BLOCK_SIZE_M, which the two
+# GEMMs share because they share one alignment. The sweep checks candidates against the same
+# kernel at its default tiles, within the tolerance of bf16 accumulation order.
+MOE_GEMM = register(KernelOp(
+    name="moe_gemm",
+    shape=("E", "N", "K", "top_k"),
+    bucket="M",
+    impls=(Impl("triton", _triton_unavailable, Tolerance(1e-2, 1e-3)),),
+    doc="fused_experts' bf16/fp16 grouped expert GEMMs (gate/up, then down)",
+))
+
+_TILE_ROWS: dict[tuple, tuple | None] = {}
+on_reset(_TILE_ROWS.clear)
 
 
-def get_config(M: int, E: int, N: int, K: int, top_k: int) -> tuple[Dict[str, int], Dict[str, int]]:
+@torch.compiler.assume_constant_result
+def _tile_rows(E: int, N: int, K: int, top_k: int, dtype: torch.dtype,
+               device: torch.device | None) -> tuple | None:
+    """The tuned rows for this shape as ``(bounds, configs)``: the rows' upper bounds (all but
+    the last row's) and each row's ``(gate/up items, down items)``; None where no table has the
+    shape. Looked up once per shape and process, and a constant to dynamo, which can't trace the
+    table read or the GPU's name: traced, they would break the graph at every compiled MoE
+    layer."""
+    key = (E, N, K, top_k, dtype, device)
+    if key not in _TILE_ROWS:
+        entry = MOE_GEMM.lookup(dtype, {"E": E, "N": N, "K": K, "top_k": top_k}, device)
+        _TILE_ROWS[key] = None if entry is None else _entry_tiles(entry)
+    return _TILE_ROWS[key]
+
+
+def _entry_tiles(entry: TableEntry) -> tuple:
+    """A ``moe_gemm`` entry's rows as :func:`_tile_rows` returns them. Every row carries its
+    tiles: the default ones depend on the token count, so a row can't defer to them."""
+    bounds, configs = [], []
+    for m, choice in entry.rows:
+        if choice.config is None or "BLOCK_SIZE_M" not in choice.config:
+            raise ValueError(f"{entry.source}: every moe_gemm row needs its tiles, BLOCK_SIZE_M included")
+        up = dict(choice.config)
+        down_overrides = up.pop("down", {})
+        down = {**up, **down_overrides, "BLOCK_SIZE_M": up["BLOCK_SIZE_M"]}
+        if m is not None:
+            bounds.append(m)
+        configs.append((tuple(up.items()), tuple(down.items())))
+    return tuple(bounds), tuple(configs)
+
+
+def get_config(
+    M: int, E: int, N: int, K: int, top_k: int,
+    dtype: torch.dtype = torch.bfloat16, device: torch.device | None = None, tuned: bool = True,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Tile configs for the gate/up GEMM and the down GEMM.
 
-    Uses the tuned table for this shape and GPU when present, taking the entry
-    for the nearest tuned batch size, else :func:`get_default_config` for both.
-    The two GEMMs share ``BLOCK_SIZE_M`` because they share one alignment.
+    The row that takes ``M`` tokens in the ``moe_gemm`` table entry for this shape on this GPU,
+    else :func:`get_default_config` for both. ``python -m benchmark.kernels.sweep moe_gemm``
+    tunes a shape.
+
+    Under ``torch.compile`` the configs must reach the Triton launch as constants (dynamo
+    refuses a symbolic ``num_warps``). The rows are a constant keyed by the expert shapes and
+    ``top_k``, which a model's weights and router fix, and the row search below is traced, so a
+    symbolic ``M`` only adds guards. A graph break between this and the launch would make them
+    data again; a caller that can't rule one out passes ``tuned=False``. So would a symbolic
+    key, which the engine's compiles never produce (a module's ints vary only under
+    ``dynamic=True``, which no MoE node uses).
     """
-    tuned = _tuned_configs(E, N, K)
-    if tuned is None:
+    rows = _tile_rows(E, N, K, top_k, dtype, device) if tuned else None
+    if rows is None:
         config = get_default_config(M, E, N, K, top_k)
-        return config, config
-    up = dict(tuned[min(tuned, key=lambda m: abs(m - M))])
-    down_overrides = up.pop("down", {})
-    down = {**up, **down_overrides, "BLOCK_SIZE_M": up["BLOCK_SIZE_M"]}
-    return up, down
+        return config, dict(config)
+    bounds, configs = rows
+    i = 0
+    while i < len(bounds) and M > bounds[i]:
+        i += 1
+    up, down = configs[i]
+    return dict(up), dict(down)
 
 
 def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, int]:

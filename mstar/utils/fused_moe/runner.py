@@ -14,6 +14,7 @@ from typing import NamedTuple
 import torch
 import triton.language as tl
 
+from mstar.utils.fused_moe import align
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
     act_and_mul_triton,
@@ -38,7 +39,9 @@ class MoeAlignment(NamedTuple):
 def moe_block_m(num_tokens: int, w1: torch.Tensor, top_k: int) -> int:
     """``BLOCK_SIZE_M`` that :func:`fused_experts` aligns to for this batch."""
     experts, two_inter, hidden = w1.shape
-    return get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k)[0]["BLOCK_SIZE_M"]
+    config, _ = get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k,
+                           dtype=w1.dtype, device=w1.device)
+    return config["BLOCK_SIZE_M"]
 
 
 def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
@@ -120,7 +123,14 @@ def fused_experts(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
-    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
+    # A tuned row carries Triton launch options (num_warps), which a compiled forward must see
+    # as constants all the way to the launch. The alignment's torch fallback breaks the graph in
+    # between, so a compiled call without the CUDA op takes the default tiles (align.py says so
+    # when the op fails to build); an eager one keeps the tuned tiles. The key is the weights'
+    # K, not the activations': static under any compile.
+    tuned = alignment is not None or not torch.compiler.is_compiling() or align._cuda_op_available()
+    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=k_in, top_k=top_k,
+                                     dtype=hidden_states.dtype, device=hidden_states.device, tuned=tuned)
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.

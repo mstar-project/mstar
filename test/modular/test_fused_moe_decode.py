@@ -51,7 +51,7 @@ def launches(monkeypatch):
 
 def _use(monkeypatch, table):
     tuning = getattr(decode, table)
-    monkeypatch.setattr(decode, "_tuning", lambda device: tuning)
+    monkeypatch.setattr(decode, "_tuning", lambda device, shape=None: tuning)
     return tuning
 
 
