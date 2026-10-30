@@ -14,12 +14,46 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 (VoxServe uses [n_pages, 2, page_size, n_heads, head_dim] without layer dim.)
 """
 
+import functools
 import logging
 
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+# A captured wrapper's later plans call FlashInfer's planner module directly
+# (``_plan_direct``): most of FlashInfer's ``plan()`` is Python that gives the
+# same answer every step of a captured bucket. vLLM and SGLang do the same
+# (vLLM's fast_plan_decode over FlashInfer's fast_decode_plan, SGLang's
+# fast_prefill_plan) with FlashInfer pinned to one version, because the
+# direct call restates FlashInfer's planner arguments and per-plan state.
+# So it runs only on the versions here, which test_flashinfer_direct_plan.py
+# and test_attn_mixed_split.py have compared with ``plan()`` on a GPU; on any
+# other, a captured wrapper plans with ``plan()``. pyproject.toml pins the
+# same version.
+DIRECT_PLAN_FLASHINFER_VERSIONS = frozenset({"0.7.2"})
+
+
+@functools.cache
+def _direct_plan_supported() -> bool:
+    import flashinfer
+
+    # a stand-in module (CPU tests) has no version: not a checked one
+    version = getattr(flashinfer, "__version__", None)
+    if version in DIRECT_PLAN_FLASHINFER_VERSIONS:
+        return True
+    checked = ", ".join(sorted(DIRECT_PLAN_FLASHINFER_VERSIONS))
+    logger.warning(
+        "FlashInfer %s is not a version the attention wrappers' direct planner calls were "
+        "checked against (%s), so captured wrappers plan with FlashInfer's plan(), which is "
+        "slower. Install the pinned version (pip install flashinfer-python==%s) to use them.",
+        version, checked, max(
+            DIRECT_PLAN_FLASHINFER_VERSIONS,
+            key=lambda v: tuple(int(p) for p in v.split(".") if p.isdigit()),
+        ),
+    )
+    return False
 
 
 # The head dims FlashInfer instantiates its paged prefill/decode kernels (and
@@ -46,6 +80,34 @@ def check_flashinfer_head_dim(head_dim: int, device: torch.device | None = None)
             "supported size (exact: the padded dims add nothing to the scores, the padded output "
             "dims are zeros to drop) and declare that size as the KV cache's head_dim."
         )
+
+
+def _prefill_plan_is_direct(w) -> bool:
+    """Whether FlashInfer prefill wrapper ``w``'s plan resolved to the one
+    path ``_plan_direct`` reproduces, on a checked FlashInfer version: fa2 or
+    fa3 under a graph, no custom mask, prefix items, window, soft cap or
+    position encoding, a 16-bit KV."""
+    return (
+        _direct_plan_supported()
+        and w._backend in ("fa2", "fa3") and w.is_cuda_graph_enabled and w._jit_module is None
+        and w._cached_module is not None and w._custom_mask_buf is None
+        and w._prefix_len_ptr is None and w._window_left == -1
+        and w._logits_soft_cap == 0.0 and w._pos_encoding_mode == "NONE"
+        and w._cached_kv_data_type in (torch.bfloat16, torch.float16)
+        and w._max_total_num_rows is not None
+    )
+
+
+def _decode_plan_is_direct(w) -> bool:
+    """Whether FlashInfer decode wrapper ``w``'s plan resolved to the one
+    path ``_plan_direct`` reproduces, on a checked FlashInfer version: fa2
+    tensor-core decode under a graph, one query token per row, no window."""
+    return (
+        _direct_plan_supported()
+        and w._backend == "fa2" and w.use_tensor_cores and w.is_cuda_graph_enabled
+        and not getattr(w, "_uses_cudnn", False) and w._jit_module is None
+        and getattr(w, "_q_len_per_req", 1) in (None, 1) and w._window_left == -1
+    )
 
 
 class FlashInferPrefillWrapper:
@@ -145,6 +207,10 @@ class FlashInferPrefillWrapper:
         # page-locked staging for an inline plan's host arrays (`_stage_pinned`)
         self._pinned: dict[str, torch.Tensor] = {}
         self._pinned_done = None
+        # set by the first staged plan when ``_plan_direct`` may take the later
+        # ones, for the (dtype, causal) it was built for
+        self._planner_args: list | None = None
+        self._planner_key = None
 
     def _stage_pinned(self, qo_indptr, kv_indptr, last_page_len, kv_lens, indices):
         """Copy the plan's host arrays into this wrapper's page-locked buffers,
@@ -207,7 +273,6 @@ class FlashInferPrefillWrapper:
         consume them as CPU and async-H2D copy to the device for our own
         per-token bookkeeping below.
         """
-        self.dtype = dtype
         if self.accelerator_graph and paged_kv_indices.device.type != "cuda":
             # planned inline behind the step in flight, which a pageable copy
             # would wait for: stage page-locked, copy the indices in ourselves
@@ -217,10 +282,16 @@ class FlashInferPrefillWrapper:
                     kv_lens, paged_kv_indices,
                 )
             )
-            self._paged_kv_indices_buf[:n].copy_(
-                self._pinned["indices"][:n], non_blocking=True,
-            )
-            paged_kv_indices = self._paged_kv_indices_buf[:n]
+            try:
+                self._plan_staged(
+                    qo_indptr, paged_kv_indptr, self._pinned["indices"][:n],
+                    paged_kv_last_page_len, kv_lens, causal, dtype, window_left,
+                )
+            finally:
+                # also on a raise: copies already issued still read the pinned buffers
+                self._pinned_done.record()
+            return
+        self.dtype = dtype
         self.attn_wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
@@ -236,10 +307,6 @@ class FlashInferPrefillWrapper:
             seq_lens=kv_lens,
             window_left=window_left,
         )
-        if self._pinned_done is not None:
-            # every copy out of the staging buffers is issued: the next
-            # restage waits for them
-            self._pinned_done.record()
 
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
         # even if we're not in a cuda graph
@@ -248,6 +315,93 @@ class FlashInferPrefillWrapper:
             if qo_indptr.device.type != "cuda":
                 qo_indptr = qo_indptr.to(self.device, non_blocking=True)
             self._qo_indptr_buf = qo_indptr
+
+    def _plan_staged(
+        self, qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len,
+        kv_lens, causal: bool, dtype: torch.dtype, window_left: int = -1,
+    ) -> None:
+        """Plan a captured wrapper from page-locked int32 host arrays, which
+        the caller keeps unchanged until this plan's copies have landed."""
+        n = paged_kv_indices.shape[0]
+        self.dtype = dtype
+        key = (dtype, causal, window_left)
+        if self._planner_key == key:
+            self._plan_direct(
+                qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens,
+            )
+            return
+        self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
+        self.attn_wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=self._paged_kv_indices_buf[:n],
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim,
+            page_size=self.page_size,
+            causal=causal,
+            q_data_type=dtype,
+            seq_lens=kv_lens,
+            window_left=window_left,
+        )
+        self._planner_args = self._direct_planner_args(causal)
+        self._planner_key = None if self._planner_args is None else key
+
+    def _direct_planner_args(self, causal: bool) -> list | None:
+        """FlashInfer's planner arguments for this wrapper, fixed but for the
+        host indptrs and lengths, when its plan resolved to the one path
+        ``_plan_direct`` reproduces (``_prefill_plan_is_direct``); else None.
+        Restating them is what vLLM and SGLang do too, on a pinned FlashInfer
+        (see ``DIRECT_PLAN_FLASHINFER_VERSIONS``)."""
+        w = self.attn_wrapper
+        if not _prefill_plan_is_direct(w):
+            return None
+        args = [
+            w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
+            None, None, None,
+            w._max_total_num_rows, w._fixed_batch_size,
+            self.num_qo_heads, self.num_kv_heads, self.page_size, True,
+            self.head_dim, self.head_dim,
+            causal,
+            -1,  # window_left
+        ]
+        if w._backend == "fa2":
+            args += [
+                -1,  # fixed_split_size
+                False,  # disable_split_kv (FlashInfer sets it for an NVFP4 KV only)
+                0,  # num_colocated_ctas
+                0,  # uniform_q_len
+            ]
+        return args
+
+    def _plan_direct(self, qo_indptr, kv_indptr, indices, last_page_len, kv_lens) -> None:
+        """What FlashInfer's ``plan`` does per step on the path
+        ``_direct_planner_args`` checked: its checks, the four index copies
+        into the captured buffers, the per-step lengths it keeps, then its
+        planner. Not its ``_kv_lens_buffer`` copy, which fa2/fa3 do not read."""
+        w = self.attn_wrapper
+        n = indices.shape[0]
+        qo = qo_indptr.numpy()
+        total = int(qo[-1])
+        if n > w._paged_kv_indices_buf.shape[0]:
+            raise ValueError("more page indices than the captured buffer holds")
+        if total > w._max_total_num_rows:
+            raise ValueError(
+                f"{total} query rows in a wrapper captured for {w._max_total_num_rows}"
+            )
+        w._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
+        w._paged_kv_indptr_buf.copy_(kv_indptr, non_blocking=True)
+        w._paged_kv_last_page_len_buf.copy_(last_page_len, non_blocking=True)
+        w._paged_kv_indices_buf[:n].copy_(indices, non_blocking=True)
+        w._qo_indptr_last = total
+        w._max_q_len = int((qo[1:] - qo[:-1]).max())
+        w._max_kv_len = int(kv_lens.numpy().max())
+        args = self._planner_args
+        args[3] = qo_indptr
+        args[4] = kv_indptr
+        args[5] = kv_lens
+        w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
@@ -306,6 +460,8 @@ class FlashInferDecodeWrapper:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = None
+        # set by the first plan when ``_plan_direct`` may take the later ones
+        self._planner_args: list | None = None
 
         import flashinfer
 
@@ -375,6 +531,15 @@ class FlashInferDecodeWrapper:
             self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
             paged_kv_indices = self._paged_kv_indices_buf[:n]
 
+        if (
+            self._planner_args is not None and dtype is self.dtype and kv_lens is not None
+            and window_left == -1
+            # the planner reads host int32 by raw pointer; plan() converts anything else
+            and kv_lens.dtype == torch.int32 and kv_lens.device.type == "cpu"
+        ):
+            self._plan_direct(paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens)
+            return
+
         if self.enable_nvtx:
             from mstar.utils.profiler import range_pop, range_push
 
@@ -399,6 +564,52 @@ class FlashInferDecodeWrapper:
 
         self._n_req = n_req
         self.dtype = dtype
+        if self.accelerator_graph and kv_lens is not None:
+            self._planner_args = self._direct_planner_args(n_req)
+
+    def _direct_planner_args(self, n_req: int) -> list | None:
+        """FlashInfer's planner arguments for this wrapper, fixed but for the
+        indptr and lengths, when its plan resolved to the one path
+        ``_plan_direct`` reproduces (``_decode_plan_is_direct``); else None.
+        Restating them is what vLLM and SGLang do too, on a pinned FlashInfer
+        (see ``DIRECT_PLAN_FLASHINFER_VERSIONS``). As FlashInfer's own
+        ``fast_decode_plan``, the direct path sets no per-step state but the
+        plan."""
+        w = self.attn_wrapper
+        if not _decode_plan_is_direct(w):
+            return None
+        from flashinfer.utils import _get_range_buf
+
+        return [
+            w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
+            _get_range_buf(n_req + 1, "cpu"), None, None,
+            n_req, n_req, self.num_qo_heads, self.num_kv_heads, self.page_size, True,
+            self.head_dim, self.head_dim,
+            False,  # causal
+            -1,  # window_left
+            -1,  # fixed_split_size
+            False,  # disable_split_kv
+            0,  # num_colocated_ctas
+            0,  # uniform_q_len
+        ]
+
+    def _plan_direct(self, indptr, indices, last_page_len, kv_lens) -> None:
+        """What FlashInfer's ``plan`` does per step on the path
+        ``_direct_planner_args`` checked: the three index copies into the
+        captured buffers, then its planner."""
+        w = self.attn_wrapper
+        n = indices.shape[0]
+        if n > w._paged_kv_indices_buf.shape[0]:
+            raise ValueError("more page indices than the captured buffer holds")
+        w._paged_kv_indptr_buf.copy_(indptr, non_blocking=True)
+        w._paged_kv_last_page_len_buf.copy_(last_page_len, non_blocking=True)
+        dst = w._paged_kv_indices_buf[:n]
+        if indices.data_ptr() != dst.data_ptr():
+            dst.copy_(indices, non_blocking=indices.device == dst.device)
+        args = self._planner_args
+        args[4] = indptr
+        args[5] = kv_lens
+        w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
@@ -425,8 +636,9 @@ class FlashInferMixedWrapper:
     by a planned permutation. Both are captured at static shapes: the
     bucket's rows and tokens, and ``max_prefill_rows`` sequences.
 
-    Every host array is staged in page-locked buffers this wrapper owns: a
-    mixed step plans inline on the gpu thread, behind the step in flight.
+    Every host array is staged in page-locked buffers this wrapper owns,
+    sized for the bucket: a mixed step plans inline on the gpu thread, behind
+    the step in flight.
     """
 
     def __init__(
@@ -445,7 +657,7 @@ class FlashInferMixedWrapper:
         backend: str = "auto",
         use_tensor_cores: bool = True,
     ):
-        from mstar.engine.resources.kv.plan import SINK_PAGE
+        from mstar.engine.resources.kv.plan import SINK_PAGE, HostLens
 
         self._sink_page = SINK_PAGE
         self._page_size = page_size
@@ -468,28 +680,38 @@ class FlashInferMixedWrapper:
             max_total_tokens=max_total_tokens, max_num_pages=max_num_pages,
             accelerator_graph=True, **kv,
         )
-        i64 = dict(dtype=torch.int64, device=device)
-        self._perm = torch.zeros(max_total_tokens, **i64)
-        self._dec_src = torch.zeros(batch_size, **i64)
-        self._dec_dst = torch.zeros(batch_size, **i64)
+        # the token permutation and the decode rows' gather/scatter, one
+        # device block filled by one copy: [perm | dec_src | dec_dst]
+        tokens, rows = max_total_tokens, batch_size
+        self._idx64 = torch.zeros(tokens + 2 * rows, dtype=torch.int64, device=device)
+        self._perm = self._idx64[:tokens]
+        self._dec_src = self._idx64[tokens:tokens + rows]
+        self._dec_dst = self._idx64[tokens + rows:]
+        pin = device.type == "cuda"
+        self._host64 = torch.empty(tokens + 2 * rows, dtype=torch.int64, pin_memory=pin)
         # the whole step's qo_indptr, which `select_last_hidden` reads
         self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-        self._pinned: dict[str, torch.Tensor] = {}
+        # an index row holds the step's pages plus one sink page per padding
+        # row; the prefill one, its prompt pages plus the sink pages of its
+        # empty rows and tail row
+        pages = max_num_pages + batch_size
+        tail_pages = -(-max(tokens, 1) // page_size)
+        sizes = dict(
+            qo=rows + 1, d_indptr=rows + 1, d_indices=pages, d_last=rows, d_lens=rows,
+            p_qo=max_prefill_rows + 2, p_kvp=max_prefill_rows + 2,
+            p_last=max_prefill_rows + 1, p_lens=max_prefill_rows + 1,
+            p_idx=pages + max_prefill_rows + tail_pages,
+        )
+        self._host = {
+            k: torch.empty(n, dtype=torch.int32, pin_memory=pin) for k, n in sizes.items()
+        }
+        self._np = {k: t.numpy() for k, t in self._host.items()}
+        self._d_lens = self._host["d_lens"].as_subclass(HostLens)
+        self._p_lens = self._host["p_lens"].as_subclass(HostLens)
+        self._iota = np.arange(tokens, dtype=np.int64)
+        self._sinks = np.full(max_prefill_rows + tail_pages, SINK_PAGE, dtype=np.int32)
         self._done = None
         self.dtype = torch.bfloat16
-
-    def _pin(self, name: str, values: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
-        """``values`` in this wrapper's page-locked buffer ``name``."""
-        n = len(values)
-        buf = self._pinned.get(name)
-        if buf is None or buf.shape[0] < n:
-            buf = self._pinned[name] = torch.empty(
-                max(n, 256, 2 * (buf.shape[0] if buf is not None else 0)),
-                dtype=dtype, pin_memory=True,
-            )
-        view = buf[:n]
-        view.numpy()[:] = values
-        return view
 
     def plan(
         self,
@@ -503,8 +725,6 @@ class FlashInferMixedWrapper:
         window_left: int = -1,
         **kwargs,
     ):
-        from mstar.engine.resources.kv.plan import HostLens
-
         self.dtype = dtype
         if self._done is None:
             self._done = torch.cuda.Event()
@@ -512,21 +732,28 @@ class FlashInferMixedWrapper:
             # this wrapper's previous plan, a step or more back: long since done
             self._done.synchronize()
 
-        qo = qo_indptr.numpy().astype(np.int64)
-        kvp = paged_kv_indptr.numpy().astype(np.int64)
+        page = self._page_size
+        sink = self._sink_page
+        qo = qo_indptr.numpy()
+        kvp = paged_kv_indptr.numpy()
         idx = paged_kv_indices.numpy()
         last = paged_kv_last_page_len.numpy()
+        rows = len(qo) - 1
+        tokens = self._tokens
+        if rows != self._bs or int(qo[-1]) > tokens:
+            raise RuntimeError(
+                f"FlashInferMixedWrapper: a step of {rows} rows and {int(qo[-1])} tokens "
+                f"in a bucket captured for {self._bs} and {tokens}"
+            )
         npages = np.diff(kvp)
         lens = (
-            np.asarray(kv_lens, dtype=np.int64) if kv_lens is not None
+            kv_lens.numpy() if kv_lens is not None
             # FlashInfer's `get_seq_lens`
-            else np.maximum(npages - 1, 0) * self._page_size + last
+            else np.maximum(npages - 1, 0) * page + last
         )
         spans = np.diff(qo)
-        rows = len(spans)
-        tokens = max(self._tokens, int(qo[-1]))
-        dec = spans == 1  # a one-token row is a decode query, state or not
-        prompt = np.flatnonzero(spans > 1)
+        other = np.flatnonzero(spans != 1)  # prompt rows and padding rows
+        prompt = other[spans[other] > 1].tolist()
         if len(prompt) > self._max_prefill_rows:
             raise RuntimeError(
                 f"FlashInferMixedWrapper: {len(prompt)} prompt rows in a step "
@@ -534,75 +761,112 @@ class FlashInferMixedWrapper:
             )
 
         # decode: every row of the bucket; a row that is not one token reads
-        # one token of the sink page, and its output lands on a scratch row
-        cnt = np.where(dec, npages, 1)
-        d_indptr = np.zeros(rows + 1, dtype=np.int32)
-        np.cumsum(cnt, out=d_indptr[1:])
-        d_indices = np.full(int(d_indptr[-1]), self._sink_page, dtype=np.int32)
-        page_row = np.repeat(np.arange(rows), npages)
-        keep = dec[page_row]
-        within = np.arange(len(idx)) - kvp[page_row]
-        d_indices[d_indptr[page_row[keep]] + within[keep]] = idx[keep]
-        d_last = np.where(dec, last, 1).astype(np.int32)
-        d_lens = np.where(dec, lens, 1).astype(np.int32)
+        # one token of the sink page, and its output lands on a scratch row.
+        # The KV plan has put padding rows there already, so only the prompt
+        # rows (and any other row not yet on the sink) move.
+        h = self._np
+        d_last, d_lens = h["d_last"], h["d_lens"]
+        d_last[:] = last
+        d_lens[:] = lens
+        move = other
+        if len(other) and len(idx):
+            on_sink = (
+                (npages[other] == 1) & (last[other] == 1) & (lens[other] == 1)
+                & (idx[np.minimum(kvp[other], len(idx) - 1)] == sink)
+            )
+            move = other[~on_sink]
+        if len(move) == 0:
+            h["d_indptr"][:] = kvp
+            n_dec = len(idx)
+            h["d_indices"][:n_dec] = idx
+        else:
+            cnt = npages.copy()
+            cnt[move] = 1
+            h["d_indptr"][0] = 0
+            np.cumsum(cnt, out=h["d_indptr"][1:])
+            n_dec = int(h["d_indptr"][-1])
+            pieces, prev = [], 0
+            for r in move.tolist():
+                pieces.append(idx[prev:kvp[r]])
+                pieces.append(self._sinks[:1])
+                prev = kvp[r + 1]
+            pieces.append(idx[prev:])
+            np.concatenate(pieces, out=h["d_indices"][:n_dec])
+            d_last[move] = 1
+            d_lens[move] = 1
 
-        # prefill: the prompt rows, then a sink-page tail row over the step's
-        # other tokens, so qo_indptr ends at the token count FlashInfer checks
+        # prefill: the prompt rows, then empty rows on the sink page up to
+        # `max_prefill_rows`, then a sink-page tail row over the step's other
+        # tokens, so qo_indptr ends at the token count FlashInfer checks
+        p_qo, p_kvp, p_last, p_lens = [0], [0], [], []
+        pieces, front = [], []
+        for r in prompt:
+            a, b, s, e = int(qo[r]), int(qo[r + 1]), int(kvp[r]), int(kvp[r + 1])
+            p_qo.append(p_qo[-1] + b - a)
+            p_kvp.append(p_kvp[-1] + e - s)
+            p_last.append(int(last[r]))
+            p_lens.append(int(lens[r]))
+            pieces.append(idx[s:e])
+            front.append((a, b))
         pad = self._max_prefill_rows - len(prompt)
-        prompt_tokens = int(spans[prompt].sum())
-        tail = tokens - prompt_tokens
-        tail_kv = max(tail, 1)
-        tail_pages = -(-tail_kv // self._page_size)
-        p_spans = np.concatenate([spans[prompt], np.zeros(pad, dtype=np.int64), [tail]])
-        p_qo = np.zeros(self._max_prefill_rows + 2, dtype=np.int32)
-        np.cumsum(p_spans, out=p_qo[1:])
-        p_cnt = np.concatenate([npages[prompt], np.ones(pad, dtype=np.int64), [tail_pages]])
-        p_kvp = np.zeros(self._max_prefill_rows + 2, dtype=np.int32)
-        np.cumsum(p_cnt, out=p_kvp[1:])
-        p_idx = np.concatenate(
-            [idx[kvp[r]:kvp[r + 1]] for r in prompt]
-            + [np.full(pad + tail_pages, self._sink_page, dtype=idx.dtype)]
-        ).astype(np.int32)
-        tail_last = tail_kv - (tail_pages - 1) * self._page_size
-        p_last = np.concatenate([last[prompt], np.ones(pad), [tail_last]]).astype(np.int32)
-        p_lens = np.concatenate([lens[prompt], np.ones(pad), [tail_kv]]).astype(np.int32)
+        tail_kv = max(tokens - p_qo[-1], 1)
+        tail_pages = -(-tail_kv // page)
+        for _ in range(pad):
+            p_qo.append(p_qo[-1])
+            p_kvp.append(p_kvp[-1] + 1)
+            p_last.append(1)
+            p_lens.append(1)
+        p_qo.append(tokens)
+        p_kvp.append(p_kvp[-1] + tail_pages)
+        p_last.append(tail_kv - (tail_pages - 1) * page)
+        p_lens.append(tail_kv)
+        h["p_qo"][:] = p_qo
+        h["p_kvp"][:] = p_kvp
+        h["p_last"][:] = p_last
+        h["p_lens"][:] = p_lens
+        n_pre = p_kvp[-1]
+        pieces.append(self._sinks[:pad + tail_pages])
+        np.concatenate(pieces, out=h["p_idx"][:n_pre])
 
         # the prompt tokens first, then every other position in order
-        front = np.concatenate(
-            [np.arange(qo[r], qo[r + 1]) for r in prompt] or [np.zeros(0, dtype=np.int64)]
-        )
-        rest = np.ones(tokens, dtype=bool)
-        rest[front] = False
-        perm = np.concatenate([front, np.flatnonzero(rest)])
-        dec_src = np.minimum(qo[:-1], max(tokens - 1, 0))
-        dec_dst = np.where(dec, qo[:-1], tokens)
+        host64 = self._host64.numpy()
+        perm = host64[:tokens]
+        if front:
+            iota = self._iota
+            rest, prev = [], 0
+            for a, b in front:
+                rest.append(iota[prev:a])
+                prev = b
+            rest.append(iota[prev:tokens])
+            np.concatenate([iota[a:b] for a, b in front] + rest, out=perm)
+        else:
+            perm[:] = self._iota
+        starts = qo[:-1]
+        np.minimum(starts, max(tokens - 1, 0), out=host64[tokens:tokens + rows])
+        dec_dst = host64[tokens + rows:]
+        dec_dst[:] = starts
+        dec_dst[other] = tokens
+        h["qo"][:] = qo
 
-        for name, values, dst in (
-            ("perm", perm, self._perm), ("dec_src", dec_src, self._dec_src),
-            ("dec_dst", dec_dst, self._dec_dst),
-        ):
-            dst[: len(values)].copy_(self._pin(name, values, torch.int64), non_blocking=True)
-        self._qo_indptr_buf[: rows + 1].copy_(
-            self._pin("qo", qo.astype(np.int32), torch.int32), non_blocking=True,
-        )
-        self._num_rows = rows
-
-        self._decode.plan(
-            paged_kv_indptr=self._pin("d_indptr", d_indptr, torch.int32),
-            paged_kv_indices=self._pin("d_indices", d_indices, torch.int32),
-            paged_kv_last_page_len=self._pin("d_last", d_last, torch.int32),
-            kv_lens=self._pin("d_lens", d_lens, torch.int32).as_subclass(HostLens),
-            dtype=dtype, window_left=window_left,
-        )
-        self._prefill.plan(
-            qo_indptr=torch.from_numpy(p_qo),
-            paged_kv_indptr=torch.from_numpy(p_kvp),
-            paged_kv_indices=torch.from_numpy(p_idx),
-            paged_kv_last_page_len=torch.from_numpy(p_last),
-            kv_lens=torch.from_numpy(p_lens).as_subclass(HostLens),
-            causal=causal, dtype=dtype, window_left=window_left,
-        )
-        self._done.record()
+        t = self._host
+        try:
+            self._idx64.copy_(self._host64, non_blocking=True)
+            self._qo_indptr_buf.copy_(t["qo"], non_blocking=True)
+            self._num_rows = rows
+            self._decode.plan(
+                paged_kv_indptr=t["d_indptr"],
+                paged_kv_indices=t["d_indices"][:n_dec],
+                paged_kv_last_page_len=t["d_last"],
+                kv_lens=self._d_lens,
+                dtype=dtype, window_left=window_left,
+            )
+            self._prefill._plan_staged(
+                t["p_qo"], t["p_kvp"], t["p_idx"][:n_pre], t["p_last"], self._p_lens,
+                causal, dtype, window_left,
+            )
+        finally:
+            # also on a raise: copies already issued still read the pinned buffers
+            self._done.record()
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
