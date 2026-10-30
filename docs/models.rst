@@ -800,11 +800,13 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   longer expected to match the offline pass bit for bit. From those figures,
   live and one-shot text should agree token for token in fp32 (inferred, not
   measured on served text); under the served bf16 a different chunking can flip
-  a knife-edge frame such as the agent's turn start. On CUDA under bf16 the
-  shared blocks keep the residual in bf16 through all 24 layers, as the
-  offline FastConformer encoders do; the replaced encoder carried it in fp32
-  from the second layer on, so served bf16 frames differ from that encoder's
-  by an amount not yet measured on a GPU.
+  a knife-edge frame such as the agent's turn start. Under bf16 autocast the
+  stream node keeps the blocks' residual in fp32, as the replaced encoder did
+  from its second layer on; the offline FastConformer encoders keep theirs in
+  bf16. Against an fp32 run on 13 clips (one H200, real checkpoint,
+  2026-10-29), live frames have a mean per-frame relative error of 1.35%,
+  level with the replaced encoder's 1.39%, where a bf16 residual gave 1.63%;
+  uploads and offline passes are as close as the replaced encoder's too.
 - The encoder keeps each call's state in a slot per session of three
   resources: its attention keys and values in a bounded KV (``encoder_kv``),
   which keeps a call's last 70 frames per layer and runs the attention, each new
