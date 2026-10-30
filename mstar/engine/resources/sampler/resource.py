@@ -154,7 +154,7 @@ class SamplerResource(Resource):
         # `sample` and the loop-back reads use so the forward passes no ids. Set
         # by a non-preplan `plan`, cleared by `commit`.
         self._step_rids: tuple[int, ...] | None = None
-        # row indices for `overwrite_rows`, H2D from a ring of pinned buffers
+        # row and slot indices of routed rows, H2D from a ring of pinned buffers
         self._row_stager: PinnedStager | None = None
         # this node's resident rows, once its planner binds this sampler
         self._cells: SamplerCells | None = None
@@ -806,9 +806,13 @@ class SamplerResource(Resource):
     def write_loopback_tokens(self, rows: list[int], tokens: torch.Tensor) -> None:
         """Put the tokens of this step's ``rows`` (positions in the planned
         batch) that arrived from elsewhere in their slot masters, for a
-        replay that reads them there (``loopback_in_graph``)."""
+        replay that reads them there (``loopback_in_graph``). The slot index
+        goes up from pinned memory: a pageable host-to-device copy ends in a
+        stream sync, which here waits out the step still running."""
         rids = self._planned_rows()
-        self._cg_buffers.write_last_tokens([rids[i] for i in rows], tokens)
+        if self._row_stager is None:
+            self._row_stager = PinnedStager(torch.long, numel=64)
+        self._cg_buffers.write_last_tokens([rids[i] for i in rows], tokens, self._row_stager)
 
     @torch.compiler.disable
     def fused_draw_args(self) -> FusedDrawArgs | None:
