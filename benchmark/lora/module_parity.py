@@ -191,6 +191,19 @@ def _hf_rope(rotary, three_d: bool = False):
     return rope
 
 
+def _fp32_rotary(module) -> None:
+    """Every rotary embedding under ``module`` with its frequencies recomputed in fp32. A
+    reference built and then cast whole with ``.to(torch.bfloat16)`` rounds its
+    ``inv_freq`` buffer too, which transformers' own bf16 models keep in fp32."""
+    import torch
+
+    for rotary in module.modules():
+        if isinstance(getattr(rotary, "inv_freq", None), torch.Tensor) and hasattr(rotary, "config"):
+            fresh = type(rotary)(rotary.config)
+            rotary.inv_freq = fresh.inv_freq.to(rotary.inv_freq.device)
+            rotary.original_inv_freq = fresh.original_inv_freq.to(rotary.inv_freq.device)
+
+
 def _load_hf(module, snapshot: str, rename, strict: bool = True, files=None) -> None:
     """The checkpoint's tensors into ``module`` under ``rename`` (None skips one)."""
     import torch
@@ -284,6 +297,7 @@ def _higgs() -> ModelSpec:
             return name if name.startswith("lm_head") else f"model.{name}"
 
         _load_hf(ref, _snapshot(model), rename)
+        _fp32_rotary(ref)
         return HfReference(
             forward=lambda m, ids: m(ids[None].cuda()).logits[0, -1].float(),
             model=ref.cuda().eval(), rope=_hf_rope(ref.model.rotary_emb),
@@ -363,6 +377,7 @@ def _qwen3_tts() -> ModelSpec:
             return native.get(name, name)
 
         _load_hf(ref, _snapshot(model), rename)
+        _fp32_rotary(ref)
         return HfReference(
             forward=lambda m, ids: m(ids[None].cuda()).logits[0, -1].float(),
             model=ref.cuda().eval(), rope=_hf_rope(ref.model.rotary_emb),
@@ -427,6 +442,7 @@ def _chatterbox() -> ModelSpec:
         _load_hf(ref, _snapshot(model),
                  lambda n: n if n.startswith(keep) and not n.startswith("tfmr.embed_tokens.") else None,
                  strict=False, files=(model.config.t3_weights,))
+        _fp32_rotary(ref)
         return HfReference(
             forward=lambda m, ids: m(ids.cuda()).float(), model=ref.cuda().eval(),
             rope=_hf_rope(ref.tfmr.rotary_emb),
