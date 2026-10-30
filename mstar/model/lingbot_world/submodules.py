@@ -207,15 +207,13 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         if encoder_vae is not None and fast:
             wan_vae.encoder_to_channels_last(encoder_vae)
         if vae is not None and fast:
-            # cuDNN has fast bf16 conv3d from 9.16; before that bf16 is slower than fp32
-            cudnn = torch.backends.cudnn.version() or 0
-            if cudnn >= 91600:
-                self._decode_dtype = torch.bfloat16
+            self._decode_dtype = wan_vae.decode_dtype()
+            if self._decode_dtype == torch.bfloat16:
                 vae.to(torch.bfloat16)
             else:
-                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)", cudnn)
-            wan_vae.to_channels_last(vae)
-        self._decode_step = wan_vae.DecoderStep(vae, compile=fast, deterministic=True) if vae is not None else None
+                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)",
+                            torch.backends.cudnn.version())
+        self._decoder = wan_vae.FastDecoder(vae, channels_last=fast, compile=fast) if vae is not None else None
         if vae is not None:
             # the de-normalize's constants, fp32 on the decoder's device
             device = next(vae.parameters()).device
@@ -417,10 +415,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         continuation of the request's stream."""
         # the de-normalize in fp32 whatever the decode's dtype
         z = (latents[None].float() / self._latents_inv_std + self._latents_mean).to(self._decode_dtype)
-        with torch.amp.autocast("cuda", enabled=False):
-            return wan_vae.decode_causal(
-                self.vae, z, state["feat_cache"], self._decode_step, clip_start=clip_start, latents_per_call=1,
-            )
+        return self._decoder.decode_stream(z, state["feat_cache"], clip_start=clip_start)
 
     def check_stop(self, request_id, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
         done = request_info.dynamic_loop_iter_counts.get(ROLLOUT_LOOP_NAME, 0)

@@ -1,5 +1,9 @@
 model: "qwen3_5_0.8b"
 max_seq_len: 32768
+# The settings this model's throughput was measured with (mstar/utils/knobs.py)
+knobs:
+  kv_plan_cache: 1
+  gc_gen0_threshold: 50000
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.

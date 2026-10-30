@@ -56,16 +56,14 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
+from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts.components.conv_stack import causal_receptive_field_frames, conv_stack
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
 from mstar.model.qwen3_tts.components.speaker_encoder import (
     Qwen3TTSMelFrontEnd,
     Qwen3TTSSpeakerEncoder,
 )
-from mstar.model.qwen3_tts.components.talker import (
-    Qwen3TTSCodePredictor,
-    Qwen3TTSTalkerModel,
-)
+from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -152,7 +150,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     def __init__(
         self,
         talker_model: Qwen3TTSTalkerModel,
-        code_predictor: Qwen3TTSCodePredictor,
+        code_predictor: ResidualCodePredictor,
         config: Qwen3TTSModelConfig,
     ) -> None:
         super().__init__()
@@ -160,8 +158,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.code_predictor = code_predictor
         self.config = config
         self.talker_config = config.talker
-        self.cp_config = config.talker.code_predictor
-        self.num_codes = config.talker.num_code_groups
         self.token_stop = TokenStop(
             loop="talker_decode_loop", buffer="layer0_codes",
             stop_ids=frozenset({config.talker.codec_eos_token_id}),
@@ -174,9 +170,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         self._flag_stager = PinnedStager(torch.bool, numel=self.MAX_BATCH_SIZE)
         self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
         self._prefill_ids: dict[tuple[int, ...], torch.Tensor] = {}
-
-        # Lazy frame-local CodePredictor KV scratch, overwritten every step.
-        self._cp_kv_cache: torch.Tensor | None = None
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -227,23 +220,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         if 0 <= eos < logits.shape[1]:
             logits[:, eos].masked_fill_(suppress_eos, float("-inf"))
         return logits
-
-    def _get_cp_kv_cache(self, batch_size: int) -> torch.Tensor:
-        """Frame-local CodePredictor scratch cache, sliced to this micro-batch.
-
-        TODO: make this a resource. The fixed maximum-batch tensor is
-        overwritten every Talker step and gives the captured decode graph
-        stable addresses.
-        """
-        if self._cp_kv_cache is None:
-            cp = self.cp_config
-            self._cp_kv_cache = torch.zeros(
-                (cp.num_hidden_layers, self.MAX_BATCH_SIZE, 2,
-                 self.num_codes, cp.num_key_value_heads, cp.head_dim),
-                dtype=self.model.model.codec_embedding.weight.dtype,
-                device=self.get_device(),
-            )
-        return self._cp_kv_cache[:, :batch_size]
 
     def _project_text(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Map tokenizer embeddings into the Talker hidden width."""
@@ -628,45 +604,16 @@ class TalkerSubmodule(ARNodeSubmodule):
         layer0_codes: torch.Tensor,
         sample_codes: "Callable[[torch.Tensor], torch.Tensor]",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Walk residual groups 1..N-1, returning (all_codes, codec_embed_sum).
+        """Walk residual groups 1..N-1 from the Talker's group-0 codes,
+        returning (all_codes, codec_embed_sum).
 
-        ``sample_codes`` maps one group's logits to codes. Every op here is
-        graph-safe, so this body is captured verbatim — inside the whole-walk
-        decode graph, or on its own by the piecewise runner.
+        ``sample_codes`` maps one group's logits to codes. The loop is
+        graph-safe, so it is captured verbatim — inside the whole-walk decode
+        graph, or on its own by the piecewise runner.
         """
-        batch_size = layer0_codes.shape[0]
-        device = layer0_codes.device
-        all_codes = torch.empty(
-            batch_size, self.num_codes, dtype=torch.long, device=device
+        return self.code_predictor.depth_loop(
+            last_hidden, layer0_codes, self.model.model.codec_embedding(layer0_codes), sample_codes,
         )
-        all_codes[:, 0] = layer0_codes
-        codec_embed = self.model.model.codec_embedding(layer0_codes)
-        codec_embed_sum = codec_embed.clone()
-
-        cp_cache = self._get_cp_kv_cache(batch_size)
-        pos = torch.zeros(batch_size, 1, dtype=torch.int32, device=device)
-        # Position 0 conditions the depth decoder on the Talker hidden state.
-        # Each following position consumes the previous group's embedding.
-        depth = self.code_predictor.depth
-        depth.bind_step(cp_cache, pos, cache_pos=0)
-        self.code_predictor.forward_depth_unrolled(last_hidden.unsqueeze(1))
-        for group_idx in range(1, self.num_codes):
-            pos.fill_(group_idx)
-            depth.bind_step(cp_cache, pos, cache_pos=group_idx)
-            cp_hidden = self.code_predictor.forward_depth_unrolled(
-                codec_embed.unsqueeze(1)
-            ).squeeze(1)
-            cp_logits = torch.matmul(
-                cp_hidden,
-                self.code_predictor.lm_head_weight[group_idx - 1].t(),
-            )
-            codes = sample_codes(cp_logits)
-            all_codes[:, group_idx] = codes
-            codec_embed = self.code_predictor.model.codec_embedding[
-                group_idx - 1
-            ](codes)
-            codec_embed_sum.add_(codec_embed)
-        return all_codes, codec_embed_sum
 
     def _code_predictor_piecewise_capture(
         self, call: PiecewiseCallInputs,
@@ -697,12 +644,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         ``talker_prefill``, which is eager because it is variable-length. Left
         eager, this loop costs ~4x its captured time.
         """
-        # a step replays the region exactly when it leased it, which is when
-        # the region (not ``declare_step``) declared CODE_PRED_SAMPLER
-        if DEPTH_LOOP_REGION not in engine_inputs.piecewise_leases:
+        # here exactly when the step leased it, which is when the region (not
+        # ``declare_step``) declared CODE_PRED_SAMPLER
+        runner = engine_inputs.piecewise_runners.get(DEPTH_LOOP_REGION)
+        if runner is None:
             return None
         batch_size = layer0_codes.shape[0]
-        output = engine_inputs.piecewise_runners[DEPTH_LOOP_REGION].run(
+        output = runner.run(
             static_inputs={
                 "last_hidden": last_hidden,
                 "layer0_codes": layer0_codes,

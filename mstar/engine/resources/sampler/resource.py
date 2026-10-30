@@ -531,7 +531,7 @@ class SamplerResource(Resource):
 
     def enable_device_loopback_reader(self) -> None:
         """A node of this sampler declares it reads its last sampled tokens
-        back on the device (``TokenStop.loopback_signal``). Only then
+        back on the device (``ARNodeSubmodule.device_loopback``). Only then
         are the slot masters kept: the eager-step write behind them is a small
         synchronous host-to-device copy per step, and a node that takes its
         tokens on the host would pay it for nothing. Honours the knob."""

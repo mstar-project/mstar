@@ -815,7 +815,7 @@ impl RequestState {
                 dests.push(d);
             }
             if let Some(lid) = src_loop {
-                if g.lp(lid).loop_back.contains(&(e.name, g.node(d).name))
+                if g.lp(lid).loop_back.contains(&(e.name, e.dest_sym))
                     && !next_iter.contains(&d)
                 {
                     next_iter.push(d);

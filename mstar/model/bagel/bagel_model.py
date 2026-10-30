@@ -14,17 +14,18 @@ Architecture (4 nodes, 7 with CFG-parallel placement):
     LLM_cfg_text, LLM_cfg_img, combine_cfg - only when the deployment places
                   the guidance branches on their own workers (the CFG walks)
 
-Graph walks (5, or 9 with CFG-parallel placement):
+Graph walks (9, or 11 with CFG-parallel placement):
     prefill_text   - Text token embedding + LLM prefill (causal)
     prefill_vit    - ViT encoding + LLM prefill (bidirectional for images)
     prefill_vae    - VAE encoding + LLM prefill (bidirectional for images)
     decode         - Autoregressive text generation
-    image_gen      - Flow matching loop (CFG + Euler) + VAE decode, every
-                     branch in the one LLM node
-    CFG-parallel only, a guided request's phases (``image_gen_phases``):
+    image_gen      - Flow matching loop (Euler, main branch only) + VAE decode
+    A guided request's phases (``image_gen_phases``):
     image_gen_head - The steps before the CFG window, on LLM alone
-    image_gen_cfg2, image_gen_cfg3 - The CFG window, one node per guidance
-                     branch, the velocities combined in combine_cfg
+    image_gen_guided2, image_gen_guided3 - The CFG window on LLM alone, every
+                     branch in one combined forward
+    image_gen_cfg2, image_gen_cfg3 - CFG-parallel only: the CFG window, one
+                     node per guidance branch, the velocities combined in combine_cfg
     image_decode   - The VAE decode alone, when the window reaches the last step
     (the steps after the window run as image_gen, from the window's end)
 
@@ -88,6 +89,7 @@ from mstar.model.bagel.submodules import (
     IMAGE_DECODE,
     IMAGE_GEN,
     IMAGE_SENTINELS,
+    LLM_GRAPH_WALKS,
     NODE_TO_CFG_LABEL,
     CFGWindow,
     CombineCFGSubmodule,
@@ -98,6 +100,7 @@ from mstar.model.bagel.submodules import (
     ViTEncoderSubmodule,
     cfg_window,
     denoise_loop,
+    guided,
     image_gen_phases,
     vae_latents,
     vit_patches,
@@ -129,7 +132,7 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
+from mstar.model.utils import TextOutput
 
 logger = logging.getLogger(__name__)
 
@@ -287,7 +290,6 @@ class BagelModel(Model):
     through interleaved text and image inputs.
     """
 
-    _text_detokenizer: TextChunkDetokenizer | None = None
 
     INTERNAL_KWARGS = (CFG_WINDOW,)
 
@@ -738,18 +740,20 @@ class BagelModel(Model):
             return result
         if prompt is None:
             parts, segments = parts_from_modalities(input_modalities), []
-        layout = self._kv_layout(parts, segments, images, output_modalities, params)
-        metadata = {"kv_layout": {"kv": layout}}
+        metadata = {}
+        window = None
         if "image" in output_modalities:
-            metadata[CFG_WINDOW] = tuple(cfg_window(
+            window = cfg_window(
                 self.config.num_timesteps, self.config.timestep_shift, tuple(params["cfg_interval"]),
                 params["cfg_text_scale"], params["cfg_img_scale"],
-            ))
+            )
+            metadata[CFG_WINDOW] = tuple(window)
+        metadata["kv_layout"] = {"kv": self._kv_layout(parts, segments, images, output_modalities, params, window)}
         return ProcessPromptOutput(result, metadata)
 
     def _kv_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
-        output_modalities: list[str], params: dict,
+        output_modalities: list[str], params: dict, window: CFGWindow | None,
     ) -> dict[str, LabelLayout]:
         """Each label's writes, in the order `_build_prefill_schedule` runs them.
 
@@ -758,8 +762,8 @@ class BagelModel(Model):
         doesn't cover the resize. Under guidance, ``cfg_img`` holds the text alone.
         ``cfg_text`` forks before a text walk and after an image walk, so it holds all
         but the last span when the last span is text, and every span when the prompt
-        ends on an image. Without guidance a generation still denoises on all three
-        labels on a CFG-parallel deployment, which isn't known here.
+        ends on an image. A branch label denoises (its scratch) only where the
+        request's ``window`` runs that branch.
         """
         cfg = self.config
         target_output = (output_modalities or ["text"])[0]
@@ -797,15 +801,16 @@ class BagelModel(Model):
         scratch = (height // cfg.latent_downsample) * (width // cfg.latent_downsample) + IMAGE_SENTINELS
         growth = (("decode_loop", 1),) if think_mode else ()
         main = LabelLayout(spans=tuple(spans), growth=growth, scratch=scratch, keyed_spans=keyed)
-        if not self._requires_cfg(target_output=target_output, **params):
-            return {"main": main, "cfg_text": LabelLayout(scratch=scratch), "cfg_img": LabelLayout(scratch=scratch)}
+        if not guided(window):
+            return {"main": main, "cfg_text": LabelLayout(), "cfg_img": LabelLayout()}
         return {
             "main": main,
             "cfg_text": LabelLayout(
                 spans=tuple(spans[:-1] if spans and spans[-1].walk == "prefill_text" else spans), scratch=scratch,
             ),
             "cfg_img": LabelLayout(
-                spans=tuple(span for span in spans if span.walk == "prefill_text"), growth=growth, scratch=scratch,
+                spans=tuple(span for span in spans if span.walk == "prefill_text"), growth=growth,
+                scratch=scratch if window.branches == 3 else 0,
             ),
         }
 
@@ -837,19 +842,19 @@ class BagelModel(Model):
         )
         return resized.squeeze(0)
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), (self.eos_token_id,))
+
     def postprocess(
         self, output: torch.Tensor,
         modality: str, # text | image | video | audio
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            ids = drop_stop_tokens(output, (self.eos_token_id,), request_kwargs)
-            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-            return self._text_detokenizer.to_bytes(ids)
+            return super().postprocess(output, modality, request_kwargs)
         if modality == "image":
-            # the same truncated pixels as before, through the shared writer: PIL's default PNG
-            # encode (adaptive filters, zlib 6) took ~0.4 s of every 1024^2 request
+            # truncated to uint8, through the shared writer: PIL's default PNG encode
+            # (adaptive filters, zlib 6) took ~0.4 s of every 1024^2 request
             return encode_image((output[0] * 255).to(torch.uint8), request_kwargs)
         raise ValueError(f"Unsupported modality: {modality!r}")
 
@@ -955,7 +960,7 @@ class BagelModel(Model):
         The conductor resolves this once and the engine hands each config to
         its resource at ingest.
         """
-        from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
+        from mstar.model.bagel.submodules import active_labels
 
         model_kwargs = model_kwargs or {}
         request = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs
@@ -969,10 +974,11 @@ class BagelModel(Model):
             branch_labels = ["cfg_text", "cfg_img"]
             if self._has_cfg_parallel and not self._has_llm_disaggregation:
                 # The branch labels' only readers are the CFG walk's branch nodes, one
-                # label each: none without a window. (A remote LLM, on a split
-                # deployment, runs single-node walks that read both.)
-                cfg_walk = next((p.walk for p in request["image_gen_phases"] if p.walk in CFG_WALKS), None)
-                branch_labels = list(NODE_TO_CFG_LABEL.values())[1:CFG_WALKS[cfg_walk]] if cfg_walk else []
+                # label each. (A remote LLM, on an LLM-disaggregated deployment, may also
+                # run decode, which reads cfg_img, and its single-node denoise walks still
+                # name both labels per request, not per walk.)
+                cfg_walk = next(p.walk for p in request["image_gen_phases"] if p.walk in CFG_WALKS)
+                branch_labels = list(NODE_TO_CFG_LABEL.values())[1:CFG_WALKS[cfg_walk]]
             for (node, walk), labels in {
                 ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
                 ("LLM", "prefill_vit"): ["cfg_text"],
@@ -1002,7 +1008,7 @@ class BagelModel(Model):
                 needed_labels_per_node_walk={
                     (node, walk): active_labels(walk, cfg, node)
                     for node in nodes
-                    for walk in LLM_GRAPH_WALKS
+                    for walk in LLM_GRAPH_WALKS[self._has_cfg_parallel]
                 },
                 # Only the main LLM instance creates cache branches consumed
                 # by the remote CFG replicas, and it exports only the ones the
@@ -1160,35 +1166,35 @@ class BagelModel(Model):
             "prefill_vit": prefill_vit,
             "prefill_vae": prefill_vae,
             DECODE: decode,
-            IMAGE_GEN: self._denoise_walk(IMAGE_GEN),
+            IMAGE_DECODE: self._vae_decode(),
         }
-        if self._has_cfg_parallel:
-            walks.update({walk: self._denoise_walk(walk) for walk in DENOISE_WALKS if walk != IMAGE_GEN})
-            walks[IMAGE_DECODE] = self._vae_decode()
+        walks.update({
+            walk: self._denoise_walk(walk) for walk in LLM_GRAPH_WALKS[self._has_cfg_parallel] if walk in DENOISE_WALKS
+        })
         return walks
 
     @staticmethod
     def _denoise_nodes(walk: str) -> tuple[str, ...]:
         """The nodes of a denoise walk that read latents and time_index."""
-        branches = DENOISE_WALKS[walk].branches
-        if branches == 1:
+        branches, split, _ = DENOISE_WALKS[walk]
+        if not split:
             return ("LLM",)
         return (*list(NODE_TO_CFG_LABEL)[:branches], "combine_cfg")
 
     def _denoise_walk(self, walk: str) -> GraphSection:
-        """A denoise walk, from its `DenoiseWalk` (branches, decode).
+        """A denoise walk, from its `DenoiseWalk` (branches, split, decode).
 
         One Euler step per iteration, so a request's N timestep boundaries take
         N - 1 iterations in all; the request's loop cap (`get_loop_caps`) sets
-        the walk's share. One branch is the LLM node alone, running every
-        branch the step needs; more are a node per branch whose velocities
+        the walk's share. Unsplit is the LLM node alone, running the walk's
+        branches as one forward; split is a node per branch whose velocities
         combine_cfg combines into the step. Without the decode the loop's last
         latents and time_index persist for the request's next walk.
         """
-        branches, decode = DENOISE_WALKS[walk]
+        branches, split, decode = DENOISE_WALKS[walk]
         loop_back = [GraphEdge(next_node=node, name=name) for node in self._denoise_nodes(walk)
                      for name in ("latents", "time_index")]
-        if branches == 1:
+        if not split:
             section = GraphNode(
                 name="LLM",
                 input_names=["latents", "time_index"],
@@ -1316,17 +1322,6 @@ class BagelModel(Model):
                     params[key] = model_kwargs[key]
         return params
 
-    def _requires_cfg(
-        self, **kwargs,
-    ):
-        return (
-            kwargs["target_output"] == "image" \
-                and (
-                    kwargs["cfg_img_scale"] > 1.0 \
-                    or kwargs["cfg_text_scale"] > 1.0
-                )
-        )
-
     def _get_step_metadata(
         self, full_metadata: CurrentForwardConductorMetadata,
     ) -> dict:
@@ -1341,11 +1336,6 @@ class BagelModel(Model):
             "width": full_metadata.kwargs["width"],
             "height": full_metadata.kwargs["height"],
             "image_preprocess": full_metadata.kwargs["image_preprocess"],
-            # a single-node denoise step's branches read these (`image_gen_step_branches`)
-            "cfg_window": full_metadata.kwargs.get(CFG_WINDOW),
-            "image_gen_branches": self._image_gen_phase(full_metadata).branches if (
-                full_metadata.graph_walk in DENOISE_WALKS
-            ) else None,
         }
 
     @staticmethod
@@ -1461,11 +1451,12 @@ class BagelModel(Model):
             "think_mode": think_mode,
             **params,  # CFG params  + gen width / height
         }
-        kwargs["requires_cfg"] = self._requires_cfg(**kwargs)
+        kwargs["requires_cfg"] = False
         if target_output == "image":
             # process_prompt resolved the window with the request's guidance kwargs
-            kwargs[CFG_WINDOW] = (model_kwargs or {})[CFG_WINDOW]
-            kwargs["image_gen_phases"] = self._image_gen_phases(kwargs[CFG_WINDOW])
+            window = CFGWindow(*(model_kwargs or {})[CFG_WINDOW])
+            kwargs["requires_cfg"] = guided(window)
+            kwargs["image_gen_phases"] = self._image_gen_phases(window)
             kwargs["image_gen_phase"] = 0
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,

@@ -29,3 +29,6 @@ node_groups:
     graph_walks:
       - decode
       - image_gen
+      - image_gen_head
+      - image_gen_guided2
+      - image_gen_guided3

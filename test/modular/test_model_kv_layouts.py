@@ -172,15 +172,11 @@ class _BagelPool:
     def step(self, walk: str, rows: dict, guided: dict) -> None:
         from mstar.engine.resources import StepContext
         from mstar.engine.resources.step import SubmoduleStep
-        from mstar.model.bagel.submodules import CFG_BRANCHES
         from mstar.model.submodule_base import ARNodeInputs
 
         inputs = []
         for rid, count in rows.items():
             inputs.append(ARNodeInputs(input_seq_len=count, resource_step_info=guided[rid]))
-            if walk.startswith("image_gen"):
-                # every label a guided request holds, as an in-interval step stamps it
-                inputs[-1].kwargs[CFG_BRANCHES] = 3 if guided[rid] else 1
             if walk not in {"prefill_text", "decode"}:
                 positions = torch.zeros(count, dtype=torch.int32)
                 inputs[-1].custom_pos_ids = dict.fromkeys(("main", "cfg_text", "cfg_img"), positions)
@@ -424,13 +420,13 @@ def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_
 
 
 def _tiny_qwen3_tts_talker():
-    from test_qwen3_tts_model import _tiny_model_config
+    from test_qwen3_tts_model import _code_predictor, _tiny_model_config
 
-    from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor, Qwen3TTSTalkerModel
+    from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
     from mstar.model.qwen3_tts.submodules import TalkerSubmodule
 
     config = _tiny_model_config()
-    return TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    return TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
 
 
 LONG_TEXT = "one two three four five six seven eight nine ten eleven twelve"

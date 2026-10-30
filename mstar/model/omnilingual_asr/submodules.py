@@ -197,9 +197,9 @@ class OmniASRCTCSubmodule(NodeSubmodule):
     def _fits_capture(self, inputs: list[NodeInputs]) -> bool:
         """Whether a step replays the captured encoder: it packs, and its rows,
         one segment each under the replay's one row, fit the attention
-        resource's per-request ceiling (read from it, so a YAML override
+        resource's ``max_segments_per_step`` (read from it, so a YAML override
         holds). A step over the ceiling encodes packed eagerly."""
-        return len(inputs) <= self.node_resources[ENCODER_ATTN].max_segments_per_request and self._packs(
+        return len(inputs) <= self.node_resources[ENCODER_ATTN].max_segments_per_step and self._packs(
             [inp.input_seq_len for inp in inputs]
         )
 
@@ -223,8 +223,8 @@ class OmniASRCTCSubmodule(NodeSubmodule):
                 rows[row] = x[i, :n]
         packed = rows[0] if len(rows) == 1 else torch.cat(rows)
         frames = [r.shape[0] for r in rows]
-        if ENCODER_LOOP in engine_inputs.piecewise_leases:
-            runner = engine_inputs.piecewise_runners[ENCODER_LOOP]
+        runner = engine_inputs.piecewise_runners.get(ENCODER_LOOP)
+        if runner is not None:
             # all of the step's segments under one row (`one_row_per_step`);
             # a copy, since the output buffer is overwritten by the next
             # step's replay

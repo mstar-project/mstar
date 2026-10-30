@@ -84,7 +84,7 @@ from mstar.model.qwen3_5.video import (
     sample_video,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
+from mstar.model.utils import TextOutput
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -165,11 +165,9 @@ class Qwen3_5DenseModel(Model):
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
     # token streaming keeps three API-server threads busy: +4 to +8% tok/s on
-    # 0.8B text at c=64 (docs/serving.rst)
+    # 0.8B text at c=64 before #849; re-measure pending (docs/serving.rst)
     API_SWITCH_INTERVAL_S = 0.001
     INTERNAL_KWARGS = (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)
-
-    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -294,9 +292,9 @@ class Qwen3_5DenseModel(Model):
                     head_dim=vision.head_dim,
                     # A segment per image, not per request: the resize floors
                     # each image at `shortest_edge` pixels. A video frame group
-                    # has no floor; a prompt with more segments runs the block
+                    # has no floor; a step with more segments runs the block
                     # loop eagerly (`VisionEncoderSubmodule._fits_capture`).
-                    max_segments_per_request=(
+                    max_segments_per_step=(
                         VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
                     ),
                 ),
@@ -416,25 +414,30 @@ class Qwen3_5DenseModel(Model):
 
     @property
     def video_processor(self):
-        """The checkpoint's ``video_preprocessor_config.json``, lazily."""
+        """The checkpoint's ``video_preprocessor_config.json``, lazily. Its
+        patches are normalized by the image processor's settings
+        (`pixel_normalizer`), so it must agree with them; checked here, on the
+        first video, so a deployment that never sees one never loads it."""
         if self._video_processor is None:
             from transformers import AutoVideoProcessor
 
-            self._video_processor = AutoVideoProcessor.from_pretrained(
+            video = AutoVideoProcessor.from_pretrained(
                 self.local_dir, cache_dir=self.cache_dir,
             )
+            image = self.image_processor
+            for name in ("rescale_factor", "image_mean", "image_std", "temporal_patch_size", "patch_size"):
+                if getattr(video, name) != getattr(image, name):
+                    raise ValueError(f"image and video processors disagree on {name}")
+            self._video_processor = video
         return self._video_processor
 
     def pixel_normalizer(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-column mean and std that turn `process_prompt`'s byte patches
         into the processors' normalized pixels: their fused rescale-and-
         normalize, ``(x - mean / rescale) / (std / rescale)``, element for
-        element. One for images and videos, whose processors share it."""
+        element. One for images and videos, whose processors share it
+        (`video_processor`)."""
         processor = self.image_processor
-        video = self.video_processor
-        for name in ("rescale_factor", "image_mean", "image_std", "temporal_patch_size", "patch_size"):
-            if getattr(video, name) != getattr(processor, name):
-                raise ValueError(f"image and video processors disagree on {name}")
         scale = 1.0 / processor.rescale_factor
         mean = torch.tensor(processor.image_mean) * scale
         std = torch.tensor(processor.image_std) * scale
@@ -647,18 +650,18 @@ class Qwen3_5DenseModel(Model):
         return self._resolve_weights()
 
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
+
     def postprocess(
-            self,
-            output: torch.Tensor,
-            modality: str,
-            request_kwargs: dict | None = None,
-        ) -> bytes:
-            if modality == "text":
-                ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-                if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                    self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-                return self._text_detokenizer.to_bytes(ids)
-            raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
+        self,
+        output: torch.Tensor,
+        modality: str,
+        request_kwargs: dict | None = None,
+    ) -> bytes:
+        if modality == "text":
+            return super().postprocess(output, modality, request_kwargs)
+        raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass args

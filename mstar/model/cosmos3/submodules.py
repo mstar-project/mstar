@@ -56,6 +56,7 @@ from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
+from mstar.engine.fp32_precision import cudnn_benchmark
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.windowing import WindowSchedule
@@ -2779,18 +2780,6 @@ def _latent_affine(vae, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch
     return mean, inv_std
 
 
-def _vae_decode_dtype() -> torch.dtype:
-    # cuDNN ships fast Hopper bf16 conv3d for the Wan-VAE decode only from
-    # 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
-    # single-variable cuDNN swap), so gate on the live version — an upgrade
-    # flips it automatically. COSMOS3_VAE_DECODE_FP32 overrides.
-    override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
-    if override is not None:
-        return torch.float32 if override.lower() not in ("0", "false", "no", "off") else torch.bfloat16
-    ver = torch.backends.cudnn.version() or 0
-    return torch.bfloat16 if ver >= 91600 else torch.float32
-
-
 class ChainedWindowHead:
     """The clean head of a window that continues earlier frames: a chained
     window's overlap, or a resumed session's first window.
@@ -2878,9 +2867,9 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the
         # choice is fixed at startup, not on the first request.
         self._decode_dtype()
-        self._fast_step = None
+        self._fast = None
         if fast:
-            self._fast_step = _wan_vae().DecoderStep(vae, compile=self._decode_compiled, deterministic=True)
+            self._fast = _wan_vae().FastDecoder(vae, compile=self._decode_compiled)
             logger.info("Cosmos3 VAE decode: video clips on the shared Wan VAE decoder (channels-last), "
                         "images through the stock decode")
 
@@ -2890,7 +2879,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     def _decode_dtype(self):
         if self._decode_dtype_cached is not None:
             return self._decode_dtype_cached
-        self._decode_dtype_cached = _vae_decode_dtype()
+        # COSMOS3_VAE_DECODE_FP32 forces fp32, or bf16 when it is 0/false/no/off
+        self._decode_dtype_cached = _wan_vae().decode_dtype("COSMOS3_VAE_DECODE_FP32")
         logger.info("Cosmos3 VAE decode dtype = %s (cuDNN %s)",
                     self._decode_dtype_cached, torch.backends.cudnn.version())
         return self._decode_dtype_cached
@@ -2925,13 +2915,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         vae_dtype = self._decode_dtype()
         z = self._vae_input(latents)
         # one latent (an image) is faster through the stock decode (24 vs 36 ms on an H200)
-        if self._fast_step is not None and z.shape[2] > 1:
-            wan_vae = _wan_vae()
-            with torch.autocast(device_type="cuda", enabled=False):
-                decoded = wan_vae.decode_causal(
-                    self.vae, z, wan_vae.new_feat_cache(self.vae), self._fast_step, clip_start=True,
-                )
-            return self._to_uint8(decoded)
+        if self._fast is not None and z.shape[2] > 1:
+            return self._to_uint8(self._fast.decode(z))
         with torch.autocast(device_type="cuda", enabled=False):
             if (
                 self._decode_compiled
@@ -3000,7 +2985,12 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
             config.session_store_size, config.session_timeout_s, config.session_timeout_max_s,
         )
         self._warm_enabled = vae is not None and bool(config.windowed_decode_warm_cache)
-        self._step = _wan_vae().DecoderStep(vae, compile=self._decode_compiled) if self._warm_enabled else None
+        # the warm cache's decoder; the stateless re-decode never runs it
+        self._stream = None
+        if self._warm_enabled:
+            self._stream = _wan_vae().FastDecoder(
+                vae, channels_last=self._channels_last, compile=self._decode_compiled, deterministic=False,
+            )
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         chunks = (inputs or {}).get("window_latents") or []
@@ -3122,25 +3112,19 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
         if not self.config.vae_decode_cudnn_benchmark:
             return super()._decode_pixels(latents)
-        with _wan_vae().cudnn_benchmark(True):
+        with cudnn_benchmark(True):
             return super()._decode_pixels(latents)
 
     def _decode_stream(self, latents: torch.Tensor, feat_cache: list, clip_start: bool) -> torch.Tensor:
         """``_decode_pixels`` continuing the stream whose decoder cache is
         ``feat_cache`` (updated in place)."""
-        wan_vae = _wan_vae()
         z = self._vae_input(latents)
         # Only steady windows group latents per call: a stream's first window
         # (the clip start, or a resumed session's context ahead of its new
         # latents) runs one latent per call, so its peak stays the default's.
         per_call = 1 if clip_start else int(self.config.windowed_decode_latents_per_call)
-        with (
-            torch.autocast(device_type="cuda", enabled=False),
-            wan_vae.cudnn_benchmark(self.config.vae_decode_cudnn_benchmark),
-        ):
-            decoded = wan_vae.decode_causal(
-                self.vae, z, feat_cache, self._step, clip_start=clip_start, latents_per_call=per_call,
-            )
+        with cudnn_benchmark(self.config.vae_decode_cudnn_benchmark):
+            decoded = self._stream.decode_stream(z, feat_cache, clip_start=clip_start, latents_per_call=per_call)
         return self._to_uint8(decoded)
 
 

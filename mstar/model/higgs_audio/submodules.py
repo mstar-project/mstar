@@ -44,6 +44,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    DeviceLoopback,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -275,10 +276,14 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         super().__init__()
         self.model = llm
         self.config = config
-        # decode reads its input ids off the sampler's slot masters
+        # the prefill samples the reply's first token
         self.token_stop = TokenStop(
             loop="decode_loop", buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
-            sampler=SAMPLER, walk="decode", loopback_signal="text_inputs",
+            sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_audio"}),
+        )
+        # decode reads its input ids off the sampler's slot masters
+        self.device_loopback = DeviceLoopback(
+            walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
         )
 
     def get_accelerator_graph_configs(
@@ -388,14 +393,8 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         if graph_walk == "decode":
             if all(inp.input_ids is not None for inp in inputs):
                 return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
-            # device loop-back: each row's last sampled token, read by slot;
-            # rows whose previous step was the prefill brought theirs
-            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
-            routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
-            if routed:
-                sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
-            return {"input_ids": ids}
+            # device loop-back: each row's last sampled token, read by slot
+            return self.loopback_inputs(engine_inputs, inputs)
         return {
             "input_embeds": torch.cat(
                 [inp.input_embeds for inp in inputs], dim=0

@@ -508,6 +508,25 @@ def test_encoder_graphs_and_vae_compiles_cover_the_max_batch(monkeypatch, max_ba
     assert decoder._decode_batch_sizes == vae
 
 
+def test_the_text_encoder_refuses_a_row_without_its_prompt_length():
+    """Whether a batch replays the captured encoder is read from each row's ``text_len``
+    step metadata; a model that never sets it must fail, not run eager on every batch."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.components.diffusion.qwen3.submodule import TEXT_LEN, Qwen3TextEncoderSubmodule
+
+    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), Flux2KleinConfig().text_encoder,
+                                     capture_walk=ENCODE_TEXT_WALK)
+
+    def row(**step_metadata):
+        return CurrentForwardPassInfo(request_id="r", graph_walk=ENCODE_TEXT_WALK, fwd_index=0, random_seed=0,
+                                      max_tokens=0, step_metadata=step_metadata)
+
+    assert text.cg_key_info(ENCODE_TEXT_WALK, {"r": row(**{TEXT_LEN: 7})}) is True
+    for metadata in ({}, {"num_inference_steps": 4}):
+        with pytest.raises(ValueError, match=TEXT_LEN):
+            text.cg_key_info(ENCODE_TEXT_WALK, {"r": row(**metadata)})
+
+
 def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch, torch_flag):
     """``torch.compile`` traces lazily, so ``emulate_precision_casts`` has to be in
     effect when the compiled callable is CALLED, not when it is built -- the build runs

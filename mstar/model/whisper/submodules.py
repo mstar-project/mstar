@@ -33,6 +33,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    DeviceLoopback,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -279,13 +280,15 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        # Only a decode step's token ends the loop. Decode reads its last token
-        # off the sampler's slot masters, and its timestamp rule state from the
-        # sampler's declared loop-back state beside it (`device_loopback_signals`).
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token",
             stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
-            walk=DECODE_WALK, loopback_signal="text_inputs",
+        )
+        # The decode walk reads its last token off the sampler's slot masters and
+        # its timestamp rule state from the sampler's declared loop-back state
+        # beside it (`device_loopback_signals`).
+        self.device_loopback = DeviceLoopback(
+            walk=DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
         )
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
@@ -561,7 +564,8 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
                 "audio_frames": inp.kwargs["audio_frames"],
             }
         if graph_walk == DECODE_WALK and any(inp.input_ids is None for inp in inputs):
-            return self._loopback_inputs(engine_inputs, inputs)
+            # the token and its rule state, read by slot
+            return self.loopback_inputs(engine_inputs, inputs, (TS_RULES,))
         rows = [self._row_ids(inp) for inp in inputs]
         device = rows[0].device
         rules = torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs])
@@ -595,25 +599,6 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         # the token's rule state rides beside it
         signals = super().device_loopback_signals(graph_walk)
         return signals | {"ts_rules"} if signals else signals
-
-    def _loopback_inputs(
-        self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
-    ) -> dict[str, torch.Tensor]:
-        """A decode step's token and rule state for every row, read by sampler
-        slot (padding rows read the trash row); a row whose last step did not
-        keep them on the device (the first decode step, after the prefill)
-        brings them routed and they override its slot's."""
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        rules = sampler.loopback_state(TS_RULES, engine_inputs.request_ids)
-        routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
-        if routed:
-            sampler.overwrite_rows(
-                routed,
-                (ids, torch.cat([inputs[i].input_ids for i in routed])),
-                (rules, torch.stack([inputs[i].tensor_inputs["ts_rules"] for i in routed])),
-            )
-        return {"input_ids": ids, "ts_rules": rules}
 
     def _write_context(self, encoder_states: torch.Tensor) -> None:
         self.decoder.write_cross_kv(encoder_states)

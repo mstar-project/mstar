@@ -1,5 +1,5 @@
-"""Ragged attention checks that need no GPU: head-dimension padding, head
-sharding and the custom op's manager registry."""
+"""Ragged attention checks that need no GPU: head-dimension padding and the
+custom op's manager registry."""
 
 import sys
 from types import SimpleNamespace
@@ -117,23 +117,28 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch):
     assert prefill.call_args.kwargs["use_cuda_graph"] is True
 
 
-@pytest.mark.parametrize(("axis", "heads"), [("tp", 2), ("sp", 2), ("cfg", 4)])
-def test_resource_info_built_without_head_shards_shards_over_its_group(axis, heads):
-    """Built outside the engine (a reference test, the checkpoint validator),
-    an ``EngineResourceInfo`` over a two-rank TP or SP group gives one rank's
-    heads; a CFG group's ranks each run whole branches, every head."""
+@pytest.mark.parametrize(("tp", "sp", "shard_over_sp", "heads"), [
+    (1, 1, True, 8), (2, 1, True, 4), (1, 2, True, 4), (2, 2, True, 2), (2, 2, False, 4),
+])
+def test_cfg_ranks_keep_every_head(tp, sp, shard_over_sp, heads):
+    """On a lockstep instance with a two-rank CFG axis, a ragged attention's
+    heads split over the TP x SP ranks only (TP only with ``shard_over_sp=False``):
+    each CFG rank runs whole guidance branches, so the instance's world size
+    over-counts the head shards."""
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
-    pair = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
-    axes = {f"{a}_group": pair if a == axis else CommGroup.trivial() for a in ("tp", "sp", "cfg")}
+    def group(size):
+        return CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(size)))
+
+    joint = JointGroups(tp_group=group(tp), sp_group=group(sp), cfg_group=group(2), instance=group(tp * sp * 2))
     spec = RaggedAttentionSpec(
-        resource_key="by_hand", nodes={"encoder"},
-        config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=64),
+        resource_key="by_hand", nodes={"dit"},
+        config=RaggedAttentionConfig(num_qo_heads=8, num_kv_heads=8, head_dim=64, shard_over_sp=shard_over_sp),
     )
     mgr = build_resource(spec, EngineResourceInfo(
-        device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=JointGroups(instance=pair, **axes),
+        device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=joint,
     ))
     assert mgr._kwargs["num_qo_heads"] == heads
 

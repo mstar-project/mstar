@@ -35,6 +35,23 @@ def test_fused_add_rms_norm_portable_kernel_is_the_unfused_add_and_norm(gemma_mo
     torch.testing.assert_close(x, expected)
 
 
+def test_fused_add_rms_norm_cuda_kernel_runs_a_dtype_mix_unfused():
+    """FlashInfer's fused kernel reads ``residual`` and ``weight`` as ``x``'s
+    dtype, so the CUDA kernel hands any other mix (here an fp32 weight) to the
+    unfused add and norm, which casts the weight."""
+    from mstar.engine.resources.rms_norm.rms_norm import _fused_add_rms_norm_cuda
+
+    torch.manual_seed(0)
+    x, residual = torch.randn(3, 8, dtype=torch.bfloat16), torch.randn(3, 8, dtype=torch.bfloat16)
+    weight = torch.randn(8)
+    want_x, want_residual = x.clone(), residual.clone()
+    torch.ops.mstar.fused_add_rms_norm(want_x, want_residual, weight, 1e-6, False)  # the portable kernel
+
+    _fused_add_rms_norm_cuda(x, residual, weight, 1e-6, False)
+
+    assert torch.equal(residual, want_residual) and torch.equal(x, want_x)
+
+
 def test_rms_norm_operator_has_backend_neutral_name():
     assert hasattr(torch.ops.mstar, "rms_norm")
 

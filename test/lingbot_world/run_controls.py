@@ -125,9 +125,7 @@ def main():
         vae = model._load_vae().to(DEVICE)
         if not vae_dtype_fp32:
             vae = vae.to(torch.bfloat16)
-        if channels_last:
-            wan_vae.to_channels_last(vae)
-        sub.vae, sub._decode_step = vae, wan_vae.DecoderStep(vae, compile=False)
+        sub.vae, sub._decoder = vae, wan_vae.FastDecoder(vae, channels_last=channels_last, compile=False)
         st = sub.request_state(20)
         st.add("feat_cache", wan_vae.new_feat_cache(vae))
         times, outs = [], []

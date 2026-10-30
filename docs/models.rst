@@ -51,6 +51,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
      - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
        stochastic sampler); TP=2 deployments.
+   * - ``cosyvoice3``
+     - ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``
+     - Zero-shot voice-cloning TTS: Qwen2-0.5B speech-token LM with RAS sampling,
+       DiT flow-matching decoder and causal HiFT vocoder, streamed in chunks.
+       Clones from a preset or an uploaded clip. 24 kHz.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
@@ -236,12 +241,14 @@ OmniVoice notes
   and each residual add folds into the next RMSNorm (flashinfer
   ``fused_add_rmsnorm``), so logits match the reference to half-precision
   rounding rather than bit for bit. ``model_kwargs: {backbone_graphs: false}``
-  runs the same layer loop eagerly.
+  runs the same layer loop eagerly, and ``backbone_token_buckets`` sets the
+  packed-token buckets (256 to 4096 by default).
 - ``configs/omnivoice_split.yaml`` runs code2wav (codec decode and the
   host-side silence trim) on a second worker sharing GPU 0, so the unmask loop
-  no longer stops for each finished request. With a CUDA MPS daemon it raised
-  concurrency-32 throughput on an H200 from ~153 to 176-184 audio-s/s and cut
-  TTFA p95 from ~9 s to ~3 s; concurrency 1 is ~10% slower.
+  no longer stops for each finished request, and sets ``mps: true`` (see
+  :doc:`serving`) so the two workers' kernels overlap. On an H200 it raised
+  concurrency-32 throughput from ~153 to 176-184 audio-s/s and cut TTFA p95
+  from ~9 s to ~3 s; concurrency 1 is ~10% slower.
 
 Higgs Audio notes
 ~~~~~~~~~~~~~~~~~
@@ -354,16 +361,23 @@ BAGEL notes
 
 - Text-to-image runs only the CFG branches a denoising step reads: two with
   image guidance off, and the main branch alone outside ``cfg_interval``, about
-  -37% latency at 1024² on an H200. Outside the interval the step returns the
-  main branch's velocity where it used to recombine all three and renormalize,
-  which is equal only up to rounding, so images move slightly (median 41 dB
-  PSNR against the previous output).
-- On a CFG-parallel deployment (``configs/bagel_cfg_parallel*.yaml``) only the
-  steps inside ``cfg_interval`` run on the guidance GPUs, as the
-  ``image_gen_cfg2`` walk (``image_gen_cfg3`` with image guidance); the other
-  steps run on the main GPU. A config that places ``LLM_cfg_text`` or
-  ``LLM_cfg_img`` with ``graph_walks`` names these walks: ``LLM_cfg_text`` and
-  ``combine_cfg`` both, ``LLM_cfg_img`` only ``image_gen_cfg3``.
+  -37% latency at 1024² on an H200. A step then computes fewer rows and returns
+  the main branch's velocity outside the interval where it used to recombine all
+  three, which is equal only up to rounding, so images move: seeded
+  text-to-image at the default guidance is about 31 dB PSNR from the previous
+  output (about 60 dB between two cold boots of one version), and generation
+  without guidance about 41 dB. Edits stay within their boot-to-boot spread.
+- A guided request's steps inside ``cfg_interval`` run as a walk of their own,
+  ``image_gen_guided2`` (``image_gen_guided3`` with image guidance), between
+  ``image_gen_head`` and ``image_gen``. A config that places ``LLM`` per walk
+  (``configs/bagel_*_disaggregated.yaml``) lists all four on the rank that
+  generates images.
+- On a CFG-parallel deployment (``configs/bagel_cfg_parallel*.yaml``) those
+  steps run on the guidance GPUs instead, as the ``image_gen_cfg2`` walk
+  (``image_gen_cfg3`` with image guidance); the other steps run on the main
+  GPU. A config that places ``LLM_cfg_text`` or ``LLM_cfg_img`` with
+  ``graph_walks`` names these walks: ``LLM_cfg_text`` and ``combine_cfg`` both,
+  ``LLM_cfg_img`` only ``image_gen_cfg3``.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
@@ -519,7 +533,7 @@ Kokoro notes
   concurrency 32-64 on an H200, Whisper WER unchanged, with the harmonic source and the
   iSTFT kept in fp32; the parity test covers fp32 only; ``configs/kokoro_bf16.yaml``).
   Each BiLSTM's two directions run as one block-diagonal recurrence, and cuDNN times
-  the frame half's conv algorithms once per captured bucket
+  the conv algorithms of both captured halves once per bucket, at capture
   (``NodeSubmodule.capture_cudnn_benchmark``).
 - Text is cut at sentence boundaries into chunks of at most 510 phonemes (the
   PL-BERT window); each chunk is emitted to the client as soon as it is
@@ -554,17 +568,53 @@ Qwen3-Omni notes
   (``cp_attention``), neither bit-exact with the unfused ops. Its 15 depth
   steps feed each sampled code into the next, so small differences can change
   later codes at near-ties.
-- The audio encoder takes the clips of up to 16 requests a step and packs
-  them along time in request order, starting a new call when the next clip
-  would take it past 300 s of audio, with attention windowed within each
-  clip. A clip's embeddings can differ at the last bit with what it is
-  batched beside, since the packed GEMMs' shapes change with the call's total
-  frames, and a prefix-cached audio prefix keeps the embeddings it was first
+- The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
+  log-mel features: a step's clips (up to 8 requests) go through one packed
+  forward, attention windowed within each clip through a ragged attention
+  resource, and the 32-layer stack replays a CUDA graph by packed token count
+  up to 4096 tokens (about 5 minutes of audio). A step over 4096 tokens runs
+  its clips one by one, each replayed if it fits a bucket, so only a clip
+  longer than that runs eagerly, on its own. A
+  clip's embeddings can differ at the last bit with what it is batched beside,
+  since the step's total tokens pick the captured bucket (or the eager GEMMs'
+  shapes), and a prefix-cached audio prefix keeps the embeddings it was first
   computed with, so a later request reusing it inherits that first batch's
   rounding.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another.
+- ``configs/qwen3omni_pd_2gpu.yaml`` runs ``qwen3omni_pd_disaggregated.yaml``'s
+  prefill/decode split on two GPUs: the prefill Thinker shares rank 0 with the
+  encoders, the Talker and Code2Wav, and rank 1 runs the Thinker's decode. At
+  concurrency 1 its text matches ``configs/qwen3omni_2gpu.yaml``'s.
+
+CosyVoice3 notes
+----------------
+
+- Install with ``pip install -e '.[cosyvoice3]'`` and serve with
+  ``mstar serve cosyvoice3 --gpus 0``. Every request clones a voice: a
+  ``ref_audio`` clip (with its transcript in ``ref_text`` for zero-shot
+  cloning) or a preset from ``voices_dir`` (see ``configs/cosyvoice3.yaml``).
+  ``instructions`` carries a style instruction. Output is 24 kHz.
+- Keep the reference clip short, a few seconds like CosyVoice's own 3.5 s
+  prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
+  from 1.4% to 13.4%, with words dropped mid-sentence.
+- On ``/v1/audio/speech``, text longer than one piece is synthesized as ordered
+  sentence pieces, as the reference frontend does: about 80 tokens (320
+  characters) of English, or 80 characters of text with Chinese, each piece
+  cloning the same voice. In one request the LM ends long text early or
+  garbles its end. A Chinese sentence over 300 characters, which the
+  reference keeps whole, is also cut at its commas, so that each piece stays
+  under the LM's 512 tokens of transcript and text.
+  ``sentence_chunking: false`` sends the text whole.
+- Japanese written in kana alone, with spaces between words, is read poorly,
+  as it is by the official model: in tests both garbled common words such as
+  ゆっくり and ありがとうございました on every seed.
+- The flow's DiT estimator runs in bfloat16 by default; the Euler state, the
+  rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor
+  float64).
+  ``model_kwargs: {flow_estimator_dtype: float32}`` in the deployment YAML runs
+  the estimator at the reference's precision instead, at lower throughput.
 
 Qwen3-TTS notes
 ---------------
@@ -621,15 +671,21 @@ Qwen3-TTS notes
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
-  Its depth loop runs the same Triton kernels as Qwen3-Omni's code predictor
-  (``mstar.model.components.code_predictor_kernels``): q/k norm, RoPE and the
-  KV write in one launch per layer, then ``cp_attention``.
+  It is the same component as Qwen3-Omni's code predictor
+  (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``):
+  the depth sequence opens with the Talker hidden state and the group-0
+  embedding in one two-token pass, each layer's q/k norm, RoPE and KV write
+  run in one launch and attention in ``cp_attention``, and the frame's 16 codec
+  embeddings are summed in fp32 and rounded once to the model dtype. Earlier
+  releases rounded the sum after every add, so greedy codes can differ at
+  near-ties.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
   On its own it lowers first-audio latency at high concurrency; with
-  ``mps: true`` in the YAML (see :doc:`serving`) the two workers' kernels also
-  overlap, which raised c=32 throughput by about a fifth on an H100.
+  ``mps: true`` in the YAML (see :doc:`serving`; ``qwen3tts_split.yaml`` sets
+  it) the two workers' kernels also overlap, which raised c=32 throughput by
+  about a fifth on an H100.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
   deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
@@ -973,9 +1029,9 @@ Chatterbox notes
 - ``configs/chatterbox_split.yaml`` (and ``chatterbox_turbo_split.yaml``,
   ``chatterbox_multilingual_split.yaml``) runs S3Gen on a second worker that
   shares GPU 0 (``rank_devices``), so T3's decode steps stop alternating with
-  S3Gen's flow solves on one worker loop. It only pays with a user-level CUDA
-  MPS daemon (``nvidia-cuda-mps-control -d`` before ``mstar serve``), which
-  lets the two workers' kernels overlap: on an H200 at concurrency 32 Chatterbox
+  S3Gen's flow solves on one worker loop. It only pays under CUDA MPS, which
+  lets the two workers' kernels overlap, so the configs set ``mps: true`` (see
+  :doc:`serving`): on an H200 at concurrency 32 Chatterbox
   went from 36-38 to 58-61 audio-s/s and Turbo from 69 to 94, at the cost of a
   later first chunk (TTFA p50 1.6-1.8 s -> 1.9-2.1 s; Turbo 0.36 s -> 1.0 s);
   concurrency 1 is unchanged, and WER held (1.22% -> 1.08%). Without MPS the
@@ -1418,44 +1474,57 @@ LTX-2.5 (``ltx2_5``)
 Text-to-audio+video on **Lightricks LTX-2.5** (``Lightricks/LTX-2.5-Diffusers``, gated):
 a 22B joint audio-video DiT, a Gemma-4 12B text encoder, and video/audio VAEs with a
 48 kHz vocoder. The distilled checkpoint runs the model card's recipes without
-guidance (single-stage: 8 sigmas); the two-stage recipe, the full (SFT) transformer,
-image-to-video and the duration head are not ported yet.
+guidance; the full (SFT) transformer, image-to-video and the duration head are not
+ported yet.
 
-Four nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
+Five nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
 DiT scaffold's denoise loop; video and audio latents carried in fp32; every attention
-through two ragged attention resources), ``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
+through two ragged attention resources), ``latent_upsampler`` (two-stage recipe only),
+``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
 modalities, so ``["video"]`` skips the audio decode (the model still denoises both).
 
 .. code-block:: bash
 
-   mstar serve ltx2_5            # configs/ltx2_5.yaml: DiT on GPU 0, the other nodes on GPU 1
+   mstar serve ltx2_5                             # configs/ltx2_5.yaml: DiT on GPU 0, the rest on GPU 1
+   mstar serve ltx2_5 --config configs/ltx2_5_tp2.yaml   # DiT tensor-parallel over 2 GPUs
+   mstar serve ltx2_5 --config configs/ltx2_5_sp2.yaml   # DiT sequence-parallel over 2 GPUs (fastest)
 
-Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32; default
-544x960), ``num_frames`` (8k+1; default 121), ``fps``, ``seed``. Frames above 720p
-decode in VAE tiles (``vae_tile_min_pixels``) to bound the decode's memory.
+Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32; 64 for the
+two-stage recipe), ``num_frames`` (8k+1), ``fps``, ``seed``, and ``recipe``:
+
+- ``single`` (default): 8 distilled sigmas at the requested size (default 544x960x121).
+- ``two_stage``: the card's better-quality path — 8 sigmas at half size, the x2 latent
+  upsampler, then 3 sigmas at full size (default 1088x1920). Frames above 720p decode
+  in VAE tiles, as the card does for this decode.
 
 Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
 ``POST /v1/videos/generations`` returns one mp4 with the audio muxed in as AAC
 (``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
 on the server's ``PATH`` and falls back to video only without it.
 
-Performance (2x H100, warm, against diffusers 0.41 with the same recipe and seeds):
+``ltx2_5_sp2`` shards the video tokens (Ulysses): each rank holds the whole DiT and
+half the tokens, and only the video self-attention exchanges them (one all-to-all
+each way); the cross-attentions run on each rank's own tokens, and the audio queries
+over the video merge the ranks' partial attentions. ``ltx2_5_tp2`` shards the
+weights instead and all-reduces after every block's attentions and feed-forwards.
 
-======================================  ==============  ==============
-                                        diffusers       ``ltx2_5``
-======================================  ==============  ==============
-544x960x121, one request                7.87 s          6.23 s
-544x960x121, 2 concurrent               7.6 videos/min  12.7 videos/min
-544x960x121, 4 concurrent               7.6 videos/min  14.0 videos/min
-======================================  ==============  ==============
+Performance (2x H100, warm; diffusers with the same recipe and seeds):
 
-Concurrency pays because the text encoder and decoders run on the second GPU while the
-DiT denoises another request; the DiT itself is GPU-bound (batching two requests costs
-two steps' time).
+======================================  ================  ================  ================
+                                        diffusers         ``ltx2_5_tp2``    ``ltx2_5_sp2``
+======================================  ================  ================  ================
+544x960x121, one request                7.87 s            3.70 s            3.15 s
+544x960x121, 4 concurrent               7.6 videos/min    19.6 videos/min   22.3 videos/min
+two-stage 1088x1920x121, one request    21.6 s            11.0 s            11.3 s
+two-stage, 2 concurrent                 2.8 videos/min    5.9 videos/min    6.1 videos/min
+======================================  ================  ================  ================
 
-The DiT is compiled and its denoise step captured per shape (``capture_shapes``);
-other shapes run the compiled eager path, and the first request of a new shape pays
-its compile.
+The DiT is compiled and its denoise step captured per shape (``capture_shapes``, which
+the two-stage recipe's stages replay too); other shapes run the compiled eager path, and the first
+request of a new shape pays its compile. ``vae_compile`` (on in these configs) compiles the
+video VAE's decoder at load for ``vae_compile_shapes``, by default the same shapes (~55 dB
+from the eager decode; other shapes decode eager). The SP2 config doesn't capture 1088x1920
+but lists it there, so its two-stage decode runs compiled too.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------

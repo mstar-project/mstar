@@ -8,14 +8,8 @@ import pytest
 import torch
 from torch import nn
 from torch._dynamo.utils import counters
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoderConfig,
-    Qwen3OmniMoeVisionEncoderConfig,
-)
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder,
-    Qwen3OmniMoeVisionEncoder,
-)
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeVisionEncoderConfig
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeVisionEncoder
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
@@ -26,7 +20,7 @@ from mstar.engine.resources.position.manager import RopeManager
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel, image_span
-from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
+from mstar.model.qwen3_omni.submodules import ThinkerSubmodule, VisionEncoderSubmodule
 
 RID = "r0"
 NODE = "Thinker"
@@ -297,36 +291,6 @@ def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
     assert [span.walk for span in layout.spans[:layout.keyed_count()]] == ["prefill_text"], (
         "a prompt with a video keyed other than its leading text"
     )
-
-def _audio(n_window: int) -> AudioEncoderSubmodule:
-    config = Qwen3OmniMoeAudioEncoderConfig(
-        encoder_layers=1, d_model=32, encoder_attention_heads=2, encoder_ffn_dim=64, output_dim=16,
-        downsample_hidden_size=8, n_window=n_window,
-    )
-    encoder = Qwen3OmniMoeAudioEncoder._from_config(config, attn_implementation="sdpa").eval()
-    return AudioEncoderSubmodule(encoder, config=None)
-
-
-def test_packed_clips_split_by_the_encoder_s_own_window():
-    """A clip's embedding count is counted with the encoder's ``n_window``, as the
-    prompt layout counts it; with the default window's count a 104-frame clip
-    would claim 14 embeddings where a 52-frame window gives 13."""
-    audio = _audio(n_window=52)
-    prepared = [
-        audio.prepare_inputs(
-            "audio", None, {"audio_features": [clip], "audio_seqlens": [torch.tensor([clip.shape[-1]])]},
-        )
-        for clip in (torch.randn(128, 104), torch.randn(128, 60))
-    ]
-    engine_inputs = SimpleNamespace(request_ids=["a", "b"])
-    with torch.no_grad():
-        packed = audio.forward_batched("audio", engine_inputs, **audio.preprocess("audio", engine_inputs, prepared))
-        alone = [audio.forward("audio", None, **p.tensor_inputs)["audio_embeds"][0] for p in prepared]
-
-    assert [packed[rid]["audio_embeds"][0].shape for rid in "ab"] == [a.shape for a in alone], (
-        "a packed clip's embeddings were split at a window other than the encoder's"
-    )
-
 
 @requires_cuda
 def test_the_vision_encoder_compiles_no_graph_for_a_size_inside_the_ranges_it_has_compiled():

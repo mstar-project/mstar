@@ -776,6 +776,7 @@ def test_vae_decode_fast_routes_whole_clips_through_the_shared_decoder(monkeypat
     calls = []
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     monkeypatch.setattr(wan_vae, "to_channels_last", lambda vae: calls.append("channels_last"))
+    monkeypatch.setattr(wan_vae, "is_channels_last", lambda vae: "channels_last" in calls)
     monkeypatch.setattr(wan_vae, "new_feat_cache", lambda vae: [])
 
     def fake_decode_causal(vae, z, feat_cache, step, *, clip_start, latents_per_call=1):

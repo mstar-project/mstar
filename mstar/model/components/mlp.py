@@ -150,10 +150,6 @@ class MLP(nn.Module):
             None.
         activation: activation between the two linears.
         bias: whether the linears have a bias term.
-        gelu_epilogue: run a ``gelu_tanh`` in the up-projection's cuBLASLt
-            epilogue: one kernel instead of a GEMM plus a pass over its output.
-            The GELU reads the fp32 accumulator, so this rounds once fewer than
-            the separate activation.
     """
 
     def __init__(
@@ -163,22 +159,13 @@ class MLP(nn.Module):
         output_size: int | None = None,
         activation: str | Callable = "silu",
         bias: bool = True,
-        gelu_epilogue: bool = False,
     ):
         super().__init__()
         if output_size is None:
             output_size = input_size
-        if gelu_epilogue and (activation != "gelu_tanh" or not bias):
-            raise ValueError("MLP gelu_epilogue needs activation='gelu_tanh' and bias=True")
-        self.gelu_epilogue = gelu_epilogue
         self.act = _resolve_activation(activation)
         self.linear_in = nn.Linear(input_size, intermediate_size, bias=bias)
         self.linear_out = nn.Linear(intermediate_size, output_size, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.gelu_epilogue:
-            hidden = torch._addmm_activation(
-                self.linear_in.bias, x.flatten(0, -2), self.linear_in.weight.t(), use_gelu=True,
-            )
-            return self.linear_out(hidden.unflatten(0, x.shape[:-1]))
         return self.linear_out(self.act(self.linear_in(x)))

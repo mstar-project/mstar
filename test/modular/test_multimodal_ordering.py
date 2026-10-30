@@ -605,7 +605,6 @@ def test_qwen_schedule_walks_the_plan():
         "pixel_values": ["px0", "px1"],
         "image_grid_thw": ["g0", "g1"],
         "audio_features": ["af0"],
-        "audio_seqlens": ["as0"],
     }
     schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, mods, signals)
     assert [walk for walk, _ in schedule] == [

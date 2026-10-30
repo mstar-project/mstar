@@ -26,6 +26,7 @@ from test_startup_graph_validation import (
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources.base import Resource
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -284,6 +285,36 @@ def test_a_cfg_instance_is_one_lockstep_group(tmp_path):
     _validate(_CfgModel(), cfg)
     (group,) = _CfgModel().get_sharding_config(cfg).groups
     assert (group.nodes, group.tp_size) == ({"llm"}, 2)
+
+
+def test_a_paged_kv_cache_on_a_cfg_parallel_node_is_refused(tmp_path):
+    """Its rank math takes every instance rank for a head shard, and a CFG rank
+    runs another branch on every head. Refused before any worker loads weights."""
+    kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=4, page_size=16,
+    ))
+    model = _CfgModel(specs=[kv], kv_labels={"kv": {"main": KVLabel()}})
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "cfg_size": 2}])
+    _refused(model, cfg, r"KV kv: a node with cfg_size > 1 can't hold a paged KV cache")
+
+
+class _WideModel(_Model):
+    """A model whose ``llm`` takes TP beside SP or CFG."""
+
+    def get_default_sharding_config(self):
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes={"llm"}, shard_dim={},
+            sp_enabled_nodes={"llm"}, cfg_enabled_nodes={"llm": 2},
+        )
+
+
+@pytest.mark.parametrize("axis", ["sp", "cfg"])
+def test_a_sharded_signal_into_an_instance_wider_than_tp_is_refused(axis, tmp_path):
+    """The fanout splits a shard_dim signal over every instance rank, while
+    only the TP ranks split the weights."""
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1, 2, 3], "tp_size": 2, f"{axis}_size": 2}],
+               sharding_config={"shard_dim": {"x": 1}})
+    _refused(_WideModel(), cfg, r"node 'llm' takes or emits \['x'\], which have a shard_dim")
 
 
 def test_model_yaml_hook_refusal_is_reported(tmp_path):

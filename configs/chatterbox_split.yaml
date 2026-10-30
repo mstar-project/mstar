@@ -1,7 +1,8 @@
 # configs/chatterbox.yaml with S3Gen on its own worker. Both workers run on GPU 0
 # (rank_devices), so T3's decode steps no longer alternate with S3Gen's flow
-# solves on one worker loop; run a CUDA MPS daemon for the two workers'
-# kernels to overlap. Same graph, resources and checkpoint.
+# solves on one worker loop. `mps: true` runs both as clients of one MPS daemon
+# so their kernels overlap rather than time-slice; without it the split
+# measured the same as one worker. Same graph, resources and checkpoint.
 model: "chatterbox"
 # cond (34) + text (<= 512) + speech (<= 4096) tokens per stream
 max_seq_len: 4680
@@ -22,6 +23,7 @@ node_groups:
     ranks: [1]
     graph_walks: [s3gen_chunk, s3gen_chunk_voice]
 rank_devices: {1: 0}
+mps: true
 # Two workers share the GPU; each plans its captures within its share.
 gpu_memory_fraction: 0.45
 model_kwargs:

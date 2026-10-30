@@ -10,6 +10,8 @@ precision, the unfused add and norm elsewhere.
 
 import torch
 
+from mstar.engine.node_dtype import warn_implicit_downcast
+
 
 def _prepare_inputs(
     x: torch.Tensor,
@@ -24,6 +26,7 @@ def _prepare_inputs(
     elif torch.is_autocast_enabled(device_type):
         x = x.to(torch.get_autocast_dtype(device_type))
     elif x.dtype == torch.float32 and device_type == "cuda":
+        warn_implicit_downcast("rms_norm", x.dtype, torch.bfloat16)
         x = x.to(torch.bfloat16)
     if weight.dtype != x.dtype:
         weight = weight.to(x.dtype)
@@ -132,15 +135,16 @@ def fused_add_rms_norm(
 def _fused_add_rms_norm_cuda(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma_mode: bool,
 ) -> None:
-    """FlashInfer's fused kernel, which takes half precision only. It normalizes
-    the sum before rounding it, where the unfused pair rounds first.
+    """FlashInfer's fused kernel, which takes half precision only, and reads
+    ``residual`` and ``weight`` in ``x``'s dtype: any other mix runs unfused. It
+    normalizes the sum before rounding it, where the unfused pair rounds first.
 
     The op, rather than calling FlashInfer's wrapper directly, keeps the kernel
     behind a graph boundary: the wrapper is plain Python (its op registration is
     a no-op), so Dynamo traces into it and breaks the graph, and each call site
     then compiles as a frame of its own, once per norm module and shape.
     """
-    if x.dtype not in (torch.bfloat16, torch.float16):
+    if x.dtype not in (torch.bfloat16, torch.float16) or not x.dtype == residual.dtype == weight.dtype:
         _unfused_add_rms_norm(x, residual, weight, eps, gemma_mode)
         return
     from flashinfer.norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm

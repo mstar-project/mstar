@@ -706,7 +706,7 @@ def test_a_step_over_the_audio_budget_is_not_encoded_packed(tiny_model, monkeypa
 
     sub = tiny_model.get_submodule(ENCODER_NODE, "cpu")
     small = OmniASRCTCSubmodule(sub.model, max_batch_size=4, max_batch_seconds=0.5)  # 8000 samples
-    small.node_resources = {ENCODER_ATTN: types.SimpleNamespace(max_segments_per_request=2)}
+    small.node_resources = {ENCODER_ATTN: types.SimpleNamespace(max_segments_per_step=2)}
     packed_calls = []
     monkeypatch.setattr(small, "_transcribe_packed", lambda waves, attn, ei: packed_calls.append(len(waves)) or [
         torch.zeros(n, dtype=torch.long) for n in small.model.frame_lengths([w.shape[0] for w in waves])

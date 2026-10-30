@@ -20,7 +20,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
-from mstar.model.submodule_base import ARNodeSubmodule, NodeInputs, NodeSubmodule, TokenStop  # noqa: E402
+from mstar.model.submodule_base import NodeInputs, NodeSubmodule  # noqa: E402
 
 WALK = "run"
 
@@ -266,24 +266,6 @@ def test_an_invalid_setting_fails_when_the_engine_loads(bad):
         _engine({"flow": _Recorder(**bad)})
 
 
-def test_a_loopback_signal_without_its_walk_fails_when_the_engine_loads():
-    """``TokenStop.loopback_signal`` loops back ``walk``'s token, so without a
-    walk nothing would loop back while the sampler still kept its masters."""
-
-    class _Decoder(_Recorder, ARNodeSubmodule):
-        preprocess = NodeSubmodule.preprocess
-
-        def __init__(self):
-            super().__init__()
-            self.token_stop = TokenStop(
-                loop="decode_loop", buffer="y", stop_ids=frozenset(), sampler="sampler",
-                loopback_signal="x",
-            )
-
-    with pytest.raises(ValueError, match="llm:.*walk"):
-        _engine({"llm": _Decoder()})
-
-
 def test_the_scope_restores_the_exact_state_it_found():
     """``matmul.allow_tf32 = False`` alone changes only the CUDA backend, which
     leaves torch's legacy getter raising. The scope still runs, and puts that
@@ -424,6 +406,22 @@ def test_the_setting_holds_under_either_graph_runtime(runtime, monkeypatch):
         _step(engine, node)
     assert a.seen == [("highest", False)] and b.seen == [("high", True)]
     assert _flags() == ("high", True)
+
+
+@pytest.mark.parametrize("before", [False, True])
+def test_cudnn_benchmark_is_scoped(before, torch_flag) -> None:
+    from mstar.engine.fp32_precision import cudnn_benchmark
+
+    torch_flag(torch.backends.cudnn, "benchmark", before)
+    with cudnn_benchmark(True):
+        assert torch.backends.cudnn.benchmark
+    assert torch.backends.cudnn.benchmark is before
+    with pytest.raises(RuntimeError), cudnn_benchmark(True):
+        raise RuntimeError
+    assert torch.backends.cudnn.benchmark is before
+    with cudnn_benchmark(False):
+        assert torch.backends.cudnn.benchmark is before
+    assert torch.backends.cudnn.benchmark is before
 
 
 def test_capture_cudnn_benchmark_covers_warmup_only(monkeypatch):

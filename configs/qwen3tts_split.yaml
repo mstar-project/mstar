@@ -1,8 +1,8 @@
 # Qwen3-TTS-12Hz-0.6B-CustomVoice with the codec on its own worker, as
 # configs/qwen3tts_1p7b_split.yaml does for the 1.7B. Both workers share GPU 0
 # (rank_devices) as separate processes, so the Talker's steps no
-# longer wait on the codec's host work. Start a CUDA MPS daemon for the GPU
-# first so their kernels overlap. On an H200 (with MPS) it raised throughput
+# longer wait on the codec's host work, and `mps: true` runs both as clients
+# of one MPS daemon so their kernels overlap. On an H200 it raised throughput
 # ~11% at c=32/64 but cost ~14% at c=1 (RTF 0.072 vs 0.062) and first-audio
 # latency at c=64 (~100 vs ~75 ms): a throughput-oriented alternative to
 # configs/qwen3tts.yaml, not a replacement.
@@ -24,3 +24,4 @@ node_groups:
     ranks: [1]
     graph_walks: [codec_chunk]
 rank_devices: {1: 0}
+mps: true

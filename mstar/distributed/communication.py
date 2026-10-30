@@ -157,6 +157,11 @@ class CommGroup:
         """On the host: waits on the other ranks, never on a device."""
         if self.world_size == 1:
             return
+        if self.cpu_group is None:
+            # torch reads ``group=None`` as the whole world
+            raise ValueError(
+                f"barrier over ranks {self.group_members} before init_dist set up their cpu_group"
+            )
         dist.barrier(group=self.cpu_group)
 
     def all_reduce_buffer(
@@ -446,7 +451,7 @@ class WorkerParallelGroups:
         # disallow colocation of multiple comm groups on the same node and axis
         per_node = self.axis_groups[axis]
         if node in per_node and per_node[node].group_members != comm_group.group_members:
-            raise RuntimeError(
+            raise ValueError(
                 f"Node {node} already has a {axis} comm group assigned for worker {self.global_rank}"
             )
         per_node.setdefault(node, comm_group)
@@ -738,6 +743,9 @@ class GlobalParallelConfig:
                             )
                         for node in wg.section.get_nodes():
                             self.per_worker_config[worker_ids[rank]].add(node, comm_groups[key], axis)
+            # first wins: ``add`` refused a node whose multi-rank instances
+            # differ on a rank, since they differ there on some axis (size-1
+            # groups count). A one-rank placement registers no groups.
             for block in wg._instance_ranks:
                 for i, rank in enumerate(block):
                     key = ("instance", rank, tuple(block))

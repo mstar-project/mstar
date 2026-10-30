@@ -18,8 +18,6 @@ from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG  # noqa: F401 - the mod
 # ---------------------------------------------------------------------------
 # Resource keys and graph names
 # ---------------------------------------------------------------------------
-# audio_encoder node: cacheless windowed attention
-AUT_ATTN = "aut_attn"
 # LLM node
 KV_CACHE = "kv_cache"
 ATTN = "attn"

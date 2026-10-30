@@ -43,8 +43,6 @@ from mstar.engine.resources import (
     PagedKVConfig,
     PositionConfig,
     PositionSpec,
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
@@ -53,11 +51,11 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
+from mstar.model.components.aut_encoder_submodule import aut_attention_spec, load_aut_encoder_submodule
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
     ATTN,
-    AUT_ATTN,
     DECODE_LOOP,
     DECODE_WALK,
     ENCODER_NODE,
@@ -70,7 +68,7 @@ from mstar.model.qwen3_asr.config import (
     Qwen3ASRModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import ByteLevelDetokenizer
+from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
 logger = logging.getLogger(__name__)
 
@@ -138,16 +136,8 @@ class Qwen3ASRModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
-    @property
-    def max_windows_per_request(self) -> int:
-        """Attention windows (``n_window_infer`` mel frames, 8 s) in the longest
-        clip a request may carry: 150 for 20 minutes."""
-        frames = self.config.max_audio_samples // self.config.hop_length
-        return -(-frames // self.config.audio.n_window_infer)
-
     def get_node_resources(self) -> list[NodeResourceSpec]:
         text = self.config.text
-        audio = self.config.audio
         kv_config = PagedKVConfig(
             num_layers=text.num_hidden_layers,
             num_kv_heads=text.num_key_value_heads,
@@ -157,15 +147,9 @@ class Qwen3ASRModel(Model):
             max_num_pages=self.KV_PAGES,
         )
         return [
-            RaggedAttentionSpec(
-                resource_key=AUT_ATTN, nodes={ENCODER_NODE},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=audio.encoder_attention_heads,
-                    num_kv_heads=audio.encoder_attention_heads,
-                    head_dim=audio.head_dim,
-                    # every 8 s window of a request is its own segment
-                    max_segments_per_request=self.max_windows_per_request,
-                ),
+            # every 8 s window of the longest clip is its own segment: 150 for 20 minutes
+            aut_attention_spec(
+                self.config.audio, {ENCODER_NODE}, self.config.num_frames(self.config.max_audio_samples),
             ),
             KVSpec(resource_key=KV_CACHE, nodes={LLM_NODE}, config=kv_config),
             # two query heads per KV head: the CUDA-core decode kernel wins
@@ -428,7 +412,8 @@ class Qwen3ASRModel(Model):
         )
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+        # the prefill samples the first of max_output_tokens
+        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
@@ -437,9 +422,12 @@ class Qwen3ASRModel(Model):
     # Model ABC: postprocess
     # -------------------------------------------------------------------
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._detokenizer)
+
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
         if modality == "text":
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for Qwen3-ASR: {modality!r}")
 
     # -------------------------------------------------------------------
@@ -468,21 +456,13 @@ class Qwen3ASRModel(Model):
         return submodule
 
     def _create_encoder_submodule(self, device: str, autocast_dtype: torch.dtype | None) -> NodeSubmodule:
-        from mstar.model.components.aut_encoder import AuTEncoder
-        from mstar.model.loader.iterators import iter_safetensors_shards
-
-        with torch.device("meta"):
-            encoder = AuTEncoder(self.config.audio, attn_key=AUT_ATTN)
-        if autocast_dtype is not None:
-            encoder = encoder.to(autocast_dtype)
-        encoder.to_empty(device=device)
-        prefix = "thinker.audio_tower."
-        weights = iter_safetensors_shards(self.local_dir, device=device, prefix=prefix)
-        encoder.load_weights((k.removeprefix(prefix), v) for k, v in weights)
-        encoder.eval()
-
-        from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule
-        return Qwen3ASREncoderSubmodule(encoder=encoder, config=self.config)
+        log_mel = LogMelSpectrogram(
+            num_mel_bins=self.config.num_mel_bins,
+            sampling_rate=self.config.sampling_rate,
+            n_fft=self.config.n_fft,
+            hop_length=self.config.hop_length,
+        )
+        return load_aut_encoder_submodule(self.local_dir, self.config.audio, device, autocast_dtype, log_mel)
 
     @staticmethod
     def _llm_remap(name: str) -> str | None:

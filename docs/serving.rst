@@ -256,7 +256,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``mps``
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
-       kernels instead of time-slicing (the ASR ``*_split`` configs). NVIDIA only, and it
+       kernels instead of time-slicing (the ASR ``*_split`` configs, and the speech ones:
+       ``chatterbox*_split``, ``omnivoice_split``, ``qwen3tts_split``). NVIDIA only, and it
        needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
        shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
        ``false``.
@@ -342,16 +343,19 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        rendezvouses. Default 512.
    * - ``api_switch_interval_s``
      - *(optional)* GIL switch interval of the API server process, in seconds
-       (``sys.setswitchinterval``), a positive number (anything else fails at
-       startup); unset keeps the model's default (``Model.API_SWITCH_INTERVAL_S``:
+       (``sys.setswitchinterval``), a positive number; an explicit ``null`` keeps
+       Python's 5 ms, whatever the model's default, and anything else fails at
+       startup. Unset, the model's default applies (``Model.API_SWITCH_INTERVAL_S``:
        ``0.001`` for Qwen3.5, Python's 5 ms otherwise). Under streaming load
        that process keeps three threads busy (event loop, message thread, data
        worker), and a shorter interval hands the GIL between them sooner:
-       ``0.001`` gave Qwen3.5-0.8B text, c=64, +4 to +8% tok/s. A
-       model whose preprocessing runs long on the data-worker thread can lose from
-       it (Kokoro's G2P: about -3.6% at c=32), so it is per model. It is
-       re-measured once `#849 <https://github.com/mstar-project/mstar/pull/849>`_
-       lands, and deleted if neutral.
+       ``0.001`` gave Qwen3.5-0.8B text, c=64, +4 to +8% tok/s, and a
+       model whose preprocessing runs long on the data-worker thread lost from it
+       (Kokoro's G2P: about -3.6% at c=32), so it is per model. Both numbers
+       were measured before `#849 <https://github.com/mstar-project/mstar/pull/849>`_
+       changed the message-thread and data-worker path; the knob awaits a
+       re-measure on the current path and is deleted if neutral. Workers take
+       theirs from ``MSTAR_PY_SWITCH_INTERVAL_SEC``.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
        (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
@@ -385,7 +389,8 @@ them by that name:
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores
      vit_attn:                  # a cacheless (ragged) attention resource
-       max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
+       max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
+                                    # flashinfer_backend
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
@@ -452,7 +457,8 @@ other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of it
 before it spawns the workers, run every worker as its client so their kernels overlap,
 and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
 processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
-driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
+driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
+Chatterbox models and OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
@@ -462,7 +468,7 @@ prefill, decode, and image generation on three GPUs:
    node_groups:
      - {node_names: [LLM], ranks: [0], graph_walks: [prefill_text, prefill_vit, prefill_vae]}
      - {node_names: [LLM], ranks: [1], graph_walks: [decode]}
-     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen]}
+     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen, image_gen_head, image_gen_guided2, image_gen_guided3]}
 
 Because placement is config-only, the *same* model code runs single-GPU or fully
 disaggregated. ``configs/`` ships several layouts per model (``*_single_gpu``,

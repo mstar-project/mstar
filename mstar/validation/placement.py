@@ -7,6 +7,7 @@ from typing import Any
 
 from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axis_sizes
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -91,6 +92,7 @@ def check_worker_graphs(
         *_loop_successors(walk_to_wgs),
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
+        *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
     ]
 
 
@@ -123,10 +125,17 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
             )
         for axis, size in sizes.items():
             enabled = getattr(sharding, f"{axis}_enabled_nodes")
-            if size > 1 and any(node not in enabled for node in names):
+            unsupported = [node for node in names if node not in enabled]
+            if size > 1 and unsupported:
+                # guidance branches rode sp_size before they had an axis of their own
+                hint = (
+                    "; split guidance branches with cfg_size instead"
+                    if axis == "sp" and any(node in sharding.cfg_enabled_nodes for node in unsupported)
+                    else ""
+                )
                 yield (
                     f"node_groups[{i}] has {axis}_size {size} and contains nodes not "
-                    f"in {axis}_enabled_nodes {sorted(enabled)}: {names}"
+                    f"in {axis}_enabled_nodes {sorted(enabled)}: {names}{hint}"
                 )
         cfg = sizes["cfg"]
         for node in names:
@@ -293,8 +302,9 @@ def _sharding_groups(
     worker_graphs: Sequence[WorkerGraph], sharding_config: ShardingConfig,
 ) -> Iterator[str]:
     """v1: one sharding group per worker graph, with the worker graph's
-    tp_size, and no custom graph_walks on a group holding a streaming
-    consumer."""
+    tp_size, no custom graph_walks on a group holding a streaming consumer,
+    and no shard_dim signal on a node whose instance is wider than its TP
+    group: the fanout splits by instance rank, the weights by TP rank."""
     streaming_consumers: set[str] = set()
     node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
     for wg in worker_graphs:
@@ -336,6 +346,46 @@ def _sharding_groups(
                         f"group has tp_size {group.tp_size}. node_groups and sharding_config disagree."
                     )
 
+    refused: set[str] = set()
+    for wg in worker_graphs:
+        if wg.instance_size == wg.tp_size:
+            continue
+        for name, node in sorted(wg.section.get_nodes().items()):
+            sharded = sorted(
+                signal for signal in node.input_names | {edge.name for edge in node.outputs}
+                if sharding_config.shard_dim.get(signal) is not None
+            )
+            if sharded and name not in refused:
+                refused.add(name)
+                yield (
+                    f"node {name!r} takes or emits {sharded}, which have a shard_dim, but "
+                    f"{_describe(wg)} spans {wg.axis_sizes}: a sharded signal is split over "
+                    "the whole lockstep instance, not the TP group. Drop their "
+                    "sharding_config.shard_dim entries, or set sp_size and cfg_size to 1."
+                )
+
+
+def _paged_kv_on_cfg_ranks(
+    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
+) -> Iterator[str]:
+    """A paged KV cache on a node with ``cfg_size > 1``: the pool's rank math
+    (prefix publishing, transfer slices) takes every instance rank for a head
+    shard, which a CFG rank isn't."""
+    for spec in specs:
+        if not (isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)):
+            continue
+        wg = next((
+            wg for wg in worker_graphs
+            if wg.cfg_size > 1 and spec.nodes & wg.section.get_nodes().keys()
+        ), None)
+        if wg is not None:
+            yield (
+                f"KV {spec.resource_key}: a node with cfg_size > 1 can't hold a paged KV "
+                f"cache, since its CFG ranks run different branches ({_describe(wg)} has "
+                f"cfg_size {wg.cfg_size}). Make each branch its own node in a graph Parallel, "
+                "on a node group with cfg_size 1, as BAGEL's LLM_cfg_text and LLM_cfg_img are."
+            )
+
 
 def _worker_parallelism(
     worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
@@ -364,7 +414,7 @@ def _worker_parallelism(
     worker_ids = [f"worker_{rank}" for rank in ranks]
     try:
         per_worker = GlobalParallelConfig(dict(enumerate(worker_graphs)), worker_ids).per_worker_config
-    except RuntimeError as e:
+    except ValueError as e:
         yield str(e)
         return
 

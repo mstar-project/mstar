@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import NamedTuple
 
 from mstar.communication.tensors import NameToTensorList, TensorStore
@@ -409,6 +410,40 @@ class SpeculationPrepOutput(NamedTuple):
     # eventually be settled with. 0 when the prep staged no streaming ingest,
     # and so has nothing to settle.
     spec_id: int = 0
+
+
+class SpecRows(NamedTuple):
+    """``GraphRuntime.prep_spec_rows``: a speculation's ready rows as columns."""
+    ready_rids: list[int]
+    # the worker graph every ready rid speculates in; -1 when none is ready
+    wg_id: int
+    # as SpeculationPrepOutput.spec_id; 0 here, since nothing streams in
+    spec_id: int
+    # None when no ready rid has a prepped input edge: everything the step
+    # reads comes from the in-flight step's outputs
+    input_edges: ColumnarEdgeSpecs | None
+
+
+class InlineRouteStatus(IntEnum):
+    """What ``route_and_send_inline`` did."""
+    # nothing (a rid with no host row, an unsupported dtype): the caller takes
+    # the general path
+    NOT_ROUTED = 0
+    # routed and sent
+    SENT = 1
+    # routed, but the send needs Python-side payloads: the caller finishes
+    # with ``send_outputs``
+    ROUTED = 2
+
+
+class InlineRoute(NamedTuple):
+    """``route_and_send_inline``'s result."""
+    status: InlineRouteStatus
+    completion_id: int
+    # ``send_outputs``' return, under SENT
+    sent_rids: list[int]
+    # the route for ``send_outputs`` to finish, under ROUTED
+    route_output: "RouteOutput | None"
 
 
 class ReadyNodeSpec(NamedTuple):
@@ -839,6 +874,34 @@ class GraphRuntime(ABC):
         are pre-filtered for removes.
         """
         pass
+
+    def prep_spec_rows(
+        self, spec_node_name: str, curr_node_name: str, graph_walk: str,
+        rids: list[int], room_for_continuing: int | None = None,
+    ) -> "SpecRows":
+        """``prep_spec_rids`` with no stream chunks to ingest, as columns, in
+        a form a runtime can serve in one crossing (the worker uses it where
+        ``SpeculationPreparer.rows_eligible`` allows). This default is that
+        composition over ``prep_spec_rids``; a runtime with a cheaper form
+        overrides it and must return the same.
+        """
+        prep = self.prep_spec_rids(SpeculationPrepInput(
+            spec_node_name=spec_node_name, curr_node_name=curr_node_name,
+            graph_walk=graph_walk, rids=list(rids),
+            room_for_continuing=room_for_continuing,
+            streaming_edges=[], streaming_edges_per_rid=[0] * len(rids),
+        ))
+        wg_ids = set(prep.wg_ids)
+        assert len(wg_ids) <= 1, (
+            "a speculation target lives in one worker graph, but its rows "
+            f"report several: {sorted(wg_ids)}"
+        )
+        return SpecRows(
+            ready_rids=list(prep.ready_rids),
+            wg_id=wg_ids.pop() if wg_ids else -1,
+            spec_id=prep.spec_id,
+            input_edges=prep.input_edges if len(prep.input_edges) else None,
+        )
 
     @abstractmethod
     def get_spec_target(

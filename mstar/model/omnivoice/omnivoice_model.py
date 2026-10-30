@@ -760,7 +760,7 @@ class OmniVoiceModel(Model):
             # mstar's layer loop attends through its own resource, so the
             # reference's packed runner (a 128 MB workspace) is never used
             del reference._fi_runner
-            backbone = OmniVoiceBackbone(reference, plan_dtype=dtype).eval()
+            backbone = OmniVoiceBackbone(reference).eval()
             return OmniVoiceBackboneSubmodule(backbone, self.config)
 
         return None

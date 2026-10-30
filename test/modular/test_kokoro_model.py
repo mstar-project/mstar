@@ -109,6 +109,9 @@ def test_masked_bilstm_matches_packed_bidirectional():
     out = ours(x, lengths)
     assert torch.allclose(out, expected, atol=1e-6)
     assert out[1, 4:].abs().sum() == 0 and out[2, 1:].abs().sum() == 0
+    # the fused LSTM is in the module tree, so a later dtype or device move reaches it
+    ours.double()
+    assert torch.allclose(ours(x.double(), lengths), expected.double(), atol=1e-6)
 
 
 def test_real_stft_inverse_matches_torch_istft_per_row():
@@ -215,7 +218,8 @@ def test_remap_name(checkpoint_key, expected):
 def test_remapped_checkpoint_names_cover_every_parameter():
     """Every parameter of the M* module is reachable from a checkpoint key
     written in the upstream naming, and vice versa (modulo the pooler)."""
-    model = tiny_model()
+    # the checkpoint loads before the LSTM directions fuse
+    model = KokoroTTS(tiny_config())
     params = set(dict(model.named_parameters()))
     # Invert the mapping for the names that differ, then check round trip.
     inverse = {
@@ -678,8 +682,8 @@ def test_bf16_decoder_keeps_source_and_head_in_fp32():
         audio, frame_lengths, _ = model(ids, lengths, style, torch.tensor([1.0]))
         config32 = tiny_config()
         ref = KokoroTTS(config32).eval()
-        ref.load_state_dict(model.state_dict())
         ref.fuse_lstm_directions()
+        ref.load_state_dict(model.state_dict())
         ref.decoder.generator.m_source.deterministic = True
         audio32, _, _ = ref(ids, lengths, style, torch.tensor([1.0]))
     # mechanics only: the fp32 head returns fp32 audio of the same shape and it

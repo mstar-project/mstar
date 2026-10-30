@@ -680,9 +680,8 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             return (bool(new) and max(n[i] for i in new) == 1 and layers_runner is not None
                     and layers_runner.can_run(len(new)))
 
-        if engine_inputs.step is None:
-            # declare_step left every resource to the region, which its lease says can replay the batch
-            assert all(steady), "an encoder step declared nothing but is not all steady"
+        if step_runner is not None and all(steady):
+            # leased, with every call steady: declare_step left every resource to the region
             steady = list(range(len(rids)))
         else:
             # This step's KV plan writes every call's new frames, so the region (which

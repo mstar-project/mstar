@@ -163,7 +163,7 @@ Some lessons learned from debugging KV cache symmetry across TP ranks:
 - **Ordered, not summarized.** A set of offloads plus a set of reloads cannot say whether a request ended up resident; the order of actions must be sent, and replayed verbatim.
 - **Many parts of the code affect resource state.** A teardown releases pages without offloading anything, so no resident-set delta accounts for it: it has to carry the step it followed, and the rank that stamped it has to honour its own stamp.
 
-Process-group creation is a collective too. `dist.new_group(ranks, backend="gloo")` while the default group is a device-bound NCCL group sends ranks *outside* `ranks` into an `ncclCommSplit` they never return from, which looks like a startup protocol hang. Create subgroups with `use_local_synchronization=True` so only members participate. Such a group is named after its ranks and how many groups the process already holds, and a non-member's call to an all-rank `new_group` registers none, so members agree on the name only if each holds the same number before it: make the members-only groups first, on every rank, in one global order, a rank outside one making a group of just itself in its place (`WorkerParallelGroups.init_dist`).
+Process-group creation is a collective too. `dist.new_group(ranks, backend="gloo")` while the default group is a device-bound NCCL group sends ranks *outside* `ranks` into an `ncclCommSplit` they never return from, which looks like a startup protocol hang. Create subgroups with `use_local_synchronization=True` so only members participate.
 
 ### 12. Async partitions coordinate through streaming edges
 

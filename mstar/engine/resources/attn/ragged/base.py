@@ -40,7 +40,11 @@ def resolve_ragged_attn_backend(
 
 def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     config = spec.config
-    config.shard(info.head_shards)
+    joint = info.joint_comm_group
+    if config.shard_over_sp or joint is None:
+        config.shard(info.head_shards)
+    else:
+        config.shard(joint.tp_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(
@@ -232,6 +236,12 @@ class _RaggedManagerBase:
         return self._config.max_segments_per_request
 
     @property
+    def max_segments_per_step(self) -> int | None:
+        """Segments a one-row replay's plan holds for its whole step, as
+        configured; None for a resource sized per request."""
+        return self._config.max_segments_per_step
+
+    @property
     def force_double_buffer(self):
         # plan H2Ds each layout into static buffers that a captured replay reads
         return True
@@ -247,9 +257,10 @@ class _RaggedManagerBase:
 
         Built on the first plan for that key, like the paged backend's. Its
         static buffers are fixed for its lifetime, so they are sized off the
-        config's per-request ceilings and the bucket — NOT off this first
-        plan's ``num_rows``, which is only one of the layouts the bucket will
-        replay.
+        config's segment ceiling at the bucket's batch size
+        (``max_segments_for``) and the bucket's token count — NOT off this
+        first plan's ``num_rows``, which is only one of the layouts the bucket
+        will replay.
         """
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)
@@ -378,21 +389,26 @@ class _RaggedManagerBase:
 
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        label: str | None = None,
-    ) -> torch.Tensor:
-        """One layer's attention through the plan for ``label``.
+        label: str | None = None, return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """One layer's attention through the plan for ``label``; with ``return_lse``
+        also the log-sum-exp ``[total_tokens, H]`` (fp32, natural log), for merging
+        attentions over disjoint key sets. The plan is the same either way.
 
         Traced by ``torch.compile`` with ``config.compile_op``, this is the
         ``mstar::ragged_attention`` op: the region keeps one graph, and Inductor
-        fuses the pointwise work on either side of the attention. Otherwise a
-        compiled caller breaks here, and an eager one calls the kernel directly.
+        fuses the pointwise work on either side of the attention. Otherwise, and
+        with ``return_lse`` (the op returns only the output), a compiled caller
+        breaks here, and an eager one calls the kernel directly.
         """
-        if self._config.compile_op and torch.compiler.is_compiling():
+        if self._config.compile_op and not return_lse and torch.compiler.is_compiling():
             return ragged_attention(q, k, v, self._key, label)
-        return self._run(q, k, v, label)
+        return self._run(q, k, v, label, return_lse)
 
     @torch.compiler.disable
-    def _run(self, q, k, v, label):
+    def _run(self, q, k, v, label, return_lse=False):
+        if return_lse:
+            return self._wrapper(label).run(q, k, v, return_lse=True)
         return self._wrapper(label).run(q, k, v)
 
 

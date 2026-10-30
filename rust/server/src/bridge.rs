@@ -14,11 +14,12 @@
 //! `ZmqCommunicator`'s opaque byte payload:
 //!   frontend -> conductor: SubmitMsg {t:"submit", rid, sub, text, file_paths,
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
-//!       streaming}, `prompt_parts` present for a chat only
+//!       streaming, accepts_chunks}, `prompt_parts` present for a chat only
 //!                        | {t:"abort", rid, sub}
 //!                        | {t:"ping", rid, sub}
 //!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
+//!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
 //!                        | {t:"done",  rid, sub}
 //!                        | {t:"pong",  rid, sub}
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
@@ -28,6 +29,10 @@
 //! reply carries the API server's rendered Prometheus text in `data` and its
 //! `content_type` in `metadata`; `metadata` has no `content_type` when the
 //! server runs without `--enable-metrics`.
+//!
+//! `chunks` is many submissions' non-error chunks as parallel lists, in
+//! order: one message per pass of the API server's message thread rather than
+//! one per request.
 //!
 //! `sub` names one submission and is never reused; `rid` is the client's id,
 //! which a client may reuse as soon as it drops a stream (that stream's `done`
@@ -82,6 +87,9 @@ struct SubmitMsg<'a> {
     /// The frontend will detokenize: text emissions come back as raw token
     /// ids (modality "token", 4-byte LE) instead of detokenized pieces.
     frontend_detok: bool,
+    /// This frontend takes `chunks` messages; a backend sends them only to a
+    /// frontend that says so, so either side can be older than the other.
+    accepts_chunks: bool,
     file_paths: &'a BTreeMap<String, Vec<String>>,
     input_modalities: &'a [String],
     output_modalities: &'a [String],
@@ -121,6 +129,15 @@ struct Inbound {
     metadata: Value,
     #[serde(default)]
     msg: String, // error message for t == "err"
+    // t == "chunks": one entry per chunk
+    #[serde(default)]
+    subs: Vec<u64>,
+    #[serde(default)]
+    modalities: Vec<String>,
+    #[serde(default)]
+    payloads: Vec<serde_bytes::ByteBuf>,
+    #[serde(default)]
+    metadatas: Vec<Value>,
 }
 
 struct Route {
@@ -287,6 +304,7 @@ impl Bridge {
             text: args.text.as_deref(),
             tokens: args.tokens.as_deref(),
             frontend_detok: args.tokens.is_some(),
+            accepts_chunks: true,
             file_paths: &args.file_paths,
             input_modalities: &args.input_modalities,
             output_modalities: &args.output_modalities,
@@ -365,6 +383,9 @@ impl Bridge {
 /// Route one inbound message to its submission's serving task; a terminal one
 /// (error, done, pong) also drops the route.
 fn deliver(routes: &Routes, msg: Inbound) {
+    if msg.t == "chunks" {
+        return deliver_batch(routes, msg);
+    }
     let (item, done) = match msg.t.as_str() {
         // A failed request is delivered in-band as a terminal chunk with
         // modality "error" (message in `data`, HTTP status in
@@ -421,6 +442,24 @@ fn deliver(routes: &Routes, msg: Inbound) {
     }
 }
 
+/// Route a `chunks` message's chunks, each to its submission, under one lock.
+/// The backend sends error chunks only as `chunk`, so none here is terminal.
+fn deliver_batch(routes: &Routes, msg: Inbound) {
+    let n = msg.subs.len();
+    if msg.modalities.len() != n || msg.payloads.len() != n || msg.metadatas.len() != n {
+        eprintln!("mstar-server bridge: dropping a chunks message with ragged lists");
+        return;
+    }
+    let table = routes.lock().expect("routes lock");
+    let items = msg.subs.into_iter().zip(msg.modalities).zip(msg.payloads).zip(msg.metadatas);
+    for (((sub, modality), data), metadata) in items {
+        if let Some(route) = table.routes.get(&sub) {
+            let chunk = ResultChunk { modality, data: data.into_vec(), metadata };
+            let _ = route.tx.send(StreamItem::Chunk(chunk));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +475,7 @@ mod tests {
             text: Some("hi"),
             tokens: None,
             frontend_detok: false,
+            accepts_chunks: true,
             file_paths: &file_paths,
             input_modalities: &[],
             output_modalities: &[],
@@ -530,6 +570,62 @@ mod tests {
         assert_eq!(table.live.get("X"), Some(&2), "the older end freed the retry's rid");
         assert!(matches!(new_rx.try_recv(), Ok(StreamItem::Chunk(_))));
         assert!(new_rx.try_recv().is_err(), "the retry got the older submission's end");
+    }
+
+    fn chunks_msg(subs: Vec<u64>, payloads: Vec<&[u8]>) -> Inbound {
+        #[derive(Serialize)]
+        struct Chunks {
+            t: &'static str,
+            subs: Vec<u64>,
+            modalities: Vec<String>,
+            payloads: Vec<serde_bytes::ByteBuf>,
+            metadatas: Vec<Value>,
+        }
+        let n = payloads.len();
+        let msg = Chunks {
+            t: "chunks",
+            subs,
+            modalities: vec!["text".into(); n],
+            payloads: payloads.into_iter().map(|p| serde_bytes::ByteBuf::from(p.to_vec())).collect(),
+            metadatas: vec![json!({}); n],
+        };
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_chunks_message_reaches_each_submission_in_order_and_ends_none() {
+        let routes: Routes = Mutex::new(Table::default());
+        let (tx1, mut rx1) = unbounded_channel();
+        let (tx2, mut rx2) = unbounded_channel();
+        routes.lock().unwrap().claim("A", 1, tx1).unwrap();
+        routes.lock().unwrap().claim("B", 2, tx2).unwrap();
+
+        // 9 is a submission already gone: its chunk is dropped
+        deliver(&routes, chunks_msg(vec![1, 2, 9, 1], vec![b"a1", b"b1", b"x", b"a2"]));
+
+        let data = |rx: &mut UnboundedReceiver<StreamItem>| -> Vec<Vec<u8>> {
+            std::iter::from_fn(|| match rx.try_recv() {
+                Ok(StreamItem::Chunk(c)) => Some(c.data),
+                Ok(_) => panic!("a chunks message delivered a terminal item"),
+                Err(_) => None,
+            })
+            .collect()
+        };
+        assert_eq!(data(&mut rx1), [b"a1".to_vec(), b"a2".to_vec()]);
+        assert_eq!(data(&mut rx2), [b"b1".to_vec()]);
+        let table = routes.lock().unwrap();
+        assert!(table.routes.contains_key(&1) && table.routes.contains_key(&2));
+    }
+
+    #[test]
+    fn a_chunks_message_with_ragged_lists_is_dropped_whole() {
+        let routes: Routes = Mutex::new(Table::default());
+        let (tx, mut rx) = unbounded_channel();
+        routes.lock().unwrap().claim("A", 1, tx).unwrap();
+        let mut msg = chunks_msg(vec![1, 1], vec![b"a", b"b"]);
+        msg.metadatas.pop();
+        deliver(&routes, msg);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
