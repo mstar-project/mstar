@@ -17,6 +17,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
+    DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
@@ -182,12 +183,14 @@ class LLMSubmodule(ARNodeSubmodule):
                 capture_graph_walk="decode",
                 single_request_inputs=dummy(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=dummy,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=LLM_MIXED,
@@ -196,12 +199,14 @@ class LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
                 # the layout its GDN splits; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
+                compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_vision",
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
                 make_node_input=vision_dummy,
                 capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
+                compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
         ]
 

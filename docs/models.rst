@@ -365,6 +365,10 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
+The text stack compiles in Inductor's deterministic mode whatever ``-O`` says: on
+2x B300 the autotune bought no GPU time per step, and its per-process kernel picks
+changed greedy output between servers.
+
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
