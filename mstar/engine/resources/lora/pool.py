@@ -605,8 +605,9 @@ class LoraAdapterPool(Resource):
         self._reserved[rid] = name
         self._reserved_count[name] = self._reserved_count.get(name, 0) + 1
 
-    def _unreserve(self, rid) -> str | None:
-        """Caller holds the lock."""
+    def _unreserve(self, rid, frees: bool = True) -> str | None:
+        """Caller holds the lock. ``frees``: whether what the reservation counted is free
+        again, so a request that didn't fit may now."""
         name = self._reserved.pop(rid, None)
         if name is not None:
             count = self._reserved_count[name] - 1
@@ -614,7 +615,8 @@ class LoraAdapterPool(Resource):
                 self._reserved_count[name] = count
             else:
                 del self._reserved_count[name]
-            self._changes += 1
+            if frees:
+                self._changes += 1
         return name
 
     def _spare_slots(self, name: str) -> int:
@@ -749,8 +751,9 @@ class LoraAdapterPool(Resource):
             self._slots[slot].refcount += 1
         self._row_slot[rid] = slot
         self._awaiting.discard(rid)
-        # held now, which counts it as the reservation did
-        self._admit_taken[rid] = (slot, self._unreserve(rid))
+        # held now, which counts it as the reservation did: only a row on the zero slot
+        # frees the slot its reservation counted
+        self._admit_taken[rid] = (slot, self._unreserve(rid, frees=slot == ZERO_SLOT))
 
     def _load_miss(self, name: str, rids: list, slot: int) -> AdmitOutcome:
         """Load ``name`` into ``slot`` (picked by ``admit``) for ``rids``. Called without
