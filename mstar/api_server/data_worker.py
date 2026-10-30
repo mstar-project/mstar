@@ -717,9 +717,8 @@ class PreprocessWorkerThread:
         # another request's pages and be served that request's KV. Likewise
         # only process_prompt sets the model's INTERNAL_KWARGS.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prompt_ids", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", *internal):
             model_kwargs.pop(name, None)
-        prompt_ids = {}
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -736,7 +735,6 @@ class PreprocessWorkerThread:
             if prompt_tensors:
                 tensors.update(prompt_tensors)
             layouts = model_kwargs.pop("kv_layout", {})
-            prompt_ids = self._prompt_ids(tensors, layouts)
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}
                 for key, by_label in layouts.items()
@@ -770,9 +768,6 @@ class PreprocessWorkerThread:
             self._ended_streams[input.request_id] = set(input.ends)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
-        # kept out of `request_model_kwargs`, which lives as long as the request
-        if prompt_ids:
-            conductor_kwargs["prompt_ids"] = prompt_ids
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(
@@ -828,26 +823,6 @@ class PreprocessWorkerThread:
             input_modalities=input.input_modalities,
             upload_sizes=sizes,
         )
-
-    @staticmethod
-    def _prompt_ids(tensors: dict, layouts: dict) -> dict[str, dict[str, bytes]]:
-        """The prompt's ids as int32 bytes, by resource and label, for a resource where exactly one label
-        has spans and all of them are ids. Like `_page_layout`, it starts every label at a source's first
-        entry, so a second label would get the first label's ids."""
-        prompt_ids: dict[str, dict[str, bytes]] = {}
-        for resource_key, by_label in layouts.items():
-            laid_out = [(label, layout) for label, layout in by_label.items() if layout.spans]
-            if len(laid_out) != 1 or any(span.kind != "ids" for span in laid_out[0][1].spans):
-                continue
-            ((label, layout),) = laid_out
-            entries: dict[str, int] = {}
-            ids = []
-            for span in layout.spans:
-                entry = entries.get(span.source, 0)
-                entries[span.source] = entry + 1
-                ids.append(tensors[span.source][entry].flatten())
-            prompt_ids[resource_key] = {label: torch.cat(ids).to(torch.int32).numpy().tobytes()}
-        return prompt_ids
 
     def _process_stream_input(self, chunk: ClientAppend) -> None:
         """Load an append, turn it into stream items and hand them to the

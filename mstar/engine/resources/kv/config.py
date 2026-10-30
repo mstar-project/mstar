@@ -5,9 +5,9 @@ without pulling FlashInfer in behind it.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
@@ -214,6 +214,13 @@ class RingKVConfig(KVConfig):
             self.num_sessions = num_sessions
 
 
+class SpanKind(StrEnum):
+    """What a span writes: token ``IDS``, a file's KV keyed by its ``DIGEST``, or ``ROWS`` of anything else."""
+    IDS = "ids"
+    DIGEST = "digest"
+    ROWS = "rows"
+
+
 @dataclass(frozen=True)
 class PrefixSpan:
     """One write to a keyed stream, as the preprocess worker laid it out.
@@ -227,9 +234,13 @@ class PrefixSpan:
     advance: int
     walk: str
     scratch: int = 0
-    kind: str = "ids"
+    kind: SpanKind = SpanKind.IDS
     digest: bytes | None = None
     end_key: bytes | None = None
+
+    def __post_init__(self):
+        # a layout row carries the kind as its string
+        object.__setattr__(self, "kind", SpanKind(self.kind))
 
 
 @dataclass
@@ -258,8 +269,6 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
-    # label -> the prompt as int32 bytes, when it is the only label with spans and all of them are ids
-    prompt_ids: dict[str, bytes] | None = None
     # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
     arrival: int | None = None
     # in a pool that decides admission, a guaranteed request reserves what it grows into and is never preempted
@@ -273,7 +282,6 @@ class KVReqConfig(ResourceReqConfig):
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
-        prompt_ids: dict[str, bytes] | None=None,
         arrival: int | None=None,
         **kwargs,
     ):
@@ -304,8 +312,6 @@ class KVReqConfig(ResourceReqConfig):
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
-        if prompt_ids is not None:
-            self.prompt_ids = prompt_ids
         if arrival is not None:
             self.arrival = arrival
 
@@ -419,6 +425,16 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
 
 
+def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
+    """Why one rebuild row can't write a request's laid-out labels again from its token ids, or None."""
+    laid_out = [layout for layout in layouts if layout.spans]
+    if any(span.kind != SpanKind.IDS for layout in laid_out for span in layout.spans):
+        return "it holds KV that can't be recomputed from token ids"
+    if len(laid_out) > 1 or any(len(layout.spans) != 1 or len(layout.growth) != 1 for layout in laid_out):
+        return "it writes more than one label, span or growth loop, which one rebuild row can't lay out again"
+    return None
+
+
 def mark_guaranteed(
     configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
 ) -> None:
@@ -434,11 +450,10 @@ def mark_guaranteed(
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
-    """Only the worker reads the layouts, caps and prompt ids, when it ingests the NewRequest, so
-    they are dropped before the configs go out with every frame between workers."""
+    """Only the KV manager's ingest reads the layouts and caps, so they are dropped
+    before the configs go out with every frame between workers."""
     return {
-        key: replace(config, kv_layout=None, loop_caps=None, prompt_ids=None) if isinstance(config, KVReqConfig)
-        else config
+        key: replace(config, kv_layout=None, loop_caps=None) if isinstance(config, KVReqConfig) else config
         for key, config in configs.items()
     }
 

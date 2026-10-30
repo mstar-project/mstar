@@ -29,6 +29,7 @@ from mstar.engine.resources import (
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
+    Rebuild,
     Resource,
     ResourceReqConfig,
     SlotLease,
@@ -39,6 +40,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sampler.config import discard_samples
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -1586,6 +1588,9 @@ class Engine:
             # the submodule declared no step (a node owning no resources);
             # there is nothing to admit, and the forward still runs
             return ADMIT_OK, None
+        if batch.rebuild_rids:
+            # a rebuild row samples again an id the request already has, and decode reads the kept one
+            discard_samples(step, rids, batch.rebuild_rids)
         # admit reads the step's ctx, so bind it before the sweep rather than
         # in `_drive_step`
         step.set_ctx(ctx)
@@ -2620,21 +2625,17 @@ class Engine:
                 return refusal
         return None
 
-    def lay_out_rebuild(self, node_name: str, request_id: int, ids: Sequence[int]) -> str:
-        """Lay the dropped request's KV out over all of ``ids`` but the last, and return the walk
-        whose row writes it."""
-        (walk,) = {
-            kv.cache.lay_out_again(request_id, ids) for kv in self.paged_kv_caches() if node_name in kv.nodes
-        }
+    def prepare_rebuild(self, node_name: str, request_id: int, rebuild: Rebuild) -> None:
+        """Tell each of the node's resources what the dropped request's rebuild row writes."""
+        for resource in self._submodules[node_name].resources.values():
+            resource.prepare_rebuild(request_id, rebuild)
         if node_name in self._resident_delta:
             self._journal(node_name, "", MoveKind.REBUILD, request_id, 0)
-        return walk
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
-        """Make the dropped request resident again, once its rebuild step has run."""
-        for kv in self.paged_kv_caches():
-            if node_name in kv.nodes:
-                kv.cache.land_rebuild(request_id)
+        """Make the dropped request resident again, once its rebuild row has run."""
+        for resource in self._submodules[node_name].resources.values():
+            resource.land_rebuild(request_id)
 
     def offload_request(self, node_name: str, request_id: int) -> int:
         """Move the request off-device across this node's resources.
@@ -2748,12 +2749,12 @@ class Engine:
         return self._resident_delta[node_name].take()
 
     def apply_resident_delta(
-        self, node_name: str, delta: OffloadDelta, kept_ids: Callable[[int], Sequence[int] | None],
+        self, node_name: str, delta: OffloadDelta, rebuild_of: Callable[[int], Rebuild | None],
     ) -> bool:
         """Match the leader's resident set on this node. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
-        ``kept_ids`` gives the ids this rank keeps for a request on the node.
+        ``rebuild_of`` gives what this rank's kept ids would rebuild of a request on the node.
         """
 
         resources = self._submodules[node_name].resources.values()
@@ -2782,17 +2783,17 @@ class Engine:
                     logger.debug("Replay: %s's drop on %s waits for its step; %d moves still owed",
                                  wire_rid, node_name, len(delta))
                     return False
-                ids = kept_ids(rid)
-                if ids is None or len(ids) != move.count:
+                rebuild = rebuild_of(rid)
+                if rebuild is None or len(rebuild.ids) != move.count:
                     raise RuntimeError(
                         f"rank 0 dropped {wire_rid} keeping {move.count} ids, and this rank keeps "
-                        f"{None if ids is None else len(ids)}"
+                        f"{None if rebuild is None else len(rebuild.ids)}"
                     )
                 freed = self.drop_request(node_name, rid, move.count)
                 logger.info("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
                             move.count, freed)
             elif kind == MoveKind.REBUILD:
-                self.lay_out_rebuild(node_name, rid, kept_ids(rid))
+                self.prepare_rebuild(node_name, rid, rebuild_of(rid))
             elif kind == MoveKind.OFFLOAD:
                 hosted = any(kv.cache.moves_to_host(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes)
                 if self.is_offloaded(node_name, rid):

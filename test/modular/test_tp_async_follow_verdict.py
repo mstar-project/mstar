@@ -65,7 +65,7 @@ class _FakeEngineManager:
             prefix_cache_open=lambda node: self.cache_open, apply_resident_delta=self._apply,
         )
 
-    def _apply(self, node_name, delta, kept_ids):
+    def _apply(self, node_name, delta, rebuild_of):
         while (move := delta.pop_left()) is not None:
             self.applied.append((move.rid, move.kind))
         return True

@@ -43,6 +43,7 @@ from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.worker import Speculation, Worker
 
 # ── two ranks through Worker.run (the acceptance harness) ─────────────────
@@ -190,6 +191,7 @@ def _check_rank(rank, layout, failed_here, store, out):
         w = Worker.__new__(Worker)
         w._walk_drivers = {}
         w._walk_driven_edges = {}
+        w._rebuilds = Rebuilds({}, {})
         w.scheduler = SimpleNamespace(read_failed_rids=set(failed_here))
         w.parallel_groups = SimpleNamespace(
             get_joint_group_for_node=lambda node: JointGroups(tp_group=tp, sp_group=sp),
@@ -336,6 +338,7 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._rebuilds = Rebuilds({}, {})
     w.scheduler, w.request_state, w.tensor_manager = sched, manager, tm
     w.wakeup_event = SimpleNamespace(drain=lambda: None)
     w.enable_nvtx = False
@@ -373,6 +376,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._rebuilds = Rebuilds({}, {})
     w.scheduler, w.request_state, w.enable_nvtx = sched, manager, False
     w._in_flight_rids = set()
     w.preps, w.assembled = [], []
@@ -516,6 +520,7 @@ def _leader(tmp_path, streamed=()):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._rebuilds = Rebuilds({}, {})
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = {NODE}, {NODE}
     w.is_tp_follower, w.enable_nvtx = False, False

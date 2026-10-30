@@ -24,6 +24,7 @@ from mstar.model.base import WorkerGraph
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -98,7 +99,8 @@ def _worker():
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._last_active = {}
-    w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}, {}
+    w._rebuilds = Rebuilds({}, {})
+    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
