@@ -8,9 +8,6 @@ entry however often it is read, and an entry that surfaces under an older stamp
 is pushed back under the page's own.
 
 Every caller holds the manager's lock, so none of this takes one of its own.
-It needs of its arena only the page owner counts and ``seal``, ``retain`` and
-``release``, so the conductor's routing mirror runs it over a counting arena
-(``kv/routing.py``).
 """
 
 import copy
@@ -19,12 +16,12 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.kv.manager import PageArena
+    from mstar.engine.resources.kv.arena import PageArena
 
 
 class PrefixIndex:
     def __init__(self, arena: "PageArena") -> None:
-        num_pages = len(arena.num_owners)
+        num_pages = arena.allocator.max_num_pages
         self._arena = arena
         self._by_key: dict[bytes, int] = {}
         self._key: list[bytes | None] = [None] * num_pages

@@ -11,11 +11,12 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import chain
-from mstar.engine.resources.kv.manager import KVManager, PageArena
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs

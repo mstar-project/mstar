@@ -23,7 +23,7 @@ from mstar.engine.resources.kv.page_copier import make_page_copier
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.kv.manager import PageArena
+    from mstar.engine.resources.kv.arena import PageArena
 
 logger = logging.getLogger(__name__)
 

@@ -1,11 +1,11 @@
 """A paged KV cache's routing mirror: which prompt pages each replica's prefix
 cache is predicted to hold, so a request goes where its prefix already is.
 
-Each replica runs the worker's own ``PrefixIndex`` over a counting arena, and a
-request takes the steps ``KVManager`` takes for it, all at dispatch: the lease
-of its matched pages, its own pages (evicting on a shortfall), and the index
-entries of its whole keyed pages. Its end releases its pages, and takes back
-the entries of a request whose walk never ran.
+Each replica runs the worker's own ``PrefixIndex`` and ``PageArena``, with no
+storage, and a request takes the steps ``KVManager`` takes for it, all at
+dispatch: the lease of its matched pages, its own pages (evicting on a
+shortfall), and the index entries of its whole keyed pages. Its end releases
+its pages, and takes back the entries of a request whose walk never ran.
 
 It predicts from what the conductor sees, a request's layout and page keys
 when it is placed and its end, and is approximate for that reason:
@@ -39,6 +39,7 @@ Kernel-free, since the conductor builds it.
 from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.spec import RoutingFacts
 
@@ -46,11 +47,13 @@ if TYPE_CHECKING:
     from mstar.engine.resources.kv.config import KVReqConfig
 
 
-class _Arena:
-    """The page owner counts and free list of one replica's pool, with no storage."""
+class _FreePages:
+    """The free list a replica's `PageArena` takes from: `PageAllocator`'s,
+    without the queue and lock that cost the conductor's one thread about a
+    microsecond a page."""
 
     def __init__(self, num_pages: int):
-        self.num_owners = [0] * num_pages
+        self.max_num_pages = num_pages
         # every page but SINK_PAGE (0), which the pool never hands out
         self._free = list(range(1, num_pages))
 
@@ -58,25 +61,15 @@ class _Arena:
     def num_free(self) -> int:
         return len(self._free)
 
-    def acquire(self, n: int) -> list[int]:
-        """Up to ``n`` free pages."""
-        pages = self._free[len(self._free) - min(n, len(self._free)):]
-        del self._free[len(self._free) - len(pages):]
-        self.retain(pages)
+    def try_allocate(self, n: int) -> list[int] | None:
+        if n > len(self._free):
+            return None
+        pages = self._free[len(self._free) - n:]
+        del self._free[len(self._free) - n:]
         return pages
 
-    def retain(self, pages: Sequence[int]) -> None:
-        for page in pages:
-            self.num_owners[page] += 1
-
-    def seal(self, pages: Sequence[int]) -> None:
-        pass
-
-    def release(self, pages: Sequence[int]) -> None:
-        for page in pages:
-            self.num_owners[page] -= 1
-            if not self.num_owners[page]:
-                self._free.append(page)
+    def free(self, pages: list[int]) -> None:
+        self._free.extend(pages)
 
 
 class _Placed(NamedTuple):
@@ -94,8 +87,11 @@ class KVRoutingMirror:
     def __init__(self, num_replicas: int, num_pages: int, page_size: int, labels: Collection[str]):
         self._page_size = page_size
         self._labels = labels
-        self._arenas = [_Arena(num_pages) for _ in range(num_replicas)]
+        self._arenas = [PageArena(kv_cache=None, allocator=_FreePages(num_pages)) for _ in range(num_replicas)]
         self._indexes = [PrefixIndex(arena) for arena in self._arenas]
+        for arena, index in zip(self._arenas, self._indexes, strict=True):
+            # as `KVManager.enable_prefix_cache` at one rank, the only size a mirror is built for
+            arena.index = index
 
     def _keyed(self, config: "KVReqConfig") -> dict[str, tuple[Sequence[bytes], int]]:
         """Each label's page keys, and how many of its pages are whole: the
@@ -128,21 +124,25 @@ class KVRoutingMirror:
         ]
 
     def add_request(self, config: "KVReqConfig", replica: int) -> _Placed | None:
-        layouts = config.kv_layout or {}
-        if not layouts:
-            return None
+        # all of the config is read before the pool moves, so a bad one leaves nothing held
         keyed = self._keyed(config)
+        pages = {
+            label: -(-sum(span.length for span in layout.spans) // self._page_size)
+            for label, layout in (config.kv_layout or {}).items()
+        }
+        if not pages:
+            return None
         arena, index = self._arenas[replica], self._indexes[replica]
         held, indexed = [], []
-        for label, layout in layouts.items():
+        for label, total in pages.items():
             keys, whole = keyed.get(label, ((), 0))
             # `KVManager._lease`, then its `_alloc` and `_index_filled_pages`
             leased = index.lookup(keys)[:len(keys) - 1] if keys else []
             arena.retain(leased)
-            need = -(-sum(span.length for span in layout.spans) // self._page_size) - len(leased)
+            need = total - len(leased)
             if need > arena.num_free:
                 index.evict(need - arena.num_free)
-            own = arena.acquire(need)
+            own = arena.acquire(min(need, arena.num_free))
             run = max(0, min(whole - len(leased), len(own)))
             if run:
                 index.insert_run(keys[len(leased):len(leased) + run], own[:run], leased[-1] if leased else None)
