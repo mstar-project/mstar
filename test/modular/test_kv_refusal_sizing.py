@@ -229,7 +229,7 @@ def test_pages_two_labels_share_are_counted_once():
     assert _admit(mgr, {"r": 3 * PAGE_SIZE}, commit=True).ok
     a = mgr._streams["r"]["main"]
     b = mgr._ensure_label("r", "fork")
-    b.page_indices = list(a.page_indices)
+    b.page_indices.assign(a.page_indices.tolist())
     b.stored_len = a.stored_len
     mgr._arena.retain(b.page_indices)
     step = KVStep(segments=(Segment("r", "main", PAGE_SIZE), Segment("r", "fork", PAGE_SIZE)))

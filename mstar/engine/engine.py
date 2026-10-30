@@ -289,6 +289,10 @@ class ExecutingBatch:
 
     # Populated on preplan
     preplan_event: Any | None = None
+    # A discarded pre-plan's event: its copies may still be in flight into
+    # buffers a re-plan skips as already holding those bytes, so the forward
+    # waits on it as on a kept pre-plan's
+    discarded_preplan_event: Any | None = None
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
@@ -314,6 +318,9 @@ class ExecutingBatch:
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
+    # the one object every row shares, when the step was prepared with the
+    # submodule's ``uniform_row_inputs``
+    uniform_inputs: NodeInputs | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -405,8 +412,9 @@ class ExecutingBatch:
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
 
-    def register_prepare_batch(self, inputs: list[NodeInputs]):
+    def register_prepare_batch(self, inputs: list[NodeInputs], uniform: NodeInputs | None = None):
         self.inputs = inputs
+        self.uniform_inputs = uniform
 
     def release_waiters(self):
         """Let anything waiting on this step proceed.
@@ -1036,7 +1044,7 @@ class Engine:
                 # return an equal one each time (128 calls at a full decode
                 # batch, on the gpu thread before the launch)
                 node_inputs = [uniform] * len(batch.request_ids)
-                batch.register_prepare_batch(node_inputs)
+                batch.register_prepare_batch(node_inputs, uniform=uniform)
                 batch.running_batched = submodule.can_batch(
                     batch=batch, model_inputs=node_inputs
                 )
@@ -1343,6 +1351,7 @@ class Engine:
             raise
         finally:
             batch.preplan_event = None
+            batch.discarded_preplan_event = None
             batch.release_waiters()
             if nvtx:
                 range_pop()
@@ -1364,7 +1373,7 @@ class Engine:
         inputs = batch.inputs
         req_info = batch.per_request_info_wrapped
         if lease is not None:
-            inputs = cg_runner.pad_inputs(lease, inputs)
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
             req_info = cg_runner.step_metadata(
                 lease, batch.request_ids, req_info
             )
@@ -1778,7 +1787,8 @@ class Engine:
         graph_walk = batch.step_context.graph_walk
         if lease is not None:
             return cg_runner.run_forward(
-                lease, preprocessed, plan_done_event=batch.preplan_event,
+                lease, preprocessed,
+                plan_done_event=batch.preplan_event or batch.discarded_preplan_event,
                 launch_started_event=release_event,
             )
         if release_event is not None:
@@ -2483,7 +2493,7 @@ class Engine:
         inputs = (
             cg_runner.declare_inputs_for(lease)
             if batch.inputs is None
-            else cg_runner.pad_inputs(lease, batch.inputs)
+            else cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
         )
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
@@ -2552,6 +2562,8 @@ class Engine:
                 # a discarded pre-plan falls back to inline plan; mark it so the
                 # cost is visible next to the nvtx ranges
                 mark(f"engine.preplan_discarded.{batch.node_name}")
+            if batch.preplan_event is not None:
+                batch.discarded_preplan_event = batch.preplan_event
             batch.preplan_event = None
             batch.preplanned_rids = None
             # The step was declared over the rows the pre-plan saw: template

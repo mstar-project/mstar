@@ -28,7 +28,7 @@ import triton
 import triton.language as tl
 
 from mstar.utils.device import DeviceCapability
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import H2DMirror, PinnedStager
 from mstar.utils.knobs import sampler_slots
 
 if TYPE_CHECKING:
@@ -1858,12 +1858,12 @@ class HostBuffer:
 
     The master is on the host because the gather runs in the pre-plan beside a
     live graph, so it must be one H2D copy with no device ops (``mstar.utils.h2d``).
+    A sampler's buffers share that copy: ``ScalarRows`` packs their ``buf`` rows.
     """
     buf: torch.Tensor
     master: np.ndarray
     default: float
     dtype: torch.dtype
-    stager: PinnedStager
 
     @classmethod
     def allocate(
@@ -1876,7 +1876,6 @@ class HostBuffer:
             master=np.full(capacity, default, dtype=np_dtype),
             default=default,
             dtype=dtype,
-            stager=PinnedStager(dtype, numel=max_bs),
         )
 
     def write_master_row(self, slot: int, value) -> None:
@@ -1891,9 +1890,45 @@ class HostBuffer:
         """This slot's per-step row."""
         return self.buf[cg_slot if self.buf.shape[0] > 1 else 0, :bs]
 
+
+class ScalarRows:
+    """The per-step rows of a sampler's ``HostBuffer``s in one device byte row
+    per cg slot, each buffer's ``buf`` a typed view into it, so a gather stages
+    them all in one H2D copy and skips it when the slot already holds the
+    bytes (a copy per buffer cost more than the gathers themselves)."""
+
+    def __init__(self, buffers: list[HostBuffer], max_bs: int, device: torch.device):
+        self.buffers = buffers
+        cg_slots = buffers[0].buf.shape[0]
+        # 8-byte aligned regions, so every typed view divides its row stride
+        self.regions: list[tuple[int, int]] = []
+        size = 0
+        for buf in buffers:
+            nbytes = max_bs * buf.master.itemsize
+            self.regions.append((size, nbytes))
+            size += -(-nbytes // 8) * 8
+        self.rows = torch.empty(cg_slots, size, dtype=torch.uint8, device=device)
+        for buf, (start, nbytes) in zip(buffers, self.regions, strict=True):
+            view = self.rows[:, start:start + nbytes].view(buf.dtype)
+            view.copy_(buf.buf)
+            buf.buf = view
+        # per slot: a pre-plan may gather one slot while the gpu thread gathers the other
+        self._host = [np.zeros(size, np.uint8) for _ in range(cg_slots)]
+        self._mirrors = [H2DMirror() for _ in range(cg_slots)]
+        # room for several rows a segment, so most gathers leave none (each
+        # segment left costs an event record)
+        self._stager = PinnedStager(torch.uint8, numel=8 * size)
+
     def gather(self, rows: np.ndarray, padded_bs: int, cg_slot: int) -> None:
-        """Rows ``rows`` of the master into ``cg_slot``'s per-step buffer."""
-        self.stager.copy_(self.slot_view(cg_slot, padded_bs), self.master[rows])
+        """Rows ``rows`` of every buffer's master into ``cg_slot``'s row. The
+        bytes past ``padded_bs`` in each region are whatever the slot held: a
+        step reads only its first ``padded_bs``."""
+        slot = cg_slot if self.rows.shape[0] > 1 else 0
+        host = self._host[slot]
+        for buf, (start, _) in zip(self.buffers, self.regions, strict=True):
+            master = buf.master
+            np.take(master, rows, out=host[start:start + padded_bs * master.itemsize].view(master.dtype))
+        self._stager.copy_(self.rows[slot], host, mirror=self._mirrors[slot])
 
 
 @dataclass
@@ -2069,6 +2104,8 @@ class SamplerBuffers:
     )
     # (padded_bs, cg slot) -> the sampler over that slot's views; see sampler_for
     _samplers: dict = field(default_factory=dict, repr=False)
+    # the scalar buffers' per-step rows, staged together; set by ``allocate``
+    _scalar_rows: ScalarRows | None = field(default=None, repr=False)
 
     @property
     def tracks_seen_tokens(self) -> bool:
@@ -2136,7 +2173,7 @@ class SamplerBuffers:
         windowed = history is not None and history.window > 0
         if history is not None:
             history.allocate_step_buffers(max_batch_size)
-        return cls(
+        buffers = cls(
             max_batch_size=max_batch_size,
             temperature=mk(torch.float32, 1.0),
             top_k=mk(torch.int32, 0),
@@ -2170,6 +2207,8 @@ class SamplerBuffers:
             _last_real_bs=[0] * cg_slots,
             _free_slots=list(range(1, cap + 1)),
         )
+        buffers._scalar_rows = ScalarRows(buffers._scalar_buffers(), max_batch_size, device)
+        return buffers
 
     def slice_for_bs(self, bs: int, cg_slot: int = 0) -> dict[str, Any]:
         """Return bs-sized views into one slot's buffers (zero-copy slices) plus
@@ -2461,11 +2500,9 @@ class SamplerBuffers:
                 self._last_real_bs[cg_slot] = len(request_ids)
                 return
         self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        # H2D copies only (pre-plan, see HostBuffer); gather_dynamic uploads
+        # one H2D copy (pre-plan, see ScalarRows); gather_dynamic uploads
         # the device-side index row
-        rows = self._slot_idx_np[cg_slot, :padded_bs]
-        for buf in self._scalar_buffers():
-            buf.gather(rows, padded_bs, cg_slot)
+        self._scalar_rows.gather(self._slot_idx_np[cg_slot, :padded_bs], padded_bs, cg_slot)
         self._last_real_bs[cg_slot] = len(request_ids)
         # read after staging: an init it ran bumped the version
         self._static_key[cg_slot] = (rids, padded_bs, self._config_version)

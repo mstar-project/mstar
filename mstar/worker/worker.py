@@ -2,6 +2,7 @@ import gc
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from functools import cached_property, partial
+from functools import cache, cached_property, partial
 from time import sleep
 from types import MappingProxyType
 from typing import NamedTuple
@@ -97,6 +98,7 @@ from mstar.utils.profiler import (
     phase_start,
     range_pop,
     range_push,
+    set_step_key,
 )
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
@@ -351,6 +353,14 @@ class _LazyPerRid:
 
     def values(self):
         return self._dict().values()
+
+
+
+@cache  # (node, walk) pairs are few
+def _step_key(node_name: str, graph_walk: str) -> str:
+    """``step.<node>.<walk>``, as a phase name (``benchmark/worker_phases``
+    reads names of word characters and dots)."""
+    return "step." + re.sub(r"\W", "_", node_name) + "." + re.sub(r"\W", "_", graph_walk)
 
 
 class Worker:
@@ -1054,7 +1064,10 @@ class Worker:
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
         laps.lap("misc")
-        logger.info("Request cleanup complete: %s", body.request_id)
+        # DEBUG: once per request on the main thread, it cost as much as the
+        # engine's own removal (test/waypoint/serve_rollout.py, which waits on
+        # it, runs the server at DEBUG)
+        logger.debug("Request cleanup complete: %s", body.request_id)
         laps.lap("log")
 
         # Last: frees the handle for reuse, so nothing above may run after it.
@@ -1994,6 +2007,9 @@ class Worker:
 
         if not engine.can_pre_plan(spec_batch.node_name):
             return False
+        if self._phase_period:
+            sb = speculation.scheduled_batch
+            set_step_key(_step_key(sb.node_name, sb.graph_walk))
         try:
             if pending is not None:
                 # A step N this slow (a long admit, say) skips the pre-plan
@@ -2019,6 +2035,9 @@ class Worker:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
             self._reset_skip_plan_flags(spec_batch)
             return False
+        finally:
+            if self._phase_period:
+                set_step_key(None)
 
     def _reset_skip_plan_flags(self, spec_node_batch: ExecutingBatch) -> None:
         """Drop the pre-plan staged for ``spec_node_batch``.
@@ -2102,12 +2121,15 @@ class Worker:
         """Record the GPU times whose events have landed, leaving the rest:
         reading a pair still in flight would block the host on the GPU."""
         while self._gpu_spans:
-            start, end = self._gpu_spans[0]
+            start, end, key = self._gpu_spans[0]
             if not end.query():
                 return
             self._gpu_spans.popleft()
             # elapsed_time is ms; the phase buffer holds seconds
-            self._phase_record("gpu_exec", start.elapsed_time(end) / 1000)
+            elapsed = start.elapsed_time(end) / 1000
+            # drained while another step runs: not that step's sample
+            self._phase_buf.unkeyed("gpu_exec").append(elapsed)
+            self._phase_buf.unkeyed(f"{key}.gpu_exec").append(elapsed)
 
     def _execute_on_gpu_thread(
         self,
@@ -2130,6 +2152,8 @@ class Worker:
         timed = self._phase_period
         t_start = _time.perf_counter() if timed else 0.0
         c_start = _time.thread_time() if timed else 0.0
+        if timed:
+            set_step_key(_step_key(batch.node_name, batch.graph_walk))
         laps = PhaseLaps("worker.gpu_thread.")
         engine = self.engine_manager.get_engine(batch.node_name)
         if self.enable_nvtx:
@@ -2218,7 +2242,7 @@ class Worker:
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
-                    self._gpu_spans.append((gpu_start, gpu_end))
+                    self._gpu_spans.append((gpu_start, gpu_end, _step_key(batch.node_name, batch.graph_walk)))
                     self._drain_gpu_spans()
                     laps.lap("gpu_exec_events")
             return outputs
@@ -2245,6 +2269,7 @@ class Worker:
                 self._phase_record(
                     "worker.gpu_thread.total.cpu", _time.thread_time() - c_start,
                 )
+                set_step_key(None)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -4918,11 +4943,17 @@ class Worker:
                             len(pending.batch.request_to_worker_graph),
                             walks=pending.batch.rids_by_walk(),
                         )
-                        with self._span(
-                            "worker.postprocess_batch",
-                            cpu="worker.postprocess_batch.cpu",
-                        ):
-                            self._postprocess_batch(pending, outputs)
+                        if phase_period:
+                            set_step_key(_step_key(pending.node_name, pending.graph_walk))
+                        try:
+                            with self._span(
+                                "worker.postprocess_batch",
+                                cpu="worker.postprocess_batch.cpu",
+                            ):
+                                self._postprocess_batch(pending, outputs)
+                        finally:
+                            if phase_period:
+                                set_step_key(None)
                         laps.skip()
                         if metrics is not None:
                             metrics.step_done(

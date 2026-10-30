@@ -17,6 +17,7 @@ from mstar.engine.resources.kv.manager import (
     KVSequenceInfo,
     PublishedKVInfo,
 )
+from mstar.engine.resources.kv.page_table import PageTable
 from mstar.engine.resources.kv.transfer import (
     KVReadInfo,
     KVTransferManager,
@@ -32,7 +33,7 @@ from mstar.model.bagel.submodules import CombineCFGSubmodule
 
 
 def test_offload_reset_preserves_remote_content_epoch():
-    stream = CacheStream(remote_reset_generation=7)
+    stream = CacheStream(page_indices=PageTable().new(), remote_reset_generation=7)
     stream.reset(content_reset=False)
     assert stream.remote_reset_generation == 7
     stream.reset()

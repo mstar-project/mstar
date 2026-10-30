@@ -76,7 +76,7 @@ def _ctx(views: list[SequenceView], **kwargs) -> StepContext:
         slot=0,
         capture=False,
         plan_results={
-            "kv": {"main": KVPlanOutput(cpu_indptrs=None, cuda_indptrs=None, views=views)}
+            "kv": {"main": KVPlanOutput(cpu_indptrs=None, views=views)}
         },
         **kwargs,
     )

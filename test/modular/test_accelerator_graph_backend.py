@@ -261,7 +261,7 @@ def test_pinned_staging_keeps_copies_intact_across_reuse_and_growth(graph_device
             stager.copy_(dst, [float(i), -float(i)], pad_value=0)
             outputs.append(dst)
     side.synchronize()
-    assert all(buffer.is_pinned() for buffer in stager._bufs)
+    assert stager._arena.is_pinned()
     for i, dst in enumerate(outputs):
         expected = torch.zeros(dst.numel())
         expected[:2] = torch.tensor([float(i), -float(i)])

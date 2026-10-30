@@ -1,6 +1,6 @@
 """Engine.prepare_inputs: a walk whose rows all get the same inputs is
 prepared with one call, the object shared by the rows; any other walk still
-prepares row by row."""
+prepares row by row. A replay pads such a step with that object too."""
 
 from types import SimpleNamespace
 
@@ -8,7 +8,13 @@ import pytest
 
 pytest.importorskip("torch")
 
+import torch  # noqa: E402
+
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig  # noqa: E402
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
 from mstar.engine.engine import Engine  # noqa: E402
+from mstar.engine.resources.step import BucketKey, SlotLease  # noqa: E402
+from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 
 
 class _Batch:
@@ -25,12 +31,14 @@ class _Batch:
         self.skipped_rids = set()
         self.failed_requests = {}
         self.inputs = None
+        self.uniform_inputs = None
         self.running_batched = None
         self.rows_only = False
         self.loopback_rids = frozenset()
 
-    def register_prepare_batch(self, inputs):
+    def register_prepare_batch(self, inputs, uniform=None):
         self.inputs = inputs
+        self.uniform_inputs = uniform
 
     def drop_rids(self, rids):
         self.request_ids = [r for r in self.request_ids if r not in rids]
@@ -73,6 +81,7 @@ def test_a_uniform_walk_is_prepared_with_one_object():
     batch = _Batch([1, 2, 3])
     _engine(sub).prepare_inputs(batch)
     assert batch.inputs == [row, row, row] and all(x is row for x in batch.inputs)
+    assert batch.uniform_inputs is row
     assert sub.calls == [] and batch.running_batched is True
 
 
@@ -118,3 +127,45 @@ def test_a_mixed_step_records_loopback_under_each_row_s_own_walk():
     eng._record_loopback(mixed)
     eng.prepare_inputs(_Batch([1, 2, 3]))
     assert sub.row_loopback == [True, True, False]
+
+
+def _runner(config, bs=4):
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    bucket = BucketKey(graph_walk="decode", bs=bs, num_tokens=bs)
+    runner._buckets = {bucket: SimpleNamespace(config=config)}
+    return runner, SlotLease(slot=0, bucket=bucket)
+
+
+def _decode_config():
+    return BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode",
+        single_request_inputs=ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=1),
+    )
+
+
+def test_a_uniform_step_pads_with_its_shared_row():
+    """The row any request of the walk gets is as good a padding row as a
+    clone of the template, and costs nothing per row."""
+    runner, lease = _runner(_decode_config())
+    row = ARNodeInputs(input_seq_len=1)
+    padded = runner.pad_inputs(lease, [row, row], uniform=row)
+    assert len(padded) == 4 and all(x is row for x in padded)
+
+
+def test_other_steps_pad_with_template_clones():
+    runner, lease = _runner(_decode_config())
+    row = ARNodeInputs(input_seq_len=1)
+    other = ARNodeInputs(input_ids=torch.ones(1, dtype=torch.long), input_seq_len=1)
+    for inputs, uniform in (
+        ([row, row], None),
+        # a row that is not the shared one: the step is not uniform
+        ([row, other], row),
+        # a shared row of another span would change what the padding declares
+        ([ARNodeInputs(input_seq_len=2)] * 2, ARNodeInputs(input_seq_len=2)),
+    ):
+        if uniform is not None and inputs[0].input_seq_len == 2:
+            inputs = [uniform] * 2
+        padded = runner.pad_inputs(lease, inputs, uniform=uniform)
+        assert padded[:2] == inputs
+        assert all(p.input_ids is not None and p.input_seq_len == 1 for p in padded[2:])
+        assert padded[2] is not padded[3]

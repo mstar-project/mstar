@@ -1454,17 +1454,29 @@ class AcceleratorGraphRunner:
         return cached
 
     def pad_inputs(
-        self, lease: SlotLease, inputs: list[NodeInputs],
+        self, lease: SlotLease, inputs: list[NodeInputs], uniform: NodeInputs | None = None,
     ) -> list[NodeInputs]:
         """Real inputs plus the rows that bring the batch to capture batch size.
         Set the length to zero so no new pages are allocated for dummy requests.
+
+        ``uniform``: the object every real row shares (``uniform_row_inputs``,
+        which holds for any request of the walk). With the template row's span
+        it pads too, instead of a fresh clone of the template per padding row.
         """
         num_pad = lease.bucket.bs - len(inputs)
         if num_pad <= 0:
             return list(inputs)
-        padding = self._buckets[lease.bucket].config.get_node_inputs(
-            num_pad, 0
-        )
+        config = self._buckets[lease.bucket].config
+        # a batched config pads with copies of one template row; a packed one
+        # lays tokens out over its rows and has none
+        template = getattr(config, "single_request_inputs", None)
+        if (
+            uniform is not None and template is not None
+            and uniform.input_seq_len == template.input_seq_len
+            and all(inp is uniform for inp in inputs)
+        ):
+            return [*inputs, *[uniform] * num_pad]
+        padding = config.get_node_inputs(num_pad, 0)
         return [*inputs, *padding]
 
     def step_ids(self, lease: SlotLease, request_ids: list[int]) -> list[int]:

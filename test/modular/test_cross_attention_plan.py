@@ -19,7 +19,9 @@ import torch
 
 from mstar.engine.resources.attn import cross as cross_mod
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.kv import page_table as page_table_mod
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.page_table import PageTable
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
@@ -271,3 +273,106 @@ def test_the_plan_hands_the_wrapper_host_kv_lens():
     assert plan["paged_kv_indices"].tolist() == [1, 2, 3, SINK_PAGE]
     assert plan["paged_kv_indptr"].tolist() == [0, 2, 3, 4]
     assert plan["paged_kv_last_page_len"].tolist() == [4, 16, 1]
+
+
+def _unbuilt():
+    raise AssertionError("the plan built views it had no need for")
+
+
+def _columns_plan(rows, *, views: bool = False) -> KVPlanOutput:
+    """The context label's plan as ``KVManager._plan_label`` builds it, off
+    ``PageTable.plan_columns``. ``rows``: (request id, held pages, written
+    length); a padding row holds nothing and has length 0. With ``views``
+    the output has no columns and the cross manager must read the views."""
+    table = PageTable()
+    offs, held, lens = [], [], []
+    for _, pages, length in rows:
+        stream = table.new()
+        stream.extend(pages)
+        offs.append(stream.off)
+        held.append(stream.n)
+        lens.append(length)
+    cols = table.plan_columns(offs, held, lens, [0] * len(rows), 16)
+    bounds = cols.kv_indptr.tolist()
+    built = [
+        SequenceView(request_id=rid, label=CONTEXT, page_idxs=cols.indices[bounds[i]:bounds[i + 1]].tolist(),
+                     length=length, to_compute=0)
+        for i, (rid, _, length) in enumerate(rows)
+    ]
+    if views:
+        return KVPlanOutput(cpu_indptrs=None, views=built)
+    # cpu_indptrs stands for the pinned ring, which a later plan may have rewritten
+    return KVPlanOutput(
+        cpu_indptrs=None, rows=[(rid, CONTEXT, 0) for rid, _, _ in rows],
+        view_builder=_unbuilt, columns=cols,
+    )
+
+
+def _rows_query(rids, spans) -> dict[str, KVPlanOutput]:
+    qo = [0]
+    for n in spans:
+        qo.append(qo[-1] + n)
+    return {"main": KVPlanOutput(
+        cpu_indptrs=PagedIndptrs(
+            qo_indptr=torch.tensor(qo, dtype=torch.int32),
+            paged_kv_indptr=torch.tensor([0], dtype=torch.int32),
+            paged_kv_indices=torch.tensor([], dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([], dtype=torch.int32),
+        ),
+        rows=[(rid, "main", n) for rid, n in zip(rids, spans, strict=True)],
+        view_builder=_unbuilt,
+    )}
+
+
+def _planned(context: KVPlanOutput, rids, spans) -> dict[str, list[int]]:
+    ctx = _ctx(tuple(rids), _rows_query(rids, spans))
+    ctx.plan_results[CTX_KV][CONTEXT] = context
+    manager = _manager()
+    manager.plan(AttentionStep(causal=False), ctx)
+    plan = manager._current_plan_states["main"].last_plan
+    assert isinstance(plan["kv_lens"], HostLens)
+    return {k: plan[k].tolist() for k in (
+        "qo_indptr", "paged_kv_indptr", "paged_kv_indices", "paged_kv_last_page_len", "kv_lens",
+    )}
+
+
+# r0 holds a page more than its length covers; pad0 and pad1 are a capture's
+# padding rows, one of them between real rows
+_CONTEXT_ROWS = [
+    ("r0", [1, 2, 9], 20), ("pad0", [], 0), ("r1", [3], 16), ("r2", [4, 5], 17), ("pad1", [], 0),
+]
+
+
+@pytest.fixture(params=["numpy", "rust"])
+def plan_columns_backend(request, monkeypatch):
+    if request.param == "numpy":
+        monkeypatch.setattr(page_table_mod, "_rust_plan_columns", None)
+    elif page_table_mod._rust_plan_columns is None:
+        pytest.skip("the mstar_rust extension is not built")
+
+
+@pytest.mark.parametrize("spans", [[1] * 5, [3, 1, 2, 1, 1]])
+def test_query_rows_in_context_order_take_the_context_plans_arrays(plan_columns_backend, spans):
+    """Same arrays as planning off the views, a padding row reading one sink
+    token, without building a view on either side."""
+    rids = [rid for rid, _, _ in _CONTEXT_ROWS]
+    fast = _planned(_columns_plan(_CONTEXT_ROWS), rids, spans)
+    assert fast == _planned(_columns_plan(_CONTEXT_ROWS, views=True), rids, spans)
+    assert fast["paged_kv_indices"] == [1, 2, SINK_PAGE, 3, 4, 5, SINK_PAGE]
+    assert fast["kv_lens"] == [20, 1, 16, 17, 1]
+
+
+def test_query_rows_in_another_order_plan_off_the_views(plan_columns_backend):
+    context = _columns_plan(_CONTEXT_ROWS)
+    built = []
+
+    def build():
+        built.append(True)
+        return _columns_plan(_CONTEXT_ROWS, views=True).views
+
+    context._view_builder = build
+    rids = ["r2", "r0", "pad1", "r1", "pad0"]
+    planned = _planned(context, rids, [1] * 5)
+    assert built
+    assert planned["paged_kv_indices"] == [4, 5, 1, 2, SINK_PAGE, 3, SINK_PAGE]
+    assert planned["kv_lens"] == [17, 20, 1, 16, 1]
