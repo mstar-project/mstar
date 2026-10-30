@@ -53,12 +53,18 @@ def _graphs(node_name: str = NODE) -> dict:
     return {"prefill": node(), "decode": Loop(section=node(), max_iters=8, outputs=[], name="decode")}
 
 
+class _Engine(SimpleNamespace):
+    """An engine stub the scheduler can collect in a set, as it does real engines."""
+    __hash__ = object.__hash__
+
+
 def _worker(kv):
     """The real handlers over one pool, with the engine's drop going straight to the pool and its runner."""
-    engine = SimpleNamespace(
+    engine = _Engine(
         drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid: _drop(kv, rid),
         offload_request=lambda node, rid: _offload(kv, rid),
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
+        admit_waiting=lambda published_of: _runner(kv).admit_waiting(published_of),
     )
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
@@ -67,7 +73,8 @@ def _worker(kv):
     w._rebuilds._kept[NODE] = {rid: KeptIds(torch.arange(5 * PAGE_SIZE), array("i", [0])) for rid in "rv"}
     w._in_flight_rids, w._victims, w._dropped, w._hold_logged = set(), {}, {}, {}
     w._preempted, w._preemptions, w._drop_logged, w._rid_str = {}, defaultdict(PreemptionCounts), {}, str
-    w.held, w.tried = [], []
+    w.held, w.tried, w.failed = [], [], {}
+    w._is_tearing_down, w._fail_requests = lambda rid: False, w.failed.update
     w.scheduler = SimpleNamespace(
         backlog={}, rebuilds={}, return_backlogged=lambda rid: None, hold_requests=w.held.extend,
         could_refill=lambda *args: False, cap_batch=lambda *args: None, limit_batch=lambda *args: None,
@@ -76,7 +83,9 @@ def _worker(kv):
         setattr(w.scheduler, name, getattr(MicroScheduler, name).__get__(w.scheduler))
     w.request_state = SimpleNamespace(
         get_partition_for_node=lambda node: "p",
-        get_fwd_info=lambda rid, p: SimpleNamespace(graph_walk="decode", dynamic_loop_iter_counts={"decode": 0}),
+        get_fwd_info=lambda rid, p: SimpleNamespace(
+            graph_walk="decode", dynamic_loop_iter_counts={"decode": 0}, resource_publish_info=None,
+        ),
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     w._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, wgs: None)
@@ -178,13 +187,18 @@ def test_a_victim_in_the_refused_step_drops_once_the_step_clears():
 def test_a_dropped_request_returns_once_its_history_and_a_page_fit():
     kv, w = _preempting()
     assert _step(kv, "r", 1).ok
-    w.rebuilt, w._is_tearing_down = [], lambda rid: False
+    w.rebuilt = []
     w._rebuild = lambda rid, node: w.rebuilt.append((rid, node))
+    # the scheduler's pass hands a dropped request to the worker once the pool admits it
+    scheduler = SimpleNamespace(
+        parked={}, dropped=w._dropped, readmit=lambda rid, node: Worker._readmit(w, rid, node),
+        engine_manager=w.engine_manager,
+    )
 
-    Worker._readmit_dropped(w)
+    MicroScheduler._unpark(scheduler, w.request_state)
     assert not w.rebuilt, "v came back into the room r needs to grow"
     _remove(kv, "r")
-    Worker._readmit_dropped(w)
+    MicroScheduler._unpark(scheduler, w.request_state)
 
     assert w.rebuilt == [("v", NODE)] and kv._allotments["v"].pages == 7, "v didn't return with its history and a page"
 
