@@ -192,8 +192,8 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         env={"MSTAR_SHM_ARENA": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
         recipe="the deployment config named in the engine column, unchanged; MSTAR_SHM_ARENA=1 as "
                ".claude/skills/benchmarking asks for numbers"),
-    # TP rows only: the worker's async scheduling for lockstep TP nodes, which defaults to off
-    # (MSTAR_TP_ASYNC_SCHED, mstar/worker/worker.py).
+    # TP rows only: the worker's async scheduling for lockstep TP nodes (MSTAR_TP_ASYNC_SCHED,
+    # mstar/worker/worker.py). Off by default on NVIDIA; on AMD GPUs a TP node has it on by default.
     Arm("mstar-tpasync", "mstar", ("text",), client="ours_openai", rows=("qwen3_5_9b_tp2",),
         env={"MSTAR_SHM_ARENA": "1", "MSTAR_TP_ASYNC_SCHED": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
         recipe="as the mstar arm, plus MSTAR_TP_ASYNC_SCHED=1 (async scheduling on the TP node)"),

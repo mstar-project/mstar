@@ -202,11 +202,15 @@ def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
 
 def _tp_async_sched_setting(
     env: str | None, config: bool | str | list[str] | None,
+    default_nodes: frozenset[str] = frozenset(),
 ) -> tuple[bool, frozenset[str] | None]:
     """The deployment config's ``tp_async_sched`` (true/false or a node list),
-    which a non-empty ``MSTAR_TP_ASYNC_SCHED`` overrides."""
+    which a non-empty ``MSTAR_TP_ASYNC_SCHED`` overrides. With neither set it
+    covers ``default_nodes``, the platform's default."""
     if env:
         return _parse_tp_async_sched(env)
+    if config is None:
+        return (True, default_nodes) if default_nodes else (False, None)
     if isinstance(config, (list, tuple)):
         return _parse_tp_async_sched(",".join(config))
     if isinstance(config, bool):
@@ -620,6 +624,7 @@ class Worker:
         # broadcasts it at once; followers rebuild it during their own N.
         self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
             os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
+            self._tp_async_default_nodes(),
         )
         # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
         self._tp_broadcast_seq = 0
@@ -2892,6 +2897,18 @@ class Worker:
         return (
             node_name in self.parallel_nodes
             and node_name not in self.parallel_leader_nodes
+        )
+
+    def _tp_async_default_nodes(self) -> frozenset[str]:
+        """The parallel nodes TP async scheduling covers when nothing sets it:
+        those with tp_size > 1 on a platform that turns it on
+        (``Platform.tp_async_sched_default``). Every rank of an instance reads
+        the same group sizes, so the ranks agree."""
+        if not current_platform.tp_async_sched_default():
+            return frozenset()
+        return frozenset(
+            node for node in self.parallel_nodes
+            if self.parallel_groups.get_tp_config_for_node(node).world_size > 1
         )
 
     def _tp_async_for(self, node_name: str) -> bool:

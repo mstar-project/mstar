@@ -120,6 +120,12 @@ class Platform:
         ``knobs:`` block and an exported variable both override them."""
         return {}
 
+    def tp_async_sched_default(self) -> bool:
+        """Whether nodes with tp_size > 1 take TP async scheduling when neither
+        the deployment config's ``tp_async_sched`` nor ``MSTAR_TP_ASYNC_SCHED``
+        sets it."""
+        return False
+
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
     ) -> dict[str, str]:
@@ -294,6 +300,11 @@ class RocmPlatform(Platform):
             "ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1", "step_thread_core": "off",
             "dit_exact_ops": "0",
         }
+
+    def tp_async_sched_default(self) -> bool:
+        # Qwen3.5 9B TP2 on MI325X, greedy output unchanged: 255-267 -> 306-314
+        # tok/s at c=1 and 6505-6662 -> 8065-8362 at c=64.
+        return True
 
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],

@@ -470,7 +470,7 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - config's ``tp_async_sched``, else ``0``
+     - config's ``tp_async_sched``, else ``0`` (on for TP nodes on ROCm)
      - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
        deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
@@ -493,7 +493,11 @@ Worker scheduling
        on every rank of an instance: the workers compare it at startup and
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
        ``0`` with it: that throttle holds the GPU thread until step N drains,
-       which serialises the very overlap this flag buys.
+       which serialises the very overlap this flag buys. On AMD GPUs, with
+       neither this nor the config set, nodes with ``tp_size`` > 1 take it
+       (``RocmPlatform.tp_async_sched_default``; Qwen3.5 9B TP2 on MI325X:
+       +18-22% tok/s at c=1, +21-28% at c=64); sequence-parallel-only nodes
+       stay serial. Read by ``Worker.__init__``.
    * - ``MSTAR_PRE_PLAN_SPEC``
      - config's ``knobs: pre_plan``, else ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread
