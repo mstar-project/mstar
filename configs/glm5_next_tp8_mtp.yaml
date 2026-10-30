@@ -8,9 +8,9 @@ max_seq_len: 2048
 # One request per KDA slot below: past them a prefill waits in the worker
 # for a slot, and its wait broke the decode speculation chain every step.
 max_concurrent_requests: 64
-# NVLS multicast for the small decode all-reduces; stays on NCCL, with a
-# warning, where NVLink multicast is unavailable.
-tp_allreduce: "symm_multimem"
+# FlashInfer's one-kernel all-reduce: 3.7-5.9 us a decode call on 8x H200,
+# against symm_multimem's 5.8-9.6 (slower above 2 MB, at prefill sizes).
+tp_allreduce: "flashinfer"
 # Prefill's all-reduces too: a 4096-token bucket moves 32 MiB per call.
 tp_allreduce_max_kb: 32768
 tp_async_sched: true
