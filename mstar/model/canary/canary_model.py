@@ -84,7 +84,7 @@ class CanaryModel(Model):
         self._detokenizer = SentencePieceDetokenizer(tokenizer)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
-    def checkpoint_path(self) -> str | None:
+    def checkpoint_path(self) -> str:
         return str(self.local_dir)
 
     # -------------------------------------------------------------------

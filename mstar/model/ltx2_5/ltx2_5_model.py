@@ -155,7 +155,7 @@ class LTX25Model(Model):
     def set_config(self, config: LTX25Config) -> None:
         self._config = config
 
-    def checkpoint_path(self) -> str | None:
+    def checkpoint_path(self) -> str:
         return str(self.snapshot)
 
     # ------------------------------------------------------------ structure
