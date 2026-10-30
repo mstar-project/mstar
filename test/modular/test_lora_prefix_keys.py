@@ -39,6 +39,7 @@ from mstar.engine.resources.lora.identity import (  # noqa: E402
 )
 from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, ProcessPromptOutput, Span  # noqa: E402
+from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
 from mstar.streaming.topology import PartitionTopology  # noqa: E402
 
 PAGE_SIZE = 16
@@ -51,7 +52,7 @@ def _lora_spec() -> LoraSpec:
     return LoraSpec(
         resource_key=LORA_RESOURCE_KEY, nodes={NODE}, num_layers=1,
         targets={"q": LoraTarget(in_features=8, out_slices=(8,))},
-        module_map=lambda m: LoraModuleRef("q", 0) if m == "layers.0.q" else None,
+        module_map=ModuleLoraMap({"layers.0.q": LoraModuleRef("q", 0)}),
         backend="torch",
     )
 
