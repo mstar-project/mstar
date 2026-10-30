@@ -22,6 +22,7 @@ from mstar.streaming.stream_buffer import (  # noqa: E402
     StreamingEdge,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PARTITION = "Decoder"
@@ -53,6 +54,7 @@ def _worker(rids=("r",)):
         request_state=SimpleNamespace(per_request_info=per_request_info),
         _consumer_node_cache={name: node for name, (node, _) in TOPOLOGY.items()},
         _stream_partition={name: PARTITION for name in TOPOLOGY},
+        _rebuilds=Rebuilds({}, {}),
     )
     worker._settle_final_streams = lambda *a: Worker._settle_final_streams(worker, *a)
     return worker

@@ -17,7 +17,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -30,6 +30,7 @@ from mstar.graph.base import (
 )
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.rebuild import RebuildPolicy
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -80,7 +81,7 @@ class Span(NamedTuple):
     ``scratch`` is the most a non-committing step writes before the span
     commits into those slots, as a denoised window does.
     """
-    kind: str
+    kind: SpanKind
     walk: str
     length: int
     advance: int
@@ -107,14 +108,14 @@ class LabelLayout(NamedTuple):
     def keyed_count(self) -> int:
         if self.keyed_spans is not None:
             return self.keyed_spans
-        return next((i for i, span in enumerate(self.spans) if span.kind == "rows"), len(self.spans))
+        return next((i for i, span in enumerate(self.spans) if span.kind == SpanKind.ROWS), len(self.spans))
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
         ``[length, advance, walk, scratch, kind]``: plain values, which keep a request's kwargs on
         the wire's msgpack path."""
         for span in self.spans:
-            if span.kind not in ("ids", "digest", "rows"):
+            if span.kind not in tuple(SpanKind):
                 raise ValueError(f"a span of kind {span.kind!r}")
             if not (isinstance(span.length, int) and isinstance(span.advance, int) and isinstance(span.scratch, int)):
                 raise ValueError(
@@ -143,7 +144,7 @@ def prompt_spans(
             spans.extend(item_spans(step))
             continue
         length = texts[step.index].numel()
-        spans.append(Span("ids", text_walk, length, length, "text_inputs"))
+        spans.append(Span(SpanKind.IDS, text_walk, length, length, "text_inputs"))
     return spans
 
 
@@ -598,6 +599,11 @@ class Model(ABC):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
+        return {}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        """``{node: policy}``: how a request dropped from each node's KV is rebuilt. A node without one never
+        drops a request."""
         return {}
 
     def combined_walk_of(self) -> dict[tuple[str, str], str]:

@@ -1373,7 +1373,6 @@ class Conductor:
         if not all(partition_states[name].is_done for name in self._streamed_partitions()):
             prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
-        prompt_ids = kwargs.get("prompt_ids") or {}
         arrival = next(self._arrivals)
         refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
@@ -1386,7 +1385,6 @@ class Conductor:
                 prefix_cache=prefix_cache,
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
-                prompt_ids=prompt_ids.get(key),
                 arrival=arrival,
             )
         if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
