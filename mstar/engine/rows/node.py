@@ -100,9 +100,11 @@ class NodeRows:
     def persistent(self, walk: str) -> bool:
         return walk in self._walks
 
-    def holds_any(self, rids: Sequence[int]) -> bool:
+    def holds_any(self, rids: Sequence[int], skip_walk: str | None = None) -> bool:
+        """Whether a walk but ``skip_walk`` holds a row of any of ``rids``."""
         return any(
-            space.holds(rid) for space in self._spaces if space.batch.n_active
+            w.space.holds(rid) for walk, w in self._walks.items()
+            if walk != skip_walk and w.space.batch.n_active
             for rid in rids
         )
 
