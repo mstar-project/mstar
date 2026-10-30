@@ -1287,8 +1287,8 @@ def test_a_refused_open_keeps_none_of_its_append(duplex):
 def test_a_paused_client_is_padded_with_silence(duplex, monkeypatch, half_sample):
     """The model steps only on the audio it hears, so the server keeps time:
     a client that stops sending is padded with silence once it is a frame
-    behind, at most MAX_PAD_SECONDS a pause, and never while half a sample
-    is pending."""
+    past JITTER_SECONDS behind, at most MAX_PAD_SECONDS a pause, and never
+    while half a sample is pending."""
     monkeypatch.setattr(serving_realtime, "MAX_PAD_SECONDS", 0.24)   # three frames
     client, api = duplex()
     frame = np.full(1280, 100, "<i2").tobytes() + (b"\x01" if half_sample else b"")
@@ -1296,7 +1296,7 @@ def test_a_paused_client_is_padded_with_silence(duplex, monkeypatch, half_sample
         ws.receive_text()
         _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 16000}}})
         _send(ws, "input_audio_buffer.append", audio=base64.b64encode(frame).decode())
-        time.sleep(0.6)
+        time.sleep(0.9)
         _send(ws, "input_audio_buffer.commit")
         _recv_until(ws, "input_audio_buffer.committed")
     first, *pads = api.appends
@@ -1305,9 +1305,10 @@ def test_a_paused_client_is_padded_with_silence(duplex, monkeypatch, half_sample
     assert padded == 0 if half_sample else 0 < padded <= 0.24 * 16000 + len(pads)
 
 
-def test_a_late_append_is_not_padded(duplex):
+def test_a_late_append_is_not_padded(duplex, monkeypatch):
     """Audio up to JITTER_SECONDS late is a late packet, not a pause: no
     silence goes into the middle of it."""
+    monkeypatch.setattr(serving_realtime, "JITTER_SECONDS", 0.5)   # margin for a slow runner
     client, api = duplex()
     frame = base64.b64encode(np.full(1280, 100, "<i2").tobytes()).decode()
     with client.websocket_connect("/v1/realtime") as ws:
