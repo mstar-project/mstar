@@ -593,7 +593,7 @@ def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
     out = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, stream[:, :, 7:12])
     video = out["video_output"][0]
 
-    expected = sub._decode_pixels(stream)
+    expected = sub._decode_pixels(stream)[0].transpose(0, 1)  # [T, C, H, W] frames
     assert video.shape == expected.shape  # 1 + 11*4 = 45 frames
     assert torch.equal(video, expected)
 
@@ -613,9 +613,9 @@ def test_windowed_decoder_streams_chunks(monkeypatch) -> None:
     out1 = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, stream[:, :, 7:12])
     c0 = out0["video_output"][0]
     c1 = out1["video_output"][0]
-    assert c0.shape[2] == 29 and c1.shape[2] == 14
-    expected = sub._decode_pixels(stream)
-    assert torch.equal(torch.cat([c0, c1], dim=2), expected[:, :, :43])
+    assert c0.shape[0] == 29 and c1.shape[0] == 14
+    expected = sub._decode_pixels(stream)[0].transpose(0, 1)
+    assert torch.equal(torch.cat([c0, c1]), expected[:43])
     assert sub.request_state("r")["ar_pixels"] == []
     # The stream's empty terminal flush stays a no-op.
     assert sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, torch.empty(0)) == {}
@@ -823,15 +823,15 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
         "session_id": "w", "resume_latent_units": 2,
     }
     out2 = sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md2), stream[:, :, 6:16])
-    video = torch.cat([out1["video_output"][0], out2["video_output"][0]], dim=2)
-    assert torch.equal(video, sub._decode_pixels(stream))
+    video = torch.cat([out1["video_output"][0], out2["video_output"][0]])
+    assert torch.equal(video, sub._decode_pixels(stream)[0].transpose(0, 1))
     # A resume whose session this node never saw still decodes, without
     # context: the first kept latent then decodes as a clip start (1 frame),
     # the next as a mid-stream latent (4) -> 5 frames from the 2 new units.
     md3 = {"rid": "r3", "num_windows": 1, "overlap_latent_units": 0, "num_frames": 8,
            "session_id": "ghost", "resume_latent_units": 2}
     out3 = sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md3), stream[:, :, 6:10])
-    assert out3["video_output"][0].shape[2] == 5
+    assert out3["video_output"][0].shape[0] == 5
 
 
 def _session_dit(monkeypatch):

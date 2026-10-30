@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import torch
 
+from mstar.platforms import current_platform
+
 try:
     import triton
     import triton.language as tl
-    from triton.language.extra.cuda import libdevice
+    from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait, libdevice
 
     _HAS_TRITON = True
 except ModuleNotFoundError:  # no triton: the torch reference covers this install
@@ -32,12 +34,15 @@ if _HAS_TRITON:
         x, h_in, post_in, comb_in, x_out, fn, part, T,
         HID: tl.constexpr, HC: tl.constexpr, MIX: tl.constexpr, MIXP: tl.constexpr,
         BT: tl.constexpr, CH: tl.constexpr, NSPLIT: tl.constexpr, UPDATE: tl.constexpr,
-        LOOP: tl.constexpr,
+        LOOP: tl.constexpr, PDL: tl.constexpr,
     ):
         """Split-K partials for BT tokens over LOOP CH-wide slices of the hidden dim, all
         streams in one tensor-core dot per slice: the mHC mix ``streams @ fn.T`` in columns
         < MIX and ``sum(streams^2)`` in column MIX. With UPDATE, first applies the previous
-        sublayer's ``update_streams`` to ``x`` (the residual) and writes the result."""
+        sublayer's ``update_streams`` to ``x`` (the residual) and writes the result. PDL: a
+        dependent launch; the first slice of ``fn`` loads before the wait on the kernel ahead."""
+        if PDL:
+            gdc_launch_dependents()
         t = tl.program_id(0) * BT + tl.arange(0, BT)
         tmask = (t < T)[:, None, None]
         t = t.to(tl.int64)[:, None, None]
@@ -51,6 +56,8 @@ if _HAS_TRITON:
             i = c0 + tl.arange(0, CH)[None, None, :]
             w = tl.load(fn + m[None, :] * (HC * HID) + ((k // CH) * HID + k % CH)[:, None]
                         + c0, mask=(m < MIX)[None, :], other=0.0)
+            if PDL and step == 0:
+                gdc_wait()
             src = x
             if UPDATE:
                 hv = tl.load(h_in + t * HID + i, mask=tmask, other=0.0)
@@ -159,20 +166,32 @@ if _HAS_TRITON:
         x, part, hc_scale, hc_base, norm_w, post_out, comb_out, y,
         rms_eps, hc_eps, norm_eps,
         HID: tl.constexpr, HC: tl.constexpr, MIX: tl.constexpr, MIXP: tl.constexpr,
-        NSPLIT: tl.constexpr, ITERS: tl.constexpr, EV: tl.constexpr,
+        NSPLIT: tl.constexpr, ITERS: tl.constexpr, EV: tl.constexpr, PDL: tl.constexpr,
     ):
         """Two programs per token that run side by side. Role 0 builds pre, collapses the
         streams with it and applies the site's weighted RMSNorm; role 1 builds post and the
-        Sinkhorn comb, which only the next ``update_streams`` reads."""
+        Sinkhorn comb, which only the next ``update_streams`` reads. PDL: a dependent launch
+        that loads its weights before waiting on the mix kernel ahead and unrolls the
+        Sinkhorn loop (both measured at decode sizes with PDL only)."""
+        if PDL:
+            gdc_launch_dependents()
         t = tl.program_id(0).to(tl.int64)
         r = tl.arange(0, HC)
         if tl.program_id(1) == 0:
             i = tl.arange(0, HID)
             rx = tl.arange(0, HC)
+            if PDL:
+                w = tl.load(norm_w + i).to(tl.float32)
+                pre_scale = tl.load(hc_scale + 0)
+                pre_base = tl.load(hc_base + r)
+                gdc_wait()
             xs = tl.load(x + t * HC * HID + rx[:, None] * HID + i[None, :], eviction_policy=EV)
             mix, m = _hc_mix(part, t, rms_eps, HID, HC, MIX, MIXP, NSPLIT)
             pre_w = tl.sum(tl.where(m[None, :] == r[:, None], mix[None, :], 0.0), 1)
-            pre = tl.sigmoid(pre_w * tl.load(hc_scale + 0) + tl.load(hc_base + r)) + hc_eps
+            if not PDL:
+                pre_scale = tl.load(hc_scale + 0)
+                pre_base = tl.load(hc_base + r)
+            pre = tl.sigmoid(pre_w * pre_scale + pre_base) + hc_eps
 
             # Collapse with pre (rounded to bf16 like the reference), then RMSNorm. pre is
             # moved onto the rows of xs through scalars, so the compiler never re-lays-out xs.
@@ -181,22 +200,35 @@ if _HAS_TRITON:
                 pre_x += tl.where(rx == s, tl.sum(tl.where(r == s, pre, 0.0), 0), 0.0)
             c = tl.sum(pre_x[:, None] * xs.to(tl.float32), 0).to(tl.bfloat16).to(tl.float32)
             rrms = tl.rsqrt(tl.sum(c * c, 0) / HID + norm_eps)
-            w = tl.load(norm_w + i).to(tl.float32)
+            if not PDL:
+                w = tl.load(norm_w + i).to(tl.float32)
             tl.store(y + t * HID + i, (c * rrms * w).to(y.dtype.element_ty))
         else:
+            cidx = 2 * HC + r[:, None] * HC + r[None, :]
+            if PDL:
+                post_scale, comb_scale = tl.load(hc_scale + 1), tl.load(hc_scale + 2)
+                post_base, comb_base = tl.load(hc_base + HC + r), tl.load(hc_base + cidx)
+                gdc_wait()
             mix, m = _hc_mix(part, t, rms_eps, HID, HC, MIX, MIXP, NSPLIT)
             post_w = tl.sum(tl.where(m[None, :] == (HC + r)[:, None], mix[None, :], 0.0), 1)
-            cidx = 2 * HC + r[:, None] * HC + r[None, :]
             comb_w = tl.sum(tl.where(m[None, None, :] == cidx[:, :, None], mix[None, None, :],
                                      0.0), 2)
-            post = 2.0 * tl.sigmoid(post_w * tl.load(hc_scale + 1) + tl.load(hc_base + HC + r))
-            logits = comb_w * tl.load(hc_scale + 2) + tl.load(hc_base + cidx)
+            if not PDL:
+                post_scale, comb_scale = tl.load(hc_scale + 1), tl.load(hc_scale + 2)
+                post_base, comb_base = tl.load(hc_base + HC + r), tl.load(hc_base + cidx)
+            post = 2.0 * tl.sigmoid(post_w * post_scale + post_base)
+            logits = comb_w * comb_scale + comb_base
             e = tl.exp(logits - tl.max(logits, 1)[:, None])
             comb = e / tl.sum(e, 1)[:, None] + hc_eps
             comb = (comb / (tl.sum(comb, 0)[None, :] + hc_eps)).to(tl.float32)
-            for _ in range(ITERS - 1):
-                comb = (comb / (tl.sum(comb, 1)[:, None] + hc_eps)).to(tl.float32)
-                comb = (comb / (tl.sum(comb, 0)[None, :] + hc_eps)).to(tl.float32)
+            if PDL:
+                for _ in tl.static_range(ITERS - 1):
+                    comb = (comb / (tl.sum(comb, 1)[:, None] + hc_eps)).to(tl.float32)
+                    comb = (comb / (tl.sum(comb, 0)[None, :] + hc_eps)).to(tl.float32)
+            else:
+                for _ in range(ITERS - 1):
+                    comb = (comb / (tl.sum(comb, 1)[:, None] + hc_eps)).to(tl.float32)
+                    comb = (comb / (tl.sum(comb, 0)[None, :] + hc_eps)).to(tl.float32)
             tl.store(post_out + t * HC + r, post)
             tl.store(comb_out + t * HC * HC + r[:, None] * HC + r[None, :], comb)
 
@@ -220,10 +252,13 @@ if _HAS_TRITON:
     @triton.jit
     def _update_streams_kernel(x, h_in, post_in, comb_in, x_out,
                                HID: tl.constexpr, HC: tl.constexpr, CH: tl.constexpr,
-                               FMA: tl.constexpr):
+                               FMA: tl.constexpr, PDL: tl.constexpr):
         """``post[s] * h + sum_j comb[j, s] * x[j]`` per stream, one CH slice per program.
         FMA: one explicit fma per j, as the prefill mix does; without it the compiler picks
-        which product to fuse, element by element."""
+        which product to fuse, element by element. PDL: lets the next layer's mix start."""
+        if PDL:
+            gdc_launch_dependents()
+            gdc_wait()
         t = tl.program_id(0).to(tl.int64)
         i = tl.program_id(1) * CH + tl.arange(0, CH)
         hv = tl.load(h_in + t * HID + i).to(tl.float32)
@@ -275,6 +310,24 @@ def prefill_sized(streams) -> bool:
     return T > _PREFILL_TOKENS and HID % 128 == 0 and HC == 4
 
 
+_PDL: dict[torch.device, bool] = {}
+# Up to this many tokens the mHC kernels launch as programmatic dependents; at 64 the chain
+# measured no faster (H100, H200).
+_PDL_MAX_TOKENS = 32
+
+
+def _pdl(t: torch.Tensor, tokens: int) -> bool:
+    """Decode-size mHC kernels launch as programmatic dependents (Hopper and newer): each
+    triggers its dependents on entry and loads its weights before waiting on the kernel
+    ahead, so back-to-back mHC kernels overlap launch and weight loads. A kernel ahead that
+    doesn't trigger (a GEMM, the all-reduce) just completes first, as without PDL."""
+    if tokens > _PDL_MAX_TOKENS:
+        return False
+    if t.device not in _PDL:
+        _PDL[t.device] = current_platform.has_cuda_capability(9, device=t.device)
+    return _PDL[t.device]
+
+
 def hc_pre(streams, fn, hc_scale, hc_base, norm_w, *, rms_eps, hc_eps, iters, norm_eps, update=None):
     """One mHC site plus the norm that follows it, on ``streams (1, T, HC, HID)``.
 
@@ -302,11 +355,13 @@ def hc_pre(streams, fn, hc_scale, hc_base, norm_w, *, rms_eps, hc_eps, iters, no
     args = (x, h_in, post_in, comb_in, x_out, fn, part, T)
     kw = dict(HID=HID, HC=HC, MIX=mix, MIXP=mixp, BT=bt, CH=ch, NSPLIT=nsplit,
               UPDATE=update is not None, LOOP=loop, num_warps=4)
+    pdl = _pdl(x, T)
     if T and prefill:
         _hc_mix_prefill_kernel[(triton.cdiv(T, bt), nsplit)](
             *args, EV_IN=ev_in, EV_KEEP=ev_keep, **kw)
     elif T:
-        _hc_mix_partial_kernel[(triton.cdiv(T, bt), nsplit)](*args, **kw)
+        _hc_mix_partial_kernel[(triton.cdiv(T, bt), nsplit)](
+            *args, PDL=pdl, launch_pdl=pdl, **kw)
     post = torch.empty(1, T, HC, dtype=torch.float32, device=x.device)
     comb = torch.empty(1, T, HC, HC, dtype=torch.float32, device=x.device)
     y = torch.empty(T, HID, dtype=streams.dtype, device=x.device)
@@ -315,7 +370,7 @@ def hc_pre(streams, fn, hc_scale, hc_base, norm_w, *, rms_eps, hc_eps, iters, no
             x_out, part, hc_scale, hc_base, norm_w, post, comb, y,
             float(rms_eps), float(hc_eps), float(norm_eps),
             HID=HID, HC=HC, MIX=mix, MIXP=mixp, NSPLIT=nsplit, ITERS=iters,
-            EV=ev_fin, num_warps=4,
+            EV=ev_fin, PDL=pdl, num_warps=4, launch_pdl=pdl,
         )
     return post, comb, y, x_out.view(1, T, HC, HID)
 
@@ -325,10 +380,12 @@ def update_streams(residual, h, post, comb):
     _, T, HC, HID = residual.shape
     out = torch.empty_like(residual)
     ch = min(256, HID)
+    prefill = prefill_sized(residual)
+    pdl = _pdl(residual, T)
     if T:
         _update_streams_kernel[(T, HID // ch)](
             residual, h, post, comb, out, HID=HID, HC=HC, CH=ch,
-            FMA=prefill_sized(residual), num_warps=4)
+            FMA=prefill, PDL=pdl, num_warps=4, launch_pdl=pdl)
     return out
 
 

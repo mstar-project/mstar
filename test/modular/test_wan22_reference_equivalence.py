@@ -637,10 +637,10 @@ def test_final_latents_and_decode_psnr(t2v_trajectory, oracle_meta, dit_submodul
             decoder, "video_gen", t2v_trajectory["fwd_info"], {"latents": [final_latents]}
         )
     video = outputs["video_output"][0]
-    assert video.shape == (1, 3, oracle_meta["num_frames"], oracle_meta["height"], oracle_meta["width"])
+    assert video.shape == (oracle_meta["num_frames"], oracle_meta["height"], oracle_meta["width"], 3)
     # Both are uint8 on the same 255 scale, so the PSNR is apples to apples.
     assert video.dtype == torch.uint8
-    ours = video[0].permute(1, 2, 3, 0).cpu()
+    ours = video.cpu()
 
     oracle_frames = _decode_oracle_mp4()
     assert oracle_frames.shape == ours.shape
@@ -697,8 +697,11 @@ def test_tiled_decode_matches_untiled(oracle_meta):
     # proving the gate routes to tiled_decode / decode and quantizes only at the
     # worker boundary, nowhere upstream.
     assert emitted_tiled.dtype == emitted_untiled.dtype == torch.uint8
-    assert torch.equal(emitted_tiled, (tiled_raw / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
-    assert torch.equal(emitted_untiled, (untiled_raw / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
+    def frames(raw):
+        return (raw[0] / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).permute(1, 2, 3, 0)
+
+    assert torch.equal(emitted_tiled, frames(tiled_raw))
+    assert torch.equal(emitted_untiled, frames(untiled_raw))
 
     diff = (tiled - untiled).abs()
     print(f"tiled-vs-untiled decode: max_abs={diff.max().item():.3e} "
