@@ -1039,7 +1039,9 @@ placed exactly as weights are.
   load, an ``F.linear`` over it), which the parent names in ``lora_unservable`` (a path
   below it -> reason; a path that is not one of its submodules is a ``ValueError``): MLA's
   absorbed projections, SigLIP's patch embedding, Command-A+'s fused decoder-layer
-  projections.
+  projections, Qwen3-Omni's code-predictor QKV. Nothing else can tell such a child from
+  one whose forward runs: an undeclared one is bound, and its delta silently never
+  added, so code that reads a linear's weight directly declares it there.
 - **Targets.** One per role in a layer stack (``<stack>.N.<role>``, the first module list
   in the path, whatever it is named; ``layers`` set where a role is on some layers only),
   named by the role's last component (``names`` overrides), plus one per module outside
