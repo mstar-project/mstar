@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.rows import RowState
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -49,6 +50,10 @@ class AttentionManager(AttentionResource):
     # on the attention backend
 
     # Label / layer cursors come from `AttentionResource`; `run` resolves them.
+
+    def row_state(self, space, node_name: str, graph_walk: str) -> RowState:
+        # plans every step per request, so nothing of it is kept in the rows yet
+        return RowState()
 
     def fingerprint(self) -> bytes:
         # the class, not the declared backend: `build` moves dense to another

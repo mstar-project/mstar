@@ -31,6 +31,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
+from mstar.engine.resources.recurrent.rows import RecurrentRows
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -41,6 +42,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.engine.rows import RowState
 from mstar.utils.h2d import H2DMirror, PinnedStager
 
 if TYPE_CHECKING:
@@ -219,6 +221,8 @@ class RecurrentStatePool(Resource):
         self._eager_addressing: dict[str, RecurrentAddressing] = {}
         # label -> this step's addressing, for the backend to read
         self._current: dict[str, RecurrentAddressing] = {}
+        # walk -> its rows, for the labels its steps carry (`recurrent.rows`)
+        self._rows: dict[str, RecurrentRows] = {}
 
         # Pre-planning stages the addressing (host bookkeeping plus two H2D
         # copies). Forks are not staged; see `_pending_fork_state`.
@@ -593,11 +597,15 @@ class RecurrentStatePool(Resource):
             self._maybe_apply_forks(step, ctx)
             self._apply_restores(step)
 
-        self._current = {}
-        for label, segments in self._group_by_label(step.segments or ()).items():
-            self._current[label] = self._build_addressing(
-                label, segments, ctx, pending,
-            )
+        rows = self._rows.get(ctx.graph_walk)
+        if rows is not None:
+            self._current = self._plan_rows(step, ctx, rows)
+        else:
+            self._current = {}
+            for label, segments in self._group_by_label(step.segments or ()).items():
+                self._current[label] = self._build_addressing(
+                    label, segments, ctx, pending,
+                )
         if ctx.is_preplan:
             self._preplanned = True
             self._cached_plan_output = self._current
@@ -957,6 +965,46 @@ class RecurrentStatePool(Resource):
         if gone:
             self._admit_restores = [k for k in self._admit_restores if k not in gone]
             self._admit_snaps = [k for k in self._admit_snaps if k not in gone]
+
+    # Persistent rows
+
+    def row_state(self, space, node_name: str, graph_walk: str) -> RowState:
+        labels = space.labels.get(self._name)
+        if not labels:
+            return RowState()
+        rows = self._rows[graph_walk] = RecurrentRows(space, labels, self.pad_index)
+        return rows
+
+    def _plan_rows(
+        self, step: RecurrentStep, ctx: StepContext, rows: RecurrentRows,
+    ) -> dict[str, RecurrentAddressing]:
+        """A step of a persistent walk: it addresses the slots its rows hold,
+        through the rows its graph gathers, which a capture records while they
+        hold padding (the sink). Here: the rows that joined or took a slot."""
+        if step.pre_forks or step.post_forks:
+            raise ValueError(
+                f"recurrent state pool {self._name!r}: a step of persistent walk "
+                f"{ctx.graph_walk!r} takes no forks"
+            )
+        by_label = self._group_by_label(step.segments or ())
+        if not by_label.keys() <= rows.slots.keys():
+            raise ValueError(
+                f"recurrent state pool {self._name!r}: a step of persistent walk "
+                f"{ctx.graph_walk!r} carries labels {sorted(by_label)}, but its rows hold "
+                f"{sorted(rows.slots)} (RowWalk.labels)"
+            )
+        if ctx.rows is not None and not ctx.capture:
+            with self._lock:
+                if ctx.rows.diff.join_rids:
+                    rows.write_joins(ctx.rows, self._slots)
+                if self._admit_taken:
+                    rows.write_taken(ctx.rows, self._admit_taken)
+        return {
+            label: RecurrentAddressing(
+                slot_indices=rows.slots[label].device, has_state=rows.has_state, num_rows=len(segments),
+            )
+            for label, segments in by_label.items()
+        }
 
     # Addressing
 

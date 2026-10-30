@@ -155,6 +155,10 @@ class StreamPages:
     def tolist(self) -> list[int]:
         return self._table.pool[self.off:self.off + self.n].tolist()
 
+    def array(self) -> np.ndarray:
+        """The pages as an int32 view, valid until the stream next changes."""
+        return self._table.pool[self.off:self.off + self.n]
+
     def __iter__(self):
         return iter(self.tolist())
 

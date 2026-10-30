@@ -13,8 +13,10 @@ import numpy as np
 
 try:
     from mstar_rust import RowStage as _RustRowStage
+    from mstar_rust import rows_step_mirrors as _rust_step_mirrors
 except ImportError:
     _RustRowStage = None
+    _rust_step_mirrors = None
 
 _ALIGN = 16
 _SEGMENT = 24  # bytes: src, dst, nbytes as int64
@@ -81,6 +83,21 @@ class PyRowStage:
         """``data`` uploaded whole to ``dst``."""
         self._add_from_payload(self._put_bytes(data), dst, data.nbytes)
 
+    def header(self, idx: np.ndarray, max_rows: int, pad: int, trash: int, dst: int) -> None:
+        """The step header: its row count, then each dense row's slot to
+        gather from (``pad`` past the step's rows) and to scatter to
+        (``trash`` past them), as int32."""
+        n = len(idx)
+        if n > max_rows:
+            raise ValueError(f"{n} rows in a header of {max_rows}")
+        header = np.empty(1 + 2 * max_rows, dtype=np.int32)
+        header[0] = n
+        header[1:1 + max_rows] = pad
+        header[1 + max_rows:] = trash
+        header[1:1 + n] = idx
+        header[1 + max_rows:1 + max_rows + n] = idx
+        self.put(header, dst)
+
     def _put_bytes(self, data: np.ndarray) -> int:
         at = self._size
         # copied now, as the Rust stage does: a caller may reuse its buffer
@@ -129,3 +146,18 @@ class PyRowStage:
 def new_stage(phases: int):
     """A step's stage: the Rust one when the extension has it."""
     return PyRowStage(phases) if _RustRowStage is None else _RustRowStage(phases)
+
+
+_INT = {1: np.int8, 2: np.int16, 4: np.int32, 8: np.int64}
+
+
+def py_step_mirrors(slab: np.ndarray, desc: np.ndarray, n_slots: int, slots: np.ndarray) -> None:
+    """``rows_step_mirrors``: add each stepped mirror's step to the rows of
+    ``slots`` in the host slab. ``desc`` is ``[buffers, 4]`` int64: byte
+    offset, element size, elements a row, step."""
+    for offset, size, elems, step in desc.tolist():
+        rows = slab[offset:offset + n_slots * elems * size].view(_INT[size]).reshape(n_slots, elems)
+        rows[slots] += step
+
+
+step_mirrors = py_step_mirrors if _rust_step_mirrors is None else _rust_step_mirrors

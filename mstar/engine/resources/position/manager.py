@@ -27,7 +27,9 @@ from mstar.engine.resources.position.config import (
 from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
+from mstar.engine.resources.position.rows import PositionRows
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+from mstar.engine.rows import RowState
 
 
 @dataclass
@@ -146,6 +148,8 @@ class RopeManager(PositionManager):
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
+        # walk -> its persistent rows, where a held request's counters live
+        self._rows: dict[str, PositionRows] = {}
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
         # Host side of the same addressing, keyed the same way; see
@@ -225,8 +229,17 @@ class RopeManager(PositionManager):
         if prefix.position > counters.get(prefix.label, 0):
             counters[prefix.label] = prefix.position
 
+    def _live_counters(self, rid: str) -> dict[str, int] | None:
+        """``rid``'s counters, from its row while it holds one."""
+        counters = self._counters.get(rid)
+        for rows in self._rows.values():
+            held = rows.held(rid)
+            if held is not None:
+                return {**(counters or {}), **held}
+        return counters
+
     def publish(self, request_id: str) -> "PublishedPositionInfo | None":
-        counters = self._counters.get(request_id)
+        counters = self._live_counters(request_id)
         if not counters:
             return None
         return PublishedPositionInfo(counters=dict(counters))
@@ -235,7 +248,7 @@ class RopeManager(PositionManager):
         self, request_id: str, node_name: str | None, graph_walk: str | None,
     ):
         del node_name, graph_walk
-        counters = self._counters.get(request_id)
+        counters = self._live_counters(request_id)
         return tuple(counters.items()) if counters else None
 
     def publish_from_snapshot(
@@ -265,6 +278,20 @@ class RopeManager(PositionManager):
             if position > counters.get(label, 0):
                 counters[label] = position
         return ADMIT_OK
+
+    def row_state(self, space, node_name: str, graph_walk: str) -> RowState:
+        labels = space.labels.get(self._kv_cache_name)
+        if not labels:
+            raise ValueError(
+                f"{node_name}: walk {graph_walk!r} keeps persistent rows but names no "
+                f"labels of KV cache {self._kv_cache_name!r} (RowWalk.labels), whose "
+                "positions its rows hold"
+            )
+        if graph_walk in self._rows:
+            raise ValueError(f"positions: walk {graph_walk!r} keeps persistent rows on two nodes")
+        step = self._config.block_step if self._config.scheme == PosScheme.BLOCK else 1
+        rows = self._rows[graph_walk] = PositionRows(space, labels, self._counters, step)
+        return rows
 
     @property
     def supports_preplan(self):
@@ -302,6 +329,10 @@ class RopeManager(PositionManager):
             "position preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if self._rows:
+            rows = self._rows.get(ctx.graph_walk)
+            if rows is not None:
+                return self._plan_rows(step, ctx, rows)
         if self._preplanned:
             # staged a step early against this same step's KV plan
             self._current_pos_ids = self._preplan_pos_ids
@@ -347,6 +378,8 @@ class RopeManager(PositionManager):
         return pos_ids_out
 
     def commit(self, step: PositionStep, ctx: StepContext):
+        if self._rows and ctx.graph_walk in self._rows:
+            return  # its requests' positions are their rows, advanced at the rows' commit
         all_counters = self._counters
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
@@ -362,6 +395,34 @@ class RopeManager(PositionManager):
         plan_outputs = ctx.plan_results.get(self._kv_cache_name)
         if plan_outputs is not None:
             self._apply_forks(plan_outputs.post_forks, ctx.padded_request_ids)
+
+    def _plan_rows(self, step: PositionStep, ctx: StepContext, rows: PositionRows) -> dict[str, torch.Tensor]:
+        """A step whose positions are its rows, one token a row: the ids are
+        the rows themselves, which the step's forward steps."""
+        if ctx.is_preplan:
+            return {}  # nothing to stage
+        if step.pos_ids is not None or step.advance is not None:
+            raise ValueError(
+                f"walk {ctx.graph_walk!r} keeps persistent rows, whose positions "
+                "advance by one token a row; it can't set them explicitly"
+            )
+        if self._preplanned:
+            self.clear_preplan()  # staged for another step, which this one overtook
+        plan_outputs: KVPlanOutputs = ctx.plan_results[self._kv_cache_name]
+        if plan_outputs.pre_forks or plan_outputs.post_forks:
+            raise ValueError(f"walk {ctx.graph_walk!r} keeps persistent rows, whose labels can't fork")
+        bs = len(ctx.padded_request_ids)
+        out = self._current_pos_ids = {}
+        for label, kv_out in plan_outputs.items():
+            buf = rows.labels.get(label)
+            if buf is None or not kv_out.is_decode:
+                raise ValueError(
+                    f"walk {ctx.graph_walk!r} keeps persistent rows, so its steps must "
+                    f"compute one token a row on labels it declares; label {label!r} "
+                    + ("is not declared" if buf is None else "computes more")
+                )
+            out[label] = buf.rows(bs)
+        return out
 
     def _apply_forks(
         self, forks: tuple[tuple[str, str], ...], request_ids: tuple[str, ...],
@@ -477,7 +538,7 @@ class RopeManager(PositionManager):
 
 
     def position(self, rid: str, label: str) -> int:
-        return self._counters.get(rid, {}).get(label, 0)
+        return (self._live_counters(rid) or {}).get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)

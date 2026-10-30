@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.engine.rows import RowWalk
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 
@@ -963,12 +964,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
-    def persistent_row_walks(self) -> frozenset[str]:
+    def persistent_row_walks(self) -> Mapping[str, RowWalk]:
         """Walks whose steps keep each request in a fixed row across steps
-        (``mstar.engine.rows``): the engine runs such a step in row order and
-        every resource of the node keeps its per-row state there. Each needs a
-        batch cap, which sizes the rows. Empty by default."""
-        return frozenset()
+        (``mstar.engine.rows``), and the stream labels their steps carry: the
+        engine runs such a step in row order and every resource of the node
+        keeps its per-row state there. Each needs a batch cap, which sizes
+        the rows. Empty by default."""
+        return {}
 
     def max_rows_in_combined(self, graph_walk: str) -> int | None:
         """How many rows of this real walk a step mixing it with another walk

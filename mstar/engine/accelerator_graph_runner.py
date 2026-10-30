@@ -736,6 +736,9 @@ class AcceleratorGraphRunner:
         # config_idx -> its compiled forward, shared by every bucket of that
         # config so shapes captured twice (once per slot) compile once
         self._compiled_forwards: dict[int, Any] = {}
+        # walk -> device work each of its forwards owes before and after it
+        # (``add_forward_hooks``)
+        self._forward_hooks: dict[str, tuple[Callable[[SlotLease], None], Callable[[], None]]] = {}
 
         # Plan-overlap stream. Lazily created the first time pre_plan
         # is called from Worker.plan_executor.
@@ -1182,8 +1185,17 @@ class AcceleratorGraphRunner:
                 prepare()
             self._graph_backend.synchronize()
 
+            hooks = self._forward_hooks.get(walk)
+
+            def run_captured():
+                before, after = hooks
+                before(lease)
+                out = run_forward()
+                after()
+                return out
+
             yield WarmedSpec(
-                run=run_forward,
+                run=run_forward if hooks is None else run_captured,
                 static_inputs=static_inputs,
                 static_input_keys=static_input_keys,
                 dummy_rids=dummy_rids,
@@ -1365,6 +1377,14 @@ class AcceleratorGraphRunner:
             graph_walk in config.replay_graph_walks
             for config in self._capture_configs
         )
+
+    def add_forward_hooks(
+        self, graph_walk: str, before: Callable[[SlotLease], None], after: Callable[[], None],
+    ) -> None:
+        """Run ``before`` (given the captured spec's lease) and ``after``
+        around the forward in every graph captured for ``graph_walk`` (not in
+        the warm-up forwards, which run for real)."""
+        self._forward_hooks[graph_walk] = (before, after)
 
     def max_batch_size_for(self, graph_walk: str) -> int | None:
         """Largest batch this walk was captured for, or None for no cap.

@@ -6,7 +6,8 @@ The engine drives the step lifecycle; a resource only says what its rows hold
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -16,6 +17,7 @@ from mstar.engine.rows.space import RowSpace, StepRows
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.step import SlotLease
 
 
 class RowState:
@@ -44,6 +46,45 @@ class RowState:
     def released(self, slots: np.ndarray) -> None:
         """Rows of removed requests left ``slots``: free what was kept for them."""
 
+    def before_forward(self, lease: SlotLease) -> None:
+        """Run before the forward of every graph captured for the walk, the
+        one ``lease`` names, so the graph builds from the rows what its
+        forward reads (see ``RowFills``)."""
+
+
+class RowFills(RowState):
+    """A ``RowState`` that builds per-step device inputs from the rows inside
+    the step's graph: the capture's plan arms a fill (``arm``) aimed at the
+    buffers that graph reads, and the capture records it ahead of the
+    forward, so a replay rebuilds them from the rows as they are then. A step
+    that isn't captured plans as it would without rows.
+
+    A spec is planned several times before its capture (once per warm-up
+    forward) and other specs are planned in between, so fills are kept per
+    lease and per ``key``: a re-plan replaces its fill, and a capture records
+    only its own lease's."""
+
+    def __init__(self):
+        self._fills: dict[SlotLease, dict[object, Callable[[], None]]] = {}
+
+    def arm(self, lease: SlotLease, key: object, fill: Callable[[], None]) -> None:
+        self._fills.setdefault(lease, {})[key] = fill
+
+    def before_forward(self, lease: SlotLease) -> None:
+        for fill in self._fills.pop(lease, {}).values():
+            fill()
+
+
+class RowWalk(NamedTuple):
+    """How a walk keeps persistent rows (``NodeSubmodule.persistent_row_walks``).
+
+    ``labels`` names, by KV cache resource key, the stream labels each step
+    of the walk extends by its one token a row. The rows are allocated before
+    any step runs, so a resource keeping per-label state in them (positions,
+    KV lengths and pages) learns its labels here.
+    """
+    labels: Mapping[str, tuple[str, ...]] = MappingProxyType({})
+
 
 class _Walk(NamedTuple):
     space: RowSpace
@@ -60,13 +101,17 @@ class NodeRows:
 
     @classmethod
     def build(
-        cls, node_name: str, walks: Collection[str],
+        cls, node_name: str, walks: Mapping[str, RowWalk],
         max_rows: Callable[[str], int | None],
         resources: Mapping[str, Resource], device: torch.device,
+        max_live: int | None = None,
     ) -> NodeRows:
-        """Each walk's space, sized to the most rows a step of it may hold,
-        with every resource of the node taking part. Raises if a walk has no
-        batch cap or a resource can't keep its state in rows."""
+        """Each walk's space, a step of it holding at most ``max_rows(walk)``
+        rows, with a resident slot for each of ``max_live`` live requests
+        (at least a step's rows; without a limit, just those, so rows that
+        rotate out of the steps are checked in), and every resource of the
+        node taking part. Raises if a walk has no batch cap or a resource
+        can't keep its state in rows."""
         built = {}
         for walk in sorted(walks):
             rows = max_rows(walk)
@@ -75,7 +120,7 @@ class NodeRows:
                     f"{node_name}: walk {walk!r} keeps persistent rows but has no "
                     "batch cap (a capture config or max_batch_size) to size them"
                 )
-            space = RowSpace(rows, device)
+            space = RowSpace(rows, device, labels=walks[walk].labels, capacity=max(rows, max_live or 0))
             states = []
             for key, resource in resources.items():
                 state = resource.row_state(space, node_name, walk)
@@ -86,6 +131,8 @@ class NodeRows:
                         "its per-row state in them"
                     )
                 states.append(state)
+            # before capture records the rows' addresses
+            space.seal()
             built[walk] = _Walk(space, tuple(states))
         return cls(node_name, built)
 
@@ -104,7 +151,7 @@ class NodeRows:
         """Whether a walk but ``skip_walk`` holds a row of any of ``rids``."""
         return any(
             w.space.holds(rid) for walk, w in self._walks.items()
-            if walk != skip_walk and w.space.batch.n_active
+            if walk != skip_walk and w.space.batch.n_held
             for rid in rids
         )
 
@@ -122,10 +169,11 @@ class NodeRows:
                 state.check_out(rows)
         return rows
 
-    def commit(self, walk: str, rows: StepRows) -> None:
-        """Commit a step of ``walk`` that is launching; ``rows.apply`` puts it
-        on the device, on the step's stream."""
-        released = rows.commit()
+    def commit(self, walk: str, rows: StepRows, forward: bool = True) -> None:
+        """Commit a step of ``walk`` that is launching, running the walk's
+        forward unless ``forward`` is False (a check-in); ``rows.apply`` puts
+        it on the device, on the step's stream."""
+        released = rows.commit(forward)
         if len(released):
             for state in self._walks[walk].states:
                 state.released(released)
@@ -134,7 +182,7 @@ class NodeRows:
         """Check ``rids`` in from every walk but ``skip_walk``, on the current
         stream, for a step that reads their state elsewhere."""
         for walk, w in self._walks.items():
-            if walk == skip_walk or not w.space.batch.n_active:
+            if walk == skip_walk or not w.space.batch.n_held:
                 continue
             held = [rid for rid in rids if w.space.holds(rid)]
             if not held:
@@ -143,8 +191,23 @@ class NodeRows:
             for state in w.states:
                 state.check_in(rows)
             rows.stage()
-            self.commit(walk, rows)
+            self.commit(walk, rows, forward=False)
             rows.apply()
+
+    def before_forward(self, walk: str, lease: SlotLease) -> None:
+        """Before the forward of the graph captured for ``walk`` on ``lease``:
+        every state's ``before_forward``, which builds from the step's
+        gathered rows."""
+        for state in self._walks[walk].states:
+            state.before_forward(lease)
+
+    def gather(self, walk: str, n: int) -> None:
+        """A step of ``walk`` over ``n`` rows, once its rows are applied: see ``RowSpace.gather``."""
+        self._walks[walk].space.gather(n)
+
+    def after_forward(self, walk: str) -> None:
+        """After a forward of ``walk``: see ``RowSpace.after_forward``."""
+        self._walks[walk].space.after_forward()
 
     def forget(self, rid: int) -> None:
         """``rid`` was removed: its rows leave at their walk's next step."""

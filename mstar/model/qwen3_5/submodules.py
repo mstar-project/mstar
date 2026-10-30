@@ -36,6 +36,7 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.engine.rows import RowWalk
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
@@ -252,7 +253,7 @@ class LLMSubmodule(ARNodeSubmodule):
         start_embed, end_embed = self._sentinel_embeds()
 
         pos = self.node_resources[ROPE].position(
-            rid=fwd_info.request_id, label="main",
+            rid=fwd_info.rid_handle, label="main",
         )
         start_pos = pos
         embeds: list[torch.Tensor] = []
@@ -583,6 +584,9 @@ class LLMSubmodule(ARNodeSubmodule):
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
     ) -> bool:
         return True
+
+    def persistent_row_walks(self) -> Mapping[str, RowWalk]:
+        return {"decode": RowWalk(labels={KV_CACHE: ("main",), GDN_STATE: ("main",)})}
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         if graph_walk == "prefill_vision":

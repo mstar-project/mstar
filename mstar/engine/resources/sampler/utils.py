@@ -15,10 +15,11 @@ Usage:
     tokens = sample_tokens(logits, temperature=0.7, top_p=0.9)
 """
 
+import heapq
 import logging
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -2050,6 +2051,15 @@ class SamplerBuffers:
     # Request rows of the device masters; lags ``_master_capacity`` until the gpu thread grows them.
     _device_capacity: int = field(default=0, repr=False)
     ingraph_scatter: bool = False
+    # masters allocated once and never grown: the in-graph scatter's captured
+    # graphs hold their addresses, and so do persistent rows' pending copies
+    fixed_masters: bool = False
+    # Master slots a persistent row holds (``hold_slots``), and those of them
+    # whose request is gone: freed when the row leaves, since the row's
+    # check-in still writes them.
+    _row_held: set[int] = field(default_factory=set, repr=False)
+    _orphaned: set[int] = field(default_factory=set, repr=False)
+    _slot_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Master row 0, never given to a request, so its config stays SamplingConfig().
     # Padding rows, unregistered rids and capture rows read it; in graph they write it.
     _trash_slot: ClassVar[int] = 0
@@ -2076,7 +2086,8 @@ class SamplerBuffers:
     )
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
-    _free_slots: list[int] = field(default_factory=list, repr=False)
+    _free_slots: list[int] = field(default_factory=list, repr=False)  # a heap
+    _top_slot: int = 0  # the highest slot handed out
     # Slots awaiting init, consumed by the next gather so the rows are written
     # on the gathering thread rather than racing it from the main one.
     _pending_init: set[int] = field(default_factory=set, repr=False)
@@ -2111,15 +2122,16 @@ class SamplerBuffers:
     def tracks_seen_tokens(self) -> bool:
         return self.seen_tokens is not None
 
+    def scalar_fields(self) -> dict[str, HostBuffer]:
+        """The per-request settings this sampler reads, by field name."""
+        names = (
+            "temperature", "top_k", "top_p", "seed", "rep_penalty", "min_p",
+            "window", "window_penalty", "min_tokens", "top_p_first", "top_p_min_keep",
+        )
+        return {name: buf for name in names if (buf := getattr(self, name)) is not None}
+
     def _scalar_buffers(self) -> list[HostBuffer]:
-        bufs = [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
-        for opt in (
-            self.min_p, self.window, self.window_penalty, self.min_tokens,
-            self.top_p_first, self.top_p_min_keep,
-        ):
-            if opt is not None:
-                bufs.append(opt)
-        return bufs
+        return list(self.scalar_fields().values())
 
     @classmethod
     def allocate(
@@ -2136,13 +2148,15 @@ class SamplerBuffers:
         ingraph_scatter: bool = False,
         slots: int | None = None,
         loopback_state: "Mapping[str, LoopbackState] | None" = None,
+        fixed_masters: bool = False,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
         The masters hold the trash row (row 0, ``_trash_slot``) plus one row per
         request. With ``ingraph_scatter`` that is ``slots`` request rows (the
         knob's 4096 by default), allocated once: the captured graphs keep their
-        addresses, so they never grow.
+        addresses, so they never grow. ``fixed_masters`` allocates them the
+        same way without the in-graph scatter.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
         repetition penalty. ``history`` (with ``stop_ids`` and
@@ -2154,7 +2168,8 @@ class SamplerBuffers:
         """
         pinned = DeviceCapability.of(device).pin_memory
         cap = max_batch_size
-        if ingraph_scatter:
+        fixed_masters = fixed_masters or ingraph_scatter
+        if fixed_masters:
             cap = max(max_batch_size, slots if slots is not None else sampler_slots())
         # row 0 is the trash row; requests take rows 1..cap
         rows = cap + 1
@@ -2166,8 +2181,14 @@ class SamplerBuffers:
 
         # seen token mask is not double-buffered, as it depends on the GPU
         # value of the previous step. Same goes for offset
+        # Unless a captured graph scatters into it, the mask master starts at
+        # a step's rows and grows to the slots in use (_sync_device_capacity),
+        # fixed masters or not.
         seen_tokens = (
-            MaskBuffer.allocate(max_batch_size, rows, vocab_size, device, cg_slots=1)
+            MaskBuffer.allocate(
+                max_batch_size, rows if ingraph_scatter else max_batch_size + 1,
+                vocab_size, device, cg_slots=1,
+            )
             if vocab_size is not None else None
         )
         windowed = history is not None and history.window > 0
@@ -2201,6 +2222,7 @@ class SamplerBuffers:
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
+            fixed_masters=fixed_masters,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
@@ -2297,11 +2319,11 @@ class SamplerBuffers:
         Host rows only, under the lock ``_write_master_row`` takes, so a plan-thread
         ``_init_slot`` cannot land in the old array; device masters grow on the gpu thread.
         """
-        if self.ingraph_scatter:
+        if self.fixed_masters:
             raise RuntimeError(
-                f"more than {self._master_capacity} concurrent requests on the "
-                "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
-                "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
+                f"more than {self._master_capacity} concurrent requests on a "
+                "sampler whose masters cannot grow (the in-graph scatter, or a "
+                "walk with persistent rows); raise MSTAR_SAMPLER_SLOTS"
             )
         rows = new_capacity + 1  # plus the trash row
         with self._host_master_lock:
@@ -2315,14 +2337,19 @@ class SamplerBuffers:
 
         Swapping them on the main thread let an in-flight scatter land in the old tensor.
         """
+        seen = self.seen_tokens
+        if seen is not None and len(seen.master) <= self._top_slot:
+            # vocab-wide, so it grows to the slots in use even while the other
+            # masters are fixed (persistent rows keep their own masks)
+            seen.grow_master(max(2 * len(seen.master), self._top_slot + 1))
         cap = self._master_capacity
         if self._device_capacity >= cap:
             return
         rows = cap + 1  # plus the trash row
         self.offset.grow_master(rows)
         self.last_token.grow_master(rows)
-        if self.seen_tokens is not None:
-            self.seen_tokens.grow_master(rows)
+        if seen is not None and len(seen.master) < rows:
+            seen.grow_master(rows)
         for buf in self.loopback.values():
             buf.grow_master(rows)
         self._device_capacity = cap
@@ -2341,7 +2368,10 @@ class SamplerBuffers:
             return
         if not self._free_slots:
             self._grow_master(self._master_capacity * 2)
-        slot = self._free_slots.pop()
+        with self._slot_lock:
+            # lowest first, so a mask master that grows on demand stays small
+            slot = heapq.heappop(self._free_slots)
+        self._top_slot = max(self._top_slot, slot)
         self._rid_to_slot[rid] = slot
         # CPU-only; every GPU write for this slot is deferred to the next gather.
         self._pending_init.add(slot)
@@ -2367,7 +2397,47 @@ class SamplerBuffers:
             return
         self._cached_config.pop(rid, None)
         self._pending_init.discard(slot)
-        self._free_slots.append(slot)
+        with self._slot_lock:
+            if slot in self._row_held:
+                self._orphaned.add(slot)
+            else:
+                heapq.heappush(self._free_slots, slot)
+
+    def check_out_slots(self, request_ids: Sequence[str]) -> np.ndarray:
+        """The master slots of registered ``request_ids``, each initialized,
+        for persistent rows to check out of."""
+        get = self._rid_to_slot.get
+        pending = self._pending_init
+        slots = np.empty(len(request_ids), dtype=np.int64)
+        for i, rid in enumerate(request_ids):
+            slot = get(rid)
+            if slot is None or slot == self._trash_slot:
+                raise RuntimeError(f"request {rid!r} has no sampler slot to check out")
+            if slot in pending:
+                self._init_slot(slot, rid)
+            slots[i] = slot
+        return slots
+
+    def hold_slots(self, slots: np.ndarray) -> None:
+        """Rows now hold ``slots``: they stay reserved until ``drop_slots``."""
+        with self._slot_lock:
+            self._row_held.update(slots.tolist())
+
+    def drop_slots(self, slots: np.ndarray) -> None:
+        """The rows holding ``slots`` left; free those whose request is gone."""
+        with self._slot_lock:
+            for slot in slots.tolist():
+                self._row_held.discard(slot)
+                if slot in self._orphaned:
+                    self._orphaned.discard(slot)
+                    heapq.heappush(self._free_slots, slot)
+
+    def sync_slots(self) -> None:
+        """Grow the device masters and reset newly registered slots' offsets
+        and loop-back rows, on the gpu thread, before anything reads them."""
+        self._sync_device_capacity()
+        self._drain_offset_resets()
+        self._sync_loopback()
 
     def update_request_config(
         self, rid: str, sampling_config: SamplingConfig,
@@ -2526,16 +2596,19 @@ class SamplerBuffers:
         self._sync_device_capacity()
         if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        with self._offset_reset_lock:
-            resets, self._pending_offset_reset = self._pending_offset_reset, set()
-        for slot in resets:
-            self.offset.master[slot:slot + 1].zero_()
+        self._drain_offset_resets()
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         if not self.ingraph_scatter:
             # with it on, the captured sample gathers off the master itself
             self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
+
+    def _drain_offset_resets(self) -> None:
+        with self._offset_reset_lock:
+            resets, self._pending_offset_reset = self._pending_offset_reset, set()
+        for slot in resets:
+            self.offset.master[slot:slot + 1].zero_()
 
     def sampler_for(self, padded_bs: int, cg_slot: int) -> "AcceleratorGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).

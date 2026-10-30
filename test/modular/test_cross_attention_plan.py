@@ -31,6 +31,7 @@ from mstar.engine.resources.kv.plan import (
     SequenceView,
 )
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.engine.rows import RowSpace
 
 CTX_KV = "ctx_kv"
 Q_KV = "q_kv"
@@ -376,3 +377,42 @@ def test_query_rows_in_another_order_plan_off_the_views(plan_columns_backend):
     assert built
     assert planned["paged_kv_indices"] == [4, 5, 1, 2, SINK_PAGE, 3, SINK_PAGE]
     assert planned["kv_lens"] == [17, 20, 1, 16, 1]
+
+
+def _rows_step(manager, space, rids, *, read=True):
+    """A decode step of the persistent walk over ``rids``. Unless ``read``,
+    the step has no plan results, so reading them fails."""
+    ctx = _ctx(tuple(rids), _rows_query(rids, [1] * len(rids)))
+    if not read:
+        ctx.plan_results = {}
+    ctx.rows = space.propose(list(rids))
+    manager.plan(AttentionStep(causal=False), ctx)
+    return ctx.rows
+
+
+@pytest.fixture
+def rows_manager():
+    manager = _manager()
+    space = RowSpace(4, torch.device("cpu"))
+    manager.row_state(space, "decoder", "decode")
+    return manager, space
+
+
+def test_unchanged_rows_reuse_the_plan_without_reading_the_step(rows_manager):
+    manager, space = rows_manager
+    _rows_step(manager, space, (0, 1)).commit()
+    wrapper = manager._current_plan_states["main"]
+    _rows_step(manager, space, (0, 1), read=False).commit()
+    assert manager._current_plan_states["main"] is wrapper and wrapper.plans == 1
+
+
+def test_rows_that_changed_or_never_committed_plan_again(rows_manager):
+    manager, space = rows_manager
+    _rows_step(manager, space, (0, 1))  # never commits
+    with pytest.raises(AssertionError, match="expected plan result"):
+        _rows_step(manager, space, (0, 1), read=False)
+    _rows_step(manager, space, (0, 1)).commit()
+    _rows_step(manager, space, (0, 2)).commit()
+    _rows_step(manager, space, (0, 2), read=False).commit()
+    with pytest.raises(AssertionError, match="expected plan result"):
+        _rows_step(manager, space, (0, 1), read=False)

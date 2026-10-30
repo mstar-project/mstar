@@ -637,11 +637,23 @@ class FlashInferDecodeWrapper:
         dst = w._paged_kv_indices_buf[:n]
         if indices.data_ptr() != dst.data_ptr():
             dst.copy_(indices, non_blocking=indices.device == dst.device)
+        self.plan_schedule(indptr, kv_lens)
+
+    def plan_schedule(self, indptr: torch.Tensor, kv_lens: torch.Tensor) -> None:
+        """FlashInfer's planner alone, from the host indptr and lengths, for a
+        captured wrapper whose paged arrays the graph writes itself. Its other
+        arguments are the ones the first full ``plan`` settled."""
         args = self._planner_args
+        if args is None:
+            raise RuntimeError(
+                "this decode wrapper's plan resolved to a path the direct planner "
+                "does not reproduce, so it can't plan the schedule alone"
+            )
         at_indptr, at_lens = self._planner_slots
         args[at_indptr] = indptr
         if at_lens is not None:
             args[at_lens] = kv_lens
+        w = self.attn_wrapper
         w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable

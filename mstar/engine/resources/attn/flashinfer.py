@@ -1,5 +1,6 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
+import functools
 from collections.abc import Mapping
 
 import torch
@@ -21,8 +22,10 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.kv.rows import decode_indptrs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.rows import RowFills
 from mstar.utils.profiler import PhaseLaps
 
 
@@ -57,6 +60,8 @@ class FlashInferManager(AttentionManager):
 
         self._preplan_states: dict[str, AttentionWrapper] = {}
         self._preplanned = False
+        # persistent walk -> its graph's fills of the wrappers' arrays
+        self._row_fills: dict[str, RowFills] = {}
 
         self._kv_config = kv_config
         check_flashinfer_head_dim(kv_config.head_dim, device)     # at load, not at the first plan
@@ -208,6 +213,10 @@ class FlashInferManager(AttentionManager):
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
+            if kv_out.device_rows is not None and lease is not None:
+                plan_states[label] = self._plan_rows(label, kv_out, lease, ctx, step.causal)
+                laps.lap("rows")
+                continue
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
                 wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
@@ -228,6 +237,37 @@ class FlashInferManager(AttentionManager):
             plan_states[label] = wrapper
 
         self._preplanned = ctx.is_preplan
+
+    def row_state(self, space, node_name: str, graph_walk: str) -> RowFills:
+        # a step of the walk reads its arrays off the KV rows (`_plan_rows`)
+        fills = self._row_fills[graph_walk] = RowFills()
+        return fills
+
+    def _plan_rows(
+        self, label: str, kv_out, lease: SlotLease, ctx: StepContext, causal: bool,
+    ) -> FlashInferDecodeWrapper:
+        """A step of a persistent walk: its graph builds the wrapper's paged
+        arrays from the KV rows before the forward, so the host runs only
+        FlashInfer's planner, on the host indptr and lengths the KV plan made
+        off the rows' mirror. The capture plans the wrapper in full first,
+        which settles the planner's other arguments."""
+        indptrs = kv_out.cpu_indptrs
+        num_rows = indptrs.qo_indptr.shape[0] - 1
+        wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
+        if not isinstance(wrapper, FlashInferDecodeWrapper) or self._window_left >= 0:
+            raise ValueError(
+                f"attention {label!r} on persistent walk {ctx.graph_walk!r} needs a "
+                "plain decode wrapper (one token a row, no sliding window)"
+            )
+        if ctx.capture:
+            wrapper.plan(causal=causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
+            self._row_fills[ctx.graph_walk].arm(lease, label, functools.partial(
+                decode_indptrs, kv_out.device_rows, num_rows, wrapper._paged_kv_indptr_buf,
+                wrapper._paged_kv_indices_buf, wrapper._paged_kv_last_page_len_buf,
+            ))
+        else:
+            wrapper.plan_schedule(indptrs.paged_kv_indptr, indptrs.kv_lens)
+        return wrapper
 
     def clear_preplan(self):
         # rebind rather than clear: a consumed preplan dict is the live one
