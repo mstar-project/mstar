@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -105,10 +106,10 @@ TILED_DECODE_MEAN_ABS = 3.0e-3
 # 3.675 (H200). Bound = worst observed x ~1.3 headroom. The eager path stays the
 # reference (SEQ/UNIPC gates); this only prices compile.
 COMPILED_VS_EAGER_MAX_ABS = 4.8
-# No-CFG (guidance_scale <= 1.0) batch-1 path vs a no-CFG oracle: one batch-1 forward
-# per step, so the same departure as the sequential-CFG trajectory, over the oracle's
-# 8 small-grid steps. 0.48 on B300 and 0.76 with the perturbation above; ~1.3x that.
-NO_CFG_TRAJECTORY_MAX_ABS = 1.0
+# No-CFG (guidance_scale <= 1.0) batch-1 path vs a no-CFG oracle, with the time
+# embedding at the reference's row count as for SEQ_PER_TOKEN_ROWS_MAX_ABS: one batch-1
+# forward per step like the reference's, so every step must match exactly.
+NO_CFG_TRAJECTORY_MAX_ABS = 0.0
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 
@@ -482,6 +483,25 @@ def _sequential_trajectory_diffs(oracle_meta, text_embeds, dit_submodule) -> lis
     return diffs
 
 
+@contextmanager
+def _per_token_rows(transformer: torch.nn.Module, meta: dict):
+    """Run ``transformer``'s time embedding at the reference's row count, one row per
+    token, and hand the blocks one row per frame as usual."""
+    embedder = transformer.condition_embedder
+    per_frame_rows = embedder.forward
+    tokens_per_frame = (meta["height"] // 32) * (meta["width"] // 32)
+
+    def per_token_rows(timestep, encoder_hidden_states):
+        temb, proj, text = per_frame_rows(timestep.repeat_interleave(tokens_per_frame, dim=1), encoder_hidden_states)
+        return temb[:, ::tokens_per_frame], proj[:, ::tokens_per_frame], text
+
+    embedder.forward = per_token_rows
+    try:
+        yield
+    finally:
+        del embedder.forward  # restore class-method lookup
+
+
 def _report_trajectory(label: str, diffs: list[float]) -> str:
     nonzero = [(i, d) for i, d in enumerate(diffs) if d > 0]
     line = f"{label} vs oracle: max_abs={max(diffs):.3e}, first nonzero step={nonzero[0] if nonzero else None}"
@@ -492,8 +512,8 @@ def _report_trajectory(label: str, diffs: list[float]) -> str:
 def test_sequential_cfg_trajectory_matches_oracle(oracle_meta, text_embeds, dit_submodule):
     """Each of the 50 per-step latents must stay within ``SEQ_TRAJECTORY_MAX_ABS`` of
     the oracle, over the whole mstar path (tokenize -> encode -> per-frame timesteps
-    -> transformer -> inline UniPC). The per-frame time embedding's rows are held to
-    the reference's in test_wan22_native_dit_equivalence.py."""
+    -> transformer -> inline UniPC). The time embedder itself is held bitwise to the
+    reference's on per-token rows in test_wan22_native_dit_equivalence.py."""
     diffs = _sequential_trajectory_diffs(oracle_meta, text_embeds, dit_submodule)
     line = _report_trajectory("sequential-CFG trajectory", diffs)
     assert max(diffs) <= SEQ_TRAJECTORY_MAX_ABS, line
@@ -504,19 +524,8 @@ def test_sequential_cfg_trajectory_is_bitexact_on_per_token_rows(oracle_meta, te
     per-step latents must be BIT-EXACT vs the oracle. This holds everything but the
     embedder's row count identical to the stock pipeline, leaving that and the
     batch-2 CFG kernel shape as the suite's ONLY priced deviations."""
-    embedder = dit_submodule.transformer.condition_embedder
-    per_frame_rows = embedder.forward
-    tokens_per_frame = (oracle_meta["height"] // 32) * (oracle_meta["width"] // 32)
-
-    def per_token_rows(timestep, encoder_hidden_states):
-        temb, proj, text = per_frame_rows(timestep.repeat_interleave(tokens_per_frame, dim=1), encoder_hidden_states)
-        return temb[:, ::tokens_per_frame], proj[:, ::tokens_per_frame], text
-
-    embedder.forward = per_token_rows
-    try:
+    with _per_token_rows(dit_submodule.transformer, oracle_meta):
         diffs = _sequential_trajectory_diffs(oracle_meta, text_embeds, dit_submodule)
-    finally:
-        del embedder.forward  # restore class-method lookup
     line = _report_trajectory("sequential-CFG trajectory, per-token rows", diffs)
     assert max(diffs) <= SEQ_PER_TOKEN_ROWS_MAX_ABS, line
 
@@ -853,10 +862,11 @@ def test_compiled_dit_matches_eager_per_step(oracle_meta, text_embeds, dit_submo
         "--height 224 --width 384 --num-frames 9 --out-dir <dir>` (oracle venv, same torch)"
     ),
 )
-def test_no_cfg_batch1_trajectory_matches_oracle(oracle_meta, text_embeds, dit_submodule):
+def test_no_cfg_batch1_trajectory_is_bitexact_on_per_token_rows(oracle_meta, text_embeds, dit_submodule):
     """guidance_scale <= 1.0 runs one batch-1 forward per step (no CFG), the branch
     no other test covered. Drive the full no-CFG oracle trajectory at guidance 1.0
-    and hold every step to the same bound as the sequential-CFG gate, since a no-CFG
+    with the time embedding at the reference's row count and hold every step
+    BIT-EXACT, like the sequential-CFG gate on per-token rows, since a no-CFG
     step is one batch-1 forward like the reference at guidance 1.0. A recorder PROVES the batch-1 branch is taken (the
     transformer sees batch 1, not the CFG batch-2), so the test cannot pass while
     silently exercising the wrong path.
@@ -888,7 +898,7 @@ def test_no_cfg_batch1_trajectory_matches_oracle(oracle_meta, text_embeds, dit_s
     diffs: list[float] = []
     try:
         carried: dict[str, list[torch.Tensor]] = {}
-        with torch.no_grad():
+        with torch.no_grad(), _per_token_rows(original, nocfg_meta):
             for step in range(num_steps):
                 fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME] = step
                 outputs = _drive(dit_submodule, "video_gen", fwd_info, {**persisted, **carried})
