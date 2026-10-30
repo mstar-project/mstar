@@ -55,6 +55,7 @@ from mstar.engine.resources.step import (
     AllocationFailed,
     RequestOffloading,
     Segment,
+    SettingValue,
     StepContext,
 )
 from mstar.utils.client_errors import client_error_text
@@ -1908,6 +1909,11 @@ class KVManager(AttentionResource):
 
             page_size = self.config.page_size
             sink = step.sink
+            # the counts are in tokens; the setting names the rows whose KV
+            # grows by them, so they are a span this label can reserve
+            reserve_ahead = ctx.reserve_whole_prefill
+            ahead = ctx.chunk_tokens_after \
+                if reserve_ahead.value is not SettingValue.UNSET else None
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
@@ -1916,6 +1922,9 @@ class KVManager(AttentionResource):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
+                if ahead and reserve_ahead.holds_for(segment.request_id):
+                    # a chunked row reserves the rest of its walk up front
+                    seq_len += ahead.get(segment.request_id, 0)
                 # the common decode row: its pages already cover the token it
                 # appends, so there is nothing to acquire and nothing to record
                 if (
@@ -2565,7 +2574,9 @@ class KVManager(AttentionResource):
         cache.step_segments = step.segments
         cache.pending = 0
         stats["hit"] += 1
-        return KVPlanOutputs(out, pre_forks=step.pre_forks, post_forks=step.post_forks)
+        return KVPlanOutputs(
+            out, pre_forks=step.pre_forks, post_forks=step.post_forks, fork_rids=step.fork_rids,
+        )
 
     @staticmethod
     def _same_plan(a: "KVPlanOutputs", b: "KVPlanOutputs") -> bool:
@@ -2701,6 +2712,7 @@ class KVManager(AttentionResource):
                 },
                 pre_forks=step.pre_forks,
                 post_forks=step.post_forks,
+                fork_rids=step.fork_rids,
             )
             if res is not None and not self._same_plan(res, full):
                 self.plan_cache_stats["mismatch"] += 1

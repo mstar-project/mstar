@@ -119,7 +119,7 @@ class _FakeWorker:
     def __init__(self):
         self._graph_runtime = _Runtime()
         self.held: list[str] = []
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
+        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, drop_chunk_lookahead=lambda *a: None)
         self.offload_calls: list[str] = []
 
     @property
@@ -211,7 +211,8 @@ class _HoldingWorker:
     def __init__(self):
         self._graph_runtime = _Runtime()
         self.scheduler = SimpleNamespace(
-            hold_requests=lambda rids: None, **_NO_LIMITS,
+            hold_requests=lambda rids: None,
+            drop_chunk_lookahead=lambda *a: None, **_NO_LIMITS,
         )
         self._hold_logged = {}
         # not a sharded node, so this rank runs its own OOM recovery
@@ -270,7 +271,10 @@ class _RefusedWorker(_HoldingWorker):
     def __init__(self):
         super().__init__()
         self.held: list[str] = []
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, **_NO_LIMITS)
+        self.scheduler = SimpleNamespace(
+            hold_requests=self.held.extend,
+            drop_chunk_lookahead=lambda *a: None, **_NO_LIMITS,
+        )
 
 
 @pytest.mark.parametrize(
@@ -532,7 +536,10 @@ def test_a_batch_too_big_alone_still_evicts_its_own_rows():
     them is what lets the rest step, as before."""
     # the request outside the batch is the least recently run
     worker = _EvictingWorker(holders=["outside", "r0", "r1"])
-    worker.scheduler = SimpleNamespace(hold_requests=lambda rids: None, **_NO_LIMITS)
+    worker.scheduler = SimpleNamespace(
+        hold_requests=lambda rids: None,
+        drop_chunk_lookahead=lambda *a: None, **_NO_LIMITS,
+    )
     batch, node_batch = _batches(_sized_refusal("r1", rows_fit=1, rows_fit_alone=1))
     node_batch.failed_resource = "kv"
     batch.node_name = node_batch.node_name = SCHED_NODE

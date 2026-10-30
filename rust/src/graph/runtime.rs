@@ -163,6 +163,9 @@ pub struct GraphRuntime {
     node_owner: FxHashMap<(Sym, Sym), WgIndex>,
     /// Loop stops from this iteration's check_stop; cleared every iteration.
     pending_loop_stops: FxHashSet<(u32, Sym, Sym)>,
+    /// (rid, walk, loop) speculation does not continue; see
+    /// `mark_do_not_speculate_loops`.
+    do_not_speculate_loops: FxHashSet<(u32, Sym, Sym)>,
     /// Routing parked between complete_and_route_batch and send_outputs.
     completions: FxHashMap<u64, Completion>,
     completion_counter: u64,
@@ -566,10 +569,12 @@ pub struct GraphRuntime {
         Some(out)
     }
 
-    /// ``speculate_node`` for one walk and its sample rid.
+    /// ``speculate_node`` for one walk's rows. The first sets the targets; a
+    /// loop-back target stays only if some row can run another iteration.
     fn speculate_walk(
-        &mut self, node_name: &str, graph_walk: &str, sample_rid: u32,
+        &mut self, node_name: &str, graph_walk: &str, rids: &[u32],
     ) -> Vec<(String, String, bool, Option<String>, Vec<String>)> {
+        let Some(&sample_rid) = rids.first() else { return vec![] };
         let Some(wg) = self.owner_of(node_name, graph_walk) else {
             return vec![];
         };
@@ -589,6 +594,9 @@ pub struct GraphRuntime {
                     && self.async_checker.can_speculate(
                         g.node(source).name, g.node(sn.node).name,
                     )
+                    // unless every row's loop ends with this iteration
+                    && (!sn.is_new_loop_iter
+                        || rids.iter().any(|&r| self.can_continue_loop(wg, r, sn, graph_walk)))
             })
             .map(|sn| self.spec_output(&g, graph_walk, &sn))
             .collect()
@@ -755,7 +763,9 @@ pub struct GraphRuntime {
         let g = &self.graphs[wg as usize];
         let loop_name = g.lp(lid).name;
         if let Some(w) = self.interner.get(graph_walk) {
-            if self.pending_loop_stops.contains(&(rid, w, loop_name)) {
+            if self.pending_loop_stops.contains(&(rid, w, loop_name))
+                || self.do_not_speculate_loops.contains(&(rid, w, loop_name))
+            {
                 return false;
             }
         }
@@ -1575,6 +1585,7 @@ impl GraphRuntime {
             walk_to_local_wgs,
             node_owner,
             pending_loop_stops: FxHashSet::default(),
+            do_not_speculate_loops: FxHashSet::default(),
             completions: FxHashMap::default(),
             completion_counter: 0,
             staged_specs: FxHashMap::default(),
@@ -1772,6 +1783,9 @@ impl GraphRuntime {
         // worker drops its outputs on a speculative new iteration and prep
         // excludes it from speculation.
         self.pending_loop_stops.retain(|&(r, _, _)| r != rid);
+        if !self.do_not_speculate_loops.is_empty() {
+            self.do_not_speculate_loops.retain(|&(r, _, _)| r != rid);
+        }
     }
 
     fn get_rid_handle(&self, rid: &str) -> Option<u32> {
@@ -1920,6 +1934,30 @@ impl GraphRuntime {
 
     fn clear_pending_loop_stops(&mut self) {
         self.pending_loop_stops.clear();
+    }
+
+    fn mark_do_not_speculate_loops(
+        &mut self, rids: Vec<u32>, graph_walks: Vec<String>, loop_names: Vec<String>,
+    ) -> PyResult<()> {
+        if rids.len() != graph_walks.len() || rids.len() != loop_names.len() {
+            return Err(PyValueError::new_err(
+                "mark_do_not_speculate_loops: rids, graph_walks and loop_names differ in length",
+            ));
+        }
+        for ((rid, walk), name) in rids.into_iter().zip(graph_walks).zip(loop_names) {
+            // A walk or loop never interned names nothing in these graphs.
+            if let (Some(w), Some(l)) = (self.interner.get(&walk), self.interner.get(&name)) {
+                self.do_not_speculate_loops.insert((rid, w, l));
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_do_not_speculate_loops(&mut self, rids: Vec<u32>) {
+        if !self.do_not_speculate_loops.is_empty() {
+            let drop: FxHashSet<u32> = rids.into_iter().collect();
+            self.do_not_speculate_loops.retain(|(r, _, _)| !drop.contains(r));
+        }
     }
 
     fn push_back_node(
@@ -2313,21 +2351,27 @@ impl GraphRuntime {
 
     /// Which nodes could run next, after the current node's outputs land.
     ///
-    /// One sample rid per walk; returns every walk's targets for the caller to
-    /// pick, filtered for async eligibility per walk.
+    /// The step's rows grouped by walk, `walk_counts[i]` for walk `i` (None:
+    /// one per walk); returns every walk's targets for the caller to pick,
+    /// filtered for async eligibility per walk.
+    #[pyo3(signature = (node_name, graph_walks, rids, walk_counts = None))]
     fn speculate_node(
-        &mut self, node_name: &str, graph_walks: Vec<String>, sample_rids: Vec<u32>,
+        &mut self, node_name: &str, graph_walks: Vec<String>, rids: Vec<u32>,
+        walk_counts: Option<Vec<usize>>,
     ) -> PyResult<Vec<(String, String, bool, Option<String>, Vec<String>)>> {
-        if graph_walks.len() != sample_rids.len() {
+        let counts = walk_counts.unwrap_or_else(|| vec![1; graph_walks.len()]);
+        if counts.len() != graph_walks.len() || counts.iter().sum::<usize>() != rids.len() {
             return Err(PyValueError::new_err(
-                "speculate_node: graph_walks and sample_rids differ in length",
+                "speculate_node: walk_counts must give each walk's share of rids",
             ));
         }
-        Ok(graph_walks
-            .into_iter()
-            .zip(sample_rids)
-            .flat_map(|(walk, rid)| self.speculate_walk(node_name, &walk, rid))
-            .collect())
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (walk, count) in graph_walks.into_iter().zip(counts) {
+            out.extend(self.speculate_walk(node_name, &walk, &rids[start..start + count]));
+            start += count;
+        }
+        Ok(out)
     }
 
     /// The loop context of a target chosen elsewhere.
@@ -3108,6 +3152,7 @@ impl GraphRuntime {
                 for name in &wanted {
                     if let Some(l) = self.interner.get(name) {
                         self.pending_loop_stops.insert((rid, walk, l));
+                        self.do_not_speculate_loops.remove(&(rid, walk, l));
                     }
                 }
                 let mut per_worker: FxHashMap<Sym, Vec<String>> = FxHashMap::default();

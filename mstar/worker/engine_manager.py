@@ -6,16 +6,48 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs
+from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
 
+
+def _unchunkable_nodes(
+    submodules: dict, model: Model, parallel_groups: WorkerParallelGroups,
+) -> frozenset[str]:
+    """Check what a chunked walk must declare, and name the nodes this worker
+    turns chunking off for.
+
+    Reporting row lengths is the model's own declaration, so a walk that
+    chunks without ``get_input_sequence_len`` is refused anywhere. Chunking
+    under TP/SP is not supported yet; refusing there would take TP away from
+    every model that chunks, so those nodes run their prefills whole instead.
+    """
+    off = set()
+    for (node, walk), policy in model.chunking_policy_of().items():
+        submodule = submodules.get(node)
+        if submodule is None or not policy.chunkable:
+            continue
+        if type(submodule).get_input_sequence_len is NodeSubmodule.get_input_sequence_len:
+            raise ValueError(
+                f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
+                "report get_input_sequence_len"
+            )
+        if parallel_groups.get_instance_world_size_for_node(node) > 1:
+            off.add(node)
+    if off:
+        logger.warning(
+            "chunked prefill is off for %s: not supported under TP/SP yet, so "
+            "their prefills run whole", sorted(off),
+        )
+    return frozenset(off)
 
 def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
     """A combined walk batches its walks together, so it must not split them by capture key."""
@@ -163,6 +195,7 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
+        no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
 
         engine = Engine(
             graph_runtime=graph_runtime,
@@ -180,6 +213,23 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+        )
+        budgets = model_config.get("max_batch_tokens") or {}
+        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        for key, setting in (("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed)):
+            unknown = sorted(set(setting) - known)
+            if unknown:
+                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
+        if not all(isinstance(flag, bool) for flag in override_mixed.values()):
+            raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")
+        engine.set_chunking_policies(model.chunking_policy_of())
+        engine.set_token_budgets(
+            budgets, set(model.get_graph_walk_graphs()),
+            combined_walk_of=model.combined_walk_of(),
+            override_mixed={node for node, flag in override_mixed.items() if flag},
+            no_chunking=no_chunking,
+            min_chunk_tokens=model_config.get("min_chunk_tokens", DEFAULT_MIN_CHUNK_TOKENS),
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 

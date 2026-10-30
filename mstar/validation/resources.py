@@ -223,8 +223,14 @@ def _unservable_walks(specs: Sequence[NodeResourceSpec], model: Model) -> Iterat
                     fed = sorted(
                         {
                             edge.next_node for edge in nodes[name].outputs
-                            if not isinstance(edge, StreamingGraphEdge)
-                            or edge.target_partition == partition_of[walk]
+                            # a loop-back is not a downstream reader: it feeds
+                            # the next iteration of the node that produced it,
+                            # and a walk served whole runs no iteration at all
+                            if edge.next_node != name
+                            and (
+                                not isinstance(edge, StreamingGraphEdge)
+                                or edge.target_partition == partition_of[walk]
+                            )
                         }
                         - SPECIAL_DESTINATIONS
                     )

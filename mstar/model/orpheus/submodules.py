@@ -13,7 +13,16 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    keep_final_chunk_samples,
+)
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
@@ -23,6 +32,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     InputMetadata,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -54,6 +64,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
+    MAX_BATCH_TOKENS = 512
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -96,6 +107,19 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             input_seq_len=inputs["text_inputs"][0].shape[0]
         )
 
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if "text_inputs" not in inputs:
+            return None
+        return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
+
     def declare_step(
         self, graph_walk: str,
         request_ids: list[str],
@@ -119,10 +143,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             steps={
                 KV_CACHE: KVStep(),
                 ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(
+                SAMPLER: keep_final_chunk_samples(SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens
-                ),
+                ), request_ids, inputs),
                 ROPE: PositionStep()
             }
         )
@@ -202,6 +226,9 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     ):
         # Metadata-only: rebind output name for graph routing. EOS check
         # moved to check_stop so the GPU thread doesn't sync on .item() here.
+        inputs = kwargs.get("inputs")
+        if inputs is not None and not inputs.is_final_chunk:
+            outputs.pop("new_token", None)  # only the last chunk's token is real
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]

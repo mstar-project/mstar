@@ -291,19 +291,22 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
     nowhere else to ride.
     """
 
-    __slots__ = ("pre_forks", "post_forks")
+    __slots__ = ("pre_forks", "post_forks", "fork_rids")
 
     def __init__(
         self,
         mapping: dict[str, KVPlanOutput] | None = None,
         pre_forks: tuple[tuple[str, str], ...] = (),
         post_forks: tuple[tuple[str, str], ...] = (),
+        fork_rids: frozenset | None = None,
     ):
         super().__init__(mapping or {})
         # applied by `plan`; the consumer mirrors them at plan time
         self.pre_forks = pre_forks
         # applied by `commit`, after this step's spans land
         self.post_forks = post_forks
+        # the rows both apply to, as `KVStep.fork_rids`; None is every row
+        self.fork_rids = fork_rids
 
 
 # Page the padding tail of a captured step scatters into. Reserved at

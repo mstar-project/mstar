@@ -58,6 +58,8 @@ class StreamBuffer:
     edge_name: str
     from_partition: str
     policy: ChunkPolicy
+    # dim to join a chunked producer's pieces on; None keeps them separate
+    join_dim: int | None = None
     # Items carry the consumer walk the producer assigned them, and a chunk
     # never spans two walks (set for connections that drive their consumer's
     # walk)
@@ -101,24 +103,79 @@ class StreamBuffer:
         self._num_tensors_registered += 1
         self._tensor_ids_in_order.append((tensor_id, walk))
 
+    def pre_read_register_joined(
+        self, tensor_ids: list[str], walk: str | None = None,
+    ) -> None:
+        """Register ``tensor_ids`` as the pieces of ONE item.
+
+        A chunked producer emits a piece per chunk; without this each would be
+        an item of its own and a policy counting items would hand the consumer
+        only the first. Counted as one registration, so the producer's item
+        total still matches.
+        """
+        if len(tensor_ids) == 1 or self.join_dim is None:
+            for tensor_id in tensor_ids:
+                self.pre_read_register(tensor_id, walk)
+            return
+        if not tensor_ids:
+            return
+        # Counted in the producer's units, one per piece, because that is what
+        # it reports in ``signal_done`` -- the buffer holding them as one item
+        # is its own business. Counting the group as one leaves the buffer
+        # permanently short of the producer's total, so it never agrees the
+        # producer is finished.
+        self._num_tensors_registered += len(tensor_ids)
+        self._tensor_ids_in_order.append((tuple(tensor_ids), walk))
+
     def put(self, tensor_id: str, item: torch.Tensor) -> None:
         """Called when a tensor arrives via normal RDMA routing."""
         self._id_to_tensor[tensor_id] = item
 
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
-            tensor_id, walk = self._tensor_ids_in_order[0]
-            if tensor_id not in self._id_to_tensor:
-                return
-            self._tensor_ids_in_order.popleft()
-            self._buffer.append(self._id_to_tensor[tensor_id])
+            entry, walk = self._tensor_ids_in_order[0]
+            # a lone tensor is every item of an unjoined stream: keep it cheap
+            if not isinstance(entry, tuple):
+                if entry not in self._id_to_tensor:
+                    return
+                self._tensor_ids_in_order.popleft()
+                self._buffer.append(self._id_to_tensor.pop(entry))
+                # producer's units: see pre_read_register_joined
+                self._num_buffer_writes += 1
+            else:
+                if any(tensor_id not in self._id_to_tensor for tensor_id in entry):
+                    return
+                self._tensor_ids_in_order.popleft()
+                self._buffer.append(self._join(
+                    [self._id_to_tensor.pop(tensor_id) for tensor_id in entry]
+                ))
+                self._num_buffer_writes += len(entry)
             if self.walk_tagged:
                 if self._walk_runs and self._walk_runs[-1][0] == walk:
                     self._walk_runs[-1][1] += 1
                 else:
                     self._walk_runs.append([walk, 1])
-            self._num_buffer_writes += 1
-            del self._id_to_tensor[tensor_id]
+
+    def _join(self, pieces: list) -> torch.Tensor:
+        """One item from a chunked producer's pieces, in chunk order.
+
+        An empty piece is real -- a prompt chunk can be all system prompt,
+        which the producer drops every position of -- so it is joined, not
+        skipped.
+
+        The one place that assumes the buffer holds tensors rather than uuids.
+        A buffer that stores uuids instead joins here too, by reading the
+        pieces, concatenating and storing the result under a fresh uuid.
+
+        A consumer that can take the pieces as they come should do that
+        instead, and set no ``join_dim`` -- which is where Qwen3-Omni's Talker
+        is headed. This is for a consumer that genuinely wants the whole
+        thing: it conditions on the complete prompt, or its shapes are
+        captured, and it has no use for a prefix.
+        """
+        if len(pieces) == 1:
+            return pieces[0]
+        return torch.cat(pieces, dim=self.join_dim)
 
     def signal_done(self, num_items: int = 0) -> None:
         """Producer signals no more items will arrive after the ``num_items``

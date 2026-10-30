@@ -95,7 +95,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_SAMPLER,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import Operation, TextChunkDetokenizer, WeightConverter, drop_stop_tokens
 from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import (
@@ -370,6 +370,22 @@ class Qwen3OmniModel(Model):
             "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode",
         }}}
 
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+
+        budget = ThinkerSubmodule.MAX_BATCH_TOKENS
+        return {"Thinker": (
+            ChunkingPolicy(
+                walks=("prefill_text", "prefill_audio", "prefill_vision"),
+                chunkable=True, max_batch_tokens=budget,
+                # the Talker conditions on the whole prompt, so it needs every
+                # chunk's states, not just the last one's
+                accumulated_outputs=frozenset({"thinker_states", "thinker_mask"}),
+            ),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(THINKER_MIXED,), max_batch_tokens=budget),
+        )}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.
 
@@ -584,7 +600,7 @@ class Qwen3OmniModel(Model):
             ],
         )
 
-        return {
+        return self.apply_chunking({
             "prefill_text": prefill_text,
             "prefill_audio": prefill_audio,
             "prefill_vision": prefill_vision,
@@ -593,7 +609,7 @@ class Qwen3OmniModel(Model):
             "talker_last_prefill": talker_last_prefill,
             "talker_decode": talker_decode,
             "code2wav_chunk": code2wav_chunk,
-        }
+        })
 
     # -----------------------------------------------------------------------
     # Partition API: 3-partition streaming topology
@@ -634,6 +650,8 @@ class Qwen3OmniModel(Model):
                     edge_name="thinker_states",
                     chunk_policy_factory=_thinker_to_talker_policy,
                     consumer_walk=_talker_walk,
+                    # the Thinker's prefill chunks are pieces of one prompt
+                    join_dim=0,
                 ),
                 Connection(
                     from_partition="Thinker",
@@ -641,6 +659,7 @@ class Qwen3OmniModel(Model):
                     edge_name="thinker_mask",
                     chunk_policy_factory=_thinker_to_talker_policy,
                     consumer_walk=_talker_walk,
+                    join_dim=0,
                 ),
                 Connection(
                     from_partition="Talker",

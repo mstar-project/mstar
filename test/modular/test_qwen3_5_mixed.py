@@ -60,3 +60,47 @@ def test_the_kernel_follows_a_packed_capture_not_the_spans(force_prefill, spans,
     gdn._build_plan("main", segments, addressing, ctx)
 
     assert gdn.kinds == [kind]
+
+
+@pytest.mark.parametrize("walk,inputs,length", [
+    ("decode", {}, 1),
+    ("prefill_text", {"text_inputs": [torch.zeros(7, dtype=torch.long)]}, 7),
+    ("prefill_vision", {"text_inputs": [torch.zeros(7, dtype=torch.long)]}, None),
+])
+def test_text_and_decode_rows_report_their_length(walk, inputs, length):
+    info = LLMSubmodule.get_input_sequence_len(None, walk, None, inputs)
+
+    assert (info.seq_len if info is not None else None) == length
+
+
+def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    model.config = SimpleNamespace(max_position_embeddings=4096)
+    model.vision_config = None
+    policies = model.chunking_policy_of()
+
+    assert policies[("LLM", "prefill_text")].chunkable
+    assert ("LLM", "prefill_vision") not in policies
+    mixed = policies[("LLM", LLM_MIXED)]
+    assert not mixed.chunkable and mixed.max_batch_tokens == LLMSubmodule.MAX_BATCH_TOKENS
+    largest = max(LLMSubmodule.PREFILL_TOKEN_BUCKETS)
+    assert LLMSubmodule.MAX_BATCH_TOKENS + max(LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES) <= largest
+
+
+def test_a_chunked_prompt_keeps_only_its_final_chunks_token():
+    from mstar.model.submodule_base import ARNodeSubmodule
+
+    llm = object.__new__(LLMSubmodule)
+    full = ARNodeInputs(input_seq_len=10, input_ids=torch.arange(10))
+    info = SimpleNamespace(graph_walk="prefill_text", step_metadata={"last_prefill": True})
+    kept = []
+    for start, end in ((0, 4), (4, 10)):
+        chunk = ARNodeSubmodule.split_inputs(llm, "prefill_text", info, full, start, end)
+        chunk.chunk_start, chunk.chunk_total = start, full.input_seq_len  # as the engine stamps them
+        outputs = {"new_token": [torch.tensor([1])]}
+        llm.postprocess(0, info, outputs, inputs=chunk)
+        kept.append("text_inputs" in outputs)
+
+    assert kept == [False, True]

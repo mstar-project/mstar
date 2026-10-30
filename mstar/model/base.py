@@ -1,7 +1,7 @@
 import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, NamedTuple, Type
 
@@ -28,8 +28,78 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
+from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.submodule_base import (
+    ChunkingPolicy,
+    chunk_loop_name,
+    chunk_tick_name,
+)
+
+
+def _wrap_node_in_loop(
+    section: GraphSection, node_name: str, graph_walk: str,
+    policy: "ChunkingPolicy",
+) -> GraphSection:
+    """``section`` with ``node_name`` wrapped in the Loop its chunks run as.
+
+    The node's real edges move onto the Loop, which is what makes a chunk's
+    output the loop's business rather than the worker's: an edge the policy
+    gathers gets every chunk's tensors at the end, and any other gets the
+    final chunk's alone, earlier ones dropped as the loop advances.
+
+    The body keeps a bare same-named edge to ``EMPTY_DESTINATION``. The Loop
+    caches by edge NAME, so the body has to emit the name for the Loop to have
+    anything to carry; the copy routes nowhere and drops every flag, since
+    persisting or counting a per-chunk tick would stage it and bill the
+    conductor for a token per chunk.
+
+    The body also routes ``chunk_tick_name`` back to itself, which is what
+    makes the next chunk a speculation target; see that function for why the
+    conductor seeds the first one. The submodule produces no tensor for it, and
+    a declared signal with no tensor still satisfies readiness, so it is free.
+    """
+    if isinstance(section, GraphNode):
+        if section.name != node_name:
+            return section
+        ticks, final, gathered = [], [], []
+        for edge in section.outputs:
+            ticks.append(GraphEdge(next_node=EMPTY_DESTINATION, name=edge.name))
+            dest = gathered if edge.name in policy.accumulated_outputs else final
+            dest.append(edge)
+        tick = chunk_tick_name(node_name, graph_walk)
+        ticks.append(GraphEdge(next_node=node_name, name=tick))
+        return Loop(
+            name=chunk_loop_name(node_name, graph_walk),
+            section=replace(
+                section, outputs=ticks,
+                input_names=set(section.input_names) | {tick},
+            ),
+            max_iters=policy.max_chunks,
+            outputs=final,
+            accumulated_outputs=gathered,
+        )
+    if isinstance(section, Sequential):
+        return Sequential([
+            _wrap_node_in_loop(s, node_name, graph_walk, policy) for s in section.sections
+        ])
+    if isinstance(section, Parallel):
+        return Parallel([
+            _wrap_node_in_loop(s, node_name, graph_walk, policy) for s in section.sections
+        ])
+    if isinstance(section, Loop):
+        # A chunkable node inside an existing Loop nests one loop in another,
+        # where the two runtimes order the completion cascade differently
+        # (rust/src/graph/state.rs, "two deliberate divergences"). Refuse it
+        # rather than ship a shape only one runtime gets right.
+        if node_name in section.section.get_nodes():
+            raise ValueError(
+                f"node {node_name!r} is chunkable and already inside Loop "
+                f"{section.name!r}; nested chunk loops are not supported"
+            )
+        return section
+    raise TypeError(f"cannot wrap a chunkable node in {type(section).__name__}")
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -664,6 +734,75 @@ class Model(ABC):
         return SamplingConfig(
             ignore_eos=(model_kwargs or {}).get("ignore_eos", False)
         )
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        """``{node: (policy, ...)}``, each policy naming the walks it covers.
+
+        A node's prefill for a chunkable walk runs as a Loop, one iteration per
+        chunk, so the declaration has to be here rather than on the submodule:
+        the graph build reads it to wrap the node. Pass the walk dict through
+        ``apply_chunking`` to do that; a policy whose node was left unwrapped is
+        refused at load.
+        """
+        return {}
+
+    def chunking_policy_of(self) -> dict[tuple[str, str], ChunkingPolicy]:
+        """``(node, walk) -> policy``, validated."""
+        walks = self.get_graph_walk_graphs()
+        combined = self.get_combined_graph_walks()
+        out: dict[tuple[str, str], ChunkingPolicy] = {}
+        for node, policies in self.get_chunking_policies().items():
+            for policy in policies:
+                if not policy.walks:
+                    raise ValueError(
+                        f"{type(self).__name__}: a chunking policy for node "
+                        f"{node!r} names no walks"
+                    )
+                for walk in policy.walks:
+                    # a combined walk carries a budget for the steps it batches,
+                    # and is not a walk of its own
+                    real = walk in walks and node in walks[walk].get_nodes()
+                    if not real and walk not in combined.get(node, {}):
+                        raise ValueError(
+                            f"{type(self).__name__}: chunking policy names walk "
+                            f"{walk!r}, which is neither a walk of node {node!r} "
+                            "nor a combined walk of it"
+                        )
+                    if policy.chunkable and not real:
+                        raise ValueError(
+                            f"{type(self).__name__}: node {node!r} cannot chunk "
+                            f"combined walk {walk!r}; chunk its constituents"
+                        )
+                    if (node, walk) in out:
+                        raise ValueError(
+                            f"{type(self).__name__}: node {node!r} gets two "
+                            f"chunking policies for walk {walk!r}"
+                        )
+                    out[(node, walk)] = policy
+        return out
+
+    def apply_chunking(
+        self, walk_graphs: dict[str, GraphSection],
+    ) -> dict[str, GraphSection]:
+        """``get_graph_walk_graphs``'s result with every chunkable node wrapped
+        in a Loop, one iteration per chunk.
+
+        Called by the model at the end of its own ``get_graph_walk_graphs``,
+        rather than applied to it from outside, because that method is what
+        declares the graph and ~20 call sites read it directly; a model that
+        declares a chunkable walk and forgets the call is caught at load by
+        ``mstar.validation.placement``.
+        """
+        for node, policies in self.get_chunking_policies().items():
+            for policy in policies:
+                if not policy.chunkable:
+                    continue
+                for walk in policy.walks:
+                    section = walk_graphs.get(walk)
+                    if section is None:
+                        continue
+                    walk_graphs[walk] = _wrap_node_in_loop(section, node, walk, policy)
+        return walk_graphs
 
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

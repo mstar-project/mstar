@@ -296,6 +296,24 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        keeps to its own walk and yields to the others, and a step mixes walks only
        when the scheduler builds one fresh. Naming a node with no combined walk, or a
        walk outside its combined walks, fails loading.
+   * - ``speculate_mid_prefill``
+     - *(optional, default true)* Per node, ``true``/``false`` for every walk it chunks,
+       or a mapping of walk -> ``true``/``false``. On, a prompt mid-prefill takes its
+       next chunk in the step speculated during the current one, so a lone long prompt
+       pays no scheduling gap between chunks; other ready work still goes first after
+       every prompt step. Off, the next chunk waits for the current one to land. Naming
+       a node or walk the model does not chunk fails loading.
+   * - ``batch_builder``
+     - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
+       budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:
+       a prompt mid-prefill takes the budget before a newer one, so it finishes first,
+       and prompts short enough for an equal share still go in whole. ``fair_share``
+       splits the budget max-min fair over every waiting prompt, so each advances every
+       step and all finish late together.
+   * - ``min_chunk_tokens``
+     - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
+       in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
+       chunked walk. See *Chunked prefill budgets* below.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -394,6 +412,47 @@ safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. A
 frees only the device pages no other running request reads, though, so a request that
 shares most of its prompt frees little. Offload helps a pool that runs short now and then.
 It doesn't replace the cap.
+
+**Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
+budget per step, and a longer prompt is split across steps. Each model sets its own
+budgets. A deployment can override them per node, either with one budget for every walk
+the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
+that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
+budget if that is smaller. When less than that is left of a step's budget, the prompt waits
+for the next step rather than running the step over its budget.
+
+Most chunked walks run inside a combined walk, which batches a node's prompts and its
+decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
+BAGEL's, ``thinker_mixed`` for Qwen3-Omni's Thinker. Such a step runs under the combined
+walk's budget, so that is the one to set, by naming the node or the combined walk:
+
+.. code-block:: yaml
+
+   max_batch_tokens:
+     LLM: 512                    # every budgeted walk of LLM, its combined walk's too
+     Thinker:
+       thinker_mixed: 1024       # the budget of a Thinker step
+
+A walk inside a combined walk takes a budget of its own only on a node listed in
+``can_override_mixed_max_tokens``. There the walk's budget, its own or the model's, caps
+that walk's rows within each step, under the step's budget, and null keeps its prompts
+whole:
+
+.. code-block:: yaml
+
+   can_override_mixed_max_tokens: {Thinker: true}
+   max_batch_tokens:
+     Thinker:
+       prefill_vision: 512       # vision rows take at most 512 of a step's tokens
+       prefill_audio: null       # audio prompts run whole
+
+Loading fails if a node is not in any node group, if a walk is one the model never runs, if
+the model sets no budget for that walk, or if the walk is inside a combined walk and its
+node does not set ``can_override_mixed_max_tokens``: there the budget would do nothing.
+
+Chunked prefill is not supported under tensor or sequence parallelism yet. A node whose
+node group spans more than one rank runs its prefills whole, whatever the model and these
+budgets say, and logs a warning at load.
 
 **Single GPU.** Everything on rank 0:
 

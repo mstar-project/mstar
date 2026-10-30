@@ -162,7 +162,10 @@ class _FailingWorker(_EvictingWorker):
         super().__init__(holders)
         self.held: list[str] = []
         self.failed: dict[str, str] = {}
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, **_NO_LIMITS)
+        self.scheduler = SimpleNamespace(
+            hold_requests=self.held.extend,
+            drop_chunk_lookahead=lambda *a: None, **_NO_LIMITS,
+        )
 
     def _fail_requests(self, errors):
         self.failed.update(errors)
@@ -338,8 +341,12 @@ def test_a_row_the_cache_served_does_not_make_a_batch_too_big_alone():
 def _engine_manager(**pools: KVManager) -> SimpleNamespace:
     """The worker's engine manager over the real ``Engine.remove_request``,
     with these KV pools as the engine's resources."""
+    from mstar.engine.chunking import ChunkingManagement
+
     engine = SimpleNamespace(
         _loopback_steps={}, _resources=pools, _submodules={},
+        # the real remove_request purges chunk state too (rid_table.py)
+        _chunking=ChunkingManagement({}),
         _runner=SimpleNamespace(
             remove_request=lambda rid: [pool.remove_request(rid) for pool in pools.values()],
         ),

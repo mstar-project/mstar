@@ -33,7 +33,7 @@ from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.sampler.config import SamplerStep
+from mstar.engine.resources.sampler.config import SamplerStep, keep_final_chunk_samples
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
@@ -71,6 +71,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     HostRows,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -312,6 +313,23 @@ class LLMSubmodule(ARNodeSubmodule):
             },
         )
 
+    # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
+    # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
+    # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
+    # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        # a vision row's length depends on its image grids; it is admitted whole
+        if graph_walk == "decode":
+            return InputSeqLenInfo(1)
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        return None
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -492,11 +510,11 @@ class LLMSubmodule(ARNodeSubmodule):
                 ATTN: AttentionStep(causal=True),
                 GDN_STATE: RecurrentStep(),
                 LINEAR_ATTN: LinearAttnStep(),
-                SAMPLER: SamplerStep(
+                SAMPLER: keep_final_chunk_samples(SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
                     kept_rids=kept_rids,
-                ),
+                ), request_ids, inputs),
                 ROPE: PositionStep(advance=advance),
             },
         )
@@ -603,7 +621,11 @@ class LLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        if not self._token_is_real(request_info):
+        inputs = kwargs.get("inputs")
+        # only the last chunk's token is real
+        if not self._token_is_real(request_info) or (
+            inputs is not None and not inputs.is_final_chunk
+        ):
             outputs.pop("new_token", None)
             return
         # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
@@ -641,6 +663,11 @@ class LLMSubmodule(ARNodeSubmodule):
         # decode rows are one token each, like the template; the prefill walks
         # feed `prefill_tokens` from the inputs
         return graph_walk == "decode"
+
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the decode loop's client edge carries the sampled token the stop

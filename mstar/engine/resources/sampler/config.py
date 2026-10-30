@@ -7,7 +7,8 @@ step without pulling them in behind it.
 
 import hashlib
 import math
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -191,3 +192,19 @@ class SamplerStep(ResourceStep):
     # The spec's loop-back states this step's forward stores
     # (``store_loopback_state``); commit persists them by slot.
     loopback_writes: frozenset[str] = frozenset()
+
+
+def keep_final_chunk_samples(
+    step: SamplerStep, request_ids: Sequence, inputs: Sequence,
+) -> SamplerStep:
+    """``step`` without the rows mid-prefill, for an autoregressive node that
+    chunks: a non-final chunk's token is not a real sample, so its RNG offset
+    and seen-token mask must not commit."""
+    non_final = {
+        rid for rid, inp in zip(request_ids, inputs, strict=True)
+        if not getattr(inp, "is_final_chunk", True)
+    }
+    if not non_final:
+        return step
+    kept = frozenset(request_ids) if step.kept_rids is None else step.kept_rids
+    return replace(step, kept_rids=kept - non_final)
