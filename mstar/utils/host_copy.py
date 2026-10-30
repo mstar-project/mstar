@@ -19,18 +19,10 @@ import torch
 # one more slice per MIN_SLICE_BYTES, up to the copier's width.
 MIN_SLICE_BYTES = 4 << 20
 
-_TORCH_DTYPES: dict[np.dtype, torch.dtype] = {}
-
-
-def _torch_dtype(dtype: np.dtype) -> torch.dtype:
-    if dtype not in _TORCH_DTYPES:
-        _TORCH_DTYPES[dtype] = torch.from_numpy(np.empty(0, dtype)).dtype
-    return _TORCH_DTYPES[dtype]
-
 
 class HostCopier:
-    """Copies host arrays into fresh torch allocations, a large one in slices
-    along its first axis on ``workers`` threads.
+    """Copies flat uint8 host arrays into fresh torch allocations, a large one
+    in slices on ``workers`` threads. The caller views and reshapes the bytes.
 
     The destination is torch's, never ``np.empty``: numpy madvises large arrays
     for huge pages, and under THP ``defrag=madvise`` their first-touch faults
@@ -44,28 +36,24 @@ class HostCopier:
             if self.workers > 1 else None
         )
 
-    def slices(self, src: np.ndarray) -> int:
-        if self._pool is None or not src.ndim:
+    def slices(self, nbytes: int) -> int:
+        if self._pool is None:
             return 1
-        return max(1, min(self.workers, src.shape[0], src.nbytes // self.min_slice_bytes))
+        return max(1, min(self.workers, nbytes // self.min_slice_bytes))
 
     def copy(self, src: np.ndarray) -> torch.Tensor:
-        """A contiguous torch copy of ``src`` (which may be strided)."""
-        # Allocated as bytes and viewed, which costs less than a typed,
-        # shaped allocation on the many small reads.
-        flat = torch.empty(src.nbytes, dtype=torch.uint8)
-        if src.ndim == 1 and src.dtype == np.uint8:
-            dst, out = flat, flat.numpy()
-        else:
-            dst = flat.view(_torch_dtype(src.dtype)).view(src.shape)
-            out = flat.numpy().view(src.dtype).reshape(src.shape)
-        if src.nbytes < 2 * self.min_slice_bytes or (parts := self.slices(src)) == 1:
+        """A flat uint8 torch copy of the flat uint8 array ``src``."""
+        if src.ndim != 1 or src.dtype != np.uint8:
+            raise TypeError(f"HostCopier.copy takes a flat uint8 array, not {src.dtype} {src.shape}")
+        dst = torch.empty(src.nbytes, dtype=torch.uint8)
+        out = dst.numpy()
+        if src.nbytes < 2 * self.min_slice_bytes or (parts := self.slices(src.nbytes)) == 1:
             np.copyto(out, src)
             return dst
-        step = -(-src.shape[0] // parts)
+        step = -(-src.nbytes // parts)
         futures = [
             self._pool.submit(np.copyto, out[i:i + step], src[i:i + step])
-            for i in range(0, src.shape[0], step)
+            for i in range(0, src.nbytes, step)
         ]
         for future in futures:
             future.result()
