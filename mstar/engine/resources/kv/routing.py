@@ -87,8 +87,9 @@ class _Placed(NamedTuple):
     replica: int
     # every page the request holds: its lease and its own
     pages: list[int]
-    # its own pages it indexed, which the worker indexes only once the walk runs
-    indexed: list[int]
+    # the (key, page) entries it filed, which the worker files only once the walk runs.
+    # An item's end page is the index's alone, so it may be evicted and refiled under another key
+    indexed: list[tuple[bytes, int]]
 
 
 class KVRoutingMirror:
@@ -176,17 +177,18 @@ class KVRoutingMirror:
             own = arena.acquire(min(need, arena.num_free))
             run = max(0, min(prompt.whole - len(leased), len(own)))
             if run:
-                index.insert_run(keys[len(leased):len(leased) + run], own[:run], leased[-1] if leased else None)
-                indexed += [page for page in own[:run] if index.holds(page)]
+                filed = keys[len(leased):len(leased) + run]
+                index.insert_run(filed, own[:run], leased[-1] if leased else None)
+                indexed += [(key, page) for key, page in zip(filed, own[:run]) if index.page_for(key) == page]
             if prompt.ends:
                 indexed += self._file_item_end(index, arena, prompt)
             held += leased + own
         return _Placed(replica, held, indexed)
 
-    def _file_item_end(self, index: PrefixIndex, arena: PageArena, prompt: _Keyed) -> list[int]:
+    def _file_item_end(self, index: PrefixIndex, arena: PageArena, prompt: _Keyed) -> list[tuple[bytes, int]]:
         """`KVManager._cache_image_end` for the prompt's last item that ends inside
         a page: that page up to the item's end, in a free page, never an evicted
-        one, filed under the page before it. Returns the page it filed."""
+        one, filed under the page before it. Returns the entry it filed."""
         end, key = prompt.ends[-1]
         page = end // self._page_size
         parent = index.page_for(prompt.keys[page - 1]) if page else None
@@ -196,7 +198,7 @@ class KVRoutingMirror:
         index.insert(key, copy[0], parent)
         # the index is its one owner, as on the worker
         arena.release(copy)
-        return copy
+        return [(key, copy[0])]
 
     def remove_request(self, handle: _Placed, ran: bool) -> None:
         self._arenas[handle.replica].release(handle.pages)

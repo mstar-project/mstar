@@ -292,6 +292,28 @@ def test_a_hit_runs_on_to_an_item_cached_inside_the_next_page():
     )
 
 
+def test_a_request_that_ends_unrun_leaves_what_another_filed_in_its_items_end_page():
+    # four pages: a holds two and the index a third, its image's end
+    mirror = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=5, page_size=PAGE,
+    )).routing_mirror(RoutingContext(1, frozenset({"prefill"}), {"main": ("prefill",)}, True))
+
+    def config(keys, *spans):
+        return KVReqConfig(prefix_keys={"main": keys}, kv_layout={"main": StreamLayout(spans, keyed_spans=len(spans))})
+
+    a = mirror.add_request(config(
+        [b"A0", b"A1"], PrefixSpan(PAGE, PAGE, "prefill"),
+        PrefixSpan(PAGE // 2, PAGE // 2, "prefill", 0, b"image", b"image end"),
+    ), 0)
+    # b evicts a's image end and files its own second page in that page, then runs
+    b = [b"B0", b"B1", b"B2"]
+    mirror.remove_request(mirror.add_request(config(b[:2], PrefixSpan(2 * PAGE, 2 * PAGE, "prefill")), 0), True)
+    # a, aborted while queued
+    mirror.remove_request(a, False)
+    (facts,) = mirror.facts(config(b, PrefixSpan(3 * PAGE, 3 * PAGE, "prefill")))
+    assert facts.kv_hit == 2 * PAGE, "a request that never ran took back an entry another request filed"
+
+
 def test_a_prefix_weight_of_0_picks_by_load_alone():
     picks = []
     for conductor in (_conductor({0: _wg(0, [0, 1])}), _kv_conductor(weights={"prefix": 0})):

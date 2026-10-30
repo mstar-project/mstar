@@ -204,12 +204,13 @@ class PrefixIndex:
             heapq.heappush(self._leaves, entry)
         return dropped
 
-    def drop(self, pages: Sequence[int]) -> None:
-        """Remove these pages' entries, last first, each only while it is a
-        leaf the index alone holds: what the routing mirror predicted a request
-        would index, taken back once the request ended without running."""
-        for page in reversed(pages):
-            if self._key[page] is not None and not self._children[page] and self._arena.num_owners[page] == 1:
+    def drop(self, entries: Sequence[tuple[bytes, int]]) -> None:
+        """Remove these ``(key, page)`` entries, last first, each only while the
+        key still names the page and it is a leaf the index alone holds: what the
+        routing mirror predicted a request would index, taken back once the
+        request ended without running."""
+        for key, page in reversed(entries):
+            if self._by_key.get(key) == page and not self._children[page] and self._arena.num_owners[page] == 1:
                 self._remove(page)
 
     def _pop_leaf(self) -> tuple[int, int] | None:
