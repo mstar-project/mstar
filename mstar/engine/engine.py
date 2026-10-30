@@ -27,6 +27,7 @@ from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, nod
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
+    AllocationFailed,
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
@@ -1600,10 +1601,36 @@ class Engine:
                 range_pop()
 
         if not admit_outcome.ok:
+            self._check_follower_refusal(batch, admit_outcome)
             batch.register_admit_error(
                 admit_outcome.reason, admit_outcome.failed_resource,
             )
         return admit_outcome, step
+
+    def _check_follower_refusal(
+        self, batch: ExecutingBatch, outcome: FullAdmitOutcome,
+    ) -> None:
+        """Stop this worker when a TP follower refuses a step rank 0 cannot have refused.
+
+        Rank 0 schedules within ``get_max_batch_size``. Where that cap follows free
+        state (GLM-5.3's prefill takes only the free KDA slots), a batch past this
+        rank's own cap, refused for capacity, means the ranks' state has diverged:
+        rank 0 admitted a step this rank cannot join. Re-queueing it or failing its
+        requests would leave rank 0 in the step's collectives until the watchdog, so
+        the worker exits, as the micro-scheduler does on a diverged page trail.
+        """
+        node = batch.node_name
+        if node not in self._tp_follower_nodes or not isinstance(outcome.reason, AllocationFailed):
+            return
+        walk = batch.step_context.graph_walk
+        cap = self.get_max_batch_size(node, walk)
+        rows = len(batch.request_ids)
+        if cap is not None and rows > cap:
+            raise SystemExit(
+                f"TP ranks diverged: a follower refused {rows} requests on {node}/{walk} "
+                f"that rank 0 scheduled, past this rank's cap of {cap}; their "
+                f"{outcome.failed_resource} state differs. {outcome.reason.message}"
+            )
 
     def _maybe_lease_piecewise_regions(
         self, node_name: str, ctx: StepContext, inputs: list[NodeInputs],

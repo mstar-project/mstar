@@ -694,6 +694,19 @@ The spec types are:
        no saved state (a request's first step, or a padding row) reads ``start``, zeros
        when none is given. ``gather`` / ``scatter_`` need the sink, so leave
        ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
+   * - ``LinearAttnSpec(config=LinearAttnConfig(recurrent_state=..., variant=...))``
+     - Linear attention planned against a ``RecurrentStateSpec`` pool that holds its
+       state: gated DeltaNet (``LinearAttnVariant.GDN``), Kimi delta attention (``KDA``:
+       fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
+       calls it through ``LinearAttnCallable``, ``KDACallable`` or ``Mamba2Callable``
+       (``mstar/engine/resources/convenience.py``), which hand the kernels the layer's
+       blocks of the pool, so the layer never names one. A KDA pool built with
+       ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
+       (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
+       settles each one's accepted drafts. The layers are shared:
+       ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
+       (``mstar/model/components/distributed/``, over ``KDAConfig``; Kimi K3's full-rank
+       output gate is ``full_rank_output_gate``).
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -755,7 +768,8 @@ appears in no spec, so it receives no resources:
        plus a ``DSASpec`` over the same cache.
    * - A node that carries per-request state between steps of a loop (an RNN-T
        decoder, recurrent attention)
-     - A ``RecurrentStateSpec``, read and written with ``gather`` / ``scatter_``.
+     - A ``RecurrentStateSpec``, read and written with ``gather`` / ``scatter_``, and for
+       a linear-attention layer stack a ``LinearAttnSpec`` over it.
    * - A node that samples with two different sets of parameters
      - Two ``SamplerSpec`` objects that both name the node, under different keys.
    * - An encoder tower that attends within the segments of one packed forward
