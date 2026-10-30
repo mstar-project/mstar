@@ -48,11 +48,13 @@ class SamplerResource(Resource):
         min_tokens_stop_ids: tuple[int, ...] = (),
         enable_top_p_first: bool = False,
         enable_logprobs: bool = False,
+        enable_processed_logprobs: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
         self._enable_logprobs = enable_logprobs
+        self._enable_processed_logprobs = enable_processed_logprobs
         self._vocab_size = vocab_size if self._track_seen_tokens else None
         self._max_repetition_window = max_repetition_window
         self._enable_top_p_first = enable_top_p_first
@@ -157,6 +159,7 @@ class SamplerResource(Resource):
             min_tokens_stop_ids=tuple(spec.min_tokens_stop_ids),
             enable_top_p_first=spec.enable_top_p_first,
             enable_logprobs=spec.enable_logprobs,
+            enable_processed_logprobs=spec.enable_processed_logprobs,
         )
 
     def build_accelerator_graph_buffers(
@@ -186,6 +189,7 @@ class SamplerResource(Resource):
                 history=self._history,
                 stop_ids=self._stop_ids,
                 enable_top_p_first=self._enable_top_p_first,
+                enable_processed_logprobs=self._enable_processed_logprobs,
             ) if self._device.type == "cuda" else {}),
             ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter(),
             loopback_state=self._loopback_state,
@@ -268,10 +272,13 @@ class SamplerResource(Resource):
             )
         if cfg.return_logprobs and not self._enable_logprobs:
             return "asks for return_logprobs but the node's SamplerSpec has enable_logprobs=False"
-        if (cfg.uses_history or cfg.uses_filter_order) and self._sampler.device.type != "cuda":
+        processed = cfg.return_logprobs and cfg.logprobs_mode == "processed"
+        if processed and not self._enable_processed_logprobs:
+            return "asks for processed logprobs but the node's SamplerSpec has enable_processed_logprobs=False"
+        if (cfg.uses_history or cfg.uses_filter_order or processed) and self._sampler.device.type != "cuda":
             return (
-                "asks for repetition_window, min_tokens, top_p_first or "
-                f"top_p_min_keep, which are CUDA-only (device {self._sampler.device})"
+                "asks for repetition_window, min_tokens, top_p_first, top_p_min_keep or "
+                f"processed logprobs, which are CUDA-only (device {self._sampler.device})"
             )
         return None
 
