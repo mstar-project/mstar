@@ -174,16 +174,19 @@ def fp8_fakes(monkeypatch):
     def fake_gemm(**kw):
         launches.append(kw)
 
-    def fake_act(gateup, down, activation="silu", swiglu_limit=None):
-        assert gateup.shape[1] == 2 * down.shape[1]
+    def fake_act_quant(gateup, group_size, activation="silu", swiglu_limit=None):
+        # SwiGLU and the intermediate's quantization are one launch: record it as that quant
         assert swiglu_limit is None
+        rows, inter = gateup.shape[0], gateup.shape[1] // 2
+        quants.append(((rows, inter), gateup.dtype, group_size))
+        return (torch.empty(rows, inter, dtype=FP8_DTYPE), torch.ones(rows, inter // group_size))
 
     def fake_reduce(inp, out, routed_scaling_factor=1.0):
         reduces.append((tuple(inp.shape), tuple(out.shape)))
 
     monkeypatch.setattr(runner, "per_token_group_quant_fp8", fake_quant)
     monkeypatch.setattr(runner, "invoke_fused_moe_kernel_fp8_w8a8", fake_gemm)
-    monkeypatch.setattr(runner, "act_and_mul_triton", fake_act)
+    monkeypatch.setattr(runner, "act_and_mul_quant_fp8", fake_act_quant)
     monkeypatch.setattr(runner, "moe_sum_reduce_triton", fake_reduce)
     monkeypatch.setattr(runner, "_tl_compute_type", lambda dtype: f"tl:{dtype}")
     return launches, quants, reduces
@@ -267,10 +270,12 @@ def test_fused_experts_fp8_reduce_results_false(fp8_fakes):
 def test_fused_experts_fp8_forwards_swiglu_limit(fp8_fakes, monkeypatch):
     seen = []
 
-    def fake_act(gateup, down, activation="silu", swiglu_limit=None):
+    def fake_act_quant(gateup, group_size, activation="silu", swiglu_limit=None):
         seen.append(swiglu_limit)
+        rows, inter = gateup.shape[0], gateup.shape[1] // 2
+        return torch.empty(rows, inter, dtype=FP8_DTYPE), torch.ones(rows, inter // group_size)
 
-    monkeypatch.setattr(runner, "act_and_mul_triton", fake_act)
+    monkeypatch.setattr(runner, "act_and_mul_quant_fp8", fake_act_quant)
     args = _fp8_inputs(tokens=2)
     runner.fused_experts_fp8(*args, block_size=BLOCK, swiglu_limit=10.0)
     assert seen == [10.0]

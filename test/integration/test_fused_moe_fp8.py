@@ -193,3 +193,21 @@ def test_align_one_and_two_kernel_paths_agree_with_the_torch_reference(num_token
         return sorted((expert * 10**6 + sorted_ids[:n].to(torch.int64)).tolist())
 
     assert pairs(got[0], got[1]) == pairs(want[0], want[1])
+
+
+@pytest.mark.parametrize("swiglu_limit", [None, 10.0])
+@pytest.mark.parametrize("rows,inter", [(1, 768), (64, 768), (300, 256), (7, 384)])
+def test_act_and_mul_quant_is_the_two_kernels_bit_for_bit(rows, inter, swiglu_limit):
+    from mstar.utils.fused_moe.kernels import act_and_mul_quant_fp8, act_and_mul_triton
+    from mstar.utils.quant_fp8 import per_token_group_quant_fp8
+
+    torch.manual_seed(5)
+    gateup = (torch.randn(rows, 2 * inter, device=DEVICE) * 20).to(torch.bfloat16)
+    gateup[0, :inter // 2] = 0  # an all-zero quant group takes the eps floor
+    act = torch.empty(rows, inter, device=DEVICE, dtype=torch.bfloat16)
+    act_and_mul_triton(gateup, act, swiglu_limit=swiglu_limit)
+    q_ref, s_ref = per_token_group_quant_fp8(act, 128)
+    q, s = act_and_mul_quant_fp8(gateup, 128, swiglu_limit=swiglu_limit)
+    assert q.dtype == FP8 and s.dtype == torch.float32 and s.shape == s_ref.shape
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s, s_ref)

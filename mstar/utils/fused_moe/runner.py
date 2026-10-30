@@ -16,6 +16,7 @@ import triton.language as tl
 
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
+    act_and_mul_quant_fp8,
     act_and_mul_triton,
     get_config,
     get_default_config,
@@ -359,11 +360,6 @@ def _fused_experts_fp8_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    cache2 = torch.empty(
-        (m_topk, inter),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
     cache3 = torch.empty(
         (num_tokens, top_k, hidden),
         device=hidden_states.device,
@@ -390,11 +386,8 @@ def _fused_experts_fp8_impl(
         block_shape=block_size,
     )
 
-    # 4. SwiGLU in bf16, then requantize the intermediate for GEMM-2.
-    act_and_mul_triton(
-        cache1, cache2, activation=activation, swiglu_limit=swiglu_limit,
-    )
-    a2_q, a2_s = per_token_group_quant_fp8(cache2, block_k)
+    # 4. SwiGLU in bf16, requantized for GEMM-2 in the same kernel.
+    a2_q, a2_s = act_and_mul_quant_fp8(cache1, block_k, activation=activation, swiglu_limit=swiglu_limit)
 
     # 5. Down GEMM (weighted); top_k=1 exactly as in fused_experts so the
     # kernel reads intermediate rows (and their scales) by slot index.
