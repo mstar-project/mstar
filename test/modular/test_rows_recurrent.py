@@ -27,7 +27,8 @@ NODE, ROWS_WALK, OTHER_WALK, POOL, MAX_ROWS, MAX_LIVE, HANDLES = "toy", "decode"
 def _build(device):
     pool = RecurrentStatePool(
         torch.device(device),
-        RecurrentStateConfig(num_layers=1, blocks={"s": RecurrentBlockConfig((2,), torch.float32)}, max_slots=24),
+        RecurrentStateConfig(num_layers=1, blocks={"s": RecurrentBlockConfig((2,), torch.float32)}, max_slots=24,
+                             labels=("main", "aux")),
         name=POOL,
     )
     node_rows = NodeRows.build(
@@ -131,7 +132,8 @@ def test_a_held_row_addresses_a_label_it_takes_later(device):
     reaches the row it already holds."""
     pool = RecurrentStatePool(
         torch.device(device),
-        RecurrentStateConfig(num_layers=1, blocks={"s": RecurrentBlockConfig((2,), torch.float32)}, max_slots=8),
+        RecurrentStateConfig(num_layers=1, blocks={"s": RecurrentBlockConfig((2,), torch.float32)}, max_slots=8,
+                             labels=("main", "aux")),
         name=POOL,
     )
     node_rows = NodeRows.build(
