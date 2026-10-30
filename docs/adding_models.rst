@@ -1880,10 +1880,11 @@ node_name, graph_walk)``, called once at startup before capture:
   capture records it ahead of the forward. A replay then rebuilds them from
   the rows as they are, and the host only plans what it must.
 
-The sampler keeps each row's settings, RNG offset, last token and declared
-loop-back states in the rows (``mstar/engine/resources/sampler/rows.py``);
-it refuses rows while it tracks a seen-token mask or a generation history,
-and off a device with graph capture. The position resource keeps each row's
+The sampler keeps each row's settings, RNG offset, last token, declared
+loop-back states and, with a repetition penalty, seen-token mask in the rows
+(``mstar/engine/resources/sampler/rows.py``); it refuses rows while it keeps
+a generation history, for a penalty without a fixed ``vocab_size``, and off a
+device with graph capture. The position resource keeps each row's
 next position on every declared label of its KV cache, mirrored and stepped
 by one token: the step's position ids are the rows
 (``mstar/engine/resources/position/rows.py``). A step of the walk takes no
