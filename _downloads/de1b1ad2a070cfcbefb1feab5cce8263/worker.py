@@ -503,6 +503,7 @@ class Worker:
         ):
             kv_shm_dir_factory = partial(
                 make_deployment_kv_shm_dir,
+                self.tensor_manager._shm_namespace,
                 socket_path_prefix=socket_path_prefix,
                 dist_init_method=dist_init_method,
             )

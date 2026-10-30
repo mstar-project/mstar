@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 29, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 30, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -803,10 +803,16 @@ set.</p></td>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_SHM_DIR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/dev/shm</span></code> (or <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> if unavailable)</p></td>
 <td><p>Base directory for host-staged KV snapshots when remote KV transfer
-uses SHM. Each deployment creates a private child directory here;
-request cleanup removes snapshots, and startup removes directories
-left by dead deployments. All workers sharing KV snapshots must see
-the same filesystem.</p></td>
+uses SHM (<code class="docutils literal notranslate"><span class="pre">make_deployment_kv_shm_dir</span></code>). Each deployment creates a
+private child directory here, named under its tensor-file namespace
+(see <code class="docutils literal notranslate"><span class="pre">MSTAR_DEPLOYMENT_TOKEN</span></code>), and holds that namespace’s lock
+file here while it runs; request cleanup removes snapshots, and
+startup removes this user’s directories whose lock no live process
+holds. All workers sharing KV snapshots must see the same
+filesystem. The lock is <code class="docutils literal notranslate"><span class="pre">flock</span></code>, which some cluster filesystems
+(GPFS, for one) keep per node, so do not point deployments on
+different nodes at one shared directory there: each would sweep the
+other’s live directories.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SEGMENT_MB</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
@@ -1592,7 +1598,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 29, 2026.
+  Last updated on Oct 30, 2026.
   <br/>
 </p>
   </div>
