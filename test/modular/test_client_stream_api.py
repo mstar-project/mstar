@@ -3,10 +3,11 @@
 ``/generate/ws`` keeps a client-stream request's input open and feeds its
 ``append`` messages to ``APIServer.stream_input``; the preprocess thread turns
 each append into stream items with ``Model.process_stream_chunk``, stores
-them, and sends them as ``INPUT_SIGNALS`` straight to the ranks the
-conductor's ``CLIENT_STREAM_ROUTE`` names, then each stream's end with its
-count. Tensors ``process_prompt`` returns under a client edge's name become
-the stream's first chunk, so a one-shot request is a stream of one chunk.
+them, and sends them as ``INPUT_SIGNALS`` straight to the consuming node and
+ranks the conductor's ``CLIENT_STREAM_ROUTE`` names, then each stream's end
+with its count. Tensors ``process_prompt`` returns under a client edge's name
+become the stream's first chunk, so a one-shot request is a stream of one
+chunk.
 """
 from __future__ import annotations
 
@@ -35,8 +36,7 @@ from mstar.api_server.request_types import (  # noqa: E402
     RequestComplete,
 )
 from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
-from mstar.conductor.request_info import PartitionDefinition  # noqa: E402
-from mstar.graph.base import GraphNode, TensorPointerInfo  # noqa: E402
+from mstar.graph.base import TensorPointerInfo  # noqa: E402
 from mstar.model.base import TensorAndMetadata  # noqa: E402
 from mstar.profile.format import RequestProfile, RequestTiming  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
@@ -56,6 +56,8 @@ from mstar.utils.ipc_format import (  # noqa: E402
 
 # the end of every stream _ListeningModel takes
 END = frozenset({"audio_in"})
+# each client stream's consuming node, as the conductor's route names it
+CONSUMERS = {"audio_in": "ear", "video_in": "eye"}
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +68,8 @@ def _headerless_audio(monkeypatch):
 
 
 class _ListeningModel:
-    """Raw float32 files in; ``audio_in`` stream items out."""
+    """Raw float32 files in; ``audio_in`` stream items out. No walks: the
+    data worker addresses items to the node the conductor's route names."""
 
     def __init__(self):
         self.chunk_calls = []
@@ -82,13 +85,6 @@ class _ListeningModel:
             Connection(from_partition=CLIENT, to_partition="Ear", edge_name="audio_in",
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1)),
         ])
-
-    def get_graph_walk_graphs(self):
-        streams = [conn.edge_name for conn in self.get_partition_topology().client_connections()]
-        return {"listen": GraphNode(name="ear", input_names=streams, consumes_stream=True, outputs=[])}
-
-    def get_partitions(self):
-        return [PartitionDefinition(name="Ear", graph_walks={"listen"}, initial_walk="listen")]
 
     def load_audio(self, filepath, device):
         data = torch.frombuffer(bytearray(open(filepath, "rb").read()), dtype=torch.float32)
@@ -187,8 +183,9 @@ def _bodies(sent, kind):
 
 def _route_msg(rid="r", **workers):
     """The conductor's route for ``rid``; ``audio_in`` to ``w0`` by default."""
+    workers = workers or {"audio_in": ["w0"]}
     return WorkerMessage(WorkerMessageType.CLIENT_STREAM_ROUTE, ClientStreamRoute(
-        request_id=rid, workers=workers or {"audio_in": ["w0"]},
+        request_id=rid, workers=workers, nodes={name: CONSUMERS[name] for name in workers},
     ))
 
 
@@ -247,6 +244,7 @@ def test_an_append_goes_straight_to_each_rank_of_its_consumer(tmp_path):
     assert _signals(sent) == [("w0", "audio_in", [[4]], {}), ("w1", "audio_in", [[4]], {})]
     (_entity, msg), _ = [(e, m) for e, m in sent if m.message_type == WorkerMessageType.INPUT_SIGNALS]
     (edge,) = msg.body.inputs
+    # the node from the route, the partition from the topology
     assert (edge.next_node, edge.is_streaming, msg.body.partition_name) == ("ear", True, "Ear")
     assert msg.body.request_info is None
     (info,) = edge.tensor_info
@@ -571,14 +569,6 @@ class _TwoStreams(_ListeningModel):
                        limits=ClientStreamLimits(max_items=10))
             for name, partition in (("audio_in", "Ear"), ("video_in", "Eye"))
         ])
-
-    def get_graph_walk_graphs(self):
-        return {walk: GraphNode(name=node, input_names=[name], consumes_stream=True, outputs=[])
-                for walk, node, name in (("listen", "ear", "audio_in"), ("look", "eye", "video_in"))}
-
-    def get_partitions(self):
-        return [PartitionDefinition(name="Ear", graph_walks={"listen"}, initial_walk="listen"),
-                PartitionDefinition(name="Eye", graph_walks={"look"}, initial_walk="look")]
 
     def process_stream_chunk(self, chunk):
         self.chunk_calls.append(chunk)

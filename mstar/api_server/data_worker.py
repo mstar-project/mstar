@@ -60,10 +60,8 @@ from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.streaming.topology import (
     CLIENT,
-    ClientStream,
     ClientStreamLimits,
     client_stream_limits,
-    find_client_streams,
 )
 from mstar.utils import profiler
 from mstar.utils.client_errors import client_error_text
@@ -595,10 +593,13 @@ class PreprocessWorkerThread:
         self._keyed_labels = {
             key: by_label for key, by_label in declared.items() if key in self._prefix_page_sizes
         }
+        # client stream edge -> the partition it flows into, which its items and
+        # ends name; the consuming node comes in the conductor's route
+        self._client_partitions = {
+            conn.edge_name: conn.to_partition for conn in model.get_partition_topology().client_connections()
+        } if model is not None else {}
         # tensors under these names are client stream items, not prompt signals
-        self._client_edges = frozenset(
-            conn.edge_name for conn in model.get_partition_topology().client_connections()
-        ) if model is not None else frozenset()
+        self._client_edges = frozenset(self._client_partitions)
         self._model_config = model_config
         # per request of a model with client streams, those streams' state
         self._client_calls: dict[str, ClientCall] = {}
@@ -943,11 +944,10 @@ class PreprocessWorkerThread:
             ranks = call.route.workers.get(name, ())
             if ranks:
                 self.tensor_manager.increment_ref_batch_uniform(uuids, len(ranks))
-                stream = self._client_streams[name]
+                edge = GraphEdge(next_node=call.route.nodes[name], name=name, tensor_info=infos, is_streaming=True)
                 body = InputSignals(
-                    request_id=request_id,
-                    inputs=[GraphEdge(next_node=stream.node, name=name, tensor_info=infos, is_streaming=True)],
-                    request_info=None, partition_name=stream.partition,
+                    request_id=request_id, inputs=[edge], request_info=None,
+                    partition_name=self._client_partitions[name],
                 )
                 self.communicator.send_each(ranks, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, body))
                 call.items_sent[name] = call.items_sent.get(name, 0) + len(infos)
@@ -963,7 +963,7 @@ class PreprocessWorkerThread:
         them."""
         ends: dict[tuple[str, str], dict[str, int]] = {}
         for name in sorted(names):
-            partition = self._client_streams[name].partition
+            partition = self._client_partitions[name]
             for worker in call.route.workers.get(name, ()):
                 ends.setdefault((worker, partition), {})[name] = call.items_sent.get(name, 0)
         for (worker, partition), counts in ends.items():
@@ -971,13 +971,6 @@ class PreprocessWorkerThread:
                 request_id=request_id, inputs=[], request_info=None, partition_name=partition,
                 producer_done={CLIENT}, producer_done_items=counts,
             )))
-
-    @cached_property
-    def _client_streams(self) -> dict[str, ClientStream]:
-        """Each client stream's consuming node and partition, which address
-        its items. Read on first use, a route's arrival, after the conductor's
-        validate_deployment has accepted the model's declaration of them."""
-        return find_client_streams(self.model)
 
     @cached_property
     def _item_limits(self) -> dict[str, ClientStreamLimits]:

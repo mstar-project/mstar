@@ -2410,7 +2410,7 @@ streams (audio and video, say): each has its own buffer and its own end.
   :doc:`clients`); every other route ends the input as soon as the request is submitted.
   ``/generate/ws`` is on the Python frontend only, not ``--rust-frontend``.
 - The API server's data worker is the stream's producer. The conductor tells it the
-  consuming node's ranks once per call, when it dispatches the request, and the data
+  consuming node and its ranks once per call, when it dispatches the request, and the data
   worker sends each append's items to every one of those ranks itself, and then the
   stream's end with how many items it carried. Every rank gets each item whole, so a client
   stream can't take a ``sharding_config.shard_dim`` entry (startup refuses one). Once the

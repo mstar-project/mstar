@@ -2045,10 +2045,15 @@ class Conductor:
 
     def _send_client_route(self, request_id: str, workers: dict[str, list[str]]) -> None:
         """Tell the data worker, which sends a request's client stream items to
-        their consumers itself, where each of ``workers``' streams goes."""
+        their consumers itself, where each of ``workers``' streams goes: its
+        consuming node, which the data worker's own copy of the model can't
+        resolve (the deployment never shaped its walks), and the node's ranks."""
         self.communicator.send(self.PREPROCESS_WORKER, WorkerMessage(
             message_type=WorkerMessageType.CLIENT_STREAM_ROUTE,
-            body=ClientStreamRoute(request_id=request_id, workers=workers),
+            body=ClientStreamRoute(
+                request_id=request_id, workers=workers,
+                nodes={name: self._client_streams[name].node for name in workers},
+            ),
         ))
 
     def _wait_for_workers_ready(self) -> None:

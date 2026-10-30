@@ -1,10 +1,10 @@
 """Client streams: a ``Connection`` from ``CLIENT`` feeds a running request.
 
 The API server's data worker sends a call's items and their end straight to
-the consuming node's ranks. The conductor tells it those ranks once, at
-dispatch (``CLIENT_STREAM_ROUTE``), and again with none once the consuming
-partition ends. At ``max_concurrent_requests`` a call with open input is
-refused rather than queued.
+the consuming node's ranks. The conductor tells it that node and its ranks
+once, at dispatch (``CLIENT_STREAM_ROUTE``), and again with no ranks once the
+consuming partition ends. At ``max_concurrent_requests`` a call with open
+input is refused rather than queued.
 
 Drives the real ``Conductor.__init__`` and ``Conductor.run`` with worker
 launch and ZMQ stubbed, as ``test_ingest_unpersist.py`` does. The worker test
@@ -79,6 +79,8 @@ class _ScriptDoneError(Exception):
 class _DuplexToy(Model):
     """One partition whose loop consumes a stream the client feeds."""
 
+    consumer = "ear"
+
     def __init__(self, consumer_input="audio_in"):
         self._consumer_input = consumer_input
 
@@ -87,7 +89,7 @@ class _DuplexToy(Model):
 
     def get_graph_walk_graphs(self):
         return {"listen": Loop(name="listen_loop", max_iters=1000, outputs=[], section=GraphNode(
-            name="ear", input_names=[self._consumer_input], consumes_stream=True,
+            name=self.consumer, input_names=[self._consumer_input], consumes_stream=True,
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="text", output_modality="text")],
         ))}
 
@@ -215,8 +217,25 @@ def test_dispatch_tells_the_data_worker_the_consumers_ranks_once(tmp_path, monke
     _run(c, [[_new_request("r")]])
 
     assert _routes(c, "r") == [dict.fromkeys(streams, ["worker_0"])]
+    assert [body.nodes for _k, _e, body in _sends(c, "CLIENT_STREAM_ROUTE")] == [dict.fromkeys(streams, "ear")]
     kinds = [kind for kind, _e, body in _sends(c, "NEW_REQUEST", "CLIENT_STREAM_ROUTE", "INPUT_SIGNALS")]
     assert kinds == ["NEW_REQUEST", "CLIENT_STREAM_ROUTE"]
+
+
+def test_the_route_names_the_consumer_as_the_deployment_shaped_it(tmp_path, monkeypatch):
+    """A model may shape its walks from the deployment, as BAGEL's
+    get_worker_graphs does, and only the conductor's copy of it is shaped:
+    the data worker addresses items to the node the route names."""
+    class _Placed(_DuplexToy):
+        def get_worker_graphs(self, config_path):
+            self.consumer = "placed_ear"
+            return super().get_worker_graphs(config_path)
+
+    c = _conductor(tmp_path, monkeypatch, model=_Placed(), node_groups=[{"node_names": ["placed_ear"], "ranks": [0]}])
+    _run(c, [[_new_request("r")]])
+
+    (route,) = [body for _k, _e, body in _sends(c, "CLIENT_STREAM_ROUTE")]
+    assert (route.nodes, route.workers) == ({"audio_in": "placed_ear"}, {"audio_in": ["worker_0"]})
 
 
 def test_the_consuming_partitions_end_sends_the_route_again_empty(tmp_path, monkeypatch):
@@ -286,12 +305,11 @@ def test_a_client_stream_with_a_shard_dim_is_refused(tmp_path, monkeypatch):
 
 
 def test_the_route_encodes_without_pickle():
-    body = ClientStreamRoute(request_id="r", workers={"audio_in": ["worker_0", "worker_1"]})
+    body = ClientStreamRoute(request_id="r", workers={"audio_in": ["worker_0", "worker_1"]}, nodes={"audio_in": "ear"})
     msg = WorkerMessage(message_type=WorkerMessageType.CLIENT_STREAM_ROUTE, body=body)
     # typed fields, not the pickle fallback; the envelope finds it by its tag
     assert wire._encoder(ClientStreamRoute).__name__ == "_encode_dataclass"
-    decoded = wire.decode(wire.encode(msg))
-    assert decoded.body.request_id == "r" and decoded.body.workers == {"audio_in": ["worker_0", "worker_1"]}
+    assert wire.decode(wire.encode(msg)).body == body
 
 
 def _stub_worker(sbuf):

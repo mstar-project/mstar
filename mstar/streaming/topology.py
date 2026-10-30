@@ -180,8 +180,8 @@ def find_client_streams(model: Model) -> dict[str, ClientStream]:
     takes the edge (as ``Worker._build_consumer_node_cache`` resolves it), in
     a walk of the partition it flows into; ``ValueError`` for a stream without
     one. The conductor reads it after the worker graphs are built (a model may
-    shape its walks from the deployment, as BAGEL does); the data worker reads
-    only the node and partition, from its own copy of the model."""
+    shape its walks from the deployment, as BAGEL does), and names each node
+    in its route to the data worker, whose copy of the model is unshaped."""
     connections = model.get_partition_topology().client_connections()
     if not connections:
         return {}
