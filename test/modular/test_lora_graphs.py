@@ -323,4 +323,4 @@ def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
     for pool in ranks:
         pool.remove_request("r1")
         pool.remove_request("r2")
-        assert pool._adapter_rows == 0 and not pool.runs_adapters(list(named))
+        assert not pool._live and not pool.runs_adapters(list(named))
