@@ -64,3 +64,25 @@ def test_host_addressing_matches_device_unpacking():
         assert got.total_tokens == ref.total_tokens
         assert torch.equal(got.token_to_page[:CAPTURE], ref.token_to_page[:CAPTURE])
         assert torch.equal(got.token_to_cache[:CAPTURE], ref.token_to_cache[:CAPTURE])
+
+
+def test_a_row_past_its_pages_is_refused():
+    """A writing row with no page, or a last page longer than a page, would
+    give a page index outside the row; numpy would wrap a negative one onto
+    another row's page."""
+    import pytest
+
+    kv = KVManager.__new__(KVManager)
+    kv.kv_cache = SimpleNamespace(page_size=PAGE)
+    kv._plan_stager = PinnedStager(torch.long)
+    i32 = lambda v: torch.tensor(v, dtype=torch.int32)  # noqa: E731
+    for kvp, idx, last in (
+        ([0, 1, 1], [5], [3, 1]),  # second row writes a token with no page
+        ([0, 1, 2], [5, 6], [3, PAGE + 1]),  # second row's last page overflows
+    ):
+        indptrs = PagedIndptrs(
+            qo_indptr=i32([0, 2, 3]), paged_kv_indptr=i32(kvp), paged_kv_indices=i32(idx),
+            paged_kv_last_page_len=i32(last), kv_lens=None,
+        )
+        with pytest.raises(RuntimeError, match="past its own pages"):
+            kv._stage_packed_plan_state(indptrs, _state(), CAPTURE)
