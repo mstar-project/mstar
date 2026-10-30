@@ -32,7 +32,7 @@ import test_tp_read_failure_acceptance as acc  # the two-rank harness
 import torch
 import torch.nn.functional as F
 from test_failed_tensor_read import _failed_future, _read, _shm_manager
-from test_micro_scheduler import NODE, WALK, _Engine, _Manager
+from test_micro_scheduler import NODE, WALK, _Engine, _Manager, _Runtime
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.communication.tensors import StoredOutputs
@@ -252,6 +252,9 @@ def _follower_scheduler(ready, read_failed=()):
         engine_manager=SimpleNamespace(get_engine=lambda n: _Engine()),
         parallel_leader_nodes=set(),
     )
+    # the graph-level scan over the manager's queues, as the worker's runtime
+    manager.runtime = _Runtime()
+    manager.runtime._manager = manager
     sched.runtime = manager.runtime
     sched.read_failed_rids.update(read_failed)
     return sched, manager

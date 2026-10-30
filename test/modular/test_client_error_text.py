@@ -118,7 +118,7 @@ def _worker(rids=("r1",)):
     w.scheduler.failed_rids = set()
     w.scheduler.held_until = {}
     w.scheduler.admit_errors = {}
-    w.scheduler.backlog = {}
+    w.scheduler._core = SimpleNamespace(drop_rids=lambda rids: None)  # nothing backlogged
     w._in_flight_rids = set(rids)
     return w
 
