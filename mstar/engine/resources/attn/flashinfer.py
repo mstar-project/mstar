@@ -16,7 +16,9 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
+    FmhaDecodeWrapper,
     check_flashinfer_head_dim,
+    fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
@@ -38,6 +40,7 @@ class FlashInferManager(AttentionManager):
         max_rows_in_combined: Mapping[str, int | None] | None = None,
         decode_tensor_cores: bool = True,
         sliding_window: int | None = None,
+        decode_fmha: bool = False,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
@@ -70,6 +73,10 @@ class FlashInferManager(AttentionManager):
             backend=backend
         )
         self._decode_tensor_cores = decode_tensor_cores
+        self._decode_fmha = (
+            decode_fmha and dtype == torch.bfloat16 and sliding_window is None
+            and fmha_decode_applies(device)
+        )
 
         self._workspaces = WorkspacePool(device)
 
@@ -109,8 +116,9 @@ class FlashInferManager(AttentionManager):
         split = self._splits.get(bucket.graph_walk)
         if split is not None:
             # its own workspaces: both wrappers are planned for the one step
+            decode_workspace = self._workspaces.get(f"{label}.split_decode", lease.slot)
             wrapper = FlashInferMixedWrapper(
-                decode_workspace=self._workspaces.get(f"{label}.split_decode", lease.slot),
+                decode_workspace=decode_workspace,
                 prefill_workspace=self._workspaces.get(f"{label}.split_prefill", lease.slot),
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
@@ -118,10 +126,11 @@ class FlashInferManager(AttentionManager):
                     self._max_rows_in_combined, num_rows,
                 ),
                 use_tensor_cores=self._decode_tensor_cores,
+                decode_wrapper=self._fmha_wrapper(decode_workspace, num_rows),
                 **kv_kwargs,
             )
         elif bucket.bs == bucket.num_tokens and not force_prefill:
-            wrapper = FlashInferDecodeWrapper(
+            wrapper = self._fmha_wrapper(buffer, num_rows) or FlashInferDecodeWrapper(
                 workspace_buffer=buffer,
                 batch_size=num_rows,
                 accelerator_graph=True,
@@ -138,6 +147,24 @@ class FlashInferManager(AttentionManager):
             )
         self._cg_plan_states[key] = wrapper
         return wrapper
+
+    def _fmha_wrapper(self, workspace: torch.Tensor, num_rows: int) -> FmhaDecodeWrapper | None:
+        """The fmha decode wrapper for a capture at ``num_rows``, or None to
+        stay on the paged decode kernel (not asked for, or none for this shape)."""
+        if not self._decode_fmha:
+            return None
+        config = self._kv_config
+        wrapper = FmhaDecodeWrapper(
+            workspace_buffer=workspace,
+            num_qo_heads=config.num_qo_heads,
+            num_kv_heads=config.num_kv_heads,
+            head_dim=config.head_dim,
+            page_size=config.page_size,
+            batch_size=num_rows,
+            max_seq_len=config.max_seq_len,
+            device=self._device,
+        )
+        return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
     def _eager_wrapper(
         self, label: str, is_decode: bool, slot: int

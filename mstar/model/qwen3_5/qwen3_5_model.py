@@ -235,6 +235,7 @@ class Qwen3_5DenseModel(Model):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
                     splits=(_MIXED_SPLIT,),
+                    decode_fmha=True,
                 ),
             ),
             PositionSpec(
