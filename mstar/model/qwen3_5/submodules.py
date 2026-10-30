@@ -313,8 +313,8 @@ class LLMSubmodule(ARNodeSubmodule):
             },
         )
 
-    # a mixed step's prompt tokens and decode rows stay under the largest
-    # prefill capture (PREFILL_TOKEN_BUCKETS). 2048 measured best on 0.8B-9B:
+    # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
+    # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
     # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
     # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
     MAX_BATCH_TOKENS = 2048

@@ -39,17 +39,20 @@ def _decodes(n: int) -> dict[str, int]:
     return {f"d{i}": 1 for i in range(n)}
 
 
-def test_decode_rows_that_fill_the_budget_leave_a_prompt_the_floor():
+def test_decode_rows_that_leave_less_than_the_floor_leave_the_prompt_for_the_next_step():
     decodes = _decodes(2047)
     take, dropped = fill_token_budget([*decodes, "p"], decodes | {"p": 1000}, {"p"}, 2048, 128)
-    assert take["p"] == 128  # 127 over budget, rather than 1 token
-    assert len(take) == 2048 and not dropped
+    # neither 1 token nor 127 over budget, which would pad to the next capture
+    assert "p" not in take and dropped == {"p"}
+    assert sum(take.values()) == 2047
 
 
 def test_the_floor_takes_a_short_remainder_whole_not_padded():
-    decodes = _decodes(2040)
-    take, _ = fill_token_budget([*decodes, "p"], decodes | {"p": 50}, {"p"}, 2048, 128)
-    assert take["p"] == 50
+    decodes = _decodes(1800)
+    take, dropped = fill_token_budget(
+        [*decodes, "p", "q"], decodes | {"p": 50, "q": 1000}, {"p", "q"}, 2048, 128,
+    )
+    assert take["p"] == 50 and take["q"] == 198 and not dropped
 
 
 def test_a_share_under_the_floor_cuts_fewer_rows_within_budget():
@@ -143,13 +146,28 @@ def test_a_row_that_cannot_be_cut_does_not_hold_up_the_rows_behind_it():
     assert dropped == {"n"}
 
 
-def test_in_start_order_decode_rows_that_fill_the_budget_leave_a_prompt_the_floor():
+def test_in_start_order_decode_rows_that_leave_less_than_the_floor_leave_the_prompts_out():
     decodes = _decodes(2047)
     take, dropped = fill_token_budget_in_start_order(
         [*decodes, "p", "q"], decodes | {"p": 1000, "q": 1000}, {"p", "q"}, 2048, 128,
     )
-    assert take["p"] == 128  # 127 over budget, rather than 1 token
-    assert dropped == {"q"}
+    assert dropped == {"p", "q"}
+    assert sum(take.values()) == 2047
+
+
+def test_in_start_order_a_prompt_that_finishes_leaves_the_next_out_rather_than_over_budget():
+    # a step that would run over its budget pays for the next capture bucket up
+    take, dropped = fill_token_budget_in_start_order(
+        ["a", "b"], {"a": 1990, "b": 6000}, {"a", "b"}, 2048, 128, {"a": 0},
+    )
+    assert take == {"a": 1990} and dropped == {"b"}
+
+
+def test_in_start_order_a_prompt_behind_one_that_finishes_takes_what_is_left():
+    take, dropped = fill_token_budget_in_start_order(
+        ["a", "b"], {"a": 1500, "b": 6000}, {"a", "b"}, 2048, 128, {"a": 0},
+    )
+    assert take == {"a": 1500, "b": 548} and not dropped
 
 
 def test_in_start_order_the_head_runs_over_budget_rather_than_nothing():
@@ -416,13 +434,12 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
         {("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=4)},
     )
     batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="mixed"))
-    # over the budget of 4 and the chunk floor's slack of 4 more
-    over = [SimpleNamespace(input_seq_len=6), SimpleNamespace(input_seq_len=3)]
+    over = [SimpleNamespace(input_seq_len=3), SimpleNamespace(input_seq_len=2)]
 
     with caplog.at_level("WARNING"):
         for _ in range(3):
             chunking.check_budget(batch, over)
-        chunking.check_budget(batch, [SimpleNamespace(input_seq_len=8)])  # within the slack
+        chunking.check_budget(batch, [SimpleNamespace(input_seq_len=4)])  # on the budget
 
     assert chunking._overruns == {("LLM", "mixed"): 3}
     assert len(caplog.records) == 2  # the 1st and 2nd overrun; the 4th would be next

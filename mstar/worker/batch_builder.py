@@ -306,10 +306,10 @@ def fill_token_budget_in_start_order(
     (``start_order``), then the others as listed -- each taking all it needs
     of what is left, so a prompt finishes before the next one starts and its
     first token does not wait on every other prompt's prefill. The first that
-    does not fit is cut to what is left, at least ``min_chunk`` tokens, which
-    keeps a long prompt moving however many short ones arrive; one that
-    cannot be cut sits out without holding up the rows behind it. Never empty
-    while a row exists: the first row runs over budget if it must.
+    does not fit is cut to what is left if that is at least ``min_chunk``
+    tokens, and otherwise waits for the next step; one that cannot be cut sits
+    out without holding up the rows behind it. Never empty while a row
+    exists: the first row runs over budget if it must.
     Returns (rid -> tokens taken, rids left out)."""
     take, left, pending = _take_whole(rids, tokens, budget)
     for rid in sorted(pending, key=lambda rid: tokens.get(rid, 0)):
@@ -329,11 +329,12 @@ def fill_token_budget_in_start_order(
         if need <= left:
             take[rid] = need
             left -= need
-        elif rid in chunkable and not cut and (left >= min_chunk or take):
-            # the one row cut, over budget at the floor if that is all that is left
+        elif rid in chunkable and not cut and left >= min_chunk:
+            # the one row cut. Not to the floor past the budget: a step over
+            # its budget pays for the next capture bucket up
             cut = True
-            take[rid] = min(need, max(left, min_chunk))
-            left -= take[rid]
+            take[rid] = left
+            left = 0
         else:
             dropped.add(rid)
     _run_head(order, tokens, chunkable, budget, min_chunk, take, dropped)
@@ -348,7 +349,7 @@ def fill_token_budget(
     go in whole, the rest split what is left (chunkable rows) or sit out.
     A cut row takes at least ``min_chunk`` tokens, or all it has left if that
     is fewer: when the share is smaller, only as many rows as what is left
-    holds are cut, and if it holds none, the first runs over budget.
+    holds are cut, and if it holds none, they wait for the next step.
     Never empty while a row exists: the first row runs over budget if it must.
     Returns (rid -> tokens taken, rids left out)."""
     take, left, pending = _take_whole(rids, tokens, budget)
@@ -357,8 +358,6 @@ def fill_token_budget(
     share = left // len(pending) if pending else 0
     if cut and share < min_chunk:
         n = min(len(cut), max(left, 0) // min_chunk)
-        if n == 0 and (take or cut[0] == rids[0]):
-            n = 1  # the one row over budget, unless that is the head's place below
         share = max(left // n, min_chunk) if n else 0
         dropped.update(cut[n:])
         cut = cut[:n]

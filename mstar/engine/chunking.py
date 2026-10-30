@@ -189,8 +189,7 @@ class ChunkingManagement:
         if budget is None:
             return
         total = sum(inp.input_seq_len for inp in node_inputs)
-        # a row cut to the chunk floor may run the step over by up to that floor
-        if total <= budget + self.min_chunk_tokens(budget):
+        if total <= budget:
             return
         key = (batch.node_name, walk)
         count = self._overruns[key] = self._overruns.get(key, 0) + 1

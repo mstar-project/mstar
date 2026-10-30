@@ -1945,6 +1945,7 @@ def test_a_request_removed_mid_prompt_leaves_no_chunk_state():
     assert not sched.chunk_progress and not sched.cached_prefix
 
 
+@pytest.mark.usefixtures("no_chunk_floor")
 def test_a_walk_cap_holds_its_rows_within_the_steps_budget():
     """can_override_mixed_max_tokens: the prompt's walk is capped at 1 token a
     step inside a budget of 4, where it would otherwise take the 2 the two
@@ -2041,15 +2042,27 @@ def test_rows_that_use_up_the_budget_leave_a_prompt_the_chunk_floor():
     assert merged.chunk_ranges == {"p0": (0, 4, 10)}
 
 
-def test_the_chunk_floor_does_not_pad_a_last_chunk():
+def test_a_last_chunk_under_the_floor_waits_rather_than_running_the_step_over():
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p0": 7}))
     sched.get_tensor = lambda uuid: uuid
 
     first = _next_batch(sched, _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"}))
 
-    # the decode rows leave 2 of 4; the prompt's last 3 run whole, not cut to 2
-    # or padded to 4, so it takes no range. The worker reads that as a final
-    # chunk and ends the row's chunk Loop (test_chunk_loop_stop.py).
+    # the decode rows leave 2 of 4, under the floor of 4: the prompt's last 3
+    # wait for the next step rather than run the step over its budget
+    assert first.chunk_ranges == {}
+    assert sorted(first.request_to_worker_graph) == ["d0", "d1"]
+
+
+def test_a_last_chunk_that_fits_runs_whole_and_takes_no_range():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p0": 8}))
+    sched.get_tensor = lambda uuid: uuid
+
+    first = _next_batch(sched, _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"}))
+
+    # the prompt's last 2 fit what the decode rows leave, so it takes no range.
+    # The worker reads that as a final chunk and ends the row's chunk Loop
+    # (test_chunk_loop_stop.py).
     assert first.chunk_ranges == {}
     assert sorted(first.request_to_worker_graph) == ["d0", "d1", "p0"]
 
