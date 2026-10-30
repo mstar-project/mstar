@@ -202,6 +202,26 @@ def test_a_discarded_preplan_gives_back_its_slots():
     assert slot_of(pool, "a") is None and slot_of(pool, "b") is None
 
 
+def test_a_discarded_preplan_gives_back_the_reservation_its_slot_took():
+    """At one rank the pool decides admission (#869): a reserved request's first slot comes out
+    of its reservation. A pre-plan that took it and is dropped gives back the slot and the
+    reservation, so the slots the pool keeps for admitted requests are as they were."""
+    pool = build_pool(max_slots=4)
+    pool.ingest_request("a")
+    assert pool.ask("a", "llm", "prefill") is not None
+    assert pool.reserve("a", "llm", "prefill", None) is None
+    before = (pool._kept, dict(pool._reserved), list(pool._free))
+    st = step(["a"])
+    st.ctx.is_preplan = True
+    assert pool.admit(st.get(POOL), st.ctx).ok
+    assert "a" not in pool._reserved, "the pre-plan's slot didn't come out of the reservation"
+    pool.plan(st.get(POOL), st.ctx)
+
+    pool.clear_preplan()
+
+    assert (pool._kept, pool._reserved, pool._free) == before
+
+
 def test_a_refusal_after_a_discarded_preplan_frees_its_slots():
     pool, after = build_pool(max_slots=4), _Refuser()
     run = runner(pool, after)

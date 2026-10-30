@@ -551,14 +551,6 @@ def test_serve_yaml_pages_cover_the_slot_pool(name):
     assert (kv["max_num_pages"] - 1) * kv["page_size"] >= requests * cfg.kv_rows
 
 
-@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml"])
-def test_serve_yaml_caps_prefill_steps(name):
-    import yaml
-
-    serve = yaml.safe_load((Path(__file__).parents[2] / "configs" / name).read_text())
-    assert serve["model_kwargs"]["prefill_max_step_tokens"] == "auto"
-
-
 def test_glm5next_model_constructs_from_config():
     """The five node resources, full-size and reduced."""
     model = object.__new__(Glm5NextModel)
@@ -1077,6 +1069,26 @@ def test_moe_quant_kernel_resolution_and_clamp_guard(monkeypatch):
     blk_bf16 = Glm5NextSparseMoeBlock(cfg_bf16)
     blk_bf16.process_weights_after_loading("cpu")
     assert blk_bf16.fp8_experts is False and blk_bf16._use_fused is False
+
+
+def test_the_fused_moe_asks_the_platform_for_fp8_dots(monkeypatch):
+    """An AMD GPU reports a CUDA-style capability (an MI300X is 9.4), which a raw check took for
+    sm89+: 'auto' resolves to the reference dispatch where the platform has no NVIDIA fp8 dots."""
+    from types import SimpleNamespace
+
+    from mstar.model.glm5_next.components import moe as moe_mod
+
+    fake = types.ModuleType("mstar.utils.fused_moe")
+    fake.fused_experts_fp8 = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "mstar.utils.fused_moe", fake)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 4))
+    monkeypatch.setattr(moe_mod, "current_platform", SimpleNamespace(
+        has_cuda_capability=lambda major, minor=0, device=None: False))
+    cfg = Glm5NextModelConfig.reduced_fp8()
+    cfg.moe_quant_kernel = "auto"
+    block = Glm5NextSparseMoeBlock(cfg)
+    block.process_weights_after_loading("cuda")
+    assert block._use_fused is False
 
 
 def test_module_tree_matches_loader_expectations():

@@ -360,6 +360,35 @@ def test_the_data_worker_tags_text_chunks_with_usage():
     assert wt.out_queue.get_nowait().metadata == {"tokens": 2, "prompt_tokens": 7, "stop_token": True}
 
 
+def test_the_data_worker_tags_inline_text_chunks_with_usage():
+    """A frame's inline tokens (one item per frame) carry the usage a read tensor's chunk does."""
+    pytest.importorskip("torch")
+    import queue
+
+    from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
+    from mstar.model.base import Model
+
+    class _Model:
+        postprocess_inline = Model.postprocess_inline
+        text_output = Model.text_output
+
+        def postprocess(self, tensor, modality, request_kwargs=None):
+            return b"hi"
+
+        def stop_token_ids(self):
+            return frozenset({9})
+
+    wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.out_queue, wt.model, wt.request_model_kwargs = queue.Queue(), _Model(), {}
+    wt._draining_rids = set()
+    wt.request_output_state = {"r1": RequestOutputState(prompt_tokens=7), "r2": RequestOutputState()}
+    wt._emit_inline_tokens(InlineTokens(["r1", "r2"], [4, 9], "text"))
+    chunks = {c.request_id: c for c in (wt.out_queue.get_nowait(), wt.out_queue.get_nowait())}
+    assert chunks["r1"].data == chunks["r2"].data == b"hi"
+    assert chunks["r1"].metadata == {"tokens": 1, "prompt_tokens": 7, "stop_token": False}
+    assert chunks["r2"].metadata == {"tokens": 1, "stop_token": True}
+
+
 def test_a_long_call_is_read_once_and_parses_as_whole():
     # quadratic otherwise: each feed copied and searched the whole call so far
     write = glm_chat.tool_parameters([{"type": "function", "function": {"name": "write", "parameters": {

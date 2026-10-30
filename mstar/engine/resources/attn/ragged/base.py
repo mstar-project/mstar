@@ -38,8 +38,9 @@ def resolve_ragged_attn_backend(
 
 def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     config = spec.config
-    if info.joint_comm_group is not None:
-        config.shard(info.joint_comm_group.world_size)
+    joint = info.joint_comm_group
+    if joint is not None:
+        config.shard(joint.world_size if config.shard_over_sp else joint.tp_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(
@@ -50,15 +51,25 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     return manager_cls(device=info.device, dtype=dtype, config=config, **kwargs)
 
 
-def _build_dense_or_flashinfer(spec, info: EngineResourceInfo, dense_cls, flashinfer_cls):
+def dense_or_flashinfer(device: torch.device, dense, flashinfer, what: str):
+    """``dense`` where FA3 (AITER on ROCm) has a varlen kernel for ``device``,
+    else ``flashinfer``. The one place that choice is made, for the ragged
+    managers and the KV-backed dense backend's wrappers alike; ``what`` names
+    the caller in the log line."""
     from mstar.engine.resources.attn.dense import _fa3_unavailable_reason
-    from mstar.engine.resources.attn.ragged.dense import _warn_ragged_dense_fallback
+    from mstar.engine.resources.attn.ragged.dense import _warn_dense_on_flashinfer
 
-    reason = _fa3_unavailable_reason(info.device)
+    reason = _fa3_unavailable_reason(device)
     if reason is None:
-        return _build_ragged(spec, info, dense_cls)
-    _warn_ragged_dense_fallback(f"no varlen kernel is available ({reason})", RaggedAttnBackend.FLASHINFER)
-    return _build_ragged(spec, info, flashinfer_cls)
+        return dense
+    _warn_dense_on_flashinfer(what, reason)
+    return flashinfer
+
+
+def _build_dense_or_flashinfer(spec, info: EngineResourceInfo, dense_cls, flashinfer_cls):
+    return _build_ragged(
+        spec, info, dense_or_flashinfer(info.device, dense_cls, flashinfer_cls, "Ragged attention"),
+    )
 
 
 class RaggedAttnManager(AttentionResource):
@@ -335,15 +346,19 @@ class _RaggedManagerBase:
     @torch.compiler.disable
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        label: str | None = None,
-    ) -> torch.Tensor:
-        """One layer's attention through the plan for ``label``.
+        label: str | None = None, return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """One layer's attention through the plan for ``label``; with ``return_lse``
+        also the log-sum-exp ``[total_tokens, H]`` (fp32, natural log), for merging
+        attentions over disjoint key sets. The plan is the same either way.
 
         Not behind a custom op, unlike the paged backend's ``run``: the ragged
         caller (an encoder tower) has no per-layer KV write to keep in the same
         graph, so the break this costs is one per layer of a region that is
         CUDA-graph captured rather than compiled.
         """
+        if return_lse:
+            return self._wrapper(label).run(q, k, v, return_lse=True)
         return self._wrapper(label).run(q, k, v)
 
 

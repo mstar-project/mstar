@@ -223,9 +223,6 @@ class Glm5NextModelConfig:
     prefill_graphs: bool = False
     prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
-    # Most prompt tokens one prefill step takes ("auto": the largest captured bucket), so a
-    # burst runs as captured chunks with decode steps between them. None: no cap.
-    prefill_max_step_tokens: int | str | None = None
 
     # Derived MLA cache geometry: with NoPE the paged cache stores one
     # 512-dim latent per token per FULL layer (kv_lora_rank + 0 rope dims),
@@ -415,13 +412,14 @@ class Glm5NextModelConfig:
     def kv_rows(self) -> int:
         """Cache rows a request may hold. Its real context is held to
         max_seq_len; under MTP each verify step also leaves its rejected drafts
-        as holes, and twice the rows keeps those from binding first until
-        acceptance falls below about (k + 1) / 2 tokens per step. Under
-        mtp_trims the host counts a step's whole block the same way, though
-        the device rewrites the rejected rows, within max_seq_len rows: a
-        decode score as wide as twice the window costs its memory twice."""
+        as holes. Admission books every step's whole block (no draft accepted),
+        so k + 1 rows a token keep the rows from refusing a request its context
+        holds. Pages are taken as the rows fill, so the bound allocates nothing.
+        Under mtp_trims the host counts a step's whole block the same way, though
+        the device rewrites the rejected rows, within max_seq_len rows: a decode
+        score as wide as k + 1 windows would cost its memory k + 1 times."""
         holes = self.mtp_num_draft_tokens > 0 and not self.mtp_trims
-        return self.max_seq_len * (2 if holes else 1)
+        return self.max_seq_len * (self.mtp_num_draft_tokens + 1 if holes else 1)
 
     @property
     def padded_head_dim(self) -> int:

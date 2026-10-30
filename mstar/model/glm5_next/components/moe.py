@@ -16,6 +16,7 @@ from mstar.model.components.moe import (
 )
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.config import Glm5NextModelConfig
+from mstar.platforms import current_platform
 from mstar.utils.fp8_block import dequantize_fp8_block_weight
 
 # HF Glm5NextTextTopkRouter: denominator = topk_weights.sum(...) + 1e-20.
@@ -405,7 +406,7 @@ class Glm5NextSparseMoeBlock(nn.Module):
         dev = torch.device(device) if device is not None else torch.device("cpu")
         kernel = self.quant_kernel
         # fp8 tensor-core dots need sm89 (Ada / Hopper) or newer
-        fused_ok = dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9)
+        fused_ok = dev.type == "cuda" and current_platform.has_cuda_capability(8, 9, device=dev)
         if fused_ok:
             try:
                 from mstar.utils.fused_moe import fused_experts_fp8  # noqa: F401

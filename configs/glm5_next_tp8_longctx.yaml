@@ -21,7 +21,6 @@ model_kwargs:
   # Prompts up to the largest captured bucket (4096 tokens) prefill captured, several to a
   # step; a longer prompt takes a step of its own and runs eager, 8192 tokens at a time.
   prefill_graphs: true
-  prefill_max_step_tokens: "auto"
 resources:
   kv_cache:
     # 11 latent planes + 11 index planes, one 512-wide bf16 row per token each: 22.5 KB per

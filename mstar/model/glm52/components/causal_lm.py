@@ -36,8 +36,7 @@ class Glm52LanguageModel(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         rows: torch.Tensor | None = None,
-        return_prenorm: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Layer order IS the IndexShare order under dsa_long_context: each FULL
         layer's pick is the one the SHARED layers after it reuse, until the next
         FULL layer (the DSA resource keeps it for the forward). ``rows``: the
@@ -56,13 +55,10 @@ class Glm52LanguageModel(nn.Module):
             else:
                 hidden_states = out
         if self.fused_add_rmsnorm:
-            # forward_residual returns (norm(r), r): r is the pre-norm hidden the MTP head reads
-            normed, hidden_states = self.norm.forward_residual(hidden_states, residual, self.comm_group)
-        else:
-            normed = self.norm(hidden_states)
-        if return_prenorm:
-            return normed, hidden_states
-        return normed
+            # forward_residual returns (norm(r), r)
+            normed, _ = self.norm.forward_residual(hidden_states, residual, self.comm_group)
+            return normed
+        return self.norm(hidden_states)
 
 
 class Glm52ForCausalLM(nn.Module):

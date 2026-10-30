@@ -1,43 +1,16 @@
-"""GLM-5.3 declares a prefill token budget per step from model_kwargs."""
+"""GLM-5.3 caps a prefill step's rows at what a captured prefill takes."""
 import sys
 
 sys.path.insert(0, ".")
 
 from mstar.model.glm5_next.config import Glm5NextModelConfig  # noqa: E402
-from mstar.model.glm5_next.glm5_next_model import Glm5NextModel  # noqa: E402
-from mstar.model.glm5_next.submodules import (  # noqa: E402
-    PREFILL_TOKEN_BUCKETS,
-    Glm5NextLLMSubmodule,
-)
+from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule  # noqa: E402
 
 
 def _submodule(config) -> Glm5NextLLMSubmodule:
     sub = object.__new__(Glm5NextLLMSubmodule)
     sub.config = config
     return sub
-
-
-def _budget(walk="prefill", **kwargs):
-    model = Glm5NextModel("x", config_variant="reduced", tokenizer_mode="byte", **kwargs)
-    return _submodule(model.config).max_step_tokens(walk)
-
-
-def test_no_budget_by_default():
-    assert Glm5NextModelConfig().prefill_max_step_tokens is None
-    assert _budget() is None
-
-
-def test_budget_from_model_kwargs_on_prefill_only():
-    assert _budget(prefill_max_step_tokens=3000) == 3000
-    assert _budget(prefill_max_step_tokens="3000") == 3000
-    assert _budget("decode", prefill_max_step_tokens=3000) is None
-
-
-def test_auto_budget_is_the_largest_captured_bucket():
-    config = Glm5NextModelConfig(prefill_max_step_tokens="auto")
-    assert _submodule(config).max_step_tokens("prefill") == max(PREFILL_TOKEN_BUCKETS)
-    config.prefill_token_buckets = [64, 2048]
-    assert _submodule(config).max_step_tokens("prefill") == 2048
 
 
 def test_captured_prefill_caps_the_rows_of_a_step(monkeypatch):
