@@ -51,6 +51,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import tempfile
 from collections.abc import Callable
@@ -312,10 +313,12 @@ def _qwen3_omni() -> ModelSpec:
         thinker = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
             _snapshot(model), torch_dtype=torch.bfloat16, device_map="cuda",
         ).thinker
+        # transformers keeps the thinker's text stack under `model.language_model`,
+        # where the checkpoint (and so an adapter) names it `model`
         return HfReference(
             forward=lambda m, ids: m(input_ids=ids[None].cuda()).logits[0, -1].float(),
-            model=thinker.eval(), rope=_hf_rope(thinker.model.rotary_emb, three_d=True),
-            adapter_name=lambda module: module.removeprefix("thinker."),
+            model=thinker.eval(), rope=_hf_rope(thinker.model.language_model.rotary_emb, three_d=True),
+            adapter_name=lambda module: re.sub(r"^model\.", "model.language_model.", module.removeprefix("thinker.")),
         )
 
     return ModelSpec(
