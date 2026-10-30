@@ -1,12 +1,17 @@
-"""A looping node capped at one row serves its requests in turn.
+"""A looping node capped at one row serves its requests in the node's order.
 
 Wan2.2's DiT takes one request per step and loops it for every denoising
 step. The worker builds step N+1 while N runs, so the row N serves is not on
 the ready queue when N+1 is chosen: the speculation chain either continues it
-(``room_for_continuing``) or the scheduler picks from the queue and backlog
-(``get_next_batch``). With the chain blind to rows on the queue, whichever
-row a backlog drained last ran to the end of its loop while the others waited
-on the queue, and a request holding a low handle got one step per drain.
+or gives the step to a row waiting there (``pick_chain_step``), and without a
+chain the scheduler picks from the queue and backlog (``get_next_batch``).
+With the chain blind to rows on the queue, whichever row a backlog drained
+last ran to the end of its loop while the others waited on the queue, and a
+request holding a low handle got one step per drain.
+
+Who goes first is the node's ``StepOrder``: under TURNS the requests advance a
+step each in rotation; under ARRIVAL the earliest request runs to the end of
+its loop, then the next.
 
 The driver below runs the real ``MicroScheduler`` in the worker's order. The
 runtime scans in handle order, as the Rust one does, so the order a row comes
@@ -21,6 +26,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import pytest  # noqa: E402
+
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.graph.runtime.base import (  # noqa: E402
     ColumnarEdgeSpecs,
@@ -29,12 +36,15 @@ from mstar.graph.runtime.base import (  # noqa: E402
     SpeculationOutput,
     SpeculationPrepOutput,
 )
+from mstar.model.submodule_base import StepOrder  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch  # noqa: E402
+from mstar.worker.batch_builder import StepPick  # noqa: E402
+from mstar.worker.micro_scheduler import ChainPick, MicroScheduler, ScheduledBatch  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
 
 NODE, WALK = "dit", "video_gen"
 KEY = (NODE, WALK)
+TURNS, ARRIVAL = StepOrder.TURNS, StepOrder.ARRIVAL
 
 
 class _Runtime:
@@ -72,10 +82,11 @@ class _Runtime:
         pass
 
 
-def _scheduler(runtime: _Runtime) -> tuple[MicroScheduler, SimpleNamespace]:
+def _scheduler(runtime: _Runtime, order: StepOrder) -> tuple[MicroScheduler, SimpleNamespace]:
     engine = SimpleNamespace(
         get_max_batch_size=lambda node, walk: 1,
         get_max_rows_in_combined=lambda node, walk: None,
+        get_step_order=lambda node, walk: order,
         splits_by_capture_key=lambda node, walk: False,
         check_ready=lambda node, rid, fwd_info, allow_reload=True: (
             runtime.checked.append(rid) or FULL_ADMIT_OK
@@ -95,53 +106,72 @@ def _scheduler(runtime: _Runtime) -> tuple[MicroScheduler, SimpleNamespace]:
     return sched, state
 
 
+def _admitted(sched: MicroScheduler, batch: ScheduledBatch, refused: bool = False) -> None:
+    """The worker's turn count once the step's admit has settled."""
+    pending = SimpleNamespace(batch=batch, node_batch=SimpleNamespace(
+        admit_error=object() if refused else None,
+    ))
+    Worker._count_turn(SimpleNamespace(scheduler=sched), pending)
+
+
 def _run(
-    steps: dict[int, int], arrive_at: dict[int, int] | None = None,
-    elsewhere: ScheduledBatch | None = None, checks: list[list[int]] | None = None,
+    steps: dict[int, int], order: StepOrder, arrive_at: dict[int, int] | None = None,
+    elsewhere: ScheduledBatch | None = None, checks: list[tuple[bool, list[int]]] | None = None,
+    refuse: frozenset[int] = frozenset(),
 ) -> list[int]:
     """The rid each step served. ``steps``: rid -> loop length; ``arrive_at``:
-    rid -> the step before which it turns ready (default 0); ``elsewhere``: a
-    step of another node on the same worker, run after each of this one's;
-    ``checks``: filled with the rids each step's build asked the engine about."""
+    rid -> the step before which it arrives (default 0, in rid order);
+    ``elsewhere``: a step of another node on the same worker, run after each
+    of this one's; ``checks``: filled with whether a chain built each step
+    and the rids its build asked the engine about; ``refuse``: the builds
+    whose step the admit refuses."""
     runtime = _Runtime()
-    sched, state = _scheduler(runtime)
+    sched, state = _scheduler(runtime, order)
     arrive_at = arrive_at or {}
     left = dict(steps)
-    order: list[int] = []
+    served: list[int] = []
     running = None  # the row step N serves, in flight while N+1 is chosen
-    for n in range(sum(steps.values()) + 1):
-        arrived = {rid for rid in steps if arrive_at.get(rid, 0) == n}
-        runtime.ready |= arrived
-        runtime.requests.update(dict.fromkeys(arrived))
-        nxt = None
+    for n in range(2 * sum(steps.values()) + 2):
+        for rid in sorted(rid for rid in steps if arrive_at.get(rid, 0) == n):
+            runtime.ready.add(rid)
+            runtime.requests[rid] = None
+            sched.note_arrival(rid)
         runtime.checked.clear()
-        with sched.remember_ready():  # as the worker wraps one speculation build
-            if running is not None and left[running]:
-                room = sched.room_for_continuing(KEY, state, [running])
-                assert room is None or room >= 0, "the runtime takes the room unsigned"
-                if room is None or room >= 1:
-                    nxt = running
-                    # the speculative merge: no room left at a cap of one
-                    assert sched.get_next_batch(state, target=KEY, pre_existing_batch_size=1) is None
-            if nxt is None:
-                batch = sched.get_next_batch(state)
-                if batch is not None:
-                    (nxt,) = batch.request_to_worker_graph
+        step = None
+        chained = running is not None and bool(left[running])
+        if chained:
+            chain = sched.pick_chain_step(state, KEY, [running])
+            assert chain.pick.room in (0, 1), "the runtime takes the room unsigned"
+            if chain.pick.room == 0:
+                step = sched.take_chain_step(state, chain)  # the chain gave its step away
+            else:
+                # prep keeps the chain's row; at a cap of one no waiting row joins
+                assert sched.take_chain_step(state, chain) is None
+                step = ScheduledBatch(NODE, WALK, request_to_worker_graph={running: 0})
+        if step is None:
+            step = sched.get_next_batch(state)
         if checks is not None:
-            checks.append(list(runtime.checked))
+            checks.append((chained, list(runtime.checked)))
         # N lands: a row the chain did not continue goes back on the queue
-        if running is not None and left[running] and nxt != running:
+        if running is not None and left[running] and (step is None or running not in step.request_to_worker_graph):
             runtime.ready.add(running)
-        if nxt is None:
+        running = None
+        if step is None:
             assert not any(left.values()), f"stalled with {left} left"
             break
-        sched.note_ran(ScheduledBatch(NODE, WALK, request_to_worker_graph={nxt: 0}))
+        (nxt,) = step.request_to_worker_graph
+        if n in refuse:
+            # no forward ran: `_handle_admit_failure` puts the row back
+            _admitted(sched, step, refused=True)
+            runtime.ready.add(nxt)
+            continue
+        _admitted(sched, step)
         if elsewhere is not None:
             sched.note_ran(elsewhere)
         left[nxt] -= 1
-        order.append(nxt)
+        served.append(nxt)
         running = nxt
-    return order
+    return served
 
 
 def _longest_wait_in_rounds(order: list[int]) -> int:
@@ -157,22 +187,42 @@ def _longest_wait_in_rounds(order: list[int]) -> int:
 
 
 def test_four_requests_at_a_cap_of_one_take_turns():
-    order = _run({rid: 6 for rid in range(4)})
+    order = _run({rid: 6 for rid in range(4)}, TURNS)
 
-    assert order[:4] == [0, 1, 2, 3]
     assert order == [0, 1, 2, 3] * 6
     assert _longest_wait_in_rounds(order) == 1
+
+
+def test_four_requests_at_a_cap_of_one_run_in_arrival_order():
+    """First come, first served to completion: a loop whose output only
+    matters at the end finishes each request as early as it can."""
+    order = _run({rid: 6 for rid in range(4)}, ARRIVAL, arrive_at={3: 0, 1: 1, 0: 2, 2: 3})
+
+    assert order == [3] * 6 + [1] * 6 + [0] * 6 + [2] * 6
 
 
 def test_a_request_with_a_recycled_low_handle_does_not_jump_the_others():
     """Handle 0 freed and handed to a newcomer: it scans first from then on,
     which is what let one request take the node while the rest waited."""
-    order = _run({0: 4, 1: 8, 2: 8, 3: 8}, arrive_at={1: 0, 2: 0, 3: 0, 0: 6})
+    arrive_at = {1: 0, 2: 0, 3: 0, 0: 6}
 
-    assert _longest_wait_in_rounds(order) == 1
-    # the newcomer joins the rotation; nobody else is overtaken twice by it
-    first = order.index(0)
-    assert sorted(order[first - 3:first]) == [1, 2, 3]
+    turns = _run({0: 4, 1: 8, 2: 8, 3: 8}, TURNS, arrive_at=arrive_at)
+    arrival = _run({0: 4, 1: 8, 2: 8, 3: 8}, ARRIVAL, arrive_at=arrive_at)
+
+    # TURNS: the newcomer joins the rotation; nobody is overtaken twice by it
+    assert _longest_wait_in_rounds(turns) == 1
+    first = turns.index(0)
+    assert sorted(turns[first - 3:first]) == [1, 2, 3]
+    # ARRIVAL: it waits for the three that came first
+    assert arrival == [1] * 8 + [2] * 8 + [3] * 8 + [0] * 4
+
+
+def test_under_arrival_the_request_holding_the_step_keeps_it():
+    """Request 0 came first but reaches the node after 1 has started there:
+    1 runs to the end of its loop before 0 gets the node."""
+    order = _run({0: 3, 1: 3}, ARRIVAL, arrive_at={0: 0, 1: 0})
+
+    assert order == [0] * 3 + [1] * 3
 
 
 def test_a_request_that_also_runs_another_node_keeps_its_turn_here():
@@ -182,22 +232,44 @@ def test_a_request_that_also_runs_another_node_keeps_its_turn_here():
     the back for as long as this node is oversubscribed."""
     other = ScheduledBatch("talker", "stream", request_to_worker_graph={0: 0})
 
-    order = _run({rid: 6 for rid in range(3)}, elsewhere=other)
+    order = _run({rid: 6 for rid in range(3)}, TURNS, elsewhere=other)
 
     assert order == [0, 1, 2] * 6
 
 
-def test_a_waiting_row_is_asked_about_once_a_step():
-    """At the cap, the chain's give-way check and the yield-away scan after
-    it read the same queue; the engine is asked about each row once."""
-    checks: list[list[int]] = []
+@pytest.mark.parametrize("order", [TURNS, ARRIVAL])
+def test_a_waiting_row_is_asked_about_once_a_step(order):
+    """The chain's pick checks the rows it reaches, once each, and its take
+    or the step built in its place doesn't ask again."""
+    checks: list[tuple[bool, list[int]]] = []
 
-    order = _run({rid: 6 for rid in range(4)}, checks=checks)
+    _run({rid: 6 for rid in range(4)}, order, checks=checks)
 
-    assert order == [0, 1, 2, 3] * 6
-    assert any(checks)
-    for step in checks:
-        assert len(step) == len(set(step)), step
+    assert any(asked for _, asked in checks)
+    for _, asked in checks:
+        assert len(asked) == len(set(asked)), asked
+    # a chain at a cap of one asks about one waiting row at most; the step
+    # after a loop ends scans the queues once, for the round robin
+    assert all(len(asked) <= 1 for chained, asked in checks if chained), checks
+
+
+def test_a_refused_step_keeps_its_rows_place_in_line():
+    """A step the admit refuses (no KV for it, say) ran nothing, so it isn't
+    a turn: the row it was for is first in line for the retry."""
+    order = _run({0: 3, 1: 3}, TURNS, refuse=frozenset({1}))
+
+    assert order == [0, 1, 0, 1, 0, 1]
+
+
+def test_a_refused_step_is_not_a_turn_for_note_ran():
+    runtime = _Runtime()
+    sched, _ = _scheduler(runtime, TURNS)
+    batch = ScheduledBatch(NODE, WALK, request_to_worker_graph={7: 0})
+
+    _admitted(sched, batch, refused=True)
+    assert sched.last_ran == {}
+    _admitted(sched, batch)
+    assert sched.last_ran == {KEY: {7: 1}}
 
 
 def test_a_lone_request_keeps_its_chain_without_a_scan():
@@ -206,18 +278,49 @@ def test_a_lone_request_keeps_its_chain_without_a_scan():
     runtime = _Runtime()
     runtime.requests[7] = None
     runtime.get_ready_nodes = None  # a scan would raise
-    sched, state = _scheduler(runtime)
+    sched, state = _scheduler(runtime, TURNS)
 
-    assert sched.room_for_continuing(KEY, state, [7]) == 1
-
-
-# ── the worker's side: which continuing rows give way ───────────────────
+    assert sched.pick_chain_step(state, KEY, [7]).pick.room == 1
 
 
-def test_the_rows_that_ran_longest_give_way_first():
+# ── the worker's side ───────────────────────────────────────────────────
+
+
+def _worker(chain: ChainPick, prep, taken=None) -> SimpleNamespace:
+    worker = SimpleNamespace(
+        worker_id="w0",
+        scheduler=SimpleNamespace(
+            backlog_splits_from=lambda *a: False,
+            pick_chain_step=lambda state, target, continuing: chain,
+            take_chain_step=lambda state, chain: taken,
+        ),
+        _graph_runtime=SimpleNamespace(prep_spec_rids=prep),
+        tensor_manager=SimpleNamespace(get_tensor=lambda uuid: None),
+        request_state=SimpleNamespace(),
+        _is_tearing_down=lambda rid: False,
+        _streams_possible=lambda: False,
+        _yield_away_speculation=lambda batch, gave_way=False: SimpleNamespace(
+            scheduled_batch=batch, gave_way=gave_way,
+        ),
+    )
+    worker._try_speculate_next = Worker._try_speculate_next.__get__(worker)
+    return worker
+
+
+_TARGET = SpeculationOutput(
+    node_name=NODE, graph_walk=WALK, is_new_loop_iter=True, loop_name="denoise",
+    output_signals=("latents",),
+)
+
+
+def _pending():
+    return SimpleNamespace(batch=ScheduledBatch(NODE, WALK, request_to_worker_graph={1: 0, 2: 0, 3: 0}))
+
+
+def test_prep_gets_the_chains_rows_in_line_and_the_room():
     """``prep_spec_rids`` keeps the first ``room_for_continuing`` rows it is
-    handed. A step lists its continuing rows before the ones merged into it,
-    so the worker rotates the front, longest-running rows to the end."""
+    handed that continue: the pick's line, so a row whose loop ends hands its
+    place to the next one in line."""
     seen = {}
 
     def prep(inp):
@@ -227,24 +330,21 @@ def test_the_rows_that_ran_longest_give_way_first():
             input_edges=ColumnarEdgeSpecs.empty(),
         )
 
-    worker = SimpleNamespace(
-        worker_id="w0",
-        scheduler=SimpleNamespace(
-            backlog_splits_from=lambda *a: False,
-            room_for_continuing=lambda target, state, continuing: 1,
-        ),
-        _graph_runtime=SimpleNamespace(prep_spec_rids=prep),
-        tensor_manager=SimpleNamespace(get_tensor=lambda uuid: None),
-        request_state=SimpleNamespace(),
-        _is_tearing_down=lambda rid: False,
-        _streams_possible=lambda: False,
-    )
-    worker._try_speculate_next = Worker._try_speculate_next.__get__(worker)
-    target = SpeculationOutput(
-        node_name=NODE, graph_walk=WALK, is_new_loop_iter=True, loop_name="denoise",
-        output_signals=("latents",),
-    )
-    pending = SimpleNamespace(batch=ScheduledBatch(NODE, WALK, request_to_worker_graph={1: 0, 2: 0, 3: 0}))
+    pick = StepPick(taken=[2, 9], continuing=[2, 3, 1], room=1, held_back=set(), ordered=True)
+    worker = _worker(ChainPick(KEY, pick, []), prep)
 
-    assert worker._try_speculate_next(pending, SpeculationTarget(target, [1, 2, 3])) is None
-    assert seen == {"rids": [3, 1, 2], "room": 1}
+    assert worker._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3])) is None
+    assert seen == {"rids": [2, 3, 1], "room": 1}
+
+
+def test_a_chain_that_gives_its_whole_step_away_runs_the_waiting_rows():
+    """No room left for the chain: the rows the pick chose run as a step of
+    their own, which still counts as the chain's for fairness, and nothing is
+    prepped for the chain's rows."""
+    pick = StepPick(taken=[9], continuing=[1, 2, 3], room=0, held_back=set(), ordered=True)
+    waiting = ScheduledBatch(NODE, WALK, request_to_worker_graph={9: 0})
+    worker = _worker(ChainPick(KEY, pick, []), prep=None, taken=waiting)
+
+    spec = worker._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3]))
+
+    assert spec.scheduled_batch is waiting and spec.gave_way

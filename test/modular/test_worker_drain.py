@@ -431,6 +431,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    w.scheduler = SimpleNamespace(note_arrival=lambda rid: seen.setdefault("scheduler", rid))
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
@@ -440,7 +441,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     handle = w._graph_runtime.get_rid_handle("X")
     assert handle == 1
     assert info.rid_handle == handle
-    assert seen == {"state": handle, "engine": handle, "tensors": handle}
+    assert seen == {"state": handle, "scheduler": handle, "engine": handle, "tensors": handle}
     assert set(w._last_active) == {(handle, "n")}
 
 

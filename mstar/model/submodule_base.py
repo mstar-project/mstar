@@ -77,6 +77,18 @@ if TYPE_CHECKING:
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
+class StepOrder(Enum):
+    """Who runs first when more rows of a node are ready than its step takes
+    (``NodeSubmodule.max_batch_size``)."""
+    # First come, first served to completion: the rows that ran the node's last
+    # step keep it, then the request that arrived first. For a loop whose output
+    # only matters once it ends (a denoising loop).
+    ARRIVAL = "arrival"
+    # Longest-waiting first: a row that just ran gives way to one that waited.
+    # For a node whose outputs stream, so every request keeps making progress.
+    TURNS = "turns"
+
+
 class InputMetadata(NamedTuple):
     """What the worker knows about one request's inputs to this step.
 
@@ -906,6 +918,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """How many rows of this real walk a step mixing it with another walk
         of its combined walk may hold; None is uncapped. For a backend whose
         mixed step runs the walk's rows on a path sized to a few of them."""
+        del graph_walk
+        return None
+
+    def step_order(self, graph_walk: str) -> StepOrder | None:
+        """Which rows go first when more are ready than ``max_batch_size``
+        allows. None (the default) takes it from the graph: ``TURNS`` when the
+        node's passes stream outputs while the request runs (to the client or
+        another partition, ``Model.streaming_node_walks``), else ``ARRIVAL``."""
         del graph_walk
         return None
 

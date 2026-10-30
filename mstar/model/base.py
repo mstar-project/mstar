@@ -28,6 +28,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
 
@@ -623,6 +624,32 @@ class Model(ABC):
                             f"both {out[(node, walk)]!r} and {name!r}"
                         )
                     out[(node, walk)] = name
+        return out
+
+    def streaming_node_walks(self) -> set[tuple[str, str]]:
+        """``(node, walk)`` pairs whose node streams: it runs many passes per
+        request (inside a loop, or on a walk a stream feeds) and its passes
+        send outputs on the way, to the client or over a streaming connection
+        out of its partition. These default to ``StepOrder.TURNS``
+        (``NodeSubmodule.step_order``)."""
+        topology = self.get_partition_topology()
+        partition_of = {
+            walk: part.name for part in self.get_partitions() for walk in part.graph_walks
+        }
+        streamed = {(conn.from_partition, conn.edge_name) for conn in topology.connections}
+        fed = {conn.to_partition for conn in topology.connections}
+        out = set()
+        for walk, graph in self.get_graph_walk_graphs().items():
+            partition = partition_of.get(walk, DEFAULT_PARTITION)
+            looped = {name for loop in graph.get_loops().values() for name in loop.get_nodes()}
+            for name, node in graph.get_nodes().items():
+                if name not in looped and partition not in fed:
+                    continue  # one pass per request: nothing to stream
+                if any(
+                    edge.next_node == EMIT_TO_CLIENT or (partition, edge.name) in streamed
+                    for edge in node.outputs
+                ):
+                    out.add((name, walk))
         return out
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
