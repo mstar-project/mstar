@@ -12,6 +12,7 @@ adapter.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -135,7 +136,7 @@ def test_edge_recipe_defaults_from_the_checkpoint(tmp_path) -> None:
     assert over.conditioning_resize == "stretch" and over.flow_shift_video == 9.0
     # Nano keeps its defaults.
     nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
-    assert nano.conditioning_resize == "stretch" and nano.flow_shift_video is None
+    assert nano.conditioning_resize == "aspect_crop" and nano.flow_shift_video is None
 
 
 def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
@@ -230,6 +231,80 @@ def test_edge_generation_defaults_from_yaml_knobs(tmp_path) -> None:
     # Explicit request values still win.
     p = model._resolve_gen_params({"size": "320x192", "flow_shift": 5.0, "num_frames": 9}, ["text"], ["video"])
     assert (p["width"], p["height"], p["num_frames"], p["flow_shift"]) == (320, 192, 9, 5.0)
+
+
+def test_edge_windowed_rollout_defaults_to_chained_61_32(tmp_path) -> None:
+    """Edge's streamed rollout runs chained 61-frame windows re-pinning 32
+    frames (16 and 8 latent frames) unless the request names otherwise; kv
+    keeps its 29-frame windows; Nano keeps 29/8."""
+    model = _model(tmp_path, enable_windowed_video=True)
+    cfg = model.config
+    assert (cfg.window_frames_default, cfg.overlap_frames_default, cfg.kv_window_frames_default) == (61, 32, 29)
+    for mk in ({"stream_video": True}, {"window_mode": "chained"}):
+        p = model._resolve_gen_params({"num_frames": 241, **mk}, ["image", "text"], ["video"])
+        assert p["window_mode"] == "chained"
+        assert (p["window_latent_units"], p["overlap_latent_units"]) == (16, 8)
+        assert p["num_windows"] == 7
+    kv = model._resolve_gen_params({"num_frames": 241, "window_mode": "kv"}, ["image", "text"], ["video"])
+    assert (kv["window_latent_units"], kv["overlap_latent_units"], kv["context_latent_units"]) == (8, 0, 16)
+    own = model._resolve_gen_params(
+        {"num_frames": 241, "window_mode": "chained", "window_frames": 29, "overlap_frames": 8},
+        ["image", "text"], ["video"],
+    )
+    assert (own["window_latent_units"], own["overlap_latent_units"]) == (8, 2)
+    yaml = _model(tmp_path / "yaml", enable_windowed_video=True, window_frames_default=45, overlap_frames_default=16)
+    p = yaml._resolve_gen_params({"num_frames": 241, "stream_video": True}, ["image", "text"], ["video"])
+    assert (p["window_latent_units"], p["overlap_latent_units"]) == (12, 4)
+    nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True)
+    p = nano._resolve_gen_params({"num_frames": 241, "stream_video": True}, ["text"], ["video"])
+    assert (p["window_latent_units"], p["overlap_latent_units"]) == (8, 2)
+
+
+@pytest.mark.parametrize("num_frames", [60, 61, 62, 63, 64, 65, 94, 95, 96, 97])
+def test_edge_windowed_schedule_covers_every_requested_frame(tmp_path, num_frames) -> None:
+    """The schedule generates at least ``num_frames`` frames (the decoder trims
+    the rest); 62-64 used to fit one 61-frame window and came back short."""
+    model = _model(tmp_path, enable_windowed_video=True)
+    tf = model.config.vae.scale_factor_temporal
+    p = model._resolve_gen_params({"num_frames": num_frames, "stream_video": True}, ["image", "text"], ["video"])
+    assert 1 + (p["total_latent_units"] - 1) * tf >= num_frames
+
+
+def test_edge_resumed_session_re_pins_the_chained_overlap(tmp_path) -> None:
+    """A resumed session conditions window 0 on the stored tail, as many latent
+    frames as the chained overlap (at least 2): 8 under Edge's 61/32 default,
+    2 with 29/8, and the schedule grows by them."""
+    model = _model(tmp_path, enable_windowed_video=True)
+    resume = {"stream_video": True, "session_id": "s", "resume_session": True}
+    p = model._resolve_gen_params({"num_frames": 61, **resume}, ["text"], ["video"])
+    assert (p["resume_latent_units"], p["overlap_latent_units"]) == (8, 8)
+    assert p["total_latent_units"] == 16 + 8
+    p = model._resolve_gen_params(
+        {"num_frames": 61, "window_frames": 29, "overlap_frames": 8, **resume}, ["text"], ["video"])
+    # 16 + 2, padded to whole windows (8 latent frames, stride 6)
+    assert (p["resume_latent_units"], p["total_latent_units"]) == (2, 20)
+    p = model._resolve_gen_params({"num_frames": 61, "stream_video": True, "session_id": "s"}, ["text"], ["video"])
+    assert p["resume_latent_units"] == 0
+
+
+def test_kv_windows_flagged_experimental_at_startup(tmp_path, caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger="mstar.model.cosmos3.cosmos3_model"):
+        _model(tmp_path / "plain")
+    assert "experimental" not in caplog.text
+    with caplog.at_level(logging.WARNING, logger="mstar.model.cosmos3.cosmos3_model"):
+        _model(tmp_path / "windowed", enable_windowed_video=True)
+    assert "window_mode='kv' is experimental" in caplog.text
+
+
+def test_distilled_checkpoint_refuses_stream_video(tmp_path) -> None:
+    root = _fake_edge_dir(tmp_path)
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"is_distilled": True, "distilled_sigmas": [1.0, 0.75, 0.5, 0.25]})
+    )
+    model = Cosmos3Model(model_path_hf=str(root), skip_weight_loading=True, enable_windowed_video=True)
+    assert model.config.is_distilled
+    with pytest.raises(ValueError, match="distilled"):
+        model._resolve_gen_params({"num_frames": 121, "stream_video": True}, ["image", "text"], ["video"])
 
 
 def test_reasoner_submodule_step_and_stop(tmp_path) -> None:

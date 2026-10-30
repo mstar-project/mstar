@@ -72,13 +72,9 @@ Qwen3-TTS also needs `uv pip install --no-deps "qwen-tts==0.1.1"` (see `docs/ins
 
 To enable flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
 ```bash
-# torch built for CUDA 12.x (cu12)
+# torch 2.10 built for CUDA 13.x (cu13); on a cu12 torch, build from source (docs/installation.rst)
 uv pip install \
-  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
-
-# torch built for CUDA 13.x (cu13)
-uv pip install \
-  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
 Other models: `mstar serve flux2_klein` · `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve kokoro` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
@@ -120,18 +116,32 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 |-------|--------|----------------|-----------|
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
+| [Qwen3.5 0.8B–27B](https://huggingface.co/Qwen/Qwen3.5-4B) / [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Vision-language model | text, image → text (hybrid gated-DeltaNet attention) | `/v1/chat/completions`, `/generate` |
+| [Nemotron VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B) *(Beta)* | Full-duplex speech LM | speech → text, speech (streamed) | `/generate` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
+| [Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) | Speech LM | text, reference audio → speech (streamed; weights under the Fish Audio Research License, non-commercial use only) | `/v1/audio/speech` |
+| [Qwen3-TTS 0.6B / 1.7B](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | Speech LM | text (+ voice instruction or reference audio) → speech (streamed; CustomVoice, VoiceDesign and Base variants) | `/v1/audio/speech` |
+| [Chatterbox / Multilingual / Turbo](https://huggingface.co/ResembleAI/chatterbox) | Speech LM | text, reference audio → speech (voice cloning; 23 languages in Multilingual) | `/v1/audio/speech` |
+| [OmniVoice](https://huggingface.co/k2-fsa/OmniVoice) | Masked-diffusion TTS | text, reference audio → speech (multilingual voice cloning) | `/v1/audio/speech` |
+| [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | TTS | text → speech (54 voices, sentence-streamed) | `/v1/audio/speech` |
+| [Whisper large-v3](https://huggingface.co/openai/whisper-large-v3) *(Beta)* | ASR | speech → text | `/v1/audio/transcriptions` |
+| [Higgs Audio v3 STT](https://huggingface.co/bosonai/higgs-audio-v3-stt) *(Beta)* | ASR | speech → text | `/v1/audio/transcriptions` |
+| [Omnilingual ASR CTC 300M–7B](https://huggingface.co/facebook/omniASR-CTC-300M) | ASR | speech → text (1,600+ languages) | `/v1/audio/transcriptions` |
 | [Cosmos3 Nano / Super](https://huggingface.co/nvidia/Cosmos3-Nano) | World model | text, image, video → image, video (+ sound), robot actions | `/v1/images/generations`, `/v1/videos/generations` |
 | [Cosmos3 Policy DROID](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID) | Robot policy | text, image, video → robot actions, video | `/generate`, `/v1/images/generations`, `/v1/videos/generations` |
 | [Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) | 480p world model + VLM | text, image, video → image, video (streamed windows), robot actions, text | `/v1/chat/completions`, `/v1/images/generations`, `/v1/videos/generations`, `/generate`, `/generate/ws` |
 | [Pi0.5](https://huggingface.co/lerobot/pi05_base) | Vision-language-action | text, image, state → robot actions | `/generate` |
 | [V-JEPA 2 / 2-AC](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256) | World model | video (+ actions) → latents, rollouts | `/generate` |
+| [Waypoint-1.5](https://huggingface.co/Overworld/Waypoint-1.5-1B) | Interactive world model | controller input (mouse, buttons, scroll) → live video frames | `/generate` |
+| [LingBot-World-V2 1.3B](https://huggingface.co/robbyant/lingbot-world-v2-1.3b-causal-fast) | Interactive world model | text, image, camera trajectory → video (streamed chunks; weights CC-BY-NC-SA-4.0) | `/generate` |
 | [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | Video diffusion | text, image → video | `/v1/videos/generations`, `/generate` |
+| [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5-Diffusers) *(Beta)* | Audio-video diffusion | text → video + stereo audio (8-step distilled; gated, LTX-2.x Community License) | `/v1/videos/generations`, `/generate` |
 | [FLUX.2 klein 4B / 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image diffusion | text, image → image (4-step distilled, editing; 4B Apache-2.0, 9B under the FLUX Non-Commercial License) | `/v1/images/generations`, `/v1/images/edits` |
 | [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image diffusion | text → image (8-step distilled) | `/v1/images/generations` |
 
 Every model is reachable through the SDK and the native `/generate` endpoint; the OpenAI-compatible
-routes cover the chat, speech, image, and video models.
+routes cover the chat, speech, transcription, image, and video models. Registry keys, configs and
+per-model notes are in [docs/models.rst](https://m-star.org/mstar/models.html).
 
 ## How it works
 
@@ -156,8 +166,10 @@ The ZeroMQ control mesh can run over a Rust transport (vendored in [`rust/`](rus
 pyzmq — wire-compatible, selectable per process with `MSTAR_RUST_ZMQ` (default `AUTO`).
 Note what AUTO-by-default means: on any machine where the extension is built, the whole
 mesh switches to the Rust transport with no configuration change — each process logs its
-choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. Build it with
-[maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. Build it
+with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+The Linux wheels of `mstar-ai` on PyPI carry it, with libzmq 4.3.4 statically linked under
+LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](PACKAGING.md) has where its source is).
 See the [installation docs](https://m-star.org/mstar/installation.html) and
 [environment variables](https://m-star.org/mstar/environment_variables.html).
 

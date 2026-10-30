@@ -15,8 +15,8 @@ through the same route, so TTFF == total there — the reference the streaming
 modes are judged against. Chunk frame counts come from the mp4s (PyAV) when it
 is installed, else from the window schedule.
 
-  python bench_stream_video.py --port 8100 --mode kv --frames 241 --size 832x480 --steps 20
-  python bench_stream_video.py --port 8100 --mode chained --frames 241
+  python bench_stream_video.py --port 8100 --mode chained --frames 241 --size 832x480 --steps 20
+  python bench_stream_video.py --port 8100 --mode kv --frames 241   # experimental
   python bench_stream_video.py --port 8100 --mode none --frames 241
 """
 import argparse
@@ -30,10 +30,10 @@ import uuid
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, required=True)
-ap.add_argument("--mode", choices=["kv", "chained", "none"], default="kv")
+ap.add_argument("--mode", choices=["chained", "kv", "none"], default="chained")
 ap.add_argument("--size", default="832x480")
 ap.add_argument("--frames", type=int, default=241)
-ap.add_argument("--window-frames", type=int, default=29)
+ap.add_argument("--window-frames", type=int, default=None, help="default: the server's")
 ap.add_argument("--overlap-frames", type=int, default=None, help="chained only (default: server's)")
 ap.add_argument("--context-frames", type=int, default=None, help="kv only (default: server's)")
 ap.add_argument("--steps", type=int, default=20)
@@ -80,7 +80,9 @@ def run_once():
         "guidance_scale": args.gs, "fps": args.fps, "seed": args.seed,
     }
     if args.mode != "none":
-        mk.update({"window_mode": args.mode, "window_frames": args.window_frames, "stream_video": True})
+        mk.update({"window_mode": args.mode, "stream_video": True})
+        if args.window_frames is not None:
+            mk["window_frames"] = args.window_frames
         if args.overlap_frames is not None:
             mk["overlap_frames"] = args.overlap_frames
         if args.context_frames is not None:
@@ -120,8 +122,9 @@ def run_once():
     return arrivals, sizes, frames
 
 
-print(f"=== stream mode={args.mode} size={args.size} frames={args.frames} window={args.window_frames} "
-      f"steps={args.steps} gs={args.gs} seed={args.seed} {'i2v' if args.image else 't2v'} ===", flush=True)
+print(f"=== stream mode={args.mode} size={args.size} frames={args.frames} "
+      f"window={args.window_frames or 'server default'} steps={args.steps} gs={args.gs} seed={args.seed} "
+      f"{'i2v' if args.image else 't2v'} ===", flush=True)
 for _ in range(args.warmup):
     run_once()
 ttff, totals, gaps, fps_out = [], [], [], []

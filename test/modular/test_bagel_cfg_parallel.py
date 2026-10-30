@@ -7,6 +7,7 @@ import pytest
 import torch
 import yaml
 
+from mstar.communication import tensors
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
@@ -41,7 +42,7 @@ def test_offload_reset_preserves_remote_content_epoch():
 def _bare_model() -> BagelModel:
     model = BagelModel.__new__(BagelModel)
     model.config = SimpleNamespace(
-        num_timesteps=50,
+        num_timesteps=50, max_position_embeddings=32768,
         temperature=1.0,
         top_k=0,
         top_p=1.0,
@@ -92,7 +93,7 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     model._has_llm_disaggregation = True
     args = {
         "default": SimpleNamespace(
-            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True})
+            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True, "target_output": "image"})
         )
     }
 
@@ -217,6 +218,34 @@ def test_shm_kv_transfer_copies_only_requested_page_ranges(tmp_path):
         source[:, 3, :, :2],
     )
     assert torch.count_nonzero(destination_cache.tensor[:, 1]) == 0
+
+
+def test_shm_kv_transfer_reads_an_mla_cache_by_token(tmp_path):
+    """MLA is [layers, pages, page_size, latent]: the reader took NHD's K/V axis
+    first and sliced latent columns, not tokens."""
+    from mstar.engine.resources.kv.cache import KVLayout
+
+    def mla_cache():
+        config = PagedKVConfig(max_num_pages=4, page_size=4, num_layers=2, num_kv_heads=1,
+                               head_dim=12, max_seq_len=16, num_qo_heads=2,
+                               layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4)
+        return KVCache(config, torch.device("cpu"), torch.float32)
+
+    source_cache, destination_cache = mla_cache(), mla_cache()
+    source_cache.tensor.copy_(torch.arange(source_cache.tensor.numel(), dtype=torch.float32)
+                              .reshape(source_cache.tensor.shape))
+    producer = ShmKVTransferEngine(source_cache, "producer", str(tmp_path))
+    consumer = ShmKVTransferEngine(destination_cache, "consumer", str(tmp_path))
+    info = producer.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[1, 3], seq_len=6,
+    )
+    consumer.read_batched_async(
+        info, [r for layer in range(2)
+               for r in (KVReadInfo(layer, 0, 1, 0, 4), KVReadInfo(layer, 2, 3, 0, 2))])
+    src, dst = source_cache.tensor, destination_cache.tensor
+    torch.testing.assert_close(dst[:, 0], src[:, 1])
+    torch.testing.assert_close(dst[:, 2, :2], src[:, 3, :2])
+    assert torch.count_nonzero(dst[:, 2, 2:]) == 0
 
 
 def test_shm_kv_transfer_requires_deployment_directory():
@@ -554,10 +583,12 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
 
     healthy_page = manager._streams["healthy"]["main"].page_indices[0]
 
+    # the refusal reaches clients: an error id, the file error itself only in the log
     assert not broken.ok
-    assert "FileNotFoundError" in broken.reason.message
+    assert "internal error (error id" in broken.reason.message
+    assert "missing.pt" not in broken.reason.message
     assert not broken_again.ok
-    assert "FileNotFoundError" in broken_again.reason.message
+    assert broken_again.reason.message == broken.reason.message
     assert healthy.ok and healthy.ready
     torch.testing.assert_close(
         manager.kv_cache.tensor[:, healthy_page, :, :1],
@@ -697,23 +728,22 @@ def test_kv_shm_directory_is_private_to_the_deployment(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("MSTAR_KV_SHM_DIR", str(tmp_path))
-    owner_pid = os.getpid()
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    stale = tmp_path / f"mstar_kv_{uid}_99999999_stale"
+    held: dict[str, int] = {}
+    monkeypatch.setattr(tensors, "_held_namespace_locks", held)
+    stale = tmp_path / f"mstar_{'d' * 12}_kv"
     stale.mkdir()
     (stale / "orphan.pt").touch()
+    (tmp_path / f"mstar_{'d' * 12}.lock").touch()
 
-    first = make_deployment_kv_shm_dir(
-        "/tmp/server-a", "tcp://host:1234", owner_pid=owner_pid,
-    )
-    second = make_deployment_kv_shm_dir(
-        "/tmp/server-b", "tcp://host:5678", owner_pid=owner_pid,
-    )
+    first = make_deployment_kv_shm_dir("a" * 12)
+    second = make_deployment_kv_shm_dir("b" * 12)
 
     assert first != second
     assert not stale.exists()
     assert Path(first).stat().st_mode & 0o777 == 0o700
     assert Path(second).stat().st_mode & 0o777 == 0o700
+    for fd in held.values():
+        os.close(fd)
 
 
 def test_local_only_cpu_cache_does_not_publish_shm_snapshots():

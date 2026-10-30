@@ -10,7 +10,9 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, release_unread, rid
+from mstar.utils.generation_kwargs import offset_seed
 
 
 async def create_images(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
@@ -26,7 +28,7 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
     for i in range(n):
         model_kwargs = dict(args.model_kwargs)
         if seed is not None and i > 0:
-            model_kwargs["seed"] = int(seed) + i
+            model_kwargs["seed"] = offset_seed(int(seed), i)
         request_id = rid("img")
         # Listed before submitting: submit_request registers the request
         # before handing it on, so a failed submit still holds an entry.
@@ -87,20 +89,29 @@ async def create_image_edit(
     image_path = upload_dir / f"{uuid4().hex}{ext}"
     image_path.write_bytes(image_bytes)
 
-    args = adapter.image_edit_to_request(prompt, str(image_path), model_kwargs)
+    try:
+        args = adapter.image_edit_to_request(prompt, str(image_path), model_kwargs)
+    except Exception as exc:
+        image_path.unlink(missing_ok=True)
+        if isinstance(exc, NotImplementedError):
+            # a model with images but no editing: the client's error, a 400
+            raise ValueError(str(exc)) from exc
+        raise
     request_id = rid("img")
 
-    api.submit_request(
-        text=args.text,
-        file_paths=args.file_paths,
-        input_modalities=args.input_modalities,
-        output_modalities=["image"],
-        model_kwargs=args.model_kwargs,
-        streaming=False,
-        request_id=request_id,
-    )
-
-    chunks = await api.collect_results(request_id, raw_request)
+    try:
+        api.submit_request(
+            text=args.text,
+            file_paths=args.file_paths,
+            input_modalities=args.input_modalities,
+            output_modalities=["image"],
+            model_kwargs=args.model_kwargs,
+            streaming=False,
+            request_id=request_id,
+        )
+        chunks = await api.collect_results(request_id, raw_request)
+    finally:
+        media_io.schedule_upload_cleanup({"image": [str(image_path)]}, upload_dir)
     data = [
         {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
         for c in chunks

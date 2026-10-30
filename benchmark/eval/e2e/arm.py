@@ -22,7 +22,6 @@ sessions alternate the arm order (ABBA with two sessions). Layout under ``job["o
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -136,24 +135,18 @@ MIN_AGE_S = 5.0   # a server process younger than this at the case's start may b
 
 def _group_pids(sid: int, min_age_s: float = 0.0) -> set[int]:
     """Live processes of the server's session (``ManagedServer`` starts it as a session leader); a worker that
-    died and was not reaped yet (a zombie) does not count."""
+    died and was not reaped yet (a zombie) does not count, nor do helpers such as compile workers
+    (``stress.helper_process``)."""
     r = subprocess.run(["ps", "-o", "pid=,stat=,etimes=", "-g", str(sid)], capture_output=True, text=True,
                        check=False)
     return {int(f[0]) for f in (ln.split() for ln in r.stdout.splitlines()) if len(f) == 3 and f[0].isdigit()
-            and not f[1].startswith("Z") and f[2].isdigit() and int(f[2]) >= min_age_s}
+            and not f[1].startswith("Z") and f[2].isdigit() and int(f[2]) >= min_age_s
+            and not stress.helper_process(int(f[0]))}
 
 
 def _namespaces(server: ManagedServer) -> set[str]:
-    """This server's deployment token in its tensor file names (``mstar_<token>_<entity>_<uuid>``): the SHA-1 of
-    its conductor's IPC endpoint (``tensors._deployment_namespace``), found under its ``--socket-path-prefix``.
-    Empty when there is no such socket (another layout): its tensor files then go unchecked, never misattributed."""
-    try:
-        cmd = server.command()
-        prefix = Path(cmd[cmd.index("--socket-path-prefix") + 1])
-    except (AttributeError, AssertionError, ValueError, IndexError):
-        return set()
-    return {hashlib.sha1(f"ipc://{os.path.realpath(p)}".encode()).hexdigest()[:12]
-            for p in prefix.rglob("conductor.ipc")}
+    """This server's deployment namespace in its tensor file names (``stress.server_namespaces``)."""
+    return stress.server_namespaces(server)
 
 
 def _shm_owner(name: str) -> int | None:
@@ -188,7 +181,7 @@ def _new_shm(before: set[str], ours: set[int], namespaces: set[str]) -> set[str]
     for n in _shm_names() - before:
         pid = _shm_owner(n)
         if pid is None:
-            if any(n.startswith(f"mstar_{ns}_") for ns in namespaces):
+            if stress.namespace_file(n, namespaces):
                 out.add(n)
         elif pid in ours and not _alive(pid):
             out.add(n)
@@ -218,6 +211,10 @@ def health_after(before: dict, server: ManagedServer, log_path: Path) -> list[st
         left &= _new_shm(set(before["shm"]), ours, ns)   # an entry counts only if it stayed the whole wait
     if left:
         found.append(f"/dev/shm +{len(left)} entries")
+    if gone:   # arena segments are named by namespace, not pid: only an exit says one may be orphaned
+        orphans = stress.unmapped_arena_segments(str(SHM), ns, _group_pids(server.pid))
+        if orphans:
+            found.append(f"/dev/shm {len(orphans)} arena segment(s) no live server process maps")
     try:
         with open(log_path, "rb") as f:
             f.seek(before["log_at"])
@@ -327,6 +324,9 @@ def build_rust_server(arm: dict) -> str | None:
 
 
 RDMA_SYSFS = Path("/sys/class/infiniband")
+#: Starts the requirement check's one result line. An import can print to stdout too, before or after it
+#: (qwen_tts prints transformers' docstring warnings), so only this line is read.
+REQUIRES_RESULT = "mstar-e2e-requires: "
 
 
 def requirements_problem(arm: dict) -> str:
@@ -340,10 +340,15 @@ def requirements_problem(arm: dict) -> str:
         return nic
     code = ("import importlib, sys\nbad = []\nfor m in sys.argv[1:]:\n    mod, _, fn = m.partition(':')\n"
             "    try:\n        x = importlib.import_module(mod)\n        if fn:\n            getattr(x, fn)()\n"
-            "    except Exception as e:\n        bad.append(f'{m}: {type(e).__name__}')\nprint('; '.join(bad))")
+            "    except Exception as e:\n        bad.append(f'{m}: {type(e).__name__}')\n"
+            f"print({REQUIRES_RESULT!r} + '; '.join(bad), flush=True)")
     r = subprocess.run([job["python"], "-c", code, *mods], env={**os.environ, **server_env(arm)}, cwd=arm["src"],
                        capture_output=True, text=True, timeout=600, check=False)
-    bad = r.stdout.strip() or (r.stderr.strip()[-300:] if r.returncode else "")
+    results = [line for line in r.stdout.splitlines() if line.startswith(REQUIRES_RESULT)]
+    if results:
+        bad = results[-1].removeprefix(REQUIRES_RESULT).strip()
+    else:   # the check died before its result line, e.g. an import that crashed the interpreter
+        bad = (r.stderr.strip() or r.stdout.strip())[-300:] or f"requirement check exited {r.returncode}"
     return "; ".join(x for x in (bad, nic) if x)
 
 

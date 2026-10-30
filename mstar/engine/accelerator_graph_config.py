@@ -8,6 +8,38 @@ import torch
 from mstar.engine.resources import SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
+# A compile mode of the engine's own rather than torch.compile's: Inductor's
+# defaults in its deterministic mode, which picks each kernel's config by rule
+# instead of timing candidates on the device, so every process compiles the
+# same kernels and one input gives one output from any server. See
+# ``accelerator_graph_runner.compile_kwargs``.
+DETERMINISTIC_COMPILE_MODE = "deterministic"
+
+
+def check_compile_mode(mode: str | None) -> str | None:
+    """A capture config's ``compile_mode``, refused at build rather than at capture,
+    where the per-capture fallback would serve the bucket eager."""
+    if mode is None or mode in ("default", DETERMINISTIC_COMPILE_MODE):
+        return mode
+    if not mode:
+        # torch.compile takes a falsy mode for "default"
+        raise ValueError("compile_mode is empty; name a mode or leave it None")
+    try:
+        from torch._inductor import list_mode_options
+
+        options = list_mode_options(mode)
+    except Exception as exc:
+        raise ValueError(
+            f"compile_mode={mode!r} is not a mode this torch.compile accepts: {exc}"
+        ) from exc
+    if options.get("triton.cudagraphs"):
+        # Inductor's own graphs inside the runner's capture fail it
+        raise ValueError(
+            f"compile_mode={mode!r} turns on Inductor's CUDA graphs inside the runner's "
+            "capture; use a -no-cudagraphs mode"
+        )
+    return mode
+
 
 class AcceleratorGraphConfigType(Enum):
     BASIC_BATCHED = "basic_batched"
@@ -24,6 +56,9 @@ class AcceleratorGraphConfig(ABC):
         # Must be hashable.
         additional_key_info: Any | None = None,
         compile: bool = True, # whether to run torch.compile before cuda graph capture
+        # torch.compile mode for the captured forward; None takes the deployment's
+        # compile level (mstar serve -O), a mode opts the config out of it
+        compile_mode: str | None = None,
 
         # Per-config override for the set of batch sizes to capture
         capture_batch_sizes: list[int] | None = None,
@@ -44,6 +79,7 @@ class AcceleratorGraphConfig(ABC):
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
         self.additional_key_info = additional_key_info
         self.compile = compile
+        self.compile_mode = check_compile_mode(compile_mode)
         self.capture_batch_sizes = capture_batch_sizes
         self.capture_forward_method = capture_forward_method
         self.caps_eager_batch_size = caps_eager_batch_size
@@ -80,6 +116,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         capture_forward_method: str = "forward_batched",
         caps_eager_batch_size: bool = True,
         total_tokens_multiplier: int = 1,
+        compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
     ):
         super().__init__(
@@ -87,6 +124,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
             replay_graph_walks=replay_graph_walks,
             additional_key_info=additional_key_info,
             compile=compile,
+            compile_mode=compile_mode,
             capture_batch_sizes=capture_batch_sizes,
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
@@ -152,6 +190,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         # guidance: cond + uncond in one plan) multiplies them by this, so
         # the resources size their per-bucket buffers for the whole plan.
         total_tokens_multiplier: int = 1,
+        compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
         # (input tokens, bs) -> each capture row's span; `distribute_tokens`
         # by default. A walk whose kernels split rows by span (a mixed step's
@@ -163,6 +202,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
             replay_graph_walks=replay_graph_walks,
             additional_key_info=additional_key_info,
             compile=compile,
+            compile_mode=compile_mode,
             capture_batch_sizes=capture_batch_sizes,
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
@@ -259,6 +299,13 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # own work; the lease only tells the outer declaration which resources are
     # already spoken for, so it can leave them out.
     lease_before_step: bool = False
+    # For a `lease_before_step` region: whether this batch may take a slot at
+    # all, beyond fitting a captured bucket. For a limit the bucket key does
+    # not express, such as how many attention segments a replay's plan holds.
+    # A batch it rejects gets no lease, so its forward runs the region eagerly
+    # (`ModelInputsFromEngine.step` is the declaration that tells it so).
+    # None: every batch that fits a bucket.
+    can_lease: Callable[[list[NodeInputs]], bool] | None = None
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
     # None => defer to the runner's default batch-size buckets
@@ -266,6 +313,12 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # Whether to torch.compile capture_fn before capture. Default off; the
     # block loop already benefits from graph capture alone.
     compile: bool = False
+    # torch.compile mode for the region; None takes the deployment's compile
+    # level (mstar serve -O), a mode opts the config out of it
+    compile_mode: str | None = None
+
+    def __post_init__(self):
+        check_compile_mode(self.compile_mode)
 
     @abstractmethod
     def get_config_type(self) -> PiecewiseConfigType:

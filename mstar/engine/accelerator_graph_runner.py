@@ -4,18 +4,20 @@ import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, is_dataclass, replace
-from functools import partial
+from functools import cache, partial
 from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
+from torch.distributed import ReduceOp
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import JointGroups
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
 )
 from mstar.engine.accelerator_graph_config import (
+    DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
     PiecewiseAcceleratorGraphConfig,
@@ -37,6 +39,75 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
+# torch.compile arguments per compile level (``mstar serve -O``), for a captured
+# forward whose config names no ``compile_mode``. Qwen3.5-0.8B on H200 with an
+# empty Inductor cache started in 170 s / 320 s / 1,294 s at levels 0 / 1 / 2.
+# Coordinate descent alone got all of max-autotune's GPU time per decode step
+# (it fuses the decode GEMMs with their epilogues); the GEMM template search on
+# top bought nothing measurable.
+COMPILE_LEVELS: dict[int, dict[str, Any]] = {
+    0: {},  # torch.compile's default: Inductor fusion, cuBLAS GEMMs, no tuning
+    1: {"options": {"coordinate_descent_tuning": True}},
+    2: {"mode": "max-autotune-no-cudagraphs"},
+}
+DEFAULT_COMPILE_LEVEL = 1
+
+
+@cache
+def compile_level() -> int:
+    """How much tuning a captured forward's compile does: ``MSTAR_COMPILE_LEVEL``
+    (``mstar serve -O``), one of ``COMPILE_LEVELS``."""
+    raw = os.environ.get("MSTAR_COMPILE_LEVEL") or str(DEFAULT_COMPILE_LEVEL)
+    try:
+        level = int(raw)
+    except ValueError:
+        level = -1
+    if level not in COMPILE_LEVELS:
+        logger.warning(
+            "MSTAR_COMPILE_LEVEL=%r is not one of %s; using %d",
+            raw, sorted(COMPILE_LEVELS), DEFAULT_COMPILE_LEVEL,
+        )
+        return DEFAULT_COMPILE_LEVEL
+    return level
+
+
+@cache
+def _has_deterministic_mode() -> bool:
+    import torch._inductor.config as inductor_config
+
+    if hasattr(inductor_config, "deterministic"):
+        return True
+    logger.warning(
+        "torch %s has no Inductor deterministic mode; compiles that ask for it time "
+        "their kernels instead, so their output can differ between server processes",
+        torch.__version__,
+    )
+    return False
+
+
+def deterministic_inductor_options() -> dict[str, Any]:
+    """Inductor options for its deterministic mode (see
+    ``DETERMINISTIC_COMPILE_MODE``), for a compile that sets its own options;
+    empty, with a warning, on a torch without the mode."""
+    return {"deterministic": True} if _has_deterministic_mode() else {}
+
+
+def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
+    """``torch.compile``'s arguments for a capture config whose ``compile_mode``
+    is ``config_mode``, which the config checked when it was built. None takes
+    the compile level's arguments."""
+    kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
+    if config_mode is None:
+        return {**kwargs, **COMPILE_LEVELS[compile_level()]}
+    if config_mode == DETERMINISTIC_COMPILE_MODE:
+        options = deterministic_inductor_options()
+        return {**kwargs, "options": options} if options else kwargs
+    # "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning
+    if config_mode != "default":
+        kwargs["mode"] = config_mode
+    return kwargs
+
+
 def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:
     """Return resource keys that prevent capture of the declared step."""
     if step is None:
@@ -53,33 +124,6 @@ def autocast_scope(dtype: torch.dtype | None, device_type: str, node_name: str |
         device_type, enabled=dtype is not None, dtype=dtype or torch.bfloat16
     ):
         yield
-
-
-def agree_across_ranks(
-    comm_group: JointGroups | None, values: list[int], device: torch.device,
-    reduce: Callable[..., torch.Tensor],
-) -> list[int]:
-    """Reduce each of ``values`` over every rank of the joint group with
-    ``reduce``. `torch.amin` ANDs flags and `torch.amax` takes the largest.
-
-    Capture failure is per-rank: a rank that keeps a graph another rank
-    dropped replays it while the other runs eager, which hangs as soon as the
-    captured region holds a collective. Callers pass an order derived from the
-    configs, which are identical on every rank.
-    """
-    groups = [] if comm_group is None else [
-        comm_group.tp_group, comm_group.sp_group
-    ]
-    if not values or all(group.world_size == 1 for group in groups):
-        return values
-    gathered = torch.tensor(values, dtype=torch.int64, device=device)
-    for group in groups:
-        if group.world_size > 1:
-            # all_gather is rank-major, so dim 0 runs over the ranks
-            gathered = reduce(group.all_gather(gathered, dim=0).reshape(
-                group.world_size, -1
-            ), dim=0)
-    return gathered.tolist()
 
 
 #: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
@@ -842,7 +886,7 @@ class AcceleratorGraphRunner:
         all, and plan on the same kind of cost. With no forward and no barrier:
         sizing ran the forwards, and a capture runs no collective.
         """
-        if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
+        if not self._comm_group.agree([int(wanted)], ReduceOp.MAX)[0]:
             return self._capture_costs
         for spec in self.prepare_for_capture():
             if spec.slot != 0 or spec.bucket not in self._lent:
@@ -896,9 +940,9 @@ class AcceleratorGraphRunner:
         # costliest first, so the graphs after it fit in what it leaves free; by
         # the most each costs on any rank, so every rank warms up in one order
         buckets = list(dict.fromkeys(spec.bucket for spec in slot_specs))
-        costs = dict(zip(buckets, agree_across_ranks(self._comm_group, [
+        costs = dict(zip(buckets, self._comm_group.agree([
             self._capture_costs[bucket].graph if sized and bucket in planned else 0 for bucket in buckets
-        ], self._device, torch.amax), strict=True))
+        ], ReduceOp.MAX), strict=True))
 
         # bucket -> slot index -> (spec, captured slot). Registration is
         # deferred to a whole bucket at a time: its slots are double buffers of
@@ -992,10 +1036,9 @@ class AcceleratorGraphRunner:
                 seen.add(spec.bucket)
                 order.append(spec.bucket)
 
-        agreed = agree_across_ranks(
-            self._comm_group,
+        agreed = self._comm_group.agree(
             [len(captured.get(key, ())) == self._num_slots for key in order],
-            self._device, torch.amin,
+            ReduceOp.MIN,
         )
         return {key for key, ok in zip(order, agreed, strict=True) if ok}
 
@@ -1165,10 +1208,7 @@ class AcceleratorGraphRunner:
             return forward
         if spec.config_idx not in self._compiled_forwards:
             self._compiled_forwards[spec.config_idx] = torch.compile(
-                forward,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=False,
-                dynamic=False,
+                forward, **compile_kwargs(spec.config.compile_mode),
             )
         return with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
@@ -1182,6 +1222,7 @@ class AcceleratorGraphRunner:
             per_request_info=dummy_metadata(dummy_rids, graph_walk),
             resources=dict(self._resources),
             captured=True,
+            synthetic=True,
         )
 
     @staticmethod
@@ -1483,12 +1524,16 @@ class AcceleratorGraphRunner:
         earlier hands the main thread a GIL the GPU thread still needs. Only
         `graph.replay()` below drops it in C++.
         """
+        laps = profiler.PhaseLaps("engine.forward.")
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             self._graph_backend.current_stream().wait_event(plan_done_event)
         if launch_started_event is not None:
             launch_started_event.set()
-        return self._replay(lease)
+        laps.lap("stage")
+        out = self._replay(lease)
+        laps.lap("replay")
+        return out
 
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
@@ -1631,7 +1676,7 @@ class PiecewiseAcceleratorGraphRunner:
         self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
         self._graph_backend = self._device_capability.graph_backend
         self._autocast_dtype = autocast_dtype
-        self._comm_group = joint_comm_group
+        self._comm_group = joint_comm_group or JointGroups(CommGroup.trivial(), CommGroup.trivial())
         # scopes buffer allocation; `label` carries it but mangled with the region
         self._node_name = node_name
         self._prepared_shapes: list | None = None
@@ -1751,9 +1796,8 @@ class PiecewiseAcceleratorGraphRunner:
         captured: list[CaptureCost] = []
         for shape in shapes:
             for slot in range(self._num_slots):
-                if self._comm_group is not None:
-                    self._comm_group.tp_group.barrier()
-                    self._comm_group.sp_group.barrier()
+                self._comm_group.tp_group.barrier()
+                self._comm_group.sp_group.barrier()
                 free = torch.cuda.mem_get_info(self._device)[0]
                 try:
                     with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
@@ -1789,7 +1833,7 @@ class PiecewiseAcceleratorGraphRunner:
     def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
         """Capture every shape a lender sized, thrown away, if ``wanted`` here
         or on another rank; see `AcceleratorGraphRunner.size_lent_captures`."""
-        if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
+        if not self._comm_group.agree([int(wanted)], ReduceOp.MAX)[0]:
             return self._capture_costs
         for shape in self.prepare_for_capture():
             bucket = self._bucket(shape)
@@ -1849,14 +1893,14 @@ class PiecewiseAcceleratorGraphRunner:
         )
         # as in `AcceleratorGraphRunner.warmup_and_capture`: what every rank planned, costliest first
         sized = planned is not None
-        planned_everywhere = agree_across_ranks(
-            self._comm_group, [not sized or self._bucket(shape) in planned for shape in ordered],
-            self._device, torch.amin,
+        planned_everywhere = self._comm_group.agree(
+            [not sized or self._bucket(shape) in planned for shape in ordered],
+            ReduceOp.MIN,
         )
-        costs = agree_across_ranks(self._comm_group, [
+        costs = self._comm_group.agree([
             self._capture_costs[self._bucket(shape)].graph if sized and ok else 0
             for shape, ok in zip(ordered, planned_everywhere, strict=True)
-        ], self._device, torch.amax)
+        ], ReduceOp.MAX)
         captured = [False] * len(ordered)
         for i in sorted(range(len(ordered)), key=lambda i: -costs[i]):
             shape = ordered[i]
@@ -1868,9 +1912,8 @@ class PiecewiseAcceleratorGraphRunner:
                 # rank still in pre-capture setup would mismatch one already in the
                 # warmup forward. Every rank walks all the slots even after a
                 # failure here, or the barrier counts diverge and they hang.
-                if self._comm_group is not None:
-                    self._comm_group.tp_group.barrier()
-                    self._comm_group.sp_group.barrier()
+                self._comm_group.tp_group.barrier()
+                self._comm_group.sp_group.barrier()
                 try:
                     self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
                 except Exception:
@@ -1891,7 +1934,7 @@ class PiecewiseAcceleratorGraphRunner:
         # `ordered` comes from the config, so every rank agrees on the order
         for shape, ok in zip(
             ordered,
-            agree_across_ranks(self._comm_group, captured, self._device, torch.amin),
+            self._comm_group.agree(captured, ReduceOp.MIN),
             strict=True,
         ):
             if ok:
@@ -1955,9 +1998,7 @@ class PiecewiseAcceleratorGraphRunner:
         fn = self._config.capture_fn
         if self._config.compile:
             fn = with_inductor_overrides(
-                torch.compile(
-                    fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
-                ),
+                torch.compile(fn, **compile_kwargs(self._config.compile_mode)),
                 shape.total_tokens,
             )
 
@@ -2012,6 +2053,7 @@ class PiecewiseAcceleratorGraphRunner:
                 per_request_info=dummy_metadata(step_ids, PIECEWISE_WALK),
                 resources=dict(self._resources),
                 step=step,
+                synthetic=True,
             ),
             kwargs=self._config.forward_kwargs,
         )
@@ -2116,6 +2158,10 @@ class PiecewiseAcceleratorGraphRunner:
     def lease_before_step(self) -> bool:
         """Whether this region takes its slot ahead of the declaration."""
         return self._config.lease_before_step
+
+    def can_lease(self, inputs: list[NodeInputs]) -> bool:
+        """The config's ``can_lease`` for this batch; True when it sets none."""
+        return self._config.can_lease is None or self._config.can_lease(inputs)
 
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,

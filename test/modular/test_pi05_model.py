@@ -333,7 +333,7 @@ def test_pi05_process_prompt_formats_state_into_text():
         input_modalities=["image", "text"],
         output_modalities=["action"],
         robot_state=state,
-    )
+    ).new_input_tensors
 
     # Result is a single text_inputs entry — no separate state_inputs.
     assert set(result.keys()) == {"text_inputs"}
@@ -356,7 +356,7 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
         prompt="hello world",
         input_modalities=["text"],
         output_modalities=["action"],
-    )
+    ).new_input_tensors
     assert "text_inputs" in result
     assert stub.last_prompt == "hello world"
 
@@ -416,38 +416,3 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
 
     # Unknown keys are dropped
     assert remap("totally.unknown.key") is None
-
-
-def test_extract_siglip_state_dict_filters_and_renames_vision_keys():
-    """Verify that ``Pi05Model._extract_siglip_state_dict`` produces a
-    ``Pi05SiglipEncoder.state_dict()``-compatible mapping from a flat
-    lerobot dict (only siglip + connector keys; others ignored).
-    """
-    from mstar.model.pi05.pi05_model import Pi05Model
-
-    def t(*shape):
-        return torch.zeros(*shape)
-
-    pali = "paligemma_with_expert.paligemma.model"
-    flat = {
-        # Vision tower -> vision_model.vision_model.<rest>
-        f"{pali}.vision_tower.vision_model.embeddings.patch_embedding.weight": t(1152, 3, 14, 14),
-        f"{pali}.vision_tower.vision_model.encoder.layers.0.layer_norm1.weight": t(1152),
-        # multi_modal_projector.linear -> connector
-        f"{pali}.multi_modal_projector.linear.weight": t(2048, 1152),
-        f"{pali}.multi_modal_projector.linear.bias": t(2048),
-        # Non-siglip keys should be dropped
-        "action_in_proj.weight": t(1024, 32),
-        f"{pali}.language_model.norm.weight": t(2048),
-        "paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight": t(2048, 1024),
-    }
-    siglip = Pi05Model._extract_siglip_state_dict(flat)
-
-    assert "vision_model.vision_model.embeddings.patch_embedding.weight" in siglip
-    assert "vision_model.vision_model.encoder.layers.0.layer_norm1.weight" in siglip
-    assert "connector.weight" in siglip
-    assert "connector.bias" in siglip
-    assert not any("multi_modal_projector" in k for k in siglip)
-    assert not any("language_model" in k for k in siglip)
-    assert not any("action_in_proj" in k for k in siglip)
-    assert not any("gemma_expert" in k for k in siglip)

@@ -35,7 +35,13 @@ from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers  # noqa: E402
-from mstar.utils.ipc_format import ConductorMessageType  # noqa: E402
+from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.utils.ipc_format import (  # noqa: E402
+    ConductorMessageType,
+    EnableMetrics,
+    WorkerMessage,
+    WorkerMessageType,
+)
 from mstar.worker.worker import Worker  # noqa: E402
 
 DATA_WORKER = "api_server_preprocess_worker"
@@ -50,6 +56,13 @@ class _Sink:
 
     def send(self, entity_id, msg):
         self.sent.append((entity_id, msg))
+
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
 
     def get_all_new_messages(self):
         return []
@@ -258,8 +271,8 @@ class _FailSecondRead(_MemmoveEngine):
 
 
 def test_a_failed_read_does_not_count_the_reads_before_it_again():
-    """A read whose future raises leaves the poll's earlier entries pending,
-    so the next poll sees them again; they count once."""
+    """A read whose future raises is dropped and handed to take_failed_reads;
+    the read delivered before it counts once, the failed one not at all."""
     producer, consumer = _mooncake("worker_0"), _mooncake("worker_1")
     consumer._async_reader = AsyncMooncakeReader(_FailSecondRead(), device="cpu")
     try:
@@ -273,9 +286,11 @@ def test_a_failed_read_does_not_count_the_reads_before_it_again():
         for future in [ep.future for ep in consumer.pending]:
             with contextlib.suppress(RuntimeError):
                 future.result(timeout=5)
-        for _ in range(3):
-            with pytest.raises(RuntimeError, match="Mooncake read failed"):
-                consumer.get_ready_tensors()
+        assert [e.name for e in consumer.get_ready_tensors()["r1"]] == ["h"]
+        for _ in range(2):
+            assert consumer.get_ready_tensors() == {}
+        (failed,) = consumer.take_failed_reads()
+        assert failed.request_id == "r1" and [e.name for e in failed.graph_edges] == ["g"]
         assert _series(stats.snapshot())[("enc", "llm", "TCP")][:3] == (16, 1, 1)
     finally:
         producer._async_reader.shutdown()
@@ -313,15 +328,20 @@ def _bare_worker(tmp_path):
 def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path):
     """A tensor parallel follower reads its own slice, so it reports its
     transfers on the worker status; its lead rank reports the engine
-    families."""
+    families. A read before ENABLE_METRICS (a warmup request's) is not
+    counted."""
     worker = _bare_worker(tmp_path)
 
     def not_on_a_follower():
         raise AssertionError("a rank leading nothing has no pending rows to report")
 
     worker.scheduler = SimpleNamespace(pending_rows=not_on_a_follower)
-    metrics = worker._start_metrics(3600.0)
-    infos = _send(_shm("worker_0", tmp_path), "r1", {"h": [torch.randn(4, 4)]})
+    metrics = worker._metrics = worker._start_metrics(3600.0)
+    producer = _shm("worker_0", tmp_path)
+    warmup = _send(producer, "warmup-0", {"h": [torch.randn(8, 8)]})
+    _read(worker.tensor_manager, "warmup-0", [GraphEdge(next_node="llm", name="h", tensor_info=warmup["h"])])
+    worker._process_message_list([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
+    infos = _send(producer, "r1", {"h": [torch.randn(4, 4)]})
     _read(worker.tensor_manager, "r1", [GraphEdge(next_node="llm", name="h", tensor_info=infos["h"])])
 
     metrics.maybe_report()
@@ -343,6 +363,9 @@ def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path
 class _TextModel:
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
 
 def test_the_data_worker_loop_publishes_the_results_it_reads(tmp_path, monkeypatch):

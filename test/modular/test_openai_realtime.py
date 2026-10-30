@@ -246,6 +246,24 @@ def test_bad_events_report_errors_but_keep_the_session(client_and_stub):
         assert json.loads(ws.receive_text())["error"]["message"] == "audio is not base64"
 
 
+@pytest.mark.parametrize("audio", [None, 0, False, []])
+def test_null_or_falsy_audio_is_an_invalid_audio_error(client_and_stub, audio):
+    """A null append is refused as on the bridge and the duplex server, not
+    read as an empty append, and the session keeps its audio."""
+    client, stub = client_and_stub
+    heard = _step_samples(stub)
+    tone = _tone(1600)
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        _append_bytes(ws, tone.tobytes())
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": audio}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        events = _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+    errors = [e["error"] for e in events if e["type"] == "error"]
+    assert errors == [{"type": "invalid_request_error", "message": "audio is not base64", "code": "invalid_audio"}]
+    assert _close_to(heard[-1], tone)
+
+
 def _step_samples(stub) -> list[np.ndarray]:
     """Make the stub keep the int16 samples each engine step heard."""
     heard: list[np.ndarray] = []
@@ -1006,3 +1024,28 @@ def test_stream_resampler_is_split_invariant_and_keeps_time():
         alias = np.sin(2 * np.pi * hz * np.arange(n) / 24000).astype(np.float32)
         out = np.concatenate([r.push(alias), r.flush()])
         assert np.sqrt((out[100:-100] ** 2).mean()) < 1e-3, hz
+
+
+def test_a_character_split_across_token_chunks_survives_a_step():
+    """Qwen3-ASR emits one byte-level BPE token per chunk, so a CJK character
+    or an emoji can arrive split across chunks: the step decodes the joined
+    bytes, not each chunk."""
+    import asyncio
+
+    text = "真正的存在😀"
+
+    class _ByteChunks(_StubAPI):
+        def submit_request(self, **kw):
+            super().submit_request(**kw)
+            data = self._chunks[kw["request_id"]][0].data
+            self._chunks[kw["request_id"]] = [_Chunk("text", data[i:i + 1]) for i in range(len(data))]
+            return kw["request_id"]
+
+    api = _ByteChunks()
+    api.answers = [text]
+    session = types.SimpleNamespace(
+        session_id="s", request=serving_realtime.TranscriptionRequest(model="rt_test"),
+        audio_so_far=lambda: np.zeros(1600, dtype=np.float32),
+    )
+    out = asyncio.run(serving_realtime._run_step(api, _ContinuingAdapter(), session, "pre "))
+    assert out == "pre " + text

@@ -51,6 +51,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sysconfig
 from pathlib import Path
 
 from mstar.api_server.auth import API_KEY_ENV
@@ -60,6 +61,7 @@ from mstar.communication.rust_communicator import (
     RustZMQCommunicator,
 )
 from mstar.model.multimodal import PromptPart
+from mstar.utils.client_errors import client_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -68,16 +70,32 @@ logger = logging.getLogger(__name__)
 #: message ends the wait immediately.
 BRIDGE_RECV_WAIT_S = 0.05
 
+#: The model's adapter class in ``ADAPTER_REGISTRY``; ``mstar-server`` picks
+#: its OpenAI translation by it (``Adapter::from_python``).
+OPENAI_ADAPTER_ENV = "MSTAR_OPENAI_ADAPTER"
+
+
+def openai_adapter_class(model_name: str) -> str:
+    """The class name of ``model_name``'s OpenAI adapter, "" when it has none."""
+    from mstar.api_server.openai.adapters import get_adapter
+
+    adapter = get_adapter(model_name)
+    return "" if adapter is None else type(adapter).__name__
+
 
 
 
 
 def find_server_binary(explicit: str | None = None) -> str:
     """Resolve the ``mstar-server`` binary: explicit arg, ``MSTAR_SERVER_BIN``,
-    ``$PATH``, then the in-repo release build."""
+    the running environment's scripts directory (where a Linux wheel installs
+    it, also when the venv is not activated), ``$PATH``, then the in-repo
+    release build. The scripts directory goes before ``$PATH`` so another
+    environment's older binary never serves this one's bridge."""
     for candidate in (
         explicit,
         os.getenv("MSTAR_SERVER_BIN"),
+        str(Path(sysconfig.get_path("scripts")) / "mstar-server"),
         shutil.which("mstar-server"),
         str(Path(__file__).resolve().parents[2]
             / "rust" / "server" / "target" / "release" / "mstar-server"),
@@ -99,6 +117,7 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env = {k: v for k, v in os.environ.items() if k != API_KEY_ENV}
     if api_key:
         env[API_KEY_ENV] = api_key
+    env[OPENAI_ADAPTER_ENV] = openai_adapter_class(model_name)
     proc = subprocess.Popen([binary, model_name, str(port), bridge_dir,
                              upload_dir], env=env)
     logger.info("Rust frontend started (pid=%d, port=%d)", proc.pid, port)
@@ -158,6 +177,14 @@ class RustFrontendBridge:
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
             )
+        except (ValueError, TypeError) as e:
+            # a refused input: an in-band error chunk carries its 400 to the client
+            logger.info("submit %s refused: %s", rid, e)
+            self._send({
+                "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
+                "data": str(e).encode("utf-8"), "metadata": {"status": 400},
+            })
+            return
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
             status = getattr(e, "status_code", None)
             if isinstance(status, int):
@@ -172,8 +199,10 @@ class RustFrontendBridge:
                     "data": str(detail).encode(), "metadata": {"status": status},
                 })
                 return
-            logger.warning("submit %s failed: %r", rid, e)
-            self._err(rid, sub, repr(e))
+            text, _ = client_error_text(
+                e, f"submit {rid} failed", log=logger, type_name=False,
+            )
+            self._err(rid, sub, text)
             return
         # Bound to this submission now, not when the task first runs: a later
         # submit in the same receive batch may reuse the rid.
@@ -191,9 +220,15 @@ class RustFrontendBridge:
                 })
             self._send({"t": "done", "rid": rid, "sub": sub})
         except Exception as e:  # noqa: BLE001 — includes the per-request timeout
-            detail = getattr(e, "detail", None) or repr(e)
-            logger.warning("request %s failed: %s", rid, detail)
-            self._err(rid, sub, str(detail))
+            detail = getattr(e, "detail", None)
+            if detail:
+                detail = str(detail)
+                logger.warning("request %s failed: %s", rid, detail)
+            else:
+                detail, _ = client_error_text(
+                    e, f"request {rid} failed", log=logger, type_name=False,
+                )
+            self._err(rid, sub, detail)
         finally:
             self._keys.pop(sub, None)
 

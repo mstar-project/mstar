@@ -7,6 +7,7 @@ extension is installed and the server binary is built
 import contextlib
 import json
 import socket
+import sysconfig
 import tempfile
 import threading
 import time
@@ -19,9 +20,11 @@ import pytest
 pytest.importorskip("mstar_rust")
 
 from mstar.api_server.rust_frontend import (
+    OPENAI_ADAPTER_ENV,
     RustFrontendBridge,
     find_server_binary,
     launch_rust_server,
+    openai_adapter_class,
 )
 
 try:
@@ -177,12 +180,12 @@ def test_generate_arrives_without_parts(stack):
     assert sub["parts"] is None, "a /generate submit carried chat parts"
 
 
-def _post_raw(port, path, raw_bytes, timeout=15):
-    """POST a raw body (possibly malformed) as application/json; return
-    (status, parsed_json_or_None)."""
+def _post_raw(port, path, raw_bytes, content_type="application/json", timeout=15):
+    """POST a raw body (possibly malformed), application/json by default;
+    return (status, parsed_json_or_None)."""
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=raw_bytes,
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": content_type})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read())
@@ -194,28 +197,29 @@ def _post_raw(port, path, raw_bytes, timeout=15):
             return e.code, None
 
 
-def test_malformed_json_body_is_422_with_detail(stack):
-    """A malformed / schema-invalid JSON body returns FastAPI's 422 +
-    {"detail": [{...}]} shape, not axum's default 400 + text/plain."""
+def test_malformed_json_body_is_400_in_the_openai_envelope(stack):
+    """A malformed / schema-invalid JSON body is a 400 in the OpenAI error
+    envelope, as on the Python frontend, not axum's default 400 + text/plain."""
     port, _stub, _bridge, _proc = stack
     # Broken JSON syntax.
     code, body = _post_raw(port, "/v1/chat/completions", b"{not json")
-    assert code == 422, (code, body)
-    assert isinstance(body["detail"], list) and body["detail"]
+    assert code == 400, (code, body)
+    assert body["error"]["type"] == "invalid_request_error"
     # Missing required field `role` (Python's pydantic ChatMessage requires it).
     code, body = _post_raw(
         port, "/v1/chat/completions",
         json.dumps({"model": "qwen3_omni",
                     "messages": [{"content": "hi"}]}).encode())
-    assert code == 422, (code, body)
-    assert isinstance(body["detail"], list) and body["detail"]
+    assert code == 400, (code, body)
+    assert body["error"]["type"] == "invalid_request_error"
 
 
-def test_ingest_failure_is_a_500_not_a_hang(stack):
+def test_refused_ingest_is_a_400_not_a_hang(stack):
     port, stub, _bridge, _proc = stack
     with pytest.raises(urllib.error.HTTPError) as e:
         _chat(port, "boom", timeout=15)
-    assert e.value.code == 500
+    # a ValueError from submit is a refused input, as on the Python frontend
+    assert e.value.code == 400
     # and the server keeps serving afterwards
     assert _chat(port, "again")["choices"][0]["message"]["content"] == \
         "Hello world"
@@ -301,8 +305,9 @@ def test_sigterm_drains_and_exits(stack):
 
 
 class _GatedStub(_StubAPIServer):
-    """Holds each request open until a shared gate is released, so a request's
-    admission permit is observably held for its whole (streaming) body."""
+    """Sends the first chunk, then holds each request open until a shared gate
+    is released, so a request's admission permit is observably held for its
+    whole (streaming) body."""
 
     def __init__(self, gate):
         super().__init__()
@@ -310,9 +315,9 @@ class _GatedStub(_StubAPIServer):
 
     async def iter_result_chunks(self, request_id):
         import asyncio
+        yield _Chunk("text", b"Hello ")
         while not self.gate.is_set():
             await asyncio.sleep(0.02)
-        yield _Chunk("text", b"Hello ")
         yield _Chunk("text", b"world")
 
 
@@ -330,7 +335,8 @@ def test_admission_permit_is_held_through_streaming_body():
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_adm_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_admup_")
-    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1")
+    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1",
+               **{OPENAI_ADAPTER_ENV: openai_adapter_class("qwen3_omni")})
     proc = subprocess.Popen(
         [BINARY, "qwen3_omni", str(port), bridge_dir, upload_dir], env=env)
     stub = _GatedStub(gate)
@@ -344,8 +350,8 @@ def test_admission_permit_is_held_through_streaming_body():
     resp_a = None
     try:
         assert _wait_healthy(port)
-        # A: a streaming chat. The role-delta head event flushes immediately;
-        # the body then blocks on the gate, so A holds its permit open.
+        # A: a streaming chat. Its first delta flushes immediately; the body
+        # then blocks on the gate, so A holds its permit open.
         body = {"model": "qwen3_omni", "stream": True,
                 "messages": [{"role": "user", "content": "hi"}]}
         req_a = urllib.request.Request(
@@ -353,7 +359,8 @@ def test_admission_permit_is_held_through_streaming_body():
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
         resp_a = urllib.request.urlopen(req_a, timeout=15)
-        assert resp_a.readline()  # head event received: A is being served
+        # Not just any line: an SSE keep-alive comment would also be one.
+        assert b"Hello" in resp_a.readline()  # first delta: A is being served
         # B: A holds the only permit, so B is refused with 503.
         with pytest.raises(urllib.error.HTTPError) as e:
             _chat(port, "second", timeout=5)
@@ -447,12 +454,13 @@ def test_upload_filename_traversal_is_contained(tmp_path):
     assert ".." not in os.path.basename(path)
 
 
-def _generate(port, urlencoded: bool, timeout=30):
+def _generate(port, urlencoded: bool, fields=None, timeout=30):
     """POST /generate with either content type; returns (status, ndjson)."""
     import urllib.parse
 
-    fields = {"text": "hi", "output_modalities": "text",
-              "streaming": "false", "model_kwargs": '{"foo": 1}'}
+    if fields is None:
+        fields = {"text": "hi", "output_modalities": "text",
+                  "streaming": "false", "model_kwargs": '{"foo": 1}'}
     if urlencoded:
         data = urllib.parse.urlencode(fields).encode()
         ctype = "application/x-www-form-urlencoded"
@@ -469,6 +477,32 @@ def _generate(port, urlencoded: bool, timeout=30):
         return r.status, r.read()
 
 
+# The Python /generate's 400s (test_video_frame_protocol checks the same text there).
+_STREAMING_ONLY = ("Output modality video_frame requires streaming=true; raw frame "
+                   "chunks cannot be returned as an aggregated response.")
+_OUTPUT_ONLY = "'video_frame' is an output-only modality"
+
+
+@pytest.mark.parametrize("fields,detail", [
+    ({"output_modalities": "video_frame", "streaming": "false"}, _STREAMING_ONLY),
+    ({"input_modalities": "video_frame", "output_modalities": "text"}, _OUTPUT_ONLY),
+], ids=["output-not-streamed", "input"])
+def test_generate_refuses_video_frame_with_a_400_before_submitting(stack, fields, detail):
+    """The API server's own check would raise a ValueError, which reaches
+    the client as a 500."""
+    import urllib.parse
+
+    port, stub, _bridge, _proc = stack
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hi", **fields}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=15)
+    assert (e.value.code, json.loads(e.value.read())) == (400, {"detail": detail})
+    assert stub.submitted == []
+
+
 def test_generate_accepts_both_content_types(stack):
     """The FastAPI /generate accepts multipart AND urlencoded form bodies
     (the latter is what `requests.post(data=...)` sends with no files); the
@@ -481,6 +515,18 @@ def test_generate_accepts_both_content_types(stack):
     texts = [s["text"] for s in stub.submitted]
     assert texts.count("hi") == 2, stub.submitted
     assert all(s["mk"] == {"foo": 1} for s in stub.submitted)
+
+
+@pytest.mark.parametrize("urlencoded", [False, True])
+def test_generate_treats_an_empty_request_id_as_none(stack, urlencoded):
+    """Like the Python /generate: each request gets a fresh id, so two with
+    ``request_id=""`` never collide on ``""``."""
+    port, stub, _bridge, _proc = stack
+    for streaming in ("true", "false"):
+        fields = {"text": "hi", "streaming": streaming, "request_id": ""}
+        assert _generate(port, urlencoded, fields)[0] == 200
+    rids = [s["rid"] for s in stub.submitted]
+    assert len(rids) == 2 and "" not in rids and rids[0] != rids[1]
 
 
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42FAKE-MP4-BYTES"
@@ -509,8 +555,9 @@ def _model_stack(model, stub, env=None):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_ms_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_msup_")
+    env = {OPENAI_ADAPTER_ENV: openai_adapter_class(model), **(env or {})}
     proc = subprocess.Popen(
-        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **(env or {})))
+        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **env))
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
@@ -759,6 +806,127 @@ def test_images_generations_on_cosmos3():
         assert base64.b64decode(out["data"][0]["b64_json"]) == b"\x89PNG\r\n\x1a\nFAKE"
 
 
+def _generate_stream(port, timeout=15):
+    import urllib.parse
+    data = urllib.parse.urlencode(
+        {"text": "hi", "output_modalities": "text", "streaming": "true"}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, [json.loads(line) for line in r.read().splitlines() if line]
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_refused_streaming_generate_gets_its_status_not_a_200():
+    """A request refused before its first chunk answers with its status, as
+    the Python frontend's open_result_stream does."""
+    with _model_stack("qwen3_omni", _ErrorChunkStub(400)) as (port, _up):
+        code, body = _generate_stream(port)
+    assert code == 400, (code, body)
+    assert "boom" in body["detail"]
+
+
+class _FailsMidStreamStub(_StubAPIServer):
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("text", b"Hello ")
+        yield _Chunk("error", b"Error in worker: boom", {"status": 503})
+
+
+def test_streaming_generate_carries_a_late_errors_status_in_band():
+    with _model_stack("qwen3_omni", _FailsMidStreamStub()) as (port, _up):
+        code, lines = _generate_stream(port)
+    assert code == 200
+    assert lines[0]["modality"] == "text"
+    assert lines[-1] == {"error": "Error in worker: boom", "status": 503}
+
+
+def test_bagel_images_map_size_onto_width_and_height():
+    """Generations and edits both, as the Python BagelAdapter."""
+    stub = _ImageStubAPIServer()
+    with _model_stack("bagel", stub) as (port, _up):
+        _post_json(port, "/v1/images/generations",
+                   {"model": "bagel", "prompt": "a cat", "size": "512x768"})
+        boundary = "mstarboundary"
+        fields = {"prompt": "make it neon", "size": "640x480"}
+        data = (
+            "".join(f'--{boundary}\r\nContent-Disposition: form-data; '
+                    f'name="{k}"\r\n\r\n{v}\r\n' for k, v in fields.items())
+            + f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
+              'filename="in.png"\r\nContent-Type: image/png\r\n\r\n'
+        ).encode() + b"\x89PNGinput\r\n" + f"--{boundary}--\r\n".encode()
+        code, _ = _post_raw(port, "/v1/images/edits", data,
+                            f"multipart/form-data; boundary={boundary}")
+        assert code == 200
+        code, body = _post_raw(port, "/v1/images/generations", json.dumps(
+            {"model": "bagel", "prompt": "a cat", "size": "big"}).encode())
+        assert code == 400 and "WxH" in body["error"]["message"]
+    gen, edit = stub.submitted
+    assert (gen["mk"]["width"], gen["mk"]["height"]) == (512, 768)
+    assert (edit["mk"]["width"], edit["mk"]["height"]) == (640, 480)
+    assert "size" not in gen["mk"] and "size" not in edit["mk"]
+
+
+class _AudioStub(_StubAPIServer):
+    """Two PCM pieces, then optionally a late failure."""
+
+    def __init__(self, fail_after=False):
+        super().__init__()
+        self.fail_after = fail_after
+
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("audio", b"\x01\x00" * 4)
+        yield _Chunk("audio", b"\x02\x00" * 4)
+        if self.fail_after:
+            yield _Chunk("error", b"Error in worker: boom", {"status": 500})
+
+
+def _speech_stream(port, fmt="wav", timeout=15):
+    """(status, content_type, body) of a streaming /v1/audio/speech request."""
+    body = {"model": "orpheus", "input": "hi", "voice": "tara",
+            "stream": True, "response_format": fmt}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/audio/speech", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.headers["Content-Type"], r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers["Content-Type"], json.loads(e.read())
+
+
+def test_refused_streaming_speech_gets_its_status_not_a_200():
+    with _model_stack("orpheus", _ErrorChunkStub(400)) as (port, _up):
+        code, _ctype, body = _speech_stream(port)
+    assert code == 400, (code, body)
+    assert "boom" in body["error"]["message"]
+    assert body["error"]["type"] == "invalid_request_error"
+
+
+def test_streaming_speech_wav_and_pcm():
+    pcm = b"\x01\x00" * 4 + b"\x02\x00" * 4
+    with _model_stack("orpheus", _AudioStub()) as (port, _up):
+        code, ctype, wav = _speech_stream(port, "wav")
+        assert (code, ctype) == (200, "audio/wav")
+        assert wav[:4] == b"RIFF" and wav.endswith(pcm) and len(wav) == 44 + len(pcm)
+        # pcm is the bare samples, as the Python frontend serves it
+        code, ctype, raw = _speech_stream(port, "pcm")
+        assert (code, ctype, raw) == (200, "audio/pcm", pcm)
+
+
+def test_streaming_speech_aborts_the_body_on_a_late_error():
+    """A cleanly ended stream would pass for a complete answer, so the read
+    must fail: a truncated body, or a dropped connection when the error lands
+    before the headers are flushed (both are http.client.HTTPException)."""
+    import http.client
+
+    with _model_stack("orpheus", _AudioStub(fail_after=True)) as (port, _up):
+        with pytest.raises(http.client.HTTPException):
+            _speech_stream(port)
+
+
 class _RefusedError(Exception):
     """An ``HTTPException`` without fastapi (the CI Rust job installs M* bare)."""
 
@@ -908,9 +1076,12 @@ class _GatedKeyedStub(_KeyedStub):
             self.running.discard(key)
             yield _Chunk("error", b"bad input", {"status": 400})
             return
+        # the first chunk opens the stream (its 200); the request stays in flight until the gate
+        chunks = super()._stream(key)
+        yield await anext(chunks)
         while not self.gate.is_set():
             await asyncio.sleep(0.01)
-        async for chunk in super()._stream(key):
+        async for chunk in chunks:
             yield chunk
 
 
@@ -957,7 +1128,7 @@ def test_refusals_reach_the_api_server_registry():
         assert call("GET", "/no/such/route") == 404
         assert call("GET", "/generate") == 405
         assert call("POST", "/v1/chat/completions", b"x" * 2**21) == 413
-        assert call("POST", "/v1/chat/completions", b"{not json") == 422
+        assert call("POST", "/v1/chat/completions", b"{not json") == 400
         assert call("POST", "/generate", generate("B", model_kwargs="{"), ctype=form) == 400
         assert call("POST", "/generate", generate("F", text="fail", streaming="false"), ctype=form) == 400
         streams = [open_stream("X")]
@@ -980,7 +1151,7 @@ def test_refusals_reach_the_api_server_registry():
                 if s.name == "mstar_http_refusals_total" and s.labels["model_name"] == "qwen3_omni"}
     assert refusals == {
         ("/v1/chat/completions", "401"): 1, ("unmatched", "401"): 1, ("unmatched", "404"): 1,
-        ("/generate", "405"): 1, ("/v1/chat/completions", "413"): 1, ("/v1/chat/completions", "422"): 1,
+        ("/generate", "405"): 1, ("/v1/chat/completions", "413"): 1, ("/v1/chat/completions", "400"): 1,
         ("/generate", "400"): 1, ("/generate", "409"): 1, ("/v1/chat/completions", "503"): 1,
     }
     assert stub.n == 3, "a refused request reached the backend"
@@ -1013,3 +1184,16 @@ def test_images_n_cap_follows_the_env():
         out = _post_json(port, "/v1/images/generations",
                          {"model": "cosmos3", "prompt": "x", "n": 2})
         assert len(out["data"]) == 2
+
+
+def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkeypatch):
+    # An unactivated venv's python must not launch an older mstar-server that
+    # happens to be on $PATH against its own bridge code.
+    scripts, elsewhere = tmp_path / "venv-bin", tmp_path / "on-path"
+    for d in (scripts, elsewhere):
+        d.mkdir()
+        (d / "mstar-server").touch(mode=0o755)
+    monkeypatch.delenv("MSTAR_SERVER_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(elsewhere))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(scripts))
+    assert find_server_binary() == str(scripts / "mstar-server")

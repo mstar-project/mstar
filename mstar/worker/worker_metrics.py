@@ -6,6 +6,10 @@ per-request work), and the tensor manager records each edge it reads
 interval, when the worker sends the conductor one ``WorkerStatus`` with
 cumulative snapshots; the conductor forwards them to the API server.
 
+The gauges are live from worker start. The histograms and counters, and the
+transfers, start at ``start_counting()``, which the API server triggers after
+its warmup requests, as it does for its own families.
+
 Engine families cover only the nodes this rank leads (``components``): the
 other ranks of a lockstep instance run the same steps over the same page
 counts. Transfers are every rank's own reads (each reads its slice).
@@ -15,6 +19,7 @@ Recording never changes what any rank runs.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -47,7 +52,7 @@ class WorkerMetrics:
         scheduler: MicroScheduler,
         send: Callable[[WorkerStatus], None],
         *,
-        transfers: EdgeTransfers,
+        enable_transfers: Callable[[], EdgeTransfers],
     ):
         self.worker_id = worker_id
         self.components = components
@@ -56,7 +61,13 @@ class WorkerMetrics:
         self._report_failed = False
         self._scheduler = scheduler
         self._send = send
-        self._transfers = transfers
+        self._enable_transfers = enable_transfers
+        # empty until start_counting() swaps in the tensor manager's
+        self._transfers = EdgeTransfers("")
+        # steps whose time starts from then on are counted
+        self._counting_since = math.inf
+        # per cache, its prefix_tokens at start_counting(); None before
+        self._prefix_base: list[dict[str, tuple[int, int]]] | None = None
         # (resource key, its reported nodes, cache); a cache only follower
         # nodes use is left to their lead rank
         self._kv = [
@@ -74,6 +85,14 @@ class WorkerMetrics:
         self._prefix_hit = Counter(catalog.PREFIX_CACHE_HIT_TOKENS)
         self._pending = Gauge(catalog.COMPONENT_PENDING_STEPS)
 
+    def start_counting(self) -> None:
+        """Count the steps whose time starts from now on (see ``step_done``),
+        the prefix-cache lookups after this, and the tensors this rank reads
+        from now on."""
+        self._counting_since = time.perf_counter()
+        self._prefix_base = [dict(cache.prefix_tokens) for _, _, cache in self._kv]
+        self._transfers = self._enable_transfers()
+
     def step_done(
         self, node: str, graph_walk: str, inputs: list[NodeInputs] | None,
         submitted_at: float,
@@ -87,7 +106,7 @@ class WorkerMetrics:
         self._last_done = now
         # A step whose rows were all declined or served from the prefix cache
         # ran no forward.
-        if inputs and node in self.components:
+        if inputs and node in self.components and start >= self._counting_since:
             labels = (node, graph_walk)
             self._step_seconds.observe(labels, now - start)
             self._batch_size.observe(labels, len(inputs))
@@ -110,18 +129,22 @@ class WorkerMetrics:
     def snapshot(self) -> list[MetricSnapshot]:
         """Every worker family in ``catalog.WORKER_FAMILIES`` order."""
         prefix: dict[str, tuple[int, int]] = {}
-        for key, nodes, cache in self._kv:
+        for i, (key, nodes, cache) in enumerate(self._kv):
             counts = cache.page_counts()
             for node in nodes:
                 labels = (node, key)
                 self._kv_used.set(labels, counts.used)
                 self._kv_total.set(labels, counts.total)
                 self._kv_cached.set(labels, counts.cached)
+            if self._prefix_base is None:
+                continue
+            base = self._prefix_base[i]
             # list() first: the GPU thread adds a node's first lookup while this runs
             for node, (queried, hit) in list(cache.prefix_tokens.items()):
                 if node in self.components:
+                    q0, h0 = base.get(node, (0, 0))
                     q, h = prefix.get(node, (0, 0))
-                    prefix[node] = (q + queried, h + hit)
+                    prefix[node] = (q + queried - q0, h + hit - h0)
         for node, (queried, hit) in prefix.items():
             # the caches keep cumulative totals, so these are set, not added
             self._prefix_query.set((node,), queried)

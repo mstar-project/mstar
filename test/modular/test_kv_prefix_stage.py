@@ -184,6 +184,24 @@ def test_a_walk_carrying_anything_opaque_never_probes(opaque):
     )
 
 
+class _Overriding(_Submodule):
+    """Overrides `split_inputs` without cutting its ``tensor_inputs``."""
+
+    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+
+
+def test_overriding_split_inputs_alone_never_probes_a_walk_carrying_tensor_inputs():
+    resource = _Answering(96)
+    engine = _engine({"kv": resource}, {NODE: ["kv"]})
+    engine._submodules[NODE].submodule = _Overriding()
+    inputs = _inputs(tensor_inputs={"extra": torch.zeros(PROMPT)})
+
+    assert _stage(engine, inputs) is inputs and resource.resolved == 0, (
+        "a submodule that never set cuts_tensor_inputs was probed, and its cut raises mid-step"
+    )
+
+
 def test_a_falsy_step_info_is_not_opaque():
     resource = _Answering(96)
     engine = _engine({"kv": resource}, {NODE: ["kv"]})
@@ -332,4 +350,23 @@ def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
     )
     assert batch.inputs[0].input_seq_len == PROMPT - 96, (
         "the surviving request lost its own match"
+    )
+
+
+@pytest.mark.parametrize("request_walks", [{}, {RID: WALK, "r1": "decode"}], ids=["one walk", "mixed"])
+def test_a_walk_the_cache_serves_whole_completes_without_failing_its_request(request_walks):
+    engine = _engine({"kv": _Answering(PROMPT)}, {NODE: ["kv"]})
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    batch = ExecutingBatch(
+        node_name=NODE, per_request_info={RID: None, "r1": None},
+        step_context=StepContext(
+            request_ids=(RID, "r1"), graph_walk="mixed" if request_walks else WALK,
+            slot=0, capture=False, request_walks=request_walks,
+        ),
+    )
+
+    engine._prepare_inputs(batch)
+
+    assert RID in batch.cached_rids and not batch.failed_requests, (
+        "a walk the cache served whole failed its request, so it never reached its next walk"
     )

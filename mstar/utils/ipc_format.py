@@ -40,6 +40,7 @@ class WorkerMessageType(Enum):
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
+    ENABLE_METRICS = "enable_metrics"
 
 
 @dataclass
@@ -49,6 +50,7 @@ class NewRequest(MessageBody):
     worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
+    loop_caps: dict[str, int]
 
 
 class MessageSource(IntEnum):
@@ -192,6 +194,12 @@ class ScheduleTPNode(MessageBody):
     # means every rid runs graph_walk
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
+    # rank 0's prefix-cache leases, by wire request id and then resource
+    prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
+    page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # A row of the step takes an input a follower reads from elsewhere: every
+    # rank agrees on whose read failed before preparing the step
+    read_check: bool = False
 
 
 @dataclass
@@ -218,6 +226,18 @@ class ConductorMessageType(Enum):
     FAIL_REQUESTS = "fail_requests"
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
+    ENABLE_METRICS = "enable_metrics"
+    CLIENT_STREAM_INPUT = "client_stream_input"
+
+
+@dataclass
+class ClientStreamInput(MessageBody):
+    """The next chunk of a running request's client streams (see
+    ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and
+    the streams that end after it. An ended stream takes no more chunks."""
+    request_id: str
+    signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
+    ended: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -231,6 +251,10 @@ class NewRequestConductor(MessageBody):
     # The client's request_id. ``request_id`` is the API server's key for this
     # one submission, never reused; the seed still derives from the client's.
     client_request_id: str | None = None
+    # For a model with client streams, the opening's own client input: its
+    # first chunk and the streams it ends, forwarded once the request is
+    # admitted. A stream it leaves open makes it a live call.
+    client_input: ClientStreamInput | None = None
 
 
 @dataclass
@@ -245,6 +269,9 @@ class WorkerGraphsDone(MessageBody):
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
+    # The walk the completed pass ran under. The conductor follows it for a
+    # partition whose walk the stream drives.
+    graph_walk: str = field(default="")
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
     # Stream edge -> destination worker -> items sent since the last report.
     # Every rank reports its own.
@@ -291,6 +318,13 @@ class WorkerStatus(MessageBody):
     edge, never per-request data."""
     worker_id: str
     metrics: list[MetricSnapshot]
+
+
+@dataclass
+class EnableMetrics(MessageBody):
+    """Start the workers' histograms and counters. The API server sends it to
+    the conductor after its warmup requests; the conductor forwards it to
+    every worker (``WorkerMetrics.start_counting``)."""
 
 
 @dataclass

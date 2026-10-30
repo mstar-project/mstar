@@ -83,9 +83,11 @@ What is counted from when
 - **API server families count from the first request after warmup.** The server
   enables metrics after its warmup requests, so first-shape compile times stay out of
   the request latency histograms.
-- **Engine worker families, and the transfers workers read, count from worker start,
-  warmup included.** Their histograms and counters are cumulative from process start,
-  so read them with ``rate()`` or ``increase()`` rather than as absolute values.
+- **Engine worker histograms and counters, and the transfers workers read, count
+  from the same point.** When the API server enables its metrics it has the conductor
+  tell every worker, so a worker counts the steps whose time starts after that, and
+  the prefix-cache lookups and tensor reads after it. The gauges (KV pages, pending
+  steps) show the current state from worker start.
 - **Requests refused before submission** (a bad form, a missing API key, a body over
   the limit, a ``request_id`` already in flight) are counted only in
   ``mstar_http_refusals_total``. A request that was submitted and then failed is
@@ -269,13 +271,15 @@ tensor or sequence parallel instance count once: the instance's first rank repor
 
 ``mstar_prefix_cache_query_tokens_total{model_name, component}``
    Counter. Prompt tokens looked up in the prefix cache, once per request (its whole
-   keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL and
-   Orpheus); the cache is off under tensor parallelism.
+   keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL,
+   Orpheus and Qwen3.5). Under tensor parallelism only rank 0 counts a lookup.
 
 ``mstar_prefix_cache_hit_tokens_total{model_name, component}``
    Counter. Tokens the prefix cache already held at that lookup. The hit rate is
    ``rate(mstar_prefix_cache_hit_tokens_total[5m])`` divided by
-   ``rate(mstar_prefix_cache_query_tokens_total[5m])``.
+   ``rate(mstar_prefix_cache_query_tokens_total[5m])``. For Qwen3.5 these are the KV
+   cache's tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool
+   cuts to 0 still counts.
 
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not

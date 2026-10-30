@@ -91,6 +91,7 @@ def drive(runtime, put, prefills: int, decode_steps: int, inline: bool = False) 
         request_id="r1", partition="default", graph_walk=PREFILL,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     uuid = 100
 
@@ -135,6 +136,7 @@ def expected_counts(reports: list[WorkerGraphsDone]) -> dict[str, int]:
     """What the conductor puts in ``request_complete``, from the real handler."""
     conductor = Conductor.__new__(Conductor)
     conductor.enable_prof = False
+    conductor.producer_triggered_partitions = set()
     request = RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: [WORKER], 1: [WORKER]}, all_worker_graph_ids={0, 1},
@@ -221,12 +223,12 @@ class _TensorManager:
         pass
 
 
-def python_runtime(decode_steps: int):
+def python_runtime(decode_steps: int, **overrides):
     manager = _TensorManager()
     recorder = _Recorder()
     runtime = PythonGraphRuntime(
         my_worker_graphs=worker_graphs(decode_steps), tensor_manager=manager,
-        communicator=recorder, **RUNTIME_KWARGS,
+        communicator=recorder, **{**RUNTIME_KWARGS, **overrides},
     )
 
     def put(uuid):
@@ -235,12 +237,14 @@ def python_runtime(decode_steps: int):
     return runtime, put, recorder
 
 
+@pytest.mark.parametrize("inline", [False, True], ids=["tensor", "inline"])
 @pytest.mark.parametrize("shape", list(SHAPES))
-def test_request_is_held_until_its_last_chunk(shape):
+def test_request_is_held_until_its_last_chunk(shape, inline):
     prefills, decode_steps = SHAPES[shape]
     runtime, put, recorder = python_runtime(decode_steps)
-    drive(runtime, put, prefills, decode_steps)
+    drive(runtime, put, prefills, decode_steps, inline=inline)
     assert len(recorder.chunks()) == prefills + decode_steps
+    assert sum(isinstance(c, ResultTokens) for c in recorder.chunks()) == (decode_steps if inline else 0)
     assert_holds_until_last_chunk(recorder.chunks(), recorder.reports())
 
 
@@ -261,7 +265,8 @@ class _ScriptedApiComm:
         return self.batches.pop(0)
 
 
-def test_completion_that_overtakes_the_last_chunks_waits_for_them():
+@pytest.mark.parametrize("inline", [False, True], ids=["tensor", "inline"])
+def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline):
     """Through the API server's real message loop: ``request_complete``
     arrives after two of the five chunks, the rest a pass later each. The
     client is released only once the fifth has been read, never with a
@@ -275,7 +280,7 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them():
     from mstar.profile.format import RequestProfile
 
     runtime, put, recorder = python_runtime(SHAPES["text_image_text"][1])
-    drive(runtime, put, *SHAPES["text_image_text"])
+    drive(runtime, put, *SHAPES["text_image_text"], inline=inline)
     chunks = recorder.chunks()
     complete = APIServerMessage(message_type="request_complete", body=RequestComplete(
         request_id="r1", output_chunk_counts=expected_counts(recorder.reports()),
@@ -310,7 +315,8 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them():
     server.pending_requests = {"r1": req}
 
     def msg(body):
-        return APIServerMessage(message_type="result_tensors", body=body)
+        kind = "result_tokens" if isinstance(body, ResultTokens) else "result_tensors"
+        return APIServerMessage(message_type=kind, body=body)
 
     batches = [[msg(chunks[0]), msg(chunks[1])], [complete], []] + [[msg(c)] for c in chunks[2:]] + [[]]
     server.communicator = _ScriptedApiComm(server, batches, req)
@@ -332,6 +338,7 @@ def test_every_rank_reports_the_chunks_it_sent():
     every rank's report rather than only rank 0's."""
     conductor = Conductor.__new__(Conductor)
     conductor.enable_prof = False
+    conductor.producer_triggered_partitions = set()
     request = RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: ["worker_0", "worker_1"]}, all_worker_graph_ids={0},

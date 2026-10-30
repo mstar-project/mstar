@@ -168,6 +168,14 @@ class AllocationFailed(AdmitFailedReason):
     pages_short: int
     label: str
     request_id: str
+    # How many of the step's requests, in its order, the free pages held, and
+    # how many the pool would hold with nothing else resident, out of the
+    # ``rows_sized`` it counted; None when the resource does not say. The
+    # worker sizes the retry from them. A row the prefix cache served whole
+    # runs no step, so it is in the worker's batch but not in ``rows_sized``.
+    rows_fit: int | None = None
+    rows_fit_alone: int | None = None
+    rows_sized: int | None = None
 
 
 @dataclass
@@ -202,6 +210,8 @@ class AdmitOutcome(NamedTuple):
 # Every resource's admit returns this on the common path, several times a
 # step; nothing reads identity, so hand back one instance rather than build it.
 ADMIT_OK = AdmitOutcome(ok=True, ready=True)
+# `Resource.ask`'s answer for a request that waits for the resource's capacity
+ASKS = AdmitOutcome(ok=True, ready=False)
 
 
 class FullAdmitOutcome(NamedTuple):
@@ -214,6 +224,8 @@ class FullAdmitOutcome(NamedTuple):
     """
     outcome: AdmitOutcome
     failed_resource: str | None = None
+    # waits for capacity on its node, until `StepRunner.admit_waiting` admits it
+    queued: bool = False
 
     @property
     def ok(self) -> bool:
@@ -231,3 +243,4 @@ class FullAdmitOutcome(NamedTuple):
 FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
+FULL_ADMIT_QUEUED = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), queued=True)

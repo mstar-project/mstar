@@ -35,8 +35,10 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.utils.ipc_format import (
     AbortRequest,
+    ClientStreamInput,
     ConductorMessage,
     DrainRequest,
+    EnableMetrics,
     FailRequests,
     InputSignals,
     MessageBody,
@@ -81,6 +83,8 @@ _TYPES: dict[str, type] = {
     "reads_done": ReadsDone,
     "fail_requests": FailRequests,
     "worker_status": WorkerStatus,
+    "enable_metrics": EnableMetrics,
+    "client_stream_input": ClientStreamInput,
     # api-server bodies
     "result_tensors": ResultTensors,
     "result_tokens": ResultTokens,

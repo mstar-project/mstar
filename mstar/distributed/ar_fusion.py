@@ -9,9 +9,12 @@ registry.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from mstar.distributed.communication import CommGroup
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +28,10 @@ _WORKSPACES: list = []
 _BACKENDS = ("auto", "trtllm")
 
 
-def _all_ranks(ok: bool, cpu_group) -> bool:
-    flag = torch.tensor([int(ok)], dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=cpu_group)
-    return bool(flag.item())
-
-
 def create_workspace(
-    rank: int, world_size: int, cpu_group, max_tokens: int, hidden: int,
-    dtype: torch.dtype,
+    group: CommGroup, max_tokens: int, hidden: int, dtype: torch.dtype,
 ) -> int | None:
-    """Collective over the TP group: every member calls it, in the same order.
+    """Collective over the TP ``group``: every member calls it, in the same order.
     Returns the id for ``allreduce_add_rmsnorm``, or None if FlashInfer cannot
     build a workspace here (caller keeps the unfused path)."""
     try:
@@ -49,9 +45,9 @@ def create_workspace(
         ws = None
         try:
             ws = fc.create_allreduce_fusion_workspace(
-                backend=backend, world_size=world_size, rank=rank,
+                backend=backend, world_size=group.world_size, rank=group.rank,
                 max_token_num=max_tokens, hidden_dim=hidden, dtype=dtype,
-                comm_backend=TorchDistBackend(group=cpu_group), group=cpu_group,
+                comm_backend=TorchDistBackend(group=group.cpu_group), group=group.cpu_group,
             )
         except Exception:
             logger.warning("FlashInfer all-reduce fusion backend %r failed",
@@ -59,7 +55,7 @@ def create_workspace(
         # Every rank must use the same backend, or the next collective
         # deadlocks: keep one only if it built on all of them.
         try:
-            agreed = _all_ranks(ws is not None, cpu_group)
+            agreed = group.agree([int(ws is not None)])[0]
         except RuntimeError:
             # A rank failed between FlashInfer's own collectives, so this vote
             # met a different one; the gloo timeout closes the group on every
@@ -101,7 +97,7 @@ def allreduce_add_rmsnorm(
         weight_bias=weight_bias,
         # Complete at the end: with an early trigger a PDL-launched consumer
         # can read the one-shot Lamport buffer before it is committed (see
-        # vLLM's allreduce_rms_fusion and flashinfer-ai/flashinfer#1223).
+        # flashinfer-ai/flashinfer#1223).
         trigger_completion_at_end=True,
     )
     return norm_out, residual_out
@@ -110,3 +106,23 @@ def allreduce_add_rmsnorm(
 @allreduce_add_rmsnorm.register_fake
 def _(x, residual, weight, eps, weight_bias, ws_id):
     return torch.empty_like(x), torch.empty_like(residual)
+
+
+@torch.library.custom_op("mstar::allreduce_oneshot", mutates_args=())
+def allreduce_oneshot(x: torch.Tensor, ws_id: int) -> torch.Tensor:
+    """``allreduce(x)`` with the same one-kernel collective, and no norm."""
+    import flashinfer.comm as fc
+
+    out = torch.empty_like(x)
+    fc.allreduce_fusion(
+        input=x, workspace=_WORKSPACES[ws_id],
+        pattern=fc.AllReduceFusionPattern.kAllReduce,
+        launch_with_pdl=True, output=out, fp32_acc=True,
+        trigger_completion_at_end=True,
+    )
+    return out
+
+
+@allreduce_oneshot.register_fake
+def _(x, ws_id):
+    return torch.empty_like(x)
