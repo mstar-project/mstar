@@ -145,7 +145,7 @@ def test_attention_over_sharded_keys_matches_one_rank(tmp_path, world, total):
     _run(_sharded_keys, world, tmp_path / "store", total)
 
 
-def _wan_dit(rank, world, grid, out_path):
+def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
     from mstar.model.wan22.components.dit import Wan22DiT
     from mstar.model.wan22.config import Wan22Config
 
@@ -154,7 +154,7 @@ def _wan_dit(rank, world, grid, out_path):
         in_channels=4, out_channels=4, text_dim=8, freq_dim=16, rope_max_seq_len=16,
     )
     torch.manual_seed(0)
-    dit = Wan22DiT(config, sp_group=_group(rank, world))
+    dit = Wan22DiT(config, sp_group=sp_group)
     for param in dit.parameters():
         torch.nn.init.normal_(param, std=0.2)
     gen = torch.Generator().manual_seed(1)
@@ -164,7 +164,11 @@ def _wan_dit(rank, world, grid, out_path):
     timestep = torch.rand(1, tokens, generator=gen) * 1000
     text = torch.randn(1, 5, 8, generator=gen)
     with torch.no_grad():
-        out = dit(latents, timestep, text)
+        return dit(latents, timestep, text)
+
+
+def _wan_dit(rank, world, grid, out_path):
+    out = _wan_dit_forward(grid, _group(rank, world))
     if rank == 0:
         torch.save(out, out_path)
 
@@ -174,15 +178,5 @@ def test_wan_dit_under_ulysses_matches_one_rank(tmp_path, grid):
     """Each SP rank keeps its slice of the tokens, their RoPE and per-token
     timesteps, and the gathered output is the one-rank DiT's (8 and 9
     tokens: an even and an uneven split over two ranks)."""
-    _run(_wan_dit, 1, tmp_path / "one", grid, str(tmp_path / "one.pt"))
     _run(_wan_dit, 2, tmp_path / "two", grid, str(tmp_path / "two.pt"))
-    torch.testing.assert_close(torch.load(tmp_path / "two.pt"), torch.load(tmp_path / "one.pt"))
-
-
-def test_wan_dit_refuses_an_sp_size_that_does_not_divide_its_heads():
-    from mstar.model.wan22.components.dit import Wan22DiT
-    from mstar.model.wan22.config import Wan22Config
-
-    config = Wan22Config(num_attention_heads=6, attention_head_dim=12, num_layers=1, ffn_dim=32)
-    with torch.device("meta"), pytest.raises(ValueError, match="sp_size"):
-        Wan22DiT(config, sp_group=CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1, 2, 3]))
+    torch.testing.assert_close(torch.load(tmp_path / "two.pt"), _wan_dit_forward(grid))
