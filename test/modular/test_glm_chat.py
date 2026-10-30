@@ -340,13 +340,14 @@ def test_the_data_worker_tags_text_chunks_with_usage():
     from types import SimpleNamespace
 
     from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState
+    from mstar.model.utils import ByteIdDetokenizer, TextOutput
 
     class _Model:
         def postprocess(self, tensor, modality, request_kwargs=None):
             return b"hi"
 
-        def stop_token_ids(self):
-            return frozenset({9})
+        def text_output(self):
+            return TextOutput(ByteIdDetokenizer(), frozenset({9}))
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue, wt.model, wt.request_model_kwargs = queue.Queue(), _Model(), {}
@@ -367,26 +368,52 @@ def test_the_data_worker_tags_inline_text_chunks_with_usage():
 
     from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
     from mstar.model.base import Model
+    from mstar.model.utils import ByteIdDetokenizer, TextOutput
 
     class _Model:
         postprocess_inline = Model.postprocess_inline
-        text_output = Model.text_output
 
-        def postprocess(self, tensor, modality, request_kwargs=None):
-            return b"hi"
-
-        def stop_token_ids(self):
-            return frozenset({9})
+        def text_output(self):
+            return TextOutput(ByteIdDetokenizer(), frozenset({9}))
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue, wt.model, wt.request_model_kwargs = queue.Queue(), _Model(), {}
     wt._draining_rids = set()
     wt.request_output_state = {"r1": RequestOutputState(prompt_tokens=7), "r2": RequestOutputState()}
-    wt._emit_inline_tokens(InlineTokens(["r1", "r2"], [4, 9], "text"))
+    wt._emit_inline_tokens(InlineTokens(["r1", "r2"], [72, 9], "text"))
     chunks = {c.request_id: c for c in (wt.out_queue.get_nowait(), wt.out_queue.get_nowait())}
-    assert chunks["r1"].data == chunks["r2"].data == b"hi"
+    assert (chunks["r1"].data, chunks["r2"].data) == (b"H", b"")  # the stop token is no text
     assert chunks["r1"].metadata == {"tokens": 1, "prompt_tokens": 7, "stop_token": False}
     assert chunks["r2"].metadata == {"tokens": 1, "stop_token": True}
+
+
+@pytest.mark.parametrize("name", ["glm52", "glm5_next"])
+def test_a_glm_reply_ends_on_the_ids_its_text_output_declares(name):
+    """Both GLMs name their end-of-turn ids once, in ``text_output``: the data worker
+    tags each chunk by them, and a stop token is no text unless the request ignores it."""
+    pytest.importorskip("torch")
+    import queue
+
+    from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
+
+    if name == "glm52":
+        from mstar.model.glm52.glm52_model import Glm52Model
+
+        model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced")
+    else:
+        from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
+
+        model = Glm5NextModel("x", tokenizer_mode="byte", config_variant="reduced")
+    eos = model.config.eos_token_ids[-1]
+    wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.out_queue, wt.model, wt._draining_rids = queue.Queue(), model, set()
+    wt.request_model_kwargs = {"r3": {"ignore_eos": True}}
+    wt.request_output_state = {rid: RequestOutputState() for rid in ("r1", "r2", "r3")}
+    wt._emit_inline_tokens(InlineTokens(["r1", "r2", "r3"], [72, eos, eos], "text"))
+    chunks = {c.request_id: c for c in (wt.out_queue.get_nowait() for _ in range(3))}
+    assert [(chunks[rid].data, chunks[rid].metadata["stop_token"]) for rid in ("r1", "r2", "r3")] == [
+        (b"H", False), (b"", True), (bytes([eos & 0xFF]), True),
+    ]
 
 
 def test_a_long_call_is_read_once_and_parses_as_whole():

@@ -42,6 +42,7 @@ from mstar.model.glm52.config import (
 )
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import ByteIdDetokenizer, ByteLevelDetokenizer, TextOutput
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -128,7 +129,6 @@ class Glm52Model(Model):
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
-        self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     def _check_mtp(self, kwargs: dict) -> None:
@@ -512,9 +512,6 @@ class Glm52Model(Model):
         each iteration emits at least one token, so it bounds those loops too."""
         return self.context_limit() - 1
 
-    def stop_token_ids(self) -> frozenset[int]:
-        return frozenset(self.config.eos_token_ids)
-
     def get_max_output_tokens(self, **model_kwargs):
         budget = normalize_generation_kwargs(model_kwargs).get(
             "max_output_tokens", self.config.max_output_tokens)
@@ -529,6 +526,22 @@ class Glm52Model(Model):
     # Model ABC: postprocess
     # -------------------------------------------------------------------
 
+    # built on first use: the tokenizer it reads loads lazily
+    _text_output: TextOutput | None = None
+
+    def text_output(self) -> TextOutput:
+        if self._text_output is None:
+            # Synthetic reduced models emit byte ids, which never touch the HF
+            # tokenizer. Otherwise the tokens' raw bytes (byte-level BPE), so a
+            # character split across tokens reaches the client whole, where decoding
+            # each token alone gives U+FFFD; special tokens drop, as with
+            # skip_special_tokens.
+            detokenizer = (
+                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
+            )
+            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+        return self._text_output
+
     def postprocess(
         self,
         output: torch.Tensor,
@@ -536,19 +549,7 @@ class Glm52Model(Model):
         **kwargs,
     ) -> bytes:
         if modality == "text":
-            token_ids = output.flatten().tolist()
-            if self._tokenizer_mode == "byte":
-                # Synthetic reduced models emit arbitrary byte ids; return raw
-                # bytes without ever touching the HF tokenizer.
-                return bytes((t & 0xFF) for t in token_ids)
-            # The tokens' raw bytes (byte-level BPE): a character split across
-            # tokens reaches the client whole, where decoding each token alone
-            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
-            if self._detokenizer is None:
-                from mstar.model.utils import ByteLevelDetokenizer
-
-                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(token_ids)
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for GLM-5.2: {modality!r}")
 
     # -------------------------------------------------------------------
