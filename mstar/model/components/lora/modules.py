@@ -273,6 +273,7 @@ def module_lora_spec(
     rows, names = dict(rows or {}), dict(names or {})
     groups: dict[tuple[str | None, str], list[_Found]] = defaultdict(list)
     stacks = {p for p, m in root.named_modules() if isinstance(m, _STACKS)}
+    walked: list[str] = []  # every module that takes, or is refused, a delta
     unservable: dict[str, str] = {}
     declared: dict[str, str] = {}  # modules' own `lora_unservable`, by exact path
     for path, module in root.named_modules():
@@ -292,6 +293,7 @@ def module_lora_spec(
         capability = lora_capability(module)
         if capability is None:
             continue
+        walked.append(path)
         reason = _declared(path, declared)
         if reason is None and (pattern := _match(path, excluded)) is not None:
             reason = excluded[pattern]
@@ -311,6 +313,9 @@ def module_lora_spec(
         else:
             stack, layer, role = found
             groups[(stack, role)].append(_Found(path, layer, target))
+    unmatched = [p for p in excluded if not any(_match(w, [p]) for w in walked)]
+    if unmatched:
+        raise ValueError(f"`exclude` patterns {unmatched} match no LoRA-capable module of {type(root).__name__}")
     if not groups:
         raise ValueError(f"{type(root).__name__} has no LoRA-capable modules")
 

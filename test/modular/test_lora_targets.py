@@ -505,6 +505,15 @@ def test_a_deferred_embedding_is_served_without_embeddings():
     assert set(spec.targets) == {"embed_tokens", "fc"} and spec.module_map.deferred == {"embed_tokens"}
 
 
+def test_an_exclude_pattern_matching_no_module_is_refused():
+    """A typo would leave served a module the model calls outside its step."""
+    with torch.device("meta"):
+        root = nn.Module()
+        root.text_proj = nn.Linear(HIDDEN, HIDDEN)
+    with pytest.raises(ValueError, match=r"`exclude` patterns \['text_projection'\]"):
+        module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", exclude={"text_projection": "-"})
+
+
 def test_a_stack_is_a_module_list_whatever_its_name():
     with torch.device("meta"):
         root = nn.Module()
