@@ -803,6 +803,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -980,10 +981,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">to whichever request gets that handle next. Known handle-keyed state:</span>
 <span class="sd">MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog} (purged by</span>
 <span class="sd">clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,</span>
-<span class="sd">streaming_buffers}, the engine's and tensor manager's per-request state,</span>
-<span class="sd">RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,</span>
-<span class="sd">_unkeyed, _admit_restores, _admit_snaps} (purged by</span>
-<span class="sd">remove_request), and WorkerProfileInfo.</span>
+<span class="sd">streaming_buffers}, RequestStateManager.{per_request_info, _fwd_by_partition}</span>
+<span class="sd">and StreamBufferManager._rids (purged by remove_request), the engine's and</span>
+<span class="sd">tensor manager's per-request state, RecurrentStatePool.{_keyed, _leases,</span>
+<span class="sd">_restores, _snap_writes, _decode, _unkeyed, _admit_restores, _admit_snaps}</span>
+<span class="sd">(purged by remove_request), and WorkerProfileInfo.</span>
 
 <span class="sd">MicroScheduler.pending_tp_follow_count is the one deliberate exception: a</span>
 <span class="sd">ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it</span>

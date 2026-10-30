@@ -803,6 +803,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1039,6 +1040,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Resource</span><span class="p">],</span>
         <span class="n">node_resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">declared_by</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="c1"># Per-resource NVTX. `engine.plan.promoted` only reports that the sweep</span>
         <span class="c1"># was slow; these say WHICH resource ate it. Gated because range_push</span>
@@ -1088,6 +1090,21 @@ window.runMermaid = runMermaid;</script>
         <span class="p">]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_cap_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cap_order</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_trail_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_trail_order</span><span class="p">)</span>
+        <span class="c1"># publisher key -&gt; every node of the deployment that declares it</span>
+        <span class="c1"># (``declared_by``): a replica on another worker, under another node</span>
+        <span class="c1"># name, reads what this one publishes. This runner's own nodes when</span>
+        <span class="c1"># not given.</span>
+        <span class="n">declared_by</span> <span class="o">=</span> <span class="n">declared_by</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_publisher_nodes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">key</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">declared_by</span><span class="p">[</span><span class="n">key</span><span class="p">])</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">declared_by</span> <span class="k">else</span> <span class="nb">frozenset</span><span class="p">(</span>
+                <span class="n">node</span> <span class="k">for</span> <span class="n">node</span><span class="p">,</span> <span class="n">keys</span> <span class="ow">in</span> <span class="p">(</span><span class="n">node_resources</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span>
+            <span class="p">)</span>
+            <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span>
+        <span class="p">}</span>
+        <span class="c1"># publisher key -&gt; the rids not to publish it for: those whose every</span>
+        <span class="c1"># declaring node runs on this lockstep instance, so no other instance</span>
+        <span class="c1"># can retrieve their state (``skip_publish``)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_unpublished</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="nb">set</span><span class="p">()</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span><span class="p">}</span>
         <span class="c1"># capture-time buffer allocation, likewise scoped: a node's runner has</span>
         <span class="c1"># no business sizing a resource it never plans against</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">))</span>
@@ -1360,8 +1377,46 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">remove_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_admission</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">rids</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unpublished</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+            <span class="n">rids</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span></div>
 
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">publisher_nodes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">"""Each publishing resource's declaring nodes, across the deployment."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publisher_nodes</span>
+
+<div class="viewcode-block" id="StepRunner.skip_publish">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.skip_publish">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">skip_publish</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">keys</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Never publish ``keys`` for ``rid``: no other lockstep instance runs</span>
+<span class="sd">        a node that declares them for this request. Purged on removal."""</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_unpublished</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="StepRunner.never_publish">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.never_publish">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">never_publish</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">keys</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``skip_publish`` for every request: ``keys`` leave the publish</span>
+<span class="sd">        order, so a step pays nothing for them."""</span>
+        <span class="n">keys</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">keys</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span> <span class="o">=</span> <span class="p">[</span><span class="n">k</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="n">node</span><span class="p">:</span> <span class="p">[</span><span class="n">k</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">order</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">]</span>
+                <span class="k">for</span> <span class="n">node</span><span class="p">,</span> <span class="n">order</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+            <span class="p">}</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_publisher_nodes</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_unpublished</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_publishing</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">order</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">request_ids</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""``order`` minus the resources none of ``request_ids`` publishes."""</span>
+        <span class="n">skip</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unpublished</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">order</span> <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">skip</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="ow">and</span> <span class="n">skip</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">issuperset</span><span class="p">(</span><span class="n">request_ids</span><span class="p">))]</span>
 
 <div class="viewcode-block" id="StepRunner.admit_retrieve">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.admit_retrieve">[docs]</a>
@@ -1652,14 +1707,19 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Scoped to the node whose step just ran; no other node's state moved,</span>
 <span class="sd">        and `merge_publish_info` keeps the entry it already published."""</span>
-        <span class="n">order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">)</span>
+        <span class="n">order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publishing</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">),</span>
+            <span class="n">request_ids</span><span class="p">,</span>
+        <span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">order</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="p">{}</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">}</span>
-        <span class="n">publishers</span> <span class="o">=</span> <span class="p">[(</span><span class="n">key</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">])</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">order</span><span class="p">]</span>
+        <span class="n">publishers</span> <span class="o">=</span> <span class="p">[(</span><span class="n">key</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unpublished</span><span class="p">[</span><span class="n">key</span><span class="p">])</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">order</span><span class="p">]</span>
         <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
             <span class="n">per_key</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">publishers</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">resource</span><span class="p">,</span> <span class="n">skip</span> <span class="ow">in</span> <span class="n">publishers</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">skip</span><span class="p">:</span>
+                    <span class="k">continue</span>
                 <span class="n">info</span> <span class="o">=</span> <span class="n">resource</span><span class="o">.</span><span class="n">publish_for_step</span><span class="p">(</span>
                     <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="o">=</span><span class="n">node_name</span><span class="p">,</span>
                     <span class="n">graph_walk</span><span class="o">=</span><span class="n">request_walks</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span> <span class="k">if</span> <span class="n">request_walks</span> <span class="k">else</span> <span class="n">graph_walk</span><span class="p">,</span>
@@ -1685,7 +1745,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        with nothing to publish has no entry. Under a combined walk each rid</span>
 <span class="sd">        is snapshotted under its own walk (``request_walks``), as ``publish``</span>
 <span class="sd">        does: a publisher may key what it publishes on the walk."""</span>
-        <span class="n">order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">)</span>
+        <span class="n">order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publishing</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">),</span>
+            <span class="n">request_ids</span><span class="p">,</span>
+        <span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">order</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">{}</span>
         <span class="k">if</span> <span class="n">request_walks</span><span class="p">:</span>
@@ -1708,7 +1771,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">per_key</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
                 <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">snaps</span> <span class="ow">in</span> <span class="n">columns</span><span class="p">:</span>
                     <span class="n">snap</span> <span class="o">=</span> <span class="n">snaps</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
-                    <span class="k">if</span> <span class="n">snap</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">snap</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">rid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unpublished</span><span class="p">[</span><span class="n">key</span><span class="p">]:</span>
                         <span class="n">per_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">snap</span>
                 <span class="k">if</span> <span class="n">per_key</span><span class="p">:</span>
                     <span class="n">out</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">per_key</span>
@@ -1754,14 +1817,19 @@ window.runMermaid = runMermaid;</script>
         <span class="n">request_walks</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">]]:</span>
 <span class="w">        </span><span class="sd">"""Publish resources configured for the end of a dynamic loop."""</span>
-        <span class="n">order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">)</span>
+        <span class="n">order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publishing</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_publish_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_publish_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">),</span>
+            <span class="n">request_ids</span><span class="p">,</span>
+        <span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">order</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="p">{}</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">}</span>
-        <span class="n">publishers</span> <span class="o">=</span> <span class="p">[(</span><span class="n">key</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">])</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">order</span><span class="p">]</span>
+        <span class="n">publishers</span> <span class="o">=</span> <span class="p">[(</span><span class="n">key</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unpublished</span><span class="p">[</span><span class="n">key</span><span class="p">])</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">order</span><span class="p">]</span>
         <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
             <span class="n">per_key</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">publishers</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">resource</span><span class="p">,</span> <span class="n">skip</span> <span class="ow">in</span> <span class="n">publishers</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">skip</span><span class="p">:</span>
+                    <span class="k">continue</span>
                 <span class="n">info</span> <span class="o">=</span> <span class="n">resource</span><span class="o">.</span><span class="n">publish_after_stop</span><span class="p">(</span>
                     <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="o">=</span><span class="n">node_name</span><span class="p">,</span>
                     <span class="n">graph_walk</span><span class="o">=</span><span class="n">request_walks</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span> <span class="k">if</span> <span class="n">request_walks</span> <span class="k">else</span> <span class="n">graph_walk</span><span class="p">,</span>
