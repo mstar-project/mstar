@@ -5,7 +5,6 @@ arena slots. Skipped unless the ``mstar_rust`` extension is installed."""
 import os
 import sys
 
-import numpy as np
 import pytest
 import torch
 
@@ -912,7 +911,7 @@ def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, pa
     monkeypatch.setattr(host_copy, "MIN_SLICE_BYTES", 1)
     prod = _manager("w0", tmp_path)
     cons = _manager("w1", tmp_path, copy_workers=4 if parallel else 1)
-    assert cons._host_copier.slices(np.empty(1152, np.uint8)) == (4 if parallel else 1)
+    assert cons._host_copier.slices(1152) == (4 if parallel else 1)
     original = (torch.arange(3 * 16 * 24) % 7 == 3) if dtype == torch.bool else (
         torch.arange(3 * 16 * 24) % 251).to(dtype)
     original = original.reshape(1, 3, 16, 24)
