@@ -179,7 +179,9 @@ class KVRoutingMirror:
             if run:
                 filed = keys[len(leased):len(leased) + run]
                 index.insert_run(filed, own[:run], leased[-1] if leased else None)
-                indexed += [(key, page) for key, page in zip(filed, own[:run]) if index.page_for(key) == page]
+                indexed += [
+                    (key, page) for key, page in zip(filed, own[:run], strict=True) if index.page_for(key) == page
+                ]
             if prompt.ends:
                 indexed += self._file_item_end(index, arena, prompt)
             held += leased + own
