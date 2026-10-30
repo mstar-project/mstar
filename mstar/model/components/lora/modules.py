@@ -3,8 +3,8 @@
 ``module_lora_spec`` walks a node's weights root (the module its weight loader fills;
 built on the meta device at one rank, so any process can declare it), finds every
 LoRA-capable module (``capable.py``), groups them into targets by their role in a layer
-stack (``layers.N.<role>`` / ``blocks.N.<role>``; a module outside the stacks is a target
-of its own), and places checkpoint modules with the root's own ``CheckpointRules`` (the
+stack (``<stack>.N.<role>``, a stack being a module list; a module outside the stacks is
+a target of its own), and places checkpoint modules with the root's own ``CheckpointRules`` (the
 ones its weight loader uses). The model states only what its modules cannot: how a
 target's rows relate to the step's tokens (``rows``), modules it calls outside the step
 (``exclude``, ``deferred``), names kept for compatibility (``names``), the prefixes
@@ -23,7 +23,6 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import logging
-import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -49,8 +48,17 @@ logger = logging.getLogger(__name__)
 PER_SEGMENT = "segment"
 RowSpec = int | Literal["segment"]
 
-# `<stack>.<layer>.<role>`, the first stack in the path
-_STACK = re.compile(r"^(?P<stack>(?:.*?\.)?(?:layers|blocks))\.(?P<layer>\d+)\.(?P<role>.+)$")
+_STACKS = (nn.ModuleList, nn.Sequential)
+
+
+def _in_stack(path: str, stacks: set[str]) -> tuple[str, int, str] | None:
+    """``(stack, layer, role)`` for ``path`` = ``<stack>.<layer>.<role>`` under the first
+    module list in it (``stacks``, by path), whatever the list is named."""
+    parts = path.split(".")
+    for i in range(len(parts) - 1):
+        if parts[i].isdigit() and ".".join(parts[:i]) in stacks:
+            return ".".join(parts[:i]), int(parts[i]), ".".join(parts[i + 1:])
+    return None
 
 
 class AdapterRoot(NamedTuple):
@@ -259,6 +267,7 @@ def module_lora_spec(
     excluded = dict(exclude) if isinstance(exclude, Mapping) else dict.fromkeys(exclude, _EXCLUDED)
     rows, names = dict(rows or {}), dict(names or {})
     groups: dict[tuple[str | None, str], list[_Found]] = defaultdict(list)
+    stacks = {p for p, m in root.named_modules() if isinstance(m, _STACKS)}
     unservable: dict[str, str] = {}
     declared: dict[str, str] = {}  # modules' own `lora_unservable`, by exact path
     for path, module in root.named_modules():
@@ -291,11 +300,12 @@ def module_lora_spec(
         if target.kind == "embedding" and not embeddings:
             unservable[path] = "a token embedding, which this node does not serve LoRA on"
             continue
-        m = _STACK.match(path)
-        if m is None:
+        found = _in_stack(path, stacks)
+        if found is None:
             groups[(None, path)].append(_Found(path, 0, target))
         else:
-            groups[(m["stack"], m["role"])].append(_Found(path, int(m["layer"]), target))
+            stack, layer, role = found
+            groups[(stack, role)].append(_Found(path, layer, target))
     if not groups:
         raise ValueError(f"{type(root).__name__} has no LoRA-capable modules")
 

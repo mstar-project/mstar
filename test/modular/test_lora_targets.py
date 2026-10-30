@@ -478,6 +478,16 @@ def test_target_names_widen_a_role_outside_every_stack():
     assert sorted(names.values()) == ["layers_attn_proj", "root_attn_proj"]
 
 
+def test_a_stack_is_a_module_list_whatever_its_name():
+    with torch.device("meta"):
+        root = nn.Module()
+        root.transformer_blocks = nn.ModuleList(
+            _with(nn.Module(), lambda m: setattr(m, "fc", nn.Linear(HIDDEN, HIDDEN))) for _ in range(3))
+        root.head = nn.Linear(HIDDEN, 4)
+    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+    assert set(spec.targets) == {"fc", "head"} and spec.num_layers == 3
+
+
 # --- what the module walk refuses ----------------------------------------------------------
 
 class _OwnForward(nn.Linear):

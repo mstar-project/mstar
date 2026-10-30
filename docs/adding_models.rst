@@ -1040,9 +1040,10 @@ placed exactly as weights are.
   below it -> reason; a path that is not one of its submodules is a ``ValueError``): MLA's
   absorbed projections, SigLIP's patch embedding, Command-A+'s fused decoder-layer
   projections.
-- **Targets.** One per role in a layer stack (``layers.N.<role>`` / ``blocks.N.<role>``,
-  ``layers`` set where a role is on some layers only), named by the role's last
-  component (``names`` overrides), plus one per module outside the stacks.
+- **Targets.** One per role in a layer stack (``<stack>.N.<role>``, the first module list
+  in the path, whatever it is named; ``layers`` set where a role is on some layers only),
+  named by the role's last component (``names`` overrides), plus one per module outside
+  the stacks.
 - **What the model states.** Only what modules cannot know. ``rows``: a target that sees
   one row per segment (``PER_SEGMENT``: a head after the last-token select) or one per
   ``k`` folded tokens. ``exclude`` (with a reason): modules called outside the planned
