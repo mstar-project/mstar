@@ -321,6 +321,9 @@ def test_fused_loop_replays_from_a_captured_graph(build, rows):
             captured = run()
         for _ in range(50):
             graph.replay()
+            # one sync per replay: a long run of back-to-back replays of a graph this
+            # large crashes the HIP runtime, and the served path syncs between steps
+            torch.cuda.synchronize()
         assert all(torch.equal(a, b) for a, b in zip(captured, eager, strict=True))
         last_hidden.copy_(torch.randn_like(last_hidden))
         graph.replay()
