@@ -1903,9 +1903,10 @@ and its term to ``routing_cost`` and ``RoutingWeights``. ``ReplicaRouter`` chang
 if its fields are not counts that add, or if its mirror reads a model declaration other
 than the KV ones, which then becomes a ``RoutingContext`` field that ``ReplicaRouter``
 fills. ``KVSpec`` with a ``PagedKVConfig`` is the one implementation. Its mirror runs the
-worker's own ``PrefixIndex`` per replica over a count of the pool's pages, takes each
-request's lease, pages and index entries at dispatch, and exists only where a walk keying
-the cache runs and ``opening_prefix_caches`` says the workers open it.
+worker's own ``PrefixIndex`` and ``PageArena`` per replica, with no storage, takes each
+request's lease, pages and index entries at dispatch, an item's end inside a page among
+them, and exists only where a walk keying the cache runs and ``opening_prefix_caches``
+says the workers open it.
 
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~

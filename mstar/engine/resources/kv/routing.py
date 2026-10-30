@@ -4,8 +4,9 @@ cache is predicted to hold, so a request goes where its prefix already is.
 Each replica runs the worker's own ``PrefixIndex`` and ``PageArena``, with no
 storage, and a request takes the steps ``KVManager`` takes for it, all at
 dispatch: the lease of its matched pages, its own pages (evicting on a
-shortfall), and the index entries of its whole keyed pages. Its end releases
-its pages, and takes back the entries of a request whose walk never ran.
+shortfall), the index entries of its whole keyed pages, and the page of its
+last item that ends inside one, up to that end. Its end releases its pages, and
+takes back the entries of a request whose walk never ran.
 
 It predicts from what the conductor sees, a request's layout and page keys
 when it is placed and its end, and is approximate for that reason:
@@ -49,8 +50,8 @@ if TYPE_CHECKING:
 
 class _FreePages:
     """The free list a replica's `PageArena` takes from: `PageAllocator`'s,
-    without the queue and lock that cost the conductor's one thread about a
-    microsecond a page."""
+    without the queue and lock that cost the conductor's one thread about 3 µs
+    a page."""
 
     def __init__(self, num_pages: int):
         self.max_num_pages = num_pages
@@ -151,7 +152,6 @@ class KVRoutingMirror:
         ]
 
     def add_request(self, config: "KVReqConfig", replica: int) -> _Placed | None:
-        # all of the config is read before the pool moves, so a bad one leaves nothing held
         keyed = self._keyed(config)
         pages = {
             label: -(-sum(span.length for span in layout.spans) // self._page_size)

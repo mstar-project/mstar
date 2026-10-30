@@ -444,11 +444,12 @@ follows its prefix to a busier replica, and a hot prefix spreads once its replic
 about 8 times its hit share more requests than another. The term is a share rather than
 a token count so that one weight fits models whose prefill and decode costs differ.
 
-The prediction runs the worker's own prefix index (``PrefixIndex``) per replica, over a
-count of each replica's pages, and takes a request's steps at dispatch: its lease of the
-matched pages, its own pages, evicting on a shortfall, and the index entries of its whole
-pages. Its end releases its pages; a request that ends before a pass of it comes back
-(aborted while queued, say) also takes back the entries only it made. Workers send
+The prediction runs the worker's own prefix index and page ownership (``PrefixIndex``,
+``PageArena``) per replica, with no storage, and takes a request's steps at dispatch: its
+lease of the matched pages, its own pages, evicting on a shortfall, the index entries of
+its whole pages, and the page of an image or other item that ends inside one, cached up
+to the item's end. Its end releases its pages; a request that ends before a pass of it
+comes back (aborted while queued, say) also takes back the entries only it made. Workers send
 nothing for it, so it does not see admit timing, decode growth, preemption or a reply's
 tokens, and it is approximate: a wrong prediction makes a request slower, never wrong.
 With no cache that opens (one replica, ``prefix_cache: false``, no walk that keys it,

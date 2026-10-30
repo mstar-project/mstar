@@ -7,7 +7,8 @@ lookup. A hit re-stamps a page without pushing it again, so a leaf keeps one hea
 entry however often it is read, and an entry that surfaces under an older stamp
 is pushed back under the page's own.
 
-Every caller holds the manager's lock, so none of this takes one of its own.
+Every caller holds the manager's lock, or is the conductor's one thread, so none
+of this takes one of its own.
 """
 
 import copy
