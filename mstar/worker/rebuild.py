@@ -117,9 +117,6 @@ class Rebuilds:
     def kept(self, rid: int, node: str) -> KeptIds | None:
         return self._kept.get(node, {}).get(rid)
 
-    def keeps_any(self, node: str) -> bool:
-        return bool(self._kept.get(node))
-
     def keep(self, rid: int, node: str, layouts: Iterable[StreamLayout]) -> bool:
         """Keep ``rid``'s ids and host copies on ``node`` from now on, and return True, when a rebuild there could
         write its laid-out labels again: the node declares a policy, and its loop grows labels one rebuild row
