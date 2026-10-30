@@ -426,6 +426,24 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
     }
 
 
+def instance_size(spec: NodeResourceSpec, instance: Mapping[str, int]) -> int:
+    """What `opening_prefix_caches` sizes ``spec`` at: the smallest lockstep
+    instance of its nodes in ``instance``, 1 where it has none."""
+    return min((instance[node] for node in spec.nodes if node in instance), default=1)
+
+
+def unrestorable(specs: Mapping[str, NodeResourceSpec], opened: Collection[str]) -> list[NodeResourceSpec]:
+    """The resources that can't restore what a hit skips while ``opened`` open:
+    each `NodeResourceSpec.restores_prefix` with no open cache of its own, unless
+    it is over open caches that restore. Each keeps every cache on its nodes shut."""
+    return [
+        spec for spec in specs.values()
+        if spec.restores_prefix and spec.resource_key not in opened and not (
+            spec.depends_on() and all(dep in opened and specs[dep].restores_prefix for dep in spec.depends_on())
+        )
+    ]
+
+
 def opening_prefix_caches(
     specs: Iterable[NodeResourceSpec], instance: Mapping[str, int], checkpoint_named: bool,
 ) -> frozenset[str]:
@@ -434,35 +452,25 @@ def opening_prefix_caches(
     nodes keeps from serving a hit. Every input is fixed at startup, so the
     engines, the conductor's routing and the data worker agree.
 
-    ``instance`` is the lockstep instance of each node the caller places; a
-    spec is sized by the smallest of its nodes there, 1 where it has none. A
-    cache over other caches, such as a recurrent pool's snapshots over its KV
-    cache's pages, keeps only where they open on all of its nodes. A node
-    carrying a resource that can't restore what a hit skips
-    (`NodeResourceSpec.restores_prefix`) keeps every cache on it shut: a hit
-    there would skip tokens its state never saw. Closing one cache can close
-    others, so the rule runs until nothing changes.
+    ``instance`` is the lockstep instance of each node the caller places
+    (`instance_size`). A cache over other caches, such as a recurrent pool's
+    snapshots over its KV cache's pages, keeps only where they open on all of
+    its nodes. A node carrying a resource that can't restore what a hit skips
+    (`unrestorable`) keeps every cache on it shut: a hit there would skip
+    tokens its state never saw. Closing one cache can close others, so the rule
+    runs until nothing changes.
     """
-    specs = list(specs)
     by_key = {spec.resource_key: spec for spec in specs}
-
-    def size(spec: NodeResourceSpec) -> int:
-        return min((instance[node] for node in spec.nodes if node in instance), default=1)
-
-    opened = {spec.resource_key for spec in specs if spec.keeps_prefix_cache(size(spec), checkpoint_named)}
+    opened = {
+        key for key, spec in by_key.items() if spec.keeps_prefix_cache(instance_size(spec, instance), checkpoint_named)
+    }
     while True:
         kept = {
             key for key in opened
             if all(dep in opened and by_key[key].nodes <= by_key[dep].nodes for dep in by_key[key].depends_on())
         }
-        unrestorable = {
-            node for spec in specs
-            if spec.restores_prefix and spec.resource_key not in kept and not (
-                spec.depends_on() and all(dep in kept and by_key[dep].restores_prefix for dep in spec.depends_on())
-            )
-            for node in spec.nodes
-        }
-        now = {key for key in kept if by_key[key].nodes.isdisjoint(unrestorable)}
+        blocked = {node for spec in unrestorable(by_key, kept) for node in spec.nodes}
+        now = {key for key in kept if by_key[key].nodes.isdisjoint(blocked)}
         if now == opened:
             return frozenset(now)
         opened = now

@@ -36,7 +36,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
-from mstar.engine.resources.kv.config import opening_prefix_caches
+from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -949,13 +949,14 @@ class Engine:
         self, specs_by_key: dict[str, NodeResourceSpec], shut: set[str], opened: frozenset[str],
         instance: Mapping[str, int], checkpoint_named: bool,
     ) -> None:
-        """Say why each keyed cache here that asks for a prefix cache stays shut."""
+        """Say why each keyed cache here that asks for a prefix cache stays shut,
+        from the pieces of `opening_prefix_caches` that shut it."""
         for key in sorted(shut & self._resources.keys()):
             spec = specs_by_key[key]
             # the cache is on at all: it opens at one rank for a model that names its checkpoint
             if not spec.keeps_prefix_cache(1, checkpoint_named=True):
                 continue
-            size = min((instance[node] for node in spec.nodes if node in instance), default=1)
+            size = instance_size(spec, instance)
             nodes = ", ".join(sorted(spec.nodes))
             if not spec.keeps_prefix_cache(size, checkpoint_named=True):
                 logger.info("KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)", key, size)
@@ -968,8 +969,8 @@ class Engine:
                 )
             else:
                 restoring = sorted(
-                    other for other, over in specs_by_key.items()
-                    if over.restores_prefix and other not in opened and not over.nodes.isdisjoint(spec.nodes)
+                    over.resource_key for over in unrestorable(specs_by_key, opened)
+                    if not over.nodes.isdisjoint(spec.nodes)
                 )
                 logger.info(
                     "KV %s: prefix cache off: %s on %s can't restore a cached prefix",
