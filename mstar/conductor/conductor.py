@@ -9,7 +9,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Collection
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
 import numpy as np
@@ -69,6 +69,7 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 from mstar.validation import validate_deployment
+from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +494,10 @@ class Conductor:
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
+        logger.info(
+            "Compile caches: Inductor %s, Triton %s",
+            os.environ.get("TORCHINDUCTOR_CACHE_DIR"), os.environ.get("TRITON_CACHE_DIR"),
+        )
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
@@ -565,6 +570,13 @@ class Conductor:
             for walk in wg.graph_walks
         }
         self.default_sharding_config.assert_streams_keep_tp_size(sorted(stream_edges))
+
+        topology = model.get_partition_topology()
+        self.producer_triggered_partitions: set[str] = (
+            topology.producer_triggered_partitions() if topology else set()
+        )
+        if topology:
+            topology.check_walk_driving_connections()
 
         for group in self.default_sharding_config.groups:
             group_graph_walks = group.graph_walks or graph_walks
@@ -640,25 +652,42 @@ class Conductor:
                 )
         return {name: caps.get(name, n) for name, n in self._loop_max_iters.items()}
 
-    def _resource_specs(self) -> dict:
-        """The model's resource specs by key, after this deployment's YAML, for admission-time checks."""
+    def _resource_specs(self) -> list[dict]:
+        """Each worker's resource specs by key, after this deployment's YAML, for admission-time checks.
+        A spec's ``nodes`` is cut to the worker's own, as the worker's engine does when it builds the resource."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
-            built = self.model.get_node_resources() or []
-            apply_yaml_overrides(built, self.model_config)
-            specs = {s.resource_key: s for s in built}
-            self._resource_specs_cache = specs
+            built = self._node_resources()
+            specs = self._resource_specs_cache = [
+                {s.resource_key: replace(s, nodes=s.nodes & nodes) for s in built if s.nodes & nodes}
+                for nodes in {frozenset(self._worker_nodes(worker_id)) for worker_id in self._per_worker_graphs}
+            ]
         return specs
+
+    def _node_resources(self) -> list:
+        """The model's resource specs after this deployment's YAML, each with all of its nodes."""
+        built = getattr(self, "_node_resources_cache", None)
+        if built is None:
+            built = self._node_resources_cache = self.model.get_node_resources() or []
+            apply_yaml_overrides(built, self.model_config)
+        return built
+
+    def _streamed_partitions(self) -> frozenset[str]:
+        streamed = getattr(self, "_streamed_partitions_cache", None)
+        if streamed is None:
+            streamed = streamed_partitions(self._node_resources(), self.model)
+            self._streamed_partitions_cache = streamed
+        return streamed
 
     def _fit_loop_caps(self, model_kwargs: dict, configs: dict, cap: int) -> tuple[int, dict[str, int]]:
         """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
         within what the request's resources hold. A loop that ``max_output_tokens`` doesn't drive is
         left as it is, and ``validate`` then refuses the request if it doesn't fit."""
-        specs = self._resource_specs()
         room: dict[str, int] = {}
-        for key, cfg in configs.items():
-            for name, n in cfg.loop_room(specs.get(key)).items():
-                room[name] = min(n, room.get(name, n))
+        for specs in self._resource_specs():
+            for key, cfg in configs.items():
+                for name, n in cfg.loop_room(specs.get(key)).items():
+                    room[name] = min(n, room.get(name, n))
 
         def overrun(caps: dict[str, int]) -> int:
             return max((caps[name] - n for name, n in room.items() if name in caps), default=0)
@@ -1339,6 +1368,8 @@ class Conductor:
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        if not all(partition_states[name].is_done for name in self._streamed_partitions()):
+            prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
         refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
@@ -1358,9 +1389,9 @@ class Conductor:
             )
             for key, cfg in request_data.resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
-        specs = self._resource_specs()
-        for key, cfg in request_data.resource_configs.items():
-            cfg.validate(specs.get(key))
+        for specs in self._resource_specs():
+            for key, cfg in request_data.resource_configs.items():
+                cfg.validate(specs.get(key))
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True
@@ -1797,6 +1828,19 @@ class Conductor:
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
                     conn.consumed_count = max(conn.consumed_count, consumed)
 
+        # The stream moves a producer-triggered partition's walk on the
+        # worker; follow it so the completion check and the model's state
+        # machine see the walk this pass actually ran.
+        if (
+            partition_name in self.producer_triggered_partitions
+            and body.graph_walk
+            and body.graph_walk != pstate.metadata.graph_walk
+        ):
+            pstate.metadata.graph_walk = body.graph_walk
+            self._set_partition_worker_graph_ids(
+                body.request_id, partition_name, body.graph_walk,
+            )
+
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
             count = pstate.wg_rank_completions.get(wg_id, 0) + 1
@@ -1880,6 +1924,11 @@ class Conductor:
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
+                    # A finished consumer takes no more input; told its
+                    # producer is done, a continue_after_done stream would
+                    # keep feeding it empty chunks
+                    if request_data.partition_states[conn.to_partition].is_done:
+                        continue
                     if conn.to_partition not in consumers:
                         consumers.add(conn.to_partition)
                         self._send_producer_done(request_id, conn.from_partition, conn.to_partition)

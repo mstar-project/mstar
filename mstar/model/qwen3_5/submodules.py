@@ -36,6 +36,7 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
@@ -376,35 +377,7 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
-        """``[3, total_tokens]`` for the step, in packed request order.
-
-        A pure-text step is the position resource's planned 1D positions
-        broadcast across the three grids (a view, no copy). An image's grids
-        do not advance together, so a request with `custom_pos_ids` supplies
-        its own and the step concatenates, using the resource's slice for text.
-        """
-        total_tokens = sum(inp.input_seq_len for inp in inputs)
-        pos_ids = self.node_resources[ROPE].pos_ids("main")
-        assert pos_ids is not None, (
-            "position resource has no plan for this step; `plan` must run "
-            "before `preprocess`"
-        )
-        if not any(inp.custom_pos_ids is not None for inp in inputs):
-            return pos_ids[:total_tokens].unsqueeze(0).expand(3, -1)
-
-        parts: list[torch.Tensor] = []
-        offset = 0
-        for inp in inputs:
-            span = inp.input_seq_len
-            if inp.custom_pos_ids is not None:
-                parts.append(inp.custom_pos_ids.float())
-            else:
-                parts.append(
-                    pos_ids[offset:offset + span].float()
-                    .unsqueeze(0).expand(3, -1)
-                )
-            offset += span
-        return torch.cat(parts, dim=1)
+        return mrope_position_ids(self.node_resources[ROPE].pos_ids("main"), inputs)
 
     def preprocess(
         self,
@@ -614,7 +587,9 @@ class LLMSubmodule(ARNodeSubmodule):
         # one per request.
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
-            check_stop_buffers={"new_token": new_tokens},
+            # The prefix cache keys a reply from this host copy, under `text_inputs`, the tensor the
+            # label's `PrefixKeys` names.
+            check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
         )
 
     # ------------------------------------------------------------------

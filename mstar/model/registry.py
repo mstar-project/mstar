@@ -17,9 +17,11 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosyvoice3": ("mstar.model.cosyvoice3.cosyvoice3_model", "CosyVoice3Model"),
     "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
+    "glm52": ("mstar.model.glm52.glm52_model", "Glm52Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnilingual_asr_ctc_300m": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
@@ -30,7 +32,9 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
+    "nemotron_asr": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
+    "parakeet": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_asr": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
@@ -90,6 +94,10 @@ HF_MODELS: dict[str, dict] = {
     # deployment as Super.
     "cosmos3_super_i2v_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Image2Video-4Step"},
     "cosmos3_super_t2i_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Text2Image-4Step"},
+    # Alibaba Fun-CosyVoice3: Qwen2-0.5B speech-token LM + DiT flow matching +
+    # causal HiFT, zero-shot voice cloning; the speech tokenizer and speaker
+    # encoder are Chatterbox's, loaded from the checkpoint's ONNX files.
+    "cosyvoice3": {"model_path_hf": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"},
     # FLUX.2 [klein]: step-distilled rectified-flow text-to-image + multi-reference
     # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
     # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
@@ -102,6 +110,9 @@ HF_MODELS: dict[str, dict] = {
     # 10 codebooks) with a 44.1 kHz causal DAC codec and reference-audio voice
     # cloning. Weights under the Fish Audio Research License (non-commercial).
     "fish_s2_pro": {"model_path_hf": "fishaudio/s2-pro"},
+    # GLM-5.2: 753B/40B MoE causal LM (MLA + DSA). The official release ships
+    # FP8 e4m3 block-scale under the -FP8 repo id; real serving is TP8.
+    "glm52": {"model_path_hf": "zai-org/GLM-5.2-FP8"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
@@ -124,7 +135,13 @@ HF_MODELS: dict[str, dict] = {
     "omnivoice": {"model_path_hf": "k2-fsa/OmniVoice"},
     # Kokoro-82M TTS: misaki G2P + PL-BERT prosody + iSTFTNet decoder, 54 bundled voices.
     "kokoro": {"model_path_hf": "hexgrad/Kokoro-82M"},
+    # NVIDIA Nemotron-3.5-ASR: cache-aware streaming FastConformer + RNN-T with
+    # a language prompt, 40 language-locales; served here over whole clips.
+    "nemotron_asr": {"model_path_hf": "nvidia/nemotron-3.5-asr-streaming-0.6b"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
+    # NVIDIA Parakeet-TDT-0.6B-v3: FastConformer + token-and-duration
+    # transducer, 25 European languages, language detected from the speech.
+    "parakeet": {"model_path_hf": "nvidia/parakeet-tdt-0.6b-v3"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().

@@ -21,7 +21,9 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from torch.distributed import ReduceOp
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine import accelerator_graph_runner
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_runner import (
@@ -74,8 +76,7 @@ class _StubMeasuredRunner:
         self._capture_costs = {}
         self._lent = set()
         self._executables = {}
-        group = SimpleNamespace(world_size=1, barrier=lambda: None)
-        self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
+        self._comm_group = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
         self.warmed: list[tuple[BucketKey, int]] = []
         self.forwards: list[int] = []
 
@@ -106,7 +107,7 @@ def measured(monkeypatch):
     monkeypatch.setattr(accelerator_graph_runner, "_capture_thrown_away", capture)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (50 * _GIB, 80 * _GIB))
     monkeypatch.setattr(
-        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, run()),
+        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype, **_: (None, run()),
     )
     return runs
 
@@ -286,7 +287,7 @@ def test_a_spec_is_warmed_up_to_size_it_and_not_again_to_capture_it(measured, mo
     runner.size_captures()
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, {}),
+        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype, **_: (None, {}),
     )
 
     for spec in runner.prepare_for_capture():
@@ -745,8 +746,9 @@ class _PeerGroup:
     def barrier(self):
         pass
 
-    def all_gather(self, tensor, dim=0):
-        return torch.cat([tensor, torch.tensor(self._peer, dtype=tensor.dtype)])
+    def agree(self, values, op):
+        pick = min if op == ReduceOp.MIN else max
+        return [int(pick(a, b)) for a, b in zip(values, self._peer, strict=True)]
 
 
 class _StubPlannedRunner:
@@ -765,9 +767,7 @@ class _StubPlannedRunner:
         self._submodule_name = "Thinker"
         self._num_slots = 1
         self._buckets = {}
-        self._comm_group = SimpleNamespace(
-            tp_group=_PeerGroup(peer), sp_group=SimpleNamespace(world_size=1, barrier=lambda: None),
-        )
+        self._comm_group = JointGroups(tp_group=_PeerGroup(peer), sp_group=CommGroup.trivial())
         self._dummy_rows = SimpleNamespace(release_all=lambda: None)
         self._graph_backend = SimpleNamespace(
             is_available=lambda: True, graph_pool_handle=lambda: AcceleratorGraphPool(object()),
