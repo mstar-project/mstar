@@ -146,6 +146,14 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     stream's end), else eagerly (a one-shot upload, a large append). In a step
     whose other streams take the eager blocks, or when the whole-step region
     has no graph for its streams, those streams run eagerly too.
+
+    Nemotron VoiceChat's duplex model is its only user, also after #937.
+    Construction refuses ``lookahead > 0``, ``reflect_edges=False`` and
+    ``normalize=True``. A second user such as Nemotron ASR would need a
+    per-step right-context window for ``lookahead > 0`` (its checkpoint ships
+    0, 3, 6 and 13), and a zero-padded path in ``NemoLogMel.complete_frames``
+    and ``stream_span``, which both assert ``reflect_edges``. Its featurizer
+    zero-pads, so it couldn't use this node even at lookahead 0.
     """
 
     # The captured regions are not compiled (compile=False); the eager front end
