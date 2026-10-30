@@ -1420,7 +1420,7 @@ def test_device_rows_share_a_slot_through_one_gather_and_copy(tmp_path, read_bat
         communicator=_NullCommunicator(), shm_dir=str(tmp_path))
     cons = ArenaShmCommunicationManager(
         my_entity_id="share_gpu_cons", hostname="localhost", device="cuda",
-        communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+        communicator=_RecordingCommunicator(), shm_dir=str(tmp_path))
     batch = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
     sent = {rid: {"state": [batch[rid]], "codes": [torch.arange(16, device="cuda") + rid]} for rid in range(8)}
     infos = {rid: prod.store_and_return_tensor_info(rid, t) for rid, t in sent.items()}
