@@ -2734,6 +2734,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         self, request_id: Rid, graph_edges: list[GraphEdge],
         graph_walk: str | None = None
     ):
+        if not any(e.tensor_info for e in graph_edges):
+            return []  # signal-only edges: no stream context to pay for
         # Run H2D copies on a dedicated stream so they overlap with the
         # consumer's in-flight default-stream work. We make default wait
         # for the H2D stream at the end so downstream kernels see the data.
@@ -2846,7 +2848,8 @@ def create_tensor_communication_manager(
     metadata_server: str = "P2PHANDSHAKE",
     tcp_transfer_device: str = "",
     shm_dir: str | None = None,
-    enable_prof: bool=False
+    enable_prof: bool=False,
+    copy_workers: int = 1,
 ) -> TensorCommunicationManager:
     """Select tensor transport backend based on protocol.
 
@@ -2856,7 +2859,8 @@ def create_tensor_communication_manager(
     ``mstar_rust`` extension is missing); ``AUTO`` — the arena when the
     extension imports, files otherwise. The flag must match across the
     deployment: the arena location rides in the tensor descriptors, so a
-    file-transport consumer cannot read an arena producer.
+    file-transport consumer cannot read an arena producer. ``copy_workers``
+    is the width of the arena's CPU reads (``host_copy.HostCopier``).
     """
     if protocol == CommProtocol.SHM:
         choice = os.getenv("MSTAR_SHM_ARENA", "0").upper()
@@ -2880,7 +2884,8 @@ def create_tensor_communication_manager(
                     device=device,
                     communicator=communicator,
                     shm_dir=shm_dir,
-                    enable_prof=enable_prof
+                    enable_prof=enable_prof,
+                    copy_workers=copy_workers,
                 )
         return SharedMemoryCommunicationManager(
             my_entity_id=my_entity_id,

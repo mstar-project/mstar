@@ -1312,44 +1312,57 @@ LTX-2.5 (``ltx2_5``)
 Text-to-audio+video on **Lightricks LTX-2.5** (``Lightricks/LTX-2.5-Diffusers``, gated):
 a 22B joint audio-video DiT, a Gemma-4 12B text encoder, and video/audio VAEs with a
 48 kHz vocoder. The distilled checkpoint runs the model card's recipes without
-guidance (single-stage: 8 sigmas); the two-stage recipe, the full (SFT) transformer,
-image-to-video and the duration head are not ported yet.
+guidance; the full (SFT) transformer, image-to-video and the duration head are not
+ported yet.
 
-Four nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
+Five nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
 DiT scaffold's denoise loop; video and audio latents carried in fp32; every attention
-through two ragged attention resources), ``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
+through two ragged attention resources), ``latent_upsampler`` (two-stage recipe only),
+``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
 modalities, so ``["video"]`` skips the audio decode (the model still denoises both).
 
 .. code-block:: bash
 
-   mstar serve ltx2_5            # configs/ltx2_5.yaml: DiT on GPU 0, the other nodes on GPU 1
+   mstar serve ltx2_5                             # configs/ltx2_5.yaml: DiT on GPU 0, the rest on GPU 1
+   mstar serve ltx2_5 --config configs/ltx2_5_tp2.yaml   # DiT tensor-parallel over 2 GPUs
+   mstar serve ltx2_5 --config configs/ltx2_5_sp2.yaml   # DiT sequence-parallel over 2 GPUs (fastest)
 
-Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32; default
-544x960), ``num_frames`` (8k+1; default 121), ``fps``, ``seed``. Frames above 720p
-decode in VAE tiles (``vae_tile_min_pixels``) to bound the decode's memory.
+Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32; 64 for the
+two-stage recipe), ``num_frames`` (8k+1), ``fps``, ``seed``, and ``recipe``:
+
+- ``single`` (default): 8 distilled sigmas at the requested size (default 544x960x121).
+- ``two_stage``: the card's better-quality path — 8 sigmas at half size, the x2 latent
+  upsampler, then 3 sigmas at full size (default 1088x1920). Frames above 720p decode
+  in VAE tiles, as the card does for this decode.
 
 Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
 ``POST /v1/videos/generations`` returns one mp4 with the audio muxed in as AAC
 (``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
 on the server's ``PATH`` and falls back to video only without it.
 
-Performance (2x H100, warm, against diffusers 0.41 with the same recipe and seeds):
+``ltx2_5_sp2`` shards the video tokens (Ulysses): each rank holds the whole DiT and
+half the tokens, and only the video self-attention exchanges them (one all-to-all
+each way); the cross-attentions run on each rank's own tokens, and the audio queries
+over the video merge the ranks' partial attentions. ``ltx2_5_tp2`` shards the
+weights instead and all-reduces after every block's attentions and feed-forwards.
 
-======================================  ==============  ==============
-                                        diffusers       ``ltx2_5``
-======================================  ==============  ==============
-544x960x121, one request                7.87 s          6.23 s
-544x960x121, 2 concurrent               7.6 videos/min  12.7 videos/min
-544x960x121, 4 concurrent               7.6 videos/min  14.0 videos/min
-======================================  ==============  ==============
+Performance (2x H100, warm; diffusers with the same recipe and seeds):
 
-Concurrency pays because the text encoder and decoders run on the second GPU while the
-DiT denoises another request; the DiT itself is GPU-bound (batching two requests costs
-two steps' time).
+======================================  ================  ================  ================
+                                        diffusers         ``ltx2_5_tp2``    ``ltx2_5_sp2``
+======================================  ================  ================  ================
+544x960x121, one request                7.87 s            3.70 s            3.15 s
+544x960x121, 4 concurrent               7.6 videos/min    19.6 videos/min   22.3 videos/min
+two-stage 1088x1920x121, one request    21.6 s            11.0 s            11.3 s
+two-stage, 2 concurrent                 2.8 videos/min    5.9 videos/min    6.1 videos/min
+======================================  ================  ================  ================
 
-The DiT is compiled and its denoise step captured per shape (``capture_shapes``);
-other shapes run the compiled eager path, and the first request of a new shape pays
-its compile.
+The DiT is compiled and its denoise step captured per shape (``capture_shapes``, which
+the two-stage recipe's stages replay too); other shapes run the compiled eager path, and the first
+request of a new shape pays its compile. ``vae_compile`` (on in these configs) compiles the
+video VAE's decoder at load for ``vae_compile_shapes``, by default the same shapes (~55 dB
+from the eager decode; other shapes decode eager). The SP2 config doesn't capture 1088x1920
+but lists it there, so its two-stage decode runs compiled too.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------

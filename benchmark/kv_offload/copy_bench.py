@@ -1,15 +1,17 @@
 """KV offload/reload copy microbenchmark, through ``CPUPagePool`` itself.
 
-For each copier that loads here (``cudaMemcpy2DAsync`` per page through
-``cuda.bindings`` or through torch's libcudart, ``hipMemcpy2DAsync`` through
-torch's libamdhip64 on ROCm, and the per-page ``copy_`` that is the fallback and
-was the only path before), direction and page count:
+For each copier that loads here (``cudaMemcpy2DAsync`` per run of adjacent pages
+through ``cuda.bindings`` or through torch's libcudart, ``hipMemcpy2DAsync``
+through torch's libamdhip64 on ROCm, and the per-page ``copy_`` that is the
+fallback and was the only path before), direction and page count:
 
 - host: wall time from issuing the copies to ``sync()`` returning, with a
   ``--queued-ms`` kernel already queued on the compute stream. A path that
   waits for that kernel reports at least ``--queued-ms``.
 - copy: CUDA-event time of the copies alone on the pool's stream, and the
   throughput that implies.
+
+The pages are adjacent in both caches, so a 2D copier copies them all in one call.
 
 Defaults are one BAGEL-7B page per TP2 rank: 28 layers, 2 KV heads of 128,
 128 tokens a page, bf16 (3.7 MB). Median of ``--repeats``.
