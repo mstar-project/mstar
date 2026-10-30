@@ -398,15 +398,28 @@ def _capture_thrown_away(
     except RuntimeError:
         logger.warning("Could not capture %s to size it", what, exc_info=True)
         graph = outputs = None
-    taken = None if graph is None else sum(
-        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool.handle)
-    )
+    taken = None if graph is None else _pool_bytes(pool.handle)
     del graph, outputs
     # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
     # workspace in the pool. No real graph uses it yet.
     torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
     return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)))
+
+
+def _pool_bytes(pool_id) -> int:
+    """The bytes the caching allocator holds for graph pool ``pool_id``.
+
+    Read off the whole snapshot, not ``memory_snapshot(pool_id)``: that call drops a
+    reference to each item of the id it is handed (torch 2.9-2.13), and once a process has
+    made 256 pools the id is no cached small int, so the call frees it while the pool's
+    handle still holds it. The handle's own release then writes into freed memory.
+    """
+    pool_id = tuple(pool_id)
+    return sum(
+        segment["total_size"] for segment in torch.cuda.memory_snapshot()
+        if tuple(segment.get("segment_pool_id", ())) == pool_id
+    )
 
 
 def _graph_nodes(graph) -> int:

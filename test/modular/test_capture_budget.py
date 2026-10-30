@@ -668,6 +668,31 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
         pytest.fail(f"torch {torch.__version__} refuses the snapshot call, so every capture would fail: {error}")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the reference is dropped in torch's CUDA snapshot")
+def test_sizing_a_throwaway_capture_keeps_the_references_to_its_pool_id(monkeypatch):
+    """torch's ``memory_snapshot(pool_id)`` drops a reference to each item of the id (2.9-2.13).
+    Past 256 pools the id is no cached small int, so sizing a throwaway capture freed it while
+    the pool's handle still held it, and the handle's release then wrote into freed memory: the
+    glibc heap corruption the draft-verify GPU modules hit when one process ran enough of them."""
+    pool_id = (0, int("1000007"))
+    held = [pool_id[1]] * 4  # so the id outlives a dropped reference and the count stays readable
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: pool_id)
+    monkeypatch.setattr(accelerator_graph_runner, "_graph_nodes", lambda graph: 0)
+    measured = ExecutableMemory()
+    measured.per_node = 0.0
+    before = sys.getrefcount(pool_id[1])
+
+    memory = accelerator_graph_runner._capture_thrown_away(
+        lambda pool, keep_graph: (object(), {}), "decode", measured,
+    )
+    # read as `before` was: inside the assert, pytest's rewrite holds one more reference
+    after = sys.getrefcount(pool_id[1])
+
+    assert memory is not None
+    assert after == before, "sizing the capture dropped a reference to its pool id"
+    del held
+
+
 def _cost(graph: int, kept: int = 0, peak: int = 0, slots: int = 1) -> CaptureCost:
     """A bucket's cost, in MiB."""
     return CaptureCost(peak=peak * _MIB, graph=graph * _MIB, kept=kept * _MIB, slots=slots)
