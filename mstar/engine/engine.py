@@ -2602,28 +2602,36 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
         )
 
-    def offload_request(self, node_name: str, request_id: int) -> int:
+    def offload_request(
+        self, node_name: str, request_id: int,
+        affected_resources: set[str] | None = None,
+    ) -> int:
         """Move the request off-device across this node's resources.
 
         Returns what was reclaimed, in whatever each resource counts (pages,
         today); 0 means nothing moved and the caller should pick another
-        victim.
+        victim. With *affected_resources*, only what those resources reclaimed
+        counts: every evictable resource still moves the request, but pages
+        freed in one that didn't run out don't make the retry fit.
         """
         if node_name in self._tp_follower_nodes:
             # Rank 0 decides what this instance evicts, and its decision arrives
             # as a resident-set delta. TP followers can deadlock if they are not
             # given a single source of truth for eviction.
             return 0
-        freed = sum(
-            resource.offload(request_id)
-            for resource in self._submodules[node_name].resources.values()
+        freed = {
+            label: resource.offload(request_id)
+            for label, resource in self._submodules[node_name].resources.items()
             if resource.supports_eviction
-        )
-        if freed > 0 and node_name in self._resident_delta:
+        }
+        if sum(freed.values()) > 0 and node_name in self._resident_delta:
             self._resident_delta[node_name].add_offloaded(
                 self._graph_runtime.get_rid_string(request_id)
             )
-        return freed
+        return sum(
+            pages for label, pages in freed.items()
+            if affected_resources is None or label in affected_resources
+        )
 
     def reload_request(self, node_name: str, request_id: int) -> bool:
         """Bring it back. False when any resource can't fit it yet, in which
