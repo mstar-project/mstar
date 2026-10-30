@@ -25,7 +25,7 @@ from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server import entrypoint  # noqa: E402
-from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
+from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue  # noqa: E402
 from mstar.api_server.entrypoint import PendingRequest  # noqa: E402
 from mstar.api_server.request_types import (  # noqa: E402
     APIServerMessage,
@@ -133,9 +133,10 @@ def _thread(model=None, is_pending=None, model_config=None):
     sent = []
     tm = _TensorManager()
     queues = {name: queue.Queue() for name in (
-        "in_queue", "result_tensor_queue", "out_queue", "profile_queue", "cleanup_request_queue",
+        "in_queue", "result_tensor_queue", "cleanup_request_queue",
         "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
     )}
+    queues["out_queue"], queues["profile_queue"] = ResultQueue(EventWakeup()), ResultQueue(EventWakeup())
     wt = PreprocessWorkerThread(
         **queues, stop_event=threading.Event(),
         communicator=SimpleNamespace(

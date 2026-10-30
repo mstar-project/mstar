@@ -109,8 +109,8 @@ def _thread(comm, wakeup, idle_wait_ms=2000, out_queue=None, profile_queue=None)
     stop = threading.Event()
     worker = PreprocessWorkerThread(
         in_queue=queue.Queue(), result_tensor_queue=queue.Queue(),
-        out_queue=out_queue if out_queue is not None else queue.Queue(),
-        profile_queue=profile_queue if profile_queue is not None else queue.Queue(),
+        out_queue=out_queue if out_queue is not None else ResultQueue(EventWakeup()),
+        profile_queue=profile_queue if profile_queue is not None else ResultQueue(EventWakeup()),
         cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop, communicator=comm,

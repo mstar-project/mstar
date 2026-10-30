@@ -569,8 +569,8 @@ class PreprocessWorkerThread:
         self,
         in_queue: queue.Queue, # for preprocessing
         result_tensor_queue: queue.Queue, # for output streaming
-        out_queue: queue.Queue,
-        profile_queue: queue.Queue,
+        out_queue: ResultQueue,
+        profile_queue: ResultQueue,
         cleanup_request_queue: queue.Queue,
         abort_request_queue: queue.Queue,
         reads_done_queue: queue.Queue,
@@ -1693,9 +1693,8 @@ class PreprocessWorkerThread:
         if not isinstance(self.communicator, OutboxCommunicator):
             self.communicator = OutboxCommunicator(self.communicator)
         idle_wait = self._idle_wait()
-        # plain queues in tests that build the thread around their own
-        flush_results = getattr(self.out_queue, "flush", lambda: None)
-        flush_profiles = getattr(self.profile_queue, "flush", lambda: None)
+        flush_results = self.out_queue.flush
+        flush_profiles = self.profile_queue.flush
         while not self.stop_event.is_set():
             did_work = False
             sends_pending = False

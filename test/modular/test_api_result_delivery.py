@@ -21,7 +21,7 @@ from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 
 from mstar.api_server import entrypoint
-from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.communication.event import EventWakeup
@@ -110,8 +110,8 @@ def test_result_reads_drain_ahead_of_preprocess():
     worker = PreprocessWorkerThread(
         in_queue=queue.Queue(),
         result_tensor_queue=queue.Queue(),
-        out_queue=queue.Queue(),
-        profile_queue=queue.Queue(),
+        out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()),
         cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(),
         reads_done_queue=queue.Queue(),

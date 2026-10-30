@@ -706,7 +706,7 @@ class _StubTensorManager:
 def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     """The real data worker thread stamps the handoff without ``--log-stats``
     once ``report_preprocess_finish`` is called, and skips the input summary."""
-    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
     from mstar.api_server.request_types import PreprocessInput
 
     class _Model:
@@ -719,10 +719,10 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.timing_requested = threading.Event()
-    facade.profile_queue = queue.Queue()
+    facade.profile_queue = ResultQueue(EventWakeup())
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
         profile_queue=facade.profile_queue, cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,

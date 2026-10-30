@@ -287,12 +287,13 @@ def test_stopping_data_worker_drops_tracked_requests():
     ``in_flight_requests``. Tracking teardown off the output-metadata dict
     misses exactly that request and leaks its signals into /dev/shm.
     """
-    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
-    for name in ("in_queue", "out_queue", "profile_queue", "result_tensor_queue", "cleanup_request_queue",
+    for name in ("in_queue", "result_tensor_queue", "cleanup_request_queue",
                  "abort_request_queue", "reads_done_queue", "discard_tensor_queue"):
         setattr(wt, name, queue.Queue())
+    wt.out_queue, wt.profile_queue = ResultQueue(EventWakeup()), ResultQueue(EventWakeup())
     wt.stop_event = threading.Event()
     wt.stop_event.set()
     wt.communicator = SimpleNamespace(get_all_new_messages=lambda: [])
