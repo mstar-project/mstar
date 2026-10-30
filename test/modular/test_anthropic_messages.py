@@ -13,6 +13,8 @@ pytest.importorskip("httpx")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server.entrypoint import APIServer  # noqa: E402
+
 
 class _Chunk:
     def __init__(self, modality, data, metadata=None):
@@ -28,6 +30,8 @@ def _usage_chunks(*parts, stop=True):
 class _StubAPI:
     """The APIServer as the agent routes use it: submit, then read the chunks
     in batches; a reader that stops early aborts the request."""
+
+    open_result_stream = APIServer.open_result_stream
 
     def __init__(self, model_name):
         self.model_name = model_name
@@ -266,6 +270,17 @@ def test_a_stream_reports_a_failure_in_band(client_and_stub):
     events = _events(client.post("/v1/messages", json=_body(stream=True)).text)
     assert events[-1] == {"type": "error", "error": {"type": "api_error", "message": "worker died"}}
     assert "message_stop" not in [e["type"] for e in events] and stub.aborted == []
+
+
+def test_a_stream_the_engine_refuses_answers_with_its_status(client_and_stub):
+    """Refused before its first token, a stream is the refusal's status and error, not a
+    200 that carries it."""
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("error", b"prompt too long", {"status": 400})]
+    r = client.post("/v1/messages", json=_body(stream=True))
+    assert r.status_code == 400
+    assert r.json() == {"type": "error", "error": {"type": "invalid_request_error", "message": "prompt too long"}}
+    assert stub.aborted == []
 
 
 def test_count_tokens_renders_the_prompt_the_model_would_get(client_and_stub):

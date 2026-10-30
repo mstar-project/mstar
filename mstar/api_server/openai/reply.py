@@ -148,7 +148,7 @@ def finish_reason(parser, usage: Usage, stop_string: str | None = None) -> str:
 
 
 def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None,
-                 usage: Usage | None = None, batches=None):
+                 usage: Usage | None = None, batches=None, key=None):
     """The events of a request's reply, one list per batch of result chunks.
     Bound to the submission when called: a stream's body is iterated later,
     by Starlette.
@@ -164,12 +164,14 @@ def reply_events(api, request_id: str, parser=None, stops: list[str] | None = No
     while the parser held the stop's end, when it may start a tag, or is the
     answer's trailing whitespace (held until text follows it).
     ``usage``, when given, is filled as the chunks arrive (a stream that opens
-    with the prompt's count reads it from there). ``batches``, when given, are
-    the request's chunk batches already opened (``api.open_result_stream``).
+    with the prompt's count reads it from there). ``batches`` and ``key``, when
+    given, are the request's chunk batches already opened
+    (``api.open_result_stream``) and its submission, named when it was submitted.
     """
     if batches is None:
         batches = api.iter_result_chunk_batches(request_id)
-    key = api.submission_key(request_id)
+    if key is None:
+        key = api.submission_key(request_id)
     return _events(batches, lambda: api.abort_submission(key, outcome="success"), parser, stops,
                    Usage() if usage is None else usage)
 

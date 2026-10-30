@@ -37,6 +37,7 @@ from __future__ import annotations
 from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import now, rid, sse
 from mstar.api_server.openai.protocol import ChatCompletionRequest
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 _FIELDS = {"model", "input", "instructions", "tools", "tool_choice", "parallel_tool_calls", "max_output_tokens",
            "reasoning", "temperature", "top_p", "stream", "store", "include", "text", "truncation",
@@ -229,10 +230,18 @@ async def create_response(api, model_name, adapter, body, raw_request=None):
         request_id=request_id,
     )
     usage = reply.Usage()
-    events = reply.reply_events(api, request_id, parser, None, usage)
     response = _Response(model_name, request_id, body)
     if req.stream:
-        return _stream(response, events, usage)
+        key = api.submission_key(request_id)  # named before the wait
+        # a request the engine refuses gets its status, not a 200
+        batches = await api.open_result_stream(request_id, raw_request, batches=True)
+        events = reply.reply_events(api, request_id, parser, None, usage, batches=batches, key=key)
+        return ReleasingStreamingResponse(
+            _stream(response, events, usage),
+            release=lambda: api.release_request(request_id),
+            media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
+        )
+    events = reply.reply_events(api, request_id, parser, None, usage)
     for e in await reply.collect(events, raw_request):
         response.add(e)
     return response.body()

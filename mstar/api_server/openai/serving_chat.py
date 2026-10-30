@@ -47,10 +47,12 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             request_id=request_id,
         )
         if req.stream:
+            # named before the wait below, which a resubmission under the id could outlast
+            key = api.submission_key(request_id)
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)
             return ReleasingStreamingResponse(
-                _stream_events(reply.reply_events(api, request_id, parser, stops, batches=batches),
+                _stream_events(reply.reply_events(api, request_id, parser, stops, batches=batches, key=key),
                                model_name, request_id, include_usage),
                 release=lambda: api.release_request(request_id),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache"},

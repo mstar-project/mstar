@@ -11,7 +11,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Request, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from mstar.api_server.body_limit import max_body_bytes
 from mstar.api_server.openai import (
@@ -145,7 +145,7 @@ async def _anthropic(require: str, raw_request: Request, handle):
         return _anthropic_error(err.status_code, json.loads(bytes(err.body))["error"]["message"])
     if isinstance(result, dict):
         return JSONResponse(result)
-    return StreamingResponse(result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return result  # serving_messages builds the streaming response
 
 
 @router.post("/v1/messages")
@@ -177,7 +177,7 @@ async def responses(raw_request: Request):
         return _exception_error(e, "/v1/responses")
     if isinstance(result, dict):
         return JSONResponse(result)
-    return StreamingResponse(result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return result  # serving_responses builds the streaming response
 
 
 @router.post("/v1/audio/speech")

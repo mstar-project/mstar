@@ -37,6 +37,7 @@ import json
 from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import rid, sse
 from mstar.api_server.openai.protocol import ChatCompletionRequest
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 _FIELDS = {"model", "messages", "system", "max_tokens", "stop_sequences", "stream", "temperature", "top_p",
            "top_k", "tools", "tool_choice", "thinking", "metadata"}
@@ -248,9 +249,17 @@ async def create_message(api, model_name, adapter, body, raw_request=None):
         request_id=request_id,
     )
     usage = reply.Usage()
-    events = reply.reply_events(api, request_id, parser, stops, usage)
     if req.stream:
-        return _stream(model_name, request_id, events, usage)
+        key = api.submission_key(request_id)  # named before the wait
+        # a request the engine refuses gets its status, not a 200
+        batches = await api.open_result_stream(request_id, raw_request, batches=True)
+        events = reply.reply_events(api, request_id, parser, stops, usage, batches=batches, key=key)
+        return ReleasingStreamingResponse(
+            _stream(model_name, request_id, events, usage),
+            release=lambda: api.release_request(request_id),
+            media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
+        )
+    events = reply.reply_events(api, request_id, parser, stops, usage)
     return _message(model_name, request_id, await reply.collect(events, raw_request))
 
 
