@@ -151,6 +151,14 @@ class KVCache:
             raise NotImplementedError(
                 f"KV layout {cfg.layout} is not recognized."
             )
+        # per-token planes on the same pages: [layer, page, token, width] each
+        self.aux = {
+            name: torch.zeros(
+                planes.num_layers, cfg.max_num_pages, cfg.page_size, planes.width,
+                dtype=dtype, device=device,
+            )
+            for name, planes in cfg.aux_planes.items()
+        }
 
     @property
     def layout(self) -> KVLayout:
@@ -234,6 +242,18 @@ class KVCache:
                 f"layer_view is not implemented for layout {self.layout}."
             )
         return self.tensor[layer_idx]
+
+    def aux_view(self, name: str, layer_idx: int) -> torch.Tensor:
+        """One layer of the aux planes ``name``: [max_num_pages, page_size, width]."""
+        return self.aux[name][layer_idx]
+
+    def write_aux(
+        self, name: str, layer_idx: int, rows: torch.Tensor,
+        page_idx: torch.Tensor, cache_idx: torch.Tensor,
+    ) -> None:
+        """Scatter per-token rows ([num_tokens, width]) into the aux planes ``name`` at the
+        (page, offset-in-page) slots given by ``page_idx``/``cache_idx``."""
+        _kv_scatter_mla_eager(self.aux[name], layer_idx, rows, page_idx, cache_idx)
 
     def read_tokens(
         self, layer_idx: int,
@@ -319,13 +339,20 @@ class KVCache:
         dst = torch.as_tensor(dst_pages, dtype=torch.long, device=self.device)
         # The gather is materialized before the scatter, so pages may appear
         # in both src and dst.
-        self.tensor[:, dst] = self.tensor[:, src]
+        for t in (self.tensor, *self.aux.values()):
+            t[:, dst] = t[:, src]
 
     def copy_slots(self, src_page: int, dst_page: int, end: int) -> None:
-        """Copy tokens [0, end) of one page onto another, every layer, both K and V."""
+        """Copy tokens [0, end) of one page onto another, every layer (both K and V under
+        NHD) and the aux planes."""
         # Index with slices rather than tensors. Slices need no copy from the host,
         # so the copy doesn't wait on the stream.
-        self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
+        if self.layout == KVLayout.MLA:  # [layer, page, token, latent]
+            self.tensor[:, dst_page, :end] = self.tensor[:, src_page, :end]
+        else:  # [layer, page, K/V, token, ...]
+            self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
+        for t in self.aux.values():
+            t[:, dst_page, :end] = t[:, src_page, :end]
 
     def chunk_view(
         self, layer_idx: int, page_idx: int,

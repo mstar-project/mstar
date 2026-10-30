@@ -1,7 +1,10 @@
 """GLM-5.3-Flash (glm5_next) architecture + generation config."""
 
+import dataclasses
 import functools
 from dataclasses import dataclass, field
+
+from mstar.engine.resources.kv.config import AuxPlanes
 
 # fp8 e4m3 with [128, 128] `weight_scale_inv` block scales and dynamic
 # activation scaling: the checkpoint's quantization scheme.
@@ -19,6 +22,7 @@ ATTN = "attn"              # the absorbed-MLA attention backend over KV_CACHE
 SAMPLER = "sampler"
 KDA_STATE = "kda_state"    # recurrent pool: the conv and delta-rule state of the 34 KDA layers
 KDA = "kda"                # the KDA linear attention run against KDA_STATE
+DSA = "dsa"                # dsa_long_context: the k-pool DSA over KV_CACHE's index planes
 # KDA_STATE blocks held per request with MTP: the MTP state that drafts the next
 # step's first token, and that draft
 MTP_HIDDEN = "mtp_hidden"
@@ -151,8 +155,15 @@ class Glm5NextModelConfig:
     # Engine half of DSA. Off: serving holds every context to index_topk,
     # where dense MLA computes exactly what DSA would (selecting
     # <= topk/kpool pools out of <= topk/kpool is the identity, tail
-    # included).
+    # included). On: contexts up to max_seq_len, every MLA layer through
+    # the k-pool indexer and sparse MLA (mstar/engine/resources/dsa/kpool.py).
     dsa_long_context: bool = False
+    # dsa_long_context: a prefill step runs its tokens through the model in windows of
+    # this many, so activations stay bounded however long the prompt.
+    prefill_window_tokens: int = 8192
+    # dsa_long_context under TP: each rank selects a block of a long prefill's rows and the
+    # blocks are all-gathered, instead of every rank selecting every row.
+    dsa_shard_prefill: bool = False
 
     # --- MLP / MoE ---
     first_k_dense_replace: int = 3  # layers 0..2 are dense
@@ -337,6 +348,53 @@ class Glm5NextModelConfig:
         if self.mtp_num_draft_tokens > 0 or _flashinfer_before("0.6.18"):
             return 64
         return 0
+
+    @property
+    def context_limit(self) -> int:
+        """Tokens a request may hold: index_topk, where dense MLA is exact, unless
+        dsa_long_context serves up to max_seq_len."""
+        return self.max_seq_len if self.dsa_long_context else self.index_topk
+
+    @property
+    def num_kv_planes(self) -> int:
+        """Latent planes of the MLA cache: one per full-attention layer and the MTP layer's.
+        With dsa_long_context each has an index plane on the same pages (``index_planes``)."""
+        return len(self.full_attn_layer_indices) + (1 if self.mtp_num_draft_tokens > 0 else 0)
+
+    @property
+    def index_planes(self) -> AuxPlanes | None:
+        """dsa_long_context: the MLA cache's index planes, a row ``[k | gate | key of the
+        pool ending here]`` per token, beside each latent plane."""
+        if not self.dsa_long_context:
+            return None
+        return AuxPlanes(num_layers=self.num_kv_planes, width=3 * self.index_head_dim)
+
+    def check_long_context(self, page_size: int | None = None) -> None:
+        """Refuse a dsa_long_context setup the index planes cannot hold."""
+        if not self.dsa_long_context:
+            return
+        if self.mtp_num_draft_tokens > 0:
+            raise ValueError(
+                "dsa_long_context with MTP is not supported: a verify step leaves rejected "
+                "drafts in the cache as holes, which the k-pool indexer would pool as tokens")
+        if self.max_seq_len <= self.index_topk:
+            # dense MLA already serves index_topk: the window is model_kwargs.max_seq_len
+            raise ValueError(
+                f"dsa_long_context serves contexts past index_topk={self.index_topk}; "
+                f"model_kwargs.max_seq_len is {self.max_seq_len}")
+        if self.prefill_window_tokens < 1:
+            raise ValueError(f"prefill_window_tokens={self.prefill_window_tokens} must be >= 1")
+        if page_size is not None and page_size % self.index_kpool:
+            raise ValueError(
+                f"page_size={page_size} must be a multiple of index_kpool={self.index_kpool}")
+        if page_size is not None and (page_size // self.index_kpool) & (
+                page_size // self.index_kpool - 1):
+            # flashinfer's page-table transform takes power-of-two pools per page
+            raise ValueError(f"page_size={page_size} over index_kpool={self.index_kpool} "
+                             "must be a power of two")
+        from mstar.engine.resources.dsa.sparse_mla import check_flashinfer
+
+        check_flashinfer()
 
     @property
     def kv_rows(self) -> int:
@@ -570,6 +628,13 @@ class Glm5NextModelConfig:
             prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],
         )
+
+    @classmethod
+    def reduced_long_context(cls, max_seq_len: int = 512) -> "Glm5NextModelConfig":
+        """``reduced`` with dsa_long_context: a latent wide enough for the index planes."""
+        cfg = cls.reduced()
+        return dataclasses.replace(cfg, kv_lora_rank=3 * cfg.index_head_dim,
+                                   dsa_long_context=True, max_seq_len=max_seq_len)
 
     @classmethod
     def reduced_fp8(

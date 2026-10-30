@@ -398,7 +398,8 @@ asr = [
 
 # GLM-5.x
 glm = [
-    "flashinfer-python>=0.6.14",
+    # long context's page-table transform takes page_size from 0.6.18 on
+    "flashinfer-python>=0.6.18",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel

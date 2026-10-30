@@ -4,11 +4,14 @@ the DSA k-pool indexer each full-attention layer ships. Its KDA layers are the s
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.dsa import kpool
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.model.components.mla import MLAAttention
-from mstar.model.glm5_next.config import ATTN, KV_CACHE, LABEL, Glm5NextModelConfig
+from mstar.model.glm5_next.config import ATTN, DSA, KV_CACHE, LABEL, Glm5NextModelConfig
 
 # k_norm eps is hardcoded in the reference indexer (LayerNorm(head_dim,
 # eps=1e-6), weight AND bias) — NOT rms_norm_eps.
@@ -38,12 +41,27 @@ class Glm5NextIndexer(nn.Module):
         self.index_kpool_compress_gate = nn.Parameter(
             torch.zeros(self.head_dim, config.hidden_size))
 
+    def keys_and_gate(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each token's index key ``(T, D)`` and its pool gate ``(T, D)``."""
+        k = self.k_norm(self.wk(hidden_states))
+        return k, F.linear(hidden_states, self.index_kpool_compress_gate)
+
+    def query_and_weights(
+        self, q_c: torch.Tensor, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The score's query heads ``(T, H, D)`` and fp32 head weights ``(T, H)``, which carry
+        the head-count and softmax scales (relu commutes with a positive scale)."""
+        q = self.wq_b(q_c).view(q_c.shape[0], self.n_heads, self.head_dim)
+        scale = self.n_heads ** -0.5 * self.head_dim ** -0.5
+        return q, self.weights_proj(hidden_states).float() * scale
+
 
 class Glm5NextMLAAttention(MLAAttention):
     """The shared MLA with no decoupled dims (``mla_use_nope``, ``qk_rope_head_dim`` 0), absorbed,
     over this layer's plane of the paged latent cache: the compact full-attention index ``kv_plane``
     (3 -> 0, 7 -> 1, ..., 43 -> 10; the MTP draft plane comes after), so the caller threads no
-    cursor through the stack."""
+    cursor through the stack. Under dsa_long_context its DSA resource selects each row's
+    slots past index_topk (``_select`` / ``_attend_selected``)."""
 
     def __init__(
         self,
@@ -67,10 +85,38 @@ class Glm5NextMLAAttention(MLAAttention):
         # Every full-attention layer (the MTP layer included) ships its own
         # full indexer; config.indexer_types is the source of truth.
         self.indexer = Glm5NextIndexer(config)
+        # dsa_long_context: this layer's index plane (its latent plane's, on the same pages),
+        # and the DSA resource whose context the submodule opens per forward
+        self.index_plane = kv_plane if config.dsa_long_context else None
+        self._dsa: kpool.KPoolDSA | None = None
+        self.dsa_group = (comm_group or CommGroup.trivial()) if config.dsa_shard_prefill else None
+
+    def bind_resources(self, resources: dict) -> None:
+        super().bind_resources(resources)
+        self._dsa = resources.get(DSA)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """``hidden_states (T, hidden)`` flat engine layout, out the same."""
         return super().forward(hidden_states, None)
+
+    def _select(self, hidden_states, q_c, position_ids):
+        """DSA past index_topk: write the step's index keys and select each row's slots (prefill
+        rows too: each selects over its own causal prefix); None without a context."""
+        ctx = self._dsa.ctx if self._dsa is not None else None
+        if ctx is None:
+            return None
+        k, gate = self.indexer.keys_and_gate(hidden_states)
+        kpool.write_index(self._kv, self.index_plane, LABEL, k, gate,
+                          self.indexer.index_kpool_compress_ape, ctx)
+        q, w = self.indexer.query_and_weights(q_c, hidden_states)
+        return kpool.select(q, w, self._kv.aux_view(INDEX_PLANES, self.index_plane), ctx,
+                            self.dsa_group)
+
+    def _attend_selected(self, slots, q_nope, q_pe, latent):
+        """Write the step's latents, then attend each row over just its selected slots."""
+        self._kv.write_kv(latent, None, layer_idx=self.kv_plane, label=LABEL)
+        return kpool.sparse_attend(q_nope, q_pe, self._kv.layer_view(self.kv_plane), slots,
+                                   self._dsa.ctx, self.softmax_scale)
 
     def forward_block_row(
         self, hidden_states: torch.Tensor, row: int, latents: torch.Tensor,

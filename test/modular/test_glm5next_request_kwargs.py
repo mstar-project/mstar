@@ -58,3 +58,10 @@ def test_a_request_without_max_tokens_runs_to_the_window():
     m = _model()
     assert m.get_max_output_tokens() == m.get_max_output_tokens(max_output_tokens=None) == m.config.index_topk
     assert m.get_max_output_tokens(max_output_tokens=100) == 100
+
+
+def test_a_long_context_request_without_max_tokens_runs_to_its_window():
+    m = _model(dsa_long_context=True, max_seq_len=1 << 20)
+    assert m.get_max_output_tokens() == m.get_max_output_tokens(max_output_tokens=None) == 1 << 20
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        m.process_prompt("Hi", ["text"], ["text"], max_output_tokens="lots")

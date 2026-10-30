@@ -48,7 +48,8 @@ def test_an_unknown_moe_kernel_is_refused(kernel):
         Glm5NextSparseMoeBlock(cfg)
 
 
-@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml"])
+@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml",
+                                  "glm5_next_tp8_longctx.yaml"])
 def test_shipped_configs_admit_one_request_per_kda_slot(name):
     # past the slots a prefill waits in the worker, and its wait broke the decode
     # speculation chain every other step
