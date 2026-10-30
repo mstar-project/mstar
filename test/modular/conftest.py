@@ -15,6 +15,7 @@ And one autouse fixture that clears the cached platform around every test.
 """
 import sys
 import types
+from importlib.machinery import ModuleSpec
 
 import pytest
 import torch
@@ -41,7 +42,11 @@ except (AttributeError, RuntimeError):
 
 if "triton" not in sys.modules:
     triton = types.ModuleType("triton")
+    # find_spec() inspects __spec__ on already-imported modules; Transformers
+    # probes Triton this way, even when no Triton distribution is installed.
+    triton.__spec__ = ModuleSpec("triton", loader=None)
     triton.language = types.ModuleType("triton.language")
+    triton.language.__spec__ = ModuleSpec("triton.language", loader=None)
     triton.language.constexpr = int
     triton.jit = lambda *a, **k: (lambda f: f)
     triton.cdiv = lambda a, b: -(-a // b)

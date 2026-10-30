@@ -40,6 +40,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "chatterbox_turbo": "chatterbox_turbo.yaml",
     "cosyvoice3": "cosyvoice3.yaml",
     "orpheus": "orpheus_colocated.yaml",
+    "personaplex": "personaplex.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
     "omnivoice": "omnivoice.yaml",
@@ -195,6 +196,10 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
+    if model == "personaplex":
+        lines.append("    res = client.generate(audio=\"user.wav\", input_modalities=(\"audio\",),")
+        lines.append("                          output_modalities=(\"audio\",\"text\"), voice=\"NATF2\")")
+        lines.append("    res.save_audio(\"agent.wav\")  # agent track, time-aligned to user.wav")
     if model in ("whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
                  "canary", "canary_qwen", "parakeet", "nemotron_asr"):
         lines.append("    print(client.transcribe(\"speech.wav\", language=\"en\"))")

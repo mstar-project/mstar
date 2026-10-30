@@ -36,6 +36,7 @@ from benchmark.request import (
 
 
 class DatasetType(Enum):
+    LOCAL_AUDIO = "local_audio"
     VBENCH = "vbench"
     TEXT = "text"
     LIBRI = "libri"
@@ -81,6 +82,7 @@ class BenchmarkConfig:
     request_type: RequestType
     local_cache_dir: str
     num_warmup: int = 3
+    audio_manifest: Optional[str] = None
     profiling_type: ProfilingType = ProfilingType.OFFLINE
     inference_system: InferenceSystemType = InferenceSystemType.OURS
     verbose: bool = False
@@ -129,6 +131,14 @@ class Benchmark:
         self.inference_system = config.inference_system.instantiate()
 
     def _get_dataset(self) -> BaseDataset:
+        if self.config.dataset == DatasetType.LOCAL_AUDIO:
+            from benchmark.personaplex.dataset import LocalAudioDataset
+
+            if not self.config.audio_manifest:
+                raise ValueError("--audio-manifest is required for local_audio")
+            return LocalAudioDataset(
+                self.config.audio_manifest, self.config.num_requests, self.config.request_type,
+            )
         if self.config.dataset == DatasetType.VBENCH:
             return VBenchDataset(
                 cache_dir=self.config.vbench_cache_dir,
@@ -520,6 +530,7 @@ def parse_args() -> BenchmarkConfig:
     )
     parser.add_argument("--num-requests", type=int, default=10)
     parser.add_argument("--num-warmup", type=int, default=3)
+    parser.add_argument("--audio-manifest", help="Digest-checked JSON list of local audio recordings")
     parser.add_argument(
         "--profiling-type", choices=[p.value for p in ProfilingType], default=ProfilingType.OFFLINE.value
     )
@@ -695,6 +706,7 @@ def parse_args() -> BenchmarkConfig:
         num_requests=args.num_requests,
         request_type=request_type,
         num_warmup=args.num_warmup,
+        audio_manifest=args.audio_manifest,
         profiling_type=ProfilingType(args.profiling_type),
         inference_system=InferenceSystemType(args.inference_system),
         batch_size=args.batch_size,

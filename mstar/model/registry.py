@@ -35,6 +35,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "nemotron_asr": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "parakeet": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
+    "personaplex": ("mstar.model.personaplex.personaplex_model", "PersonaPlexModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_asr": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
@@ -142,6 +143,10 @@ HF_MODELS: dict[str, dict] = {
     # NVIDIA Parakeet-TDT-0.6B-v3: FastConformer + token-and-duration
     # transducer, 25 European languages, language detected from the speech.
     "parakeet": {"model_path_hf": "nvidia/parakeet-tdt-0.6b-v3"},
+    # Gated: accept NVIDIA's license on the model page and use a token with
+    # access. Voice presets come from the same repo's voices.tgz, fetched and
+    # extracted on first use unless model_kwargs.voice_dir points elsewhere.
+    "personaplex": {"model_path_hf": "nvidia/personaplex-7b-v1"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().

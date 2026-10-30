@@ -301,6 +301,19 @@ pi05 = [
     "triton",
 ]
 
+personaplex = [
+    # Only what mstar/model/personaplex imports: no moshi, pyloudnorm or einops.
+    # transformers backs Mimi; GPU-checked on 4.57.3, 5.20.2 and 5.21.0.
+    # sentencepiece tokenizes the persona prompt.
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "safetensors",
+    "sentencepiece",
+    "torchcodec",
+    "transformers>=4.57.3",
+]
+
 vjepa2 = [
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
@@ -444,6 +457,8 @@ all = [
     # lingbot_world: camera trajectory resampling and prompt cleaning
     "scipy",
     "ftfy",
+    # personaplex (persona prompt tokenizer)
+    "sentencepiece",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
     # separately, see docs/installation.rst.
     # flash-attn-4 (waypoint's default flex attention backend) is also installed
