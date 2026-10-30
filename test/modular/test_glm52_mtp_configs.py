@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import sys
 import types
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,7 +72,7 @@ def test_mtp_acceptance_log_per_position(caplog):
     """
     k = 3
 
-    def _ns(pair_postnorm: bool) -> SimpleNamespace:
+    def _ns() -> SimpleNamespace:
         return SimpleNamespace(
             config=SimpleNamespace(mtp_num_draft_tokens=k),
             _MTP_STAT_LOG_EVERY=Glm52LLMSubmodule._MTP_STAT_LOG_EVERY,
@@ -80,10 +81,9 @@ def test_mtp_acceptance_log_per_position(caplog):
             # 512 steps halving at each position: reached = [512, 256, 128, 64].
             _mtp_stat_acc_hist=[256, 128, 64, 64],
             _mtp_stat_emitted=256 * 1 + 128 * 2 + 64 * 3 + 64 * 4,
-            _mtp_pair_postnorm=pair_postnorm,
         )
 
-    ns = _ns(False)
+    ns = _ns()
     with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
         Glm52LLMSubmodule._maybe_log_mtp_acceptance(ns)
     msgs = [r.getMessage() for r in caplog.records]
@@ -92,24 +92,61 @@ def test_mtp_acceptance_log_per_position(caplog):
     assert "[256, 128, 64, 64]" in pos_line
     assert "0.50 0.50 0.50" in pos_line
     assert ns._mtp_stat_logged == 512
-    # The line must name which trunk-pairing mode produced it: a profile whose
-    # mode you have to infer from the launch environment is one you cannot
-    # trust afterwards, and a mislabelled one inverts the comparison silently.
-    assert "pre-final-norm (MSTAR_GLM52_MTP_PAIR_POSTNORM=0)" in pos_line
-    assert "post-final-norm" not in pos_line
-
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
-        Glm52LLMSubmodule._maybe_log_mtp_acceptance(_ns(True))
-    (post_line,) = [
-        r.getMessage() for r in caplog.records if "by position" in r.getMessage()
-    ]
-    # post-norm pairing is the default (the env var's 1); the label said the opposite
-    assert "post-final-norm (default" in post_line
     # below the threshold nothing is logged
     caplog.clear()
-    quiet = _ns(True)
+    quiet = _ns()
     quiet._mtp_stat_steps = 100
     with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
         Glm52LLMSubmodule._maybe_log_mtp_acceptance(quiet)
     assert not caplog.records
+
+
+class _ChainMTP:
+    """A stand-in MTP layer: a pass returns (head input, layer output) as two distinct
+    functions of the stream it was given, and a block-row pass records that stream."""
+
+    def __init__(self):
+        self.prev_hidden: list[torch.Tensor] = []
+
+    def forward_block_row(self, embeds, prev_hidden, position_ids, row, block, rows):
+        self.prev_hidden.append(prev_hidden.clone())
+        out = prev_hidden + embeds + 1.0
+        return out * 2.0, out  # (shared_head-normed, under the norm)
+
+    def __call__(self, embeds, paired, position_ids):  # the seed pass over the block
+        out = paired + embeds
+        return out * 2.0, out
+
+
+def test_the_draft_chain_and_the_seed_carry_the_post_norm_stream():
+    """A draft's MTP pass reads the previous pass's shared_head-normed output, the stream
+    the head reads, as d1's reads the trunk's post-final-norm state; the seed left for the
+    next step's first chained draft is that stream too. Chaining the output under the norm
+    cut GLM-5.2's second and third drafts' acceptance on 8xH200."""
+    k, n, hidden, vocab = 3, 2, 8, 16
+    block = k + 1
+    mtp = _ChainMTP()
+    embed = lambda ids: ids.float()[:, None].expand(-1, hidden)  # noqa: E731
+    ns = SimpleNamespace(language_model=SimpleNamespace(model=SimpleNamespace(embed_tokens=embed), mtp=mtp),
+                         mtp_k=k, mtp_block=block)
+    seed_h = torch.randn(n, hidden)
+    ns._mtp_read_seed = lambda slots: (seed_h, torch.tensor([3, 5]))
+    ns._draft_tokens = lambda h_head, prev: h_head.sum(-1).abs().long() % vocab
+    ns._hidden = lambda ids, pos, *dsa: torch.randn(ids.shape[0], hidden)
+    ns._dsa_use = lambda *dsa: nullcontext()
+    ns.lm_head = lambda h: torch.randn(h.shape[0], vocab)
+    ns._broadcast = lambda t: t
+    ns._stage_verdict = lambda *a: None
+    ns._mtp_seed = lambda slots, h_head, prev: None
+    Glm52LLMSubmodule._mtp_decode(ns, SimpleNamespace(request_ids=["r0", "r1"]), torch.tensor([1, 2]),
+                                  torch.arange(n * block), torch.tensor([1, 2]), torch.tensor([7]))
+    # k - 1 chained passes: the first reads the seed, the second the first pass's head input
+    assert len(mtp.prev_hidden) == k - 1
+    assert torch.equal(mtp.prev_hidden[0], seed_h)
+    assert torch.equal(mtp.prev_hidden[1], (seed_h + embed(torch.tensor([3, 5])) + 1.0) * 2.0)
+
+    store = SimpleNamespace(_mtp_seed_hidden=torch.zeros(4, hidden), _mtp_seed_draft=torch.zeros(4, dtype=torch.long),
+                            _draft_tokens=ns._draft_tokens)
+    slots, h_head = torch.tensor([1, 2]), torch.randn(n, hidden)
+    Glm52LLMSubmodule._mtp_seed(store, slots, h_head, torch.tensor([0, 0]))
+    assert torch.equal(store._mtp_seed_hidden[slots], h_head)

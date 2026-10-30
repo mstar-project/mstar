@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from mstar.platforms import current_platform
 from mstar.utils.fp8_block import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
@@ -248,7 +249,7 @@ def _probe_w8a8(device: torch.device) -> bool:
 
 def _probe_fi(device: torch.device) -> bool:
     """flashinfer's SM90 block-scale GEMM runs here (and is loaded before any capture)."""
-    if torch.cuda.get_device_capability(device) != (9, 0):
+    if current_platform.cuda_capability(device) != (9, 0):
         return False
     try:
         from flashinfer.gemm import fp8_blockscale_gemm_sm90
