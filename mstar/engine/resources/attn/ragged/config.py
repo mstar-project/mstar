@@ -5,6 +5,7 @@ a submodule can declare a step without pulling FlashInfer in behind it.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import torch
@@ -20,6 +21,14 @@ def cross_label(q_label: str, kv_label: str) -> str:
     """The plan a cross-attention pair runs under: ``q_label``'s spans attending
     ``kv_label``'s."""
     return f"{q_label}<-{kv_label}"
+
+
+class RaggedAttnBackend(Enum):
+    # the platform's default, decided when the resource is built
+    AUTO = "auto"
+    FLASHINFER = "flashinfer"
+    # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
+    DENSE = "dense"
 
 
 @dataclass(frozen=True)
@@ -63,6 +72,7 @@ class RaggedAttentionConfig:
     # bucket's own token count is the ceiling and this stays None.
     max_tokens_per_request: int | None = None
 
+    backend: RaggedAttnBackend = RaggedAttnBackend.AUTO
     flashinfer_backend: str = "auto"
 
     # Activation dtype of the q / k / v the node hands the kernel (and of its
@@ -108,6 +118,7 @@ class _RaggedSpecBase(NodeResourceSpec):
 
     def apply_yaml_overrides(
         self,
+        backend: str | RaggedAttnBackend | None = None,
         flashinfer_backend: str | None = None,
         max_segments_per_request: int | None = None,
         max_tokens_per_request: int | None = None,
@@ -118,6 +129,8 @@ class _RaggedSpecBase(NodeResourceSpec):
         The two ceilings are here rather than on the model because they size
         CUDA-graph buckets, which is a deployment's memory/coverage trade.
         """
+        if backend is not None:
+            self.config.backend = RaggedAttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
         if max_segments_per_request is not None:
@@ -152,3 +165,23 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
         from mstar.engine.resources.attn.ragged.base import RaggedCrossAttnManager
 
         return RaggedCrossAttnManager
+
+
+@dataclass
+class RaggedBlockCausalAttentionSpec(_RaggedSpecBase):
+    """Cacheless block-causal self-attention within each declared span: a token in
+    block ``b`` of its span (``block_size`` tokens a block, from the span's start)
+    attends every key of blocks ``0..b``. Declared with ``AttentionStep(causal=False)``,
+    since the block structure is the whole mask.
+
+    Its own kind, not a flag on ``RaggedAttentionSpec``: it runs a different kernel
+    (paged prefill over one-token pages, see ``attn.ragged.block_causal``).
+    """
+
+    block_size: int
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedBlockCausalAttnManager
+
+        return RaggedBlockCausalAttnManager

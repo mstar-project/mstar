@@ -258,7 +258,7 @@ def run_case(
     shape = shape or SMALL
     hidden = shape["hidden"]
     pool, manager = build(device, shape)
-    manager.build_cuda_graph_buffers([], max_bs=1, max_seq_len=BUCKET_TOKENS)
+    manager.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=BUCKET_TOKENS)
     stack = Stack(pool, manager, device, shape)
     if repo is not None:
         load_real_weights(stack, repo)
@@ -345,7 +345,7 @@ def bisect_layers(spans=(14, 9), seed: int = 0) -> None:
     shape = SMALL
     hidden = shape["hidden"]
     pool, manager = build(device, shape)
-    manager.build_cuda_graph_buffers([], max_bs=1, max_seq_len=BUCKET_TOKENS)
+    manager.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=BUCKET_TOKENS)
     stack = Stack(pool, manager, device, shape)
 
     pre_lease = SlotLease(

@@ -13,15 +13,15 @@ Architecture (3 async partitions):
 
 Streaming topology:
     Thinker --[thinker_states, FixedChunkPolicy(1)]--> Talker
-    Talker  --[codec_tokens,  FixedChunkPolicy(25)]--> Code2Wav
+    Talker  --[codec_tokens,  ScheduledLeftContextChunkPolicy((12, 13), 25, 25)]--> Code2Wav
 
-Conductor-triggered pipelined prefill (Approach C):
-    After each Thinker walk completes (prefill_text, prefill_audio,
-    prefill_vision, thinker_decode), the conductor sends a
-    ``talker_trigger`` to the Talker partition.  During prefill each
-    trigger extends the Talker KV cache with the new Thinker hidden
-    states.  The final trigger (when thinker_decode starts) tells the
-    Talker to sample its first codec token and transition to decode.
+Producer-triggered Talker walks:
+    The Thinker assigns its streamed states the Talker walk they run under
+    (see ``_talker_walk``).  States from a Thinker prefill walk extend the Talker
+    KV cache in ``talker_prefill``; the first ``thinker_decode`` state runs
+    ``talker_last_prefill``, which samples the first codec token, and the
+    rest feed ``talker_decode``.  The Talker never needs to know how many
+    prefill walks the Thinker runs.
 
 Text-only mode:
     When output_modalities does not include "audio", only the Thinker
@@ -30,6 +30,7 @@ Text-only mode:
 
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from jinja2 import TemplateError
@@ -55,7 +56,19 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import (
+    MAX_OUTPUT_TOKENS,
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+)
+from mstar.model.components import MoeParallelConfig
+from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -67,6 +80,7 @@ from mstar.model.multimodal import (
     prefill_plan,
     split_around_spans,
 )
+from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,
@@ -76,15 +90,53 @@ from mstar.model.qwen3_omni.config import (
     TALKER_SAMPLER,
     THINKER_ATTN,
     THINKER_KV,
+    THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
 )
+from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import Operation, WeightConverter, drop_stop_tokens
-from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
-from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.model.utils import Operation, TextChunkDetokenizer, WeightConverter, drop_stop_tokens
+from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
+from mstar.streaming.topology import (
+    Connection,
+    PartitionTopology,
+    ProducerWalkCtx,
+    StreamingGraphEdge,
+)
 
 logger = logging.getLogger(__name__)
+
+# Code2Wav streaming knobs a deployment YAML's ``model_kwargs`` may set; the
+# rest of the Code2Wav config comes from the checkpoint.
+CODE2WAV_SERVING_OVERRIDES = ("codec_chunk_schedule", "codec_chunk_frames", "codec_left_context_frames")
+
+
+def apply_code2wav_serving_overrides(code2wav, model_kwargs: dict) -> None:
+    """Move the Code2Wav streaming knobs out of ``model_kwargs`` into the
+    config, rejecting values that would drop or repeat streamed audio."""
+    for name in CODE2WAV_SERVING_OVERRIDES:
+        if model_kwargs.get(name) is not None:
+            value = model_kwargs.pop(name)
+            setattr(code2wav, name, tuple(value) if isinstance(value, list) else value)
+    code2wav.check_streaming_knobs()
+
+
+def _thinker_to_talker_policy() -> FixedChunkPolicy:
+    # Past the Thinker's end only the decode loop keeps running; an empty
+    # chunk in a prefill walk would run a prefill pass with nothing in it
+    return FixedChunkPolicy(
+        chunk_size=1, continue_after_done=frozenset({"talker_decode"}),
+    )
+
+
+def _talker_walk(ctx: ProducerWalkCtx) -> str:
+    """The Talker walk a Thinker pass's streamed states run under."""
+    if ctx.producer_walk != "thinker_decode":
+        return "talker_prefill"
+    # The first decode iteration closes the prefill and samples the first codec
+    first = ctx.loop_iters.get("thinker_decode_loop", 0) == 0
+    return "talker_last_prefill" if first else "talker_decode"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -107,12 +159,29 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
+class ImageSpan(NamedTuple):
+    length: int
+    advance: int
+
+
+def image_span(grid_thw: torch.Tensor, merge_size: int) -> ImageSpan:
+    """An image's tokens share one temporal position and sit on the merged
+    grid, so it advances the position by the grid's longer side."""
+    t, h, w = (int(n) for n in grid_thw)
+    h, w = h // merge_size, w // merge_size
+    return ImageSpan(t * h * w + 2, max(h, w) + 2)
+
+
 # ---------------------------------------------------------------------------
 # Qwen3OmniModel
 # ---------------------------------------------------------------------------
 
 class Qwen3OmniModel(Model):
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
+
+    LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
+
+    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -148,10 +217,12 @@ class Qwen3OmniModel(Model):
         local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
+        apply_code2wav_serving_overrides(self.config.code2wav, kwargs)
 
-        # Tokenizer (Thinker uses a Qwen-family tokenizer)
+        # Tokenizer (Thinker uses a Qwen-family tokenizer). Qwen3-Omni is native
+        # in transformers, so no loader here runs code from the checkpoint repo.
         self.tokenizer = AutoTokenizer.from_pretrained(
-            local_dir, cache_dir=cache_dir, trust_remote_code=True,
+            local_dir, cache_dir=cache_dir, trust_remote_code=False,
         )
 
         # Full multimodal processor: combines tokenizer + image_processor +
@@ -161,7 +232,7 @@ class Qwen3OmniModel(Model):
         try:
             from transformers import AutoProcessor
             self._processor = AutoProcessor.from_pretrained(
-                local_dir, cache_dir=cache_dir, trust_remote_code=True,
+                local_dir, cache_dir=cache_dir, trust_remote_code=False,
             )
         except Exception as e:
             logger.warning(
@@ -279,12 +350,25 @@ class Qwen3OmniModel(Model):
             )
         }
 
+    def checkpoint_path(self) -> str:
+        return self.local_dir
+
+    def _audio_frames(self, seqlens: torch.Tensor) -> torch.Tensor:
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
+
+        return _get_feat_extract_output_lengths(seqlens, n_window=self.config.audio_encoder.n_window)
+
     def _get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
     # -----------------------------------------------------------------------
     # Model ABC: graph walk definitions
     # -----------------------------------------------------------------------
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"Thinker": {THINKER_MIXED: {
+            "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode",
+        }}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.
@@ -429,17 +513,14 @@ class Qwen3OmniModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.thinker_text.max_position_embeddings,
             outputs=[],
         )
 
-        # -- Talker prefill: receives thinker_states + talker_trigger --
-        # Dual-input gating: both thinker_states from streaming and
-        # talker_trigger from conductor cross-partition trigger must be
-        # present for a prefill step.
+        # -- Talker prefill: extends the KV cache with each streamed state --
         talker_prefill = GraphNode(
             name="Talker",
-            input_names=["thinker_states", "thinker_mask", "talker_trigger"],
+            input_names=["thinker_states", "thinker_mask"],
             outputs=[],
         )
 
@@ -447,7 +528,7 @@ class Qwen3OmniModel(Model):
             sections=[
                 GraphNode(
                     name="Talker",
-                    input_names=["thinker_states", "thinker_mask", "talker_trigger"],
+                    input_names=["thinker_states", "thinker_mask"],
                     outputs=[
                         GraphEdge(
                             next_node=EMPTY_DESTINATION,
@@ -486,7 +567,7 @@ class Qwen3OmniModel(Model):
                     )
                 ]
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.thinker_text.max_position_embeddings,
             outputs=[],
         )
 
@@ -551,24 +632,31 @@ class Qwen3OmniModel(Model):
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_states",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=_thinker_to_talker_policy,
+                    consumer_walk=_talker_walk,
                 ),
                 Connection(
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_mask",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=_thinker_to_talker_policy,
+                    consumer_walk=_talker_walk,
                 ),
                 Connection(
                     from_partition="Talker",
                     to_partition="Code2Wav",
                     edge_name="codec_tokens",
-                    chunk_policy_factory=lambda: LeftContextChunkPolicy(
-                        chunk=self.config.code2wav.codec_chunk_frames,
-                        left_context=self.config.code2wav.codec_left_context_frames,
-                    ),
+                    chunk_policy_factory=self._code2wav_chunk_policy,
                 ),
             ],
+        )
+
+    def _code2wav_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
+        cfg = self.config.code2wav
+        return ScheduledLeftContextChunkPolicy(
+            schedule=cfg.codec_chunk_schedule,
+            chunk=cfg.codec_chunk_frames,
+            left_context=cfg.codec_left_context_frames,
         )
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
@@ -606,23 +694,13 @@ class Qwen3OmniModel(Model):
                 is_prefill=True,
                 kwargs={
                     "audio_output": audio_output,
-                    "talker_prefill_done": False,
-                    # Derived from the schedule, not len(input_modalities),
-                    # which counts neither the text spans an attachment splits
-                    # the prompt into nor the spans between two attachments.
-                    "num_thinker_prefill_steps": len(
-                        self._build_thinker_prefill_schedule(
-                            input_modalities, input_signals,
-                        )
-                    ),
-                    "prefill_chunks_processed": 0,
                     "voice": model_kwargs.get("voice", "Ethan"),
                     "talker_max_tokens": self._get_max_talker_output_tokens(**model_kwargs),
                 },
             )
             return ForwardPassArgs(
                 full_metadata=full_metadata,
-                inputs=[GraphEdge(next_node="Talker", name="talker_trigger")] if audio_output else [],
+                inputs=[],
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
                 step_metadata={
@@ -913,38 +991,24 @@ class Qwen3OmniModel(Model):
     ) -> ForwardPassArgs:
         """Talker partition state machine.
 
-        1. While prefill: return empty inputs (wait for cross-partition trigger)
-           - When trigger arrives with is_last_prefill=False:
-             extend KV cache only, no outputs
-           - When trigger arrives with is_last_prefill=True:
-             sample first codec token, produce all_codes
-        2. After last prefill produces all_codes: transition to talker_decode
-           - Set graph_walk="talker_decode", is_prefill=False
-           - Return all_codes as input edge (conductor-driven)
-        3. Each decode step: check all_codes for codec_eos
-           - If codec_eos: request_done=True for Talker
-           - Else: return all_codes as input again (loop)
+        The Thinker's stream moves the Talker through its prefill walks (see
+        ``_talker_walk``); the conductor only hands the first decode step its
+        input once ``talker_last_prefill`` has sampled the first codec token.
+
+        1. talker_prefill: nothing to send; the next streamed state runs the
+           next pass.
+        2. talker_last_prefill: feed talker_input_embeds to talker_decode.
+        3. talker_decode: the decode loop ended, so the Talker is done.
         """
         if metadata.graph_walk == "talker_prefill":
-            metadata.kwargs["prefill_chunks_processed"] += 1
-            is_last_prefill = metadata.kwargs["num_thinker_prefill_steps"] == \
-                 metadata.kwargs["prefill_chunks_processed"]
-            metadata.graph_walk = "talker_last_prefill" if is_last_prefill else "talker_prefill"
             return ForwardPassArgs(
                 full_metadata=metadata,
-                inputs=[GraphEdge(next_node="Talker", name="talker_trigger")],
+                inputs=[],
                 unpersist_tensors=[],
-                step_metadata={
-                    "is_prefill": True,
-                    # voice is used for the last prefill
-                    "voice": metadata.kwargs.get("voice", "Ethan"),
-                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
-                },
             )
         elif metadata.graph_walk == "talker_last_prefill":
             metadata.is_prefill = False
             metadata.graph_walk = "talker_decode"
-            metadata.kwargs["talker_prefill_done"] = True
 
             # Feed talker_input_embeds back as input for first decode step
             edge = GraphEdge(next_node="Talker", name="talker_input_embeds")
@@ -990,19 +1054,17 @@ class Qwen3OmniModel(Model):
         Same pattern as Orpheus SNAC -- the conductor just tracks whether
         there are more codec tokens to process.
         """
-        chunk_size = self.config.code2wav.codec_chunk_frames
         metadata.graph_walk = "code2wav_chunk"
-        step_metadata = {"consumed_tokens": chunk_size}
 
-        # Don't predict the last chunk from token counts: LeftContextChunkPolicy
-        # emits an extra flush pass for the retained overlap, so a count-based
-        # guess completes the request before that final chunk is emitted. The
-        # `available <= 0` check above fires once consumption actually catches up.
+        # Don't predict the last chunk from token counts: the left-context
+        # policy emits an extra flush pass for the retained overlap, so a
+        # count-based guess completes the request before that final chunk is
+        # emitted. The conductor ends the partition once the worker reports
+        # the pass that consumed the stream's final chunk.
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=[],
             unpersist_tensors=[],
-            step_metadata=step_metadata,
             request_done=False,
         )
 
@@ -1014,13 +1076,21 @@ class Qwen3OmniModel(Model):
         self, filepath: str, device: str
     ) -> TensorAndMetadata:
         # TODO: support audio in video
-        from qwen_omni_utils.v2_5.vision_process import fetch_video
-        video_input, video_sample_fps = fetch_video(
-            {"video": filepath},
-            return_video_sample_fps=True,
-            image_patch_size=14,
-            return_video_metadata=False
-        )
+        from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes
+
+        install_budgeted_readers(VIDEO_READER_BACKENDS)
+        # the sampled readers decode the frames fetch_video samples, at full size before resizing them
+        probe = probe_video(filepath)
+        if probe is not None:
+            total, fps, height, width = probe
+            VideoBudget().add(height, width, smart_nframes({"video": filepath}, total_frames=total, video_fps=fps))
+        with header_charged(probe is not None):
+            video_input, video_sample_fps = fetch_video(
+                {"video": filepath},
+                return_video_sample_fps=True,
+                image_patch_size=14,
+                return_video_metadata=False
+            )
         return TensorAndMetadata(
             data=video_input.to(device),
             metadata=dict(
@@ -1061,7 +1131,7 @@ class Qwen3OmniModel(Model):
         input_metadata: dict[str, dict] = {},
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Build the full ChatML prompt + derived multimodal tensors.
 
         Uses HF's full ``AutoProcessor`` (combines tokenizer + image_processor
@@ -1163,7 +1233,8 @@ class Qwen3OmniModel(Model):
         input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"][0]
         spans = find_media_spans(input_ids, self._placeholder_specs())
         segments = split_around_spans(input_ids, spans)
-        check_plan(prefill_plan(parts), spans, len(segments))
+        plan = prefill_plan(parts)
+        check_plan(plan, spans, len(segments))
         result["text_inputs"] = segments
 
         result["pixel_values"] = []
@@ -1223,7 +1294,80 @@ class Qwen3OmniModel(Model):
             result["video_grid_thw"] += vid_out["video_grid_thw"]
             result["pixel_values_videos"].append(vid_out["pixel_values_videos"])
 
-        return result
+        if not attached:
+            return ProcessPromptOutput(result, {})
+        return ProcessPromptOutput(result, {"kv_layout": self._kv_layout(plan, result, "audio" in output_modalities)})
+
+    def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
+        """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.
+
+        The Talker prefills every step's rows except those of a system or earlier
+        assistant turn. It then prefills its assistant prefix, and writes a row per decode step.
+        """
+        from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_text_mask
+
+        merge = self.config.vision.spatial_merge_size
+        thinker, talker, position = [], [], 0
+        for step in plan:
+            if step.modality == TEXT:
+                ids = tensors["text_inputs"][step.index]
+                span = Span("ids", "prefill_text", len(ids), len(ids), "text_inputs")
+                kept = int(talker_text_mask(ids, self.config).sum())
+            elif step.modality == "audio":
+                # the encoder's rows between two sentinels
+                rows = int(self._audio_frames(tensors["audio_seqlens"][step.index])) + 2
+                span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
+                kept = rows
+            elif step.modality == "image":
+                image = image_span(tensors["image_grid_thw"][step.index], merge)
+                span = Span("digest", "prefill_vision", image.length, image.advance, ("image", step.index))
+                kept = image.length
+            else:
+                grid = tensors["video_grid_thw"][step.index]
+                per_grid = tensors["video_second_per_grid"][step.index].item()
+                rows = int(grid.prod()) // merge ** 2 + 2
+                # the walk moves the counter one past its end sentinel, which follows the grid's largest position
+                positions = get_rope_index_vision(
+                    grid, position + 1, self.config.thinker.position_id_per_seconds,
+                    spatial_merge_size=merge, seconds_per_grid=per_grid,
+                )
+                advance = int(positions.max()) + 2 - position
+                span = Span("digest", "prefill_vision", rows, advance, ("video", step.index))
+                kept = rows
+            thinker.append(span)
+            talker.append(Span("rows", "talker_prefill", kept, kept, "thinker_states"))
+            position += span.advance
+        prefix = TalkerSubmodule.TALKER_LAST_PREFILL_TOKENS_PER_REQ
+        # A prompt with a video keys only its leading text, since keying past it has never been run or tested.
+        video = any(step.modality == "video" for step in plan)
+        return {
+            THINKER_KV: {"main": LabelLayout(
+                spans=tuple(thinker), growth=(("thinker_decode_loop", 1),), keyed_spans=1 if video else None,
+            )},
+            TALKER_KV: {"main": LabelLayout(
+                spans=(*talker, Span("rows", "talker_last_prefill", prefix, prefix, "thinker_states")),
+                growth=(("talker_decode_loop", 1),),
+            ) if audio_output else LabelLayout()},
+        }
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {
+            "thinker_decode_loop": self.get_max_output_tokens(**model_kwargs),
+            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs)),
+        }
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        """The Thinker keys its prompt by text ids, each image and audio clip by
+        file, and its replies as they decode."""
+        return {
+            THINKER_KV: {"main": KVLabel(
+                growth=(("thinker_decode", "thinker_decode_loop"),),
+                keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vision", "prefill_audio"), growth=True),
+            )},
+            TALKER_KV: {"main": KVLabel(
+                growth=(("talker_decode", "talker_decode_loop"),),
+            )},
+        }
 
     # -----------------------------------------------------------------------
     # Model ABC: postprocess
@@ -1237,8 +1381,9 @@ class Qwen3OmniModel(Model):
     ) -> bytes:
         if modality == "text":
             ids = drop_stop_tokens(output, (self.config.im_end_token_id,), request_kwargs)
-            detok = self.tokenizer.decode(ids)
-            return detok.encode("utf-8")
+            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+            return self._text_detokenizer.to_bytes(ids)
         elif modality == "audio":
             if output.numel() == 0:
                 return b""
@@ -1261,8 +1406,11 @@ class Qwen3OmniModel(Model):
         # ``codec_tokens``, ``talker_input_embeds``, ``new_token``) is
         # already replicated by the upstream all-reduce or sampler
         # broadcast before it leaves its producing node.
+        # The Thinker's routed experts can also run EP; the Talker's
+        # shared-expert block has no EP variant.
         return ShardingConfig(
             groups=[], tp_enabled_nodes={"Thinker", "Talker"}, shard_dim={},
+            ep_enabled_nodes={"Thinker"},
         )
 
     # -----------------------------------------------------------------------
@@ -1272,11 +1420,13 @@ class Qwen3OmniModel(Model):
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(
             node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+            moe_parallel=moe_parallel,
         )
         logger.info("Successfully loaded Qwen3-Omni submodule for %s", node_name)
         self._submodule_cache[node_name] = submodule
@@ -1304,10 +1454,12 @@ class Qwen3OmniModel(Model):
     def _create_submodule(
         self, node_name: str, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name == "Thinker":
             return self._create_thinker_submodule(
                 device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+                moe_parallel=moe_parallel,
             )
         elif node_name == "Talker":
             return self._create_talker_submodule(
@@ -1395,13 +1547,16 @@ class Qwen3OmniModel(Model):
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule:
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
 
         with torch.device("meta"):
-            thinker_model = Qwen3OmniThinkerModel(self.config, comm_group=tp_group)
+            thinker_model = Qwen3OmniThinkerModel(
+                self.config, comm_group=tp_group, moe_parallel=moe_parallel,
+            )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:
@@ -1559,7 +1714,7 @@ class Qwen3OmniModel(Model):
         # Load config only (no weights)
         config = AutoConfig.from_pretrained(
             self.local_dir,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
 
         # This should be a Qwen3OmniMoeConfig
@@ -1600,7 +1755,7 @@ class Qwen3OmniModel(Model):
         # Load full config (no weights)
         config = AutoConfig.from_pretrained(
             self.local_dir,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
 
         # Extract the vision sub-config
@@ -1613,8 +1768,8 @@ class Qwen3OmniModel(Model):
         # "sdpa", Qwen3OmniMoeVisionAttention.forward falls into the
         # per-segment Python loop (modeling_qwen3_omni_moe.py:892-913),
         # which issues N sequential attention calls per layer for an
-        # N-frame video. This causes the 10× V2T/V2S TTFT regression vs
-        # vllm-omni. With "flash_attention_2", a single varlen FA2 call
+        # N-frame video and makes V2T/V2S TTFT far slower. With
+        # "flash_attention_2", a single varlen FA2 call
         # per layer handles all frames at once via cu_seqlens.
         patch_hf_fa2_int_maxlen()
         vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(

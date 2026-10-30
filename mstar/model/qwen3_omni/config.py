@@ -10,6 +10,7 @@ published HF defaults for easy reference / fallback.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,8 @@ THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
 
 THINKER_SAMPLER = "thinker_sampler"
+# combined walk of the Thinker's text/audio prefill and decode
+THINKER_MIXED = "thinker_mixed"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_sampler"
 
@@ -153,6 +156,7 @@ class AudioEncoderConfig:
     encoder_attention_heads: int = 20
     output_dim: int = 3584
     max_source_positions: int = 1500
+    n_window: int = 50
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AudioEncoderConfig:
@@ -216,10 +220,9 @@ class TalkerConfig:
     # in HF defaults), so IDs ≥ 3072 are out-of-range and cause a
     # CUDA device-side assert when the assistant-prefix builder tries
     # to embed them.  The ACTUAL published Qwen3-Omni checkpoint uses
-    # the 2148-2157 range (matching sglang-omni's values and the
-    # model's tokenizer).  We use those as our defaults here and also
-    # load from the checkpoint's ``config.json`` via ``from_dict`` if
-    # the keys are present.
+    # the 2148-2157 range (matching the model's tokenizer).  We use
+    # those as our defaults here and also load from the checkpoint's
+    # ``config.json`` via ``from_dict`` if the keys are present.
     codec_eos_token_id: int = 2150
     codec_nothink_id: int = 2155
     codec_think_bos_id: int = 2156
@@ -294,17 +297,25 @@ class Code2WavConfig:
     num_hidden_layers: int = 8
     upsample_rates: Tuple[int, ...] = (8, 5, 4, 3)
     upsampling_ratios: Tuple[int, ...] = (2, 2)
-    # Streaming chunk size (in codec frames) for the Talker→Code2Wav edge.
-    # 25 frames keeps TTFT low (~1s); matches vllm-omni's
-    # ``codec_chunk_frames=25`` default. ``codec_left_context_frames`` is the
-    # number of overlap frames prepended to non-first chunks by
-    # ``LeftContextChunkPolicy`` (warms up the causal ConvNet vocoder) and
-    # trimmed from the emitted waveform in ``Code2WavSubmodule``.
+    # Streaming chunk sizes (in codec frames, 12.5 Hz) for the Talker→Code2Wav
+    # edge, a ``ScheduledLeftContextChunkPolicy``. Chunk k carries
+    # ``codec_chunk_schedule[k]`` new frames, then ``codec_chunk_frames`` once
+    # the schedule runs out, each behind up to ``codec_left_context_frames``
+    # already-delivered frames (warm-up for the vocoder, trimmed from the
+    # emitted waveform in ``Code2WavSubmodule``). The first audio waits for
+    # the first chunk, so the ramp starts it after 12 frames (0.96 s of audio)
+    # instead of 25 (2 s); an empty schedule restores 25-frame first chunks.
+    # The ramp sums to the left context: its windows hold the whole stream so
+    # far, and every later window is the one 25-frame first chunks would pop,
+    # so the audio is theirs. Playback stalls unless the Talker runs at least
+    # 1.5x real time over its first 50 frames; (4, 8, 13) starts audio sooner
+    # but needs 2x, and on a B200 it stalled from concurrency 16.
     #
     # Named with a ``codec_`` prefix to avoid collision with HF's
     # ``Qwen3OmniMoeCode2WavConfig`` (which has no such field today but could
     # add one; the HF method ``chunked_decode(chunk_size=...)`` also uses the
     # same bare name with different semantics).
+    codec_chunk_schedule: Tuple[int, ...] = (12, 13)
     codec_chunk_frames: int = 25
     codec_left_context_frames: int = 25
     attention_bias: bool = False
@@ -328,10 +339,55 @@ class Code2WavConfig:
     def from_dict(cls, d: dict[str, Any]) -> Code2WavConfig:
         fnames = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in d.items() if k in fnames}
-        for tup_field in ("upsample_rates", "upsampling_ratios"):
+        for tup_field in ("upsample_rates", "upsampling_ratios", "codec_chunk_schedule"):
             if tup_field in filtered and isinstance(filtered[tup_field], list):
                 filtered[tup_field] = tuple(filtered[tup_field])
         return cls(**filtered)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.codec_chunk_schedule, list):
+            self.codec_chunk_schedule = tuple(self.codec_chunk_schedule)
+        self.check_streaming_knobs()
+
+    @property
+    def codec_lookahead_samples(self) -> int:
+        """Samples a window decodes short of ``frames * total_upsample`` (555
+        for Qwen3-Omni): each decoder block's ``ConvTranspose1d(2r, stride r,
+        padding r)`` drops ``r`` samples, scaled by the blocks after it."""
+        rates = self.upsample_rates
+        return sum(rate * math.prod(rates[i + 1:]) for i, rate in enumerate(rates))
+
+    @property
+    def codec_min_left_context_frames(self) -> int:
+        """Fewest context frames whose audio covers the lookahead samples the
+        window before could not decode (1 for Qwen3-Omni: 555 < 1920). With
+        fewer, ``Code2WavSubmodule.postprocess`` drops them at every boundary."""
+        total_upsample = math.prod(self.upsample_rates) * math.prod(self.upsampling_ratios)
+        return -(-self.codec_lookahead_samples // total_upsample)
+
+    def check_streaming_knobs(self) -> None:
+        """Reject chunking that would drop or repeat streamed audio."""
+        def is_int(value) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        schedule = self.codec_chunk_schedule
+        if not isinstance(schedule, tuple) or not all(is_int(size) and size >= 1 for size in schedule):
+            raise ValueError(f"codec_chunk_schedule must be a list of positive integers, got {schedule!r}")
+        if not is_int(self.codec_chunk_frames) or self.codec_chunk_frames < 1:
+            raise ValueError(f"codec_chunk_frames must be a positive integer, got {self.codec_chunk_frames!r}")
+        minimum = self.codec_min_left_context_frames
+        if not is_int(self.codec_left_context_frames) or self.codec_left_context_frames < minimum:
+            raise ValueError(
+                f"codec_left_context_frames must be an integer >= {minimum}, got "
+                f"{self.codec_left_context_frames!r}: a window decodes {self.codec_lookahead_samples} samples short "
+                f"and the next window's context must re-decode them, or they are lost at every chunk boundary"
+            )
+
+    @property
+    def codec_max_window(self) -> int:
+        """Frames in the widest window the chunk schedule pops. Every window
+        is padded to it, so the vocoder runs (and captures) one shape."""
+        return self.codec_left_context_frames + max((self.codec_chunk_frames, *self.codec_chunk_schedule))
 
     def get_hf_config(self):
         from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (

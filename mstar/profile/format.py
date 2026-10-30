@@ -71,6 +71,7 @@ class GraphTiming:
 class RequestTiming:
     recv_time: float | None = None # all are time.perf_counter
     preprocess_finish_time: float | None = None
+    conductor_arrival_time: float | None = None  # only while metrics are on
     conductor_ingest_time: float | None = None
     first_chunk_time: float | None = None
     last_chunk_time: float | None = None

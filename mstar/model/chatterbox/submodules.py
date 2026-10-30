@@ -26,7 +26,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -37,6 +41,7 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.model.chatterbox.components.s3_tokenizer import AudioEncoderV2
 from mstar.model.chatterbox.components.s3gen import FlowRow
 from mstar.model.chatterbox.config import (
     CFG_LABEL,
@@ -107,6 +112,14 @@ class VoiceCache:
 # ===========================================================================
 
 
+def reference_tokens(samples: int, config: ChatterboxConfig) -> int:
+    """How many S3 prompt tokens `VoiceEncoderSubmodule.condition` makes of a ``samples``-long
+    reference clip. It asserts the same count."""
+    wav16 = min(-(-samples * S3_SR // config.sample_rate), round(config.enc_cond_seconds * S3_SR))
+    frames = min(wav16 // config.s3_tokenizer.hop_size, 4 * config.t3.speech_cond_prompt_len)
+    return AudioEncoderV2._conv_out_len(AudioEncoderV2._conv_out_len(frames, 2), 2)
+
+
 class VoiceEncoderSubmodule(NodeSubmodule):
     """Speaker embedding (LSTM voice encoder over the whole clip) and the S3
     prompt tokens (first ``enc_cond_seconds`` of the clip), as the reference
@@ -140,7 +153,12 @@ class VoiceEncoderSubmodule(NodeSubmodule):
         tokens, lens = self.s3_tokenizer(
             [prompt_wav], max_len=self.config.t3.speech_cond_prompt_len,
         )
-        return speaker_emb, tokens[0, : int(lens[0])]
+        count = int(lens[0])
+        assert count == reference_tokens(wav24.numel(), self.config), (
+            f"the S3 tokenizer made {count} prompt tokens of a {wav24.numel()}-sample clip, "
+            "not the count `reference_tokens` gives a layout to size it by"
+        )
+        return speaker_emb, tokens[0, :count]
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
@@ -429,7 +447,7 @@ class T3Submodule(ARNodeSubmodule):
             return set()
         token = int(outputs[SPEECH_TOKENS][0].reshape(-1)[0].item())
         generated = int(self.request_state(request_id).get("generated", 0))
-        max_new = int(request_info.step_metadata.get("max_new_tokens", request_info.max_tokens))
+        max_new = request_info.max_tokens
         sampling = request_info.resource_configs.get(T3_SAMPLER)
         ignore_eos = bool(getattr(sampling, "ignore_eos", False))
         if (not ignore_eos and token == self.t3.stop_speech_token) or generated >= max_new:
@@ -464,7 +482,9 @@ class T3Submodule(ARNodeSubmodule):
             resource_step_info=requires_cfg,
         )
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
         dtype = self.model.speech_emb.weight.dtype
         configs = []
@@ -472,7 +492,7 @@ class T3Submodule(ARNodeSubmodule):
             if self.config.t3_prefill_graphs:
                 # both prefill walks replay the same captures; the packed
                 # layout pads the batch's tokens up to the bucket
-                configs.append(PackedCudaGraphConfig(
+                configs.append(PackedAcceleratorGraphConfig(
                     capture_graph_walk="prefill",
                     replay_graph_walks=list(PREFILL_WALKS),
                     capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -484,7 +504,7 @@ class T3Submodule(ARNodeSubmodule):
                     # guidance packs the cond and uncond streams into one plan
                     total_tokens_multiplier=2 if requires_cfg else 1,
                 ))
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(1, self.t3.hidden_size, dtype=dtype, device=device),
@@ -502,12 +522,12 @@ class T3Submodule(ARNodeSubmodule):
             ))
         return configs
 
-    def can_use_cuda_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         if not self.can_batch(batch, model_inputs):
             return False
         if batch.graph_walk in PREFILL_WALKS and not self.config.t3_prefill_graphs:
             return False
-        return super().can_use_cuda_graphs(batch, model_inputs)
+        return super().can_use_accelerator_graphs(batch, model_inputs)
 
 
 # ===========================================================================

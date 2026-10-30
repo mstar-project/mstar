@@ -8,24 +8,26 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
-from time import perf_counter
+from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
-from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
-from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.engine.resources.admission import Admission
+from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.utils.profiler import PHASE_PERIOD, phase_record, range_pop, range_push
+from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
 
-def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
+def topo_sort(resources: Mapping[str, Resource | NodeResourceSpec]) -> tuple[str, ...]:
+    """Keys in dependency order; built resources at load, their specs when the
+    conductor validates a deployment."""
     deps: dict[str, set[str]] = {
         key: set(resource.depends_on()) for key, resource in resources.items()
     }
@@ -99,7 +101,19 @@ class StepRunner:
         # name every node, including one that owns nothing — an absent node
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
+        self._ask_order = [key for key in self._order if type(self._resources[key]).ask is not Resource.ask]
+        self._node_ask_order = self._per_node(node_resources, self._ask_order)
+        self._admission = Admission(self._resources, self._ask_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
+        self._trail_order = [
+            key for key in self._order if self._resources[key].page_trail() is not None
+        ]
+        self._cap_order = [
+            key for key in self._order
+            if type(self._resources[key]).cap_cached_prefix is not Resource.cap_cached_prefix
+        ]
+        self._node_cap_order = self._per_node(node_resources, self._cap_order)
+        self._node_trail_order = self._per_node(node_resources, self._trail_order)
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -110,32 +124,64 @@ class StepRunner:
         self._pre_admitted: tuple | None = None
 
     def resolve_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str,
-    ) -> int:
-        """The longest prefix every resource on ``node_name`` can serve.
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+    ) -> CachedPrefix | None:
+        """The longest prefix of this walk every resource on ``node_name`` can serve.
 
         The smallest answer wins, because a step is one span: a resource that
         holds less than another has to be caught up by the tokens that run.
-        A resource with no opinion is not an answer of zero.
+        A resource with no opinion is not an answer of zero. A resource that
+        holds only some lengths then caps the agreed prefix.
         """
-        matched = None
+        agreed = None
         for key in self._sweep(self._node_order, self._order, node_name):
             answer = self._resources[key].resolve_cached_prefix(
-                rid, node_name, graph_walk,
+                rid, node_name, graph_walk, inputs,
             )
-            if answer is not None and (matched is None or answer < matched):
-                matched = answer
-        return matched or 0
+            if answer is not None and (agreed is None or answer.tokens < agreed.tokens):
+                agreed = answer
+        if agreed is not None:
+            for key in self._sweep(self._node_cap_order, self._cap_order, node_name):
+                agreed = self._resources[key].cap_cached_prefix(rid, node_name, graph_walk, agreed)
+        return agreed
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-        inputs, matched_len: int,
+        inputs, prefix: CachedPrefix | None,
     ) -> None:
-        """Give every resource the agreed length, with the untrimmed inputs."""
+        """Give every resource the agreed prefix, with the untrimmed inputs."""
         for key in self._sweep(self._node_order, self._order, node_name):
             self._resources[key].apply_cached_prefix(
-                rid, node_name, graph_walk, inputs, matched_len,
+                rid, node_name, graph_walk, inputs, prefix,
             )
+
+    def lease_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> dict[str, list[int]]:
+        leases = {}
+        for key in self._sweep(self._node_order, self._order, node_name):
+            pages = self._resources[key].lease_cached_prefix(rid, node_name, graph_walk)
+            if pages is not None:
+                leases[key] = pages
+        return leases
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, leases: dict[str, list[int]], caught_up: bool,
+    ) -> bool:
+        ready = True
+        for key, pages in leases.items():
+            ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, pages, caught_up)
+        return ready
+
+    def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].release_cached_prefix(rid, node_name, graph_walk)
+
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+        return {
+            key: self._resources[key].page_trail()
+            for key in self._sweep(self._node_trail_order, self._trail_order, node_name)
+        }
 
     def prefix_chain_keys(self, node_name: str | None) -> list[str]:
         """The node's resources with a prefix cache open right now. Empty in
@@ -170,21 +216,34 @@ class StepRunner:
             )
 
     def extend_prefix_chains_batch(
-        self, request_ids: list[str], node_name: str, graph_walk: str,
-        host_rows, outputs, keys: list[str],
+        self, request_ids: list[str], node_name: str,
+        walk_of: Callable[[str], str] | str, host_rows, outputs, keys: list[str],
     ) -> None:
         """``extend_prefix_chains`` for a step: a resource with a batch form
-        takes the host rows; the others are offered each request's host copy."""
+        takes the host rows; the others are offered each request's host copy.
+
+        ``walk_of`` rather than one walk for the step, so a combined walk comes
+        through here too instead of falling back to a call per row; a step of
+        one walk passes that walk itself.
+        """
         for key in keys:
             resource = self._resources[key]
             batched = getattr(resource, "extend_prefix_chains_batch", None)
             if batched is not None:
-                batched(request_ids, node_name, graph_walk, host_rows)
+                batched(request_ids, node_name, walk_of, host_rows)
                 continue
             for rid in request_ids:
                 per_rid = outputs.get(rid)
                 if isinstance(per_rid, dict):
-                    resource.extend_prefix_chain(rid, node_name, graph_walk, per_rid)
+                    resource.extend_prefix_chain(
+                        rid, node_name,
+                        walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
+                    )
+
+    def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Tell the node's resources that the cache served this walk whole."""
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].complete_cached_walk(rid, node_name, graph_walk)
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -287,6 +346,7 @@ class StepRunner:
             self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
+        self._admission.remove_request(rid)
         for key in self._order:
             self._resources[key].remove_request(rid)
 
@@ -294,7 +354,7 @@ class StepRunner:
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
     ) -> FullAdmitOutcome:
-        """bring published state in
+        """bring published state in, once `node_name`'s resources have admitted the request
 
         gives `ready=False` when still has inflights; shortcircuit on failure
 
@@ -304,6 +364,13 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
+        if not self._admission.admitted(rid, node_name):
+            waits = self._admission.admit(
+                rid, node_name, graph_walk, published,
+                self._sweep(self._node_ask_order, self._ask_order, node_name),
+            )
+            if waits is not None:
+                return waits
         ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
@@ -321,7 +388,10 @@ class StepRunner:
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
-
+    def admit_waiting(
+        self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
+    ) -> list[tuple[str, str]]:
+        return self._admission.admit_waiting(published_of)
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
     #
@@ -402,12 +472,12 @@ class StepRunner:
                 continue
             if self._nvtx:
                 range_push(f"res.admit.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.admit.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.admit.{key}", t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -415,14 +485,22 @@ class StepRunner:
                     "Admit for resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
-                for done in reversed([*covered, *admitted, key]):
-                    self._resources[done].rollback_admit(
-                        step.get(done), step.ctx,
-                    )
+                self._unwind(step, [*covered, *admitted, key])
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
+
+    def rollback_admit(self, step: SubmoduleStep) -> None:
+        """Give back everything an admitted step reserved, for a step that
+        will not run: the unwind a refused ``admit`` does, over every
+        resource the step declares."""
+        self._unwind(step, self._keys_for(step))
+
+    def _unwind(self, step: SubmoduleStep, keys: list[str]) -> None:
+        # reverse dependency order, off a list so every rank unwinds alike
+        for key in reversed(keys):
+            self._resources[key].rollback_admit(step.get(key), step.ctx)
 
     def plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan in dependency order
@@ -440,12 +518,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.plan.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.plan.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.plan.{key}", t0)
                 if self._nvtx:
                     range_pop()
         return results
@@ -463,9 +541,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_admit.{key}")
+            t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
+                if t0 is not None:
+                    phase_end(f"res.pre_admit.{key}", t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -473,10 +554,7 @@ class StepRunner:
                     "Admit for pre-planning resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
-                for done in reversed([*admitted, key]):
-                    self._resources[done].rollback_admit(
-                        step.get(done), step.ctx,
-                    )
+                self._unwind(step, [*admitted, key])
                 self._pre_admitted = None
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
@@ -494,12 +572,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_plan.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.pre_plan.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.pre_plan.{key}", t0)
                 if self._nvtx:
                     range_pop()
         self._staged = self._step_key(step)
@@ -510,12 +588,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.commit.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 self._resources[key].commit(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.commit.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.commit.{key}", t0)
                 if self._nvtx:
                     range_pop()
 
@@ -524,6 +602,7 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """durable state outward publish
 
@@ -540,7 +619,8 @@ class StepRunner:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
                 info = resource.publish_for_step(
-                    rid, node_name=node_name, graph_walk=graph_walk,
+                    rid, node_name=node_name,
+                    graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
                 )
                 if info is not None:
                     per_key[key] = info
@@ -552,31 +632,41 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """``publish``, deferred: per rid the snapshot each publisher took.
 
         Finished by ``publish_from_snapshots`` for the rids that need it. A rid
-        with nothing to publish has no entry."""
+        with nothing to publish has no entry. Under a combined walk each rid
+        is snapshotted under its own walk (``request_walks``), as ``publish``
+        does: a publisher may key what it publishes on the walk."""
         order = self._sweep(self._node_publish_order, self._publish_order, node_name)
         if not order:
             return {}
-        # one call per publisher for the whole batch, then one dict per
-        # request that has anything to publish
-        columns = [
-            (key, self._resources[key].publish_snapshot_batch(
-                request_ids, node_name=node_name, graph_walk=graph_walk,
-            ))
-            for key in order
-        ]
+        if request_walks:
+            groups: dict[str, list[str]] = {}
+            for rid in request_ids:
+                groups.setdefault(request_walks.get(rid, graph_walk), []).append(rid)
+        else:
+            groups = {graph_walk: request_ids}
         out: dict[str, dict[str, Any]] = {}
-        for i, rid in enumerate(request_ids):
-            per_key: dict[str, Any] = {}
-            for key, snaps in columns:
-                snap = snaps[i]
-                if snap is not None:
-                    per_key[key] = snap
-            if per_key:
-                out[rid] = per_key
+        for walk, rids in groups.items():
+            # one call per publisher for the walk's rows, then one dict per
+            # request that has anything to publish
+            columns = [
+                (key, self._resources[key].publish_snapshot_batch(
+                    rids, node_name=node_name, graph_walk=walk,
+                ))
+                for key in order
+            ]
+            for i, rid in enumerate(rids):
+                per_key: dict[str, Any] = {}
+                for key, snaps in columns:
+                    snap = snaps[i]
+                    if snap is not None:
+                        per_key[key] = snap
+                if per_key:
+                    out[rid] = per_key
         return out
 
     def publish_from_snapshots(
@@ -585,17 +675,20 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
-        """The published info of ``request_ids`` from their snapshots."""
+        """The published info of ``request_ids`` from their snapshots, each
+        under its own walk (see ``publish_snapshot``)."""
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             snaps = snapshots.get(rid)
             if not snaps:
                 continue
+            walk = request_walks.get(rid, graph_walk) if request_walks else graph_walk
             per_key: dict[str, PublishedInfo] = {}
             for key, snap in snaps.items():
                 info = self._resources[key].publish_from_snapshot(
-                    rid, snap, node_name=node_name, graph_walk=graph_walk,
+                    rid, snap, node_name=node_name, graph_walk=walk,
                 )
                 if info is not None:
                     per_key[key] = info
@@ -607,6 +700,7 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """Publish resources configured for the end of a dynamic loop."""
         order = self._sweep(self._node_publish_order, self._publish_order, node_name)
@@ -618,14 +712,15 @@ class StepRunner:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
                 info = resource.publish_after_stop(
-                    rid, node_name=node_name, graph_walk=graph_walk,
+                    rid, node_name=node_name,
+                    graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
                 )
                 if info is not None:
                     per_key[key] = info
             out[rid] = per_key
         return out
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
         node_name: str | None = None,
     ) -> None:
@@ -635,6 +730,6 @@ class StepRunner:
         batch size say nothing about a resource this node's graphs never touch.
         """
         for key in self._sweep(self._node_order, self._order, node_name):
-            self._resources[key].build_cuda_graph_buffers(
+            self._resources[key].build_accelerator_graph_buffers(
                 slots, max_bs, max_seq_len
             )

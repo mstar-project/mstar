@@ -238,8 +238,10 @@ pub struct WorkerGraphsDone<'a> {
     pub output_signal_names: Vec<Sym>,
     pub partition_name: &'a str,
     pub partition_done: bool,
+    pub graph_walk: &'a str,
     pub stream_tokens_consumed: &'a [(String, i64)],
-    pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
+    /// `dict[str, dict[str, int]]`: stream edge -> destination worker -> items.
+    pub stream_items_sent: Vec<(Sym, Vec<(Sym, i64)>)>,
     /// `dict[str, PublishedInfo]` -- abstract, so it stays Python's. Read
     /// encoded by Python and forwarded without interpreting resource types.
     pub resource_publish_info: Option<Value>,
@@ -272,16 +274,18 @@ impl WorkerGraphsDone<'_> {
             }
             w_str(m.key("partition_name"), self.partition_name);
             w_bool(m.key("partition_done"), self.partition_done);
+            w_str(m.key("graph_walk"), self.graph_walk);
             str_counts(
                 m.key("stream_tokens_consumed"), self.stream_tokens_consumed,
             );
-            w_map(
-                m.key("output_loop_indices"),
-                self.output_loop_indices.len() as u32,
-            );
-            for (sig, (order, idxs, fwd)) in &self.output_loop_indices {
-                w_str(m.buf(), it.name(*sig));
-                nested_loop_indices(m.buf(), it, order, idxs, *fwd);
+            w_map(m.key("stream_items_sent"), self.stream_items_sent.len() as u32);
+            for (edge, per_worker) in &self.stream_items_sent {
+                w_str(m.buf(), it.name(*edge));
+                w_map(m.buf(), per_worker.len() as u32);
+                for (worker, n) in per_worker {
+                    w_str(m.buf(), it.name(*worker));
+                    w_i64(m.buf(), *n);
+                }
             }
             // Omitted when absent, so the decoder's default stands.
             if let Some(v) = &self.resource_publish_info {

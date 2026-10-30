@@ -15,7 +15,7 @@ If a hang, crash, or other bug has several plausible causes, the tempting fix is
 | API server | `mstar/api_server/` | HTTP, tokenization, media loading, streaming results back |
 | Conductor | `mstar/conductor/` | request lifecycle, graph-walk transitions, worker selection |
 | Worker | `mstar/worker/` | one process per GPU: micro-scheduler, async execution, tensor routing |
-| Engine | `mstar/engine/engine.py` | compiles forwards, captures CUDA graphs, batches, runs admit/plan/forward/commit |
+| Engine | `mstar/engine/engine.py` | compiles forwards, captures accelerator graphs, batches, runs admit/plan/forward/commit |
 | Resources | `mstar/engine/resources/` | paged KV, attention plans, positions, samplers, etc. |
 | Models | `mstar/model/` | computation graph, tokenization, resource *declarations*, submodules |
 | Graph | `mstar/graph/` | M* graph primitives and logic |
@@ -27,11 +27,11 @@ Background: [docs/architecture.rst](docs/architecture.rst). Model authoring, end
 ## Invariants
 
 ### 1. Models declare, the engine executes
-In M*, much of the optimizations (e.g., cuda graphs, attention wrappers, sampling, batching) are provided on the engine level, and the model declares specifications for optimizations / resources it needs.
+In M*, much of the optimizations (e.g., accelerator graphs, attention wrappers, sampling, batching) are provided on the engine level, and the model declares specifications for optimizations / resources it needs.
 
 Some heuristics for when something should be implemented on the engine level instead of as model-specific code:
 
-1. **Would any other model want this?** Engine code is available to every model, e.g., `Resource`s (e.g., attention managers, KV cache, samplers), CUDA-graph capture and replay, pre-planning. If your model needs recurrent state, a sampling variant, or a new kind of attention, so will future models.
+1. **Would any other model want this?** Engine code is available to every model, e.g., `Resource`s (e.g., attention managers, KV cache, samplers), accelerator graph capture and replay, pre-planning. If your model needs recurrent state, a sampling variant, or a new kind of attention, so will future models.
 2. **If the underlying implementation changed, would the fix be a config edit or a sweep through model packages?** Engine-level abstractions allow optimizations to be plug-and-play and easily replaceable. E.g., when a better attention kernel library appears, a model that declared an attention resource moves to it in a few lines of config once the engine work is done. A model that called the kernel directly has to be rewritten, and so does every model that copied it.
 3. **Is there ordering-sensitive bookkeeping around capture?** The engine handles a lot of tricky bookkeeping: e.g., preplanning, buffer management and double-buffering, graph capture and replay, allocating resources for requests (along with eviction/reload), incrementing sequence-length counters, etc. These parts are particularly error-prone, and mistakes typically corrupt request data instead of surfacing as an exception.
 4. **Does it touch the broader system beyond model execution?** Anything that could touch, e.g., request lifecycle, transfer of data between ranks, or M* graph node-level schedule and readiness should be the concern of the engine or worker (or other parts of the broader system). For instance, if a finite resource like a paged KV cache is over-subscribed, this becomes engine-level *backpressure the scheduler can resolve by eviction*, not an exception inside a forward pass. Code that allocates its own state turns a schedulable condition into an OOM.
@@ -40,22 +40,22 @@ Model code that reimplements an engine mechanism is a defect even when it works,
 
 For example, nothing under `mstar/model/` should:
 
-- **Capture CUDA graphs.** No `torch.cuda.graph`, `torch.cuda.CUDAGraph`, `graph_pool_handle`, or `make_graphed_callables`. Capture belongs to [mstar/engine/cuda_graph_runner.py](mstar/engine/cuda_graph_runner.py). A model declares a `CudaGraphConfig`: `BatchedCudaGraphConfig`, `PackedCudaGraphConfig`, or for an inner loop `PiecewiseBatchedConfig` / `PiecewisePackedConfig` from [mstar/engine/cuda_graph_config.py](mstar/engine/cuda_graph_config.py), and the engine captures it. As of this writing there are **zero** raw capture calls under `mstar/model/`; keep it that way.
+- **Capture accelerator graphs.** No `torch.cuda.graph`, `torch.cuda.CUDAGraph`, `torch.xpu.graph`, `torch.xpu.XPUGraph`, `graph_pool_handle`, or `make_graphed_callables`. Capture belongs to [mstar/engine/accelerator_graph_runner.py](mstar/engine/accelerator_graph_runner.py). A model declares an `AcceleratorGraphConfig`: `BatchedAcceleratorGraphConfig`, `PackedAcceleratorGraphConfig`, or for an inner loop `PiecewiseBatchedConfig` / `PiecewisePackedConfig` from [mstar/engine/accelerator_graph_config.py](mstar/engine/accelerator_graph_config.py), and the engine captures it. As of this writing there are **zero** raw capture calls under `mstar/model/`; keep it that way.
 - **Allocate, free, or evict resource state.** No calls into `PageArena`, `PageAllocator`, `CacheStream`, `CPUPagePool`, or `WorkspacePool`, and no direct `admit`/`commit`. Declare resources in `Model.get_node_resources()` and declare each step's effect on them in `NodeSubmodule.declare_step()`. The engine runs the lifecycle.
 - **Choose which requests form a batch.** Batch *selection* is the micro-scheduler's job: implement `can_batch` and `forward_batched`, set `input_seq_len` in `prepare_inputs`, and let it decide. (Note: given a batch, mechanically stacking or concatenating tensors in `preprocess` is normal and expected, and some audio submodules also pad to a maximum sequence length themselves for capture compatibility).
-- **Manage streams or synchronize.** No `torch.cuda.Stream`, `torch.cuda.synchronize`, or `torch.cuda.Event` under `mstar/model/`.
+- **Manage streams or synchronize.** No `torch.Stream`, `torch.Event`, `torch.accelerator.synchronize`, or device-specific equivalents under `mstar/model/`.
 - **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_`, `attend` over the current plan), so eager and captured paths address rows the same way.
 
 Things that look model-specific but belong to the system:
 
-- **Anything that should be a new resource.** Especially where preplanning is needed for CUDA-graph compatibility — recurrent/mamba state wrappers, sampling logic. Added as a `Resource` under `mstar/engine/resources/` it is available to every model and lands inside the admit/plan/commit lifecycle. Reimplemented inside one model, it is neither. Before writing one, read [.claude/skills/engine-resources/SKILL.md](.claude/skills/engine-resources/SKILL.md).
+- **Anything that should be a new resource.** Especially where preplanning is needed for accelerator graph compatibility — recurrent/mamba state wrappers, sampling logic. Added as a `Resource` under `mstar/engine/resources/` it is available to every model and lands inside the admit/plan/commit lifecycle. Reimplemented inside one model, it is neither. Before writing one, read [.claude/skills/engine-resources/SKILL.md](.claude/skills/engine-resources/SKILL.md).
 - **Fundamental abstractions that cut across layers**, such as session state or bidirectional streaming. These touch the conductor, the worker and the engine, so a per-model version becomes dead weight the moment the system-level feature lands.
 
 Some caveats:
 - Sometimes, building a cross-layer feature will be a long-running effort that should not block the implementation of a model. In that case, the right outcome is to note it, land the per-model version, and assign the system-level work.
 - There are cases where model-level state is lightweight enough that it can be held in the model itself; e.g., Qwen3-Omni allocates a fixed-size dense KV cache for the code predictor module.
 
-The converse matters just as much: **model-level concerns shouldn't leak into engine code.** If a behavior only makes sense for some models, the engine should provide it as a helper that the model opts into, rather than applying it to every model. For example, with chunked prefill, only the last chunk of a prompt samples a real token. Rather than the engine filtering sampler rows for every model, `keep_final_chunk_samples` ([#365](https://github.com/mstar-project/mstar/pull/365)) wraps a submodule's `SamplerStep`, and each submodule whose sampled token is meaningful only on the final chunk calls it in `declare_step`.
+The converse matters just as much: **model-level concerns shouldn't leak into engine code.** If a behavior only makes sense for some models, the engine should provide it as a helper that the model opts into, rather than applying it to every model. For example, with chunked prefill, only the last chunk of a prompt samples a real token. Rather than the engine filtering sampler rows for every model, `keep_final_chunk_samples` ([#365](https://github.com/mstar-project/mstar/pull/365), open PR) wraps a submodule's `SamplerStep`, and each submodule whose sampled token is meaningful only on the final chunk calls it in `declare_step`.
 
 ### 2. Resources are declared per graph node, and a node gets only what it declares
 
@@ -65,7 +65,7 @@ Per-deployment sizing goes in the config YAML under `resources:` overrides, not 
 
 ### 3. Submodule forwards are mostly tensor-in, tensor-out
 
-Aim for `forward` and `forward_batched` to be compilable and CUDA-graph capturable, which in practice means a pure tensor → tensor function: no host syncs, no data-dependent Python control flow, no shapes that vary outside a declared capture bucket, no I/O. Per-request bookkeeping goes in `prepare_inputs` / `preprocess`, and stopping decisions go in `check_stop`. The existing models are the best reference for how far this can be pushed.
+Aim for `forward` and `forward_batched` to be compilable and accelerator graph capturable, which in practice means a pure tensor → tensor function: no host syncs, no data-dependent Python control flow, no shapes that vary outside a declared capture bucket, no I/O. Per-request bookkeeping goes in `prepare_inputs` / `preprocess`, and stopping decisions go in `check_stop`. The existing models are the best reference for how far this can be pushed.
 
 ### 4. A change for one model must not degrade the others
 
@@ -114,7 +114,9 @@ Some additional information:
 
 ### 8. Configs map nodes to hardware; code stays hardware-agnostic
 
-`configs/*.yaml` `node_groups` map graph node names to GPU ranks. The same model code must run on one GPU or many with only the config changing. Don't branch on rank counts or device indices in model code; any branching should be contained to engine-level code (or worker, conductor, etc.), and should ideally be done in a modular manner (e.g., the `XPUAttentionManager` is a good example -- a new resource that encapsulates the accelerator-specific logic). 
+`configs/*.yaml` `node_groups` map graph node names to GPU ranks. The same model code must run on one GPU or many with only the config changing. Don't branch on rank counts or device indices in model code; any branching should be contained to engine-level code (or worker, conductor, etc.), and should ideally be done in a modular manner (e.g., the `XPUAttentionManager` is a good example -- a new resource that encapsulates the accelerator-specific logic).
+
+To branch on the GPU vendor or architecture, ask `mstar.platforms.current_platform` (`is_rocm()`, `arch()`, `has_cuda_capability()`) rather than `torch.version.hip`, the `cuda` device type, or a raw compute capability. PyTorch's ROCm build calls AMD GPUs `cuda` devices and reports an MI300X as compute capability 9.4, so neither tells you the vendor. Checking `device.type == "cuda"` to ask "is this a GPU" is still fine.
 
 ### 9. Update the documentation
 
@@ -149,7 +151,7 @@ Two things about what the number is for. **Don't optimize against one benchmark.
 
 A node's TP×SP block is its **lockstep instance** ([mstar/distributed/communication.py](mstar/distributed/communication.py)). Every rank in it must execute the same sequence of collectives, in the same order, with the same shapes — including on failure paths.
 
-The failure mode that actually happens: a readiness scan, admission check, capture decision or early `return` that consults **per-rank** state, so one rank takes a branch the others don't and the instance deadlocks on the next collective. Anything that decides control flow for the instance must be derived from state all ranks agree on, or reduced across the group first — `cuda_graph_runner.py` ANDs capture flags across the joint group for exactly this reason, and barriers once per spec whether it passed or failed.
+The failure mode that actually happens: a readiness scan, admission check, capture decision or early `return` that consults **per-rank** state, so one rank takes a branch the others don't and the instance deadlocks on the next collective. Anything that decides control flow for the instance must be derived from state all ranks agree on, or reduced across the group first — `accelerator_graph_runner.py` ANDs capture flags across the joint group for exactly this reason, and barriers once per spec whether it passed or failed.
 
 Review any new early return, `continue`, or exception path in worker and engine loops against this. A hang is much more expensive to debug than an error.
 
@@ -166,7 +168,7 @@ Process-group creation is a collective too. `dist.new_group(ranks, backend="gloo
 ### 12. Async partitions coordinate through streaming edges
 
 Distinct from the async worker in invariant 7. An **async partition** keeps its own set of graph walks with independent state transitions; data crosses between partitions on **streaming edges**, buffered in `StreamBuffer`s on the consumer worker and handed to graph nodes according to a chunk policy. Two hazards we have seen so far:
-- **Cross-partition races.** Partitions that must advance together need an explicit mechanism. Qwen3-Omni's thinker and talker have to stay in lockstep, and specifically the talker must transition to its decode walk at the right moment: the conductor sends a dummy edge for every new graph walk to mark that walk's start, after which decode runs as a dynamic loop with no further conductor intervention. [#385](https://github.com/mstar-project/mstar/pull/385) replaces this with producer-triggered walks: a `Connection`'s `consumer_walk` hook runs on the producer and assigns each pass's streamed items the consumer walk they run under, the consumer switches walk only when the partition is idle, and conductor inputs for a later walk wait on the worker. Once it lands, use it rather than adding a second coordination mechanism, or say why it doesn't fit.
+- **Cross-partition races.** Partitions that must advance together need an explicit mechanism. Qwen3-Omni's thinker and talker have to stay in lockstep, and specifically the talker must move through its prefill walks as the thinker's prefill and decode advance. The mechanism is producer-triggered walks ([#385](https://github.com/mstar-project/mstar/pull/385)): a `Connection`'s `consumer_walk` hook runs on the producer and assigns each row's streamed items the consumer walk they run under, the consumer switches walk only when the partition is idle, and the conductor follows the walk each pass reports on `WORKER_GRAPHS_DONE`. Use it rather than adding a second coordination mechanism, or say why it doesn't fit.
 - **Deciding a streaming partition is finished.** This is easy to get subtly wrong. Qwen3-Omni and Orpheus are the references worth reading before writing a new one.
 
 ### 13. Cross-request prefix reuse
@@ -185,21 +187,24 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 
 ```bash
 ruff check .                          # CI enforces this
-python -m pytest @test/cpu-core.txt   # the CPU Core CI job, no GPU or weights
-pytest test/modular/                  # broader CPU graph/worker tests
+python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
+    test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
+                                      # the CPU Core CI job (CI adds -p xdist -n 4), no GPU or weights
 pytest test/integration/              # needs GPU + weights
-cd rust && cargo test --release --no-default-features && pytest ../test/rust/
+cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
 
-Adding a CPU-only module to CI means adding its path to [test/cpu-core.txt](test/cpu-core.txt) — see [CONTRIBUTING.md](CONTRIBUTING.md).
+The CPU Core job runs every test module under the directories in `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)), including `test/modular/`, `test/distributed/` and `mstar/model/*/tests/`; there is no list of test files to add to. A new module there runs in CI as soon as it exists, so it must pass or skip on a CPU-only machine: guard CUDA, weights and optional packages with a `skipif` or `pytest.importorskip("<module>")` (import names: `flashinfer`, `misaki`, `qwen_tts`, `mstar_rust`), and give a test that is broken on `main` an in-file `pytest.mark.skip` whose reason says why and names the fixing PR or issue when one exists. A test module outside those directories goes in `NOT_CPU_CORE` there with where it runs instead; `test/ci/test_cpu_selection.py` fails on one in neither, and on two selected modules outside a package with the same basename. A guard on a reference package named like an mstar model (`kokoro`, `chatterbox`, `omnivoice`) imports a submodule only the reference has: once pytest puts `mstar/model` on `sys.path` for `mstar/model/*/tests`, the bare name finds mstar's own package (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
-The modular tests exist because these are the parts that are easy to get wrong: `test_resource_runner.py` (the admit/plan/commit lifecycle from `declare_step`), `test_cuda_graph_capture.py` (bucket keys, `cg_key_info`, `additional_key_info`), `test_micro_scheduler.py` (admission, failure, backpressure), `test_admit_failure_handling.py`, `test_kv_offload.py`.
+CI has no GPU. A PR whose change runs on the GPU says which GPU tests it ran, on what hardware and torch/CUDA build. Real-weights tests skip when the checkpoint isn't cached, so a passing CPU run of them shows only that they import: rerun them on CUDA on the commit being pushed, and report them as run, not skipped.
 
-Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep.
+The modular tests exist because these are the parts that are easy to get wrong: `test_resource_runner.py` (the admit/plan/commit lifecycle from `declare_step`), `test_accelerator_graph_capture.py` (bucket keys, `cg_key_info`, `additional_key_info`), `test_micro_scheduler.py` (admission, failure, backpressure), `test_admit_failure_handling.py`, `test_kv_offload.py`.
+
+Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep. When a test needs a worker or engine method, build the smallest real object (`Worker.__new__(Worker)` plus the attributes the method reads) and call the real method rather than copying its body into a fake: a copy keeps passing after the real code changes. [#444](https://github.com/mstar-project/mstar/pull/444) (open PR) updates 14 tests whose hand-built stubs had drifted from main.
 
 If a bug only reproduces through a running server, write a standalone harness before the third attempt. A server restart can be minutes of compilation, while a harness that builds the resources directly, drives `admit`/`plan`/`commit` by hand, and captures and replays a graph runs in seconds — [test/modular/test_gdn_cuda_graph.py](test/modular/test_gdn_cuda_graph.py) is the shape to copy. Where the bug is inside a captured graph, intermediates are invisible after a replay; returning `torch.isfinite(x).all()` per layer as an extra graph output gives a flag tensor readable afterwards, which names the first bad kernel instead of the first place the damage shows.
 
-Before attributing a test failure to your change, check whether it also fails on `main`; some modular tests have pre-existing failures. Compare the set of failing tests against main, not just the count.
+Before attributing a test failure to your change, check whether it also fails on `main`; some modular tests have pre-existing failures. Compare the set of failing tests against main, not just the count. Bit-exact CPU tests (`torch.equal`) can depend on the intra-op thread count: two wan22 cases in `test/modular/test_wan_vae_decode.py` fail with `OMP_NUM_THREADS` 4 or 8 on a 32-vCPU AMD EPYC host and pass with 1 or 2. Run the CPU suite with `OMP_NUM_THREADS=2` before treating such a failure as yours, and pin the thread count (`torch.set_num_threads`) in a fixture when writing a new bit-exact test.
 
 Output-quality artifacts get the same check, against the reference implementation as well as `main`, and measured over several samples per prompt rather than judged by ear: some are the checkpoint's own behavior (e.g. Qwen3-Omni's spoken replies sometimes start garbled in the reference too).
 
@@ -215,7 +220,7 @@ Recommended practice: the reviewer raises these as notes and never blocks on the
 
 **Land system changes separately.** A new resource kind, or anything else under `mstar/engine/`, `mstar/worker/` or `mstar/conductor/` that a model change happens to need, reviews better on its own and can usually merge earlier than the model that motivated it. Split it out, or stack it under the model PR.
 
-**Consider stacking capture and optimization on an eager MVP.** Correct eager execution is a coherent thing to merge, and capture plus batching plus tuning stack cleanly on top of it — which also keeps parity debugging out of the same diff as capture debugging. The counterweight is that some models, particularly large ones, are painfully slow end to end without CUDA graphs, so an eager-only merge is not always useful on its own. Judgement call per model, not a requirement.
+**Consider stacking capture and optimization on an eager MVP.** Correct eager execution is a coherent thing to merge, and capture plus batching plus tuning stack cleanly on top of it — which also keeps parity debugging out of the same diff as capture debugging. The counterweight is that some models, particularly large ones, are painfully slow end to end without accelerator graphs, so an eager-only merge is not always useful on its own. Judgement call per model, not a requirement.
 
 ## Style and structure
 
@@ -231,7 +236,7 @@ Readability rules the reviewer may cite as **S1** through **S4**. These are the 
 - Once the implementation or optimization settles, do a pass over the comments and docstrings you wrote and cut them down. Keep the TL;DR and whatever a reader would not guess from the code (an invariant, a surprising constraint, why the obvious alternative was rejected); drop restatements of the code and accounts of how it got there, which belong in the commit message or PR. Agent-written comments drift long and tend to stay long, so make this a deliberate step rather than relying on writing them short the first time.
 - Check comments for staleness when the code under them changes, especially comments that state lifecycle or ordering semantics. A comment that was true of an earlier draft (e.g., "a chunked prompt forks on its first chunk", when pre-fork happens on the first chunk and post-fork on the last) is worse than none.
 
-**S3. Reach for a class when the shape calls for one.** Several related functions with differing implementations — attention backends being the obvious case — want a base class with subclasses, particularly where the alternative is module-level global state. Likewise, a cluster of related fields and methods accreting on `Worker` or `Engine` usually wants to be its own object; the graph runtime on the worker and submodule management / the CUDA graph runner on the engine are the examples worth imitating. And when a new behaviour differs enough from an existing class's that supporting it means an optional argument that switches what the class does, consider a sibling class over a shared base instead. This is a judgement call rather than a rule: the ragged attention resource gained cross-attention as `RaggedCrossAttentionSpec` / `RaggedCrossPrefillWrapper` beside the self-attention classes, rather than an optional `kv_cu_seqlens` that changed what a plan meant, and the self-attention API stayed untouched.
+**S3. Reach for a class when the shape calls for one.** Several related functions with differing implementations — attention backends being the obvious case — want a base class with subclasses, particularly where the alternative is module-level global state. Likewise, a cluster of related fields and methods accreting on `Worker` or `Engine` usually wants to be its own object; the graph runtime on the worker and submodule management / the accelerator graph runner on the engine are the examples worth imitating. And when a new behaviour differs enough from an existing class's that supporting it means an optional argument that switches what the class does, consider a sibling class over a shared base instead. This is a judgement call rather than a rule: the ragged attention resource gained cross-attention as `RaggedCrossAttentionSpec` / `RaggedCrossPrefillWrapper` beside the self-attention classes, rather than an optional `kv_cu_seqlens` that changed what a plan meant, and the self-attention API stayed untouched.
 
 **S4. Keep abstractions semantically coherent.** Don't bundle concerns into one dataclass, gather or code path because they arrived together for one model; split them by what each needs (per-request state versus static settings, say), and add a feature to an existing path as a branch rather than a parallel copy of it, unless there is a stated reason.
 
@@ -244,9 +249,9 @@ Readability rules the reviewer may cite as **S1** through **S4**. These are the 
 
 Not rules, and the reviewer shouldn't cite them; these are cleanups that came out of review and made the code easier to work with.
 
-**One hook that returns a policy object, rather than several parallel hooks.** Chunked prefill first added four methods to the submodule base class (whether a walk is chunkable, its token budget, how its outputs accumulate, whether it reuses a cached prefix). They became one `get_chunking_policy(graph_walk) -> ChunkingPolicy` ([#365](https://github.com/mstar-project/mstar/pull/365)), a frozen dataclass with a callable field for the one dynamic case, which the engine caches per (node, walk). A submodule author implements one thing per concern and sees every option in one place, and the engine doesn't rebuild the answer every step.
+**One hook that returns a policy object, rather than several parallel hooks.** Chunked prefill first added four methods to the submodule base class (whether a walk is chunkable, its token budget, how its outputs accumulate, whether it reuses a cached prefix). They became one `get_chunking_policy(graph_walk) -> ChunkingPolicy` ([#365](https://github.com/mstar-project/mstar/pull/365), open PR), a frozen dataclass with a callable field for the one dynamic case, which the engine caches per (node, walk). A submodule author implements one thing per concern and sees every option in one place, and the engine doesn't rebuild the answer every step.
 
-**If a structural restriction can be enforced at startup, enforce it at startup.** Speculating into a chunkable (node, walk) isn't safe, since chunks are cut at schedule time from lengths a speculative batch doesn't know yet. Rather than the worker filtering speculation targets at runtime and hoping the runtime picks a safe one, the chunkable pairs are computed once when submodules load and passed to the graph runtime's constructor as `disable_spec_node_walks` ([#365](https://github.com/mstar-project/mstar/pull/365)), and the runtime never returns them from `speculate_node`. A component that can't produce the forbidden thing is safer than call sites that each have to remember to check.
+**If a structural restriction can be enforced at startup, enforce it at startup.** Speculating into a chunkable (node, walk) isn't safe, since chunks are cut at schedule time from lengths a speculative batch doesn't know yet. Rather than the worker filtering speculation targets at runtime and hoping the runtime picks a safe one, the chunkable pairs are computed once when submodules load and passed to the graph runtime's constructor as `disable_spec_node_walks` ([#365](https://github.com/mstar-project/mstar/pull/365), open PR), and the runtime never returns them from `speculate_node`. A component that can't produce the forbidden thing is safer than call sites that each have to remember to check.
 
 ## Performance ideas from past work
 

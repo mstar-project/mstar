@@ -211,6 +211,12 @@ def _video_parity(mode: str) -> None:
     dpipe, mpipe, snap = ctx["dpipe"], ctx["mpipe"], ctx["snap"]
     dev, dtype = ctx["device"], ctx["dtype"]
     is_i2v = mode == "i2v"
+    if is_i2v:
+        from diffusers.pipelines.cosmos import pipeline_cosmos3_omni
+
+        if not hasattr(pipeline_cosmos3_omni, "_preprocess_conditioning_image"):
+            print("  (skipped i2v parity: diffusers before 0.40 stretches the conditioning image, mstar crops it)")
+            return
     asset = os.path.join(snap, "assets", "example_i2v_prompt.json" if is_i2v else "example_t2v_prompt.json")
     with open(asset) as f:
         prompt = json.load(f)["temporal_caption"]
@@ -292,5 +298,6 @@ def test_video_postprocess_falls_back_to_pyav(monkeypatch) -> None:
     with av.open(io.BytesIO(data)) as container:
         stream = container.streams.video[0]
         frames = [f for f in container.decode(stream)]
+        codec, rate = stream.codec_context.name, float(stream.average_rate)
     assert len(frames) == 9 and (frames[0].width, frames[0].height) == (64, 48)
-    assert stream.codec_context.name == "h264" and float(stream.average_rate) == 12.0
+    assert codec == "h264" and rate == 12.0

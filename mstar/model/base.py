@@ -1,8 +1,9 @@
 import itertools
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
-from typing import NamedTuple, Type
+from typing import TYPE_CHECKING, NamedTuple, Type
 
 import torch
 import yaml
@@ -16,6 +17,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -25,9 +27,12 @@ from mstar.graph.base import (
     Parallel,
     Sequential,
     TensorPointerInfo,
-    top_level_entities,
 )
-from mstar.model.multimodal import PromptPart
+from mstar.model.media_limits import VideoBudget, read_image
+from mstar.model.multimodal import TEXT, PromptPart
+
+if TYPE_CHECKING:
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -49,14 +54,128 @@ class ProcessPromptOutput(NamedTuple):
     metadata: dict
 
 
-class PrefixStream(NamedTuple):
-    """The input tensor whose token ids key one cache stream's pages."""
-    tensor: str
-    keyed_by: str
-    # the walk that writes the keyed span; a write from any other walk ends the chain
+class ClientChunk(NamedTuple):
+    """One append the client sends to a running request, as
+    ``Model.process_stream_chunk`` sees it."""
+    text: str | None
+    # the append's files, loaded as a request's are (``audio_inputs`` and so on)
+    tensors: NameToTensorList
+    input_metadata: dict[str, list[dict]]
+    # per ``tensors`` list, the client stream each file names, None where it names none
+    streams: dict[str, list[str | None]]
+    # this append's model_kwargs, and the opening message's
+    model_kwargs: dict
+    request_kwargs: dict
+
+
+class Span(NamedTuple):
+    """One write to a KV stream. A layout lists them in the order the walks write.
+
+    ``length`` is how many KV slots the write fills, and ``advance`` is how far
+    it moves the position counter, which is the length for text. ``source`` is
+    the tensor whose next entry an ids span keys, or the file of a digest span
+    as ``(modality, index)``. ``params`` are the preprocessing arguments that
+    change the tensors made from the file. A ``rows`` span writes KV made from
+    anything else, such as another node's outputs, and is never keyed.
+    ``scratch`` is the most a non-committing step writes before the span
+    commits into those slots, as a denoised window does.
+    """
+    kind: str
     walk: str
-    # the walk whose input is the last sampled token, to key generated pages; None keys the prompt only
-    decode_walk: str | None = None
+    length: int
+    advance: int
+    source: str | tuple[str, int]
+    params: tuple = ()
+    scratch: int = 0
+
+
+class LabelLayout(NamedTuple):
+    """Everything a request writes into one paged KV label, from `process_prompt`'s ``kv_layout``.
+
+    ``spans`` are the committed writes known at intake, in walk order. Each
+    ``(loop, slots)`` in ``growth`` writes ``slots`` per iteration of the named
+    loop. ``scratch`` is the most one non-committing step writes past the
+    committed length, and ``retention`` the policy the label's committing steps declare.
+    """
+    spans: tuple[Span, ...] = ()
+    growth: tuple[tuple[str, int], ...] = ()
+    scratch: int = 0
+    retention: RetentionPolicy | None = None
+    # how many leading spans the label's keys cover, by default every span before the first rows span
+    keyed_spans: int | None = None
+
+    def keyed_count(self) -> int:
+        if self.keyed_spans is not None:
+            return self.keyed_spans
+        return next((i for i, span in enumerate(self.spans) if span.kind == "rows"), len(self.spans))
+
+    def row(self) -> list:
+        """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
+        ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
+        wire's msgpack path."""
+        for span in self.spans:
+            if span.kind not in ("ids", "digest", "rows"):
+                raise ValueError(f"a span of kind {span.kind!r}")
+            if not (isinstance(span.length, int) and isinstance(span.advance, int) and isinstance(span.scratch, int)):
+                raise ValueError(
+                    f"a {span.kind} span's length, advance and scratch are {type(span.length).__name__}, "
+                    f"{type(span.advance).__name__} and {type(span.scratch).__name__}"
+                )
+        retention = self.retention
+        return [
+            [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
+            [[loop, slots] for loop, slots in self.growth],
+            self.scratch,
+            None if retention is None else [retention.context_budget, retention.protected_prefix],
+            self.keyed_count(),
+        ]
+
+
+def prompt_spans(
+    plan: Iterable[PromptPart], texts: Sequence[torch.Tensor], text_walk: str,
+    item_spans: Callable[[PromptPart], Iterable[Span]],
+) -> list[Span]:
+    """A prompt's prefill writes in ``plan`` order: a text step's ids from ``texts``, and an
+    attachment's from ``item_spans``."""
+    spans = []
+    for step in plan:
+        if step.modality != TEXT:
+            spans.extend(item_spans(step))
+            continue
+        length = texts[step.index].numel()
+        spans.append(Span("ids", text_walk, length, length, "text_inputs"))
+    return spans
+
+
+class PrefixKeys(NamedTuple):
+    """How a label's pages are keyed for cross-request prefix reuse.
+
+    ``tensor`` holds the ids an ids span is keyed by. Only a write from one of
+    ``walks`` keeps the keys going. With ``growth``, the ids the label's growth
+    walk samples extend the keys.
+    """
+    tensor: str
+    walks: tuple[str, ...]
+    growth: bool = False
+
+
+class KVLabel(NamedTuple):
+    """A paged KV label, as the model's walks write it.
+
+    Each ``(walk, loop)`` in ``growth`` writes after admission, bounded by the
+    named loop. A label with ``keys`` is keyed for prefix reuse.
+    """
+    growth: tuple[tuple[str, str], ...] = ()
+    keys: PrefixKeys | None = None
+
+
+def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
+    keyed = {}
+    for key, labels in model.kv_labels().items():
+        marked = {label: kv_label for label, kv_label in labels.items() if kv_label.keys is not None}
+        if marked:
+            keyed[key] = marked
+    return keyed
 
 
 def video_metadata_dict(metadata_obj) -> dict:
@@ -267,24 +386,21 @@ def _divide_into_worker_graphs(
         return loop_section_worker_graphs
 
 
-def _self_triggered(entity: GraphNode | Loop) -> bool:
-    """Whether the stream alone can re-run a top-level entity once it completes:
-    it is, or (a Loop) holds, a consumer with every input streamed. Completion
-    reseeds streaming readiness only for such nodes; a consumer with a
-    non-streamed input has to receive it again first."""
-    return any(
-        node.consumes_stream and node.input_names <= node._streaming_inputs
-        for node in entity.get_nodes().values()
-    )
+def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallelConfig"]:
+    """Each node's parsed ``ep_config``, from the node groups that list it.
 
+    Nodes whose config is the default (TP) are left out. A node listed by
+    several groups, one per graph walk, must get the same config from each.
+    """
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
-def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
-    """Whether every request runs all of these worker graphs on the same
-    workers: the conductor picks one replica per node_group, so they share a
-    node_group, or each is a single instance on the same ranks."""
-    if len({wg._group_id for wg in wgs}) == 1:
-        return True
-    return all(len(wg.ranks) == wg.tp_size and wg.ranks == wgs[0].ranks for wg in wgs)
+    configs: dict[str, MoeParallelConfig] = {}
+    for ng in node_groups:
+        cfg = MoeParallelConfig.from_yaml(ng.get("ep_config"))
+        for node in ng["node_names"]:
+            if configs.setdefault(node, cfg) != cfg:
+                raise ValueError(f"node {node!r} gets different ep_config from two node_groups")
+    return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
 
 
 @dataclass
@@ -315,10 +431,22 @@ class Model(ABC):
     # values to the conductor alongside their tensor descriptors.
     PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
 
+    # Keys only this model's process_prompt sets (prompt layouts, stream
+    # leads) for the conductor to read back from model_kwargs. The data
+    # worker drops a client's values for them before process_prompt.
+    INTERNAL_KWARGS: tuple[str, ...] = ()
+
+    # Request keys that set an output length. A request that sets one is refused when it
+    # doesn't fit the context, instead of having its length cut to fit.
+    LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
+    # Request keys the conductor reads for every model, never logged as ignored.
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache")
+
     # Intra-op threads for the API server's preprocessing of this model's
-    # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
-    # default of one per core; ``preprocess_torch_threads`` in the model's
-    # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
+    # inputs (``load_image``, ``process_prompt``, ...). None takes a default
+    # sized from the CPUs the process may use; ``preprocess_torch_threads`` in
+    # the model's config.yaml overrides either. See
+    # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
 
     def _get_worker_graphs_for_graph_walk(
@@ -357,130 +485,34 @@ class Model(ABC):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Reject a deployment YAML this model cannot serve.
 
-        Called by the Conductor at startup with the parsed YAML. The model
-        sees only ``model_kwargs`` in ``__init__``, so checks on other keys
-        (``max_concurrent_requests``, ``resources``, ...) belong here. Raise
-        ``ValueError`` naming the key; ``config_path`` is for the message.
+        Called by ``validate_deployment`` in the conductor at startup, with the
+        parsed YAML. The model sees only ``model_kwargs`` in ``__init__``, so
+        checks on other keys (``max_concurrent_requests``, ``resources``, ...)
+        belong here. Raise ``ValueError`` naming the key; ``config_path`` is
+        for the message.
         """
         return
 
     def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
+        """Divide every walk into worker graphs by ``node_groups``, first
+        refusing a placement that cannot be divided, with every problem in one
+        ``DeploymentError``. ``validate_deployment`` checks the result."""
+        from mstar.validation import DeploymentError
+        from mstar.validation.placement import check_placement
+
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
-        node_groups = config.get("node_groups")
-        if node_groups is None:
-            raise KeyError("Config must define `node_groups`.")
+        problems = check_placement(self, config)
+        if problems:
+            raise DeploymentError(config_path, problems)
 
-        walk_graphs = self.get_graph_walk_graphs()
-        self._check_walk_placement(walk_graphs, node_groups, config_path)
+        node_groups = config["node_groups"]
         # TODO: merge identical worker graphs from different graph walks
-        walk_to_wgs = {
-            graph_walk: self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
-            for graph_walk, graph in walk_graphs.items()
-        }
-        self._check_stream_driven_walks(walk_to_wgs, config_path)
-        return sum(walk_to_wgs.values(), start=[])
-
-    def _check_walk_placement(
-        self, walk_graphs: dict[str, GraphSection], node_groups: list[dict], config_path: str,
-    ) -> None:
-        """Reject declarations the conductor would accept and then serve wrongly:
-        a walk in no partition or in two (its worker graphs are registered on no
-        worker, or in both partitions), and a node of a walk in no node_group or
-        in two (the later group silently wins)."""
-        partitions = self.get_partitions()
-        for part in partitions:
-            unknown = sorted(part.graph_walks - walk_graphs.keys())
-            if unknown:
-                raise ValueError(
-                    f"Partition {part.name!r} lists graph walks {unknown} that "
-                    f"get_graph_walk_graphs() does not define (walks: {sorted(walk_graphs)})."
-                )
-        for walk in walk_graphs:
-            owners = [part.name for part in partitions if walk in part.graph_walks]
-            if len(owners) != 1:
-                raise ValueError(
-                    f"Graph walk {walk!r} is in {len(owners)} partitions {owners}; "
-                    "every walk must be listed in the graph_walks of exactly one "
-                    "PartitionDefinition from get_partitions()."
-                )
-
-        for i, group in enumerate(node_groups):
-            unknown = sorted(set(group.get("graph_walks", [])) - walk_graphs.keys())
-            if unknown:
-                raise ValueError(
-                    f"{config_path}: node_groups[{i}] (nodes {group['node_names']}) lists "
-                    f"graph_walks {unknown}, which this model does not define "
-                    f"(walks: {sorted(walk_graphs)})."
-                )
-        for walk, graph in walk_graphs.items():
-            for node in graph.get_nodes():
-                groups = [
-                    i for i, group in enumerate(node_groups)
-                    if node in group["node_names"]
-                    and ("graph_walks" not in group or walk in group["graph_walks"])
-                ]
-                if len(groups) != 1:
-                    where = ", ".join(f"node_groups[{i}]" for i in groups) or "no node_groups entry"
-                    raise ValueError(
-                        f"{config_path}: node {node!r} of graph walk {walk!r} is placed by "
-                        f"{where}; place it in exactly one node_groups entry for that walk "
-                        "(use graph_walks to give one node different ranks per walk)."
-                    )
-
-    def _check_stream_driven_walks(
-        self, walk_to_wgs: dict[str, list[WorkerGraph]], config_path: str,
-    ) -> None:
-        """Reject stream-driven walk shapes the runtime and conductor can't
-        account for.
-
-        A worker graph counts entity completions per pass, and a self-triggered
-        consumer (every input streamed) is re-armed for the next chunk as soon as
-        it completes, so a second top-level entity can be counted done before it
-        runs, and the pass-end reset drops input it has buffered. A consumer
-        gated on a non-streamed input waits for that input instead, which is
-        safe when it arrives once per pass (from the conductor, say).
-        Across worker graphs, self-triggered passes overlap with no pass
-        identity, and the conductor reads the final-stream flag only off the
-        report that closes a pass: the flag is per worker, so it is there only
-        if every worker graph of the walk runs on the consumer's workers. A walk
-        with no stream-consuming node is conductor driven and unaffected, and a
-        TP worker graph is one worker graph on several ranks.
-        """
-        topology = self.get_partition_topology()
-        consumer_partitions = {conn.to_partition for conn in topology.connections}
-        walk_partition = {
-            walk: part.name for part in self.get_partitions() for walk in part.graph_walks
-        }
-        for walk, wgs in walk_to_wgs.items():
-            if walk_partition[walk] not in consumer_partitions:
-                continue
-            if not any(wg.consumes_stream for wg in wgs):
-                continue
-            where = f"{config_path}: graph walk {walk!r} of consumer partition {walk_partition[walk]!r}"
-            entities = [top_level_entities(wg.section) for wg in wgs]
-            triggered = sorted(
-                name for ents in entities for name, e in ents.items() if _self_triggered(e)
-            )
-            if len(wgs) > 1 and (triggered or not _on_same_workers(wgs)):
-                raise ValueError(
-                    f"{where} consumes a stream and spans {len(wgs)} worker graphs "
-                    f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
-                    f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
-                    "is served only with every consumer gated on a non-streamed input that "
-                    "arrives once per pass and every worker graph on the same workers (one "
-                    "node_group, or one instance on the same ranks); otherwise run it as "
-                    "one worker graph, or move the work after the consumer into a "
-                    "downstream partition fed by a StreamingGraphEdge."
-                )
-            if len(wgs) == 1 and len(entities[0]) > 1 and triggered:
-                raise ValueError(
-                    f"{where} has self-triggered consumers {triggered} (every input "
-                    f"streamed) among {len(entities[0])} top-level entities {sorted(entities[0])} "
-                    "in one worker graph. Gate the consumer on a non-streamed input that "
-                    "arrives once per pass (from the conductor, say), or move the work "
-                    "after it into a downstream partition fed by a StreamingGraphEdge."
-                )
+        return [
+            wg
+            for graph_walk, graph in self.get_graph_walk_graphs().items()
+            for wg in self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
+        ]
 
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
         with open(config_path, "r") as f:
@@ -492,30 +524,20 @@ class Model(ABC):
         # node_groups section drives both worker assignment and TP grouping;
         # the separate "sharding_config" section just holds shard_dim.
         groups: list[ShardingGroup] = []
+        node_moe_parallel_configs(config.get("node_groups", []))
         for ng in config.get("node_groups", []):
+            if "ep_config" in ng and any(
+                node not in sharding_config.ep_enabled_nodes for node in ng["node_names"]
+            ):
+                raise ValueError(
+                    f"Node group with ep_config contains nodes not in "
+                    f"ep_enabled_nodes {sharding_config.ep_enabled_nodes}: {ng['node_names']}"
+                )
             tp = ng.get("tp_size", 1)
             sp = ng.get("sp_size", 1)
             instance_size = tp * sp
             if instance_size <= 1:
                 continue
-            if tp > 1 and any(
-                node not in sharding_config.tp_enabled_nodes
-                for node in ng["node_names"]
-            ):
-                raise ValueError(
-                    f"Node group with tp_size {tp} contains "
-                    f"nodes not in tp_enabled_nodes {sharding_config.tp_enabled_nodes}: "
-                    f"{ng['node_names']}"
-                )
-            if sp > 1 and any(
-                node not in sharding_config.sp_enabled_nodes
-                for node in ng["node_names"]
-            ):
-                raise ValueError(
-                    f"Node group with sp_size {sp} contains "
-                    f"nodes not in sp_enabled_nodes {sharding_config.sp_enabled_nodes}: "
-                    f"{ng['node_names']}"
-                )
             # The sharding group is the lockstep unit — tp*sp workers routed
             # together. TP shards weights via shard_dim-driven fanout; SP is
             # in-module (replicated signals, no shard_dim) but its ranks must
@@ -574,13 +596,43 @@ class Model(ABC):
         """
         return type(self).__name__
 
-    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """Which input tensor keys which ``(resource, label)`` cache stream.
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
+        return {}
 
-        Declaring one opts a node into cross-request prefix reuse: the
-        preprocess worker keys that tensor and the KV resource matches what it
-        already holds. Empty leaves the model uncached whatever the deployment
-        asks for.
+    def combined_walk_of(self) -> dict[tuple[str, str], str]:
+        """``(node, real walk) -> combined walk``, validated."""
+        walks = self.get_graph_walk_graphs()
+        out: dict[tuple[str, str], str] = {}
+        for node, combined in self.get_combined_graph_walks().items():
+            for name, members in combined.items():
+                if name in walks:
+                    raise ValueError(
+                        f"{type(self).__name__}: combined walk {name!r} of {node!r} "
+                        "reuses the name of a real walk"
+                    )
+                for walk in members:
+                    if walk not in walks or node not in walks[walk].get_nodes():
+                        raise ValueError(
+                            f"{type(self).__name__}: combined walk {name!r} names "
+                            f"{walk!r}, which is not a walk of node {node!r}"
+                        )
+                    if (node, walk) in out:
+                        raise ValueError(
+                            f"{type(self).__name__}: walk {walk!r} of {node!r} is in "
+                            f"both {out[(node, walk)]!r} and {name!r}"
+                        )
+                    out[(node, walk)] = name
+        return out
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        """The paged KV labels the model's walks write, by resource and label.
+
+        `process_prompt` returns a `LabelLayout` for each under ``kv_layout``, as
+        ``{resource: {label: LabelLayout}}``. A label with keys opts its node into
+        cross-request prefix reuse: the preprocess worker keys its layout's keyed
+        spans and the KV resource matches what it already holds. With no keyed
+        label the model is uncached whatever the deployment asks for.
         """
         return {}
 
@@ -668,26 +720,65 @@ class Model(ABC):
         """
         pass
 
-    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        import torchvision
+    def max_input_files(self) -> dict[str, int]:
+        """Most files of each input modality one request may attach, e.g.
+        ``{"audio": 1}``. The data worker refuses a request over it before
+        decoding any file; a modality left out is held only to
+        ``MSTAR_MAX_MEDIA_FILES``."""
+        return {}
 
-        img = torchvision.io.decode_image(filepath).to(device)  # uint8 CxHxW
-        img = img.float() / 255.0
+    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
+        """Turn one append the client sends to a running request into items of
+        the model's client streams (``Connection(from_partition=CLIENT, ...)``).
+
+        Called by the API server data worker for each append that carries text
+        or files, after it has loaded the files the way it loads a request's
+        (``chunk.tensors``: ``audio_inputs``, ``image_inputs``,
+        ``video_inputs``). ``chunk.streams`` names the stream the client meant
+        each file for, where it named one; ``chunk.model_kwargs`` are the
+        append's own, beside the opening's ``chunk.request_kwargs``. Returns
+        items by client edge name; each list entry is one item of that stream.
+        Raise ``ValueError`` for an append the model can't take (the client
+        gets a 400); an append with text that yields no item is refused.
+
+        Keep it stateless: the consuming node folds items into its own state.
+        Tensors ``process_prompt`` returns under a client edge's name are the
+        stream's first chunk, so a one-shot request needs no append.
+        """
+        raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
+
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        # RGB whatever the file holds: image processors cannot place the
+        # channel axis of a 4-channel (RGBA or CMYK) image.
+        try:
+            img = read_image(filepath, rgb=True)
+        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
+            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
+        img = img.to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        from torchcodec.decoders import AudioDecoder
+        # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
+        # FFmpeg build torchcodec happens to load (some base images ship a
+        # video-only one); torchcodec for the other containers.
+        from mstar.model.components.audio_features import load_audio_file
 
-        decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        audio = load_audio_file(filepath, sample_rate=16000)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
         decoder = VideoDecoder(filepath, device=device)
-        video = torch.stack([frame for frame in decoder]).float() / 255.0
+        budget = VideoBudget()
+        frames = []
+        for frame in decoder:
+            budget.add(*frame.shape[-2:])
+            frames.append(frame)
+        video = torch.stack(frames)
+        del frames
+        video = video.float().div_(255.0)
         return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
 
     @abstractmethod
@@ -704,6 +795,10 @@ class Model(ABC):
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
 
+        An image or video artifact encodes on the API server's pool, beside the
+        data worker's inline calls for the request's other outputs, so an
+        override must not keep state across calls.
+
         Modality to expected encoding type:
         - text: utf-8
         - image: png
@@ -714,6 +809,7 @@ class Model(ABC):
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
+        moe_parallel: "MoeParallelConfig | None" = None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
 
@@ -729,6 +825,10 @@ class Model(ABC):
         never receive it. Models that support SP forward it to their
         attention so it can all-to-all the sequence around the kernel.
 
+        ``moe_parallel`` is the node group's ``ep_config``: TP or EP for the
+        node's routed experts. Passed only for a node in ``ep_enabled_nodes``
+        whose group sets one; build MoE layers with ``instantiate_moe_block``.
+
         ``autocast_dtype`` is the dtype this node's params should be
         allocated in. Models that build on the meta device must cast the
         meta module to this dtype *before* ``to_empty(device)`` so storage
@@ -743,22 +843,20 @@ class Model(ABC):
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
 
-    def get_max_output_tokens_limit(self) -> int | None:
-        """The largest ``max_output_tokens`` a request may ask for; above it the
-        conductor refuses the request (a 400) rather than stopping short. None
-        is no published limit.
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        """The iterations each named loop may run for this request, each at least 1.
 
-        A model whose decode Loop is built with ``max_iters`` from the
-        kwarg-less ``get_max_output_tokens()`` must return that value: the loop
-        ends there whatever the request asked.
+        A loop runs the smaller of its graph ``max_iters`` and its cap. A model
+        whose stop check ends a loop at a count sets the cap to that count, so the
+        loop ends on the same iteration and never speculates past it.
         """
-        return None
+        return {}
 
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an
         OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key named in the ``X-MStar-Ignored-Params`` response header.
-        None (the default) declares nothing, so nothing is reported.
+        and the key logged as ignored. None (the default) declares nothing, so
+        nothing is logged.
         """
         return None
 
@@ -783,9 +881,10 @@ class Model(ABC):
     def warmup_preprocess(self) -> None:
         """Called once in the preprocess worker before it takes requests.
 
-        Build what ``process_prompt`` needs lazily (a G2P front end, a
-        tokenizer, a feature extractor) so the first request does not pay for
-        it. The default does nothing.
+        Build what ``process_prompt`` and ``postprocess`` would otherwise build
+        lazily (a G2P front end, a tokenizer, a feature extractor, a compiled
+        kernel) so the first request does not pay for it. The default does
+        nothing.
         """
         return None
 

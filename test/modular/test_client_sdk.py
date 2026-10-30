@@ -7,7 +7,7 @@ from unittest import mock
 
 import pytest
 
-pytest.importorskip("requests")
+requests = pytest.importorskip("requests")
 np = pytest.importorskip("numpy")
 
 from mstar.client import AudioBuffer, MStarClient  # noqa: E402
@@ -98,6 +98,7 @@ def test_stream_without_content_type_charset():
             r"Server stream failed \(status 500\): capture failed",
         ),
         ({"error": "bridge failed"}, "Server stream failed: bridge failed"),
+        ({"error": "bridge failed", "status": 503}, r"Server stream failed \(status 503\): bridge failed"),
     ],
 )
 def test_stream_raises_in_band_server_errors(payload, message):
@@ -113,6 +114,25 @@ def test_stream_raises_in_band_server_errors(payload, message):
     with mock.patch.object(client._session, "post", return_value=ctx):
         with pytest.raises(RuntimeError, match=message):
             list(client._stream("http://x/generate", {}, None))
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_refused_request_raises_http_error_with_the_server_message(stream):
+    requests = pytest.importorskip("requests")
+    resp = requests.Response()
+    resp.status_code = 400
+    resp.reason = "Bad Request"
+    resp.headers["Content-Type"] = "application/json"
+    resp.raw = io.BytesIO(json.dumps({"detail": "top_p must be in (0, 1]"}).encode())
+
+    client = MStarClient("http://x")
+    ctx = mock.MagicMock()
+    ctx.__enter__.return_value = resp
+    with mock.patch.object(client._session, "post", return_value=ctx if stream else resp):
+        with pytest.raises(requests.HTTPError, match=r"400 Bad Request: top_p must be") as e:
+            result = client.generate(text="hi", stream=stream, top_p=0)
+            list(result)
+    assert e.value.response is resp
 
 
 @pytest.mark.parametrize("modality", ["action", "scalar", "tensor", "video"])
@@ -188,7 +208,7 @@ def test_voices_lists_ids():
     resp.json.return_value = {"object": "list", "voices": voices}
     with mock.patch.object(c._session, "get", return_value=resp) as get:
         assert c.voices() == ["tara", "zoe"]
-    get.assert_called_once_with("http://x/v1/audio/voices", timeout=c.timeout)
+    get.assert_called_once_with("http://x/v1/audio/voices", timeout=c.timeout, auth=c._auth)
     resp.raise_for_status.assert_called_once()
 
 
@@ -283,3 +303,44 @@ def test_stream_names_content_encoding_as_the_cause_on_a_compressed_binary_body(
     )
     with pytest.raises(RuntimeError, match="Content-Encoding 'gzip'"):
         _stream_with(MStarClient("http://x", prefer_binary=True), resp)
+
+
+def test_api_key_rides_on_every_request_as_a_bearer_token(monkeypatch):
+    monkeypatch.delenv("MSTAR_API_KEY", raising=False)
+    session = mock.MagicMock(headers={})
+    session.post.return_value.json.return_value = {"request_id": "r", "outputs": {}}
+    session.get.return_value.json.return_value = {"voices": []}
+    client = MStarClient("http://x", session=session, api_key="k")
+    client.generate(text="hi")
+    client.voices()
+    assert session.post.call_args.kwargs["auth"] is client._auth
+    assert session.get.call_args.kwargs["auth"] is client._auth
+    assert _sent_authorization(client) == b"Bearer k"
+    assert "Authorization" not in client._stream_headers(("video_frame",))
+    assert session.headers == {}  # the caller's session is left alone
+
+
+def _sent_authorization(client, url="http://x/v1/audio/voices"):
+    """The Authorization header a real session would send for ``client``."""
+    prepared = requests.Session().prepare_request(requests.Request("GET", url, auth=client._auth))
+    return prepared.headers.get("Authorization")
+
+
+def test_api_key_defaults_to_the_env_and_is_absent_without_one(monkeypatch):
+    monkeypatch.setenv("MSTAR_API_KEY", "from-env")
+    assert _sent_authorization(MStarClient("http://x")) == b"Bearer from-env"
+    assert _sent_authorization(MStarClient("http://x", api_key="explicit")) == b"Bearer explicit"
+    monkeypatch.delenv("MSTAR_API_KEY")
+    assert MStarClient("http://x")._auth is None
+    assert "Authorization" not in MStarClient("http://x")._stream_headers(("video_frame",))
+
+
+def test_api_key_wins_over_netrc_and_is_sent_as_utf8(monkeypatch, tmp_path):
+    netrc = tmp_path / "netrc"
+    netrc.write_text("machine x login old-user password old-password\n")
+    netrc.chmod(0o600)
+    monkeypatch.setenv("NETRC", str(netrc))
+    monkeypatch.delenv("MSTAR_API_KEY", raising=False)
+    assert _sent_authorization(MStarClient("http://x", api_key="secret")) == b"Bearer secret"
+    for key in ("s\u00e9cret", "\u5bc6\u94a5"):
+        assert _sent_authorization(MStarClient("http://x", api_key=key)) == b"Bearer " + key.encode("utf-8")

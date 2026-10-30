@@ -9,7 +9,7 @@ what those configs already describe.
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +17,24 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CombinedSplit:
+    """A combined walk run on two kernels: decode for one-token rows, prefill
+    for the rows of ``prefill_walks``, captured for as many as
+    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows)."""
+    combined_walk: str
+    prefill_walks: tuple[str, ...]
+
+    def max_prefill_rows(
+        self, max_rows_in_combined: Mapping[str, "int | None"], bucket_rows: int,
+    ) -> int:
+        total = 0
+        for walk in self.prefill_walks:
+            cap = max_rows_in_combined.get(walk)
+            total += bucket_rows if cap is None else cap
+        return min(total, bucket_rows)
 
 
 @dataclass
@@ -32,6 +50,11 @@ class NodeResourceSpec(ABC):
         """Keys whose specs this one builds against; the engine resolves them
         into ``EngineResourceInfo.dependencies``."""
         return set()
+
+    @property
+    def writes_prefix_snapshots(self) -> bool:
+        """Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them."""
+        return False
 
     @property
     @abstractmethod
@@ -72,6 +95,11 @@ class ResourceReqConfig:
     def apply_conductor_config(self, **kwargs):
         return
 
+    def loop_room(self, spec: "NodeResourceSpec | None" = None) -> dict[str, int]:
+        """The most iterations each loop can run before the request outgrows the
+        resource built from ``spec``. A loop the resource doesn't bound is left out."""
+        return {}
+
     def validate(self, spec: "NodeResourceSpec | None" = None) -> None:
         """Raise ``ValueError`` if a client-supplied value is out of range, or
         one the resource built from ``spec`` cannot honour.
@@ -82,25 +110,48 @@ class ResourceReqConfig:
         return
 
 
+def spec_dependency_problems(specs: Sequence[NodeResourceSpec]) -> list[str]:
+    """Every duplicate resource key and undeclared ``depends_on`` in ``specs``."""
+    problems: list[str] = []
+    keys: set[str] = set()
+    for spec in specs:
+        if spec.resource_key in keys:
+            problems.append(
+                f"two resources declared under the key {spec.resource_key!r}"
+            )
+        keys.add(spec.resource_key)
+    for spec in specs:
+        missing = sorted(spec.depends_on() - keys)
+        if missing:
+            problems.append(
+                f"resource {spec.resource_key!r} depends on {missing}, which "
+                f"this model does not declare; available: {sorted(keys)}"
+            )
+    return problems
+
+
 def resolve_spec_dependencies(
     specs: Sequence[NodeResourceSpec],
 ) -> dict[str, NodeResourceSpec]:
     """Index specs by resource key, checking uniqueness and ``depends_on``."""
-    by_key: dict[str, NodeResourceSpec] = {}
-    for spec in specs:
-        if spec.resource_key in by_key:
-            raise ValueError(
-                f"two resources declared under the key {spec.resource_key!r}"
-            )
-        by_key[spec.resource_key] = spec
-    for spec in specs:
-        missing = sorted(spec.depends_on() - by_key.keys())
-        if missing:
-            raise ValueError(
-                f"resource {spec.resource_key!r} depends on {missing}, which "
-                f"this model does not declare; available: {sorted(by_key)}"
-            )
-    return by_key
+    problems = spec_dependency_problems(specs)
+    if problems:
+        raise ValueError(problems[0])
+    return {spec.resource_key: spec for spec in specs}
+
+
+TOP_LEVEL_KV_CACHE = (
+    "top-level `kv_cache:` in the serving config is no longer read; "
+    "move it under `resources:` keyed by resource name, e.g.\n"
+    "resources:\n  kv_cache:\n    max_num_pages: 1024"
+)
+
+
+def unknown_overrides_message(unknown: list[str], declared: Collection[str]) -> str:
+    return (
+        f"serving config overrides unknown resource(s) {unknown}; this "
+        f"model declares {sorted(declared)}"
+    )
 
 
 def apply_yaml_overrides(
@@ -114,21 +165,14 @@ def apply_yaml_overrides(
     would otherwise be a silently ineffective setting.
     """
     if "kv_cache" in model_config:
-        raise ValueError(
-            "top-level `kv_cache:` in the serving config is no longer read; "
-            "move it under `resources:` keyed by resource name, e.g.\n"
-            "resources:\n  kv_cache:\n    max_num_pages: 1024"
-        )
+        raise ValueError(TOP_LEVEL_KV_CACHE)
     overrides = model_config.get("resources") or {}
     if not overrides:
         return
     by_key = resolve_spec_dependencies(specs)
     unknown = sorted(overrides.keys() - by_key.keys())
     if unknown:
-        raise ValueError(
-            f"serving config overrides unknown resource(s) {unknown}; this "
-            f"model declares {sorted(by_key)}"
-        )
+        raise ValueError(unknown_overrides_message(unknown, by_key))
     for key, kwargs in overrides.items():
         by_key[key].apply_yaml_overrides(**kwargs)
     logger.info("Resource specs after YAML overrides: %s", specs)

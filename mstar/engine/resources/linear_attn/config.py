@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -45,12 +45,16 @@ class LinearAttnConfig:
 
     # L2-normalise q and k for the delta rule: in the kernel where it can, by
     # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
-    # it (HF and vLLM both pass it) and skipping it diverges silently.
+    # it (the HF reference passes it) and skipping it diverges silently.
     qk_l2norm: bool = True
 
     # Mamba-2 only: clamp on dt after softplus, as HF's ``time_step_limit``
     # (Nemotron-H leaves it open: (0, inf)).
     time_step_limit: tuple[float, float] = (0.0, float("inf"))
+
+    # GDN only: combined walks whose steps run decode rows on the decode kernel
+    # and prompt rows on the chunked one (`GDNMixedWrapper`)
+    splits: tuple[CombinedSplit, ...] = ()
 
 
 @dataclass
@@ -59,6 +63,11 @@ class LinearAttnSpec(NodeResourceSpec):
 
     def depends_on(self) -> set[str]:
         return {self.config.recurrent_state}
+
+    @property
+    def writes_prefix_snapshots(self) -> bool:
+        # only the GDN wrapper writes state checkpoints into the pool's snapshot slots
+        return self.config.variant is LinearAttnVariant.GDN
 
     @property
     def resource_class(self) -> "type[Resource]":

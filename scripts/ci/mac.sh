@@ -11,7 +11,7 @@ worktree in native ARM Linux containers, including uncommitted and untracked
 source files. Reports are saved in .ci-results/. No Git hooks are installed.
 
 Mac checks; full x86 CPU suite not run. The cpu-smoke selection is smaller
-than GitHub's cpu-core suite. GitHub Actions remains the full CI gate.
+than GitHub's CPU Core job. GitHub Actions remains the full CI gate.
 
 Optional environment:
   CI_BUILD_JOBS   Parallel Rust compilation jobs (default: 2)
@@ -97,7 +97,7 @@ for job in "${jobs[@]}"; do
     echo "=== $job ($platform) ==="
     started=$SECONDS
     docker build --platform "$platform" --target "$target" \
-        --tag "$image" --file scripts/ci/Dockerfile scripts/ci \
+        --tag "$image" --file scripts/ci/Dockerfile --build-context repo=. scripts/ci \
         > "$job_reports/image-build.log" 2>&1 &
     active_pid=$!
     if ! wait "$active_pid"; then

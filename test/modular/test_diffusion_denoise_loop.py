@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+import threading
 
 import pytest
 import torch
@@ -190,9 +191,9 @@ def test_cg_key_info_and_declare_step_agree():
     assert ToyDenoise().declare_step(WALK, ["a"], [a]) is None  # no resource declared -> nothing to plan
 
 
-def test_cuda_graph_configs_one_bucket_per_shape():
+def test_accelerator_graph_configs_one_bucket_per_shape():
     sub = ToyDenoise(capture_buckets=[(WALK, (8, 3)), (WALK, (16, 3))], capture_batch_sizes=(4, 1))
-    configs = sub.get_cuda_graph_configs(torch.device("cpu"))
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert [c.additional_key_info for c in configs] == [(8, 3), (16, 3)]
     cfg = configs[0]
     assert cfg.capture_graph_walk == WALK and cfg.capture_batch_sizes == [1, 4]
@@ -202,7 +203,30 @@ def test_cuda_graph_configs_one_bucket_per_shape():
     assert cfg.get_total_tokens(4) == [44]
     assert cfg.caps_eager_batch_size is False and cfg.compile is False
     assert cfg.input_seq_dims == {key: 0 for key in cfg.single_request_inputs.tensor_inputs}
-    assert ToyDenoise().get_cuda_graph_configs(torch.device("cpu")) == []
+    assert ToyDenoise().get_accelerator_graph_configs(torch.device("cpu")) == []
+
+
+
+def test_captured_layouts_are_kept_and_the_rest_are_lru_bounded():
+    built = []
+
+    class Layouts(ToyDenoise):
+        def build_layout(self, bucket_key, device):
+            built.append(bucket_key)
+            return object()
+
+    sub = Layouts(capture_buckets=[(WALK, (8, 3))], max_uncaptured_layouts=2)
+    cpu = torch.device("cpu")
+    captured = sub.layout((8, 3), cpu)
+    a, b = sub.layout((1, 3), cpu), sub.layout((2, 3), cpu)
+    assert sub.layout((1, 3), cpu) is a             # a hit refreshes (1, 3)
+    sub.layout((4, 3), cpu)                         # evicts (2, 3), the least recent
+    assert sub.layout((1, 3), cpu) is a
+    assert sub.layout((2, 3), cpu) is not b         # rebuilt
+    for tokens in range(10, 20):
+        sub.layout((tokens, 3), cpu)
+    assert sub.layout((8, 3), cpu) is captured      # never evicted
+    assert built.count((8, 3)) == 1 and built.count((2, 3)) == 2
 
 
 class TwoSpanDenoise(ToyDenoise):
@@ -221,7 +245,7 @@ def test_declare_step_lists_every_attention_span_per_row():
         ("a", "image", 8), ("a", "main", 11), ("b", "image", 8), ("b", "main", 11),
     ]
     # a capture bucket's rows carry the shape key, so their spans match the real rows'
-    cfg = TwoSpanDenoise(attn_resource_key="dit_attn", capture_buckets=[(WALK, (8, 3))]).get_cuda_graph_configs(
+    cfg = TwoSpanDenoise(attn_resource_key="dit_attn", capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(
         torch.device("cpu"),
     )[0]
     pad = cfg.single_request_inputs
@@ -289,7 +313,7 @@ def test_a_mapping_from_denoise_is_split_across_rows_and_edges():
 
 def test_capture_buckets_stage_every_loop_back_edge():
     sub = UniPCDenoise(capture_buckets=[(WALK, (8, 3))])
-    tensor_inputs = sub.get_cuda_graph_configs(torch.device("cpu"))[0].single_request_inputs.tensor_inputs
+    tensor_inputs = sub.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs.tensor_inputs
     assert set(tensor_inputs) == {LATENTS, "history", "cond", "sigma", "sigma_next", "timestep"}
 
 
@@ -341,7 +365,7 @@ def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
     assert out["a"][LATENTS][0].shape == (8, 4)
 
     # and the capture bucket stages it at the declared fill
-    cfg = GuidedDenoise(capture_buckets=[(WALK, (8, 3))]).get_cuda_graph_configs(torch.device("cpu"))[0]
+    cfg = GuidedDenoise(capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(torch.device("cpu"))[0]
     assert torch.equal(cfg.single_request_inputs.tensor_inputs["guidance"], torch.tensor([3.5]))
     # the base staged it off the schedule, so nothing had to touch the state
     assert torch.equal(sub.request_state(_handle("a"))["guidances"], torch.arange(4.0))
@@ -485,3 +509,127 @@ def dataclasses_replace(info, **changes):
     import dataclasses
 
     return dataclasses.replace(info, **changes)
+
+
+class PrefetchingToy(ToyDenoise):
+    PREFETCH_SEEDS = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.drawn_on: list[str] = []
+
+    def seed_latents(self, fwd_info, bucket_key, generator):
+        import threading
+
+        self.drawn_on.append(threading.current_thread().name)
+        # a permuted view, as klein's packing returns
+        return torch.randn(4, bucket_key[0], generator=generator).t()
+
+
+def _added(sub, rid, **info):
+    """``on_request_added`` as the engine calls it at ingest, with the first walk's info."""
+    ingest = dataclasses.replace(_info(rid, 0, **info), graph_walk="encode_text")
+    sub.on_request_added(_handle(rid), ingest)
+    return sub.request_state(_handle(rid))["seed_draw"][1]
+
+
+def test_prefetched_seeds_are_drawn_off_the_calling_thread_and_match_an_inline_draw():
+    sub = PrefetchingToy()
+    future = _added(sub, "p0", seed=11)
+    assert future.result()[LATENTS].is_contiguous()
+    got = sub.prepare_inputs(WALK, _info("p0", 0, seed=11), _inputs())
+    assert sub.drawn_on == ["mstar-seed_0"]
+    assert "seed_draw" not in sub.request_state(_handle("p0")), "the draw is taken once"
+    inline = PrefetchingToy().prepare_inputs(WALK, _info("p1", 0, seed=11), _inputs())
+    assert torch.equal(got.tensor_inputs[LATENTS], inline.tensor_inputs[LATENTS])
+
+
+def test_a_draw_for_another_bucket_key_is_dropped_and_drawn_inline():
+    sub = PrefetchingToy()
+    _added(sub, "p2", tokens=8, seed=3).result()
+    got = sub.prepare_inputs(WALK, _info("p2", 0, tokens=16, seed=3), _inputs())
+    assert got.tensor_inputs[LATENTS].shape == (16, 4)
+    assert sub.drawn_on == ["mstar-seed_0", "MainThread"]
+
+
+def test_seeds_are_drawn_once_per_request_and_only_when_asked():
+    sub = PrefetchingToy()
+    _added(sub, "p3").result()
+    sub.on_request_added(_handle("p3"), _info("p3", 0))  # its second partition on this worker
+    assert sub.drawn_on == ["mstar-seed_0"]
+    plain = ToyDenoise()
+    plain.on_request_added(_handle("p4"), _info("p4", 0))
+    assert "seed_draw" not in plain.request_state(_handle("p4"))
+
+
+def test_removing_the_request_drops_its_draw():
+    sub = PrefetchingToy()
+    _added(sub, "p5").result()
+    sub.cleanup_request(_handle("p5"))
+    assert _handle("p5") not in sub.request_states
+
+
+class GatedToy(PrefetchingToy):
+    """Draws on the pool block until the test opens the gate, so a third request's
+    draw stays queued behind the pool's two threads; an inline draw is not gated."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gate = threading.Event()
+
+    def seed_latents(self, fwd_info, bucket_key, generator):
+        if threading.current_thread().name.startswith("mstar-seed"):
+            self.gate.wait(timeout=10)
+        return super().seed_latents(fwd_info, bucket_key, generator)
+
+
+def test_removing_a_request_cancels_its_queued_draw():
+    sub = GatedToy()
+    running = [_added(sub, "q0"), _added(sub, "q1")]
+    queued = _added(sub, "q2")
+    sub.cleanup_request(_handle("q2"))
+    assert queued.cancelled(), "a queued draw would delay a live request's"
+    sub.gate.set()
+    for future in running:
+        future.result()
+
+
+def test_a_queued_draw_for_another_bucket_key_is_cancelled():
+    sub = GatedToy()
+    running = [_added(sub, "q3"), _added(sub, "q4")]
+    queued = _added(sub, "q5", tokens=8, seed=3)
+    got = sub.prepare_inputs(WALK, _info("q5", 0, tokens=16, seed=3), _inputs())
+    assert got.tensor_inputs[LATENTS].shape == (16, 4)
+    assert queued.cancelled()
+    sub.gate.set()
+    for future in running:
+        future.result()
+
+
+def test_an_initial_loop_back_of_its_own_is_not_handed_the_draw():
+    class FromInputs(PrefetchingToy):
+        def initial_loop_back(self, fwd_info, inputs, bucket_key, generator):
+            return {LATENTS: torch.full((bucket_key[0], 4), 2.0)}
+
+    sub = FromInputs()
+    _added(sub, "p6").result()
+    got = sub.prepare_inputs(WALK, _info("p6", 0), _inputs())
+    assert torch.equal(got.tensor_inputs[LATENTS], torch.full((8, 4), 2.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the host sync is a CUDA stream sync")
+def test_iteration_zero_stages_its_schedule_and_seeds_without_a_host_sync():
+    """A blocking H2D synchronizes the stream, so on the GPU thread it would wait out
+    the step still running there; sync-debug mode raises on one."""
+    sub = PrefetchingToy().to("cuda")
+    _added(sub, "s0", seed=4).result()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = sub.prepare_inputs(WALK, _info("s0", 0, seed=4), _inputs())
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    want = PrefetchingToy().prepare_inputs(WALK, _info("s1", 0, seed=4), _inputs())
+    for name in (LATENTS, "sigma", "timestep"):
+        assert torch.equal(got.tensor_inputs[name].cpu(), want.tensor_inputs[name].cpu()), name

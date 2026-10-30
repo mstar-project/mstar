@@ -30,12 +30,14 @@ import asyncio
 from collections.abc import Callable
 
 from fastapi import HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import rid
+from mstar.api_server.openai._util import release_unread, rid
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.utils.generation_kwargs import offset_seed
 
 
 def _plan_chunks(req, adapter, text: str) -> list[str]:
@@ -48,7 +50,8 @@ def _plan_chunks(req, adapter, text: str) -> list[str]:
     min_chars = getattr(adapter, "speech_chunk_min_chars", None)
     if requested is False or (requested is None and (min_chars is None or len(text) < min_chars)):
         return [text]
-    chunks = split_sentences(text, max_chars=getattr(adapter, "speech_chunk_max_chars", 400))
+    split = getattr(adapter, "split_speech_text", None)
+    chunks = split(text) if split else split_sentences(text, max_chars=getattr(adapter, "speech_chunk_max_chars", 400))
     max_pieces = getattr(adapter, "speech_chunk_max_pieces", 32)
     if len(chunks) > max_pieces:
         raise HTTPException(
@@ -64,8 +67,7 @@ def _chunk_kwargs(model_kwargs: dict, index: int) -> dict:
     kwargs.pop("sentence_chunking", None)
     seed = kwargs.get("seed")
     if isinstance(seed, int) and not isinstance(seed, bool) and index:
-        # the conductor's seed is an int64: a seed near the top wraps instead of overflowing
-        kwargs["seed"] = (seed + index) % 2**63
+        kwargs["seed"] = offset_seed(seed, index)
     return kwargs
 
 
@@ -81,7 +83,7 @@ def list_voices(api) -> VoiceList | None:
     )
 
 
-async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
+async def create_speech(api, model_name, adapter, req, raw_request=None):
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
     # before any upload or GPU work: a format we cannot produce is the client's error
     try:
@@ -94,63 +96,71 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
     except ValueError as exc:
         # the adapter refused the request's fields (a bad data URL, a server path)
         raise HTTPException(status_code=400, detail=str(exc)) from None
-    request_id = rid("speech")
-    chunks = _plan_chunks(req, adapter, args.text or "")
-
-    def submit(index: int) -> str:
-        chunk_id = request_id if len(chunks) == 1 else f"{request_id}-{index}"
-        return api.submit_request(
-            text=chunks[index],
-            file_paths=args.file_paths,
-            input_modalities=args.input_modalities,
-            output_modalities=args.output_modalities,
-            model_kwargs=_chunk_kwargs(args.model_kwargs, index),
-            streaming=bool(req.stream),
-            request_id=chunk_id,
-        )
-
-    lookahead = max(1, int(getattr(adapter, "speech_chunk_lookahead", 2)))
-    pending = [submit(i) for i in range(min(lookahead, len(chunks)))]
-    if req.stream:
-        raw_pcm = fmt == "pcm"
-        # Look at the first result before committing to a 200: a request the
-        # engine rejects (bad voice, dead worker, ...) must surface as an HTTP
-        # error, not as an empty WAV.
-        first_iter = api.iter_result_chunks(pending[0])
-        try:
-            first = await anext(first_iter, None)
-            if _is_error(first):
-                # Read it to the end so the finished request isn't aborted.
-                await _drain(first_iter)
-                raise _http_error(first)
-        except BaseException:
-            # The first piece released itself; release the ones submitted ahead.
-            _release_unread(api, pending, 1)
-            raise
-        return StreamingResponse(
-            _stream_pcm(api, submit, len(chunks), pending, first_iter, first, sample_rate,
-                        with_wav_header=not raw_pcm),
-            media_type="audio/pcm" if raw_pcm else "audio/wav",
-            headers={"Cache-Control": "no-cache"},
-        )
-
-    pcm_parts: list[bytes] = []
-    read = 0  # pieces collect_results has released; the rest are released on early exit
+    # Every chunk reads the same reference clip, and a stream submits the later
+    # ones while it plays, so a returned stream schedules the cleanup itself.
+    stream_owns_uploads = False
     try:
-        for index in range(len(chunks)):
-            if len(pending) < len(chunks):
-                pending.append(submit(len(pending)))
+        request_id = rid("speech")
+        chunks = _plan_chunks(req, adapter, args.text or "")
+
+        def submit(index: int) -> str:
+            chunk_id = request_id if len(chunks) == 1 else f"{request_id}-{index}"
+            return api.submit_request(
+                text=chunks[index],
+                file_paths=args.file_paths,
+                input_modalities=args.input_modalities,
+                output_modalities=args.output_modalities,
+                model_kwargs=_chunk_kwargs(args.model_kwargs, index),
+                streaming=bool(req.stream),
+                request_id=chunk_id,
+            )
+
+        lookahead = max(1, int(getattr(adapter, "speech_chunk_lookahead", 2)))
+        pending = [submit(i) for i in range(min(lookahead, len(chunks)))]
+        if req.stream:
+            raw_pcm = fmt == "pcm"
+            # a request the engine rejects gets its status, not an empty WAV
             try:
-                results = await api.collect_results(pending[index], raw_request)
-            except HTTPException:
-                read = index + 1
+                first_iter = await api.open_result_stream(pending[0], raw_request)
+            except BaseException:
+                # The first piece released itself; release the ones submitted ahead.
+                release_unread(api, pending, 1)
                 raise
-            read = index + 1
-            if not results and raw_request is not None and await raw_request.is_disconnected():
-                break
-            pcm_parts.append(b"".join(c.data for c in results if c.modality == "audio"))
+
+            def release_unstarted() -> None:
+                # What _stream_pcm's finally does, for a body that never ran it.
+                release_unread(api, pending, 0)
+                media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
+
+            stream_owns_uploads = True
+            return ReleasingStreamingResponse(
+                _stream_pcm(api, submit, len(chunks), pending, first_iter, sample_rate,
+                            with_wav_header=not raw_pcm, file_paths=args.file_paths),
+                release=release_unstarted,
+                media_type="audio/pcm" if raw_pcm else "audio/wav",
+                headers={"Cache-Control": "no-cache"},
+            )
+
+        pcm_parts: list[bytes] = []
+        read = 0  # pieces collect_results has released; the rest are released on early exit
+        try:
+            for index in range(len(chunks)):
+                if len(pending) < len(chunks):
+                    pending.append(submit(len(pending)))
+                try:
+                    results = await api.collect_results(pending[index], raw_request)
+                except HTTPException:
+                    read = index + 1
+                    raise
+                read = index + 1
+                if not results and raw_request is not None and await raw_request.is_disconnected():
+                    break
+                pcm_parts.append(b"".join(c.data for c in results if c.modality == "audio"))
+        finally:
+            release_unread(api, pending, read)
     finally:
-        _release_unread(api, pending, read)
+        if not stream_owns_uploads:
+            media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
     audio_bytes, mime = media_io.pcm16_to_container(b"".join(pcm_parts), sample_rate, fmt)
     return Response(content=audio_bytes, media_type=mime)
 
@@ -167,19 +177,9 @@ def _http_error(chunk) -> HTTPException:
     )
 
 
-async def _drain(iterator) -> None:
-    async for _ in iterator:
-        pass
-
-
-def _release_unread(api, pending: list[str], read: int) -> None:
-    """Release every submitted piece from ``pending[read]`` on (not yet fully read)."""
-    for chunk_id in pending[read:]:
-        api.release_request(chunk_id)
-
-
 async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pending: list[str],
-                      first_iter, first, sample_rate: int, with_wav_header: bool = True):
+                      first_iter, sample_rate: int, with_wav_header: bool = True,
+                      file_paths: dict[str, list[str]] | None = None):
     read = 0  # pieces read to the end; the rest are released if the stream stops early
     try:
         if with_wav_header:
@@ -188,12 +188,7 @@ async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pendin
             if len(pending) < num_chunks:
                 # Keep the next chunk generating while this one plays.
                 pending.append(submit(len(pending)))
-            if index == 0:
-                iterator, head = first_iter, first
-            else:
-                iterator, head = api.iter_result_chunks(pending[index]), None
-            if head is not None and head.modality == "audio" and head.data:
-                yield head.data
+            iterator = first_iter if index == 0 else api.iter_result_chunks(pending[index])
             error = None
             async for c in iterator:
                 # Read past an error to the end: leaving early would abort a
@@ -208,4 +203,6 @@ async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pendin
                 # the only honest signal left, so raise rather than end quietly.
                 raise _http_error(error)
     finally:
-        _release_unread(api, pending, read)
+        release_unread(api, pending, read)
+        if file_paths:
+            media_io.schedule_upload_cleanup(file_paths, api.upload_dir)

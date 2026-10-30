@@ -23,6 +23,7 @@ import torch
 
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import Resource, StepContext, StepRunner
+from mstar.engine.resources.base import CachedPrefix
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -42,18 +43,18 @@ class _Answering(Resource):
     def __init__(self, matched: int | None):
         self._matched = matched
         self.resolved = 0
-        self.applied: list[tuple[int, int]] = []
+        self.applied: list[tuple[int, int | None]] = []
 
     @classmethod
     def build(cls, spec, info):
         raise NotImplementedError
 
-    def resolve_cached_prefix(self, rid, node_name, graph_walk):
+    def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         self.resolved += 1
-        return self._matched
+        return None if self._matched is None else CachedPrefix("main", self._matched, self._matched)
 
-    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, matched_len):
-        self.applied.append((inputs.input_seq_len, matched_len))
+    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, prefix):
+        self.applied.append((inputs.input_seq_len, prefix and prefix.tokens))
 
 
 class _Submodule:
@@ -81,6 +82,7 @@ def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]
     # every node keys WALK, as a declaration would name it
     engine._keyed_walks = {node: {WALK} for node in node_resources}
     engine._prefix_model = "_Model"
+    engine._loopback_steps = {}
     return engine
 
 
@@ -92,6 +94,7 @@ def _batch(node_name: str = NODE):
             request_ids=(RID,), graph_walk=WALK, slot=0, capture=False,
         ),
         per_request_info={RID: None},
+        per_request_info_wrapped={RID: None},
     )
 
 
@@ -181,6 +184,24 @@ def test_a_walk_carrying_anything_opaque_never_probes(opaque):
     )
 
 
+class _Overriding(_Submodule):
+    """Overrides `split_inputs` without cutting its ``tensor_inputs``."""
+
+    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+
+
+def test_overriding_split_inputs_alone_never_probes_a_walk_carrying_tensor_inputs():
+    resource = _Answering(96)
+    engine = _engine({"kv": resource}, {NODE: ["kv"]})
+    engine._submodules[NODE].submodule = _Overriding()
+    inputs = _inputs(tensor_inputs={"extra": torch.zeros(PROMPT)})
+
+    assert _stage(engine, inputs) is inputs and resource.resolved == 0, (
+        "a submodule that never set cuts_tensor_inputs was probed, and its cut raises mid-step"
+    )
+
+
 def test_a_falsy_step_info_is_not_opaque():
     resource = _Answering(96)
     engine = _engine({"kv": resource}, {NODE: ["kv"]})
@@ -213,13 +234,6 @@ def test_a_node_with_no_keyed_stream_is_never_probed():
     _stage(engine, _inputs())
 
     assert resource.resolved == 0, "a node nobody declared was probed"
-
-
-def test_the_keyed_walk_placing_its_own_positions_names_the_model_and_walk():
-    engine = _engine({"kv": _Answering(96)}, {NODE: ["kv"]})
-
-    with pytest.raises(AssertionError, match=f"_Model keys the '{WALK}' walk of {NODE}"):
-        _stage(engine, _inputs(custom_pos_ids=torch.arange(PROMPT)))
 
 
 def test_the_keyed_walk_with_no_ids_to_cut_names_the_model_and_walk():
@@ -299,10 +313,10 @@ class _RaisingFor(_Answering):
         super().__init__(matched)
         self._rid = rid
 
-    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, matched_len):
+    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, prefix):
         if rid == self._rid:
             raise RuntimeError("apply failed")
-        super().apply_cached_prefix(rid, node_name, graph_walk, inputs, matched_len)
+        super().apply_cached_prefix(rid, node_name, graph_walk, inputs, prefix)
 
 
 class _Preparing(_Submodule):
@@ -336,4 +350,23 @@ def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
     )
     assert batch.inputs[0].input_seq_len == PROMPT - 96, (
         "the surviving request lost its own match"
+    )
+
+
+@pytest.mark.parametrize("request_walks", [{}, {RID: WALK, "r1": "decode"}], ids=["one walk", "mixed"])
+def test_a_walk_the_cache_serves_whole_completes_without_failing_its_request(request_walks):
+    engine = _engine({"kv": _Answering(PROMPT)}, {NODE: ["kv"]})
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    batch = ExecutingBatch(
+        node_name=NODE, per_request_info={RID: None, "r1": None},
+        step_context=StepContext(
+            request_ids=(RID, "r1"), graph_walk="mixed" if request_walks else WALK,
+            slot=0, capture=False, request_walks=request_walks,
+        ),
+    )
+
+    engine._prepare_inputs(batch)
+
+    assert RID in batch.cached_rids and not batch.failed_requests, (
+        "a walk the cache served whole failed its request, so it never reached its next walk"
     )

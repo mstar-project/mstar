@@ -27,7 +27,10 @@ import torch
 from jinja2 import TemplateError
 
 from mstar.api_server.openai.adapters import flatten_messages
-from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+# Qwen3OmniModel's submodules import flashinfer at module level.
+pytest.importorskip("flashinfer")
+from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel  # noqa: E402
 
 SYSTEM_PROMPT = (
     "You are Qwen, a virtual human developed by the Qwen team, Alibaba Group, "
@@ -158,7 +161,7 @@ def _old_process_prompt(model, prompt, input_modalities):
 def _new_text_inputs(model, prompt, input_modalities, prompt_parts=None):
     return model.process_prompt(
         prompt, input_modalities, ["text"], prompt_parts=prompt_parts,
-    )["text_inputs"]
+    ).new_input_tensors["text_inputs"]
 
 
 def _ids(segments):
@@ -399,7 +402,7 @@ def test_stub_matches_released_checkpoint(messages):
     from transformers import AutoProcessor
 
     real = AutoProcessor.from_pretrained(
-        os.environ["MSTAR_QWEN3_OMNI_PATH"], trust_remote_code=True,
+        os.environ["MSTAR_QWEN3_OMNI_PATH"], trust_remote_code=False,
     )
     assert real.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,

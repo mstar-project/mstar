@@ -22,8 +22,13 @@ services:
       dockerfile: mstar/integrations/dynamo/docker/Dockerfile
     entrypoint: ["/opt/mstar/venv/bin/python", "-m", "dynamo.frontend"]
     command: ["--http-port", "8000"]
+    # The frontend loads the tokenizer and config from the worker's
+    # --model-path, so it needs the same model mount.
     environment:
       - ETCD_ENDPOINTS=http://etcd:2379
+      - HF_HOME=/models
+    volumes:
+      - ${MODELS_DIR:-~/.cache/huggingface}:/models:ro
     ports:
       - "8000:8000"
     depends_on:
@@ -45,6 +50,8 @@ services:
       - HF_HUB_OFFLINE=1
     volumes:
       - ${MODELS_DIR:-~/.cache/huggingface}:/models:ro
+      # compiled kernels, so a recreated worker starts warm
+      - mstar-cache:/root/.cache/mstar
     # The SHM tensor transport and the worker processes allocate from
     # /dev/shm; the 64 MB container default is far too small.
     shm_size: 32gb
@@ -52,3 +59,6 @@ services:
     depends_on:
       - etcd
     restart: on-failure
+
+volumes:
+  mstar-cache:
