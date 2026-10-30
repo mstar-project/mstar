@@ -110,7 +110,8 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
         rid: stop for rid, (tok, i) in cases.items()
         if (stop := sub.check_stop(rid, i, {"new_token": [torch.tensor(tok)]}))
     }
-    assert expected == {"eos": {"decode_loop"}, "budget": {"decode_loop"}}
+    # a row at its budget goes on: the loop's cap ends it
+    assert expected == {"eos": {"decode_loop"}}
     order = list(reversed(cases))
     rows = HostRows(tuple(order), {"new_token": torch.tensor([cases[r][0] for r in order] + [eos])})
     assert sub.check_stop_batched(list(cases), infos, rows) == expected

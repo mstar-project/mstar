@@ -1853,20 +1853,14 @@ class Engine:
     ) -> None:
         submodule_mgmt = self._submodules[batch.node_name]
         submodule = submodule_mgmt.submodule
-        # a reply that ended at prefill (``TokenStop.prefill_walks``): its closing step emits no token
-        stop = getattr(submodule, "token_stop", None)
-        closing_buffer = stop.buffer if stop is not None and stop.prefill_walks else None
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
             try:
-                row = outputs.get(rid, {})
                 submodule.postprocess(
                     request_id=rid,
                     request_info=batch.per_request_info_wrapped[rid],
-                    outputs=row,
+                    outputs=outputs.get(rid, {}),
                     inputs=node_inputs,
                 )
-                if closing_buffer is not None and submodule.ended_at_prefill(rid):
-                    row.pop(closing_buffer, None)
             except Exception as error:
                 batch.register_failure(rid, error)
         if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:

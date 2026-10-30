@@ -4167,17 +4167,34 @@ class Worker:
     def _inline_emit_values(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
         rids: list[int], signals,
-    ) -> tuple[str | None, list[int]]:
+    ) -> tuple[str | None, list[int | None]]:
         """The values of a client signal that can ride inline this step.
 
         Taken off the stop check's host copy, one ``tolist`` for the batch.
         Every rid must have a row, or the step keeps the tensor path for the
-        whole batch: the runtime applies the values positionally.
+        whole batch: the runtime applies the values positionally. A row whose
+        output the stop check withheld (``StopCheck.withheld``) gets None,
+        which the runtime routes as that row's tensors: none.
         """
         if host_rows is None or not self._graph_runtime.supports_inline_emit:
             return None, []
-        if not batch_N.batch.request_walks:
-            return self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
+        if batch_N.batch.request_walks:
+            signal, values = self._inline_emit_mixed(engine, batch_N, host_rows, rids, signals)
+        else:
+            signal, values = self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
+        withheld = batch_N.node_batch.withheld_outputs
+        if signal is not None and withheld:
+            values = [
+                None if signal in withheld.get(rid, ()) else value
+                for rid, value in zip(rids, values, strict=True)
+            ]
+        return signal, values
+
+    def _inline_emit_mixed(
+        self, engine, batch_N: PendingBatch, host_rows: "HostRows",
+        rids: list[int], signals,
+    ) -> tuple[str | None, list[int]]:
+        """`_inline_emit_values` for a step that mixes walks."""
         # Per real walk: a combined walk is no walk of the submodule's.
         walk_of = batch_N.batch.walk_of
         walks = list(batch_N.batch.rids_by_walk()) or [batch_N.graph_walk]

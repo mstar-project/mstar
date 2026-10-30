@@ -906,7 +906,7 @@ def test_sampler_min_p_goes_through_the_resource():
     assert _sampler_spec(turbo).enable_min_p is False
 
 
-def test_t3_stop_on_eos_and_token_budget():
+def test_t3_stop_on_eos():
     sub = _t3_submodule()
     info = _fwd_info("a", max_new=3)
     sub.prepare_inputs("prefill", info, {TEXT_INPUTS: [torch.tensor([255, 0])]})
@@ -920,7 +920,8 @@ def test_t3_stop_on_eos_and_token_budget():
     info.resource_configs[T3_SAMPLER].ignore_eos = True
     assert sub.check_stop("a", info, eos) == set()
     sub.postprocess("a", info, out)
-    assert sub.check_stop("a", info, out) == {"decode_loop"}  # 3 generated >= max_new 3
+    # 3 generated of max_new 3: the budget is the loop cap's to end
+    assert sub.check_stop("a", info, out) == set()
     sub.cleanup_request("a")
     assert not sub.request_states
 

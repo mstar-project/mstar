@@ -1391,9 +1391,10 @@ class PythonGraphRuntime(GraphRuntime):
             routing_per_rid[rid] = routing
             if inline_on and routing.emit_to_client:
                 tensor_emits = []
+                value = input.inline_values[i]
                 for edge in routing.emit_to_client:
-                    if edge.name == input.inline_signal and not edge.persist:
-                        emit_inline.append((rid, edge.name, edge.output_modality, input.inline_values[i]))
+                    if value is not None and edge.name == input.inline_signal and not edge.persist:
+                        emit_inline.append((rid, edge.name, edge.output_modality, value))
                     else:
                         tensor_emits.append(edge)
                 routing.emit_to_client = tensor_emits

@@ -964,29 +964,6 @@ def test_qwen3_tts_clone_prefill_streams_reference_frames_first():
     assert submodule._codec_stream_items("talker_prefill_clone", "other", frame) == [frame]
 
 
-def test_qwen3_tts_prefill_frame_counts_toward_generation_limit():
-    config = _tiny_model_config()
-    submodule = TalkerSubmodule(
-        Qwen3TTSTalkerModel(config),
-        Qwen3TTSCodePredictor(config),
-        config,
-    )
-    submodule.request_state("request").add("generated_frames", 0)
-    outputs = {"layer0_codes": [torch.tensor(1)]}
-    request_info = SimpleNamespace(
-        graph_walk="talker_decode",
-        step_metadata={},
-        resource_configs={},
-        max_tokens=1,
-    )
-
-    submodule.postprocess("request", request_info, outputs)
-
-    assert submodule.check_stop("request", request_info, outputs) == {
-        "talker_decode_loop"
-    }
-
-
 def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
@@ -1062,7 +1039,8 @@ def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
 def test_qwen3_tts_batched_stop_check_agrees_with_the_per_request_one():
     """``check_stop_batched`` reads one host copy of the group-0 codes and
     must stop exactly the requests ``check_stop`` stops: EOS (unless
-    ``ignore_eos``) or the frame limit, rows matched by request id."""
+    ``ignore_eos``; a row at its frame limit is the loop cap's to end), rows
+    matched by request id."""
     config = _tiny_model_config()
     submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
     eos = config.talker.codec_eos_token_id
@@ -1091,7 +1069,7 @@ def test_qwen3_tts_batched_stop_check_agrees_with_the_per_request_one():
         if (s := check.stops if isinstance(check, StopCheck) else check)
     }
     withheld = {rid: check.withheld for rid, check in checks.items() if isinstance(check, StopCheck)}
-    assert stops == {"eos": {"talker_decode_loop"}, "limit": {"talker_decode_loop"}}
+    assert stops == {"eos": {"talker_decode_loop"}}
     # EOS frames stay out of the codec stream, ``ignore_eos`` or not
     assert withheld == {"eos": ("codec_tokens",), "ignored": ("codec_tokens",)}
     # Rows in forward order (reversed here), plus a padding row past the real ones.

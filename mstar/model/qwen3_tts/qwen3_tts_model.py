@@ -1088,7 +1088,7 @@ class Qwen3TTSModel(Model):
         )
 
     def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
+        # the prefill samples the first frame, so decode runs one iteration fewer than max tokens
         return {"talker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:

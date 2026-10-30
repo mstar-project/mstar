@@ -344,8 +344,9 @@ def test_prefill_reserves_each_clips_context_once():
 @pytest.mark.parametrize("width", [1, 3])
 def test_batched_stop_check_agrees_with_the_per_request_one(width):
     """Rows come in the order the forward ran the requests, which needn't be
-    the order the worker asks in; EOS, ignore_eos and the token limit. Both
-    read a row's first element, also from a buffer wider than one token."""
+    the order the worker asks in; EOS, ignore_eos, and a row at its token
+    limit, which the loop's cap ends rather than the check. Both read a
+    row's first element, also from a buffer wider than one token."""
     from types import SimpleNamespace
 
     from mstar.model.canary.config import SAMPLER
@@ -363,25 +364,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one(width):
     asked = ["eos", "ignored", "limit", "go"]
     batched = node.check_stop_batched(asked, infos, HostRows(request_ids=rows, buffers={"new_token": tokens}))
     one_by_one = {rid: node.check_stop(rid, infos[rid], {"new_token": [tokens[rows.index(rid)]]}) for rid in asked}
-    assert batched == {rid: stop for rid, stop in one_by_one.items() if stop} == {
-        "eos": {"decode_loop"}, "limit": {"decode_loop"},
-    }
-
-
-def test_a_stop_check_on_a_dropped_request_creates_no_state():
-    """A token budget counted in request state (``TokenStop.generated_key``) is
-    read, not created: the check can run after the request's state is dropped,
-    and a state made then would outlive the request."""
-    from types import SimpleNamespace
-
-    from mstar.model.canary.config import SAMPLER
-
-    node = _tiny_node()
-    node.token_stop = node.token_stop._replace(generated_key="generated")
-    info = SimpleNamespace(resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)},
-                           dynamic_loop_iter_counts={}, max_tokens=2)
-    assert node.check_stop("gone", info, {"new_token": [torch.tensor([7])]}) == set()
-    assert "gone" not in node.request_states
+    assert batched == {rid: stop for rid, stop in one_by_one.items() if stop} == {"eos": {"decode_loop"}}
 
 
 def test_decoder_node_caps_captures_and_names(snapshot):

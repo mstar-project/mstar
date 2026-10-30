@@ -46,8 +46,9 @@ _ENDED_AT_PREFILL = "ended_at_prefill"
 
 class TokenStop(NamedTuple):
     """When an AR submodule's sampled token ends its decode loop: on a stop
-    id (unless the request's sampler config sets ``ignore_eos``), or once
-    the request has generated ``max_tokens`` tokens.
+    id, unless the request's sampler config sets ``ignore_eos``. The token
+    budget is the loop's cap (``Model.get_loop_caps``), which the runtime
+    enforces.
 
     Declared as ``ARNodeSubmodule.token_stop``; ``check_stop`` and
     ``check_stop_batched`` follow from it, and with ``loopback_signal`` the
@@ -63,9 +64,6 @@ class TokenStop(NamedTuple):
     sampler: str
     # the only walk whose rows can stop the loop; None for every walk
     walk: str | None = None
-    # request-state key counting the tokens generated so far; None counts
-    # the loop's iterations, plus the token this step sampled
-    generated_key: str | None = None
     # the input signal ``walk``'s token loops back to. Its rows then read it
     # off the sampler's slot masters instead of a routed tensor
     # (``MSTAR_DEVICE_LOOPBACK``), and the client edge carries ``buffer``
@@ -74,12 +72,13 @@ class TokenStop(NamedTuple):
     # step, which a node that reads its tokens on the host would pay for
     # nothing.
     loopback_signal: str | None = None
-    # walks that sample the reply's first token before the loop runs. A stop
+    # walks that sample the reply's first token before the loop runs. That
+    # token counts toward the budget, so the model's ``get_loop_caps`` gives
+    # the loop ``max_output_tokens - 1`` (GLM-5.2, Command A+). A stop
     # id sampled there has no loop to stop, so the reply ends at the loop's
-    # first step (``ARNodeSubmodule.ended_at_prefill``), whose ``buffer`` the
-    # engine drops after postprocess, so the loop's client edge must carry
-    # ``buffer``. The loop count includes the prefill's token (a
-    # ``generated_key`` counter has to count it itself)
+    # first step (``ARNodeSubmodule.ended_at_prefill``), which withholds its
+    # ``buffer`` and ``withhold`` (``StopCheck.withheld``), so the loop's
+    # client edge must carry ``buffer``
     prefill_walks: frozenset[str] = frozenset()
     # outputs left unrouted on a row whose token is a stop id, ``ignore_eos``
     # or not (``StopCheck.withheld``): a frame streamed beside the stop token
@@ -1234,11 +1233,13 @@ class ARNodeSubmodule(NodeSubmodule):
         if stop is None:
             return super().check_stop(request_id, request_info, outputs)
         if stop.buffer not in outputs:
-            # the closing step of a reply that ended at prefill: postprocess dropped its token
-            return {stop.loop} if stop.prefill_walks and self.ended_at_prefill(request_id) else set()
+            return set()
         # a row's first element, as ``HostRows.first_values`` reads it
         token = outputs[stop.buffer][0].reshape(-1)[0].item()
         stops = {stop.loop} if self._token_stops(request_id, token, request_info) else set()
+        if stops and stop.prefill_walks and self.ended_at_prefill(request_id):
+            # the step closing a reply that ended at prefill: none of its outputs are the reply's
+            return StopCheck(stops, withheld=(stop.buffer, *stop.withhold))
         if stop.withhold and token in stop.stop_ids:
             return StopCheck(stops, withheld=stop.withhold)
         return stops
@@ -1255,20 +1256,25 @@ class ARNodeSubmodule(NodeSubmodule):
         if pairs is None:
             return None
         verdict = self._token_stops
-        if not stop.withhold:
-            return {rid: {stop.loop} for rid, token in pairs if verdict(rid, token, request_infos[rid])}
-        stops: dict[str, set[str]] = {}
         withheld: dict[str, tuple[str, ...]] = {}
-        for rid, token in pairs:
-            if verdict(rid, token, request_infos[rid]):
-                stops[rid] = {stop.loop}
-            if token in stop.stop_ids:
-                withheld[rid] = stop.withhold
-        return BatchedStopCheck(stops, withheld)
+        if not stop.withhold:
+            stops = {rid: {stop.loop} for rid, token in pairs if verdict(rid, token, request_infos[rid])}
+        else:
+            stops = {}
+            for rid, token in pairs:
+                if verdict(rid, token, request_infos[rid]):
+                    stops[rid] = {stop.loop}
+                if token in stop.stop_ids:
+                    withheld[rid] = stop.withhold
+        if stop.prefill_walks:
+            # rows closing a reply that ended at prefill: none of their outputs are the reply's
+            withheld.update({rid: (stop.buffer, *stop.withhold) for rid in stops if self.ended_at_prefill(rid)})
+        return BatchedStopCheck(stops, withheld) if withheld else stops
 
     def ended_at_prefill(self, request_id: str) -> bool:
         """Whether a walk in ``token_stop.prefill_walks`` sampled a stop id for
-        the request, so its next step only closes the loop."""
+        the request, so its next step only closes the loop: that step's token,
+        sampled after the stop id, is withheld from the reply."""
         # read, never create: the check can run after the state was dropped
         state = self.request_states.get(request_id)
         return state is not None and bool(state.get(_ENDED_AT_PREFILL))
@@ -1282,22 +1288,13 @@ class ARNodeSubmodule(NodeSubmodule):
             return True
         # the set test first: a stop id is rare, and the config read behind
         # it goes through the info wrapper
-        on_stop_id = token in stop.stop_ids and not info.resource_configs[stop.sampler].ignore_eos
+        if token not in stop.stop_ids or info.resource_configs[stop.sampler].ignore_eos:
+            return False
         if prefill_walks and info.graph_walk in prefill_walks:
             # no loop on this walk to stop: the loop's first step will
-            if on_stop_id:
-                self.request_state(request_id).add(_ENDED_AT_PREFILL, True)
+            self.request_state(request_id).add(_ENDED_AT_PREFILL, True)
             return False
-        if not on_stop_id:
-            # read, never create: the check can run after the state was dropped
-            generated = (
-                info.dynamic_loop_iter_counts.get(stop.loop, 0) + (2 if prefill_walks else 1)
-                if stop.generated_key is None
-                else int(self.request_states.get(request_id, {}).get(stop.generated_key, 0))
-            )
-            if generated < info.max_tokens:
-                return False
-        # only a row of ``walk`` ends the loop; tested last, as most rows go on
+        # only a row of ``walk`` ends the loop
         return stop.walk is None or info.graph_walk == stop.walk
 
     def split_inputs(
