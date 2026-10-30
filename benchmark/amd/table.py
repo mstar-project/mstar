@@ -19,8 +19,10 @@ from pathlib import Path
 
 from benchmark.amd import catalog, tables
 
-# This workstream's marker in the job's active/<job>.users directory; anything else there is a co-tenant.
-OWN_MARKER = "ws-j"
+# The harness's own marker in the job's active/<job>.users directory; anything else there is a co-tenant.
+# Result files written before the rename carry the older name.
+OWN_MARKER = "amd-bench"
+OWN_MARKERS = {OWN_MARKER, "ws-j"}
 # (summary key, header, scale, decimals) per family; the workload's primary metric also gets [min-max].
 COLUMNS = {
     "text": [("tok_s", "out tok/s", 1, 0), ("ttft_p50_s", "TTFT p50 ms", 1e3, 1), ("ttft_p95_s", "TTFT p95 ms", 1e3, 1),
@@ -62,7 +64,7 @@ def _cotenants(arm_dir: Path) -> dict:
     markers, load = set(), None
     for p in arm_dir.glob("cells/*/c*/**/cotenants.json"):
         c = _load(p) or {}
-        markers.update(m for m in c.get("markers", []) if m != OWN_MARKER)
+        markers.update(m for m in c.get("markers", []) if m not in OWN_MARKERS)
         if c.get("loadavg"):
             load = max(load or 0.0, c["loadavg"][0])
     return {"markers": sorted(markers), "peak_load": load}
