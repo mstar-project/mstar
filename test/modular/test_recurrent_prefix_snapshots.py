@@ -324,7 +324,9 @@ def _open(monkeypatch, prefix_slots: int = 2, world_size: int = 1) -> Engine:
         "state": _build(specs["state"].config, world_size),
         "gdn": _StubGDN(),
     }
-    engine._open_prefix_caches(specs, _Keyed(), {"LLM": world_size})
+    instance = {"LLM": world_size}
+    opened = opening_prefix_caches(specs.values(), instance, checkpoint_named=False)
+    engine._open_prefix_caches(specs, _Keyed(), instance, opened, None)
     return engine
 
 
@@ -412,6 +414,8 @@ def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, 
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     by_key = {spec.resource_key: spec for spec in specs}
     local = [spec for spec in specs if not spec.nodes.isdisjoint(instance)]
+    # as Engine.load_model evaluates it, once, for the builds and for opening
+    rule = opening_prefix_caches(specs, instance, checkpoint_named=False)
     engine = Engine.__new__(Engine)
     engine._resources = {}
     for spec in local:
@@ -426,17 +430,17 @@ def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, 
             engine._resources[spec.resource_key] = RecurrentStatePool.build(spec, EngineResourceInfo(
                 device=torch.device("cpu"), joint_comm_group=group,
                 dependencies={dep: by_key[dep] for dep in spec.depends_on()},
-                prefix_caches=opening_prefix_caches(specs, instance, checkpoint_named=False),
+                prefix_caches=rule,
             ))
         else:
             engine._resources[spec.resource_key] = _StubGDN()
-    engine._open_prefix_caches(by_key, _KeyedOn(keyed), instance)
+    engine._open_prefix_caches(by_key, _KeyedOn(keyed), instance, rule, None)
     opened = {
         key for key, resource in engine._resources.items()
         if (isinstance(resource, KVManager) and resource._index is not None)
         or (isinstance(resource, RecurrentStatePool) and resource._kv is not None)
     }
-    assert opened == opening_prefix_caches(specs, instance, checkpoint_named=False) & engine._resources.keys()
+    assert opened == rule & engine._resources.keys()
     assert opened == opens
 
 

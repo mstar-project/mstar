@@ -523,9 +523,9 @@ class Engine:
         node_to_resources = {}
         specs_by_key = resolve_spec_dependencies(specs)
         instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
-        prefix_caches = opening_prefix_caches(
-            specs, instance, checkpoint_named=model is not None and model.checkpoint_path() is not None,
-        )
+        checkpoint = model.checkpoint_path() if model is not None else None
+        # a cache only another engine holds counts here at one rank: its own engine sizes it
+        prefix_caches = opening_prefix_caches(specs, instance, checkpoint_named=checkpoint is not None)
 
         self._classify_tp_roles(node_names, parallel_groups)
 
@@ -580,7 +580,7 @@ class Engine:
             enable_nvtx=self._enable_nvtx,
         )
 
-        self._open_prefix_caches(specs_by_key, model, instance)
+        self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
@@ -875,20 +875,19 @@ class Engine:
             runners[label] = runner
         return runners
 
-    def _open_prefix_caches(self, specs_by_key, model, instance: Mapping[str, int]) -> None:
-        """Open exactly the caches `opening_prefix_caches` opens, ``instance`` being
-        the lockstep instance of each node here. Each is rooted in the weights,
-        the preprocessing, and the config of every resource its pages were
-        planned against."""
-        checkpoint = model.checkpoint_path() if model is not None else None
+    def _open_prefix_caches(
+        self, specs_by_key, model, instance: Mapping[str, int], opened: frozenset[str], checkpoint: str | None,
+    ) -> None:
+        """Open exactly the caches in ``opened``, `opening_prefix_caches` over
+        ``instance``, the lockstep instance of each node here, for ``model``'s
+        ``checkpoint``. Each is rooted in the weights, the preprocessing, and the
+        config of every resource its pages were planned against."""
         shared = [
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
             model.preprocess_fingerprint() if model is not None else "",
         ]
         declared = keyed_labels(model) if model is not None else {}
         self._prefix_model = type(model).__name__
-        # a cache only another engine holds counts here at one rank: its own engine sizes it
-        opened = opening_prefix_caches(specs_by_key.values(), instance, checkpoint_named=checkpoint is not None)
         opened_keys = opened & declared.keys()
         self._log_shut_caches(specs_by_key, declared.keys() - opened, opened, instance, checkpoint is not None)
         # node -> the walks a probe may run on, from the keys of every label on an open cache the node uses

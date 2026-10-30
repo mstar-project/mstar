@@ -33,7 +33,14 @@ from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
 from mstar.engine.resources import NodeResourceSpec, Resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVSpec,
+    PagedKVConfig,
+    PrefixSpan,
+    StreamLayout,
+    opening_prefix_caches,
+)
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.position.manager import RopeManager
@@ -134,6 +141,13 @@ def _rope(**overrides) -> RopeManager:
     return rope
 
 
+def _open_caches(engine: Engine, specs: dict, model, instance: dict) -> None:
+    """`Engine._open_prefix_caches` given the rule's caches, as `Engine.load_model` evaluates them."""
+    checkpoint = model.checkpoint_path()
+    opened = opening_prefix_caches(specs.values(), instance, checkpoint_named=checkpoint is not None)
+    engine._open_prefix_caches(specs, model, instance, opened, checkpoint)
+
+
 def _root(kv=None, rope=None, model=None, instance=None) -> bytes:
     """Run the engine's fold over one KV resource and one resource above it, on
     nodes whose lockstep instances are ``instance`` (one rank by default)."""
@@ -147,7 +161,7 @@ def _root(kv=None, rope=None, model=None, instance=None) -> bytes:
             resource_key=ROPE, nodes={"LLM"}, config=rope._config,
         ),
     }
-    engine._open_prefix_caches(specs, model or _Model(), instance or {"LLM": 1})
+    _open_caches(engine, specs, model or _Model(), instance or {"LLM": 1})
     return kv._prefix_root
 
 
@@ -403,8 +417,8 @@ def _open(resources: dict, specs: dict | None = None) -> None:
     engine = Engine.__new__(Engine)
     engine._resources = resources
     kv = resources[KV]
-    engine._open_prefix_caches(
-        {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config), **(specs or {})}, _Model(), {"LLM": 1},
+    _open_caches(
+        engine, {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config), **(specs or {})}, _Model(), {"LLM": 1},
     )
 
 
@@ -501,7 +515,7 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
     engine._resources = {}
     engine._device = torch.device("cuda")
     kv = _kv(prefix_cache_salt=salt).config
-    engine._open_prefix_caches({KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv)}, _laid_out(), {})
+    _open_caches(engine, {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv)}, _laid_out(), {})
     # "vae" is an encoder that no layout walk runs, like an edit's.
     engine._submodules = {
         name: SimpleNamespace(submodule=SimpleNamespace(forward=None, forward_batched=None))
@@ -528,7 +542,7 @@ def test_an_encoder_that_marks_its_own_dims_compiles_with_the_default_while_its_
     spec = KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
     ))
-    engine._open_prefix_caches({KV: spec}, _laid_out(), {})
+    _open_caches(engine, {KV: spec}, _laid_out(), {})
     vit = SimpleNamespace(forward="eager", forward_batched="eager", marks_dynamic_dims=True)
     engine._submodules = {"vit": SimpleNamespace(submodule=vit, forward="eager")}
 
