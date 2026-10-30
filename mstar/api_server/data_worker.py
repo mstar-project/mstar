@@ -105,6 +105,15 @@ def encode_workers(cpus: int | None = None, png_workers: int | None = None) -> i
     return max(1, min(4, cpus // png_workers))
 
 
+def copy_workers(cpus: int | None = None, png_workers: int | None = None) -> int:
+    """Threads a large output read copies over (``host_copy.HostCopier``): one
+    encode's share of the CPUs in the budget ``encode_workers`` sets. Reads run
+    one at a time on the data worker's thread, each ahead of its own encode."""
+    if cpus is None:
+        cpus = usable_cpus()
+    return max(1, cpus // encode_workers(cpus, png_workers))
+
+
 def _sha256(path: str) -> bytes:
     with open(path, "rb") as file:
         return hashlib.file_digest(file, "sha256").digest()
@@ -162,8 +171,9 @@ def _video_frame_metadata(
 class InlineTokens:
     """One RESULT_TOKENS frame's values for the requests still known here,
     queued behind the tensor results so each request's chunks keep arrival
-    order. One item per frame, so the data worker wakes the message thread
-    once per step (``ResultQueue``)."""
+    order. One item per frame, not per request, so the data worker wakes the
+    message thread once per step (``ResultQueue``). No loop indices: a chunk's
+    order is its arrival sequence, and nothing reads them."""
     request_ids: list[str]
     values: list[int]
     modality: str
@@ -279,6 +289,7 @@ class PreprocessWorker:
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof,
+            copy_workers=copy_workers(),
         )
 
         self.thread = threading.Thread(
@@ -1225,29 +1236,40 @@ class PreprocessWorkerThread:
             state.next_sequence += 1
 
     def _emit_inline_tokens(self, item: InlineTokens) -> None:
-        """Detokenize a frame's values and queue each request's chunk."""
-        for request_id, value in zip(item.request_ids, item.values, strict=True):
-            if request_id in self._draining_rids:
-                continue
-            state = self.request_output_state.setdefault(
-                request_id, RequestOutputState()
+        """Postprocess a frame's inline values in one model call and queue each
+        request's chunk, in arrival order with its tensor results."""
+        rids, values = item.request_ids, item.values
+        if self._draining_rids:
+            keep = [i for i, rid in enumerate(rids) if rid not in self._draining_rids]
+            rids = [rids[i] for i in keep]
+            values = [values[i] for i in keep]
+        kwargs = self.request_model_kwargs
+        try:
+            datas = self.model.postprocess_inline(
+                values, item.modality, [kwargs.get(rid) for rid in rids],
             )
+        except Exception:  # noqa: BLE001 — retried row by row below
+            # so a failure fails only the request it belongs to
+            datas = None
+        states = self.request_output_state
+        for i, request_id in enumerate(rids):
+            state = states.get(request_id)
+            if state is None:
+                state = states[request_id] = RequestOutputState()
             sequence = state.next_sequence
             state.next_sequence += 1
             try:
-                tensor = torch.tensor([value], dtype=torch.int64)
-                postprocessed = self.model.postprocess(
-                    tensor, item.modality,
-                    request_kwargs=self.request_model_kwargs.get(request_id),
-                )
+                if datas is None:
+                    data = self.model.postprocess_inline(
+                        [values[i]], item.modality, [kwargs.get(request_id)],
+                    )[0]
+                else:
+                    data = datas[i]
                 self._queue_completed_output(
                     request_id,
                     sequence,
                     ResultChunk(
-                        request_id=request_id,
-                        modality=item.modality,
-                        data=postprocessed,
-                        metadata={},
+                        request_id=request_id, modality=item.modality, data=data, metadata={},
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client

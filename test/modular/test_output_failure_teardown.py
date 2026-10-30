@@ -26,6 +26,7 @@ from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _requ
 from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
+from mstar.model.base import Model
 from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests, ReadsDone
 
@@ -97,6 +98,10 @@ class _Model:
     def process_prompt(self, *args, **kwargs):
         if self.prompt_raises:
             raise ValueError("bad prompt")
+
+    # the inline path's per-value default, over the stub's postprocess
+    postprocess_inline = Model.postprocess_inline
+    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         if self.postprocess_raises:

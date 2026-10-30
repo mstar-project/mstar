@@ -33,6 +33,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ConductorMessageType, RemoveRequest
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
@@ -127,6 +128,7 @@ def test_the_worker_fails_only_the_refused_request():
         worker = Worker.__new__(Worker)
         worker._walk_drivers = {}
         worker._walk_driven_edges = {}
+        worker.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
         worker.tensor_manager = mgr
         worker.scheduler = SimpleNamespace(failed_rids=set())
         reported = []
@@ -178,6 +180,7 @@ def _postprocess_worker(refuse, follower=False):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
@@ -465,11 +468,11 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w.is_tp_follower = False
     w._rid = lambda wire: 3
     w._in_flight_rids = set()
     w._draining_rids, w._pending_drains, w._reads_done_sent = set(), set(), set()
-    w._stream_buffer_rids = set()
     w._pending_removes = set()
     w._last_active = {}
     w.streaming_buffers = {}

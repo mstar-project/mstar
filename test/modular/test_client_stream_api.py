@@ -1066,7 +1066,7 @@ def test_an_output_failure_aborts_a_request_that_may_still_take_input():
 
     wt, sent, _tm = _thread(_FailingOutputModel())
     _open(wt)
-    wt._emit_inline_tokens(InlineTokens(request_ids=["r"], values=[5], modality="text"))
+    wt._emit_inline_tokens(InlineTokens(["r"], [5], "text"))
 
     assert wt.out_queue.get(timeout=5).modality == "error"
     (abort,) = _bodies(sent, ConductorMessageType.ABORT_REQUEST)

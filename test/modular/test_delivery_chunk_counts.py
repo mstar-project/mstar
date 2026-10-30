@@ -18,7 +18,7 @@ import pytest
 import torch
 from api_server_helpers import StandInSocket
 
-from mstar.api_server.data_worker import PreprocessWorker
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorker
 from mstar.api_server.request_types import ResultTensors, ResultTokens
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensor_store import TensorStore
@@ -296,12 +296,12 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline):
     worker._signal = lambda: None
     worker.results_wakeup = EventWakeup()
 
-    def read_at_once(item):
-        """The data worker's thread, collapsed: a queued read completes at once."""
-        for rid in getattr(item, "request_ids", None) or [item.request_id]:
+    # the data worker's thread, collapsed: a queued read completes at once, and
+    # a frame's inline values (one InlineTokens per frame) give a chunk per request
+    def complete_at_once(item):
+        for rid in item.request_ids if isinstance(item, InlineTokens) else [item.request_id]:
             worker.output_queue.put(ResultChunk(request_id=rid, modality="text", data=b"x", metadata={}))
-
-    worker.result_tensor_input_queue = SimpleNamespace(put=read_at_once)
+    worker.result_tensor_input_queue = SimpleNamespace(put=complete_at_once)
 
     server = object.__new__(APIServer)
     server.running = True
