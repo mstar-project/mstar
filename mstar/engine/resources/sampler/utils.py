@@ -3192,22 +3192,33 @@ class SamplerBuffers:
             0, self._slot_idx_gpu[cg_slot, :padded_bs] if index is None else index
         )
 
-    def _slots_of(self, request_ids: list[str]) -> torch.Tensor:
-        slots = [
+    def _slot_list(self, request_ids: list[str]) -> list[int]:
+        return [
             0 if isinstance(rid, int) and rid < 0 else self._rid_to_slot[rid]
             for rid in request_ids
         ]
-        return torch.tensor(slots, dtype=torch.long, device=self.last_token.master.device)
 
-    def write_last_tokens(self, request_ids: list[str], tokens: torch.Tensor) -> None:
-        """Eager-step write of ``tokens`` (``[len(request_ids)]``) to the
-        requests' master rows. Every request must be registered."""
+    def _slots_of(self, request_ids: list[str]) -> torch.Tensor:
+        return torch.tensor(
+            self._slot_list(request_ids), dtype=torch.long, device=self.last_token.master.device,
+        )
+
+    def write_last_tokens(
+        self, request_ids: list[str], tokens: torch.Tensor, stager: PinnedStager | None = None,
+    ) -> None:
+        """Write ``tokens`` (``[len(request_ids)]``) to the requests' master
+        rows. Every request must be registered. With ``stager`` (a routed row on
+        the GPU thread) the slot index goes up from pinned memory in a
+        non-blocking copy, not through a pageable tensor's stream drain."""
         if not request_ids:
             return
         self._sync_device_capacity()
-        self.last_token.master.index_copy_(
-            0, self._slots_of(request_ids), tokens.to(self.last_token.master.dtype)
+        master = self.last_token.master
+        slots = (
+            self._slots_of(request_ids) if stager is None
+            else to_device_nonblocking(self._slot_list(request_ids), master.device, dtype=torch.long)
         )
+        master.index_copy_(0, slots, tokens.to(master.dtype))
 
     def last_tokens_for(self, request_ids: list[str]) -> torch.Tensor:
         """``[len(request_ids)]`` last tokens of registered requests, for an
