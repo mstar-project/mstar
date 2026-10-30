@@ -125,10 +125,16 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
             )
         for axis, size in sizes.items():
             enabled = getattr(sharding, f"{axis}_enabled_nodes")
-            if size > 1 and any(node not in enabled for node in names):
+            unsupported = [node for node in names if node not in enabled]
+            if size > 1 and unsupported:
+                # guidance branches rode sp_size before they had an axis of their own
+                hint = (
+                    "; split guidance branches with cfg_size instead"
+                    if any(node in sharding.cfg_enabled_nodes for node in unsupported) else ""
+                )
                 yield (
                     f"node_groups[{i}] has {axis}_size {size} and contains nodes not "
-                    f"in {axis}_enabled_nodes {sorted(enabled)}: {names}"
+                    f"in {axis}_enabled_nodes {sorted(enabled)}: {names}{hint}"
                 )
         cfg = sizes["cfg"]
         for node in names:
