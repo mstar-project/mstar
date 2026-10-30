@@ -820,13 +820,13 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   which keeps a call's last 70 frames per layer and runs the attention, each new
   frame over the 70 before it, with the relative-position term as a band of
   distances; its conv inputs (``encoder_state``); and its newest audio and mel
-  frames (``encoder_front``), the last two recurrent-state pools. A
-  live step of one frame (1280 samples), every step of a client appending 80 ms
-  or less, runs whole as a CUDA graph; other steps take the front end
-  eagerly, then the layer stack as a graph when each got at most one frame (the
-  call's end), or eagerly (a one-shot upload, a large append:
-  a chunk over a second is not batched with other calls, so the engine runs
-  each call of that step on its own).
+  frames (``encoder_front``), the last two recurrent-state pools. Every live
+  step, one frame (1280 samples) whatever the client's append size, runs whole
+  as a CUDA graph; other steps take the front end eagerly, then the layer stack
+  as a graph when each got at most one frame (the call's end), or eagerly (a
+  one-shot upload, an opening clip, the call's last append: a chunk over a
+  second is not batched with other calls, so the engine runs each call of that
+  step on its own).
 - Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
   bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the
   standalone reference path on the same clip and checks the served text

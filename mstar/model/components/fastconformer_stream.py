@@ -134,18 +134,19 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     lets a consumer's ``FixedChunkPolicy(1)`` pace a frame-synchronous loop.
 
     Live streams' chunks run in one batched pass, except that a step holding a
-    chunk of more than a second (an upload, a large append) is not batched
-    (``can_batch``): the engine then runs each stream of it on its own. The
-    encoder is bound to the bounded KV and the conv pool; ``front_key`` names
-    the pool of each stream's audio and mel tails.
+    chunk of more than a second (an upload, an opening clip, the stream's last
+    append) is not batched (``can_batch``): the engine then runs each stream of
+    it on its own. The encoder is bound to the bounded KV and the conv pool;
+    ``front_key`` names the pool of each stream's audio and mel tails.
 
     A stream one frame of audio further on the frame grid (every live step of
     a stream that declares ``ClientAudio``) runs whole as a CUDA graph (``STEP_REGION``). The
     others take the front end eagerly, then the blocks as a graph
     (``LAYERS_REGION``) when each got at most one frame (a live step, the
-    stream's end), else eagerly (a one-shot upload, a large append). In a step
-    whose other streams take the eager blocks, or when the whole-step region
-    has no graph for its streams, those streams run eagerly too.
+    stream's end), else eagerly (a one-shot upload, an opening clip, the
+    stream's last append). In a step whose other streams take the eager blocks,
+    or when the whole-step region has no graph for its streams, those streams
+    run eagerly too.
     """
 
     # The captured regions are not compiled (compile=False); the eager front end
@@ -291,7 +292,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # A pass pads every stream to its longest chunk, so a chunk of more than
         # BATCHED_CHUNK_S keeps its step from being batched, and the engine runs
         # each stream's step on its own (declare, admit, plan, forward, commit).
-        # Such chunks are uploads and large appends, so it is a rare step.
+        # Such chunks are uploads, opening clips and a stream's last append, so
+        # it is a rare step.
         longest = int(self.BATCHED_CHUNK_S * self.log_mel.sampling_rate)
         return len(model_inputs) == 1 or all(inp.input_seq_len <= longest for inp in model_inputs)
 
