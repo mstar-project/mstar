@@ -108,8 +108,8 @@ class ModuleLoraMap:
         self._siblings: tuple[ModuleLoraMap, ...] = ()
 
     def link(self, siblings: Sequence[ModuleLoraMap]) -> None:
-        """Leave a module another node's map of the same model claims more specifically
-        to that map (``link_lora_specs``)."""
+        """Leave a module another node's map of the same model places to that map
+        (``link_lora_specs``)."""
         self._siblings = tuple(m for m in siblings if m is not self)
 
     def _candidates(self, module: str):
@@ -160,13 +160,18 @@ class ModuleLoraMap:
 
     def ignores(self, module: str) -> bool:
         """``LoraSpec.ignored_modules``: a module the model never runs (``ignore``), or one
-        another node's spec claims more specifically, which that spec loads or refuses."""
+        another node's spec loads: one it places and this map does not, or places too
+        under a more specific root. A module no map places is left to the most specific
+        claimant, which refuses it with its reason."""
         if any(fnmatch.fnmatchcase(module, p) for p in self._ignore):
             return True
         if not self._siblings:
             return False
         own = self.claim(module)
-        return any(s.claim(module) > own for s in self._siblings)
+        placing = [s for s in self._siblings if s(module) is not None]
+        if self(module) is not None:
+            return any(s.claim(module) > own for s in placing)
+        return bool(placing) or any(s.claim(module) > own for s in self._siblings)
 
 
 def _match(path: str, patterns) -> str | None:
@@ -394,9 +399,9 @@ def _target_names(keys: list[tuple[str | None, str]], names: Mapping[str, str]) 
 
 def link_lora_specs(specs: Sequence[LoraSpec]) -> list[LoraSpec]:
     """A model's specs for several nodes (an LLM and its vision tower), told about each
-    other: each leaves the modules another claims more specifically (``AdapterRoot``) to
-    it, so one adapter file serves both nodes and a module either places is not refused
-    by the other."""
+    other: each leaves the modules another places to it (to the most specific root,
+    ``AdapterRoot``, when both do), so one adapter file serves both nodes and a module
+    either places is not refused by the other."""
     maps = [s.module_map for s in specs if isinstance(s.module_map, ModuleLoraMap)]
     for m in maps:
         m.link(maps)

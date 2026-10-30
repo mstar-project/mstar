@@ -1058,9 +1058,9 @@ placed exactly as weights are.
 - **Several nodes.** A model whose adapters reach several nodes (an LLM and its vision
   encoder, which a TP config may put on different ranks) returns a spec per node, the
   first keyed ``"lora"`` and the others apart, told about each other by
-  ``link_lora_specs``: a module belongs to the spec whose ``adapter_roots`` claim it most
-  specifically, and the others leave it alone (``ignored_modules``), so one adapter file
-  serves both. The one ``lora:`` block sizes them all, the conductor opens every request
+  ``link_lora_specs``: a module belongs to the spec that places it (the one whose
+  ``adapter_roots`` claim it most specifically, when several do), and the others leave
+  it alone (``ignored_modules``), so one adapter file serves both. The one ``lora:`` block sizes them all, the conductor opens every request
   with the same adapter on each, and the startup check reads an adapter under every
   spec.
 - **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every placed module

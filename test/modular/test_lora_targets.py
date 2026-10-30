@@ -46,6 +46,7 @@ from mstar.model.components.lora.modules import (  # noqa: E402
     PER_SEGMENT,
     _target_names,
     bind_module_lora,
+    link_lora_specs,
     module_lora_spec,
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
@@ -476,6 +477,23 @@ def test_target_names_widen_a_role_outside_every_stack():
     # a stacked role and a top-level module with the same role path
     names = _target_names([("layers", "attn.proj"), (None, "attn.proj")], {})
     assert sorted(names.values()) == ["layers_attn_proj", "root_attn_proj"]
+
+
+def test_linked_specs_leave_a_module_to_the_spec_that_places_it():
+    """A spec with no adapter roots beside one whose checkpoint prefix claims every
+    module: each keeps what it places."""
+    def spec(stack: str, node: str, rules: CheckpointRules):
+        with torch.device("meta"):
+            root = nn.Module()
+            setattr(root, stack, nn.ModuleList([_with(nn.Module(), lambda m: setattr(m, "q", nn.Linear(HIDDEN, HIDDEN)))]))
+        return module_lora_spec(root, resource_key=node, nodes={node}, root_path="", rules=rules)
+
+    text, vision = link_lora_specs([
+        spec("layers", "text", CheckpointRules(remap=lambda n: n)),
+        spec("blocks", "vision", CheckpointRules(prefix="model.visual.")),
+    ])
+    assert not text.ignored_modules("layers.0.q") and vision.ignored_modules("layers.0.q")
+    assert text.ignored_modules("model.visual.blocks.0.q") and not vision.ignored_modules("model.visual.blocks.0.q")
 
 
 def test_a_stack_is_a_module_list_whatever_its_name():
