@@ -1372,6 +1372,22 @@ def test_replies_are_paired_by_step_however_the_chunks_arrive(duplex):
                        and e["response_id"] == response["id"]) == response["output"][0]["content"][0]["transcript"]
 
 
+def test_a_reply_without_an_end_mark_ends_where_the_next_starts(duplex):
+    texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), _text(3, mark="start"), _text(4, b"Yo"),
+             _text(5, mark="end"), _text(6)]
+    client, api = duplex([*texts, *(_audio(i) for i in range(7))], end=True)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        events = _until_closed(ws)
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert [(r["status"], r["output"][0]["content"][0]["transcript"]) for r in done] == [
+        ("completed", "Hi"), ("completed", "Yo")]
+    for response, steps in zip(done, ([1, 2], [3, 4, 5]), strict=True):
+        assert [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"
+                and e["response_id"] == response["id"]] == [_step_pcm(i) for i in steps]
+
+
 def test_a_call_that_ends_mid_reply_finishes_its_response(duplex):
     outputs = [_text(0, mark="start"), _text(1, b"Hel"), _audio(0),
                _Chunk("error", b"the call passed its length", {"status": 400})]

@@ -1283,7 +1283,12 @@ class RealtimeConversation:
         turn = self.turns[-1] if self.turns and self.turns[-1].end is None else None
         data = bytes(chunk.data)
         for mark in meta.get("turn", ()):
-            if mark == "start" and turn is None:
+            if mark == "start":
+                if turn is not None:   # no end mark: the open reply ends before this one
+                    logger.warning("realtime reply %s got no end mark; ending it at step %d", turn.response_id,
+                                   step - 1)
+                    await self._feed(turn, b"", final=True)
+                    turn.end = step - 1
                 turn = await self._start_turn(step)
             elif mark == "end" and turn is not None:
                 await self._feed(turn, data, final=True)
