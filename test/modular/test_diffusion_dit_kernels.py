@@ -16,7 +16,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion import modulation, qk_norm_rope
-from mstar.model.components.diffusion.rope import apply_rotary_interleaved
+from mstar.model.wan22.components.dit import Wan22RoPE3D
+from mstar.model.wan22.config import Wan22Config
 
 CUDA = torch.cuda.is_available()
 needs_kernels = pytest.mark.skipif(
@@ -61,18 +62,35 @@ def test_eager_formulation_is_the_inline_block_math_bitwise():
     assert torch.equal(x_out, plain) and torch.equal(out, plain_mod)
 
 
-def test_eager_rms_norm_rope_is_the_modules_bitwise():
+def _slice_write_rotation(x, cos, sin):
+    """The reference's interleaved-pair rotation, written the way the Wan port did
+    before it moved to the shared stacked form: fp32 math through the promotion
+    against the tables, rounded to the stream dtype at the slice assignment."""
+    x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+    cos = cos[None, :, None, 0::2]
+    sin = sin[None, :, None, 1::2]
+    out = torch.empty_like(x)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not CUDA, reason="needs CUDA"))]
+)
+def test_eager_rms_norm_rope_is_the_slice_write_rotation_bitwise(device):
+    cfg = Wan22Config()
+    heads, head_dim = cfg.num_attention_heads, cfg.attention_head_dim
+    cos, sin = Wan22RoPE3D(head_dim, cfg.rope_max_seq_len)((3, 5, 8), torch.device(device))
+    seq = cos.shape[0]
     g = torch.Generator(device="cpu").manual_seed(0)
-    heads, head_dim, seq = 3, 32, 20
-    q = torch.randn(1, seq, heads * head_dim, generator=g).bfloat16()
-    k = torch.randn(1, seq, heads * head_dim, generator=g).bfloat16()
-    q_norm = nn.RMSNorm(heads * head_dim, eps=EPS, dtype=torch.bfloat16)
-    k_norm = nn.RMSNorm(heads * head_dim, eps=EPS, dtype=torch.bfloat16)
-    ang = torch.rand(seq, head_dim // 2, generator=g) * 6
-    cos, sin = ang.cos().repeat_interleave(2, 1), ang.sin().repeat_interleave(2, 1)
+    q = (torch.randn(2, seq, heads * head_dim, generator=g) * 3).to(device, torch.bfloat16)
+    k = (torch.randn(2, seq, heads * head_dim, generator=g) * 3).to(device, torch.bfloat16)
+    q_norm = nn.RMSNorm(heads * head_dim, eps=EPS, device=device, dtype=torch.bfloat16)
+    k_norm = nn.RMSNorm(heads * head_dim, eps=EPS, device=device, dtype=torch.bfloat16)
     q_out, k_out = qk_norm_rope.rms_norm_rope(q, k, q_norm, k_norm, cos, sin, heads)
-    assert torch.equal(q_out, apply_rotary_interleaved(q_norm(q).unflatten(2, (heads, -1)), cos, sin))
-    assert torch.equal(k_out, apply_rotary_interleaved(k_norm(k).unflatten(2, (heads, -1)), cos, sin))
+    assert torch.equal(q_out, _slice_write_rotation(q_norm(q).unflatten(2, (heads, -1)), cos, sin))
+    assert torch.equal(k_out, _slice_write_rotation(k_norm(k).unflatten(2, (heads, -1)), cos, sin))
 
 
 def _assert_bf16_close(got: torch.Tensor, want: torch.Tensor, min_equal: float = 0.999):
