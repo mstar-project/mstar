@@ -69,9 +69,6 @@ class Rebuilds:
     def kept(self, rid: int, node: str) -> KeptIds | None:
         return self._kept.get(node, {}).get(rid)
 
-    def keeps_any(self, node: str) -> bool:
-        return bool(self._kept.get(node))
-
     def can_rebuild(self, node: str, layouts: Iterable[StreamLayout]) -> bool:
         """Whether a rebuild on ``node`` can write a request's laid-out labels again: the node declares a policy,
         and its loop grows labels one rebuild row can lay out again, written in the policy's walk."""

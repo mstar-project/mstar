@@ -4198,12 +4198,6 @@ class KVManager(AttentionResource):
                 rest = [other for other in victims if other != victim]
                 if self._frees(rest) == freed:
                     victims = rest
-            for victim in victims:
-                if self._overrides[victim].arrival <= arrival or not (victim in hosted or droppable(victim)):
-                    raise RuntimeError(
-                        f"KV {self.name}: chose {victim} (arrival {self._overrides[victim].arrival}) to free pages "
-                        f"for {rid} (arrival {arrival}), but a victim must be newer and able to move"
-                    )
             earmark = Earmark(rid, pages_short, set(victims))
             for victim in victims:
                 self._victims[victim] = earmark

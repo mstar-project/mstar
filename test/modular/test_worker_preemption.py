@@ -124,6 +124,11 @@ def test_only_a_deciding_kv_pool_preempts(case):
         assert w._dropped == {"v": NODE} and not w.held, "r's shortage didn't drop v"
         assert _step(kv, "r", 1).ok, "r didn't get the page v's drop freed"
         assert w._preemptions[NODE] == PreemptionCounts(victims=1, drops=1), "the drop went uncounted"
+    elif case == "a node where no request keeps ids":
+        # the node's policy decides how it preempts, whichever requests keep ids now
+        assert not w.tried and not w.held and kv.waits("r") and kv.is_resident("v"), (
+            "a node that rebuilds requests switched to the offload and the hold while none kept ids"
+        )
     else:
         assert w.tried and w.held == ["r"] and kv.is_resident("v"), f"{case} lost the offload and the hold"
 
