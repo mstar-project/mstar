@@ -328,12 +328,19 @@ def _qwen3_omni() -> ModelSpec:
         thinker = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
             _snapshot(model), torch_dtype=torch.bfloat16, device_map="cuda",
         ).thinker
-        # transformers keeps the thinker's text stack under `model.language_model`,
-        # where the checkpoint (and so an adapter) names it `model`
+        # newer transformers 5 releases (5.22, not 5.19) keep the thinker's text stack
+        # under `model.language_model`, where the checkpoint (and so an adapter) names it `model`
+        text = getattr(thinker.model, "language_model", thinker.model)
+        nested = text is not thinker.model
+
+        def adapter_name(module):
+            module = module.removeprefix("thinker.")
+            return re.sub(r"^model\.", "model.language_model.", module) if nested else module
+
         return HfReference(
             forward=lambda m, ids: m(input_ids=ids[None].cuda()).logits[0, -1].float(),
-            model=thinker.eval(), rope=_hf_rope(thinker.model.language_model.rotary_emb, three_d=True),
-            adapter_name=lambda module: re.sub(r"^model\.", "model.language_model.", module.removeprefix("thinker.")),
+            model=thinker.eval(), rope=_hf_rope(text.rotary_emb, three_d=True),
+            adapter_name=adapter_name,
         )
 
     return ModelSpec(
@@ -376,12 +383,16 @@ def _qwen3_tts() -> ModelSpec:
                 return None
             return native.get(name, name)
 
+        def adapter_name(module):
+            weight = module.removeprefix("talker.") + ".weight"
+            return native.get(weight, weight).removesuffix(".weight")
+
         _load_hf(ref, _snapshot(model), rename)
         _fp32_rotary(ref)
         return HfReference(
             forward=lambda m, ids: m(ids[None].cuda()).logits[0, -1].float(),
             model=ref.cuda().eval(), rope=_hf_rope(ref.model.rotary_emb),
-            adapter_name=lambda module: module.removeprefix("talker."),
+            adapter_name=adapter_name,
         )
 
     return ModelSpec(

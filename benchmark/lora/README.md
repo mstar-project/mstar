@@ -326,7 +326,8 @@ and GPU-pending until these pass):
   adapter and the base model in one mixed step, against each adapter merged into the
   weights;
 * `hf`: the same against transformers + PEFT where transformers has the node (Orpheus,
-  Higgs Audio's Qwen3 LLM, the Qwen3-Omni Thinker, Chatterbox T3's Llama backbone), RoPE
+  Higgs Audio's Qwen3 LLM, the Qwen3-Omni Thinker, the Qwen3-TTS Talker as Qwen3 over its
+  codec embedding and head, Chatterbox T3's Llama backbone), RoPE
   as the reference computes it;
 * `serve`: the stock config plus a `lora:` block, captured and compiled as shipped, a
   mixed batch included, against a server on a checkpoint with the adapter merged in.
