@@ -1104,14 +1104,15 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
 def split_loop(request):
     """One loop whose body spans two worker graphs, as BAGEL's CFG-parallel
     denoise: ``step`` in one, ``combine`` here, and combine's output loops
-    back to step. ``step`` enters the loop with an external ``cond`` and runs
-    on a peer (over the wire) or in a sibling worker graph on this worker.
+    back to step. ``step`` is fed its first ``x`` from outside, as BAGEL's
+    branches get their first ``latents``, and runs on a peer (over the wire)
+    or in a sibling worker graph on this worker.
     The runtime under test is this worker's."""
     kind, step_workers = request.param
     loop = Loop(
         name="L", max_iters=3, outputs=[],
         section=Sequential(sections=[
-            GraphNode(name="step", input_names={"cond", "x"},
+            GraphNode(name="step", input_names={"x"},
                       outputs=[GraphEdge(name="v", next_node="combine")]),
             GraphNode(name="combine", input_names={"v"},
                       outputs=[GraphEdge(name="x", next_node="step")]),
@@ -1170,8 +1171,7 @@ def test_the_last_iteration_sends_no_loop_back_to_another_worker_graph(split_loo
         return uuid, out
 
     if sibling:  # the loop is entered at step, as BAGEL's branches
-        rt.ingest_inputs_batch(_ingest_block(
-            [rid, rid], [_spec("cond", "step"), _spec("x", "step")]))
+        rt.ingest_inputs_batch(_ingest_block([rid], [_spec("x", "step")]))
     held, sent = [], []
     for _ in range(3):
         if sibling:
