@@ -1427,9 +1427,11 @@ class Conductor:
         request_data.resource_configs = without_layouts(request_data.resource_configs)
 
         if self._client_streams:
-            # After the workers' NEW_REQUESTs; a stream whose partition this
-            # request doesn't run takes nothing. Each item goes whole to the
-            # ranks a one-rank source fans a replicated edge out to.
+            # Once dispatch can no longer fail, so every rank the data worker
+            # sends items to holds the request and gets its REMOVE (a rank
+            # parks items that beat its NEW_REQUEST). A stream whose partition
+            # this request doesn't run takes nothing. Each item goes whole to
+            # the ranks a one-rank source fans a replicated edge out to.
             cfg = request_data.sharding_config
             self._send_client_route(body.request_id, {
                 name: [] if partition_states[stream.partition].is_done

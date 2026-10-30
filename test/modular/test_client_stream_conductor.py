@@ -207,8 +207,9 @@ def _reads_done(rid, *entities):
 
 
 def test_dispatch_tells_the_data_worker_the_consumers_ranks_once(tmp_path, monkeypatch):
-    """After the workers' NEW_REQUESTs, which the items must not overtake on a
-    rank; the conductor forwards none itself."""
+    """After the workers' NEW_REQUESTs, once dispatch can't fail: every rank
+    that gets items then holds the request and gets its REMOVE. (A rank parks
+    items that arrive before its NEW_REQUEST.) The conductor forwards none."""
     c = _conductor(tmp_path, monkeypatch)
     _run(c, [[_new_request("r")]])
 
