@@ -29,7 +29,9 @@ class CombinedSplit:
     ``prefill_walks`` last, so both kernels read the step's tokens in place:
     the decode kernel the leading run of one-token rows, the prefill kernel
     the rows after it (under capture every token, the run as one leading
-    sequence)."""
+    sequence). Every walk of ``combined_walk`` outside ``prefill_walks`` must
+    be one token per row: its rows go first, and a multi-token one there
+    ends the run, so each decode row after it counts as a prompt row."""
     combined_walk: str
     prefill_walks: tuple[str, ...]
 
