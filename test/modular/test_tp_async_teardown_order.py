@@ -36,6 +36,7 @@ from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
 from mstar.worker.rebuild import Rebuilds  # noqa: E402
+from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 NODE, WALK = "LLM", "decode"
@@ -131,7 +132,7 @@ def _rank(
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
-    w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
+    w.streaming_buffers, w._last_active = {}, {}
     w._rebuilds = Rebuilds({}, {})
     w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
     w._tp_broadcast_seq = 0
@@ -164,6 +165,7 @@ def _rank(
         remove_request=lambda rid: None, get_partition_for_node=lambda node: "p",
     )
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.parallel_groups = SimpleNamespace(
         barrier_all=lambda: None, restore_default_timeout=lambda: None,

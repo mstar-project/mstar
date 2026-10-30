@@ -43,6 +43,7 @@ from mstar.utils.ipc_format import (
     WorkerGraphsDone,
     WorkerMessageType,
 )
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 PRODUCER = "worker_0"
@@ -281,8 +282,9 @@ def _consumer(policy):
             name: [object()] for name in d
         },
     )
-    w._consumer_node_cache = {EDGE: "snac_decoder"}
-    w._stream_partition = {EDGE: "SNAC"}
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w.streams.consumer_node = {EDGE: "snac_decoder"}
+    w.streams._partition = {EDGE: "SNAC"}
     return w, buf
 
 
@@ -290,16 +292,16 @@ def _deliver(w, descriptor):
     """The descriptor arrives and its read completes."""
     w._process_new_inputs(descriptor)
     for edge in descriptor.inputs:
-        w._route_streaming_tensor(1, edge)
+        w.streams.route_tensor(1, edge)
 
 
 def _chunks(w, buf):
     """Every chunk the consumer would take now, as (num_items, is_final)."""
     out = []
-    while (se := w._pop_streaming_edge(buf, EDGE, 1)) is not None:
+    while (se := w.streams.pop_edge(buf, EDGE, 1)) is not None:
         out.append((se.chunk.num_items, se.chunk.is_final))
         if se.chunk.is_final:
-            node_done, partition_done = w._settle_final_streams("snac_decoder", {1: {EDGE}})
+            node_done, partition_done = w.streams.settle_final("snac_decoder", {1: {EDGE}})
             assert node_done == partition_done == {1}
     return out
 
@@ -405,9 +407,9 @@ def test_a_continuing_stream_waits_for_its_last_item_too(tmp_path):
 
     w, buf = _consumer(FixedChunkPolicy(1, continue_after_done=True))
     w._process_new_inputs(done)
-    assert w._pop_streaming_edge(buf, EDGE, 1) is None, "an empty chunk overtook the last item"
+    assert w.streams.pop_edge(buf, EDGE, 1) is None, "an empty chunk overtook the last item"
     _deliver(w, descriptor)
-    se = w._pop_streaming_edge(buf, EDGE, 1)
+    se = w.streams.pop_edge(buf, EDGE, 1)
     assert se.chunk.num_items == 1 and not se.chunk.is_final
 
 
