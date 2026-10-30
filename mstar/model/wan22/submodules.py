@@ -156,18 +156,14 @@ def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
     setattr(owner, attr, value)
 
 
-def _loop_step(fwd_info: CurrentForwardPassInfo, time_index: torch.Tensor) -> int:
+def _loop_step(fwd_info: CurrentForwardPassInfo) -> int:
     """The denoise iteration this step runs, from the engine's loop counter.
 
-    ``time_index`` holds the same value, but it is the previous step's device
-    output: reading it on the host waits for that step to finish, which stalls
-    the speculative preparation of this one. Callers that drive the submodule
-    without a loop counter (tests, harnesses) fall back to the edge.
+    A value carried on a loop-back edge would be the previous step's device
+    output, and reading it on the host waits for that step to finish, which
+    stalls the speculative preparation of this one.
     """
-    counts = getattr(fwd_info, "dynamic_loop_iter_counts", None) or {}
-    if DENOISE_LOOP_NAME in counts:
-        return int(counts[DENOISE_LOOP_NAME])
-    return int(time_index.reshape(-1)[0].item())
+    return int(fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME])
 
 
 def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, int]:
@@ -336,16 +332,15 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     Loop-carried edges, all float32 over the latent grid:
 
         latents              current sample x_t
-        time_index           [1] int64, the 0-based step index k
         unipc_model_outputs  ring buffer of the last two converted outputs;
                              see ``UniPCState``
         unipc_last_sample    the sample the previous predictor was given
 
     Nothing else is carried. The sigmas, the order ramp and the timestep pair all
-    follow from ``time_index`` and the per-request tables, so they are recomputed
-    rather than shipped across an edge.
+    follow from the engine's loop counter and the per-request tables, so they are
+    recomputed rather than shipped across an edge.
 
-    At iteration 0 the conductor sends the four edges empty and this submodule
+    At iteration 0 the conductor sends the three edges empty and this submodule
     seeds them (noise from the request's seed, on a CPU generator as diffusers
     does). I2V also consumes the persisted ``image_latent``: frame 0 of the input
     is replaced by it and its per-token timestep zeroed, and the conditioning is
@@ -419,16 +414,12 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
             latents = torch.randn(shape, generator=generator, dtype=torch.float32).to(device)
             tensor_inputs["latents"] = latents
-            # 1-D, not 0-dim: the worker's output fanout reads dims[0] of every
-            # routed edge.
-            tensor_inputs["time_index"] = torch.zeros(1, dtype=torch.int64, device=device)
             tensor_inputs["unipc_model_outputs"] = torch.zeros(
                 (SOLVER_ORDER, *shape), dtype=torch.float32, device=device
             )
             tensor_inputs["unipc_last_sample"] = torch.zeros(shape, dtype=torch.float32, device=device)
         else:
-            time_index = inputs["time_index"][0]
-            k = _loop_step(fwd_info, time_index)
+            k = _loop_step(fwd_info)
             num_steps = int(fwd_info.step_metadata["num_inference_steps"])
             if k >= num_steps:
                 # Async scheduling dispatched an iteration past this request's
@@ -442,7 +433,6 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                 )
                 return None
             tensor_inputs["latents"] = inputs["latents"][0]
-            tensor_inputs["time_index"] = time_index
             tensor_inputs["unipc_model_outputs"] = inputs["unipc_model_outputs"][0]
             tensor_inputs["unipc_last_sample"] = inputs["unipc_last_sample"][0]
         return NodeInputs(tensor_inputs=tensor_inputs)
@@ -452,7 +442,6 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         latents: torch.Tensor,
-        time_index: torch.Tensor,
         unipc_model_outputs: torch.Tensor,
         unipc_last_sample: torch.Tensor,
         text_embeds_pos: torch.Tensor,
@@ -464,7 +453,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         step_metadata = fwd_info.step_metadata
         num_steps = int(step_metadata["num_inference_steps"])
         guidance_scale = float(step_metadata["guidance_scale"])
-        k = _loop_step(fwd_info, time_index)
+        k = _loop_step(fwd_info)
         device = latents.device
 
         with _inference_ctx():
@@ -516,7 +505,6 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
 
         return {
             "latents": [new_latents],
-            "time_index": [time_index + 1],
             "unipc_model_outputs": [new_ring],
             "unipc_last_sample": [sample],
         }

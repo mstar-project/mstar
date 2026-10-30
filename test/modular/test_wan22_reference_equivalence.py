@@ -44,6 +44,7 @@ sys.path.insert(0, ".")
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 from mstar.model.wan22.submodules import (
+    DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
     Wan22TextEncoderSubmodule,
 )
@@ -332,10 +333,11 @@ def t2v_trajectory(oracle_meta, text_embeds, dit_submodule) -> dict:
     try:
         with torch.no_grad():
             for step in range(num_steps):
+                fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME] = step
                 outputs = _drive(dit_submodule, "video_gen", fwd_info, {**persisted, **carried})
                 carried = {
                     name: outputs[name]
-                    for name in ("latents", "time_index", "unipc_model_outputs", "unipc_last_sample")
+                    for name in ("latents", "unipc_model_outputs", "unipc_last_sample")
                 }
                 latents = outputs["latents"][0]
                 latents_per_step.append(latents.detach().cpu().float())
@@ -467,10 +469,11 @@ def test_sequential_cfg_trajectory_is_bitexact_vs_oracle(oracle_meta, text_embed
         carried: dict[str, list[torch.Tensor]] = {}
         with torch.no_grad():
             for step in range(num_steps):
+                fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME] = step
                 outputs = _drive(dit_submodule, "video_gen", fwd_info, {**persisted, **carried})
                 carried = {
                     name: outputs[name]
-                    for name in ("latents", "time_index", "unipc_model_outputs", "unipc_last_sample")
+                    for name in ("latents", "unipc_model_outputs", "unipc_last_sample")
                 }
                 ref = torch.load(ORACLE_DIR / "latents" / f"step_{step:03d}.pt", map_location="cpu")
                 diffs.append((outputs["latents"][0].cpu().float() - ref.float()).abs().max().item())
@@ -574,10 +577,11 @@ def test_i2v_first_frame_injection_semantics(oracle_meta, text_embeds, dit_submo
         carried: dict[str, list[torch.Tensor]] = {}
         with torch.no_grad():
             for step in range(num_steps):
+                fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME] = step
                 outputs = _drive(dit_submodule, "video_gen_i2v", fwd_info, {**persisted, **carried})
                 carried = {
                     name: outputs[name]
-                    for name in ("latents", "time_index", "unipc_model_outputs", "unipc_last_sample")
+                    for name in ("latents", "unipc_model_outputs", "unipc_last_sample")
                 }
                 out_latents = outputs["latents"][0]
                 frame0_injected = torch.equal(out_latents[:, :, 0], condition[:, :, 0])
@@ -776,10 +780,11 @@ def test_compiled_dit_matches_eager_per_step(oracle_meta, text_embeds, dit_submo
         carried: dict[str, list[torch.Tensor]] = {}
         with torch.no_grad():
             for step in range(num_steps):
+                fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME] = step
                 outputs = _drive(dit_submodule, "video_gen", fwd_info, {**persisted, **carried})
                 carried = {
                     name: outputs[name]
-                    for name in ("latents", "time_index", "unipc_model_outputs", "unipc_last_sample")
+                    for name in ("latents", "unipc_model_outputs", "unipc_last_sample")
                 }
                 diffs.append(
                     (outputs["latents"][0].cpu().float() - eager_latents[step]).abs().max().item()
@@ -855,10 +860,11 @@ def test_no_cfg_batch1_trajectory_is_bitexact(oracle_meta, text_embeds, dit_subm
         carried: dict[str, list[torch.Tensor]] = {}
         with torch.no_grad():
             for step in range(num_steps):
+                fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME] = step
                 outputs = _drive(dit_submodule, "video_gen", fwd_info, {**persisted, **carried})
                 carried = {
                     name: outputs[name]
-                    for name in ("latents", "time_index", "unipc_model_outputs", "unipc_last_sample")
+                    for name in ("latents", "unipc_model_outputs", "unipc_last_sample")
                 }
                 ref = torch.load(NOCFG_ORACLE_DIR / "latents" / f"step_{step:03d}.pt", map_location="cpu")
                 diffs.append((outputs["latents"][0].cpu().float() - ref.float()).abs().max().item())

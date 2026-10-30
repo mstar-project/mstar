@@ -1,19 +1,19 @@
 """Denoise step prep reads no tensor on the host (Cosmos3, Wan 2.2, OmniVoice).
 
-The loop-carried step counter (``time_index`` / ``step_index``) is the
-previous step's device output, so an ``.item()`` on it in ``prepare_inputs``
-waits for that step to finish and stalls the speculative preparation of the
-next one. These loops read the step from the engine's per-batch loop counter
-instead, as the DiT scaffold does, and keep Cosmos3's timesteps as a host list.
+A loop-carried step counter (``time_index`` / ``step_index``) is the previous
+step's device output, so an ``.item()`` on it in ``prepare_inputs`` waits for
+that step to finish and stalls the speculative preparation of the next one.
+These loops read the step from the engine's per-batch loop counter instead, as
+the DiT scaffold does, and keep Cosmos3's timesteps as a host list.
 
 Each test walks a short schedule (including the async-overshoot step the
 prepare vetoes) and checks, per step:
 
 * no host read of any tensor (``item`` / ``tolist`` / ``int()`` / ...) happens
   while preparing with the loop counter set, as the engine sets it;
-* the prepared inputs equal those of the edge-reading path, which is the
-  derivation the submodules used before (and still use for callers that pass
-  no loop counter).
+* for Cosmos3 and OmniVoice, the prepared inputs equal those of the edge-reading
+  path, which callers that pass no loop counter still use. Wan 2.2 carries no
+  such edge, so a missing counter is an error there.
 
 CPU only, no weights.
 """
@@ -100,29 +100,41 @@ def _check_schedule(prepare, walk_fwd, edge_inputs, loop, steps):
 
 # ---------------------------------------------------------------- Wan 2.2
 
+def _wan22_loop_inputs(shape, k):
+    return {
+        "text_embeds_pos": [torch.zeros(1, 8, 16)],
+        "text_embeds_neg": [torch.zeros(1, 8, 16)],
+        "latents": [torch.full(shape, float(k))],
+        "unipc_model_outputs": [torch.zeros((2, *shape))],
+        "unipc_last_sample": [torch.zeros(shape)],
+    }
+
+
 def test_wan22_step_prep_reads_no_tensor():
     sub = Wan22DitSubmodule(transformer=None, config=Wan22Config())
     shape = (1, 4, 2, 2, 2)
     steps = 3
 
-    def inputs(k):
-        return {
-            "text_embeds_pos": [torch.zeros(1, 8, 16)],
-            "text_embeds_neg": [torch.zeros(1, 8, 16)],
-            "latents": [torch.full(shape, float(k))],
-            "time_index": [torch.tensor([k], dtype=torch.int64)],
-            "unipc_model_outputs": [torch.zeros((2, *shape))],
-            "unipc_last_sample": [torch.zeros(shape)],
-        }
+    def prepare(k):
+        info = _fwd("r", "video_gen", {"num_inference_steps": steps}, DENOISE_LOOP_NAME, k)
+        return sub.prepare_inputs("video_gen", info, _wan22_loop_inputs(shape, k))
 
-    def fwd(loop, k):
-        return _fwd("r", "video_gen", {"num_inference_steps": steps}, loop, k)
+    for k in range(1, steps):
+        with _HostReads() as host:
+            got = prepare(k)
+        assert host.reads == [], f"step {k}: host reads {host.reads}"
+        assert got.tensor_inputs.keys() == _wan22_loop_inputs(shape, k).keys()
+        assert torch.equal(got.tensor_inputs["latents"], torch.full(shape, float(k)))
+    with _HostReads() as host:
+        assert prepare(steps) is None  # overshoot vetoed
+    assert host.reads == []
 
-    def prepare(fwd_info, inp):
-        return sub.prepare_inputs("video_gen", fwd_info, inp)
 
-    _check_schedule(prepare, fwd, inputs, DENOISE_LOOP_NAME, steps)
-    assert prepare(fwd(DENOISE_LOOP_NAME, steps), inputs(steps)) is None  # overshoot vetoed
+def test_wan22_step_prep_fails_without_the_loop_counter():
+    sub = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    info = _fwd("r", "video_gen", {"num_inference_steps": 3})
+    with pytest.raises(KeyError, match=DENOISE_LOOP_NAME):
+        sub.prepare_inputs("video_gen", info, _wan22_loop_inputs((1, 4, 2, 2, 2), 1))
 
 
 # ---------------------------------------------------------------- OmniVoice
