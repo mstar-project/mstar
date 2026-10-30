@@ -259,7 +259,10 @@ class RocmPlatform(Platform):
         # time on MI300X. Building the rope tables and scattering the
         # sampler's rows inside the graph drops about ten a step (Qwen3.5
         # 2B/9B: +1-3% tok/s at c=1-4).
-        return {"ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1"}
+        # Step threads stay on the process mask: on MI325X the pin gains no
+        # tok/s at c=1 or c=64, raises 0.8B c=64 TTFT (57.5 -> 62.2 ms) and
+        # graph-replay launch p95 (0.34-0.47 -> 1.3-3.3 ms).
+        return {"ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1", "step_thread_core": "off"}
 
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],

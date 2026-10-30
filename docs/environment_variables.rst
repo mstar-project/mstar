@@ -499,7 +499,8 @@ Worker scheduling
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
    * - ``MSTAR_STEP_THREAD_CORE``
-     - config's ``knobs: step_thread_core``, else ``auto``
+     - config's ``knobs: step_thread_core``, else ``auto`` (``off`` on AMD GPUs,
+       ``RocmPlatform.knob_defaults``)
      - The CPU a worker's main, GPU and plan threads share. A step passes
        between them several times, and a thread woken on another core waits
        for it to leave a deep idle state; on one shared CPU it starts at once.
