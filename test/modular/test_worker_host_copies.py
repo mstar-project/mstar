@@ -26,6 +26,7 @@ from mstar.graph.base import GraphEdge
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 STEPS, RID, NODE, WALK = 4, 7, "rollout_predictor", "rollout"
@@ -89,6 +90,7 @@ def _worker(tmp_path):
     w.tensor_manager = _manager(tmp_path, "worker_0")
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},
+        after_output_copy=lambda batch: None,
         extend_prefix_chains=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
     ))
@@ -105,6 +107,7 @@ def _worker(tmp_path):
         return {RID: {"pred": [reused]}}, None
 
     w._prematerialize_for_check_stop = stop_check_copies
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     return w
 
 
