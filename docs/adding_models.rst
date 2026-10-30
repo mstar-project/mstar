@@ -2433,8 +2433,9 @@ streams (audio and video, say): each has its own buffer and its own end.
   streams declares it and its audio output is mono: the route decodes the caller's codec, resamples to
   ``sample_rate`` and turns the model's output back into the caller's format from
   ``get_output_sample_rate``. On every route the data worker, the stream's producer,
-  sends it in whole frames: an append's whole frames (the opening's included) go as
-  one item and the rest waits for the next append, or goes with the stream's end. A
+  sends it in whole frames: each whole frame of an append goes as an item (an opening
+  clip's frames as one) and the rest waits for the next append, or goes with the
+  stream's end. A
   model whose client streams all declare ``ClientAudio`` needs no
   ``process_stream_chunk``: the data worker takes appended audio files at
   ``sample_rate`` (one at another rate is refused: resampling an append alone leaves a

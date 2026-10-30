@@ -194,10 +194,9 @@ models ignore ``end_input``, and an append to them is rejected.
 Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``
 or ``/v1/realtime``. On either route, a model that declares its audio frame (Nemotron
 VoiceChat: 80 ms, 1280 samples at 16 kHz) gets a live call's audio in whole frames: each
-append's whole frames go on as one step and the rest waits for the next append, or goes
-with the stream's end. Nemotron runs a step of one frame as one CUDA graph, so appends of
-80 ms or less serve best; a larger append is served the same, as one step, more slowly
-(see :doc:`models`).
+whole frame of an append goes on as a step of its own and the rest waits for the next
+append, or goes with the stream's end, so appends of any size keep the call on the steps
+Nemotron runs as one CUDA graph (see :doc:`models`).
 
 .. code-block:: python
 

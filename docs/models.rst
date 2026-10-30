@@ -795,8 +795,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   resampled nor rescaled one by one, which would put a seam at every append);
   ``/v1/realtime`` resamples for the client. On both, ``audio_in`` declares the
   encoder's 80 ms frame (``ClientAudio``), and the data worker sends a live
-  call's audio in whole frames, each append's as one step, the rest waiting for
-  the next append or the call's end.
+  call's audio in whole frames, a step each, the rest waiting for the next
+  append or the call's end.
 - Encoder numerics, measured on CPU at the checkpoint's dimensions with random
   weights on the duplex encoder the shared FastConformer replaced, and not
   since: an upload was one encoder pass, bit for bit that encoder's offline

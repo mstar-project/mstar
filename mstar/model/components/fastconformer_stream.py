@@ -140,7 +140,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     the pool of each stream's audio and mel tails.
 
     A stream one frame of audio further on the frame grid (every live step of
-    a client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The
+    a stream that declares ``ClientAudio``) runs whole as a CUDA graph (``STEP_REGION``). The
     others take the front end eagerly, then the blocks as a graph
     (``LAYERS_REGION``) when each got at most one frame (a live step, the
     stream's end), else eagerly (a one-shot upload, a large append). In a step

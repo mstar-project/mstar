@@ -451,22 +451,23 @@ class _FramedModel(_ListeningModel):
 
 
 def test_client_audio_goes_on_in_whole_frames_whatever_the_appends(tmp_path):
-    """Each append's whole frames, the opening's included, go as one item
-    with the rest waiting for the next append, so every route keeps a call on
-    its consumer's frame; the stream's end takes the rest along, before it."""
+    """Each append's whole frames go as an item each, the opening clip's as
+    one item, with the rest waiting for the next append, so every route keeps
+    a call on its consumer's frame; the stream's end takes the rest along,
+    before it."""
     wt, sent, _tm = _thread(_FramedModel())
     _open(wt)                                                                 # 6: 4 and 2 left
     _route(wt)
     for append in (
         ClientAppend("r", samples={"audio_in": np.full(1, 0.5, np.float32)}),   # 3: nothing yet
-        ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 9)]}),   # 12
+        ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 9)]}),   # 12: three frames
         ClientAppend("r", samples={"audio_in": np.zeros(5, np.float32)}),        # 4 and 1 left
         ClientAppend("r", ends=END),                                             # the 1, then the end
     ):
         wt._process_stream_input(append)
 
-    assert _signals(sent) == [("w0", "audio_in", [[n]], {}) for n in (4, 12, 4, 1)] + [
-        ("w0", None, [], {"audio_in": 4})]
+    assert _signals(sent) == [("w0", "audio_in", dims, {}) for dims in ([[4]], [[4]] * 3, [[4]], [[1]])] + [
+        ("w0", None, [], {"audio_in": 6})]
 
 
 @pytest.mark.parametrize("append, error", [

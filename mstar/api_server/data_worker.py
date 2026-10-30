@@ -803,7 +803,7 @@ class PreprocessWorkerThread:
         call = None
         if self._client_edges:
             call = self._client_calls[input.request_id] = ClientCall(ended=set(input.ends))
-            stream_items = self._framed(call, stream_items, call.ended)
+            stream_items = self._framed(call, stream_items, call.ended, per_frame=False)
             self._charge_stream_items(call, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
         if stream_items:
@@ -891,7 +891,7 @@ class PreprocessWorkerThread:
                 items.setdefault(name, []).append(torch.from_numpy(audio))
             items = self._without_ended_streams(call, chunk, items)
             ending = chunk.ends - call.ended
-            items = self._framed(call, items, ending)
+            items = self._framed(call, items, ending, per_frame=True)
             self._charge_stream_items(call, items)
             items = {name: tensors for name, tensors in items.items() if tensors}
             if items:
@@ -950,12 +950,16 @@ class PreprocessWorkerThread:
             items.setdefault(name, []).append(wav)
         return items
 
-    def _framed(self, call: ClientCall, items: NameToTensorList, ending: Collection[str]) -> NameToTensorList:
+    def _framed(
+        self, call: ClientCall, items: NameToTensorList, ending: Collection[str], per_frame: bool,
+    ) -> NameToTensorList:
         """``items`` with each ClientAudio stream's cut on its consumer's
-        frame: what the stream holds, with the call's tail before it, goes as
-        one item of whole frames and the rest waits for the next append, so
-        every route keeps a live call on the frame grid. A stream that ends
-        here takes its tail along instead."""
+        frame: what the stream holds, with the call's tail before it, goes on
+        in whole frames and the rest waits for the next append, so every
+        route keeps a live call on the frame grid. ``per_frame`` sends an
+        append's frames as an item each, the step a live consumer is built
+        for; an opening clip goes as one item. A stream that ends here takes
+        its tail along, in one item."""
         out = dict(items)
         for name in (items.keys() | set(ending)) & self._client_edges:
             audio = self._client_connections[name].audio
@@ -972,7 +976,12 @@ class PreprocessWorkerThread:
             whole = wav.numel() if name in ending else wav.numel() - wav.numel() % audio.frame_samples
             if whole < wav.numel():
                 call.tails[name] = wav[whole:].clone()
-            out[name] = [wav[:whole]] if whole else []
+            if not whole:
+                out[name] = []
+            elif per_frame and name not in ending:
+                out[name] = list(wav[:whole].split(audio.frame_samples))
+            else:
+                out[name] = [wav[:whole]]
         return out
 
     def _route_client_streams(self, body: ClientStreamRoute) -> None:
