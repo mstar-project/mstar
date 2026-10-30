@@ -312,6 +312,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        subgroups during weight load and warmup; serving keeps PyTorch's default.
        Unset keeps PyTorch's default throughout. Raise it only where weight load,
        JIT or CUDA-graph capture can exceed that default.
+   * - ``weight_update_timeout_s``
+     - *(optional, default 600)* How long the conductor waits for every worker rank to
+       answer one step of a pause or in-place weight update (confirming it is idle,
+       checking the checkpoint, copying it, reporting its version). A rank that does
+       not answer fails the step, and the deployment stays paused.
    * - ``tp_allreduce``
      - *(optional)* Small-message all-reduce path of every TP and SP group:
        ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
