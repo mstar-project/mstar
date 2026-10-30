@@ -168,28 +168,15 @@ def gather_shrink_reference(
     h = a[slots, :, ids.clamp(0, vocab - 1)]  # [T, slices * R]
     return torch.where(live[:, None], h, torch.zeros((), dtype=h.dtype, device=h.device))
 
-class TorchLoraBackend(LoraBackend):
-    """The plain-torch reference (``shrink_reference`` / ``expand_reference_``), called
-    directly: the custom ops in ``ops.py`` register the same functions as their default
-    kernel, and Triton's over them on CUDA, so this is the one that never dispatches to a
-    GPU kernel. Fine for a reference and for small pools."""
-
-    def shrink(self, x, a, addressing, ranks, num_slices=1):
-        return shrink_reference(x, a, addressing.token_order, addressing.slot_indptr, ranks, num_slices)
-
-    def expand_fused(self, h, b, addressing, ranks, scalings, y, out_slices):
-        expand_reference_(
-            y, h, b, addressing.token_order, addressing.slot_indptr, ranks, scalings, list(out_slices),
-        )
-
-
 def make_backend(kind: str, device: torch.device) -> LoraBackend:
-    if kind == "auto":
-        kind = "triton" if device.type == "cuda" else "torch"
-    if kind == "torch":
-        return TorchLoraBackend()
-    if kind == "triton":
-        from mstar.engine.resources.lora.triton_backend import TritonLoraBackend
+    """The custom ops (``ops.LoraOpsBackend``) on every device, so ``torch.compile`` takes
+    each kernel as one opaque node. ``"triton"`` (``"auto"`` on CUDA) registers the Triton
+    kernels for them; ``"torch"`` leaves the reference kernel, which a deployment's pools
+    then all run, since they share one ``lora:`` block."""
+    if kind not in ("auto", "torch", "triton"):
+        raise ValueError(f"unknown LoRA backend {kind!r}; expected auto, torch or triton")
+    if kind == "triton" or (kind == "auto" and device.type == "cuda"):
+        import mstar.engine.resources.lora.triton_backend  # noqa: F401  (registers the kernels)
+    from mstar.engine.resources.lora.ops import LoraOpsBackend
 
-        return TritonLoraBackend()
-    raise ValueError(f"unknown LoRA backend {kind!r}; expected auto, torch or triton")
+    return LoraOpsBackend()

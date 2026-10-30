@@ -1067,9 +1067,9 @@ reads stable addresses; a replay's padding rows address the zero adapter and its
 tokens no slot. The pool admits and plans on the GPU thread only (no pre-plan), in step
 order, and every write it makes to the device (an adapter load, the addressing) goes on
 the stream the forwards run on, so a load into a slot lands after every step queued
-before it. ``backend`` picks the kernels: ``"triton"`` (slot-grouped shrink and expand,
-the default on CUDA) or ``"torch"`` (a reference with no data-dependent shapes, the
-default elsewhere).
+before it. ``backend`` picks the kernels behind the custom ops, which every device runs:
+``"triton"`` (slot-grouped shrink and expand, the default on CUDA) or ``"torch"`` (a
+reference with no data-dependent shapes, the default elsewhere).
 
 Under tensor parallelism each rank of the node's lockstep instance keeps its own pool and
 makes its own slot decisions, with nothing journalled from rank 0, and they come out the
