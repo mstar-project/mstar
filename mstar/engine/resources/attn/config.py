@@ -63,6 +63,9 @@ class AttentionSpec(NodeResourceSpec):
         # be the same KVConfig the KV resource holds
         return {self.config.kv_cache}
 
+    def combined_splits(self) -> tuple[CombinedSplit, ...]:
+        return self.config.splits
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.attn.base import AttentionManager

@@ -45,6 +45,10 @@ import time
 import numpy as np
 import requests as http_requests
 
+# iter_lines rejoins a line from its chunks, so its 512 B default is quadratic in
+# the line length; a V-JEPA 2-AC rollout line is several MiB.
+_NDJSON_CHUNK_BYTES = 1 << 20
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -103,7 +107,7 @@ def _send_pi05(url: str, req_input) -> tuple[bytes | None, float]:
             raw_bytes = base64.b64decode(chunks[0]["data"])
     else:
         # Streaming: parse NDJSON lines
-        for line in resp.iter_lines():
+        for line in resp.iter_lines(chunk_size=_NDJSON_CHUNK_BYTES):
             if not line:
                 continue
             try:
@@ -141,7 +145,7 @@ def _send_vjepa2_ac(url: str, req_input) -> tuple[list[bytes], float]:
     latency_first = None
     chunks = []
 
-    for line in resp.iter_lines():
+    for line in resp.iter_lines(chunk_size=_NDJSON_CHUNK_BYTES):
         if not line:
             continue
         try:

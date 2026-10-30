@@ -6,6 +6,7 @@ from typing import Any
 
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
+from mstar.engine.resources.recurrent.config import RecurrentStateSpec
 from mstar.engine.resources.runner import topo_sort
 from mstar.engine.resources.spec import (
     TOP_LEVEL_KV_CACHE,
@@ -107,6 +108,10 @@ def _unskippable_resources(
     A hit takes the front of a request away from every resource on the node,
     not just the ones that answered the probe, so one that cannot account for
     tokens it never saw would plan its step against a sequence that never ran.
+    A recurrent pool restores its state from snapshots instead, when every
+    resource over it writes them, and such a resource plans against what the
+    pools restore. The engine keeps the node's caches shut where a pool keeps
+    no snapshots.
     """
     declared = set(keyed_labels(model))
     if not declared:
@@ -115,9 +120,17 @@ def _unskippable_resources(
         node for spec in specs if spec.resource_key in declared
         for node in spec.nodes
     }
+    pools = {spec.resource_key for spec in specs if isinstance(spec, RecurrentStateSpec)}
+    readers = {key: [spec for spec in specs if key in spec.depends_on()] for key in pools}
     for spec in specs:
         shared = spec.nodes & cached_nodes
         if not shared or spec.resource_class.prefix_skip_safe:
+            continue
+        if spec.resource_key in pools and readers[spec.resource_key] and all(
+            reader.writes_prefix_snapshots for reader in readers[spec.resource_key]
+        ):
+            continue
+        if spec.depends_on() and spec.depends_on() <= pools and spec.writes_prefix_snapshots:
             continue
         yield (
             f"resource {spec.resource_key!r} cannot serve a request whose "

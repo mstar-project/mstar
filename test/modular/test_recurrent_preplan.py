@@ -57,6 +57,7 @@ def pool_spec() -> RecurrentStateSpec:
                 ),
             },
             max_slots=16,
+            labels=("main", "draft"),
         ),
     )
 

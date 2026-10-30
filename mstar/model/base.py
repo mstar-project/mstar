@@ -509,11 +509,14 @@ class Model(ABC):
     # Request keys that set an output length. A request that sets one is refused when it
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
+    # Request keys the conductor reads for every model, never logged as ignored.
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache")
 
     # Intra-op threads for the API server's preprocessing of this model's
-    # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
-    # default of one per core; ``preprocess_torch_threads`` in the model's
-    # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
+    # inputs (``load_image``, ``process_prompt``, ...). None takes a default
+    # sized from the CPUs the process may use; ``preprocess_torch_threads`` in
+    # the model's config.yaml overrides either. See
+    # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
 
     def _get_worker_graphs_for_graph_walk(
@@ -931,6 +934,10 @@ class Model(ABC):
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
 
+        An image or video artifact encodes on the API server's pool, beside the
+        data worker's inline calls for the request's other outputs, so an
+        override must not keep state across calls.
+
         Modality to expected encoding type:
         - text: utf-8
         - image: png
@@ -987,8 +994,8 @@ class Model(ABC):
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an
         OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key named in the ``X-MStar-Ignored-Params`` response header.
-        None (the default) declares nothing, so nothing is reported.
+        and the key logged as ignored. None (the default) declares nothing, so
+        nothing is logged.
         """
         return None
 
