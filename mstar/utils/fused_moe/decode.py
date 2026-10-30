@@ -49,11 +49,35 @@ _H100 = _Tuning(
 )
 
 
+# GLM-5.2's experts (hidden 6144, 256 experts of 256) on an H200, from a sweep that reads every
+# call's weights from HBM: the per-pair winner per token count up to 8, the grouped kernels from 9.
+_H200_GLM52 = _Tuning(
+    pair_max_tokens=8,
+    gate_up=((1, dict(bj=8, bk=512, bjs=32, bks=256, warps=2)),
+             (2, dict(bj=16, bk=512, bjs=32, bks=256, warps=4)),
+             (3, dict(bj=8, bk=1024, bjs=32, bks=256, warps=4)),
+             (4, dict(bj=16, bk=256, bjs=16, bks=256, warps=4)),
+             (5, dict(bj=8, bk=1024, bjs=32, bks=256, warps=4)),
+             (6, dict(bj=8, bk=512, bjs=32, bks=128, warps=4)),
+             (None, dict(bj=16, bk=256, bjs=16, bks=256, warps=4))),
+    down=((1, dict(bn=16, bc=256, warps=8)),
+          (2, dict(bn=32, bc=128, warps=4)),
+          (3, dict(bn=16, bc=256, warps=8)),
+          (4, dict(bn=32, bc=256, warps=8)),
+          (None, dict(bn=32, bc=128, warps=4))),
+    router=_H200.router,
+)
+_GLM52_EXPERTS = (6144, 256, 256)  # (hidden, experts, intermediate)
+
+
 @functools.cache
-def _tuning(device: torch.device) -> _Tuning:
-    """The H100 table on an H100, the H200 one everywhere else."""
+def _tuning(device: torch.device, experts: tuple[int, int, int] | None = None) -> _Tuning:
+    """The H100 table on an H100; elsewhere the H200 one, or GLM-5.2's at its ``experts``
+    shape, ``(hidden, experts, intermediate)``."""
     if device.type == "cuda" and "H100" in torch.cuda.get_device_name(device):
         return _H100
+    if experts == _GLM52_EXPERTS:
+        return _H200_GLM52
     return _H200
 
 
@@ -678,7 +702,7 @@ def experts(x, w13, s13, w2, s2, shared_w13, shared_w2, topk_w, topk_ids, *,
     experts per token. ``swiglu_limit`` clamps gate from above and up to +-limit before the
     SwiGLU; None: no clamp. Above ``pair_max_tokens`` tokens ``x`` must be bf16."""
     _check_experts(x, w13, s13, w2, s2, shared_w13, shared_w2, block_size)
-    tuning = _tuning(x.device)
+    tuning = _tuning(x.device, (x.shape[1], w13.shape[0], w13.shape[1] // 2))
     buf = _expert_buffers(x, topk_ids.shape[1], w13.shape[0], w13.shape[1] // 2,
                           tuning.pair_max_tokens)
     if x.shape[0]:
@@ -702,7 +726,7 @@ def forward(x, gate_w, bias, w13, s13, w2, s2, shared_w13, shared_w2, *, top_k, 
     assert gate_w.is_contiguous()
     T, H = x.shape
     _check_router_tokens(T)
-    tuning = _tuning(x.device)
+    tuning = _tuning(x.device, (H, w13.shape[0], w13.shape[1] // 2))
     part = torch.empty(_router_split(H, tuning)[0], T, gate_w.shape[0], dtype=torch.float32,
                        device=x.device)
     topk_w = torch.empty(T, top_k, dtype=torch.float32, device=x.device)
