@@ -340,8 +340,8 @@ class Allotment:
     """Pages an admitted request may take from free and evictable pages: the pages it asked for, less the
     cache hits another request holds. Nothing is taken off for a guaranteed request. ``remaining`` is its
     share of `KVManager._unused`, and ``prompt`` is the pages it asked for, which `unreserve` puts back in
-    `_asks`. An allotment for a request on the host covers its reload, and ``returning`` is the pages
-    beyond it, which the reload leaves on top of what the request then holds."""
+    `_asks`. An allotment for a request on the host covers its reload, and ``returning`` is set while the
+    request returns from the host: the pages it may take beyond its reload."""
     pages: int
     remaining: int = 0
     prompt: int = 0
@@ -3452,9 +3452,9 @@ class KVManager(AttentionResource):
         return needed
 
     def _return_pages(self, rid: str) -> int:
-        """The pages a request that asks again after its move to the host is allotted beyond what it reloads,
-        or 0 for any other request. Its whole allotment is its prompt or, when larger, the sum of `_one_more`
-        over each stream's reloaded pages, as a drop counts the request's history."""
+        """Pages a request returning from the host may take beyond its reload, 0 for any other: the larger of its
+        prompt and its reload plus a page per stream (`_one_more`, as a drop counts a history), less the
+        reload."""
         prompt = self._asks.get(rid)
         if prompt is None:
             return 0
@@ -4171,17 +4171,13 @@ class KVManager(AttentionResource):
     # Preemption
 
     def preempt(self, rid: str, pages_short: int, droppable: Callable[[str], bool]) -> list[str] | None:
-        """Choose the requests to move off the device so that ``rid`` gets the ``pages_short`` pages its grant ran
-        short of, and earmark the pages they free for ``rid``.
+        """Choose newer requests to move off the device for ``rid``'s shortage of ``pages_short`` pages, newest
+        first, and earmark what they free for ``rid``. A victim the host can take whole moves there
+        (`moves_to_host`), and any other is dropped, once ``droppable`` says its launched steps allow it.
 
-        The victims are the newest requests that arrived after ``rid`` and aren't already victims, taken until
-        their moves cover the shortage. A victim the host can take whole moves there, and `moves_to_host` returns
-        True for it. Any other victim is dropped. When the newer requests that aren't victims free less than the
-        shortage, return ``[rid]`` alone with no earmark if moving ``rid`` frees pages and no newer victim is still
-        to move. Otherwise return an empty list, and ``rid`` waits until the room grows. It also returns an empty
-        list when pages released since the grant ran short cover the shortage, and while ``rid`` or a victim chosen
-        for it hasn't moved yet. None when the pool doesn't decide or ``rid`` has no arrival number. ``droppable``
-        returns whether a request can be dropped once the steps it has launched land.
+        Returns the victims, or ``[rid]`` when only moving ``rid`` itself frees pages, or ``[]`` while ``rid``
+        waits for room or for its earlier victims to move. None when the pool doesn't decide or ``rid`` has no
+        arrival number.
         """
         if not self._decides:
             return None
