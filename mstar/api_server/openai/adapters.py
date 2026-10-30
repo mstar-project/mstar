@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
+from mstar.api_server.openai import glm_chat
 from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
@@ -321,6 +322,11 @@ class OpenAIAdapter:
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
         # emits text, whereas BAGEL chat is text-only.
         raise NotImplementedError("chat is not supported by this model")
+
+    def make_output_parser(self, req: ChatCompletionRequest):  # noqa: ARG002
+        """A parser for a chat reply with structure inside its text (reasoning,
+        tool calls), or None to return the text as ``content``."""
+        return None
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("audio/speech is not supported by this model")
@@ -1512,9 +1518,12 @@ class TextChatAdapter(OpenAIAdapter):
     applies its own chat template; sampling fields reach it as model_kwargs."""
 
     supports_chat = True
+    # a subclass whose output parser splits tool calls out of the reply serves them
+    serves_tool_calls = False
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
+        if not self.serves_tool_calls:
+            _refuse_tool_calls(req)
         text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
         # an image or audio part was decoded to disk and then dropped: the model
         # answered as if it had seen it
@@ -1553,6 +1562,73 @@ class TextChatAdapter(OpenAIAdapter):
             model_kwargs=mk,
             prompt_parts=parts,
         )
+
+
+class GlmChatAdapter(TextChatAdapter):
+    """GLM-5.2 / GLM-5.3: the messages with their roles, and ``tools``, go to
+    the checkpoint's chat template; the reply comes back with
+    ``reasoning_content`` and ``tool_calls`` split out (see ``glm_chat``).
+
+    ``tool_choice`` is ``"auto"`` (default) or ``"none"``, which leaves the tools
+    out of the prompt; ``"required"`` and a named function need constrained
+    decoding and are refused. ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always
+    reasons, and turning it off is a 400), ``reasoning_effort`` and
+    ``clear_thinking`` reach the template, flat in ``extra_body`` or under
+    ``chat_template_kwargs``; other template keys are dropped, as vLLM drops the
+    ones a template does not read.
+    """
+
+    serves_tool_calls = True
+
+    def __init__(self, *, always_thinks: bool):
+        self.always_thinks = always_thinks
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        # flatten_messages refuses a tool turn; the template takes each turn's role
+        # from template_messages below, so the base checks read a tool result as user text
+        checked = req.model_copy(update={"messages": [
+            m.model_copy(update={"role": "user"}) if m.role == "tool" else m for m in req.messages
+        ]})
+        args = super().chat_to_request(checked, upload_dir)
+        mk = args.model_kwargs
+        tools, template_kwargs = self._options(mk)
+        thinking = template_kwargs.get("enable_thinking")
+        if self.always_thinks and thinking is not None and not thinking:
+            # the template has no switch, so off would still reason
+            raise ValueError("this model always reasons; enable_thinking cannot turn it off")
+        mk["messages"] = glm_chat.template_messages(req.messages)
+        if tools:
+            mk["tools"] = tools
+        mk["chat_template_kwargs"] = template_kwargs
+        return args
+
+    def make_output_parser(self, req: ChatCompletionRequest):
+        tools, template_kwargs = self._options(_passthrough(req))
+        # truthiness, as the GLM-5.2 template reads it
+        thinking = self.always_thinks or bool(template_kwargs.get("enable_thinking", True))
+        return glm_chat.GlmReplyParser(
+            thinking=thinking, tools=glm_chat.tool_parameters(tools) if tools else None,
+        )
+
+    @staticmethod
+    def _options(mk: dict) -> tuple[list | None, dict]:
+        """Takes ``tools``, ``tool_choice`` and the template's keys out of ``mk``."""
+        tools = mk.pop("tools", None) or None
+        choice = mk.pop("tool_choice", None)
+        if choice not in (None, "auto", "none"):
+            raise ValueError(f"tool_choice {choice!r} needs constrained decoding; use 'auto' or 'none'")
+        if tools is not None:
+            glm_chat.tool_parameters(tools)
+            if choice == "none":
+                tools = None
+        template_kwargs = mk.pop("chat_template_kwargs", None) or {}
+        if not isinstance(template_kwargs, dict):
+            raise ValueError("chat_template_kwargs must be an object")
+        template_kwargs = {k: v for k, v in template_kwargs.items() if k in glm_chat.TEMPLATE_KWARGS}
+        for key in glm_chat.TEMPLATE_KWARGS:
+            if key in mk:
+                template_kwargs.setdefault(key, mk.pop(key))
+        return tools, template_kwargs
 
 
 class OmnilingualASRAdapter(OpenAIAdapter):
@@ -1637,8 +1713,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
-    "glm52": TextChatAdapter(),
-    "glm5_next": TextChatAdapter(),
+    "glm52": GlmChatAdapter(always_thinks=False),
+    "glm5_next": GlmChatAdapter(always_thinks=True),
 }
 
 # One key per size; every size takes the same adapter.

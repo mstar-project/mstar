@@ -50,6 +50,7 @@ from mstar.model.glm5_next.config import (
     Glm5NextModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import ByteIdDetokenizer, ByteLevelDetokenizer, TextOutput
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -80,6 +81,9 @@ class Glm5NextModel(Model):
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # read only by process_prompt's template, and kept off the conductor's wire,
+    # which cannot carry every number a tool schema may hold (2**64)
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs")
 
     def __init__(
         self,
@@ -131,7 +135,6 @@ class Glm5NextModel(Model):
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
-        self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     @property
@@ -449,15 +452,24 @@ class Glm5NextModel(Model):
             vocab = self.config.vocab_size
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        # The checkpoint's chat template: [gMASK]<sop> + assistant turn.
+        # The checkpoint's chat template over the chat API's messages, tools and
+        # template switches (GlmChatAdapter); a bare prompt is one user turn.
         elif getattr(self.tokenizer, "chat_template", None):
+            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
+            if not isinstance(messages, list):
+                raise ValueError("messages must be a list of chat messages")
+            # the template's switches only: others collide with apply_chat_template's own
+            switches = {k: v for k, v in (kwargs.get("chat_template_kwargs") or {}).items()
+                        if k in ("enable_thinking", "reasoning_effort", "clear_thinking")}
             input_ids = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
+                messages,
+                tools=kwargs.get("tools"),
                 add_generation_prompt=True,
                 return_tensors="pt",
                 # transformers 5.x defaults return_dict=True (a BatchEncoding);
                 # keep the bare-tensor return so [0] selects the row
                 return_dict=False,
+                **switches,
             )[0]
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
@@ -517,6 +529,22 @@ class Glm5NextModel(Model):
     # Model ABC: postprocess
     # -------------------------------------------------------------------
 
+    # built on first use: the tokenizer it reads loads lazily
+    _text_output: TextOutput | None = None
+
+    def text_output(self) -> TextOutput:
+        if self._text_output is None:
+            # Synthetic reduced models emit byte ids, which never touch the HF
+            # tokenizer. Otherwise the tokens' raw bytes (byte-level BPE), so a
+            # character split across tokens reaches the client whole, where decoding
+            # each token alone gives U+FFFD; special tokens drop, as with
+            # skip_special_tokens.
+            detokenizer = (
+                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
+            )
+            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+        return self._text_output
+
     def postprocess(
         self,
         output: torch.Tensor,
@@ -524,19 +552,7 @@ class Glm5NextModel(Model):
         **kwargs,
     ) -> bytes:
         if modality == "text":
-            token_ids = output.flatten().tolist()
-            if self._tokenizer_mode == "byte":
-                # Synthetic reduced models emit arbitrary byte ids; never
-                # touch the HF tokenizer.
-                return bytes((t & 0xFF) for t in token_ids)
-            # The tokens' raw bytes (byte-level BPE): a character split across
-            # tokens reaches the client whole, where decoding each token alone
-            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
-            if self._detokenizer is None:
-                from mstar.model.utils import ByteLevelDetokenizer
-
-                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(token_ids)
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for GLM-5.3-Flash: {modality!r}")
 
     # -------------------------------------------------------------------

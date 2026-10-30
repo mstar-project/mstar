@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Container
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -186,6 +186,32 @@ def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
                 os.unlink(path)
             except OSError:
                 pass
+
+
+def _text_usage(tokens: torch.Tensor, stop_ids, prompt_tokens: int | None) -> dict:
+    """A text chunk's share of the API's usage: its token count, the prompt's,
+    and whether it ends on a stop token (the last chunk's says why the reply ended)."""
+    usage = {"tokens": tokens.numel()}
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+    if stop_ids is not None and tokens.numel():
+        # tolist keeps the GIL; a torch op (flatten, indexing, int) releases it, and with the
+        # event loop busy each release waits out the switch interval (~5 ms) to get it back
+        last = tokens.tolist()
+        while isinstance(last, list):
+            last = last[-1]
+        usage["stop_token"] = last in stop_ids
+    return usage
+
+
+def _token_usage(value: int, stop_ids, prompt_tokens: int | None) -> dict:
+    """``_text_usage`` of one inline token, without a tensor."""
+    usage = {"tokens": 1}
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+    if stop_ids is not None:
+        usage["stop_token"] = value in stop_ids
+    return usage
 
 
 def _preprocess_loop(**kwargs):
@@ -520,6 +546,8 @@ class RequestOutputState:
     # A video_frame chunk can carry several frames, so this advances by
     # frame_count rather than chunks.
     frame_index: int = 0
+    # the prompt's token count, for the API's usage
+    prompt_tokens: int | None = None
 
 
 class PreprocessWorkerThread:
@@ -772,7 +800,10 @@ class PreprocessWorkerThread:
         initial_signals = self._store_persisted(input.request_id, tensors)
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        prompt_ids = tensors.get("text_inputs") if self.model is not None else None
+        self.request_output_state[input.request_id] = RequestOutputState(
+            prompt_tokens=sum(t.numel() for t in prompt_ids) if prompt_ids else None,
+        )
         if input.ends:
             self._ended_streams[input.request_id] = set(input.ends)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
@@ -1205,6 +1236,14 @@ class PreprocessWorkerThread:
             state.order[tensor_info.uuid] = (state.next_sequence, result.loop_indices)
             state.next_sequence += 1
 
+    @cached_property
+    def _text_stop_ids(self) -> Container[int] | None:
+        """The ids that end a text reply, as the model's ``text_output`` declares
+        them, read on the first text chunk. None for a model that names none,
+        whose replies are all reported as stopped."""
+        text = self.model.text_output() if self.model is not None else None
+        return (text.stop_token_ids or None) if text is not None else None
+
     def _emit_inline_tokens(self, item: InlineTokens) -> None:
         """Postprocess a frame's inline values in one model call and queue each
         request's chunk, in arrival order with its tensor results."""
@@ -1222,6 +1261,7 @@ class PreprocessWorkerThread:
             # so a failure fails only the request it belongs to
             datas = None
         states = self.request_output_state
+        is_text = item.modality == "text"
         for i, request_id in enumerate(rids):
             state = states.get(request_id)
             if state is None:
@@ -1235,11 +1275,14 @@ class PreprocessWorkerThread:
                     )[0]
                 else:
                     data = datas[i]
+                metadata = _token_usage(
+                    values[i], self._text_stop_ids, state.prompt_tokens,
+                ) if is_text else {}
                 self._queue_completed_output(
                     request_id,
                     sequence,
                     ResultChunk(
-                        request_id=request_id, modality=item.modality, data=data, metadata={},
+                        request_id=request_id, modality=item.modality, data=data, metadata=metadata,
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1311,6 +1354,12 @@ class PreprocessWorkerThread:
             )
 
         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
+        if modality == "text" and self.model is not None:
+            chunk_metadata = {
+                **chunk_metadata,
+                **_text_usage(tensor, self._text_stop_ids,
+                              self.request_output_state[request_id].prompt_tokens),
+            }
         # Audio is emitted as headerless 16-bit PCM; surface the
         # model's output sample rate + channel count so clients can
         # wrap it.

@@ -317,7 +317,8 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
-    out_bytes = model.postprocess(torch.tensor(generated), "text")
+    # with the request's ignore_eos, as the data worker passes it: an end-of-turn id is text too
+    out_bytes = model.postprocess(torch.tensor(generated), "text", request_kwargs={"ignore_eos": True})
     assert isinstance(out_bytes, bytes)
     assert len(out_bytes) == len(generated)  # byte mode: 1 byte per id
 
