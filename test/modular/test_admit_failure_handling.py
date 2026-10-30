@@ -24,7 +24,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-from test_micro_scheduler import MIXED, _combined_scheduler, _Engine, _Manager, _next_batch, _scheduler
+from test_micro_scheduler import MIXED, _combined_scheduler, _Engine, _Manager, _next_batch, _over, _scheduler
 from test_micro_scheduler import NODE as SCHED_NODE
 from test_micro_scheduler import WALK as SCHED_WALK
 
@@ -350,7 +350,8 @@ def _refusing_loop(fits: int, ready: int, cap: int, passes: int, sized: bool = T
     manager = _Manager([f"r{i}" for i in range(ready)])
     worker = _HoldingWorker()
     worker.scheduler = sched
-    worker._graph_runtime = manager.runtime
+    _over(sched, manager)
+    worker._graph_runtime = sched.runtime
     refused = []
     for _ in range(passes):
         batch = _next_batch(sched, manager)
@@ -401,7 +402,7 @@ def test_an_admitted_step_lifts_the_limit():
 
     sched.clear_batch_limit(SCHED_NODE, SCHED_WALK, len(admitted))
 
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 16
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 16
 
 
 def test_the_limit_never_drops_below_one_row():
@@ -409,7 +410,7 @@ def test_the_limit_never_drops_below_one_row():
     sched.limit_batch(SCHED_NODE, SCHED_WALK, 0)
     sched.cap_batch(SCHED_NODE, SCHED_WALK, 0)
 
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 1
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 1
 
 
 def test_a_refused_batch_below_its_cap_is_not_limited():
@@ -422,7 +423,8 @@ def test_a_refused_batch_below_its_cap_is_not_limited():
     manager = _Manager([f"d{i}" for i in range(9)])
     worker = _HoldingWorker()
     worker.scheduler = sched
-    worker._graph_runtime = manager.runtime
+    _over(sched, manager)
+    worker._graph_runtime = sched.runtime
     batch = _next_batch(sched, manager)
     rids = list(batch.request_to_worker_graph)
     assert len(rids) == 9
@@ -450,7 +452,8 @@ def test_a_mixed_step_held_under_its_cap_by_row_caps_is_limited():
     )
     worker = _HoldingWorker()
     worker.scheduler = sched
-    worker._graph_runtime = manager.runtime
+    _over(sched, manager)
+    worker._graph_runtime = sched.runtime
     batch = _next_batch(sched, manager)
     rids = list(batch.request_to_worker_graph)
     assert batch.graph_walk == MIXED and len(rids) == 2
@@ -496,7 +499,8 @@ def test_a_batch_the_pool_cannot_hold_alone_is_capped_not_evicted_for():
     manager = _Manager([f"p{i}" for i in range(48)])
     worker = _EvictingWorker(holders=[f"d{i}" for i in range(4)])
     worker.scheduler = sched
-    worker._graph_runtime = manager.runtime
+    _over(sched, manager)
+    worker._graph_runtime = sched.runtime
     sizes = []
     for _ in range(8):
         batch = _next_batch(sched, manager)
@@ -518,13 +522,13 @@ def test_a_batch_the_pool_cannot_hold_alone_is_capped_not_evicted_for():
     )
 
     sched.clear_batch_limit(SCHED_NODE, SCHED_WALK, 11)
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 15
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 15
     sched.clear_batch_limit(SCHED_NODE, SCHED_WALK, 15)
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 15, (
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 15, (
         "a step at the cap lifted it, so the next full batch is refused again"
     )
     sched.clear_batch_limit(SCHED_NODE, SCHED_WALK, 3)
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 16
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 16
 
 
 def test_a_batch_too_big_alone_still_evicts_its_own_rows():
@@ -592,8 +596,8 @@ def test_could_refill_counts_the_rows_that_could_run_in_the_retry():
     manager = _Manager(
         ["b0", "b1", "w0", "failed", "held", "gone", "off", "p0"], walks={"p0": "prefill"},
     )
-    sched.runtime = manager.runtime
-    manager.runtime.combined_walk_of = sched.combined_walk_of
+    _over(sched, manager)
+    sched.runtime.combined_walk_of = sched.combined_walk_of
     sched.failed_rids.add("failed")
     sched.hold_requests(["held"])
     sched.pending_removes = {"gone": None}
@@ -836,7 +840,8 @@ def test_a_batch_too_big_alone_that_evicts_its_own_row_is_capped():
     manager = _Manager(rids_all)
     worker = _EvictingWorker(holders=rids_all)
     worker.scheduler = sched
-    worker._graph_runtime = manager.runtime
+    _over(sched, manager)
+    worker._graph_runtime = sched.runtime
     sizes = []
     for _ in range(8):
         batch = _next_batch(sched, manager)

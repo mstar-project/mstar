@@ -158,14 +158,14 @@ WALK = "decode"
 
 
 def _setup(rids=("r0", "r1")):
+    queue = _FakeQueue(rids, NODE)
+    manager = _FakeRequestStateManager(queue)
     sched = MicroScheduler(
         engine_manager=_FakeEngineManager(),
+        runtime=manager.runtime,
         # Follower role: NODE is parallel here but this rank does not lead it.
         parallel_leader_nodes=set(),
     )
-    queue = _FakeQueue(rids, NODE)
-    manager = _FakeRequestStateManager(queue)
-    sched.runtime = manager.runtime
     return sched, manager
 
 

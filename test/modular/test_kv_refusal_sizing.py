@@ -23,7 +23,7 @@ from test_admit_failure_handling import (
     _EvictingWorker,
     _SchedEngine,
 )
-from test_micro_scheduler import _Manager, _next_batch, _scheduler
+from test_micro_scheduler import _Manager, _next_batch, _over, _scheduler
 from test_worker_drain import _worker as _teardown_worker
 
 from mstar.engine.engine import Engine
@@ -372,7 +372,8 @@ def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under()
     batch = _next_batch(sched, manager)
     assert list(batch.request_to_worker_graph) == long_rows
     refuser = _EvictingWorker(holders=long_rows)
-    refuser.scheduler, refuser._graph_runtime = sched, manager.runtime
+    _over(sched, manager)
+    refuser.scheduler, refuser._graph_runtime = sched, sched.runtime
     refuser._handle_allocation_failure(batch, SimpleNamespace(
         node_name=SCHED_NODE, failed_resource="kv", admit_error=outcome.reason,
     ))
@@ -385,7 +386,7 @@ def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under()
         manager.in_flight.clear()
         for rid in step:
             manager.ingest(rid)
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 15
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 15
 
     worker = _teardown_worker(known_rids=long_rows)
     worker.scheduler, worker.engine_manager = sched, _engine_manager(kv=pool)
@@ -394,7 +395,7 @@ def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under()
     manager.queues["wg0"]._ready.pop("d1", None)
 
     assert pool._arena.num_free == free + 3
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 16, (
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 16, (
         "the cap outlived a teardown that handed its pool's pages back"
     )
     assert len(_next_batch(sched, manager).request_to_worker_graph) == 16
@@ -419,10 +420,10 @@ def test_a_teardown_that_frees_none_of_the_capping_pool_leaves_the_cap():
     _remove(worker, "a", "b")
 
     assert self_kv._arena.num_free == free, "the teardown did not run"
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 15, (
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 15, (
         "a teardown that freed none of the cross pool lifted its cap"
     )
 
     assert _admit(cross_kv, {"c": 2 * PAGE_SIZE}, commit=True).ok
     _remove(worker, "c")
-    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 16
+    assert sched.keys.max_batch_size(SCHED_NODE, SCHED_WALK) == 16

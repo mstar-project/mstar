@@ -154,9 +154,10 @@ class _FakeRequestStateManager:
         return None
 
 
-def _sched(engine=None):
+def _sched(engine=None, manager=None):
     sched = MicroScheduler(
         engine_manager=_FakeEngineManager(engine or _FakeEngine()),
+        runtime=None if manager is None else manager.runtime,
         parallel_leader_nodes=set(),  # follower role
     )
     return sched
@@ -172,10 +173,9 @@ def _head(rids, seq=5, from_seq=4):
 # ---------------------------------------------------------------- pop_ready_rids
 
 def test_pop_ready_rids_pops_exactly_the_named_set():
-    sched = _sched()
     queue = _FakeQueue(["r0", "r1", "r2"])
     manager = _FakeRequestStateManager(queue)
-    sched.runtime = manager.runtime
+    sched = _sched(manager=manager)
 
     popped = sched.pop_ready_rids(manager, NODE, WALK, ["r1", "r2"])
     assert popped is not None
@@ -190,10 +190,9 @@ def test_pop_ready_rids_pops_exactly_the_named_set():
 
 
 def test_pop_ready_rids_is_all_or_nothing_on_graph_readiness():
-    sched = _sched()
     queue = _FakeQueue(["r0"], not_ready_rids=["r1"])
     manager = _FakeRequestStateManager(queue)
-    sched.runtime = manager.runtime
+    sched = _sched(manager=manager)
 
     assert sched.pop_ready_rids(manager, NODE, WALK, ["r0", "r1"]) is None
     # NOTHING was consumed: r0 is still ready for a later attempt.
@@ -202,10 +201,9 @@ def test_pop_ready_rids_is_all_or_nothing_on_graph_readiness():
 
 
 def test_pop_ready_rids_is_all_or_nothing_on_engine_readiness():
-    sched = _sched(_FakeEngine(not_ready=["r1"]))
     queue = _FakeQueue(["r0", "r1"])
     manager = _FakeRequestStateManager(queue)
-    sched.runtime = manager.runtime
+    sched = _sched(_FakeEngine(not_ready=["r1"]), manager=manager)
 
     assert sched.pop_ready_rids(manager, NODE, WALK, ["r0", "r1"]) is None
     assert NODE in queue.per_request_queues["r0"].ready_node_names
@@ -213,9 +211,8 @@ def test_pop_ready_rids_is_all_or_nothing_on_engine_readiness():
 
 
 def test_pop_ready_rids_empty_set_is_a_valid_no_op():
-    sched = _sched()
     manager = _FakeRequestStateManager(_FakeQueue(["r0"]))
-    sched.runtime = manager.runtime
+    sched = _sched(manager=manager)
     popped = sched.pop_ready_rids(manager, NODE, WALK, [])
     # edge_specs is a columnar block now, so it is compared by emptiness
     # rather than against a literal.
@@ -229,9 +226,8 @@ def test_serial_tp_follow_path_still_serves_via_shared_pop():
     """Refactor guard: ``_try_schedule_tp_follow`` now goes through
     ``pop_ready_rids``; the observable serial behaviour is unchanged, and the
     batch carries the head's seq."""
-    sched = _sched()
     manager = _FakeRequestStateManager(_FakeQueue(["r0", "r1"]))
-    sched.runtime = manager.runtime
+    sched = _sched(manager=manager)
     sched.register_tp_follow(_head(["r0", "r1"], seq=9))
     batch = sched.get_next_batch(manager)
     assert batch is not None
@@ -241,10 +237,9 @@ def test_serial_tp_follow_path_still_serves_via_shared_pop():
 
 
 def test_serial_tp_follow_waits_when_a_rid_is_not_ready_and_pops_nothing():
-    sched = _sched()
     queue = _FakeQueue(["r0"], not_ready_rids=["r1"])
     manager = _FakeRequestStateManager(queue)
-    sched.runtime = manager.runtime
+    sched = _sched(manager=manager)
     sched.register_tp_follow(_head(["r0", "r1"]))
     assert sched.get_next_batch(manager) is None
     assert NODE in queue.per_request_queues["r0"].ready_node_names
@@ -277,9 +272,8 @@ def test_fifo_accessors_touch_only_the_head_and_keep_order():
 # head pops included, or an abort never completes.
 
 def test_drain_refcount_discharged_by_the_serial_path():
-    sched = _sched()
     manager = _FakeRequestStateManager(_FakeQueue(["r0"]))
-    sched.runtime = manager.runtime
+    sched = _sched(manager=manager)
     sched.register_tp_follow(_head(["r0"]))
     assert sched.pending_tp_follow_count["r0"] == 1
 

@@ -77,7 +77,7 @@ def _worker(known_rids=("r1", "r2")):
     w.scheduler.read_failed_rids = set()
     w.scheduler.held_until = {}
     w.scheduler.admit_errors = {}
-    w.scheduler.backlog = {}
+    w.scheduler._core = SimpleNamespace(drop_rids=lambda rids: None)  # nothing backlogged
     return w
 
 

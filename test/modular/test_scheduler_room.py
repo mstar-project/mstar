@@ -95,9 +95,8 @@ def _setup(walks, max_bs):
     runtime = _Runtime(walks)
     sched = MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine),
-        parallel_leader_nodes={NODE},
+        runtime=runtime, parallel_leader_nodes={NODE},
     )
-    sched.runtime = runtime
     return sched, runtime, _State(runtime)
 
 

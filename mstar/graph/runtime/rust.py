@@ -282,6 +282,10 @@ class RustGraphRuntime(GraphRuntime):
 
     supports_inline_emit = True
 
+    def local_node_walks(self) -> list[tuple[str, str]]:
+        """Every (node, walk) a local worker graph runs."""
+        return self._rust.local_node_walks()
+
     # --------- Bookkeeping ----------
 
     def set_node_metadata(

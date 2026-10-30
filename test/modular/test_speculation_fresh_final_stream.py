@@ -33,6 +33,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler, PopReadyResult, ScheduledBatch  # noqa: E402
+from mstar.worker.sched_core.base import SchedKeys  # noqa: E402
 from mstar.worker.speculation import SpeculationBuilder, SpeculationContext, SpeculationPreparer  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
@@ -157,7 +158,7 @@ def _follower_speculation(final: bool):
             {FRESH: 0}, _fresh_edges(final), ("prev_text",),
         ),
         pop_tp_follow_head=lambda: head,
-        combined_walk_of={},
+        keys=SchedKeys(None),
     )
     scheduler._key = MicroScheduler._key.__get__(scheduler)
     runtime, _ = _runtime()

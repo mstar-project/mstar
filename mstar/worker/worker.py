@@ -578,6 +578,7 @@ class Worker:
 
         self.scheduler = MicroScheduler(
             self.engine_manager,
+            runtime=self._graph_runtime,
             parallel_leader_nodes=self.parallel_leader_nodes,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
@@ -585,7 +586,6 @@ class Worker:
 
         # Request ids are strings on the wire and ints (handles) inside this
         # worker; the runtime holds the table where the two meet.
-        self.scheduler.runtime = self._graph_runtime
         self.scheduler.rid_of = self._rid
         self.tensor_manager.rid_to_str = self._rid_str
 
