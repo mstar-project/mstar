@@ -513,10 +513,7 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
-        node_dtypes: Mapping[str, torch.dtype | None] | None = None,
     ):
-        """``node_dtypes`` is each node's resolved dtype, as the engine manager
-        cast it; a node missing from it resolves against the engine's dtype."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -596,10 +593,8 @@ class Engine:
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
-                node_dtype=(
-                    node_dtypes[node_name] if node_dtypes is not None and node_name in node_dtypes
-                    else resolve_node_dtype(submodule, self._autocast_dtype)
-                ),
+                # the dtype the engine manager cast this node to
+                node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)

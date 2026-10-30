@@ -130,7 +130,6 @@ class EngineManager:
         # return — the latter doubles the load-time VRAM peak. The cast below
         # applies the same resolved dtype, so allocation and runtime agree.
         submodules: dict[str, torch.nn.Module] = {}
-        node_dtypes: dict[str, torch.dtype | None] = {}
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
@@ -153,7 +152,7 @@ class EngineManager:
                 continue
             # the one dtype the load cast and every forward and capture use;
             # None keeps the dtype the node was built in
-            node_dtype = node_dtypes[name] = resolve_node_dtype(submodule, autocast_dtype)
+            node_dtype = resolve_node_dtype(submodule, autocast_dtype)
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
@@ -174,7 +173,6 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
-            node_dtypes=node_dtypes,
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
