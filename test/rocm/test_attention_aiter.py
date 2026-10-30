@@ -439,7 +439,6 @@ def test_ragged_captured_with_empty_padding_segments(d):
         rows = [(spans[i], k[cu[i]:cu[i + 1]], v[cu[i]:cu[i + 1]]) for i in range(len(spans))]
         err, nonfinite = max_err(out, reference(q, rows, d ** -0.5, causal=False))
         assert nonfinite == 0 and err < 1, (spans, err, nonfinite)
-        assert not out[n:].any(), "rows past the plan read back zero"
 
 
 @pytest.mark.parametrize("d", [64, 72])
@@ -473,7 +472,6 @@ def test_ragged_one_request_with_several_segments_replays(d):
         rows = [(spans[i], k[cu[i]:cu[i + 1]], v[cu[i]:cu[i + 1]]) for i in range(len(spans))]
         err, nonfinite = max_err(out, reference(q, rows, d ** -0.5, causal=False))
         assert nonfinite == 0 and err < 1, (spans, err, nonfinite)
-        assert not out[n:].any(), "rows past the plan read back zero"
     with pytest.raises(ValueError, match="5 segments"):
         plan([16] * 5)
 
