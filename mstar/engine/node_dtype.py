@@ -46,16 +46,17 @@ def resolve_node_dtype(
     return submodule.get_autocast_dtype() or model_dtype
 
 
-_current_node: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "mstar_current_node", default=None
+_current_node: contextvars.ContextVar[tuple[str | None, torch.dtype | None]] = (
+    contextvars.ContextVar("mstar_current_node", default=(None, None))
 )
 _warned: set[tuple[str | None, str]] = set()
 
 
 @contextmanager
-def node_scope(node_name: str | None) -> Iterator[None]:
-    """Name the node whose forward runs inside, for ``warn_implicit_downcast``."""
-    token = _current_node.set(node_name)
+def node_scope(node_name: str | None, dtype: torch.dtype | None = None) -> Iterator[None]:
+    """Name the node whose forward runs inside, and its resolved dtype, for
+    ``warn_implicit_downcast``."""
+    token = _current_node.set((node_name, dtype))
     try:
         yield
     finally:
@@ -64,16 +65,19 @@ def node_scope(node_name: str | None) -> Iterator[None]:
 
 def warn_implicit_downcast(op: str, src: torch.dtype, dst: torch.dtype) -> None:
     """Warn once per node and op that ``op`` ran a node's ``src`` input in ``dst``
-    although the node runs without autocast. Silent while dynamo traces, which
-    would graph-break on it; an eager or custom-op caller still reports."""
+    rather than the node's dtype. Silent while dynamo traces, which would
+    graph-break on it; an eager or custom-op caller still reports.
+
+    A custom op inside a compiled forward sees no autocast, so a node that
+    autocasts in ``dst`` lands here too; that is the dtype it asked for."""
     if torch.compiler.is_compiling():
         return
-    node = _current_node.get()
-    if (node, op) in _warned:
+    node, node_dtype = _current_node.get()
+    if node_dtype == dst or (node, op) in _warned:
         return
     _warned.add((node, op))
+    reason = "the node has autocast off" if node_dtype is None else f"the node runs in {node_dtype}"
     logger.warning(
-        "%s runs node %s's %s input in %s: the node has autocast off, and the "
-        "kernel takes no %s",
-        op, node or "<unknown>", src, dst, src,
+        "%s runs node %s's %s input in %s: %s, and the kernel takes no %s",
+        op, node or "<unknown>", src, dst, reason, src,
     )

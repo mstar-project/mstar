@@ -120,7 +120,7 @@ def autocast_scope(dtype: torch.dtype | None, device_type: str, node_name: str |
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
     submodule in its own dtype and shuts out any ambient autocast.
     ``node_name`` names the node in implicit-downcast warnings."""
-    with node_scope(node_name), torch.amp.autocast(
+    with node_scope(node_name, dtype), torch.amp.autocast(
         device_type, enabled=dtype is not None, dtype=dtype or torch.bfloat16
     ):
         yield

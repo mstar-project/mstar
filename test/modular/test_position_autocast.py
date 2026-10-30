@@ -101,3 +101,30 @@ def test_downcast_during_capture_names_the_node(monkeypatch, caplog, static_outp
     warnings = [r.getMessage() for r in caplog.records if r.name == node_dtype.__name__]
     assert len(warnings) == 1
     assert "code2wav" in warnings[0] and "<unknown>" not in warnings[0]
+
+
+def test_downcast_to_the_nodes_own_dtype_does_not_warn(monkeypatch, caplog):
+    """A custom op in a compiled forward sees no autocast, so it takes the
+    no-autocast branch even for a node that autocasts. Landing in the node's
+    own dtype is silent; landing in another dtype still warns."""
+    from mstar.engine import node_dtype
+    from mstar.engine.accelerator_graph_runner import autocast_scope
+
+    monkeypatch.setattr(
+        torch.ops.mstar, "rope_apply_qk_inplace", lambda q, k, *args, **kwargs: None,
+    )
+    monkeypatch.setattr(node_dtype, "_warned", set())
+    manager = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"), max_seq_len=8)
+    manager._current_pos_ids["main"] = torch.arange(1)
+    q = torch.ones((1, 1, 2), dtype=torch.float32)
+
+    with caplog.at_level("WARNING", logger=node_dtype.__name__):
+        for name, dtype in (("llm", torch.bfloat16), ("vocoder", torch.float16), ("code2wav", None)):
+            # the inner scope hides autocast the way a compiled forward hides it from a custom op
+            with autocast_scope(dtype, "cpu", node_name=name), torch.amp.autocast("cpu", enabled=False):
+                manager.apply_qk(q, q.clone(), "main")
+
+    warnings = [r.getMessage() for r in caplog.records if r.name == node_dtype.__name__]
+    assert len(warnings) == 2
+    assert "vocoder" in warnings[0] and "torch.float16" in warnings[0]
+    assert "code2wav" in warnings[1] and "autocast off" in warnings[1]
