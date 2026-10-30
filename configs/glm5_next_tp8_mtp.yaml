@@ -24,9 +24,6 @@ model_kwargs:
   # Capture the prefill per (rows, token bucket); an uncaptured shape runs
   # eager. Adds ~40 s of capture at startup.
   prefill_graphs: true
-  # A prefill step takes prompts up to the largest captured bucket (4096 tokens),
-  # so a burst runs as captured chunks with decode steps between them.
-  prefill_max_step_tokens: "auto"
 # Per-resource overrides, keyed by what get_node_resources declares.
 resources:
   kv_cache:

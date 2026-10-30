@@ -114,9 +114,6 @@ class Glm5NextModel(Model):
         for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
             if kwargs.get(key) is not None:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
-        if kwargs.get("prefill_max_step_tokens") is not None:
-            cap = kwargs["prefill_max_step_tokens"]
-            self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
         # Requests that may hold KDA state at once (the decode batch cap). The
         # pool holds one more slot, its sink; a serve YAML sets the pool's
         # size, sink included, under ``resources: kda_state: {max_slots: N}``.

@@ -211,9 +211,6 @@ class Glm5NextModelConfig:
     prefill_graphs: bool = False
     prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
-    # Most prompt tokens one prefill step takes ("auto": the largest captured bucket), so a
-    # burst runs as captured chunks with decode steps between them. None: no cap.
-    prefill_max_step_tokens: int | str | None = None
 
     # Derived MLA cache geometry: with NoPE the paged cache stores one
     # 512-dim latent per token per FULL layer (kv_lora_rank + 0 rope dims),

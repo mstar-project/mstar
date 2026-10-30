@@ -193,14 +193,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return None
         return max(self.config.prefill_capture_batch_sizes or PREFILL_CAPTURE_BATCH_SIZES)
 
-    def max_step_tokens(self, graph_walk: str) -> int | None:
-        cap = self.config.prefill_max_step_tokens
-        if graph_walk != "prefill" or cap is None:
-            return None
-        if cap == "auto":
-            return max(self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS)
-        return cap
-
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:

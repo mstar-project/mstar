@@ -550,14 +550,6 @@ def test_serve_yaml_pages_cover_the_slot_pool(name):
     assert (kv["max_num_pages"] - 1) * kv["page_size"] >= requests * cfg.kv_rows
 
 
-@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml"])
-def test_serve_yaml_caps_prefill_steps(name):
-    import yaml
-
-    serve = yaml.safe_load((Path(__file__).parents[2] / "configs" / name).read_text())
-    assert serve["model_kwargs"]["prefill_max_step_tokens"] == "auto"
-
-
 def test_glm5next_model_constructs_from_config():
     """The five node resources, full-size and reduced."""
     model = object.__new__(Glm5NextModel)
