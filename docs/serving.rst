@@ -334,8 +334,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        rendezvouses. Default 512.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
-       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
-       overrides it).
+       (default; on AMD GPUs the nodes with ``tp_size`` > 1 default to on) or a
+       list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which overrides it).
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
