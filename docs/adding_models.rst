@@ -536,6 +536,16 @@ three common fields:
   immediately, rather than during a forward pass. ``RaggedAttentionSpec`` is the one
   attention spec that depends on nothing: it names no cache, because it has none.
 
+Two lockstep-parallel nodes on one worker (TP or SP nodes placed on the same ranks) must not
+name the same evictable resource. Under TP, rank 0 decides such a resource's state outside
+the step that uses it (offloads, reloads, prefix leases), and the other ranks replay each
+decision with the next step of the node it was recorded under, so a resource shared by two
+lockstep nodes could admit out of step on a follower. A spec marks this with the
+``journals_resident_moves`` property: ``KVSpec`` sets it, and the spec of any new resource
+with ``supports_eviction`` must set it too. The conductor refuses a deployment that places
+two lockstep nodes over one such resource on a worker; give each node a spec of its own, or
+place the nodes on different workers.
+
 The spec types are:
 
 .. list-table::
