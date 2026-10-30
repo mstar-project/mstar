@@ -475,14 +475,19 @@ def prefix_caches_by_rank(
 ) -> dict[int, frozenset[str]]:
     """The caches each rank's engine opens: `opening_prefix_caches` over the
     nodes on the rank, each at its lockstep instance size, as `Engine.load_model`
-    evaluates it. ``groups`` gives each node group's ranks, instance size and
-    nodes."""
+    evaluates it, less the caches with no node there, which that engine counts at
+    one rank for its item encoders but never builds. ``groups`` gives each node
+    group's ranks, instance size and nodes."""
     specs = list(specs)
     local: dict[int, dict[str, int]] = {}
     for ranks, size, nodes in groups:
         for rank in ranks:
             local.setdefault(rank, {}).update(dict.fromkeys(nodes, size))
-    return {rank: opening_prefix_caches(specs, nodes, checkpoint_named) for rank, nodes in local.items()}
+    return {
+        rank: opening_prefix_caches(specs, nodes, checkpoint_named)
+        & {spec.resource_key for spec in specs if not spec.nodes.isdisjoint(nodes)}
+        for rank, nodes in local.items()
+    }
 
 
 @dataclass
