@@ -1100,14 +1100,16 @@ methods are:
 ``check_stop(...) -> set[str] | StopCheck`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
-   terminates. An AR submodule whose loop ends on a stop token or the token budget sets
+   terminates. An AR submodule whose loop ends on a stop token sets
    ``self.token_stop = TokenStop(...)`` in ``__init__`` instead of writing one; that also
    gives it ``check_stop_batched``, which checks a whole step off one host copy of its
-   tokens. When a prefill walk outside the loop samples the reply's first token, list it
-   in ``prefill_walks``: the token counts toward ``max_tokens`` (a ``generated_key``
-   counter has to include it), and a stop id sampled
-   there ends the loop at its first step, whose ``buffer`` the engine drops, so the loop
-   has to emit the token under that name (GLM-5.2, Command A+).
+   tokens. The token budget is the loop's cap from ``get_loop_caps``, not a stop check.
+   When a prefill walk outside the loop samples the reply's first token, list it
+   in ``prefill_walks``; that token counts toward the budget, so ``get_loop_caps``
+   gives the loop ``max_output_tokens - 1``. A stop id sampled
+   there ends the loop at its first step, which withholds its ``buffer`` (see
+   ``StopCheck`` below), so the loop has to emit the token under that name (GLM-5.2,
+   Command A+).
    To also keep some of this step's outputs from being routed, return
    ``StopCheck(stops, withheld=(names...))``, for example a frame streamed alongside the
    EOS token: its consumer then never receives it, instead of finding and dropping it with
@@ -1641,9 +1643,11 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
 - ``one_row_per_step`` makes the runner lease, check (``can_run``) and replay the region as
   one row, whatever the step's batch size, under the step's first request. It is for a
   packed region that runs every request's segments as one ragged batch, such as a vision
-  tower, and needs ``lease_before_step`` and ``capture_batch_sizes=[1]``. The whole step's
-  segments then count against the ragged resource's ``max_segments_per_request``, so pair
-  it with a ``can_lease`` that refuses a step with more.
+  tower, and needs ``lease_before_step`` and ``capture_batch_sizes=[1]``. The region's
+  ``declare_step`` then receives ``[first_rid]`` with every request's ``seq_lens``, so the
+  whole step's segments count against that one request's ``max_segments_per_request``,
+  which for this region is a per-step ceiling. Pair it with a ``can_lease`` that refuses a
+  step with more.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is

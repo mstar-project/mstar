@@ -1721,8 +1721,14 @@ class DataParallelReplicas(NamedTuple):
 
 
 def _data_parallel_replicas(model, config_path: str) -> DataParallelReplicas:
-    counts = [len(wg.replica_ranks) for wg in model.get_worker_graphs(config_path)]
-    return DataParallelReplicas(most=max(counts), fewest=min(counts))
+    """``DataParallelReplicas(1, 1)``, with a warning, when the worker graphs
+    can't be counted: warmup is best effort and must not stop startup."""
+    try:
+        counts = [len(wg.replica_ranks) for wg in model.get_worker_graphs(config_path)]
+        return DataParallelReplicas(most=max(counts), fewest=min(counts))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("warmup: could not count data-parallel replicas (%s); sending one copy", exc)
+        return DataParallelReplicas(1, 1)
 
 
 def _run_warmup_requests(

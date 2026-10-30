@@ -794,8 +794,8 @@ class Qwen3_5DenseModel(Model):
             edge.tensor_info = persist_signals.get("new_token", [])
             inputs = [edge]
         else:
-            # decode stops via `LLMSubmodule.check_stop`; reaching here again
-            # after it fires means the request is finished
+            # decode stops via `LLMSubmodule.check_stop` or the loop cap;
+            # reaching here again after either means the request is finished
             metadata.kwargs["decode_finished"] = True
             return ForwardPassArgs(
                 full_metadata=metadata,

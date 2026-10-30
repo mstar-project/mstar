@@ -223,7 +223,8 @@ def test_resource_info_built_without_head_shards_shards_over_its_group():
 
 def test_a_dropped_manager_leaves_the_op_registry():
     """The custom op finds a manager by key; the registry must not keep one
-    alive past the engine that built it."""
+    alive past the engine that built it, nor hand one engine's key to
+    another's manager over the same resource key."""
     import gc
 
     from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
@@ -234,8 +235,10 @@ def test_a_dropped_manager_leaves_the_op_registry():
         resource_key="dropped", nodes={"encoder"},
         config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=64),
     )
-    mgr = build_resource(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16))
-    assert _MANAGERS["dropped"] is mgr
+    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16)
+    mgr, other = build_resource(spec, info), build_resource(spec, info)
+    assert _MANAGERS[mgr._key] is mgr and _MANAGERS[other._key] is other
+    key = mgr._key
     del mgr
     gc.collect()
-    assert "dropped" not in _MANAGERS
+    assert key not in _MANAGERS

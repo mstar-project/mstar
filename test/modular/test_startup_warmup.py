@@ -195,6 +195,8 @@ def test_warmup_reaches_every_data_parallel_replica(tmp_path) -> None:
         {"node_names": ["llm", "text_encoder"], "ranks": [0]},
         {"node_names": ["unused"], "ranks": [1, 2, 3]},
     ]) == (1, 1)
+    # worker graphs that can't be built leave warmup at one copy, not startup stopped
+    assert entrypoint._data_parallel_replicas(model, str(tmp_path / "missing.yaml")) == (1, 1)
     fake = _FakeServer()
     entrypoint._run_warmup_requests(fake, [{"text": "a"}, {"text": "b"}], entrypoint.DataParallelReplicas(2, 2))
     assert [s["request_id"] for s in fake.submitted] == ["warmup-0.0.0", "warmup-0.0.1", "warmup-1.0.0", "warmup-1.0.1"]

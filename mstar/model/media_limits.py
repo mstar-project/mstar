@@ -24,7 +24,8 @@ def video_decode_threads() -> int:
     """FFmpeg threads for one video decode. torchcodec decodes single-threaded
     by default, which dominates a long clip's request latency; frame threading
     is bit-identical. Bounded by the CPUs this process may use (its affinity and
-    cgroup quota) and by 8, so concurrent decodes don't oversubscribe. Not tied
+    cgroup quota) and by 8. The bound is per decode: concurrent decodes each
+    start this many threads. Not tied
     to torch's intra-op pool: FFmpeg's threads are its own, and that pool is
     kept small for fork-join ops a decode doesn't run. Read once per process,
     as ``image_io.PNG_WORKERS`` is."""

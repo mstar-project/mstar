@@ -304,21 +304,6 @@ class _Cosmos3Tokenizer:
         return 2
 
 
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_command_a_plus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
-    from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
-
-    llm = CommandAPlusLLMSubmodule(None, SimpleNamespace(eos_token_id=0), image_token_id=1)
-
-    cap = CommandAPlusModel.get_loop_caps(object.__new__(CommandAPlusModel), max_output_tokens=max_tokens)
-
-    assert cap["decode_loop"] == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_cosmos3_caps_the_reasoners_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
@@ -450,39 +435,6 @@ def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
 
     assert cap == _stops_after(
         llm.check_stop, "decode_loop", "decode", 1024,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
-
-    llm = LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset()))
-
-    cap = Qwen3_5DenseModel.get_loop_caps(object.__new__(Qwen3_5DenseModel), max_output_tokens=max_tokens)
-
-    assert cap["decode_loop"] == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_glm52_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.glm52.glm52_model import Glm52Model
-    from mstar.model.glm52.submodules import Glm52LLMSubmodule
-
-    model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
-    language_model = torch.nn.Module()
-    language_model.lm_head = torch.nn.Identity()
-    llm = Glm52LLMSubmodule(language_model, model.config)
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
 
@@ -652,21 +604,6 @@ def _whisper():
         n_fft=model.config.n_fft, hop_length=model.config.hop_length, chunk_length=model.config.chunk_length,
     )
     return model
-
-
-@pytest.mark.parametrize("max_tokens", [1, 1000])
-def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.whisper.config import SAMPLER
-    from mstar.model.whisper.submodules import WhisperDecoderSubmodule
-
-    model = _whisper()
-    bound = model.get_max_output_tokens(max_output_tokens=max_tokens)
-
-    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == _stops_after(
-        WhisperDecoderSubmodule(None, model.config).check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=bound,
-        resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
-    ), "the cap and the stop check end decode on different iterations"
 
 
 @pytest.mark.parametrize("language", ["en", None], ids=["forced", "detected"])

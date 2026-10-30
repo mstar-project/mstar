@@ -160,7 +160,8 @@ def _stepper(runtime, put):
 def _script(runtime, put) -> list[list[int]]:
     """Three requests through prefill and a five-step decode loop, covering
     every inline case: a persisted client signal (prefill), inline decode
-    rows, a step mixing a prefill row with decode rows, a device loop-back
+    rows, a row with no inline value (None: its tensor goes instead), a step
+    mixing a prefill row with decode rows, a device loop-back
     step that stores no tensors, values that miss a row, and a failed
     request. Returns each step's staged uuids."""
     a, b, c = (_admit(runtime, f"r{i}") for i in range(3))
@@ -170,7 +171,7 @@ def _script(runtime, put) -> list[list[int]]:
     for rid in (a, b):
         runtime.set_walk(rid, "default", DECODE)
     _ingest(runtime, [a, b])
-    outs.append(step([(a, DECODE), (b, DECODE)], [11, 21]))
+    outs.append(step([(a, DECODE), (b, DECODE)], [11, None]))
     outs.append(step([(c, PREFILL), (a, DECODE), (b, DECODE)], [3, 12, 22]))
     outs.append(step([(a, DECODE), (b, DECODE)], [13, 23], stored=False))
     outs.append(step([(a, DECODE), (b, DECODE)], [14]))
@@ -218,7 +219,7 @@ def test_both_runtimes_send_the_same_frames(tmp_path):
     assert [type(c) for c in py_chunks] == [type(c) for c in rs_chunks]
     assert _reports(recorder.reports()) == _reports(rs_reports)
     tokens = sorted(sorted(c.values) for c in rs_chunks if isinstance(c, ResultTokens))
-    assert tokens == [[11, 21], [12, 22], [13, 23], [15]]
+    assert tokens == [[11], [12, 22], [13, 23], [15]]
 
 
 def _tp_rank(rank):

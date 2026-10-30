@@ -32,7 +32,7 @@ from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule, Comm
 from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
 from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
 from mstar.model.multimodal import PromptPart
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import ModelInputsFromEngine, StopCheck
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 
@@ -43,23 +43,6 @@ def info(walk="prefill", max_tokens=6, ignore_eos=False, index=0):
         resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": index} if walk == "decode" else {},
     )
-
-
-def engine_postprocess(submodule, request_id, request_info, outputs):
-    """``postprocess`` as ``Engine._postprocess_batch`` runs it, the engine's own
-    tail included (it drops the closing token of a reply that ended at prefill)."""
-    from mstar.engine.engine import Engine
-    from mstar.model.submodule_base import BatchedModelOutput
-
-    failures = {}
-    batch = SimpleNamespace(
-        node_name="llm", request_ids=[request_id], inputs=[None],
-        per_request_info_wrapped={request_id: request_info}, failed_requests=failures,
-        register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk=request_info.graph_walk),
-    )
-    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=submodule, piecewise_runners={})})
-    Engine._postprocess_batch(engine, batch, BatchedModelOutput(per_rid_outputs={request_id: outputs}))
-    assert not failures, failures
 
 
 class ToyLM(nn.Module):
@@ -122,17 +105,17 @@ class NodeTests(unittest.TestCase):
                 self.assertEqual(self.node.check_stop("a", info(ignore_eos=ignore_eos), prefill), set())
                 request = info("decode", ignore_eos=ignore_eos)
                 decode = {"new_token": [torch.tensor([7])]}
-                engine_postprocess(self.node, "a", request, decode)
-                self.assertEqual("new_token" not in decode, ends)
-                self.assertEqual(self.node.check_stop("a", request, decode), {"decode_loop"} if ends else set())
+                self.node.postprocess("a", request, decode)
+                # the closing step's token came after the reply's last: withheld
+                closes = StopCheck({"decode_loop"}, withheld=("new_token",))
+                self.assertEqual(self.node.check_stop("a", request, decode), closes if ends else set())
                 self.node.cleanup_request("a")
                 self.assertNotIn("a", self.node.request_states)
 
-    def test_decode_stop_counts_prefill_token_and_respects_ignore_eos(self):
+    def test_decode_stops_on_eos_unless_ignore_eos(self):
+        # a row at its token budget goes on: the loop's cap ends it
         for token, maximum, index, ignore_eos, stops in (
-            (3, 5, 0, False, True), (3, 5, 0, True, False),
-            (7, 2, 0, False, True), (7, 3, 0, False, False),
-            (7, 3, 1, False, True),
+            (3, 5, 0, False, True), (3, 5, 0, True, False), (7, 2, 0, False, False),
         ):
             with self.subTest(token=token, maximum=maximum, index=index, ignore_eos=ignore_eos):
                 request = info("decode", maximum, ignore_eos, index)
@@ -304,6 +287,9 @@ class ModelIntegrationTests(unittest.TestCase):
 
     def test_real_graph_loop_stops_after_total_token_budget(self):
         graph = WorkerGraphIO(self.model.get_graph_walk_graphs()["decode"])
+        # the request's caps, as the worker applies them when the request arrives
+        for name, cap in self.model.get_loop_caps(max_output_tokens=3).items():
+            graph.loops[name].max_iters = min(graph.loops[name].max_iters, cap)
         node = CommandAPlusLLMSubmodule(
             ToyLM(self.model.config.vocab_size), self.model.config, self.model.vision_config.image_token_id,
         )

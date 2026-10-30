@@ -756,8 +756,8 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
 
     def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
-        """The shared stop condition (EOS or the token cap) on a decode row's
-        token; a prompt walk's token never stops the loop. Either way the token
+        """The shared stop condition (EOS) on a decode row's token; a prompt
+        walk's token never stops the loop. Either way the token
         is kept for the align walk first."""
         if info.graph_walk != DECODE_WALK:
             self._record_prompt_token(info, token)

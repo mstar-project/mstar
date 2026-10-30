@@ -7,6 +7,7 @@ segments of one packed forward. There is nothing to page, nothing to advance,
 and nothing to carry between steps: the resource holds only planned wrappers.
 """
 
+import itertools
 import weakref
 from collections.abc import Iterable
 
@@ -155,12 +156,13 @@ class RaggedBlockCausalAttnManager(AttentionResource):
         raise ValueError(f"Unknown ragged block-causal attention backend {backend!r}")
 
 
-# Live managers by resource key, which is how the custom op below names one: an
-# op takes tensors and scalars, not objects. The key is unique within the
-# worker's engine, so a rebuilt resource replaces its entry, and a compiled
-# graph, which bakes the key in as a constant, reaches the new manager without
-# recompiling. Weak, so an entry goes with the engine's last reference to it.
+# Live managers by op key, which is how the custom op below names one: an op
+# takes tensors and scalars, not objects. The op key is the resource key plus a
+# number unique in the process, so two engines in one process (tests,
+# harnesses) never reach each other's plans. Weak, so an entry goes with the
+# engine's last reference to it.
 _MANAGERS: weakref.WeakValueDictionary[str, "_RaggedManagerBase"] = weakref.WeakValueDictionary()
+_MANAGER_NUMBERS = itertools.count()
 
 
 @torch.library.custom_op("mstar::ragged_attention", mutates_args=())
@@ -197,8 +199,8 @@ class _RaggedManagerBase:
         config: RaggedAttentionConfig,
         key: str,
     ):
-        self._key = key
-        _MANAGERS[key] = self
+        self._key = f"{key}#{next(_MANAGER_NUMBERS)}"
+        _MANAGERS[self._key] = self
         self._config = config
         self._device = device
         self._dtype = dtype
