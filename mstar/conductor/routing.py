@@ -46,9 +46,10 @@ Instance = tuple[int, ...]
 class RoutingWeights(NamedTuple):
     """The serving config's ``routing_weights``: one weight per term of the cost."""
     load: float = 1.0
-    # the best weight in simulations of BAGEL and of Qwen3.5 0.8B and 9B before
-    # Qwen3.5's hits were cut to its recurrent snapshots; above 16 a hot prefix
-    # piles onto one replica
+    # provisional: the best weight in simulations of BAGEL and Qwen3.5 0.8B and 9B
+    # that credit Qwen3.5's hits whole, as the KV mirror does, where its workers
+    # serve them only up to a recurrent snapshot; above 16 a hot prefix piles
+    # onto one replica
     prefix: float = 8.0
 
 
