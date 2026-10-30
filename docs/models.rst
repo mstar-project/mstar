@@ -1576,10 +1576,13 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    (every single-stream block's output projection), ``single_blocks.0-3.*`` (the first
    four single blocks), ``double_blocks.0-2.img_ff.linear_out``. An entry that names none
    of the model's fp8 linears is an error at load. Each kept linear gives back its share of
-   the fp8 speedup; which ones buy the most quality per millisecond is a per-model
-   measurement (the 4-step klein samplers turn any small change into a comparable change
-   of the image, so the output projections, which read the most heavy-tailed activations,
-   matter more than any block's position).
+   the fp8 speedup, and which ones buy the most quality per millisecond is a per-model
+   measurement. ``configs/flux2_klein_9b.yaml`` keeps the 51 of klein-9B's 80 fp8 linears
+   with the most image error per millisecond saved (every double block's, most single
+   blocks' output projections and two early fused projections): in a one-GPU MI325X A/B it
+   serves at a median 26.5 dB from the diffusers reference, over the ROCm floor, at about
+   1.18 times the bf16 images per second (1.39 times with every linear in fp8). Lists
+   giving back 20% and 30% of the saving instead of 40% measured 25.2 dB, under the floor.
 
 With the klein defaults every served image is within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
