@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from itertools import repeat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple, Sequence
 
@@ -390,15 +391,14 @@ class ExecutingBatch:
     exec_timings: ExecTimings = field(default_factory=ExecTimings)
 
     def __post_init__(self):
-        self.per_request_info_wrapped = {
-            rid: ForwardPassInfoWrapper(
-                # Sparse: only rids with stream chunks or loop counters get an
-                # entry, so default like the .get() at prepare_inputs does.
-                info=info, metadata=self.per_request_input_metadata.get(
-                    rid, EMPTY_INPUT_METADATA,
-                ),
-            ) for rid, info in self.per_request_info.items()
-        }
+        # Sparse metadata: only rids with stream chunks or loop counters get
+        # an entry, so default like the .get() at prepare_inputs does. Built
+        # with C-level maps: this runs for every step, on every row.
+        rids = self.per_request_info.keys()
+        self.per_request_info_wrapped = dict(zip(rids, map(
+            ForwardPassInfoWrapper, self.per_request_info.values(),
+            map(self.per_request_input_metadata.get, rids, repeat(EMPTY_INPUT_METADATA)),
+        ), strict=True))
 
     @property
     def request_ids(self):
@@ -536,6 +536,8 @@ class Engine:
 
         node_names = set(submodules.keys())
         node_to_resources = {}
+        # resource -> every node declaring it, on this worker or another
+        declared_by: dict[str, frozenset[str]] = {}
         specs_by_key = resolve_spec_dependencies(specs)
 
         self._classify_tp_roles(node_names, parallel_groups)
@@ -577,6 +579,7 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
+            declared_by[spec.resource_key] = frozenset(spec.nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -587,6 +590,7 @@ class Engine:
             # absent node would fall back to the full sweep
             node_resources={n: node_to_resources.get(n, []) for n in node_names},
             enable_nvtx=self._enable_nvtx,
+            declared_by=declared_by,
         )
 
         self._open_prefix_caches(specs_by_key, model)
@@ -2832,6 +2836,19 @@ class Engine:
         except Exception:
             self.remove_request(request_id)
             raise
+
+    @property
+    def publisher_nodes(self) -> Mapping[str, frozenset[str]]:
+        """Each publishing resource's declaring nodes, across the deployment."""
+        return self._runner.publisher_nodes
+
+    def skip_publish(self, request_id, keys) -> None:
+        """Never publish ``keys`` for this request (see ``StepRunner.skip_publish``)."""
+        self._runner.skip_publish(request_id, keys)
+
+    def never_publish(self, keys) -> None:
+        """Never publish ``keys`` for any request (see ``StepRunner.never_publish``)."""
+        self._runner.never_publish(keys)
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down on every resource. Returns the resources it

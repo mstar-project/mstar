@@ -19,6 +19,7 @@ from mstar.utils.ipc_format import (
 from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
 from mstar.worker.rebuild import RebuildRow, Rebuilds
 from mstar.worker.rid_table import RidTable
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 # ── the table ──────────────────────────────────────────────────────────────
@@ -175,10 +176,14 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w.streams._rids.add(a)
     w.profile_info = SimpleNamespace(pop_request=lambda h: None)
     w.scheduler.held_until[a] = float("inf")
 
     w._remove_request(RemoveRequest(request_id="req-a", source=MessageSource.SELF))
+
+    assert not w.streams.possible(), "the stream manager forgets the handle"
 
     assert w.removed_in_runtime == [a]
     assert b in w.request_state.per_request_info
@@ -248,6 +253,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         lambda request_id, request_info: got.__setitem__("state", request_id)
     )
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         add_request=lambda rid, cfgs, info: got.__setitem__("engine", rid),
         evictable_nodes=lambda: [],
     )
@@ -257,8 +263,8 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     )
     w._draining_rids = set()
     w._last_active = {}
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._rebuilds = Rebuilds({}, {})
-    w._my_consumer_connections = []
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._unprocessed_messages = {}
     info = SimpleNamespace(
@@ -294,18 +300,21 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
     w.request_state.add_request = lambda request_id, request_info: None
     w.request_state.per_request_info = collections.defaultdict(lambda: req)
-    w.engine_manager = SimpleNamespace(add_request=lambda rid, cfgs, info: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+        add_request=lambda rid, cfgs, info: None, evictable_nodes=lambda: [],
+    )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
     w._rebuilds = Rebuilds({}, {})
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w._consumer_node_cache = {"codec_tokens": "Codec"}
-    w._my_consumer_connections = [Connection(
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [Connection(
         from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
         chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3),
-    )]
+    )])
+    w.streams.consumer_node = {"codec_tokens": "Codec"}
 
     def new(partition, lead):
         info = SimpleNamespace(

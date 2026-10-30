@@ -23,6 +23,7 @@ from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import KeptIds, RebuildRow, Rebuilds
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
@@ -75,7 +76,8 @@ def _worker():
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
-    w._in_flight_rids, w._last_active, w._stream_buffer_rids = set(), {}, set()
+    w._in_flight_rids, w._last_active = set(), {}
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     # holds no row, so any routing, stop or loop-count call fails the test
