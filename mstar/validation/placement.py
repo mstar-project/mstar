@@ -2,7 +2,6 @@
 they divide into, the parallel groups each worker is handed, and the weights
 that pick a request's replica among them."""
 
-import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -31,11 +30,16 @@ def node_groups_problems(config: Mapping[str, Any]) -> list[str]:
     ]
 
 
+# Far above any useful weight, and low enough that no replica's cost overflows to inf, where
+# inf - inf would make it NaN and fail every pick.
+_MAX_ROUTING_WEIGHT = 1e6
+
+
 def routing_weights_problems(config: Mapping[str, Any]) -> list[str]:
     """``routing_weights``, the data-parallel replica pick's: one per term of
-    the cost, each a finite number >= 0, since the cost is a sum of weighted
-    terms, and ``load`` above 0 when another term is, or nothing would spread
-    a hot prefix."""
+    the cost, each a number from 0 to ``_MAX_ROUTING_WEIGHT``, since the cost
+    is a sum of weighted terms, and ``load`` above 0 when another term is, or
+    nothing would spread a hot prefix."""
     weights = config.get("routing_weights")
     if weights is None:
         return []
@@ -46,11 +50,10 @@ def routing_weights_problems(config: Mapping[str, Any]) -> list[str]:
     if unknown:
         problems.append(f"routing_weights names {unknown}; it takes {list(RoutingWeights._fields)}")
     for name, weight in weights.items():
-        if (
-            isinstance(weight, bool) or not isinstance(weight, (int, float))
-            or not math.isfinite(weight) or weight < 0
-        ):
-            problems.append(f"routing_weights.{name} must be a finite number >= 0; got {weight!r}")
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 <= weight <= _MAX_ROUTING_WEIGHT:
+            problems.append(
+                f"routing_weights.{name} must be a number from 0 to {_MAX_ROUTING_WEIGHT:g}; got {weight!r}"
+            )
     if not problems and not weights.get("load", RoutingWeights._field_defaults["load"]) and any(
         weights.get(name, default) for name, default in RoutingWeights._field_defaults.items() if name != "load"
     ):

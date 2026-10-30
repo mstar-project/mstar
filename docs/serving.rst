@@ -251,7 +251,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
-       the prompt predicted in its KV prefix cache. Each is a finite number >= 0; ``load``
+       the prompt predicted in its KV prefix cache. Each is a number from 0 to 1e6; ``load``
        defaults to 1.0 and ``prefix`` to 8.0. Any other key, or ``load: 0`` while another
        weight is above 0, fails loading. ``prefix: 0`` picks by load alone, and ``prefix: 1``
        or less keeps a hit below one live request, so it only breaks ties. At data
