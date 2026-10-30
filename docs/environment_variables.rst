@@ -94,10 +94,16 @@ Communication
    * - ``MSTAR_KV_SHM_DIR``
      - ``/dev/shm`` (or ``/tmp`` if unavailable)
      - Base directory for host-staged KV snapshots when remote KV transfer
-       uses SHM. Each deployment creates a private child directory here;
-       request cleanup removes snapshots, and startup removes directories
-       left by dead deployments. All workers sharing KV snapshots must see
-       the same filesystem.
+       uses SHM (``make_deployment_kv_shm_dir``). Each deployment creates a
+       private child directory here, named under its tensor-file namespace
+       (see ``MSTAR_DEPLOYMENT_TOKEN``), and holds that namespace's lock
+       file here while it runs; request cleanup removes snapshots, and
+       startup removes this user's directories whose lock no live process
+       holds. All workers sharing KV snapshots must see the same
+       filesystem. The lock is ``flock``, which some cluster filesystems
+       (GPFS, for one) keep per node, so do not point deployments on
+       different nodes at one shared directory there: each would sweep the
+       other's live directories.
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
      - ``256``
      - Size of each arena segment. The arena grows segment by segment;
@@ -616,11 +622,12 @@ Worker scheduling
        worker main loop (speculate, await_gpu, submit_spec, ...).
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
-     - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping against the streams
-       holding the pages, and each commit against its request's layout. A recurrent
-       snapshot's key is checked against the KV chain's key at its boundary. Logs a
-       label left under its footprint at removal. Tests and debugging only.
+     - ``1``: after every ``admit``, ``commit``, ``reset_request``, ``remove_request``
+       and change to an admitted request's pages, check the KV page bookkeeping against
+       the streams holding the pages, the reservations against the free and evictable
+       pages, and each commit against its request's layout. A recurrent snapshot's key is
+       checked against the KV chain's key at its boundary. Logs a label left under its
+       footprint at removal. Tests and debugging only.
 
 Compilation
 -----------

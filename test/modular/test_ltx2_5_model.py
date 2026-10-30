@@ -15,6 +15,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, RaggedCrossAttentionSpec, RaggedCrossAttentionStep
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -39,6 +40,10 @@ from mstar.model.ltx2_5.ltx2_5_model import (
     GENERATE_AUDIO_WALK,
     GENERATE_AV_WALK,
     GENERATE_VIDEO_WALK,
+    REFINE_AUDIO_WALK,
+    REFINE_AV_WALK,
+    REFINE_VIDEO_WALK,
+    STAGE1_WALK,
     LTX25Model,
 )
 from mstar.model.ltx2_5.submodules import (
@@ -58,6 +63,8 @@ from mstar.model.ltx2_5.submodules import (
 )
 from mstar.model.submodule_base import NodeInputs
 
+ALL_WALKS = {ENCODE_TEXT_WALK, GENERATE_AV_WALK, GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK, STAGE1_WALK,
+             REFINE_AV_WALK, REFINE_VIDEO_WALK, REFINE_AUDIO_WALK}
 CONFIG_PATH = "configs/ltx2_5.yaml"
 
 
@@ -133,8 +140,8 @@ def test_defaults_match_the_checkpoint_when_cached():
 def test_graph_walks_and_nodes():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
-    assert set(walks) == {ENCODE_TEXT_WALK, GENERATE_AV_WALK, GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK}
-    assert model.nodes == ["audio_decoder", "dit", "text_encoder", "vae_decoder"]
+    assert set(walks) == ALL_WALKS
+    assert model.nodes == ["audio_decoder", "dit", "latent_upsampler", "text_encoder", "vae_decoder"]
     text = walks[ENCODE_TEXT_WALK]
     assert isinstance(text, GraphNode) and text.input_names == {"text_inputs"}
     assert {(e.name, e.persist, e.next_node) for e in text.outputs} == {
@@ -182,7 +189,7 @@ def test_worker_graphs_from_yaml():
     walks = set()
     for wg in _make_model().get_worker_graphs(CONFIG_PATH):
         walks |= wg.graph_walks
-    assert walks == {ENCODE_TEXT_WALK, GENERATE_AV_WALK, GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK}
+    assert walks == ALL_WALKS
 
 
 def test_dummy_mode_returns_no_submodules():
@@ -238,6 +245,7 @@ def test_schedule_encode_text_then_generate_then_done(outputs, walk):
     md = args.full_metadata
     assert md.graph_walk == ENCODE_TEXT_WALK and md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, walk]
     assert args.step_metadata == {"is_prefill": True, "height": 544, "width": 960, "num_frames": 121, "fps": 24.0}
+    assert md.kwargs["request"]["recipe"] == "single"
     persist = {"text_video": [_info("v", [1024, 4096])], "text_audio": [_info("a", [1024, 2048])]}
     nxt = model.get_partition_forward_pass_args("default", md, persist)
     assert nxt.full_metadata.graph_walk == walk and not nxt.request_done
@@ -246,6 +254,61 @@ def test_schedule_encode_text_then_generate_then_done(outputs, walk):
     assert by_name["latents"].tensor_info == [] and by_name["audio_latents"].tensor_info == []
     done = model.get_partition_forward_pass_args("default", nxt.full_metadata, {})
     assert done.request_done and done.inputs == []
+
+
+def test_stage1_walk_upsamples_and_persists_the_refine_inputs():
+    section = _make_model().get_graph_walk_graphs()[STAGE1_WALK]
+    loop, upsampler = section.sections
+    assert loop.max_iters == 8
+    assert {(e.name, e.next_node) for e in loop.outputs} == {
+        ("latents", "latent_upsampler"), ("audio_latents", "latent_upsampler"),
+    }
+    assert upsampler.name == "latent_upsampler" and upsampler.input_names == {"latents", "audio_latents"}
+    assert {(e.name, e.persist, e.next_node) for e in upsampler.outputs} == {
+        ("refine_latents", True, EMPTY_DESTINATION), ("refine_audio", True, EMPTY_DESTINATION),
+    }
+
+
+def test_refine_walk_reads_the_upsampled_latents_for_three_steps():
+    loop, _ = _make_model().get_graph_walk_graphs()[REFINE_AV_WALK].sections
+    assert loop.max_iters == 3
+    assert loop.section.input_names == {
+        "text_video", "text_audio", "latents", "audio_latents", "refine_latents", "refine_audio",
+    }
+
+
+def test_two_stage_schedule_keeps_text_until_the_refine_walk():
+    model = _make_model()
+    args = model.get_initial_forward_pass_args(
+        "default", ["text"], ["video", "audio"], {"text_inputs": [_info("t", [36])]},
+        model_kwargs={"recipe": "two_stage", "height": 1088, "width": 1920, "num_frames": 121},
+    )
+    md = args.full_metadata
+    assert md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, STAGE1_WALK, REFINE_AV_WALK]
+    text = {"text_video": [_info("v", [1024, 4096])], "text_audio": [_info("a", [1024, 2048])]}
+    md.kwargs.update(args.step_metadata)  # what the conductor does after every pass
+    s1 = model.get_partition_forward_pass_args("default", md, text)
+    assert s1.full_metadata.graph_walk == STAGE1_WALK
+    s1.full_metadata.kwargs.update(s1.step_metadata)
+    # stage 1 runs at half the size, and the text embeddings stay persisted for stage 2
+    assert (s1.step_metadata["height"], s1.step_metadata["width"]) == (544, 960)
+    assert s1.unpersist_tensors == []
+    refine_inputs = {**text, "refine_latents": [_info("rl", [32640, 128])], "refine_audio": [_info("ra", [126, 128])]}
+    s2 = model.get_partition_forward_pass_args("default", s1.full_metadata, refine_inputs)
+    assert s2.full_metadata.graph_walk == REFINE_AV_WALK
+    assert (s2.step_metadata["height"], s2.step_metadata["width"]) == (1088, 1920)
+    assert {e.name for e in s2.inputs} == {
+        "text_video", "text_audio", "refine_latents", "refine_audio", "latents", "audio_latents",
+    }
+    assert {i.uuid for i in s2.unpersist_tensors} == {"uuid-v", "uuid-a", "uuid-rl", "uuid-ra"}
+    assert model.get_partition_forward_pass_args("default", s2.full_metadata, {}).request_done
+
+
+def test_two_stage_sizes_must_halve_onto_the_vae_grid():
+    with pytest.raises(ValueError, match="multiple of 64"):
+        _make_model().process_prompt("a dog", ["text"], ["video"], recipe="two_stage", height=544, width=1920)
+    with pytest.raises(ValueError, match="recipe"):
+        _make_model().process_prompt("a dog", ["text"], ["video"], recipe="three_stage")
 
 
 def test_postprocess_audio_is_interleaved_pcm16():
@@ -257,7 +320,7 @@ def test_postprocess_audio_is_interleaved_pcm16():
 
 
 def test_postprocess_video_is_an_mp4():
-    frames = torch.randint(0, 255, (3, 9, 64, 64), dtype=torch.uint8)
+    frames = torch.randint(0, 255, (9, 64, 64, 3), dtype=torch.uint8)
     data = _make_model().postprocess(frames, "video", {"fps": 24})
     assert data[4:8] == b"ftyp"
 
@@ -321,6 +384,22 @@ def test_declare_step_spans_and_pairs():
     assert spans == {(r, label): n for r in (11, 12) for label, n in (("video", 24), ("audio", 5), ("text", 16))}
     assert step.cg_key_info == shape
     assert _dit(cfg, use_ragged=False).declare_step("generate_av", [11], inputs[:1]) is None
+
+
+@pytest.mark.parametrize("rank, shard", [(0, 13), (1, 12)])
+def test_declare_step_under_sequence_parallelism(rank, shard):
+    """The video self-attention spans every video token; the cross-attentions attend
+    from this rank's share of them, and the audio queries attend that share too (the
+    block merges the ranks' partial attentions)."""
+    cfg = LTX25Config()
+    shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
+    sub = LTXDenoiseSubmodule(nn_stub(), cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True,
+                              sp_group=CommGroup(rank, rank, [0, 1]))
+    step = sub.declare_step("generate_av", [11], [NodeInputs(resource_step_info=shape)])
+    assert [s.span for s in step.steps[VIDEO_ATTN].segments] == [25]
+    for key in (VIDEO_XATTN, AUDIO_XATTN):
+        assert {s.label: s.span for s in step.steps[key].segments}["video"] == shard
+    assert set(step.steps[AUDIO_XATTN].pairs) == {("audio", "text"), ("video", "audio"), ("audio", "video")}
 
 
 def test_distilled_schedule_matches_the_scheduler_recipe():
@@ -390,3 +469,53 @@ def test_toy_dit_forward_shapes_and_row_independence():
     torch.testing.assert_close(video[1:], v1, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(audio[1:], a1, rtol=1e-5, atol=1e-5)
     assert torch.isfinite(video).all() and torch.isfinite(audio).all()
+
+
+def test_vae_compile_shapes_are_independent_of_the_dit_captures():
+    """The decoder warms the capture shapes by default, and vae_compile_shapes alone when
+    given (the SP2 config warms the 1088x1920 decode it never captures)."""
+    def sizes(model):
+        return [(s.height, s.width, s.frames) for s in model._decode_shapes()]
+
+    model = _make_model(capture_shapes=[[544, 960, 121, 24], [1088, 1920, 121, 24]])
+    assert sizes(model) == [(17, 30, 16), (34, 60, 16)]
+    model = _make_model(capture_shapes=[[544, 960, 121, 24]],
+                        vae_compile_shapes=[[544, 960, 121, 24], [1088, 1920, 121, 24]])
+    assert model.capture_buckets() == [(GENERATE_AV_WALK, model._decode_shapes()[0])]
+    assert sizes(model) == [(17, 30, 16), (34, 60, 16)]
+    assert sizes(_make_model(vae_compile_shapes=[])) == []
+    # a shape no request can have (1080 isn't on the 32-pixel grid) is refused, not warmed
+    with pytest.raises(ValueError, match="vae_compile_shapes"):
+        _make_model(vae_compile_shapes=[[1080, 1920, 121, 24]])._decode_shapes()
+
+
+def test_warmed_vae_decoder_compiles_only_warmed_shapes():
+    """vae_compile: the decoder runs compiled (on its channels_last copy) for the shapes
+    seen while warming, a tiled decode's tiles included, and eager for any other."""
+    from mstar.model.ltx2_5.submodules import _WarmedDecoder
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv3d(2, 3, 1)
+
+        def forward(self, z, temb=None, causal=None):
+            return self.conv(z)
+
+    gate = _WarmedDecoder(Decoder())
+    calls = []
+    gate._compiled = lambda z, temb, causal=None: calls.append(("compiled", tuple(z.shape))) or gate.channels_last(z)
+    eager_forward = gate.eager.forward
+    gate.eager.forward = lambda z, temb=None, causal=None: calls.append(("eager", tuple(z.shape))) or eager_forward(z)
+
+    warm, other = torch.randn(1, 2, 2, 4, 4), torch.randn(1, 2, 2, 4, 6)
+    gate(warm)                       # not yet warmed: eager
+    gate.warming = True
+    gate(warm)
+    gate.warming = False
+    out = gate(warm)
+    gate(other)
+    assert calls == [("eager", warm.shape), ("compiled", warm.shape), ("compiled", warm.shape), ("eager", other.shape)]
+    # the compiled path's copy holds the same weights, in channels_last_3d
+    assert gate.channels_last.conv.weight.is_contiguous(memory_format=torch.channels_last_3d)
+    torch.testing.assert_close(out, gate.eager.conv(warm))
