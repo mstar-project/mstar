@@ -111,6 +111,31 @@ def ulysses_attention(
     return sp_group.all_to_all(out, scatter_dim=seq_dim, gather_dim=head_dim, scatter_sizes=seq_sizes)
 
 
+@torch.compiler.disable
+def attention_over_sharded_keys(
+    sp_group: CommGroup,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    run_attention: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
+    """A query replicated on every rank attending keys sharded along the sequence:
+    ``q`` ``[B, Lq, H, D]``, ``k``/``v`` ``[B, Lk/P, H, D]`` (this rank's tokens), returns
+    ``[B, Lq, H, D]``. Each rank attends its own shard and the partial attentions merge
+    exactly by their log-sum-exps, which moves query-sized results rather than the keys.
+
+    ``run_attention(q, k, v, return_lse=True)`` returns ``(out, lse)`` with ``lse``
+    ``[B, Lq, H]`` in natural log (``joint_attention`` over a ragged resource, or
+    ``sdpa_attention``)."""
+    if sp_group.world_size == 1:
+        return run_attention(q, k, v)
+    out, lse = run_attention(q, k, v, return_lse=True)
+    # one gather for both: [P, B, Lq, H, D + 1] fp32, the log-sum-exp in the last column
+    gathered = sp_group.all_gather(torch.cat([out.float(), lse.float().unsqueeze(-1)], dim=-1).unsqueeze(0), dim=0)
+    outs, lses = gathered[..., :-1], gathered[..., -1:]
+    return (outs * torch.softmax(lses, dim=0)).sum(dim=0).to(q.dtype)
+
+
 def sp_head_slice(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
     """Keep this SP rank's contiguous head-group: ``[T, H, D] -> [T, H/P, D]``.
 
@@ -132,3 +157,4 @@ def sp_head_gather(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
     if sp_group.world_size == 1:
         return x
     return sp_group.all_gather(x, dim=1)
+
