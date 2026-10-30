@@ -48,6 +48,12 @@ class _Comm:
     def get_all_new_messages(self):
         return []
 
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
 
 class _Sink:
     def __init__(self, loop):
