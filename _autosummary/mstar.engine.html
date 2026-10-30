@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
@@ -750,10 +751,13 @@
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.fp32_precision.html#module-mstar.engine.fp32_precision" title="mstar.engine.fp32_precision"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fp32_precision</span></code></a></p></td>
 <td><p>Per-node float32 math precision, applied by the engine around a node's forward.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.html#module-mstar.engine.resources" title="mstar.engine.resources"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resources</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.node_dtype.html#module-mstar.engine.node_dtype" title="mstar.engine.node_dtype"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_dtype</span></code></a></p></td>
+<td><p>Which dtype each node runs in, resolved once at load.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.html#module-mstar.engine.resources" title="mstar.engine.resources"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resources</span></code></a></p></td>
 <td><p>The resource layer's declaration surface.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.windowing.html#module-mstar.engine.windowing" title="mstar.engine.windowing"><code class="xref py py-obj docutils literal notranslate"><span class="pre">windowing</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.windowing.html#module-mstar.engine.windowing" title="mstar.engine.windowing"><code class="xref py py-obj docutils literal notranslate"><span class="pre">windowing</span></code></a></p></td>
 <td><p>Windowed (sliding-window) autoregressive generation support.</p></td>
 </tr>
 </tbody>

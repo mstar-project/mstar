@@ -40,6 +40,7 @@
    accelerator_graph_runner
    engine
    fp32_precision
+   node_dtype
    resources
    windowing
 

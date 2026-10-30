@@ -604,6 +604,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
@@ -992,6 +993,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">PiecewiseCaptureShape</span><span class="p">,</span>
     <span class="n">PiecewiseConfigType</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.node_dtype</span><span class="w"> </span><span class="kn">import</span> <span class="n">node_scope</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">StepRunner</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">BatchedModelOutput</span><span class="p">,</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span><span class="p">,</span> <span class="n">NodeSubmodule</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
@@ -1095,12 +1097,15 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="autocast_scope">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.autocast_scope">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">autocast_scope</span><span class="p">(</span><span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">device_type</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="nd">@contextmanager</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">autocast_scope</span><span class="p">(</span><span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">device_type</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""A forward's autocast scope; ``None`` (``disable_autocast``) runs the</span>
-<span class="sd">    submodule in its own dtype and shuts out any ambient autocast."""</span>
-    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">amp</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span>
+<span class="sd">    submodule in its own dtype and shuts out any ambient autocast.</span>
+<span class="sd">    ``node_name`` names the node in implicit-downcast warnings."""</span>
+    <span class="k">with</span> <span class="n">node_scope</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">dtype</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">amp</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span>
         <span class="n">device_type</span><span class="p">,</span> <span class="n">enabled</span><span class="o">=</span><span class="n">dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span> <span class="ow">or</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span>
-    <span class="p">)</span></div>
+    <span class="p">):</span>
+        <span class="k">yield</span></div>
 
 
 
@@ -1156,7 +1161,10 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="capture_into_graph">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.capture_into_graph">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">capture_into_graph</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">capture_into_graph</span><span class="p">(</span>
+    <span class="n">run</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Capture ``run`` into a new CUDA graph allocated from ``pool``.</span>
 
 <span class="sd">    Returns the graph and what ``run`` returned. A capture that fails part</span>
@@ -1185,7 +1193,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">torch</span><span class="o">.</span><span class="n">backends</span><span class="o">.</span><span class="n">cudnn</span><span class="o">.</span><span class="n">benchmark</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">set_stance</span><span class="p">(</span><span class="s2">"fail_on_recompile"</span><span class="p">),</span> \
-                <span class="n">autocast_scope</span><span class="p">(</span><span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">backend</span><span class="o">.</span><span class="n">device_type</span><span class="p">):</span>
+                <span class="n">autocast_scope</span><span class="p">(</span><span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">backend</span><span class="o">.</span><span class="n">device_type</span><span class="p">,</span> <span class="n">node_name</span><span class="p">):</span>
             <span class="k">with</span> <span class="n">backend</span><span class="o">.</span><span class="n">capture</span><span class="p">(</span><span class="n">graph</span><span class="p">,</span> <span class="n">pool</span><span class="o">=</span><span class="n">pool</span><span class="p">):</span>
                 <span class="n">output</span> <span class="o">=</span> <span class="n">run</span><span class="p">()</span>
     <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
@@ -1204,6 +1212,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.capture_with_static_outputs">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">capture_with_static_outputs</span><span class="p">(</span>
     <span class="n">run</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">AcceleratorGraphPool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.</span>
 
@@ -1232,7 +1241,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">static_outputs</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">static_outputs</span>
 
-    <span class="n">graph</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span><span class="n">captured</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">)</span>
+    <span class="n">graph</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span><span class="n">captured</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">keep_graph</span><span class="p">,</span> <span class="n">node_name</span><span class="o">=</span><span class="n">node_name</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">graph</span><span class="p">,</span> <span class="n">static_outputs</span></div>
 
 
@@ -1910,7 +1919,7 @@ window.runMermaid = runMermaid;</script>
                             <span class="n">CaptureCost</span><span class="p">(</span><span class="n">warmed</span><span class="o">.</span><span class="n">peak</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">returned</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">),</span> <span class="kc">True</span><span class="p">,</span>
                             <span class="n">partial</span><span class="p">(</span>
                                 <span class="n">capture_into_graph</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
-                                <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                                <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="n">node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span>
                             <span class="p">),</span>
                             <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">spec</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executables</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="n">ExecutableMemory</span><span class="p">()),</span>
                         <span class="p">)</span>
@@ -1949,7 +1958,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">memory</span> <span class="o">=</span> <span class="n">_capture_thrown_away</span><span class="p">(</span>
                         <span class="n">partial</span><span class="p">(</span>
                             <span class="n">capture_into_graph</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
-                            <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                            <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="n">node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span>
                         <span class="p">),</span>
                         <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">spec</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">_executables</span><span class="p">[(</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">cg_key_info</span><span class="p">)],</span>
@@ -2135,6 +2144,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
             <span class="n">graph</span><span class="p">,</span> <span class="n">output</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span>
                 <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                <span class="n">node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_slot_from_capture</span><span class="p">(</span>
                 <span class="n">output</span><span class="o">=</span><span class="n">BatchedModelOutput</span><span class="o">.</span><span class="n">coerce</span><span class="p">(</span><span class="n">output</span><span class="p">),</span>
@@ -2223,7 +2233,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># the last forward's peak, not the first's: that one may compile and autotune</span>
                 <span class="n">live</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
                 <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">reset_peak_memory_stats</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
-                <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span><span class="p">):</span>
+                <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">):</span>
                     <span class="n">returned</span> <span class="o">=</span> <span class="n">_tensor_bytes</span><span class="p">(</span><span class="n">run_forward</span><span class="p">())</span>
                 <span class="n">peak</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">max_memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span> <span class="o">-</span> <span class="n">live</span>
                 <span class="c1"># back to a clean stream state so the re-plan below (and the</span>
@@ -2948,6 +2958,7 @@ window.runMermaid = runMermaid;</script>
                                 <span class="n">partial</span><span class="p">(</span>
                                     <span class="n">capture_with_static_outputs</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">warm_outputs</span><span class="p">,</span>
                                     <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                                    <span class="n">node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_name</span><span class="p">,</span>
                                 <span class="p">),</span>
                                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="si">}</span><span class="s2"> bs=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2"> total_tokens=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executable</span><span class="p">,</span>
                             <span class="p">)</span>
@@ -2985,6 +2996,7 @@ window.runMermaid = runMermaid;</script>
                         <span class="n">partial</span><span class="p">(</span>
                             <span class="n">capture_with_static_outputs</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs_like</span><span class="p">(</span><span class="n">bucket</span><span class="p">),</span>
                             <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                            <span class="n">node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_name</span><span class="p">,</span>
                         <span class="p">),</span>
                         <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="si">}</span><span class="s2"> bs=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2"> total_tokens=</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executable</span><span class="p">,</span>
                     <span class="p">)</span>
@@ -3110,6 +3122,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">graph</span><span class="p">,</span> <span class="n">static_outputs</span> <span class="o">=</span> <span class="n">capture_with_static_outputs</span><span class="p">(</span>
                 <span class="n">warmed</span><span class="o">.</span><span class="n">run</span><span class="p">,</span> <span class="n">warmed</span><span class="o">.</span><span class="n">warm_outputs</span> <span class="k">if</span> <span class="n">forwards</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs_like</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">)),</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+                <span class="n">node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_name</span><span class="p">,</span>
             <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">[</span><span class="n">PiecewiseGraphKey</span><span class="p">(</span>
@@ -3155,7 +3168,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># as in `AcceleratorGraphRunner._warmed`</span>
                 <span class="n">live</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
                 <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">reset_peak_memory_stats</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
-                <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span><span class="p">):</span>
+                <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="o">.</span><span class="n">type</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_node_name</span><span class="p">):</span>
                     <span class="n">warm_outputs</span> <span class="o">=</span> <span class="n">run_fn</span><span class="p">()</span>
                 <span class="n">peak</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">max_memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span> <span class="o">-</span> <span class="n">live</span>
                 <span class="c1"># back to a clean stream state so the re-plan below (and the</span>

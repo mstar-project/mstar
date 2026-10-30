@@ -604,6 +604,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
@@ -6723,6 +6724,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.engine.fp32_precision.html#module-mstar.engine.fp32_precision">mstar.engine.fp32_precision</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.node_dtype.html#module-mstar.engine.node_dtype">mstar.engine.node_dtype</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.html#module-mstar.engine.resources">mstar.engine.resources</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.admission.html#module-mstar.engine.resources.admission">mstar.engine.resources.admission</a>
@@ -7188,8 +7191,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.conductor.mps.html#mstar.conductor.mps.MpsDaemon">MpsDaemon (class in mstar.conductor.mps)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.mrope_interleaved">mrope_interleaved (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -7198,6 +7199,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.mrope_interleaved">(mstar.model.qwen3_5.config.Qwen3_5Config attribute)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.components.reasoner.html#mstar.model.cosmos3.components.reasoner.mrope_position_ids">mrope_position_ids() (in module mstar.model.cosmos3.components.reasoner)</a>
 </li>
       <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.mrope_section">mrope_section (mstar.model.qwen3_5.config.Qwen3_5Config attribute)</a>
@@ -7433,6 +7436,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.fp32_precision.html#module-mstar.engine.fp32_precision">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.engine.node_dtype
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.node_dtype.html#module-mstar.engine.node_dtype">module</a>
 </li>
       </ul></li>
       <li>
@@ -9189,6 +9199,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.node_resources">node_resources (mstar.model.submodule_base.NodeSubmodule attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.node_dtype.html#mstar.engine.node_dtype.node_scope">node_scope() (in module mstar.engine.node_dtype)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeAndGraphWalk">NodeAndGraphWalk (class in mstar.graph.base)</a>
 </li>
@@ -11426,10 +11438,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroISTFTNetConfig.resblock_kernel_sizes">(mstar.model.kokoro.config.KokoroISTFTNetConfig attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.reseed_streaming_ready">reseed_streaming_ready() (mstar.graph.base.WorkerGraphStateRegistry method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.reserve">reserve() (mstar.engine.resources.base.Resource method)</a>
 
       <ul>
@@ -11525,6 +11537,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.resolve_media_ref">resolve_media_ref() (in module mstar.api_server.media_io)</a>
 </li>
       <li><a href="_autosummary/mstar.model.command_a_plus.assets.html#mstar.model.command_a_plus.assets.resolve_metadata">resolve_metadata() (in module mstar.model.command_a_plus.assets)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.node_dtype.html#mstar.engine.node_dtype.resolve_model_dtype">resolve_model_dtype() (in module mstar.engine.node_dtype)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.node_dtype.html#mstar.engine.node_dtype.resolve_node_dtype">resolve_node_dtype() (in module mstar.engine.node_dtype)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend">resolve_ragged_attn_backend() (in module mstar.engine.resources.attn.ragged.base)</a>
 </li>
@@ -14291,6 +14307,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.auth.html#mstar.api_server.auth.warn_if_no_api_key">warn_if_no_api_key() (in module mstar.api_server.auth)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.node_dtype.html#mstar.engine.node_dtype.warn_implicit_downcast">warn_implicit_downcast() (in module mstar.engine.node_dtype)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.orphan.html#mstar.utils.orphan.watch_parent">watch_parent() (in module mstar.utils.orphan)</a>
 </li>

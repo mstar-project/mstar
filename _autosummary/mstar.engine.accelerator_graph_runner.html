@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
@@ -835,7 +836,7 @@
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.autocast_scope" title="mstar.engine.accelerator_graph_runner.autocast_scope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">autocast_scope</span></code></a>(dtype, device_type)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.autocast_scope" title="mstar.engine.accelerator_graph_runner.autocast_scope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">autocast_scope</span></code></a>(dtype, device_type[, node_name])</p></td>
 <td><p>A forward's autocast scope; <code class="docutils literal notranslate"><span class="pre">None</span></code> (<code class="docutils literal notranslate"><span class="pre">disable_autocast</span></code>) runs the submodule in its own dtype and shuts out any ambient autocast.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.blocked_capture_resources" title="mstar.engine.accelerator_graph_runner.blocked_capture_resources"><code class="xref py py-obj docutils literal notranslate"><span class="pre">blocked_capture_resources</span></code></a>(step, resources)</p></td>
@@ -2114,14 +2115,16 @@ the same step; use <code class="docutils literal notranslate"><span class="pre">
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.autocast_scope">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">autocast_scope</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device_type</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#autocast_scope"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.autocast_scope" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">autocast_scope</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device_type</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#autocast_scope"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.autocast_scope" title="Link to this definition">#</a></dt>
 <dd><p>A forward’s autocast scope; <code class="docutils literal notranslate"><span class="pre">None</span></code> (<code class="docutils literal notranslate"><span class="pre">disable_autocast</span></code>) runs the
-submodule in its own dtype and shuts out any ambient autocast.</p>
+submodule in its own dtype and shuts out any ambient autocast.
+<code class="docutils literal notranslate"><span class="pre">node_name</span></code> names the node in implicit-downcast warnings.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>device_type</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -2143,7 +2146,7 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.capture_into_graph">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_into_graph</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#capture_into_graph"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.capture_into_graph" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_into_graph</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#capture_into_graph"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.capture_into_graph" title="Link to this definition">#</a></dt>
 <dd><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> into a new CUDA graph allocated from <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p>
 <p>Returns the graph and what <code class="docutils literal notranslate"><span class="pre">run</span></code> returned. A capture that fails part
 way leaves two things behind that would sink every later capture on the
@@ -2162,6 +2165,7 @@ cannot succeed and would otherwise die with an unrelated error.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool" title="mstar.engine.accelerator_graph_backend.AcceleratorGraphPool"><em>AcceleratorGraphPool</em></a>)</p></li>
 <li><p><strong>keep_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -2169,7 +2173,7 @@ cannot succeed and would otherwise die with an unrelated error.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.capture_with_static_outputs">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_with_static_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">warm_outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#capture_with_static_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_with_static_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">warm_outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#capture_with_static_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs" title="Link to this definition">#</a></dt>
 <dd><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> so its outputs land in buffers allocated OUTSIDE <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">warm_outputs</span></code> is what <code class="docutils literal notranslate"><span class="pre">run</span></code> returned on a warm-up call (<code class="docutils literal notranslate"><span class="pre">{name:</span>
 <span class="pre">Tensor}</span></code>); it fixes the shapes and dtypes. The captured graph ends with a
@@ -2190,6 +2194,7 @@ node runs in between.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.AcceleratorGraphPool" title="mstar.engine.accelerator_graph_backend.AcceleratorGraphPool"><em>AcceleratorGraphPool</em></a>)</p></li>
 <li><p><strong>keep_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
