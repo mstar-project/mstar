@@ -2738,7 +2738,7 @@ class Engine:
         journal.add(kind, wire_rid, pool, count, wire_victims)
         if kind in (MoveKind.EARMARK, MoveKind.DROP):
             # matched against the followers' replay lines to compare the ranks' victims
-            logger.info("Journaled %s of request %s on %s (%d, victims %s)", kind.name, wire_rid, node_name, count,
+            logger.debug("Journaled %s of request %s on %s (%d, victims %s)", kind.name, wire_rid, node_name, count,
                         wire_victims)
 
     def take_resident_delta(
@@ -2782,7 +2782,7 @@ class Engine:
                 victims = [self._graph_runtime.get_rid_handle(victim) for victim in move.victims]
                 self._resources[move.pool].replay(kind, rid, move.count, victims)
                 if kind == MoveKind.EARMARK:
-                    logger.info("Replayed rank 0's EARMARK of request %s on %s (%d, victims %s)", wire_rid,
+                    logger.debug("Replayed rank 0's EARMARK of request %s on %s (%d, victims %s)", wire_rid,
                                 node_name, move.count, move.victims)
             elif kind == MoveKind.DROP:
                 if any(kv.cache.in_step(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes):
@@ -2796,7 +2796,7 @@ class Engine:
                         f"{None if rebuild is None else len(rebuild.ids)}"
                     )
                 freed = self.drop_request(node_name, rid, move.count)
-                logger.info("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
+                logger.debug("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
                             move.count, freed)
             elif kind == MoveKind.REBUILD:
                 self.prepare_rebuild(node_name, rid, rebuild_of(rid))
