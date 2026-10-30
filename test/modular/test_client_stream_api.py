@@ -317,7 +317,9 @@ def test_a_stream_whose_partition_ended_answers_later_appends_as_late(tmp_path, 
         _route(wt, audio_in=[])
 
     assert late == ["the call's 'audio_in' input has ended"]
-    assert _signals(sent) == [] and not any(tm.refs.values())
+    assert _signals(sent) == []
+    # stored only to be held for the route, which then frees them
+    assert (not any(tm.refs.values())) if held else tm.refs == {}
 
 
 def test_a_call_that_drains_before_its_route_sends_nothing(tmp_path):

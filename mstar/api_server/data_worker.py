@@ -933,8 +933,9 @@ class PreprocessWorkerThread:
         """Send stored items to their streams' consumer ranks, each rank one
         reader of them, and drop the store's own hold; before the route
         arrives, hold them. Items held for a stream the route gives no rank
-        (its partition never ran) are dropped, and their append answered as
-        late."""
+        (its partition never ran, which no model's does yet) are dropped and
+        their append answered as late; an append that also carried items for
+        a stream already ended gets a second answer."""
         if call.route is None:
             call.held.append((signals, on_late))
             return
