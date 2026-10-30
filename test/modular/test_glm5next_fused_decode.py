@@ -174,6 +174,40 @@ def test_hc_pre_update_matches_plain_on_its_streams(tokens, fn_dtype):
         assert torch.equal(a, b), name
 
 
+@pytest.mark.parametrize("tokens", [1, 7, 32])
+def test_mhc_chain_with_pdl_is_bitwise_unchanged(tokens, monkeypatch):
+    """A layer's decode mHC chain (site, site with the sublayer's update, closing update)
+    as dependent launches inside a CUDA graph gives the same bits as without them."""
+    if not torch.cuda.get_device_capability()[0] >= 9:
+        pytest.skip("programmatic dependent launch needs sm90+")
+    attn, ffn, norm = _site(4096, 4), _site(4096, 4), _norm(4096)
+    residual, h_attn, _, _ = _update_inputs(tokens, 4096, 4)
+    h_mlp = torch.randn_like(h_attn)
+
+    def chain():
+        post, comb, _, streams = attn.forward_fused(residual, norm)
+        post, comb, normed, streams = ffn.forward_fused(streams, norm, update=(h_attn, post, comb))
+        return normed, fused_decode.update_streams(streams, h_mlp, post, comb)
+
+    dev = residual.device
+    with torch.no_grad():
+        monkeypatch.setitem(fused_decode._PDL, dev, False)
+        ref = chain()
+        monkeypatch.setitem(fused_decode._PDL, dev, True)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            chain()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = chain()
+        graph.replay()
+        torch.cuda.synchronize()
+    for name, a, b in zip(("normed", "streams"), out, ref, strict=True):
+        assert torch.equal(a, b), name
+
+
 # -- router ------------------------------------------------------------------
 
 
