@@ -1982,7 +1982,13 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    but klein-9B falls under the ROCm floor of 3 dB below the reference's own kernel spread, so
    it stays opt-in, a quality trade to make per deployment. Z-Image-Turbo's longer sampler
    carries the error further (two of 40 images half-way or more to another seed), so ``fp8``
-   is not recommended there.
+   is not recommended there. Which linears to keep bf16 under ``fp8`` is a per-model
+   measurement: ``configs/flux2_klein_9b.yaml`` keeps the 51 of klein-9B's 80 fp8 linears with
+   the most image error per millisecond saved (every double block's, most single blocks' output
+   projections and two early fused projections); in a one-GPU MI325X A/B it serves at a median
+   26.5 dB from the diffusers reference, over the ROCm floor, at about 1.18 times the bf16
+   images per second (1.39 times with every linear in fp8). Lists giving back 20% and 30% of
+   the saving instead of 40% measured 25.2 dB, under the floor.
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one
