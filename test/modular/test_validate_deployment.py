@@ -56,11 +56,18 @@ class _Spec(NodeResourceSpec):
 class _Model(_ToyModel):
     """A toy model with resources, KV labels and a YAML hook to taste."""
 
-    def __init__(self, walks=_prefill_decode, specs=(), kv_labels=None, refuse_yaml=None, **kw):
+    def __init__(self, walks=_prefill_decode, specs=(), kv_labels=None, refuse_yaml=None,
+                 sp_enabled_nodes=(), **kw):
         super().__init__(walks, **kw)
         self._specs = list(specs)
         self._kv_labels = kv_labels or {}
         self._refuse_yaml = refuse_yaml
+        self._sp_enabled_nodes = set(sp_enabled_nodes)
+
+    def get_default_sharding_config(self):
+        sharding = super().get_default_sharding_config()
+        sharding.sp_enabled_nodes = self._sp_enabled_nodes
+        return sharding
 
     def get_node_resources(self):
         return list(self._specs)
@@ -387,18 +394,20 @@ def test_lockstep_nodes_sharing_a_kv_resource_are_refused(offload, tmp_path):
     assert problem.startswith("Resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_0, worker_1;")
 
 
-@pytest.mark.parametrize("b", [
-    {"ranks": [1, 0], "tp_size": 2},  # the same ranks, led by the other one
-    {"ranks": [0, 1, 2, 3], "tp_size": 4},
-], ids=["other_leader", "other_size"])
-def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, tmp_path):
+@pytest.mark.parametrize("b, placed", [
+    ({"ranks": [1, 0], "tp_size": 2}, "TP ranks [1, 0]"),  # the same ranks, led by the other one
+    ({"ranks": [0, 1, 2, 3], "tp_size": 4}, "TP ranks [0, 1, 2, 3]"),
+    ({"ranks": [0, 1], "sp_size": 2}, "SP ranks [0, 1]"),  # the same ranks, the other axis
+], ids=["other_leader", "other_size", "other_axis"])
+def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, placed, tmp_path):
     """Two instances on a worker are two leaders' step streams with no order
     between them."""
     cfg = _cfg(tmp_path, [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **b}])
-    problems = _problems(_Model(_a_then_b, tp_enabled_nodes=["a", "b"]), cfg)
+    model = _Model(_a_then_b, tp_enabled_nodes=["a", "b"], sp_enabled_nodes=["b"])
+    problems = _problems(model, cfg)
     assert len(problems) == 2
     for rank, problem in enumerate(problems):
-        assert f"on worker_{rank}" in problem and f"a on TP ranks [0, 1]; b on TP ranks {b['ranks']}" in problem
+        assert f"on worker_{rank}" in problem and f"a on TP ranks [0, 1]; b on {placed}" in problem
 
 
 def test_parallel_ranks_off_their_position_are_refused(tmp_path):
