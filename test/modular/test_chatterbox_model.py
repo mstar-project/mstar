@@ -268,7 +268,7 @@ def test_speech_adapter_refuses_server_paths(tmp_path):
     from mstar.api_server.openai.adapters import ChatterboxAdapter
 
     uploads = tmp_path / "uploads"
-    uploads.mkdir()
+    uploads.mkdir(mode=0o700)
     elsewhere = tmp_path / "elsewhere.wav"
     elsewhere.write_bytes(b"RIFF")
     (uploads / "escape.wav").symlink_to(elsewhere)

@@ -66,6 +66,7 @@ from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
 from mstar.utils.utf8_stream import Utf8Stream
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
@@ -106,11 +107,10 @@ def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> s
     embedded ``../`` cannot escape the directory; the extension is kept
     because the data worker's decoder sniffs the container by it.
     """
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = ensure_private_dir(upload_dir)
     base = os.path.basename(filename or "") or "audio.wav"
     path = upload_dir / f"{uuid.uuid4()}_{base}"
-    path.write_bytes(audio_bytes)
+    write_private_file(path, audio_bytes)
     return str(path)
 
 

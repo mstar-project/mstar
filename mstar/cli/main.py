@@ -14,13 +14,12 @@ directly, or pass ``--config`` here to override the default.
 from __future__ import annotations
 
 import argparse
-import getpass
 import os
 import sys
 from pathlib import Path
 
 import mstar
-from mstar.utils.socket_prefix import per_port_socket_prefix
+from mstar.utils.socket_prefix import default_upload_dir, per_port_socket_prefix
 
 # Model name -> default config (relative to the repo's configs/).
 DEFAULT_CONFIGS: dict[str, str] = {
@@ -244,9 +243,8 @@ def _serve(args: argparse.Namespace) -> None:
     if args.compile_level is not None:
         os.environ["MSTAR_COMPILE_LEVEL"] = str(args.compile_level)
 
-    who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
     socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
-    upload_dir = args.upload_dir or f"/tmp/mstar_uploads_{who}/"
+    upload_dir = args.upload_dir or default_upload_dir()
 
     argv = [
         "--config", config,

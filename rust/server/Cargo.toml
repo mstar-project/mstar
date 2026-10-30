@@ -29,6 +29,8 @@ tower-http = { version = "0.5", features = ["cors"] }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 # Constant-time API key compare; already in the tree through rustls.
 subtle = "2"
+# geteuid for the runtime-dir owner check (std has none).
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

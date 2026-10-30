@@ -69,7 +69,8 @@ from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
-from mstar.utils.socket_prefix import per_port_socket_prefix
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
+from mstar.utils.socket_prefix import default_upload_dir, per_port_socket_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -412,7 +413,7 @@ class APIServer:
     def __init__(
         self,
         socket_path_prefix: str = "/tmp/mstar",
-        upload_dir: str = "/tmp/mstar_uploads",
+        upload_dir: str | None = None,
         hostname: str="localhost",
         timeout_seconds: float = 600.0,
         tensor_comm_protocol=CommProtocol.RDMA,
@@ -424,8 +425,7 @@ class APIServer:
         enable_nvtx: bool = False,
         model_config: dict | None = None,
     ):
-        self.upload_dir = Path(upload_dir)
-        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.upload_dir = ensure_private_dir(upload_dir or default_upload_dir())
         self.timeout_seconds = timeout_seconds
 
         # The result-delivery path runs on this process, not the worker's, so its
@@ -1905,6 +1905,10 @@ def _decode_ws_files(
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
     saved: list[Path] = []
+    if files:
+        # checked per message, not only at startup: a /tmp cleaner may have
+        # removed it and another user recreated it since
+        upload_dir = ensure_private_dir(upload_dir)
     try:
         for entry in files or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
@@ -1922,7 +1926,7 @@ def _decode_ws_files(
                 raise ValueError(f"file {name!r} carries no data")
             base = os.path.basename(name) or "upload"
             save_path = upload_dir / f"{uuid.uuid4()}_{base}"
-            save_path.write_bytes(bytes(data))
+            write_private_file(save_path, bytes(data))
             saved.append(save_path)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
@@ -2441,6 +2445,8 @@ async def generate(
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
     if files:
+        # checked per request, as the OpenAI routes and the Rust frontend do
+        upload_dir = await run_in_threadpool(ensure_private_dir, api_server.upload_dir)
         for f in files:
             modality = _detect_modality(f.filename or "")
             if modality == "unknown":
@@ -2455,9 +2461,9 @@ async def generate(
             # embedded separators (../) would escape upload_dir.
             base = os.path.basename(f.filename or "") or "upload"
             save_name = f"{uuid.uuid4()}_{base}"
-            save_path = api_server.upload_dir / save_name
+            save_path = upload_dir / save_name
             content = await f.read()
-            await run_in_threadpool(save_path.write_bytes, content)
+            await run_in_threadpool(write_private_file, save_path, content)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
             paths.append(str(save_path))
@@ -2660,8 +2666,8 @@ def main(argv: list[str] | None = None):
              "default /tmp/mstar_<user>_<port>/",
     )
     parser.add_argument(
-        "--upload-dir", type=str, default="/tmp/mstar_uploads",
-        help="Directory for temporary uploaded files",
+        "--upload-dir", type=str, default=None,
+        help="Directory for temporary uploaded files; default /tmp/mstar_uploads_<user>/",
     )
     parser.add_argument(
         "--timeout", type=float, default=600.0,
@@ -2719,6 +2725,8 @@ def main(argv: list[str] | None = None):
         parser.error(INSTALL_HINT)
     if args.socket_path_prefix is None:
         args.socket_path_prefix = per_port_socket_prefix(args.port)
+    if args.upload_dir is None:
+        args.upload_dir = default_upload_dir()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

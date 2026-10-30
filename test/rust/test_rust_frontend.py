@@ -511,6 +511,32 @@ def test_upload_filename_traversal_is_contained(tmp_path):
     assert ".." not in os.path.basename(path)
 
 
+@pytest.mark.parametrize("which", ["upload", "bridge"])
+@pytest.mark.parametrize("kind", ["symlink", "mode_777"])
+def test_server_refuses_a_shared_runtime_dir(tmp_path, which, kind):
+    """The frontend exits at startup, naming the path, when its upload or
+    bridge socket dir is a symlink or writable by others, as the Python
+    server does."""
+    import subprocess
+
+    good = {d: tmp_path / d for d in ("upload", "bridge")}
+    for d in good.values():
+        d.mkdir(mode=0o700)
+    bad = tmp_path / f"bad_{which}"
+    if kind == "symlink":
+        bad.symlink_to(good[which])
+    else:
+        bad.mkdir()
+        bad.chmod(0o777)
+    dirs = {**good, which: bad}
+    proc = subprocess.run(
+        [BINARY, "qwen3_omni", str(_free_port()), f"{dirs['bridge']}/", f"{dirs['upload']}/"],
+        capture_output=True, text=True, timeout=30, check=False)
+    assert proc.returncode == 1, proc.stderr
+    assert f"refusing {bad}: " in proc.stderr
+    assert "--upload-dir" in proc.stderr
+
+
 def _generate(port, urlencoded: bool, fields=None, timeout=30):
     """POST /generate with either content type; returns (status, ndjson)."""
     import urllib.parse

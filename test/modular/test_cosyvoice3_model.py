@@ -677,7 +677,8 @@ def test_an_upload_the_server_cannot_write_is_not_a_bad_request(tmp_path, monkey
     def fail(*args, **kwargs):
         raise error
 
-    monkeypatch.setattr(Path, "write_bytes", fail)
+    # uploads are written 0600 through write_private_file, not Path.write_bytes
+    monkeypatch.setattr(adapters.media_io, "write_private_file", fail)
     with pytest.raises(RuntimeError) as raised:
         adapters.CosyVoice3Adapter().speech_to_request(_speech(ref_audio=ref, ref_text="w"), tmp_path)
     assert not isinstance(raised.value, ValueError)
@@ -710,7 +711,7 @@ def test_an_upload_write_failure_is_a_500_with_no_path(tmp_path, monkeypatch):
     def fail(path, data):
         raise OSError(28, "No space left on device", str(path))
 
-    monkeypatch.setattr(Path, "write_bytes", fail)
+    monkeypatch.setattr(adapters.media_io, "write_private_file", fail)
     app = FastAPI()
     app.include_router(router)
     r = TestClient(app, raise_server_exceptions=False).post(
