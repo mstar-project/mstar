@@ -1140,7 +1140,21 @@ class MicroScheduler:
             chunkable=chunkable,
             min_chunk_tokens=min_chunk,
             start_order=started,
+            in_progress=(
+                self._prompts_in_progress(node_walk[0])
+                if row_tokens and self.batch_builder.holds_new_prompts else frozenset()
+            ),
         ), starts, speculative)
+
+    def _prompts_in_progress(self, node: str) -> frozenset[int]:
+        """``node``'s rows partway through a prompt with tokens left to
+        schedule. One whose last chunk is scheduled, or that failed or is
+        being removed, holds no other prompt back."""
+        return frozenset(
+            rid for (rid, row_node), progress in self.chunk_progress.items()
+            if row_node == node and progress.next_start() < progress.total
+            and rid not in self.failed_rids and rid not in self.pending_removes
+        )
 
     def _mid_prefill_rows(
         self, node_walk: tuple[str, str], rows: Collection[MidPrefillRow],

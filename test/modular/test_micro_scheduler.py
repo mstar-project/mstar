@@ -38,6 +38,7 @@ from mstar.graph.runtime.base import (
 from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import (
+    ArrivalBatchBuilder,
     BaseBatchBuilder,
     BatchBuildRequest,
     BatchBuildResult,
@@ -1860,6 +1861,65 @@ def test_a_fair_share_builder_advances_every_prompt_each_step():
     manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
 
     assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10), "p1": (0, 2, 10)}
+
+
+def test_the_batch_builder_key_selects_the_arrival_builder():
+    from mstar.worker.batch_builder import BatchBuilderType, make_batch_builder
+
+    assert isinstance(make_batch_builder(BatchBuilderType("arrival")), ArrivalBatchBuilder)
+
+
+@pytest.mark.parametrize("builder", [ArrivalBatchBuilder, FIFOBatchBuilder])
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_under_arrival_no_prompt_starts_while_one_partway_through_is_held(builder):
+    """A prompt held after an OOM keeps the others from starting, so on a tight
+    pool they cannot each take pages the held one needs to finish. Decode rows
+    still run, and once the hold runs out the held prompt goes on. The start-order
+    builder, which has no such rule, starts the second prompt."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.batch_builder = builder()
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    queue = manager.queues["wg0"]._ready
+    queue.pop("p1")  # arrives later
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 3, 10)}
+
+    sched.advance_chunk("p0", NODE, 3)
+    sched.hold_requests(["p0"])
+    queue.update({"p0": {NODE}, "d0": {NODE}, "p1": {NODE}})
+    held = _next_batch(sched, manager)
+    if builder is FIFOBatchBuilder:
+        assert ("p1", NODE) in sched.chunk_progress
+        return
+    assert set(held.request_to_worker_graph) == {"d0"}, "decode rows wait for the held prompt"
+    assert ("p1", NODE) not in sched.chunk_progress, "p1 started beside the held prompt"
+
+    sched.held_until["p0"] = 0.0  # the backoff ran out
+    queue["d0"] = {NODE}
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (3, 6, 10)}
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_under_arrival_a_prompt_whose_last_chunk_is_scheduled_holds_none_back():
+    """While a prompt's chunk is in flight and not continued in the step, no
+    other prompt starts; once its last chunk is scheduled, the next one may."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.batch_builder = ArrivalBatchBuilder()
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    queue = manager.queues["wg0"]._ready
+    queue.pop("p1")  # arrives later
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 4, 10)}
+
+    queue["p1"] = {NODE}
+    assert _next_batch(sched, manager) is None, "p1 started while p0's chunk is in flight"
+
+    sched.advance_chunk("p0", NODE, 4)
+    queue["p0"] = {NODE}
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (4, 8, 10)}
+    sched.advance_chunk("p0", NODE, 8)
+    queue["p0"] = {NODE}
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (8, 10, 10), "p1": (0, 2, 10)}
 
 
 @pytest.mark.usefixtures("no_chunk_floor")

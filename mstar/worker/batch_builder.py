@@ -55,6 +55,9 @@ class BatchBuildRequest:
     min_chunk_tokens: int = 1
     # Rows already mid-prefill -> when their first chunk was cut; lower is older.
     start_order: dict[int, int] = field(default_factory=dict)
+    # The node's rows partway through a prompt with tokens left to schedule,
+    # in this step or not; filled only for a builder that `holds_new_prompts`.
+    in_progress: frozenset[int] = frozenset()
     # `Engine.capture_group` for one rid of this (node, walk).
     capture_group: Callable[[int], Any] = lambda _: None
 
@@ -99,6 +102,10 @@ def _merged(
 
 
 class BaseBatchBuilder(ABC):
+    # Whether no prompt starts while one of its node's is partway through
+    # outside the step; the scheduler fills `BatchBuildRequest.in_progress` for it.
+    holds_new_prompts: bool = False
+
     @abstractmethod
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
         """One step's rows out of ``request``'s backlog and entries."""
@@ -214,15 +221,19 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         if scheduled is None or request.max_batch_tokens is None:
             return BatchBuildResult(scheduled, backlog=remainder, returned=returned)
 
+        hold_new = bool(request.in_progress) and not (
+            request.in_progress <= scheduled.request_to_worker_graph.keys()
+        )
         take, dropped = self.share_token_budget(
             list(scheduled.request_to_worker_graph), request.row_tokens,
             request.chunkable, request.max_batch_tokens, request.min_chunk_tokens,
-            request.start_order,
+            request.start_order, hold_new,
         )
         if request.walk_max_tokens:
             _cap_walks(
                 scheduled, take, dropped, request.chunkable, request.walk_max_tokens,
                 self.share_token_budget, request.min_chunk_tokens, request.start_order,
+                hold_new,
             )
         chunk_tokens = {
             rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
@@ -238,10 +249,11 @@ class FIFOBatchBuilder(BaseBatchBuilder):
     @staticmethod
     def share_token_budget(
         rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-        min_chunk: int, start_order: dict[int, int],
+        min_chunk: int, start_order: dict[int, int], hold_new: bool = False,
     ) -> tuple[dict[int, int], set[int]]:
         """How the step's rows share its token budget: (rid -> tokens taken,
-        rids left out)."""
+        rids left out). ``hold_new``: a prompt of the node is partway through
+        outside the step (only for a builder that ``holds_new_prompts``)."""
         return fill_token_budget_in_start_order(
             rids, tokens, chunkable, budget, min_chunk, start_order,
         )
@@ -255,9 +267,29 @@ class FairShareBatchBuilder(FIFOBatchBuilder):
     @staticmethod
     def share_token_budget(
         rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-        min_chunk: int, start_order: dict[int, int],
+        min_chunk: int, start_order: dict[int, int], hold_new: bool = False,
     ) -> tuple[dict[int, int], set[int]]:
         return fill_token_budget(rids, tokens, chunkable, budget, min_chunk)
+
+
+class ArrivalBatchBuilder(FIFOBatchBuilder):
+    """``FIFOBatchBuilder`` with prompts served strictly in arrival order
+    (``fill_token_budget_in_arrival_order``), and one prompt of a node partway
+    through at a time: while one is outside the step -- held after an OOM,
+    or its chunk in flight and not continued here -- no other prompt starts.
+    On a tight KV pool, prompts started beside a stalled one each hold pages
+    the others need to finish, until none can."""
+
+    holds_new_prompts = True
+
+    @staticmethod
+    def share_token_budget(
+        rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
+        min_chunk: int, start_order: dict[int, int], hold_new: bool = False,
+    ) -> tuple[dict[int, int], set[int]]:
+        return fill_token_budget_in_arrival_order(
+            rids, tokens, chunkable, budget, min_chunk, start_order, hold_new,
+        )
 
 
 def _take_whole(
@@ -341,6 +373,47 @@ def fill_token_budget_in_start_order(
     return take, dropped
 
 
+def fill_token_budget_in_arrival_order(
+    rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
+    min_chunk: int = 1, start_order: dict[int, int] | None = None,
+    hold_new: bool = False,
+) -> tuple[dict[int, int], set[int]]:
+    """``budget`` over ``rids`` strictly first come, first served. Rows that
+    cannot be cut (decode rows among them) go in whole where they fit. Then
+    the prompts: those mid-prefill by when they started (``start_order``),
+    then the others as listed, each whole while it fits. The first that does
+    not fit is cut to what is left, at least ``min_chunk`` tokens, and every
+    prompt behind it sits out, a short one too. ``hold_new`` starts no prompt
+    that is not mid-prefill. Never empty while a row may run: the first runs
+    over budget if it must, so a step is empty only when every row is a
+    prompt ``hold_new`` keeps waiting.
+    Returns (rid -> tokens taken, rids left out)."""
+    start_order = start_order or {}
+    take: dict[int, int] = {}
+    left = budget
+    whole = [rid for rid in rids if rid not in chunkable]
+    for rid in whole:
+        need = tokens.get(rid, 0)
+        if need <= left:
+            take[rid] = need
+            left -= need
+    order = sorted((rid for rid in rids if rid in start_order and rid in chunkable), key=start_order.__getitem__)
+    if not hold_new:
+        order += [rid for rid in rids if rid in chunkable and rid not in start_order]
+    for rid in order:
+        need = tokens.get(rid, 0)
+        if need <= left:
+            take[rid] = need
+            left -= need
+            continue
+        if left >= min_chunk or take:
+            take[rid] = min(need, max(left, min_chunk))
+        break
+    dropped = set(rids) - take.keys()
+    _run_head(whole + order, tokens, chunkable, budget, min_chunk, take, dropped)
+    return take, dropped
+
+
 def fill_token_budget(
     rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
     min_chunk: int = 1,
@@ -375,6 +448,7 @@ def _cap_walks(
     chunkable: set[int], caps: dict[str, int],
     share: Callable[..., tuple[dict[int, int], set[int]]],
     min_chunk: int = 1, start_order: dict[int, int] | None = None,
+    hold_new: bool = False,
 ) -> None:
     """Hold each capped walk's rows to its cap as well as the step's budget:
     those rows share the cap as ``share`` (the builder's) shares a budget,
@@ -386,7 +460,7 @@ def _cap_walks(
             continue
         walk_take, walk_dropped = share(
             rids, {rid: take[rid] for rid in rids}, chunkable, cap, min(min_chunk, cap),
-            start_order or {},
+            start_order or {}, hold_new,
         )
         for rid in rids:
             del take[rid]
@@ -457,10 +531,12 @@ def _compose_walks(
 class BatchBuilderType(Enum):
     FIFO = "fifo"
     FAIR_SHARE = "fair_share"
+    ARRIVAL = "arrival"
 
 
 def make_batch_builder(kind: BatchBuilderType) -> BaseBatchBuilder:
     return {
         BatchBuilderType.FIFO: FIFOBatchBuilder,
         BatchBuilderType.FAIR_SHARE: FairShareBatchBuilder,
+        BatchBuilderType.ARRIVAL: ArrivalBatchBuilder,
     }[kind]()
