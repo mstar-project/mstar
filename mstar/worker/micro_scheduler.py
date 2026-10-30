@@ -239,6 +239,26 @@ def runs_final_chunk(chunk: tuple[int, int, int] | None) -> bool:
     return chunk is None or chunk[1] >= chunk[2]
 
 
+def tp_chunk_ranges(message: ScheduleTPNode, rids: list[int]) -> dict[int, tuple[int, int, int]]:
+    """The chunks the leader cut for ``message``'s rows, keyed by this rank's
+    handles for them (``rids``, from ``tp_rids``). Lists that do not match the
+    rows mean the ranks disagree on the step, so they raise."""
+    if not message.chunk_starts:
+        return {}
+    return {
+        rid: (start, end, total)
+        for rid, start, end, total in zip(
+            rids, message.chunk_starts, message.chunk_ends, message.chunk_totals, strict=True,
+        )
+        if start >= 0 and rid != REMOVED_RID
+    }
+
+
+def unfinished_chunk_rids(chunk_ranges: dict[int, tuple[int, int, int]]) -> set[int]:
+    """The rows of ``chunk_ranges`` whose prompt needs another chunk."""
+    return {rid for rid, chunk in chunk_ranges.items() if not runs_final_chunk(chunk)}
+
+
 class ChunkCursor(NamedTuple):
     """A scheduled chunk: where it starts, and where the one after it does."""
     start: int
@@ -724,6 +744,8 @@ class MicroScheduler:
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
         rids = self.tp_rids(first_tp_node)
+        # before anything is popped: lists that do not match the rows raise
+        chunk_ranges = tp_chunk_ranges(first_tp_node, rids)
         unread = self.unread_rows(first_tp_node, rids)
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name, first_tp_node.graph_walk,
@@ -754,6 +776,9 @@ class MicroScheduler:
             request_walks=request_walks,
             walk_output_signals=walk_signals,
             read_check_rids=tuple(rids) if first_tp_node.read_check else None,
+            # the leader's chunks, so the chunk Loop ends on the same step here
+            chunk_ranges=chunk_ranges,
+            incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
         )
 
     def unread_rows(self, head: ScheduleTPNode, rids: list[int]) -> set[int]:
