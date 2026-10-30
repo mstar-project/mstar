@@ -255,9 +255,9 @@ class MLAAttention(nn.Module):
         else:
             fused = fp8_block_linear(hidden_states, self.fused_qkv_a_proj_weight,
                                      self.fused_qkv_a_proj_scale_inv, self.fp8_block)
-        if (self.mla_fused_prep and not self._selects(**sparse) and fused.is_cuda
-                and fused.dtype == torch.bfloat16):
-            attn_latent = self._fused_prep_and_attend(fused, position_ids)
+        if (self.mla_fused_prep and (self._attends_written or not self._selects(**sparse))
+                and fused.is_cuda and fused.dtype == torch.bfloat16):
+            attn_latent = self._fused_prep_and_attend(fused, hidden_states, position_ids, **sparse)
         else:
             attn_latent = self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
         return self.o_proj(self._gate(self._out(attn_latent), hidden_states))
@@ -410,28 +410,39 @@ class MLAAttention(nn.Module):
         latent = torch.cat([kv_c, kv_c.new_zeros(kv_c.shape[0], self.mla_cache_kpe)], dim=-1)
         return q_norm(q_c), latent
 
-    def _fused_prep_and_attend(self, fused: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def _fused_prep_and_attend(
+        self, fused: torch.Tensor, hidden_states: torch.Tensor, position_ids: torch.Tensor,
+        **sparse,
+    ) -> torch.Tensor:
         """``_prep_and_attend`` in two kernels: q_a's norm before q_b, then kv_a's norm, both
         RoPEs (from the position resource's cos/sin table) and the latent's cache write inside
-        the attention call."""
+        the attention call. A selecting subclass selects from the normed ``q_c`` in between."""
         q_c = mla_prep.q_norm(
             fused, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
+        selection = (self._select(hidden_states, q_c, position_ids, **sparse)
+                     if self._attends_written else None)
         q = self.q_b_proj(q_c).view(fused.shape[0], self.num_heads, self.qk_head_dim)
         q_nope = torch.einsum("thd,hdl->thl", q[..., : self.qk_nope_head_dim], self.w_kc)
-        return self._write_fused_and_attend(q_nope, q, fused, position_ids)
+        return self._write_fused_and_attend(q_nope, q, fused, position_ids, selection, **sparse)
 
     # outside dynamo for the layer index, as _write_and_attend
     @torch.compiler.disable
-    def _write_fused_and_attend(self, q_nope, q, fused, position_ids):
+    def _write_fused_and_attend(self, q_nope, q, fused, position_ids, selection=None, **sparse):
         layer = self._kv.layer_view(self.cache_layer_idx)
         pages, offsets = self._kv.write_slots()
         q_pe = mla_prep.kv_write_q_rope(
             fused, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon,
             self._pos.cos_sin_table, position_ids, q, layer, pages, offsets)
-        return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe)
+        if selection is None:
+            return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe)
+        return self._attend_written(selection, q_nope, q_pe, **sparse)
+
+    # A selecting subclass that implements ``_attend_written`` takes the fused prep too.
+    _attends_written = False
 
     def _selects(self, **sparse) -> bool:
-        """Whether this forward may select rows (else the fused prep may serve it)."""
+        """Whether this forward may select rows (else the fused prep may serve it, or with
+        ``_attends_written`` either way)."""
         del sparse
         return False
 
@@ -443,6 +454,10 @@ class MLAAttention(nn.Module):
     def _attend_selected(self, selection, q_nope, q_pe, latent, **sparse) -> torch.Tensor:
         """Write the step's cache rows ``latent (T, L + kpe)``, then absorbed attention over
         ``_select``'s rows: ``(T, H_local, kv_lora_rank)``."""
+        raise NotImplementedError(f"{type(self).__name__} selects rows but attends none")
+
+    def _attend_written(self, selection, q_nope, q_pe, **sparse) -> torch.Tensor:
+        """``_attend_selected`` over cache rows the fused prep already wrote."""
         raise NotImplementedError(f"{type(self).__name__} selects rows but attends none")
 
     # The absorbed forward reads only w_kc / w_vc / fused_qkv_a_proj_weight;
