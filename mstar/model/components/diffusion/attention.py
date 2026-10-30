@@ -18,10 +18,15 @@ whoever owns the resource, not per layer.
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 from typing import Protocol
 
 import torch
 import torch.nn.functional as F
+
+# ``(q, k, v) -> out`` over ``[B, L, H, D]`` tensors (``k`` / ``v`` may have their own
+# ``L``): ``sdpa_attention``, ``joint_attention`` over a ragged resource, or a wrapper.
+Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 class RaggedAttentionFn(Protocol):

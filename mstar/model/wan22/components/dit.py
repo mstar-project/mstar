@@ -30,20 +30,14 @@ two-linear MLPs ARE the shared ``components.mlp.MLP``.
 
 import functools
 import math
-from typing import Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
-from mstar.model.components.distributed.sequence_parallel import (
-    gather_sequence,
-    scatter_sequence,
-    sp_seq_split,
-    ulysses_attention,
-)
+from mstar.model.components.diffusion.attention import Attend, RaggedAttentionFn, joint_attention
+from mstar.model.components.distributed.sequence_parallel import SeqParallel, sp_seq_split
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import Wan22Config
 
@@ -180,7 +174,7 @@ class Wan22DiTAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attend: Callable[..., torch.Tensor] = joint_attention,
+        attend: Attend = joint_attention,
     ) -> torch.Tensor:
         kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
         query = self.q_norm(self.q_proj(hidden_states))
@@ -259,7 +253,7 @@ class Wan22DiTBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        self_attend: Callable[..., torch.Tensor] = joint_attention,
+        self_attend: Attend = joint_attention,
     ) -> torch.Tensor:
         # [1, 1, 6, dim] + [B, seq, 6, dim] -> six [B, seq, dim] fp32 tensors.
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -369,15 +363,9 @@ class Wan22DiT(nn.Module):
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # every per-token tensor is cut to this rank's tokens (a no-op on one rank)
-        sp = self.sp_group
-        seq_sizes = sp_seq_split(hidden_states.shape[1], sp.world_size)
-        hidden_states, timestep, *rotary_emb = (
-            scatter_sequence(sp, x, seq_sizes, dim=1) for x in (hidden_states, timestep, *rotary_emb)
-        )
-        self_attend = functools.partial(
-            ulysses_attention, sp, run_attention=functools.partial(joint_attention, ragged=self_attn_fn),
-            seq_sizes=seq_sizes, seq_dim=1, head_dim=2,
-        )
+        sp = SeqParallel(self.sp_group, sp_seq_split(hidden_states.shape[1], self.sp_group.world_size))
+        hidden_states, timestep, *rotary_emb = (sp.scatter(x) for x in (hidden_states, timestep, *rotary_emb))
+        self_attend = functools.partial(sp.attend, run=functools.partial(joint_attention, ragged=self_attn_fn))
 
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
             timestep, encoder_hidden_states
@@ -391,7 +379,7 @@ class Wan22DiT(nn.Module):
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
         shift, scale = shift.squeeze(2), scale.squeeze(2)
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
-        hidden_states = gather_sequence(sp, self.proj_out(hidden_states), seq_sizes, dim=1)
+        hidden_states = sp.gather(self.proj_out(hidden_states))
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)

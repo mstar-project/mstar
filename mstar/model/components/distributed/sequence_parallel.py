@@ -19,15 +19,17 @@ layouts such as ``[batch, tokens, heads, head_dim]``; :func:`sp_head_slice` and
 :func:`sp_head_gather` assume ``[tokens, heads, head_dim]``. ``seq_sizes`` is the
 per-rank token count along the sequence (need not be equal — sequences indivisible
 by ``sp`` are handled without padding); the scatter/gather of the residual stream
-at the model boundary uses the same split.
+at the model boundary uses the same split. :class:`SeqParallel` binds the group and
+that split once per forward for a ``[B, L, H, D]`` DiT stream.
 """
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import torch
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.diffusion.attention import Attend
 
 
 def sp_seq_split(total: int, world_size: int) -> list[int]:
@@ -171,3 +173,30 @@ def sp_head_gather(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
         return x
     return sp_group.all_gather(x, dim=1)
 
+
+
+class SeqParallel(NamedTuple):
+    """Ulysses sequence parallelism over a ``[B, L, H, D]`` token stream: ``sizes`` is
+    each rank's share of its ``L``. ``scatter`` cuts a replicated per-token tensor to
+    this rank's tokens and ``gather`` reassembles them, both a no-op on one rank.
+
+    Only an attention whose queries and keys are both the sharded stream needs the
+    exchange: it attends every token over this rank's head-group (``attend``). A
+    query shard attending a replicated stream needs nothing, and a replicated query
+    attending the sharded keys merges the ranks' partial attentions by their
+    log-sum-exps (``attend_shards``; ``run`` must take ``return_lse``)."""
+
+    group: CommGroup
+    sizes: list[int]
+
+    def scatter(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        return scatter_sequence(self.group, x, self.sizes, dim=dim)
+
+    def gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        return gather_sequence(self.group, x, self.sizes, dim=dim)
+
+    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
+        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
+
+    def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
+        return attention_over_sharded_keys(self.group, q, k, v, run)

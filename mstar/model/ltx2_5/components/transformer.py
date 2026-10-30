@@ -27,13 +27,12 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.distributed.sequence_parallel import gather_sequence, scatter_sequence, sp_seq_split
+from mstar.model.components.diffusion.attention import Attend
+from mstar.model.components.distributed.sequence_parallel import SeqParallel, sp_seq_split
 from mstar.model.ltx2_5.components.layers import (
-    Attend,
     GatedAttention,
     GeluFeedForward,
     RotaryTable,
-    SeqParallel,
     rms_norm_no_weight,
     split_rope_table,
 )
@@ -302,7 +301,7 @@ class LTX2DiT(nn.Module):
         sp = None
         if self.sp_group.world_size > 1:
             sp = SeqParallel(self.sp_group, sp_seq_split(latents.shape[1], self.sp_group.world_size))
-            latents = scatter_sequence(sp.group, latents, sp.sizes, dim=1)
+            latents = sp.scatter(latents)
             rope = rope._replace(video=_shard_rows(sp, rope.video), cross_video=_shard_rows(sp, rope.cross_video))
         x = self.proj_in(latents)
         a = self.audio_proj_in(audio_latents)
@@ -316,7 +315,7 @@ class LTX2DiT(nn.Module):
         a = nn.functional.layer_norm(a, (a.shape[-1],), eps=1e-6) * (1 + a_scale) + a_shift
         video = self.proj_out(x)
         if sp is not None:
-            video = gather_sequence(sp.group, video, sp.sizes, dim=1)
+            video = sp.gather(video)
         return video, self.audio_proj_out(a)
 
 
