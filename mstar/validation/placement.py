@@ -7,6 +7,7 @@ from typing import Any
 
 from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axis_sizes
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -91,6 +92,7 @@ def check_worker_graphs(
         *_loop_successors(walk_to_wgs),
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
+        *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
     ]
 
 
@@ -335,6 +337,28 @@ def _sharding_groups(
                         f"{_describe(wg)} has instance size {wg.instance_size}, but its sharding "
                         f"group has tp_size {group.tp_size}. node_groups and sharding_config disagree."
                     )
+
+
+def _paged_kv_on_cfg_ranks(
+    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
+) -> Iterator[str]:
+    """A paged KV cache on a node with ``cfg_size > 1``: the pool's rank math
+    (prefix publishing, transfer slices) takes every instance rank for a head
+    shard, which a CFG rank isn't."""
+    for spec in specs:
+        if not (isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)):
+            continue
+        wg = next((
+            wg for wg in worker_graphs
+            if wg.cfg_size > 1 and spec.nodes & wg.section.get_nodes().keys()
+        ), None)
+        if wg is not None:
+            yield (
+                f"KV {spec.resource_key}: a node with cfg_size > 1 can't hold a paged KV "
+                f"cache, since its CFG ranks run different branches ({_describe(wg)} has "
+                f"cfg_size {wg.cfg_size}). Make each branch its own node in a graph Parallel, "
+                "on its own node group, as BAGEL's LLM_cfg_text and LLM_cfg_img are."
+            )
 
 
 def _worker_parallelism(
