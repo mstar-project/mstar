@@ -15,13 +15,13 @@ Streaming topology:
     Thinker --[thinker_states, FixedChunkPolicy(1)]--> Talker
     Talker  --[codec_tokens,  ScheduledLeftContextChunkPolicy((12, 13), 25, 25)]--> Code2Wav
 
-Conductor-triggered pipelined prefill (Approach C):
-    After each Thinker walk completes (prefill_text, prefill_audio,
-    prefill_vision, thinker_decode), the conductor sends a
-    ``talker_trigger`` to the Talker partition.  During prefill each
-    trigger extends the Talker KV cache with the new Thinker hidden
-    states.  The final trigger (when thinker_decode starts) tells the
-    Talker to sample its first codec token and transition to decode.
+Producer-triggered Talker walks:
+    The Thinker assigns its streamed states the Talker walk they run under
+    (see ``_talker_walk``).  States from a Thinker prefill walk extend the Talker
+    KV cache in ``talker_prefill``; the first ``thinker_decode`` state runs
+    ``talker_last_prefill``, which samples the first codec token, and the
+    rest feed ``talker_decode``.  The Talker never needs to know how many
+    prefill walks the Thinker runs.
 
 Text-only mode:
     When output_modalities does not include "audio", only the Thinker
@@ -96,9 +96,14 @@ from mstar.model.qwen3_omni.config import (
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import Operation, TextChunkDetokenizer, WeightConverter, drop_stop_tokens
+from mstar.model.utils import Operation, TextOutput, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
-from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.streaming.topology import (
+    Connection,
+    PartitionTopology,
+    ProducerWalkCtx,
+    StreamingGraphEdge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +120,23 @@ def apply_code2wav_serving_overrides(code2wav, model_kwargs: dict) -> None:
             value = model_kwargs.pop(name)
             setattr(code2wav, name, tuple(value) if isinstance(value, list) else value)
     code2wav.check_streaming_knobs()
+
+
+def _thinker_to_talker_policy() -> FixedChunkPolicy:
+    # Past the Thinker's end only the decode loop keeps running; an empty
+    # chunk in a prefill walk would run a prefill pass with nothing in it
+    return FixedChunkPolicy(
+        chunk_size=1, continue_after_done=frozenset({"talker_decode"}),
+    )
+
+
+def _talker_walk(ctx: ProducerWalkCtx) -> str:
+    """The Talker walk a Thinker pass's streamed states run under."""
+    if ctx.producer_walk != "thinker_decode":
+        return "talker_prefill"
+    # The first decode iteration closes the prefill and samples the first codec
+    first = ctx.loop_iters.get("thinker_decode_loop", 0) == 0
+    return "talker_last_prefill" if first else "talker_decode"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -159,7 +181,6 @@ class Qwen3OmniModel(Model):
 
     LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
 
-    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -495,13 +516,10 @@ class Qwen3OmniModel(Model):
             outputs=[],
         )
 
-        # -- Talker prefill: receives thinker_states + talker_trigger --
-        # Dual-input gating: both thinker_states from streaming and
-        # talker_trigger from conductor cross-partition trigger must be
-        # present for a prefill step.
+        # -- Talker prefill: extends the KV cache with each streamed state --
         talker_prefill = GraphNode(
             name="Talker",
-            input_names=["thinker_states", "thinker_mask", "talker_trigger"],
+            input_names=["thinker_states", "thinker_mask"],
             outputs=[],
         )
 
@@ -509,7 +527,7 @@ class Qwen3OmniModel(Model):
             sections=[
                 GraphNode(
                     name="Talker",
-                    input_names=["thinker_states", "thinker_mask", "talker_trigger"],
+                    input_names=["thinker_states", "thinker_mask"],
                     outputs=[
                         GraphEdge(
                             next_node=EMPTY_DESTINATION,
@@ -613,13 +631,15 @@ class Qwen3OmniModel(Model):
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_states",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=_thinker_to_talker_policy,
+                    consumer_walk=_talker_walk,
                 ),
                 Connection(
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_mask",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=_thinker_to_talker_policy,
+                    consumer_walk=_talker_walk,
                 ),
                 Connection(
                     from_partition="Talker",
@@ -673,23 +693,13 @@ class Qwen3OmniModel(Model):
                 is_prefill=True,
                 kwargs={
                     "audio_output": audio_output,
-                    "talker_prefill_done": False,
-                    # Derived from the schedule, not len(input_modalities),
-                    # which counts neither the text spans an attachment splits
-                    # the prompt into nor the spans between two attachments.
-                    "num_thinker_prefill_steps": len(
-                        self._build_thinker_prefill_schedule(
-                            input_modalities, input_signals,
-                        )
-                    ),
-                    "prefill_chunks_processed": 0,
                     "voice": model_kwargs.get("voice", "Ethan"),
                     "talker_max_tokens": self._get_max_talker_output_tokens(**model_kwargs),
                 },
             )
             return ForwardPassArgs(
                 full_metadata=full_metadata,
-                inputs=[GraphEdge(next_node="Talker", name="talker_trigger")] if audio_output else [],
+                inputs=[],
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
                 step_metadata={
@@ -980,38 +990,24 @@ class Qwen3OmniModel(Model):
     ) -> ForwardPassArgs:
         """Talker partition state machine.
 
-        1. While prefill: return empty inputs (wait for cross-partition trigger)
-           - When trigger arrives with is_last_prefill=False:
-             extend KV cache only, no outputs
-           - When trigger arrives with is_last_prefill=True:
-             sample first codec token, produce all_codes
-        2. After last prefill produces all_codes: transition to talker_decode
-           - Set graph_walk="talker_decode", is_prefill=False
-           - Return all_codes as input edge (conductor-driven)
-        3. Each decode step: check all_codes for codec_eos
-           - If codec_eos: request_done=True for Talker
-           - Else: return all_codes as input again (loop)
+        The Thinker's stream moves the Talker through its prefill walks (see
+        ``_talker_walk``); the conductor only hands the first decode step its
+        input once ``talker_last_prefill`` has sampled the first codec token.
+
+        1. talker_prefill: nothing to send; the next streamed state runs the
+           next pass.
+        2. talker_last_prefill: feed talker_input_embeds to talker_decode.
+        3. talker_decode: the decode loop ended, so the Talker is done.
         """
         if metadata.graph_walk == "talker_prefill":
-            metadata.kwargs["prefill_chunks_processed"] += 1
-            is_last_prefill = metadata.kwargs["num_thinker_prefill_steps"] == \
-                 metadata.kwargs["prefill_chunks_processed"]
-            metadata.graph_walk = "talker_last_prefill" if is_last_prefill else "talker_prefill"
             return ForwardPassArgs(
                 full_metadata=metadata,
-                inputs=[GraphEdge(next_node="Talker", name="talker_trigger")],
+                inputs=[],
                 unpersist_tensors=[],
-                step_metadata={
-                    "is_prefill": True,
-                    # voice is used for the last prefill
-                    "voice": metadata.kwargs.get("voice", "Ethan"),
-                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
-                },
             )
         elif metadata.graph_walk == "talker_last_prefill":
             metadata.is_prefill = False
             metadata.graph_walk = "talker_decode"
-            metadata.kwargs["talker_prefill_done"] = True
 
             # Feed talker_input_embeds back as input for first decode step
             edge = GraphEdge(next_node="Talker", name="talker_input_embeds")
@@ -1376,6 +1372,9 @@ class Qwen3OmniModel(Model):
     # Model ABC: postprocess
     # -----------------------------------------------------------------------
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), (self.config.im_end_token_id,))
+
     def postprocess(
         self,
         output: torch.Tensor,
@@ -1383,10 +1382,7 @@ class Qwen3OmniModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            ids = drop_stop_tokens(output, (self.config.im_end_token_id,), request_kwargs)
-            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-            return self._text_detokenizer.to_bytes(ids)
+            return super().postprocess(output, modality, request_kwargs)
         elif modality == "audio":
             if output.numel() == 0:
                 return b""

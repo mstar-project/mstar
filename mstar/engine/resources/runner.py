@@ -11,6 +11,7 @@ import logging
 from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
+from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
@@ -64,6 +65,7 @@ class StepRunner:
         self, resources: Mapping[str, Resource],
         node_resources: Mapping[str, Collection[str]] | None = None,
         enable_nvtx: bool = False,
+        declared_by: Mapping[str, Collection[str]] | None = None,
     ):
         # Per-resource NVTX. `engine.plan.promoted` only reports that the sweep
         # was slow; these say WHICH resource ate it. Gated because range_push
@@ -100,11 +102,34 @@ class StepRunner:
         # name every node, including one that owns nothing — an absent node
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
+        self._ask_order = [key for key in self._order if type(self._resources[key]).ask is not Resource.ask]
+        self._node_ask_order = self._per_node(node_resources, self._ask_order)
+        self._admission = Admission(self._resources, self._ask_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
         self._trail_order = [
             key for key in self._order if self._resources[key].page_trail() is not None
         ]
+        self._cap_order = [
+            key for key in self._order
+            if type(self._resources[key]).cap_cached_prefix is not Resource.cap_cached_prefix
+        ]
+        self._node_cap_order = self._per_node(node_resources, self._cap_order)
         self._node_trail_order = self._per_node(node_resources, self._trail_order)
+        # publisher key -> every node of the deployment that declares it
+        # (``declared_by``): a replica on another worker, under another node
+        # name, reads what this one publishes. This runner's own nodes when
+        # not given.
+        declared_by = declared_by or {}
+        self._publisher_nodes: dict[str, frozenset[str]] = {
+            key: frozenset(declared_by[key]) if key in declared_by else frozenset(
+                node for node, keys in (node_resources or {}).items() if key in keys
+            )
+            for key in self._publish_order
+        }
+        # publisher key -> the rids not to publish it for: those whose every
+        # declaring node runs on this lockstep instance, so no other instance
+        # can retrieve their state (``skip_publish``)
+        self._unpublished: dict[str, set] = {key: set() for key in self._publish_order}
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -121,7 +146,8 @@ class StepRunner:
 
         The smallest answer wins, because a step is one span: a resource that
         holds less than another has to be caught up by the tokens that run.
-        A resource with no opinion is not an answer of zero.
+        A resource with no opinion is not an answer of zero. A resource that
+        holds only some lengths then caps the agreed prefix.
         """
         agreed = None
         for key in self._sweep(self._node_order, self._order, node_name):
@@ -130,6 +156,9 @@ class StepRunner:
             )
             if answer is not None and (agreed is None or answer.tokens < agreed.tokens):
                 agreed = answer
+        if agreed is not None:
+            for key in self._sweep(self._node_cap_order, self._cap_order, node_name):
+                agreed = self._resources[key].cap_cached_prefix(rid, node_name, graph_walk, agreed)
         return agreed
 
     def apply_cached_prefix(
@@ -333,14 +362,47 @@ class StepRunner:
             self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
+        self._admission.remove_request(rid)
         for key in self._order:
             self._resources[key].remove_request(rid)
+        for rids in self._unpublished.values():
+            rids.discard(rid)
+
+    @property
+    def publisher_nodes(self) -> Mapping[str, frozenset[str]]:
+        """Each publishing resource's declaring nodes, across the deployment."""
+        return self._publisher_nodes
+
+    def skip_publish(self, rid, keys) -> None:
+        """Never publish ``keys`` for ``rid``: no other lockstep instance runs
+        a node that declares them for this request. Purged on removal."""
+        for key in keys:
+            self._unpublished[key].add(rid)
+
+    def never_publish(self, keys) -> None:
+        """``skip_publish`` for every request: ``keys`` leave the publish
+        order, so a step pays nothing for them."""
+        keys = set(keys)
+        self._publish_order = [k for k in self._publish_order if k not in keys]
+        if self._node_publish_order is not None:
+            self._node_publish_order = {
+                node: [k for k in order if k not in keys]
+                for node, order in self._node_publish_order.items()
+            }
+        for key in keys:
+            self._publisher_nodes.pop(key, None)
+            self._unpublished.pop(key, None)
+
+    def _publishing(self, order: list[str], request_ids) -> list[str]:
+        """``order`` minus the resources none of ``request_ids`` publishes."""
+        skip = self._unpublished
+        return [key for key in order if not (skip[key] and skip[key].issuperset(request_ids))]
 
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
     ) -> FullAdmitOutcome:
-        """bring published state in
+        """bring published state in, once `node_name`'s resources have admitted the request
 
         gives `ready=False` when still has inflights; shortcircuit on failure
 
@@ -350,6 +412,13 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
+        if not self._admission.admitted(rid, node_name):
+            waits = self._admission.admit(
+                rid, node_name, graph_walk, published,
+                self._sweep(self._node_ask_order, self._ask_order, node_name),
+            )
+            if waits is not None:
+                return waits
         ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
@@ -367,7 +436,10 @@ class StepRunner:
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
-
+    def admit_waiting(
+        self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
+    ) -> list[tuple[str, str]]:
+        return self._admission.admit_waiting(published_of)
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
     #
@@ -586,14 +658,19 @@ class StepRunner:
 
         Scoped to the node whose step just ran; no other node's state moved,
         and `merge_publish_info` keeps the entry it already published."""
-        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        order = self._publishing(
+            self._sweep(self._node_publish_order, self._publish_order, node_name),
+            request_ids,
+        )
         if not order:
             return {rid: {} for rid in request_ids}
-        publishers = [(key, self._resources[key]) for key in order]
+        publishers = [(key, self._resources[key], self._unpublished[key]) for key in order]
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
-            for key, resource in publishers:
+            for key, resource, skip in publishers:
+                if rid in skip:
+                    continue
                 info = resource.publish_for_step(
                     rid, node_name=node_name,
                     graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
@@ -616,7 +693,10 @@ class StepRunner:
         with nothing to publish has no entry. Under a combined walk each rid
         is snapshotted under its own walk (``request_walks``), as ``publish``
         does: a publisher may key what it publishes on the walk."""
-        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        order = self._publishing(
+            self._sweep(self._node_publish_order, self._publish_order, node_name),
+            request_ids,
+        )
         if not order:
             return {}
         if request_walks:
@@ -639,7 +719,7 @@ class StepRunner:
                 per_key: dict[str, Any] = {}
                 for key, snaps in columns:
                     snap = snaps[i]
-                    if snap is not None:
+                    if snap is not None and rid not in self._unpublished[key]:
                         per_key[key] = snap
                 if per_key:
                     out[rid] = per_key
@@ -679,14 +759,19 @@ class StepRunner:
         request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """Publish resources configured for the end of a dynamic loop."""
-        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        order = self._publishing(
+            self._sweep(self._node_publish_order, self._publish_order, node_name),
+            request_ids,
+        )
         if not order:
             return {rid: {} for rid in request_ids}
-        publishers = [(key, self._resources[key]) for key in order]
+        publishers = [(key, self._resources[key], self._unpublished[key]) for key in order]
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
-            for key, resource in publishers:
+            for key, resource, skip in publishers:
+                if rid in skip:
+                    continue
                 info = resource.publish_after_stop(
                     rid, node_name=node_name,
                     graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,

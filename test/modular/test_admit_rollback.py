@@ -108,6 +108,7 @@ def _pool(max_slots: int) -> RecurrentStatePool:
             num_layers=1,
             blocks={"state": RecurrentBlockConfig(shape=(2, 4), dtype=torch.float32)},
             max_slots=max_slots,
+            labels=("main", "fork"),
         ),
     )
     return RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))

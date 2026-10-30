@@ -94,10 +94,16 @@ Communication
    * - ``MSTAR_KV_SHM_DIR``
      - ``/dev/shm`` (or ``/tmp`` if unavailable)
      - Base directory for host-staged KV snapshots when remote KV transfer
-       uses SHM. Each deployment creates a private child directory here;
-       request cleanup removes snapshots, and startup removes directories
-       left by dead deployments. All workers sharing KV snapshots must see
-       the same filesystem.
+       uses SHM (``make_deployment_kv_shm_dir``). Each deployment creates a
+       private child directory here, named under its tensor-file namespace
+       (see ``MSTAR_DEPLOYMENT_TOKEN``), and holds that namespace's lock
+       file here while it runs; request cleanup removes snapshots, and
+       startup removes this user's directories whose lock no live process
+       holds. All workers sharing KV snapshots must see the same
+       filesystem. The lock is ``flock``, which some cluster filesystems
+       (GPFS, for one) keep per node, so do not point deployments on
+       different nodes at one shared directory there: each would sweep the
+       other's live directories.
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
      - ``256``
      - Size of each arena segment. The arena grows segment by segment;
@@ -621,10 +627,12 @@ Worker scheduling
        worker main loop (speculate, await_gpu, submit_spec, ...).
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
-     - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping against the streams
-       holding the pages, and each commit against its request's layout. Logs a
-       label left under its footprint at removal. Tests and debugging only.
+     - ``1``: after every ``admit``, ``commit``, ``reset_request``, ``remove_request``
+       and change to an admitted request's pages, check the KV page bookkeeping against
+       the streams holding the pages, the reservations against the free and evictable
+       pages, and each commit against its request's layout. A recurrent snapshot's key is
+       checked against the KV chain's key at its boundary. Logs a label left under its
+       footprint at removal. Tests and debugging only.
 
 Compilation
 -----------
@@ -647,6 +655,21 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``TRITON_PTXAS_BLACKWELL_PATH``
+     - torch's ptxas, when needed
+     - Triton's own variable: the ptxas it runs for sm_100 and up. ptxas
+       before 13.1.115, including the 13.1.80 that Triton 3.7.1 bundles,
+       miscompiles some integer floor divisions on sm_103 (Inductor's fused
+       interleaved mRoPE table came out wrong on B300). Unset, the conductor
+       points its workers at torch's ``torch/bin/ptxas`` when a compute
+       capability 10.x GPU is present, Triton's bundled ptxas predates
+       13.1.115 and torch's does not; it then also sets
+       ``TORCH_COMPILE_CACHE_KEY_TAG``, since Inductor's graph cache would
+       otherwise reuse kernels compiled by the bundled ptxas (decided by
+       :func:`mstar.platforms.ptxas.blackwell_ptxas_env`). A value you set
+       is kept, and the cache tag then names the ptxas you chose, so a cache
+       another ptxas wrote is not reused. A ``TORCH_COMPILE_CACHE_KEY_TAG``
+       you set gets ``-ptxas-blackwell-<version>`` appended.
    * - ``TORCHINDUCTOR_CACHE_DIR``
      - ``$XDG_CACHE_HOME/mstar/torchinductor`` (``~/.cache/mstar/torchinductor`` when unset)
      - torch's own variable; M* sets this default when importing

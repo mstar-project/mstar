@@ -635,7 +635,7 @@ class _LoopWorker:
         ))
         if self.runtime == "rust":
             plan = rt._rust.take_send_plan(out.completion_id)
-            return node, any(r == rid and wgs for r, wgs, _ in plan.completed)
+            return node, any(r == rid and wgs for r, wgs, *_ in plan.completed)
         done = bool(rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids)
         rt.send_outputs(SendInput(
             completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
@@ -701,6 +701,12 @@ def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
     fixture = ROOT / "mstar/model/command_a_plus/tests/fixtures/tiny_config.json"
     (tmp_path / "config.json").write_text(fixture.read_text())
     return _constructed(name, model_kwargs, checkpoint_dir=str(tmp_path), max_seq_len=64)
+
+
+def _cosyvoice3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.cosyvoice3.config import CosyVoice3Config
+    from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model
+    return _bare(CosyVoice3Model, config=CosyVoice3Config())
 
 
 def _cosmos3(name, model_kwargs, tmp_path, monkeypatch):
@@ -851,6 +857,7 @@ _FACTORIES = {
     "CommandAPlusModel": _command_a_plus,
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
+    "CosyVoice3Model": _cosyvoice3,
     "Flux2KleinModel": _flux2,
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,

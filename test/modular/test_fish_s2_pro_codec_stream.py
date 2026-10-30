@@ -35,8 +35,8 @@ from mstar.model.fish_s2_pro.config import (
     FishSlowARConfig,
 )
 from mstar.model.fish_s2_pro.fish_s2_pro_model import clip_digest
-from mstar.model.fish_s2_pro.submodules import CodecSubmodule, RefEncoderSubmodule
-from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
+from mstar.model.fish_s2_pro.submodules import ARSubmodule, CodecSubmodule, RefEncoderSubmodule
+from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, StopCheck
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
@@ -116,7 +116,7 @@ def random_decoder(config: FishS2ProConfig, seed: int = 0) -> FishDACDecoder:
 
 
 def stream_codes(num_frames: int, seed: int = 1, eos: bool = True) -> torch.Tensor:
-    """``[T (+1), 4]`` frames as the AR streams them; the last one is <|im_end|>."""
+    """``[T (+1), 4]`` frames as the AR samples them; the last one is <|im_end|>."""
     g = torch.Generator().manual_seed(seed)
     codes = torch.cat(
         [
@@ -137,10 +137,25 @@ def whole_decode(decoder: FishDACDecoder, codes: torch.Tensor) -> torch.Tensor:
     return (wav.clamp(-1, 1) * 32767).to(torch.int16)
 
 
+def ar_streamed(config: FishS2ProConfig, frames: torch.Tensor, rid: str = "r") -> list[torch.Tensor]:
+    """The frames the AR puts on the codec stream: each step's stop check
+    withholds the <|im_end|> frame (head index in codebook 0)."""
+    ar = ARSubmodule.__new__(ARSubmodule)
+    ar.eos_code, ar.request_states = config.eos_code, {}
+    info = SimpleNamespace(max_tokens=frames.shape[0] + 1, resource_configs={})
+    kept = []
+    for frame in frames:
+        result = ar.check_stop(rid, info, {"head_index": [frame[:1]], "codec_tokens": [frame]})
+        if not (isinstance(result, StopCheck) and "codec_tokens" in result.withheld):
+            kept.append(frame)
+    return kept
+
+
 def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor]):
-    """Stream each request's frames through its own buffer; every step batches the
-    requests that have a chunk ready, as the scheduler batches the codec.
-    Returns, per request, ``(chunk_info, audio)`` per step and the decode count."""
+    """Stream each request's frames, as the AR samples them, through its own
+    buffer; every step batches the requests that have a chunk ready, as the
+    scheduler batches the codec. Returns, per request, ``(chunk_info, audio)``
+    per step and the decode count."""
     cfg = submodule.codec
     buffers = {}
     for rid, request_frames in frames.items():
@@ -150,10 +165,11 @@ def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor]):
             from_partition="AR",
             policy=ScheduledLeftContextChunkPolicy(cfg.chunk_schedule, cfg.chunk_frames, cfg.left_context_frames),
         )
-        for i, frame in enumerate(request_frames):
+        streamed_frames = ar_streamed(submodule.config, request_frames, rid)
+        for i, frame in enumerate(streamed_frames):
             buffers[rid].pre_read_register(f"t{i}")
             buffers[rid].put(f"t{i}", frame)
-        buffers[rid].signal_done()
+        buffers[rid].signal_done(len(streamed_frames))
     infos = {rid: SimpleNamespace(request_id=rid, rid_handle=rid) for rid in frames}
     steps = {rid: [] for rid in frames}
     decodes = 0
@@ -161,9 +177,12 @@ def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor]):
         chunks = {rid: buffers[rid].pop_chunk() for rid in rids}
         meta = {rid: InputMetadata(stream_chunks={"codec_tokens": chunk.info}) for rid, chunk in chunks.items()}
         engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={})
+        # an empty chunk reaches the node as an edge with no tensors
         items = [
             submodule.prepare_inputs(
-                "codec_chunk", infos[rid], {"codec_tokens": [chunks[rid].data["data"]]}, input_metadata=meta[rid]
+                "codec_chunk", infos[rid],
+                {"codec_tokens": [] if chunks[rid].data["data"] is None else [chunks[rid].data["data"]]},
+                input_metadata=meta[rid],
             )
             for rid in rids
         ]
@@ -254,9 +273,9 @@ def test_streamed_chunks_stitch_into_the_whole_decode(config, decoder, num_frame
     full = whole_decode(decoder, codes)
     assert full.numel() == num_frames * HOP
     for info, audio in steps:
-        # the window's new frames, less <|im_end|> (frame ``num_frames``) wherever it lands
-        new = min(info.start_offset + info.num_items, num_frames) - (info.start_offset + info.context_items)
-        assert audio.numel() == max(new, 0) * HOP
+        # every item is a frame: the AR withheld <|im_end|>
+        assert info.start_offset + info.num_items <= num_frames
+        assert audio.numel() == (info.num_items - info.context_items) * HOP
     assert_same_audio(streamed(steps), full)
 
 
@@ -284,22 +303,49 @@ def test_streams_batched_at_different_offsets_each_stitch_into_their_own_decode(
 
 
 def test_context_only_terminal_flush_decodes_nothing(config, decoder):
-    """A stream whose last window holds only context and <|im_end|> emits nothing
-    and, alone in its batch, runs no decode."""
+    """A stream whose last window holds only context emits nothing and, alone
+    in its batch, runs no decode."""
     submodule = CodecSubmodule(decoder, config)
     # ramp 2 + 3, then chunks of 5: 15 frames end exactly on a window
     steps, decodes = run_streams(submodule, {"r": stream_codes(15)})
     steps = steps["r"]
 
     info, audio = steps[-1]
-    assert info.is_final and info.num_items - info.context_items == 1  # just <|im_end|>
+    assert info.is_final and info.num_items == info.context_items
     assert audio.numel() == 0
     assert decodes == len(steps) - 1
 
 
-def test_codec_drops_the_end_of_stream_frame(config, decoder):
+@pytest.mark.parametrize("num_frames", [1, 3, 4, 6, 14, 16])
+def test_the_ar_withholds_im_end_and_the_final_window_keeps_the_last_frames(config, decoder, num_frames):
+    """Off a window boundary, the stream's final chunk carries its last frames
+    and emits their audio, rather than a flush around the <|im_end|> frame."""
     submodule = CodecSubmodule(decoder, config)
-    frames = stream_codes(3)
+    codes = stream_codes(num_frames)
+    assert len(ar_streamed(config, codes)) == num_frames
+
+    steps, _ = run_streams(submodule, {"r": codes})
+    info, audio = steps["r"][-1]
+
+    assert info.is_final and info.num_items > info.context_items
+    assert audio.numel() == (info.num_items - info.context_items) * HOP
+    assert_same_audio(streamed(steps["r"]), whole_decode(decoder, codes))
+
+
+def test_a_stream_of_only_im_end_ends_with_an_empty_chunk(config, decoder):
+    """The AR's first frame was <|im_end|>: the stream gets no item, and its
+    final chunk reaches the codec with no tensor, decodes nothing and emits no audio."""
+    submodule = CodecSubmodule(decoder, config)
+    steps, decodes = run_streams(submodule, {"r": stream_codes(0)})
+
+    ((info, audio),) = steps["r"]
+    assert info == StreamChunkInfo(0, 0, 0, True)
+    assert audio.numel() == 0 and decodes == 0
+
+
+def test_codec_takes_every_item_as_a_frame(config, decoder):
+    submodule = CodecSubmodule(decoder, config)
+    frames = stream_codes(3, eos=False)
     item = submodule.prepare_inputs(
         "codec_chunk",
         SimpleNamespace(request_id="r", rid_handle="r"),
@@ -316,7 +362,7 @@ def test_codec_preprocess_stages_window_geometry_as_the_per_column_copies_did(co
         submodule.prepare_inputs(
             "codec_chunk",
             SimpleNamespace(request_id=str(i), rid_handle=i),
-            {"codec_tokens": [stream_codes(frames)]},
+            {"codec_tokens": [stream_codes(frames, eos=False)]},
             input_metadata=InputMetadata(
                 stream_chunks={"codec_tokens": StreamChunkInfo(start, context, frames, is_final=False)}
             ),

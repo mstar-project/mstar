@@ -8,11 +8,18 @@ import torch
 from mstar.engine.resources import SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
+# A compile mode of the engine's own rather than torch.compile's: Inductor's
+# defaults in its deterministic mode, which picks each kernel's config by rule
+# instead of timing candidates on the device, so every process compiles the
+# same kernels and one input gives one output from any server. See
+# ``accelerator_graph_runner.compile_kwargs``.
+DETERMINISTIC_COMPILE_MODE = "deterministic"
+
 
 def check_compile_mode(mode: str | None) -> str | None:
     """A capture config's ``compile_mode``, refused at build rather than at capture,
     where the per-capture fallback would serve the bucket eager."""
-    if mode is None or mode == "default":
+    if mode is None or mode in ("default", DETERMINISTIC_COMPILE_MODE):
         return mode
     if not mode:
         # torch.compile takes a falsy mode for "default"
