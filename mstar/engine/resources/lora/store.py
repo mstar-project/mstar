@@ -161,21 +161,22 @@ def check_adapter_file(
     spec: LoraSpec, name: str, path: str, others: Sequence[LoraSpec] = (),
 ) -> bytes:
     """The adapter at ``path`` checked against ``spec`` and the model's ``others`` (its
-    LoRA specs for other nodes, a vision tower's say, which serve the same adapters), and
-    read as a worker reads it under each (shapes against the targets included); returns
-    its digest. Raises ``ValueError`` for an adapter the deployment cannot
-    serve."""
-    digest = None
+    LoRA specs for other nodes, a vision tower's say, which serve the same adapters), each
+    from the checkpoint's header; returns its digest. The digest is read once per way the
+    specs convert the checkpoint (``convert_keys``), so once for specs that read it alike.
+    Raises ``ValueError`` for an adapter the deployment cannot serve."""
+    digests: dict = {}  # convert_keys -> the digest of the file read that way
     for each in (spec, *others):
         each.check_adapter(name, inspect_adapter(each, path))
-        read = LoraAdapterStore(each, pin=False, dtype=torch.float32).read(name, path).digest
-        # one digest pins the adapter on every spec's pools (``adapter_digests``)
-        if digest is not None and read != digest:
-            raise ValueError(
-                f"LoRA adapter {name!r} digests differently under {each.resource_key!r}; "
-                "a model's LoRA specs must read checkpoints alike (convert_keys)"
-            )
-        digest = read
+        if each.convert_keys not in digests:
+            digests[each.convert_keys] = adapter_digest(read_lora_file(path, convert_keys=each.convert_keys))
+    digest, *rest = digests.values()
+    # one digest pins the adapter on every spec's pools (``adapter_digests``)
+    if any(other != digest for other in rest):
+        raise ValueError(
+            f"LoRA adapter {name!r} digests differently under the model's LoRA specs; "
+            "they must read checkpoints alike (convert_keys)"
+        )
     return digest
 
 
