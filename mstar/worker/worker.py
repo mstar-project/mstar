@@ -103,9 +103,9 @@ logger = logging.getLogger(__name__)
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
 
-# ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
-# releases the event on every exit, so this only fires if that thread died.
-_ADMIT_FENCE_TIMEOUT_S = 10.0
+# How often ``_await_admit_settled`` warns while a step has yet to admit. It
+# never gives up; see there.
+_ADMIT_FENCE_WARN_S = 10.0
 
 # How many torn-down request keys a worker remembers, so that a message landing
 # after the teardown (a duplicate REMOVE, a peer's late stream chunk or
@@ -517,6 +517,7 @@ class Worker:
         ):
             kv_shm_dir_factory = partial(
                 make_deployment_kv_shm_dir,
+                self.tensor_manager._shm_namespace,
                 socket_path_prefix=socket_path_prefix,
                 dist_init_method=dist_init_method,
             )
@@ -1420,10 +1421,11 @@ class Worker:
         # producer's segment may be unlinked once every reader ACKs READS_DONE.
         if body.request_id in self._draining_rids:
             return
-        logger.debug(
-            "Received new signals %s at worker %s for request %s",
-            format_graph_edge_list(body.inputs), self.worker_id, body.request_id
-        )
+        if logger.isEnabledFor(logging.DEBUG):  # the edge list is formatted per message
+            logger.debug(
+                "Received new signals %s at worker %s for request %s",
+                format_graph_edge_list(body.inputs), self.worker_id, body.request_id
+            )
         request_id = self._rid(body.request_id)
         if request_id is None:
             # _process_message_list parks or drops signals for an unknown
@@ -2517,9 +2519,9 @@ class Worker:
             return False
         try:
             if pending is not None:
-                # The engine releases this event even on its failure paths, so off a TP node the 10 s timeout fires
-                # only if the GPU thread died. A TP rank that pre-plans a head that N voids keeps pages, so every TP
-                # rank waits for N's commit, or for N's future after a raise before the GPU thread's `try`.
+                # A step N this slow (a long admit, say) skips the pre-plan rather than holding plan_executor, and
+                # exec plans N+1 inline. A TP rank that pre-plans a head that N voids keeps pages, so every TP rank
+                # waits for N's commit, or for N's future after a raise before the GPU thread's `try`.
                 with self._span("worker.plan_thread.await_commit"):
                     committed = pending.node_batch.commit_done.wait(timeout=10.0)
                     while not committed and pending.node_name in self.parallel_nodes and not pending.future.done():
@@ -2657,39 +2659,38 @@ class Worker:
         c_start = _time.thread_time() if timed else 0.0
         laps = PhaseLaps("worker.gpu_thread.")
         engine = self.engine_manager.get_engine(batch.node_name)
-        # Every output of this step stays on the device: the engine keeps the
-        # rows and skips the per-request dicts and tail (cached per node and
-        # walk, a dict read here).
-        node_batch.rows_only = self._all_on_device(
-            engine, batch.node_name, batch.graph_walk, batch.output_signals,
-        )
-        if batch.request_walks:
-            node_batch.loopback_rids = self._loopback_rids(engine, batch)
-        if logger.isEnabledFor(logging.DEBUG):
-            # test/waypoint/serve_rollout.py parses this line (wire ids, logged
-            # before prepare_inputs runs) to recover the DiT schedule.
-            logger.debug(
-                "Executing: %s graph_walk=%s %s", node_batch.node_name,
-                batch.graph_walk, [self._rid_str(r) for r in node_batch.request_ids],
-            )
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
-        laps.lap("setup")
-        # The plan thread wrote this batch's plan into the resources; wait for
-        # it before the forward reads them. Waiting releases the GIL — which is
-        # the point: running prepare_inputs here instead just puts the two
-        # threads in contention for it, and measured worse.
-        if plan_future is not None:
-            with self._span("worker.gpu_thread.await_plan"):
-                plan_future.result()
-        laps.skip()
-        if self.enable_nvtx:
             range_push(
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
                 synchronize=False,
             )
         try:
+            # Every output of this step stays on the device: the engine keeps
+            # the rows and skips the per-request dicts and tail (cached per node
+            # and walk, a dict read here).
+            node_batch.rows_only = self._all_on_device(
+                engine, batch.node_name, batch.graph_walk, batch.output_signals,
+            )
+            if batch.request_walks:
+                node_batch.loopback_rids = self._loopback_rids(engine, batch)
+            if logger.isEnabledFor(logging.DEBUG):
+                # test/waypoint/serve_rollout.py parses this line (wire ids,
+                # logged before prepare_inputs runs) to recover the DiT schedule.
+                logger.debug(
+                    "Executing: %s graph_walk=%s %s", node_batch.node_name,
+                    batch.graph_walk, [self._rid_str(r) for r in node_batch.request_ids],
+                )
+            laps.lap("setup")
+            # The plan thread wrote this batch's plan into the resources; wait
+            # for it before the forward reads them. Waiting releases the GIL —
+            # which is the point: running prepare_inputs here instead just puts
+            # the two threads in contention for it, and measured worse.
+            if plan_future is not None:
+                with self._span("worker.gpu_thread.await_plan"):
+                    plan_future.result()
+            laps.skip()
             try:
                 if node_batch.read_check_rids is not None:
                     with self._span("worker.gpu_thread.read_check"):
@@ -2746,10 +2747,6 @@ class Worker:
                     laps.lap("gpu_exec_events")
             return outputs
         finally:
-            # Safety net: a step that raised before the forward would otherwise
-            # leave the submitter blocked on this for the full wait timeout.
-            if node_batch.launch_started_event is not None:
-                node_batch.launch_started_event.set()
             # Safety net: a step that raised before publishing outputs or
             # committing would otherwise strand the plan thread preparing the
             # next one. The engine does this too on its own paths; here covers
@@ -2776,37 +2773,56 @@ class Worker:
                 range_pop(synchronize=False)
 
     def _await_admit_settled(self, pending: "PendingBatch | None") -> None:
-        """Block until the in-flight step's admit has run (for TP leaders).
+        """Block until the in-flight step has admitted.
 
         Admit is on the GPU thread; every offload and reload is on this one. A
         page move in the window between a step's broadcast and its admit lands
         in the NEXT step's resident delta, so the follower applies it after
         admitting this step while the leader admitted with it already applied.
+        The event is set at the step's first launch, after every row has
+        admitted, or when the step ends without launching
+        (``_submit_gpu_step``). On the per-request path later rows plan after
+        it lifts; their plans read only their own in-flight rows.
 
+        It waits however long the admit takes: giving up lets the ranks split,
+        and this thread blocks on the step's result later in the pass anyway.
         Separate from the submitter's ``MSTAR_LAUNCH_WAIT_MS`` wait on the same
-        event: that one is a GIL throttle and is meant to expire early. This
-        one is for correctness, so it waits out the step.
+        event, a GIL throttle that is meant to expire.
         """
         if pending is None:
             return
         event = pending.node_batch.launch_started_event
         if event is None or event.is_set():
             return
+        waited = 0.0
         with self._span("worker.await_admit_settled"):
-            settled = event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S)
-            # A TP node's ranks diverge if this rank moves pages before the admit, however long it takes. A step
-            # that raised before the GPU thread's `try` never sets the event, but its future is done.
-            while not settled and pending.node_name in self.parallel_nodes and not pending.future.done():
+            while not event.wait(timeout=_ADMIT_FENCE_WARN_S):
+                waited += _ADMIT_FENCE_WARN_S
                 logger.warning(
-                    "Worker %s: node=%s walk=%s has not admitted after %ss; holding page moves until it does",
-                    self.worker_id, pending.node_name, pending.graph_walk, _ADMIT_FENCE_TIMEOUT_S,
+                    "Worker %s: still waiting for node=%s walk=%s to admit after "
+                    "%.0f s; scheduling and teardowns wait for it",
+                    self.worker_id, pending.node_name, pending.graph_walk, waited,
                 )
-                settled = event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S)
-        if not settled:
-            logger.warning(
-                "Worker %s: node=%s walk=%s has not admitted after %ss; scheduling the next step before its admit",
-                self.worker_id, pending.node_name, pending.graph_walk, _ADMIT_FENCE_TIMEOUT_S,
-            )
+
+    def _submit_gpu_step(
+        self,
+        gpu_executor: ThreadPoolExecutor,
+        batch: ScheduledBatch,
+        node_batch: ExecutingBatch,
+        plan_future: Future | None,
+    ) -> Future:
+        """Submit a step to the GPU thread with a fresh launch event.
+
+        The engine sets the event at launch. A step that ends without one (a
+        refused admit, a raise, an executor that never ran it) sets it on
+        completion, so the admit fence and the submitter's wait always lift.
+        """
+        event = node_batch.launch_started_event = threading.Event()
+        future = gpu_executor.submit(
+            self._execute_on_gpu_thread, batch, node_batch, plan_future,
+        )
+        future.add_done_callback(lambda _f: event.set())
+        return future
 
     def _drop_rows_whose_loop_stopped(self, pending: PendingBatch) -> None:
         """Take a refused speculative step's rows whose loop stopped at N out
@@ -5111,7 +5127,7 @@ class Worker:
                     self._follower_rebuild(batch)
                     node_batch = self._build_executing_batch(batch)
                     batch_partition = self.request_state.get_partition_for_node(batch.node_name)
-                    logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
+                    logger.debug("Yield away: %s %s", batch.node_name, node_batch.request_ids)
                     speculation = Speculation(
                         scheduled_batch=batch,
                         node_batch=node_batch,
@@ -5548,11 +5564,8 @@ class Worker:
 
                             # Hold the main thread off the GIL until the GPU
                             # thread reaches the forward launch; see exec.
-                            spec_launch_started = threading.Event()
-                            spec_node_batch.launch_started_event = spec_launch_started
-                            spec_future = gpu_executor.submit(
-                                self._execute_on_gpu_thread,
-                                spec_batch, spec_node_batch,
+                            spec_future = self._submit_gpu_step(
+                                gpu_executor, spec_batch, spec_node_batch,
                                 speculation.plan_future,
                             )
                             # the GPU thread owns the pre-plan and the rids
@@ -5564,7 +5577,9 @@ class Worker:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
                             with self._span("worker.submit_spec.launch_wait"):
-                                spec_launch_started.wait(timeout=launch_wait_s)
+                                spec_node_batch.launch_started_event.wait(
+                                    timeout=launch_wait_s,
+                                )
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
@@ -5690,14 +5705,11 @@ class Worker:
                 # Unlike the spec submit, this path doesn't hold off the GIL for
                 # the launch — but it still has to be fenceable, or the next
                 # iteration schedules against an admit that hasn't run.
-                node_batch.launch_started_event = threading.Event()
                 self._set_in_flight_flag(batch, True)
                 submitted_at = _time.perf_counter() if metrics is not None else 0.0
-                future = gpu_executor.submit(
-                    self._execute_on_gpu_thread, batch, node_batch, None,
-                )
+                future = self._submit_gpu_step(gpu_executor, batch, node_batch, None)
                 self.wakeup_event.register_future(future)
-                logger.debug(f"Scheduling: {batch.node_name} {node_batch.request_ids}")
+                logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
                 _set_pending(PendingBatch(
                     batch=batch,
                     node_batch=node_batch,

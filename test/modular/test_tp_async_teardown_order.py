@@ -402,50 +402,29 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
 
 
-class _SlowAdmit(threading.Event):
-    """An admit that lands on the third wait."""
+def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
+    """The fence waits past any number of warning intervals; it never gives up.
+    A lone-rank step (``tp_seq=-1``) is the case that used to."""
+    tp_seq = -1
+    monkeypatch.setattr(worker_mod, "_ADMIT_FENCE_WARN_S", 0.001)
+    admitted = threading.Event()
+    warnings = []
 
-    waits = 0
+    def warn(*args):
+        warnings.append(args)
+        if len(warnings) == 3:
+            admitted.set()  # the admit lands during the third interval
 
-    def wait(self, timeout=None):
-        self.waits += 1
-        return self.waits == 3
-
-
-def test_the_fence_holds_a_tp_worker_until_its_step_admits():
+    monkeypatch.setattr(worker_mod.logger, "warning", warn)
     w = Worker.__new__(Worker)
-    w.worker_id, w.parallel_nodes, w._span = "rank0", {NODE}, lambda name: nullcontext()
-    event = _SlowAdmit()
+    w.worker_id = "rank0"
+    w._span = lambda name: nullcontext()
+    _, executing = _batch(tp_seq, [HANDLES["kept"]])
+    executing.launch_started_event = admitted
+    pending = SimpleNamespace(
+        tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, node_batch=executing,
+    )
 
-    w._await_admit_settled(SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(launch_started_event=event),
-        future=SimpleNamespace(done=lambda: False),
-    ))
+    w._await_admit_settled(pending)
 
-    assert event.waits == 3, "a page move would run before the step admitted"
-
-
-class _NoAdmit(threading.Event):
-    """An admit that never lands."""
-
-    waits = 0
-
-    def wait(self, timeout=None):
-        self.waits += 1
-        assert self.waits < 5, "the fence waits for good"
-        return False
-
-
-def test_the_fence_lets_a_tp_worker_go_once_a_step_that_raised_before_its_admit_is_done():
-    """The GPU thread can raise before the try whose finally sets the event, for instance while it waits on the
-    pre-plan. The main loop then surfaces the error from the step's future."""
-    w = Worker.__new__(Worker)
-    w.worker_id, w.parallel_nodes, w._span = "rank0", {NODE}, lambda name: nullcontext()
-    event = _NoAdmit()
-
-    w._await_admit_settled(SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(launch_started_event=event),
-        future=SimpleNamespace(done=lambda: True),
-    ))
-
-    assert event.waits == 1, "the fence kept waiting for a step that will never admit"
+    assert admitted.is_set() and len(warnings) == 3
