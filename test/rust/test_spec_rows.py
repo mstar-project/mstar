@@ -80,7 +80,8 @@ class _StubTM:
 
 class _Scheduler:
     """The scheduler questions the speculation asks: no backlog, an optional
-    cap, and the fresh rows a test queues (the same batch to both builds)."""
+    cap, every row ready for the next node, and the fresh rows a test queues
+    (the same batch to both builds)."""
     failed_rids: set = frozenset()
 
     def __init__(self):
@@ -92,6 +93,9 @@ class _Scheduler:
 
     def room_for_continuing(self, target):
         return self.room
+
+    def _check_ready(self, node_name, rid, fwd_info):
+        return True
 
     def get_next_batch(self, *a, **k):
         if self.fresh is None:
