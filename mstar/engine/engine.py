@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import repeat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 
@@ -803,22 +803,26 @@ class Engine:
                 node_name, walks, max_rows, submodule_mgmt.resources, self._device,
             )
 
-    def _enter_rows(self, batch: ExecutingBatch, preplan: bool = False) -> bool:
-        """Put a persistent walk's step in row order, proposing its rows; on
-        the gpu thread, check in the rows any other step of the node runs.
-        False for a pre-plan that has to wait for that check-in."""
+    def _enter_rows(self, batch: ExecutingBatch, preplan: bool = False) -> Sequence[int] | None:
+        """The step's rids in the order it runs: a persistent walk's in row
+        order, proposing its rows. On the gpu thread, put the batch in that
+        order and check in the rows any other step of the node runs. None for
+        a pre-plan that has to wait for that check-in.
+
+        A pre-plan leaves the batch as it is, since the main thread may still
+        be dropping rows from it; exec reorders it."""
         node_rows = self._rows.get(batch.node_name)
         if node_rows is None:
-            return True
+            return batch.request_ids
         ctx = batch.step_context
         walk = ctx.graph_walk
         if not node_rows.persistent(walk):
             if preplan:
                 # the check-in lands in stream order on the gpu thread, and
                 # this step's plan reads what it writes back
-                return not node_rows.holds_any(batch.request_ids)
+                return None if node_rows.holds_any(batch.request_ids) else batch.request_ids
             node_rows.check_in(batch.request_ids)
-            return True
+            return batch.request_ids
         rids = batch.request_ids
         rows = ctx.rows
         if rows is None or rows.stale or (
@@ -826,12 +830,14 @@ class Engine:
         ):
             rows = ctx.rows = node_rows.begin(walk, rids)
         order = rows.order
+        if preplan:
+            return order
         if tuple(order) != tuple(rids):
             if batch.inputs is not None:
                 at = {rid: i for i, rid in enumerate(rids)}
                 batch.inputs = [batch.inputs[at[rid]] for rid in order]
             batch.request_ids = list(order)
-        return True
+        return batch.request_ids
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],
@@ -2579,19 +2585,22 @@ class Engine:
     ) -> bool:
 
         laps = PhaseLaps("engine.pre_plan.")
-        if not self._enter_rows(batch, preplan=True):
+        rids = batch.request_ids
+        order = self._enter_rows(batch, preplan=True)
+        if order is None:
             return False
         laps.lap("rows")
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
-        inputs = (
-            cg_runner.declare_inputs_for(lease)
-            if batch.inputs is None
-            else cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
-        )
-        batch.step_context.set_padded_rids(
-            cg_runner.step_ids(lease, batch.request_ids)
-        )
+        if batch.inputs is None:
+            inputs = cg_runner.declare_inputs_for(lease)
+        else:
+            inputs = batch.inputs
+            if order is not rids and tuple(order) != tuple(rids):
+                at = {rid: i for i, rid in enumerate(rids)}
+                inputs = [inputs[at[rid]] for rid in order]
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
+        batch.step_context.set_padded_rids(cg_runner.step_ids(lease, order))
         laps.lap("pad")
         t0 = phase_start()
         step = submodule_mgmt.submodule.declare_step(
@@ -2630,7 +2639,7 @@ class Engine:
             laps.skip()
             batch.preplan_event = torch.Event(device=self._device)
             batch.preplan_event.record(stream)
-            batch.preplanned_rids = tuple(batch.request_ids)
+            batch.preplanned_rids = tuple(order)
             laps.lap("event")
         finally:
             batch.step_context.is_preplan = False
@@ -2641,9 +2650,10 @@ class Engine:
         if batch.preplanned_rids is None:
             return False
         rows = batch.step_context.rows
-        return batch.preplanned_rids != tuple(batch.request_ids) or (
-            rows is not None and rows.stale
-        )
+        if rows is not None:
+            # planned in row order, which exec puts the batch in (_enter_rows)
+            return rows.stale or set(batch.preplanned_rids) != set(batch.request_ids)
+        return batch.preplanned_rids != tuple(batch.request_ids)
 
     def reset_pre_plan_for_batch(self, batch: ExecutingBatch | None = None) -> None:
         """Drop planned-ahead state, e.g. when its batch never dispatched.
