@@ -241,8 +241,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     def encode_clip(self, wav: torch.Tensor) -> torch.Tensor:
         """A whole clip through the featurizer, encoder and projection, as
         offline: ``(frames, projection out)``."""
-        states, _ = self.encoder(self.log_mel(wav)[None].to(self.projection.weight.dtype))
-        return self.projection(states)[0]
+        return self._blocks(self.encoder.subsample(self.log_mel(wav)[None].to(self.projection.weight.dtype)))[0]
 
     # -- engine contract ------------------------------------------------------
 
@@ -390,8 +389,13 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         s = call.static_inputs
         return {"y": self._blocks(s["x"], s["n"])}
 
-    def _blocks(self, x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
-        return self.projection(self.encoder.blocks(x, new=n))
+    def _blocks(self, x: torch.Tensor, n: torch.Tensor | None = None) -> torch.Tensor:
+        """The blocks (a stream step given ``n``) and the projection. The residual
+        goes in fp32, which the fused add + LayerNorm keeps: under bf16 autocast
+        a bf16 residual put the frames measurably further from an fp32 run (see
+        docs/models.rst). The offline encoders keep theirs in bf16; for Canary
+        an fp32 one was no closer."""
+        return self.projection(self.encoder.blocks(x.float(), new=n))
 
     # -- the front end --------------------------------------------------------
 
