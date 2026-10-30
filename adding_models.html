@@ -436,6 +436,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.generation_kwargs.html">mstar.utils.generation_kwargs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.host_copy.html">mstar.utils.host_copy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
@@ -2529,6 +2530,15 @@ default:</p>
 </div>
 <p>The setting applies only to the API server process. The conductor and workers keep
 torch’s default.</p>
+<p>A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
+video decoder should therefore emit its clip in the layout the encoder takes, transposed
+on the GPU inside its forward, so <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> hands the tensor it reads straight to the
+encoder: <code class="docutils literal notranslate"><span class="pre">[T,</span> <span class="pre">C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code> for torchcodec’s <code class="docutils literal notranslate"><span class="pre">VideoEncoder</span></code> (Cosmos3) and <code class="docutils literal notranslate"><span class="pre">[T,</span> <span class="pre">H,</span> <span class="pre">W,</span> <span class="pre">3]</span></code>
+rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw <code class="docutils literal notranslate"><span class="pre">video_frame</span></code> stream (LingBot-World).
+A permute in <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> costs a host copy of the whole clip, or a slower copy of each
+frame inside PyAV. The arena’s CPU read of an output (<code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>) slices a large
+copy over threads of its own (<code class="docutils literal notranslate"><span class="pre">mstar.utils.host_copy.HostCopier</span></code>), one encode’s share of
+the CPUs.</p>
 </section>
 <section id="tensor-parallelism-sharding">
 <span id="tensor-parallelism"></span><h3>Tensor parallelism (sharding)<a class="headerlink" href="#tensor-parallelism-sharding" title="Link to this heading">#</a></h3>
