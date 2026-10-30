@@ -95,6 +95,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_SAMPLER,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, TextOutput, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
@@ -368,6 +369,11 @@ class Qwen3OmniModel(Model):
         return {"Thinker": {THINKER_MIXED: {
             "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode",
         }}}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # the Talker's KV is built from the Thinker's states, which no ids recompute
+        return {"Thinker": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
+                                         loop="thinker_decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.
