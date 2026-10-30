@@ -16,6 +16,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import test_kv_host_index as host
+import torch
 from test_kv_admission import _remove, _runner
 from test_kv_preemption import (  # noqa: F401
     PAGE_SIZE,
@@ -33,12 +34,24 @@ from test_kv_preemption import (  # noqa: F401
 from mstar.engine.engine import PagedKVCache
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.step import Segment
+from mstar.graph.base import GraphEdge, GraphNode, Loop
+from mstar.model.base import KVLabel
+from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.worker import KeptIds, Worker
+from mstar.worker.rebuild import KeptIds, Rebuilds, policies_run_here
+from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
 NODE = "LLM"
+POLICY = RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token", loop="decode")
+
+
+def _graphs(node_name: str = NODE) -> dict:
+    """The node prefills in ``prefill`` and grows its KV in loop ``decode`` of walk ``decode``."""
+    def node():
+        return GraphNode(name=node_name, input_names={"text_inputs"}, outputs=[GraphEdge("out", "new_token")])
+    return {"prefill": node(), "decode": Loop(section=node(), max_iters=8, outputs=[], name="decode")}
 
 
 def _worker(kv):
@@ -51,15 +64,17 @@ def _worker(kv):
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
     w._kv_caches, w._kv_keys = {"kv": PagedKVCache("kv", frozenset({NODE}), kv)}, {NODE: ["kv"]}
-    w._kept_ids = {NODE: {rid: KeptIds(array("i", range(5 * PAGE_SIZE)).tobytes(), array("i", [0])) for rid in "rv"}}
-    w._growth_loops = {("decode", NODE): "decode"}
-    w._in_flight_rids, w._victims, w._dropped, w._rebuild_rows, w._hold_logged = set(), {}, {}, {}, {}
+    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    w._rebuilds._kept[NODE] = {rid: KeptIds(torch.arange(5 * PAGE_SIZE), array("i", [0])) for rid in "rv"}
+    w._in_flight_rids, w._victims, w._dropped, w._hold_logged = set(), {}, {}, {}
     w._preempted, w._preemptions, w._drop_logged, w._rid_str = {}, defaultdict(PreemptionCounts), {}, str
     w.held, w.tried = [], []
     w.scheduler = SimpleNamespace(
-        backlog={}, return_backlogged=lambda rid: None, hold_requests=w.held.extend,
+        backlog={}, rebuilds={}, return_backlogged=lambda rid: None, hold_requests=w.held.extend,
         could_refill=lambda *args: False, cap_batch=lambda *args: None, limit_batch=lambda *args: None,
     )
+    for name in ("queue_rebuild", "take_rebuilds", "rebuild_queued"):  # the real rebuild queue
+        setattr(w.scheduler, name, getattr(MicroScheduler, name).__get__(w.scheduler))
     w.request_state = SimpleNamespace(
         get_partition_for_node=lambda node: "p",
         get_fwd_info=lambda rid, p: SimpleNamespace(graph_walk="decode", dynamic_loop_iter_counts={"decode": 0}),
@@ -82,9 +97,9 @@ def _preempting(case: str = "deciding kv pool", in_flight: tuple[str, ...] = ())
     w = _worker(kv)
     w._in_flight_rids = set(in_flight)
     if case == "a node that keeps no ids":
-        w._kept_ids = {}
+        w._rebuilds = Rebuilds({}, {})
     elif case == "a node where no request keeps ids":
-        w._kept_ids = {NODE: {}}
+        w._rebuilds._kept[NODE] = {}
     elif case == "nothing to drop":
         w.engine_manager.get_engine(NODE).drop_refusal = lambda node, rid: "refused"
     rows = dict.fromkeys(("r", *in_flight), 0)
@@ -113,18 +128,12 @@ def test_only_a_deciding_kv_pool_preempts(case):
         assert w.tried and w.held == ["r"] and kv.is_resident("v"), f"{case} lost the offload and the hold"
 
 
-@pytest.mark.parametrize("node, rebuilds", [
-    pytest.param("llm", True, id="a node whose walks all run here"),
-    pytest.param("decoder", False, id="a node with a second cache, as Whisper's decoder"),
-    pytest.param("pd_decode", False, id="a node whose prefill walk runs on another worker"),
+@pytest.mark.parametrize("my_walks, rebuilds", [
+    pytest.param({(NODE, "prefill"), (NODE, "decode")}, True, id="a node whose walks all run here"),
+    pytest.param({(NODE, "decode")}, False, id="a node whose prefill walk runs on another worker"),
 ])
-def test_only_a_node_a_rebuild_can_recompute_drops_requests(node, rebuilds):
-    w = Worker.__new__(Worker)
-    w._kv_keys = {"llm": ["kv"], "decoder": ["kv", "cross"], "pd_decode": ["kv"]}
-    w._walk_inputs = {(walk, name): {"text_inputs"} for walk in ("prefill", "decode") for name in w._kv_keys}
-    my_walks = {(name, walk) for walk, name in w._walk_inputs} - {("pd_decode", "prefill")}
-
-    assert w._can_rebuild_on(node, my_walks) == rebuilds
+def test_only_a_node_whose_rebuild_runs_here_drops_requests(my_walks, rebuilds):
+    assert bool(policies_run_here({NODE: POLICY}, _graphs(), my_walks, ())) == rebuilds
 
 
 def test_a_victim_the_host_takes_whole_goes_there_and_its_pages_to_the_request_that_ran_short():
@@ -231,7 +240,8 @@ def test_preemptions_after_metrics_start_are_reported():
 ], ids=["prefill worker", "worker that runs every walk"])
 def test_a_pool_reserves_growth_only_for_the_loops_its_worker_runs(walks, loops):
     kv = _pool()
-    _worker(kv)._set_local_loops(walks)
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    _worker(kv)._set_local_loops(model, walks)
     assert kv.local_loops == loops, "a guaranteed request would reserve growth its worker never runs"
 
 

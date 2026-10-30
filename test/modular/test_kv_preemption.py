@@ -146,31 +146,16 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
 def test_a_dropped_request_with_an_image_returns_with_pages_for_the_image_too():
     kv = _pool()
     image = PrefixSpan(3 * PAGE_SIZE, 4, WALK, kind="digest")
-    layout = StreamLayout(spans=(PrefixSpan(PAGE_SIZE, PAGE_SIZE, WALK), image), growth=(("decode", 1),))
+    text = (PrefixSpan(PAGE_SIZE - 1, PAGE_SIZE - 1, WALK), PrefixSpan(1, 1, WALK))
+    layout = StreamLayout(spans=(text[0], image, text[1]), growth=(("decode", 1),))
     _runner(kv).ingest_request("v", {"kv": KVReqConfig(
         kv_layout={"main": layout}, loop_caps={"decode": 8 * PAGE_SIZE}, arrival=1,
-        prompt_ids={"main": bytes(4 * PAGE_SIZE)},
     )})
     assert _ready(kv, "v") and _step(kv, "v", 4 * PAGE_SIZE).ok
     _drop(kv, "v")
 
-    # its history is the text page and one sample, and its rebuild writes the image's rows too
+    # its history is a page of text and the sample its next step writes, and its rebuild writes the image's rows too
     assert _admitted(kv, "v") and kv._allotments["v"].pages == 6, "the rebuild would run out of pages in the image"
-
-
-def test_a_dropped_request_waiting_for_room_counts_its_pages_once():
-    kv = _pool()
-    _request(kv, "r", 2, arrival=1)
-    assert _ready(kv, "r") and _step(kv, "r", 2 * PAGE_SIZE).ok
-    lay_out, laid_out = kv._rebuilt_spans, []
-    kv._rebuilt_spans = lambda *args: laid_out.append(args) or lay_out(*args)
-    kv._room = lambda: 0
-    _drop(kv, "r")
-
-    for _ in range(3):
-        assert not _admitted(kv, "r")
-
-    assert len(laid_out) == 1, "every main-loop pass would lay out the rebuild again"
 
 
 def test_a_victim_still_to_move_is_chosen_for_no_other_request():

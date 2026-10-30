@@ -47,7 +47,7 @@ The conductor sets the class once, at ingest, and the same class holds in every 
 | 1 | Audio it streams out | guaranteed | a pause is a gap in playback |
 | 2 | A `rows` span | guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads |
 | 3 | A `digest` span | guaranteed | its KV comes from an encoder's output, freed after prefill |
-| 4 | No kept ids on its node | guaranteed there | the node has no ids to rebuild from, as when its decode reads embeddings |
+| 4 | No rebuild policy on its node | guaranteed there | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
 | 5 | Only `ids` spans | preemptible | its token ids reproduce all of its KV |
 
 Row 3 becomes preemptible with a followup, R5, which keeps a host copy of the encoder's output for the rebuild. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Until then, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker.
@@ -260,22 +260,27 @@ Why this shape:
 ### 5.3 The rebuild row
 
 ```python
-@dataclass
-class KeptIds:
-    """A request's token ids as its model consumed them, kept for a rebuild."""
-    prompt: bytes    # the prompt's ids as int32, from the data worker
-    sampled: array   # array('i'), each kept sample, appended at the stop check
+@dataclass(frozen=True)
+class RebuildPolicy:
+    """How a node rebuilds a dropped request's KV, as its model declares it."""
+    walk: str            # the prefill walk a rebuild row runs
+    ids_input: str       # the walk's input that carries the prompt's ids
+    sample_output: str   # the output that carries each sampled id
+    loop: str            # the loop each of whose iterations samples one id
+    copied_inputs: Mapping[str, tuple[str, ...]]   # another prefill walk -> what it reads besides the ids
 ```
 
-The rebuild is one row of the engine's batch over the kept ids minus the last, under the node's prefill walk, in a step of its own. Its sample is discarded, it sends nothing, and its decode loop doesn't advance. Decoding resumes from the last kept id once the step lands.
+A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup. A node without one never drops a request.
 
-The data worker already reads the prompt's ids on the host to key the prefix cache, so it sends them with the request's first frame. They are the ids after templating. The worker keeps them per node and per handle, and lists them in `rid_table.py`. It keeps them only where one prefill row can rebuild the node's KV. Elsewhere the request is guaranteed (§1).
+The rebuild is one row of the engine's batch over the kept ids minus the last, under the walk the request prefilled in, in a step of its own. Its sample is discarded, it sends nothing, and its decode loop doesn't advance. Decoding resumes from the last kept id once the step lands.
+
+The worker keeps a request's prompt ids from the policy's input the first time a step runs one of the policy's prefill walks, as one device copy per step shared by its rows, and appends each sample from the stop check's host copy. A walk of `copied_inputs` reads more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs and the step's metadata to the host, and the rebuild row reads them back under that metadata. The worker keeps all of this per node and per handle, only for a request a rebuild could write again, and lists it in `rid_table.py`. A rebuild copies the prompt to the host once, for the KV's layout and keys.
 
 Why this shape:
 
 - **The graph runtime never sees the row.** Switching the request's runtime walk for one step would touch both runtimes, the output edges, `WORKER_GRAPHS_DONE` and the loop-back.
 - **The prefill walk.** Each model's decode walk breaks a multi-token row in its own way. Bagel's declares a span of 1, the Qwen3-Omni Thinker's embeds every id at one position, and Qwen3.5's with device loop-back reads one token off the sampler.
-- **The prompt's ids from the data worker.** A drop can come at any token, after the prompt tensor is freed. Keeping the ids any other way means a device-to-host copy of every prefill's input.
+- **The prompt's ids from the walk's input.** A drop can come at any token, after the prompt tensor is freed, so the worker copies the ids when the step runs. The copy stays on the device, and only a rebuild waits on a copy to the host. Sending the ids from the data worker with every request instead added 0.5 to 1.8 ms of TTFT at Bagel c16 and Qwen3.5 c32.
 - **Not a remove and re-ingest.** The sampler's RNG offset and repetition mask would be lost.
 
 > Note: the row's cache probe serves the kept ids' cached prefix first, so a rebuild recomputes only what the GPU index doesn't hold. Qwen3.5 rebuilds its whole history until its prefix caching (P2) lands.
@@ -349,7 +354,7 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 - **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
 - **Rebuild steps.** A rebuild runs in a step of its own, so the node's decode rows wait one step. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.
-- **Kept ids.** Every request's prompt ids ride its first frame to each worker, which keeps them at 4 B per token, 128 KB for a 32K-token request. Carrying them adds 0.5 to 1.8 ms of TTFT per request at Bagel c16 and Qwen3.5 c32. Keeping the ids any other way would mean a d2h copy of every prefill.
+- **Kept ids.** A node with a rebuild policy keeps each request's prompt ids on the device, in the walk's input dtype, until the request finishes: 256 KB for a 32K-token request of int64 ids. A rebuild waits on one copy of them to the host.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.
 

@@ -324,11 +324,12 @@ A layout has five fields:
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
   node's outputs. A request with a ``"rows"`` span can't be rebuilt, so in a pool that decides
   admission it reserves its whole footprint and is never preempted. A request with ``"digest"``
-  spans is rebuilt from a host copy of what its prefill walk read, at one rank, when every span of
-  the label is on that one walk, the last is an ``"ids"`` span and the label isn't keyed for the
-  prefix cache. It is guaranteed otherwise. The rebuild row gives the walk one tensor of ids per
-  ``"ids"`` span, with the samples appended to the last, and the prefill row's step metadata, so
-  the walk must read its prompt in that shape.
+  spans can be rebuilt at one rank when the node's ``RebuildPolicy`` names its walk in
+  ``copied_inputs``: the worker keeps host copies of the inputs listed there, and the rebuild row
+  reads them again. Every span of the label must be on that walk, the last must be an ``"ids"``
+  span, and the label must key none of them for the prefix cache. It is guaranteed otherwise. The
+  rebuild row gives the walk its ids as the prefill row read them, with the samples appended to the
+  last tensor, under the prefill row's step metadata, so the walk must read its prompt in that shape.
   ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.

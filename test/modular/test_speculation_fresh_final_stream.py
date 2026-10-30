@@ -33,6 +33,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler, PopReadyResult, ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
 
 NODE, WALK, LOOP, PART, STREAM = "nano_llm", "decode", "decode_loop", "LLM", "audio_frame"
@@ -73,6 +74,7 @@ def _worker(scheduler, runtime):
     }
     worker = SimpleNamespace(
         worker_id="w0",
+        _rebuilds=Rebuilds({}, {}),
         scheduler=scheduler,
         _graph_runtime=runtime,
         tensor_manager=SimpleNamespace(get_tensor=lambda uuid: torch.tensor([uuid])),

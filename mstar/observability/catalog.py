@@ -111,7 +111,7 @@ KV_DROPS = Family(
 )
 KV_REBUILD_TOKENS = Family(
     "mstar_kv_rebuild_tokens_total", COUNTER,
-    "KV slots the rebuild rows prefilled from kept history, image slots and cache hits included.",
+    "Tokens of kept history the rebuild rows prefilled, cache hits included.",
     ("component",),
 )
 KV_REBUILD_CACHED_PAGES = Family(

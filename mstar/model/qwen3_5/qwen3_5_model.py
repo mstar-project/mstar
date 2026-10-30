@@ -82,6 +82,7 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
 from mstar.utils.fast_tokenize import encode_ids
@@ -305,6 +306,14 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # A prompt with images is rebuilt from host copies of the encoder's output. A video's frames are rows,
+        # which no rebuild recomputes.
+        return {"LLM": RebuildPolicy(
+            walk="prefill_text", ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
+            copied_inputs={"prefill_vision": ("vision_embeds", "image_grid_thw")},
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(
