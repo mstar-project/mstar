@@ -2546,29 +2546,8 @@ class KVManager(AttentionResource):
         gained a page, and the host arrays FlashInfer's planner reads."""
         rows = ctx.rows
         lease = ctx.slot_lease
-        if step.pre_forks or step.post_forks or step.sink or step.combined_labels or step.eager_write:
-            raise ValueError(
-                f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} takes "
-                "no forks, sink rows, combined labels or eager writes"
-            )
-        by_label = group_by_plan_label(step.segments, {})
-        if by_label.keys() != kv_rows.labels.keys():
-            raise ValueError(
-                f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} carries "
-                f"labels {sorted(by_label)}, but its rows hold {sorted(kv_rows.labels)} "
-                "(RowWalk.labels)"
-            )
+        by_label = self._write_rows(step, ctx, kv_rows)
         order = rows.order
-        d = rows.diff
-        if d.join_rids:
-            kv_rows.write_joins(rows, self._streams)
-        if self._admit_reserved_pages:
-            joined = set(d.join_rids)
-            for (rid, label), new in self._admit_reserved_pages.items():
-                if rid in joined or label not in kv_rows.labels or ctx.is_padding_row(rid):
-                    continue
-                held = self._streams[rid][label].page_indices.n
-                kv_rows.write_pages(rows, label, rows.slot_of(rid), held - len(new), new)
         page_size = kv_rows.page_size
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
         out = {}
@@ -2607,6 +2586,34 @@ class KVManager(AttentionResource):
             self._staged_outputs.pop((lease.slot, label), None)
             plan_states[label] = state
         return KVPlanOutputs(out)
+
+    def _write_rows(self, step: KVStep, ctx: StepContext, kv_rows: KVRows) -> dict:
+        """The rows a step of a persistent walk changes: those that joined and
+        the pages held rows gained. Its segments by label."""
+        if step.pre_forks or step.post_forks or step.sink or step.combined_labels or step.eager_write:
+            raise ValueError(
+                f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} takes "
+                "no forks, sink rows, combined labels or eager writes"
+            )
+        by_label = group_by_plan_label(step.segments, {})
+        if by_label.keys() != kv_rows.labels.keys():
+            raise ValueError(
+                f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} carries "
+                f"labels {sorted(by_label)}, but its rows hold {sorted(kv_rows.labels)} "
+                "(RowWalk.labels)"
+            )
+        rows = ctx.rows
+        d = rows.diff
+        if d.join_rids:
+            kv_rows.write_joins(rows, self._streams)
+        if self._admit_reserved_pages:
+            joined = set(d.join_rids)
+            for (rid, label), new in self._admit_reserved_pages.items():
+                if rid in joined or label not in kv_rows.labels or ctx.is_padding_row(rid):
+                    continue
+                held = self._streams[rid][label].page_indices.n
+                kv_rows.write_pages(rows, label, rows.slot_of(rid), held - len(new), new)
+        return by_label
 
     def _arm_rows(self, kv_rows: KVRows, res: "KVPlanOutputs", ctx: StepContext) -> None:
         """While a persistent walk's graph is captured: have it write each
@@ -3002,7 +3009,16 @@ class KVManager(AttentionResource):
         if reused is not None:
             return reused
 
-        kv_rows = self._kv_rows.get(ctx.graph_walk) if ctx.slot_lease is not None else None
+        if ctx.slot_lease is None:
+            kv_rows = None
+            eager_rows = self._kv_rows.get(ctx.graph_walk) if ctx.rows is not None else None
+            if eager_rows is not None:
+                # A step of the walk with no capture of its size: it plans as
+                # any step does, and its rows take what it changed for the
+                # replays after it (after_forward steps their lengths).
+                self._write_rows(step, ctx, eager_rows)
+        else:
+            kv_rows = self._kv_rows.get(ctx.graph_walk)
         if kv_rows is not None and ctx.rows is not None and not ctx.capture:
             res = self._plan_rows(step, ctx, kv_rows)
             laps.lap("rows")

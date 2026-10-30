@@ -1895,7 +1895,9 @@ stepped) and page list (device only) in the rows
 address of each row's token from them, and the FlashInfer attention
 resource's graph builds its paged arrays the same way, so the host runs only
 FlashInfer's planner, on lengths from the mirror. The host uploads a joining
-row, or a page a held row's stream gained. The streams remain the host
+row, or a page a held row's stream gained, on every step of the walk: one
+with no capture of its size runs eagerly and plans as any step does, but
+keeps the rows right for the replays after it. The streams remain the host
 truth, extended at each commit as for any step. A read-only step of the walk
 (every segment span 0) reuses its last plan while the rows are unchanged,
 and so does cross attention (``FlashInferCrossManager``): a held row's
