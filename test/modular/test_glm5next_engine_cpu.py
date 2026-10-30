@@ -284,14 +284,14 @@ class TestEngineCpu:
     def test_a_follower_out_of_slots_rank_0_had_raises(self):
         """Rank 0 schedules a prefill only into free slots. A follower whose pool
         is full for it has diverged, and must not quietly re-queue a step rank 0
-        is already running."""
+        is already running: it stops its worker."""
         engine, sub, cfg = _build_engine()
         engine._tp_follower_nodes = {"LLM"}
         prompt = torch.tensor([1, 2, 3], dtype=torch.long)
         for rid in "abcde":
             _add(engine, rid)
         _run(engine, "prefill", {rid: prompt for rid in "abcd"})
-        with pytest.raises(RuntimeError, match="diverged"):
+        with pytest.raises(SystemExit, match="diverged"):
             _run(engine, "prefill", {"e": prompt})
         # the refusal was unwound: the four held slots, none for e
         pool = engine._resources[KDA_STATE]
