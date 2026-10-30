@@ -169,29 +169,25 @@ class CommGroup:
         """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
         hidden]`` inputs of ``dtype``. Returns whether it is available for them.
 
-        Collective: every member calls it at the same point, with the same
-        arguments. Each node of a lockstep instance shares its group and calls
-        this at load for its own width and dtype, so the group keeps one
-        workspace per ``(dtype, hidden)``; a larger ``max_tokens`` for one it
-        has replaces it. Each holds a few ``max_tokens x hidden`` buffers per
-        rank in device memory (FlashInfer's IPC / multicast buffers, outside
-        torch's allocator). An input with no workspace for its width and dtype,
-        or longer than ``max_tokens``, takes NCCL all-reduce + a separate norm.
+        Collective: every member calls it at load, in the same order with the
+        same arguments. The lockstep nodes of an instance share its group, so
+        it keeps one workspace per ``(dtype, hidden)``; a larger ``max_tokens``
+        builds a larger one, and the smaller stays alive for any forward that
+        holds its id. Each is a few ``max_tokens x hidden`` buffers per rank,
+        allocated outside torch's allocator. Other inputs take NCCL all-reduce
+        and a separate norm.
         """
         if self.world_size == 1:
             return False
-        key = (dtype, hidden)
-        have = self._ar_fusion.get(key)
+        have = self._ar_fusion.get((dtype, hidden))
         if have is not None and have.max_tokens >= max_tokens:
             return True
-        from mstar.distributed.ar_fusion import create_workspace, destroy_workspace
+        from mstar.distributed.ar_fusion import create_workspace
 
         ws_id = create_workspace(self, max_tokens, hidden, dtype)
         if ws_id is None:
-            return have is not None
-        if have is not None:
-            destroy_workspace(have.ws_id)
-        self._ar_fusion[key] = ArFusionWorkspace(ws_id, max_tokens)
+            return False
+        self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(ws_id, max_tokens)
         return True
 
     def allreduce_add_rmsnorm(

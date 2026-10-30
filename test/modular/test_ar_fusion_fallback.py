@@ -81,17 +81,16 @@ def test_a_shared_group_keeps_a_workspace_per_width_and_dtype(monkeypatch):
     """Two lockstep nodes of one instance share its group, and each sets up
     fusion for its own width and dtype. Each input takes the workspace built
     for its (dtype, hidden); one with none, or longer than its workspace,
-    takes NCCL."""
+    takes NCCL. A larger max_tokens that fails to build keeps the smaller."""
     import torch
 
-    built, destroyed, used = [], [], []
+    built, used = [], []
 
     def create(group, max_tokens, hidden, dtype):
         built.append((dtype, hidden, max_tokens))
-        return len(built) - 1
+        return None if max_tokens > 16 else len(built) - 1
 
     monkeypatch.setattr(ar_fusion, "create_workspace", create)
-    monkeypatch.setattr(ar_fusion, "destroy_workspace", destroyed.append)
     monkeypatch.setattr(
         ar_fusion, "allreduce_add_rmsnorm",
         lambda x, residual, weight, eps, bias, ws_id: used.append(ws_id) or (x, residual),
@@ -101,11 +100,11 @@ def test_a_shared_group_keeps_a_workspace_per_width_and_dtype(monkeypatch):
     assert group.init_allreduce_fusion(16, torch.float32, max_tokens=8)
     assert group.init_allreduce_fusion(8, torch.float32, max_tokens=8)
     assert group.init_allreduce_fusion(16, torch.bfloat16, max_tokens=8)
-    assert group.init_allreduce_fusion(16, torch.float32, max_tokens=4)   # kept
-    assert group.init_allreduce_fusion(8, torch.float32, max_tokens=16)   # rebuilt
-    assert built == [(torch.float32, 16, 8), (torch.float32, 8, 8),
-                     (torch.bfloat16, 16, 8), (torch.float32, 8, 16)]
-    assert destroyed == [1]
+    assert group.init_allreduce_fusion(16, torch.float32, max_tokens=4)       # has one
+    assert group.init_allreduce_fusion(8, torch.float32, max_tokens=16)       # grown
+    assert not group.init_allreduce_fusion(16, torch.float32, max_tokens=32)  # build failed
+    assert built == [(torch.float32, 16, 8), (torch.float32, 8, 8), (torch.bfloat16, 16, 8),
+                     (torch.float32, 8, 16), (torch.float32, 16, 32)]
 
     for rows, hidden, dtype in ((4, 16, torch.float32), (16, 8, torch.float32),
                                 (4, 16, torch.bfloat16), (4, 32, torch.float32),
