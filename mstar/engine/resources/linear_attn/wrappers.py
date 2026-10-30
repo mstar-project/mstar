@@ -724,9 +724,10 @@ class GDNMixedWrapper(GDNWrapper):
         if len(prompt) > cap:
             raise RuntimeError(
                 f"GDNMixedWrapper: {len(prompt)} prompt rows in a step "
-                f"captured for {cap}. Possible causes: more than the scheduler "
-                "lets in, a decode row behind a prompt row (a broken row order), "
-                "or a CombinedSplit that leaves out a multi-token walk"
+                f"captured for {cap}. Possible causes: the scheduler let in more "
+                "than max_rows_in_combined allows, a decode row behind a prompt "
+                "row (a broken row order), or a CombinedSplit that leaves out a "
+                "multi-token walk"
             )
         # Under capture the decode half runs the bucket's rows; eagerly, the run's.
         width = max(self._bs or 0, rows) if self._accelerator_graph else run
