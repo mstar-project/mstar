@@ -132,7 +132,7 @@ class Glm52MLAAttention(MLAAttention):
     def _selects(self, dsa_selection=None) -> bool:
         return self._dsa_ctx() is not None
 
-    # mla_fused_prep serves the selecting path too: q_norm feeds the indexer's q_c, and
+    # the fused MLA prep serves the selecting path too: q_norm feeds the indexer's q_c, and
     # kv_write_q_rope writes the step's latents before _attend_written reads them
     _attends_written = True
 

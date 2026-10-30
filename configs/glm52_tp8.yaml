@@ -4,12 +4,13 @@ model: "glm52"
 # checkpoint through the HF cache (HF_HOME) or pass
 # model_kwargs.checkpoint_path.
 #
-# Routed experts run the fused fp8 W8A8 kernel (moe_quant_kernel: auto), which
-# is what lets decode capture. model_kwargs.moe_quant_kernel: reference serves
-# the per-expert dequant loop instead, eager, as the numerics anchor.
-#
-# The speedups below are on; set a flag false to drop one. tp_async_sched
-# builds decode step N+1 while step N runs (MSTAR_TP_ASYNC_SCHED overrides).
+# The fp8 linears stay fp8, and the model serves its tuned kernels (kernels: auto):
+# the fused fp8 MoE, which is what lets decode capture, its decode and router
+# kernels, the MLA latent prep in two kernels, each all-reduce up to 1 MiB fused
+# with the next add + RMSNorm, and the last layer's FFN on the sampled rows at
+# prefill. model_kwargs.kernels: reference serves the numerics anchor instead,
+# eager. tp_async_sched builds decode step N+1 while step N runs
+# (MSTAR_TP_ASYNC_SCHED overrides).
 #
 # Without dsa_long_context the context is capped at index_topk (2048), where
 # dense MLA equals the sparse reference exactly; the submodule refuses more.
@@ -27,23 +28,6 @@ tp_async_sched: true
 # fit the pool below, so a decode step never finds it empty.
 max_concurrent_requests: 64
 model_kwargs:
-  # each all-reduce up to 1 MiB fused with the next add + RMSNorm (FlashInfer);
-  # larger ones take the path above
-  fused_add_rmsnorm: true
-  # q_a/kv_a norms, RoPE and the latent cache write in two kernels, same bits
-  mla_fused_prep: true
-  # the non-expert linears stay fp8 with their block scales (numerics differ)
-  dense_fp8: true
-  # w8a16 decode MoE kernels (numerics differ from the W8A8 runner)
-  moe_decode_kernel: true
-  # wider-tile prefill MoE kernels, bit-identical to the runner
-  moe_prefill_kernel: true
-  # shared expert summed into the routed partial before one all-reduce
-  moe_fused_allreduce: true
-  # the router's sigmoid/top-k/normalize as one kernel (ids differ at exact ties)
-  moe_router_kernel: true
-  # prefill runs the last layer's FFN on the sampled rows only
-  prefill_last_layer_rows: true
   # prefill graphs every 64 tokens to 2048 for one request (a 1024-token chat
   # prompt is ~1100 tokens), coarser for batches to 4096; longer prefills run
   # the compiled forward, where the GPU is the bound

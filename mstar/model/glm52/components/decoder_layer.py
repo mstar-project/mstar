@@ -19,13 +19,16 @@ class Glm52DecoderLayer(nn.Module):
         config: Glm52ModelConfig,
         layer_idx: int,
         comm_group: CommGroup | None = None,
+        fused_add_rmsnorm: bool | None = None,
     ) -> None:
+        """``fused_add_rmsnorm`` (default: ``kernels: auto``): each all-reduce runs fused into
+        the next residual add + RMSNorm; o_proj and the FFN return partials, and the next norm
+        reduces them. The fused norm rounds differently from an add then a norm."""
         super().__init__()
         self.layer_idx = layer_idx
         self.comm_group = comm_group or CommGroup.trivial()
-        # Each all-reduce is fused into the next add + RMSNorm: o_proj and the FFN return
-        # partials, and the next norm reduces them.
-        self.fused_add_rmsnorm = config.fused_add_rmsnorm
+        self.fused_add_rmsnorm = (
+            config.tuned_kernels if fused_add_rmsnorm is None else fused_add_rmsnorm)
         self.self_attn = Glm52MLAAttention(
             config, comm_group=comm_group, layer_idx=layer_idx)
         if self.fused_add_rmsnorm:
@@ -45,7 +48,7 @@ class Glm52DecoderLayer(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``rows``: run the FFN half on these rows only (and return only them).
 
-        With ``fused_add_rmsnorm`` the layer returns ``(FFN partial, residual)``, and takes
+        Fused (``fused_add_rmsnorm``), the layer returns ``(FFN partial, residual)``, and takes
         the previous layer's pair (``residual`` None: ``hidden_states`` is the embedding).
         """
         if self.fused_add_rmsnorm:

@@ -364,7 +364,7 @@ class _TextModel:
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 
-    def stop_token_ids(self):
+    def text_output(self):
         return None
 
     def get_partition_topology(self):

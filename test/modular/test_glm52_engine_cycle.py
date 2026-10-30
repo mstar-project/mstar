@@ -333,7 +333,7 @@ def test_a_prefill_stop_token_finishes_the_chat_reply():
     model = Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte")
     chunks = [
         SimpleNamespace(modality="text", data=model.postprocess(token[None], "text"),
-                        metadata=_text_usage(token[None], model.stop_token_ids(), 5))
+                        metadata=_text_usage(token[None], model.text_output().stop_token_ids, 5))
         for token in stream
     ]
     reply = _build_response("glm", "r0", chunks, 24000)

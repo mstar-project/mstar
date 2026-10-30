@@ -20,15 +20,8 @@ model_kwargs:
   max_seq_len: 262144
   prefill_chunk_tokens: 8192
   dsa_shard_prefill: true
-  fused_add_rmsnorm: true
-  # q_a/kv_a norms, RoPE and the latent cache write in two kernels, same bits (the
-  # selecting path too)
-  mla_fused_prep: true
-  dense_fp8: true
-  moe_decode_kernel: true
-  moe_prefill_kernel: true
-  moe_fused_allreduce: true
-  moe_router_kernel: true
+  # glm52_tp8.yaml's kernels (kernels: auto); the fused MLA prep serves the selecting
+  # path too
   prefill_token_buckets: [
     64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
     832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,

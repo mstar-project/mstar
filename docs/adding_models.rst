@@ -229,10 +229,12 @@ The following methods have defaults and are optional to override:
 
 ``text_output(self) -> TextOutput | None``
    Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
-   end a reply, which are dropped unless the request sets ``ignore_eos``.
-   ``postprocess`` and ``postprocess_inline`` derive their text paths from it. A text
-   chunk may end inside a character, since the API server joins a request's text
-   chunks before decoding them, so a byte-level BPE model should declare
+   end a reply, which are dropped unless the request sets ``ignore_eos``. The chat APIs
+   report a reply that does not end on one of them as cut at its token budget
+   (``finish_reason: "length"``); a model that names none has every reply reported as
+   stopped. ``postprocess`` and ``postprocess_inline`` derive their text paths from
+   it. A text chunk may end inside a character, since the API server joins a
+   request's text chunks before decoding them, so a byte-level BPE model should declare
    ``mstar.model.utils.TextChunkDetokenizer`` (or ``ByteLevelDetokenizer``), which
    emits each token's raw bytes, rather than ``tokenizer.decode([id])``, which turns
    a split character into U+FFFD.
@@ -604,8 +606,8 @@ The spec types are:
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
        fallback, which cannot be captured in a CUDA graph. The layer is ``MLAAttention``
-       (``mstar/model/components/mla.py``); its config picks rotated, unrotated (Kimi K3)
-       or no decoupled dims (GLM-5.3), an output gate and the latent norms' eps.
+       (``mstar/model/components/mla.py``); its config picks rotated decoupled dims (GLM-5.2)
+       or none (GLM-5.3).
        ``sliding_window=N`` lets each query attend to the last ``N`` positions, its
        own included. It needs the FlashInfer backend and causal attention, and the
        pages behind the window stay allocated.

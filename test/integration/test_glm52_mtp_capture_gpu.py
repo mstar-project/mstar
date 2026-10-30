@@ -156,14 +156,16 @@ def test_compiled_capture_matches_compiled_plain_decode(tmp_path, monkeypatch):
 @pytest.mark.parametrize("k", [1, 3])
 def test_captured_mtp_on_paged_dsa_matches_plain_decode(tmp_path, monkeypatch, eager_capture, k):
     """MTP over paged DSA at a small index_topk, so the prefill, every verify row and the
-    seed pass select: captured MTP == eager MTP == plain paged decode, token for token."""
+    seed pass select: captured MTP == eager MTP == plain paged decode, token for token. Under
+    the reference: kernels: auto's plain prefill runs the last layer on the sampled rows only
+    and MTP's prefill doesn't, and under auto their first tokens differed here (H200)."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2, 4])
     # the indexer ropes its first 64 dims
     dsa = dict(dsa_long_context=True, index_topk=8, index_n_heads=16,
                index_head_dim=64, max_seq_len=64)
     model, submodule = _load(tmp_path, monkeypatch, fp8=False,
-                             cfg_overrides={**_mtp_cfg(0), **dsa})
+                             cfg_overrides={**_mtp_cfg(0), **dsa}, kernels="reference")
     plain = _Node(model, submodule, capture=False, prompts=PROMPTS)
     reference = plain.generate()
     plain.close()
@@ -173,7 +175,7 @@ def test_captured_mtp_on_paged_dsa_matches_plain_decode(tmp_path, monkeypatch, e
         ckpt = tmp_path / f"dsa-k{k}-{int(capture)}"
         ckpt.mkdir()
         model, submodule = _load(ckpt, monkeypatch, fp8=False,
-                                 cfg_overrides={**_mtp_cfg(k), **dsa})
+                                 cfg_overrides={**_mtp_cfg(k), **dsa}, kernels="reference")
         node = _MtpNode(model, submodule, capture=capture, prompts=PROMPTS)
         if capture:
             assert node.cg.any_graphs and node.cg.dropped_buckets == []

@@ -3,7 +3,9 @@
 Each holds this rank's shard of an e4m3 weight (uint8 container, like the routed experts,
 so ``module.to(bf16)`` leaves it alone) and its fp32 ``weight_scale_inv`` blocks. Column
 parallel shards the output rows, row parallel the input columns; the scales shard with
-them, so every per-rank size must be a whole number of blocks.
+them, so every per-rank size must be a whole number of blocks. ``reference`` runs them as
+the weight dequantized per call (a config's ``kernels: reference``), else the dense_fp8
+kernels.
 """
 from __future__ import annotations
 
@@ -30,6 +32,12 @@ def dense_fp8_block(config) -> tuple[int, int] | None:
     return tuple(config.quantization_config.weight_block_size)
 
 
+def fp8_reference(config) -> bool:
+    """Whether a config's fp8 linears take ``reference``: its ``kernels: reference``, the
+    numerics anchor."""
+    return getattr(config, "kernels", "auto") == "reference"
+
+
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
@@ -45,10 +53,10 @@ def reference(x, weight, scale, block_size, glu=False):
     return y
 
 
-def fp8_block_linear(x, weight, scale, block_size, glu=False):
+def fp8_block_linear(x, weight, scale, block_size, glu=False, use_reference=False):
     """``x @ (weight * scale).T`` (its SwiGLU with ``glu``): the dense_fp8 kernels on CUDA,
-    ``reference`` on host tensors (tests, no triton needed)."""
-    if not x.is_cuda:
+    ``reference`` with ``use_reference`` or on host tensors (tests, no triton needed)."""
+    if use_reference or not x.is_cuda:
         return reference(x, weight, scale, block_size, glu)
     from mstar.utils import dense_fp8
 
@@ -71,9 +79,11 @@ class Fp8Linear(nn.Module):
         shard: int | None = REPLICATED,
         merged: int = 1,
         reduce_results: bool = False,
+        reference: bool = False,
     ) -> None:
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
+        self.reference = reference
         self.comm_group = comm_group
         self.tp_rank, self.tp_size = comm_group.rank, comm_group.world_size
         self.block_size = tuple(block_size)
@@ -136,7 +146,8 @@ class Fp8Linear(nn.Module):
         dst.copy_(loaded)
 
     def forward(self, x: torch.Tensor, glu: bool = False) -> torch.Tensor:
-        y = fp8_block_linear(x, self.weight, self.weight_scale_inv, self.block_size, glu)
+        y = fp8_block_linear(x, self.weight, self.weight_scale_inv, self.block_size, glu,
+                             use_reference=self.reference)
         if self.reduce_results and self.tp_size > 1:
             y = self.comm_group.all_reduce(y)
         return y
@@ -164,13 +175,15 @@ class Fp8ParallelGatedMLP(nn.Module):
         block_size: tuple[int, int],
         comm_group: CommGroup | None = None,
         reduce_results: bool = True,
+        reference: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = Fp8Linear(
-            hidden_size, 2 * intermediate_size, block_size, comm_group, shard=COLUMN, merged=2)
+            hidden_size, 2 * intermediate_size, block_size, comm_group, shard=COLUMN, merged=2,
+            reference=reference)
         self.down_proj = Fp8Linear(
             intermediate_size, hidden_size, block_size, comm_group, shard=ROW,
-            reduce_results=reduce_results)
+            reduce_results=reduce_results, reference=reference)
         self.intermediate_size_per_partition = self.gate_up_proj.out_features // 2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
