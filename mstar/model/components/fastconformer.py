@@ -8,7 +8,7 @@ bias on the attention scores, so attention over a clip runs through SDPA rather
 than a paged kernel. Cache-aware streaming checkpoints differ only in causal
 convolutions, a LayerNorm in the conv module and chunked attention; with no
 right context they also run as a stream, attending in a bounded KV
-(``FastConformerEncoder.blocks``).
+(``FastConformerEncoder.blocks_stream``).
 """
 from __future__ import annotations
 
@@ -348,7 +348,7 @@ class ConvModule(nn.Module):
     def forward_stream(self, x: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
         """A stream step. ``tails`` is, per row, where its newest ``k - 1`` conv
         inputs sit in the cached ones followed by the step's
-        (``FastConformerEncoder.blocks``)."""
+        (``FastConformerEncoder.blocks_stream``)."""
         # eager: the Triton kernel takes no cached inputs
         cached = self.state.gather("conv", self.layer_idx)  # (B, C, k - 1)
         x = torch.cat([cached.to(x.dtype), F.glu(self.pointwise_conv1(x), dim=-1).transpose(1, 2)], dim=2)
@@ -457,10 +457,11 @@ class FastConformerEncoder(nn.Module):
     ``(B, T', hidden)`` and per-request encoder lengths out: ``subsample``
     then ``blocks``, the split NeMo's ``bypass_pre_encode`` makes.
 
-    A causal encoder also runs as a stream, a few frames at a time: ``blocks``
-    with ``new`` attends in the bounded KV ``kv_key`` names (each frame over the
-    ``left_context`` before it) and continues each conv from the recurrent-state
-    pool ``conv_key`` names, which hold a stream's state between steps."""
+    A causal encoder also runs as a stream, a few frames at a time:
+    ``blocks_stream`` attends in the bounded KV ``kv_key`` names (each frame
+    over the ``left_context`` before it) and continues each conv from the
+    recurrent-state pool ``conv_key`` names, which hold a stream's state
+    between steps."""
 
     def __init__(self, config: FastConformerConfig, kv_key: str | None = None, conv_key: str | None = None):
         super().__init__()
@@ -489,16 +490,9 @@ class FastConformerEncoder(nn.Module):
             x = x * math.sqrt(self.config.hidden_size)
         return x
 
-    def blocks(
-        self, x: torch.Tensor, lengths: torch.Tensor | None = None, new: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """The Conformer blocks over ``x (B, T', hidden)``: offline over the
-        clip, ``lengths`` (encoder frames per row) masking the padding; or, given
-        ``new`` (a device ``(B,)`` count of each stream's new frames, ``<= T'``),
-        one stream step under the plans its declaration made for the bound KV
-        and conv pool. A stream with no new frame keeps its conv state."""
-        if new is not None:
-            return self._stream_blocks(x, new)
+    def blocks(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """The Conformer blocks over the clip ``x (B, T', hidden)``, ``lengths``
+        (encoder frames per row) masking the padding."""
         t = x.shape[1]
         valid = _time_mask(lengths, t)
         mask = None
@@ -515,7 +509,11 @@ class FastConformerEncoder(nn.Module):
             x = layer(x, pos_emb, mask, valid)
         return x
 
-    def _stream_blocks(self, x: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+    def blocks_stream(self, x: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+        """One stream step of the blocks over ``x (B, T', hidden)``, ``new`` a
+        device ``(B,)`` count of each stream's new frames (``<= T'``), under the
+        plans its declaration made for the bound KV and conv pool. A stream with
+        no new frame keeps its conv state."""
         b, c = x.shape[0], self.config
         left = c.left_context
         # distances 0..left, all a frame sees: row d is distance d

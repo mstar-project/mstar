@@ -16,7 +16,7 @@ kernel shapes.
   offline ones.
 - Blocks: each new frame attends the ``left_context`` frames before it and
   itself in the bounded KV, and each depthwise conv continues from its cached
-  last inputs (``FastConformerEncoder.blocks``).
+  last inputs (``FastConformerEncoder.blocks_stream``).
 
 A stream's state is bounded however long it runs: its host counters
 (``StreamState``, in its per-request state), its newest audio and mel frames
@@ -364,7 +364,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         return {"y": self._blocks(s["x"], s["n"])}
 
     def _blocks(self, x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
-        return self.projection(self.encoder.blocks(x, new=n))
+        return self.projection(self.encoder.blocks_stream(x, n))
 
     # -- the front end --------------------------------------------------------
 
