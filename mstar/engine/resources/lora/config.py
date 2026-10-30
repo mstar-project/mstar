@@ -351,11 +351,11 @@ class LoraSpec(NodeResourceSpec):
         targets: list[str] | None = None,
     ):
         """How many adapters stay resident, the largest rank served, and which adapters
-        this deployment serves. ``targets`` keeps only those of the model's targets (one list for every
-        LoRA spec of the model, so a name another spec declares is not an error here;
-        ``serving_resources`` checks the list as a whole): dropping the LM head and
-        embedding saves their vocabulary-sized slots, and an adapter that touches a
-        dropped target is refused.
+        this deployment serves. ``targets`` keeps only those of the model's targets (one
+        list for every LoRA spec of the model, so a name another spec declares is not an
+        error here; ``serving_resources`` checks the list as a whole): dropping the LM
+        head and embedding saves their vocabulary-sized slots, and an adapter that
+        touches a dropped target is refused.
 
         Every value is checked before any is set, so a refused override leaves the spec
         as declared."""

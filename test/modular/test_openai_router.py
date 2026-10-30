@@ -44,6 +44,7 @@ class _StubModel:
 
 class _StubAPI:
     open_result_stream = APIServer.open_result_stream
+    lora_kwargs = APIServer.lora_kwargs
 
     def __init__(self, model_name="bagel"):
         self.model_name = model_name

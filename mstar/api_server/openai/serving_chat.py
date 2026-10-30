@@ -26,22 +26,23 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
     try:
+        # resolved once, before it is submitted: the response names the adapter that
+        # served it, as vLLM's does, whether the model field or the lora_adapter kwarg
+        # picked it
+        model_kwargs = api.lora_kwargs(req.model, args.model_kwargs)
+        served = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
+        if served is not None:
+            model_name = served
         api.submit_request(
             text=args.text,
             file_paths=args.file_paths,
             input_modalities=args.input_modalities,
             output_modalities=args.output_modalities,
-            model_kwargs=args.model_kwargs,
+            model_kwargs=model_kwargs,
             prompt_parts=args.prompt_parts,
             streaming=bool(req.stream),
             request_id=request_id,
-            model=req.model,
         )
-        served = (api.served_models.select(req.model, args.model_kwargs) or {}).get(LORA_ADAPTER_KWARG)
-        if served is not None:
-            # the response names the adapter that served it, as vLLM's does, whether the
-            # model field or the lora_adapter kwarg picked it
-            model_name = served
         if req.stream:
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)

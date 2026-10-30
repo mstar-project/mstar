@@ -78,9 +78,11 @@ class _StubAPI:
         self.upload_dir = Path(tempfile.mkdtemp())
         self.last_submit = None
 
+    # the real APIServer's adapter selection, on this stub's ServedModels
+    lora_kwargs = APIServer.lora_kwargs
+
     def submit_request(self, **kw):
-        # the real APIServer's adapter selection, on this stub's ServedModels
-        kw["model_kwargs"] = APIServer.lora_kwargs(self, kw.pop("model", None), kw.get("model_kwargs"))
+        kw["model_kwargs"] = self.lora_kwargs(kw.pop("model", None), kw.get("model_kwargs"))
         self.last_submit = kw
         return kw["request_id"]
 

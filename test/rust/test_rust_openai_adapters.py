@@ -249,6 +249,7 @@ class _PythonServer:
     """What the Python routes call on APIServer, replying as the stub does."""
 
     open_result_stream = APIServer.open_result_stream
+    lora_kwargs = APIServer.lora_kwargs
 
     def __init__(self, model_name, upload_dir):
         self.model_name, self.upload_dir, self.model = model_name, upload_dir, None
