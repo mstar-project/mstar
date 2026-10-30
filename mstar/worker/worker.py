@@ -711,7 +711,8 @@ class Worker:
         # speculation, so syncing on default would also drain GPU(N+1) and
         # erase the overlap. The side stream waits on
         # ``output.completion_event`` (recorded after GPU(N)) and then runs
-        # an isolated D→H, so the main thread only blocks on the copy.
+        # an isolated D→H, so the main thread only blocks on the copy. The
+        # rebuild's host copies queue behind it, and copy back on it.
         # Lazy-initialized — workers without CUDA never touch it.
         self._d2h_stream: torch.Stream | None = None
         self._pinned_d2h_buffers: dict[
@@ -1131,7 +1132,7 @@ class Worker:
                 config.guaranteed for config in node_configs
             ):
                 continue
-            if not self._rebuilds.keep(request_id, node_name, layouts):
+            if not self._rebuilds.keep(request_id, node_name, node_configs):
                 for config in node_configs:
                     config.guaranteed = True
 
@@ -1153,6 +1154,7 @@ class Worker:
                 f"on {node_name}"
             )
         freed = self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
+        self._rebuilds.drop_rows(request_id, node_name)
         self._dropped[request_id] = node_name
         return freed
 
@@ -4654,7 +4656,7 @@ class Worker:
 
 
     def _side_stream(self) -> torch.Stream | None:
-        """The stream host copies queue on, behind a step's own output copy, or None without a device."""
+        """The D2H stream, which also carries the rebuild's host copies, or None without a device."""
         if not self.device_capability.is_available:
             return None
         if self._d2h_stream is None:

@@ -353,12 +353,11 @@ A layout has five fields:
   admission it reserves its whole footprint and is never preempted. A request with ``"digest"``
   spans can be rebuilt at one rank when the node's ``RebuildPolicy`` names their walks in
   ``copied_inputs``: the worker keeps host copies of the inputs listed there, and a rebuild row runs
-  each prefill step again from them. A prompt on one walk must take one prefill step, and a prompt on
-  several walks one step per span. The last span must be an ``"ids"`` span, and a keyed label must
-  key every span. It is guaranteed otherwise. A row gives its walk the step's ids as the step read
-  them, the last row with the samples appended to its last tensor. A row with host copies runs under
-  its step's metadata, and a row of ids alone under the request's own, so the walk must read its
-  prompt in that shape.
+  each prefill step again from them. The last span must be an ``"ids"`` span, and a label that
+  carries prefix keys must key every span. It is guaranteed otherwise. A row gives its walk the
+  step's ids as the step read them, the last row with the samples appended to its last tensor. A row
+  with host copies runs under its step's metadata, and a row of ids alone under the request's own, so
+  the walk must read its prompt in that shape.
   ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.
@@ -375,6 +374,15 @@ takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whos
 is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default
 length of a request that asks for none until it fits. With every loop at 0 iterations, the
 same sum is the prompt a request reserves when its pool admits it.
+
+A node whose requests can be dropped and rebuilt returns a
+:class:`mstar.model.rebuild.RebuildPolicy` for it from ``rebuild_policies()``: the walk that
+prefills a prompt of ids, the input that carries the ids, the output that carries each sampled
+id, the loop that samples, and under ``copied_inputs`` each other prefill walk with the inputs
+the node reads there besides the ids. The worker checks the policy against the graphs at boot,
+and a walk that reads the ids must output the sample. The worker records a request's prefill
+steps until its first kept sample, so only the last prefill step may keep one. A node without a
+policy never drops a request.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:

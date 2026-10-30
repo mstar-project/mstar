@@ -785,7 +785,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     w, eng = _worker()
     w._rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs())
     eng.prepare_rebuild = lambda node, rid, rebuild: kv.prepare_rebuild(rid, rebuild)
-    assert w._rebuilds.keep(R, NODE, config.kv_layout.values()), "an image chat would be guaranteed"
+    assert w._rebuilds.keep(R, NODE, [config]), "an image chat would be guaranteed"
     w._rebuilds.keep_prefill(SimpleNamespace(
         node_name=NODE, request_ids=[R], cached_rids=set(), rebuild_rids=frozenset(),
         step_context=StepContext((R,), "prefill_vision", 0, False),

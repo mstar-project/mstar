@@ -3129,7 +3129,7 @@ class KVManager(AttentionResource):
                 return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
             if self._overrides[rid].guaranteed:
                 return f"KV {self.name}: {rid} is guaranteed, so it is never preempted"
-            why = rebuild_refusal((self._overrides[rid].kv_layout or {}).values())
+            why = rebuild_refusal([self._overrides[rid]])
             if why is not None:
                 return f"KV {self.name}: {rid} can't be dropped, since {why}"
         return None

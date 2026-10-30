@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
-from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.sampler.config import discard_samples
 from mstar.engine.resources.step import SubmoduleStep
 from mstar.graph.base import GraphEdge, GraphNode, Loop
@@ -48,6 +48,12 @@ def _graphs() -> dict:
 
 def _layout(*spans: PrefixSpan) -> StreamLayout:
     return StreamLayout(spans=spans, growth=(("decode_loop", 1),))
+
+
+def _config(*spans: PrefixSpan, keyed: int | None = None, cached: bool = False) -> KVReqConfig:
+    """A request laid out as ``spans``, the first ``keyed`` of them keyed, carrying prefix keys when ``cached``."""
+    layout = replace(_layout(*spans), keyed_spans=len(spans) if keyed is None else keyed)
+    return KVReqConfig(kv_layout={"main": layout}, prefix_keys={"main": [b"k"]} if cached else None)
 
 
 def _on_vision(*spans: PrefixSpan) -> tuple[PrefixSpan, ...]:
@@ -85,6 +91,14 @@ def test_a_policy_naming_what_the_graph_doesnt_have_is_refused_at_load(field, va
         Rebuilds({NODE: policy}, _graphs())
 
 
+def test_a_copied_walk_that_reads_the_ids_and_doesnt_output_the_sample_is_refused_at_load():
+    graphs = _graphs()
+    graphs[VISION].outputs = [GraphEdge("out", "hidden")]
+
+    with pytest.raises(ValueError, match="where it reads 'text_inputs'"):
+        Rebuilds({NODE: MEDIA}, graphs)
+
+
 def test_a_walk_whose_node_reads_more_than_the_ids_is_refused_at_load():
     graphs = _graphs()
     graphs[PREFILL].input_names = {"text_inputs", "pixel_values"}
@@ -106,27 +120,32 @@ def test_a_copied_walk_this_worker_doesnt_run_and_every_copied_walk_above_one_ra
     )
 
 
-@pytest.mark.parametrize("policy, spans, steps", [
-    (POLICY, (PrefixSpan(4, 4, PREFILL),), 1),
-    (MEDIA, _on_vision(TEXT, IMAGE, CLOSE), 1),
-    (MEDIA, (TEXT, IMAGE, IMAGE, CLOSE), 4),
-    (POLICY, (TEXT, IMAGE, CLOSE), None),
-    (MEDIA, (TEXT, replace(IMAGE, kind="rows"), CLOSE), None),
-    (MEDIA, (), None),
-], ids=["ids alone", "images on one walk", "images on walks of their own", "walk not copied", "rows", "no prompt"])
-def test_only_a_request_whose_layout_its_rebuild_rows_can_write_again_keeps_its_prefill(policy, spans, steps):
+@pytest.mark.parametrize("policy, config, keeps", [
+    (POLICY, _config(PrefixSpan(4, 4, PREFILL)), True),
+    (MEDIA, _config(*_on_vision(TEXT, IMAGE, CLOSE)), True),
+    (MEDIA, _config(TEXT, IMAGE, IMAGE, CLOSE, cached=True), True),
+    (MEDIA, _config(TEXT, IMAGE, CLOSE, keyed=1), True),
+    (MEDIA, _config(TEXT, IMAGE, CLOSE, keyed=1, cached=True), False),
+    (POLICY, _config(TEXT, IMAGE, CLOSE), False),
+    (MEDIA, _config(TEXT, replace(IMAGE, kind="rows"), CLOSE), False),
+    (MEDIA, _config(), False),
+], ids=[
+    "ids alone", "images on one walk", "images on walks of their own", "keys short of the image, cache off",
+    "keys short of the image", "walk not copied", "rows", "no prompt",
+])
+def test_only_a_request_whose_layout_its_rebuild_rows_can_write_again_keeps_its_prefill(policy, config, keeps):
     rebuilds = Rebuilds({NODE: policy}, _graphs())
 
-    assert rebuilds.keep(R, NODE, [_layout(*spans)]) == (steps is not None), (
+    assert rebuilds.keep(R, NODE, [config]) == keeps, (
         "a request no rebuild can write again would be preemptible, or the reverse"
     )
-    assert rebuilds._steps[NODE].get(R) == steps, "a drop could take a request whose prefill isn't all kept"
+    assert (R in rebuilds._accepted[NODE]) == keeps, "a request would record prefill steps no rebuild reads"
 
 
 def test_each_prefill_step_is_kept_once_it_has_run_and_its_rows_share_one_copy():
     rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     for rid in (R, A):
-        rebuilds.keep(rid, NODE, [_layout(TEXT)])
+        rebuilds.keep(rid, NODE, [_config(TEXT)])
     inputs = {rid: {"text_inputs": [torch.arange(rid, rid + 3)]} for rid in (R, A, B)}
 
     rebuilds.keep_prefill(_step({R: PREFILL, A: PREFILL, B: PREFILL}, inputs), _metadata)
@@ -144,30 +163,48 @@ def test_each_prefill_step_is_kept_once_it_has_run_and_its_rows_share_one_copy()
 
 def test_a_prompt_on_several_walks_keeps_each_step_in_order_with_copies_of_its_image():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs())
-    rebuilds.keep(R, NODE, [_layout(TEXT, IMAGE, CLOSE)])
+    rebuilds.keep(R, NODE, [_config(TEXT, IMAGE, CLOSE)])
     embeds = torch.ones(6, 2)
 
     rebuilds.keep_prefill(_step({R: PREFILL}, {R: {"text_inputs": [torch.tensor([1, 2, 3])]}}), _metadata)
     # the prefix cache serves the image's step whole, and the step is kept all the same
     rebuilds.keep_prefill(_step({R: VIT}, {R: {"embeds": [embeds]}}, cached={R}), _metadata)
-    assert "kept 2 of the 3 prefill steps" in rebuilds.refusal(R, NODE, DECODE, {}), (
+    assert "hasn't sampled" in rebuilds.refusal(R, NODE, DECODE, {}), (
         "a drop would leave the closing text out of the rebuild"
     )
     rebuilds.keep_prefill(_step({R: PREFILL}, {R: {"text_inputs": [torch.tensor([4, 5])]}}), _metadata)
 
     steps = rebuilds._kept[NODE][R].steps
     assert [step.walk for step in steps] == [PREFILL, VIT, PREFILL], "the rebuild would run its steps out of order"
-    assert [[t.tolist() for t in step.ids] for step in steps] == [[[1, 2, 3]], [], [[4, 5]]]
+    assert [[t.tolist() for t in step.ids] for step in steps] == [[[1, 2, 3]], [], [[4, 5]]], (
+        "a row would read another step's ids"
+    )
     assert steps[1].copies.inputs == {"embeds": [embeds]}, "a rebuild would need the encoder to run again"
     assert steps[1].copies.step_metadata == _metadata(R), "the image's row would run under decode's metadata"
-    assert "don't cover its KV" in rebuilds.refusal(R, NODE, DECODE, {}), "the prefill's sample isn't kept yet"
+    assert "hasn't sampled" in rebuilds.refusal(R, NODE, DECODE, {}), "the prefill's sample isn't kept yet"
     rebuilds._kept[NODE][R].sampled.append(6)
     assert rebuilds.refusal(R, NODE, DECODE, {}) is None, "a request its kept steps cover was refused"
 
 
+def test_a_prompt_run_as_two_steps_of_one_walk_keeps_both_until_its_first_sample():
+    # Bagel prefills a think-mode generation's text in two steps of one walk
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    rebuilds.keep(R, NODE, [_config(TEXT, CLOSE)])
+    for ids in ([1, 2, 3], [4, 5]):
+        rebuilds.keep_prefill(_step({R: PREFILL}, {R: {"text_inputs": [torch.tensor(ids)]}}), _metadata)
+    rebuilds._kept[NODE][R].sampled.append(6)
+    rebuilds.keep_prefill(_step({R: PREFILL}, {R: {"text_inputs": [torch.tensor([7])]}}), _metadata)
+
+    steps = rebuilds._kept[NODE][R].steps
+    assert [[t.tolist() for t in step.ids] for step in steps] == [[[1, 2, 3]], [[4, 5]]], (
+        "the rebuild would leave out a prefill step, or rerun a step after the first sample"
+    )
+    assert rebuilds.refusal(R, NODE, DECODE, {}) is None, "a request whose two steps are kept was refused"
+
+
 def test_a_prompt_with_images_on_one_walk_keeps_its_ids_as_the_walk_read_them():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs())
-    rebuilds.keep(R, NODE, [_layout(*_on_vision(TEXT, IMAGE, CLOSE))])
+    rebuilds.keep(R, NODE, [_config(*_on_vision(TEXT, IMAGE, CLOSE))])
     inputs = {R: {"text_inputs": [torch.tensor([1, 2, 3]), torch.tensor([4, 5])], "embeds": [torch.zeros(6, 2)]}}
     metadata = _metadata(R)
 
@@ -198,7 +235,9 @@ def test_a_rebuild_runs_each_prefill_step_again_in_order_and_the_last_carries_th
     assert [row.walk for row in rows] == [PREFILL, VIT, PREFILL], "a row would write its span in another's place"
     texts = [[t.tolist() for t in row.inputs.get("text_inputs", ())] for row in rows]
     assert texts == [[[1, 2, 3]], [], [[4, 5, 6]]], "the samples would follow another step, or decode read one twice"
-    assert rows[1].inputs == {"embeds": [embeds]} and rows[1].step_metadata is copies.step_metadata
+    assert rows[1].inputs == {"embeds": [embeds]} and rows[1].step_metadata is copies.step_metadata, (
+        "the image's row would run without its copy, or under another step's metadata"
+    )
     assert rows[0].step_metadata is None and rows[2].step_metadata is None, "a row of ids alone runs as decode does"
 
 
@@ -206,7 +245,7 @@ def test_a_rebuild_runs_each_prefill_step_again_in_order_and_the_last_carries_th
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     side = torch.cuda.Stream()
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), side_stream=lambda: side)
-    rebuilds.keep(R, NODE, [_layout(*_on_vision(TEXT))])
+    rebuilds.keep(R, NODE, [_config(*_on_vision(TEXT))])
     rows = 1 << 22
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
     expected = embeds.cpu()
@@ -244,7 +283,7 @@ def _prompts(*rids: int) -> Rebuilds:
     """Rebuilds whose ``rids`` each kept a prompt of one step."""
     rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     for rid in rids:
-        rebuilds.keep(rid, NODE, [_layout(TEXT)])
+        rebuilds.keep(rid, NODE, [_config(TEXT)])
         rebuilds._kept[NODE][rid] = _kept_ids(PrefillStep(PREFILL, (torch.arange(3),)))
     return rebuilds
 
@@ -278,12 +317,13 @@ def test_a_sample_of_more_than_one_id_is_refused(host):
 @pytest.mark.parametrize("why, node, walk, sampled, iters", [
     ("declares no rebuild policy", "vocoder", DECODE, 1, 0),
     ("keeps no ids", NODE, DECODE, None, 0),
+    ("hasn't sampled", NODE, DECODE, 0, 0),
     ("doesn't run", NODE, PREFILL, 1, 0),
     ("don't cover its KV", NODE, DECODE, 1, 1),
 ])
 def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sampled, iters):
     rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    rebuilds.keep(R, NODE, [_layout(TEXT)])
+    rebuilds.keep(R, NODE, [_config(TEXT)])
     prompt = PrefillStep(PREFILL, (torch.tensor([1, 2]),))
     if sampled is not None:
         rebuilds._kept[NODE][R] = _kept_ids(prompt, sampled=[5] * sampled)

@@ -55,7 +55,7 @@ def _graphs() -> dict:
 
 def _keep(w: Worker, rid: int, *sampled: int, prompt=(1, 2, 3)) -> None:
     """``rid`` kept a prompt of one step on ``NODE``, and ``sampled``."""
-    w._rebuilds._steps[NODE][rid] = 1
+    w._rebuilds._accepted[NODE].add(rid)
     w._rebuilds._kept[NODE][rid] = KeptIds([PrefillStep(PREFILL, (torch.tensor(prompt),))], array("i", sampled))
 
 
@@ -188,7 +188,7 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     eng.land_rebuild = lambda node, rid: None
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
     w._rebuilds._policies = {node: replace(POLICY, copied_inputs={walk: ("embeds",)})}
-    w._rebuilds._steps, w._rebuilds._kept = {node: {1: 1}}, {node: {R: KeptIds()}}
+    w._rebuilds._accepted, w._rebuilds._kept = {node: {1}}, {node: {R: KeptIds()}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
         rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
@@ -229,7 +229,8 @@ def test_a_prompt_on_several_walks_rebuilds_a_row_per_step_in_order_and_lands_af
     w, eng = _worker()
     w._rebuilds = Rebuilds({NODE: replace(POLICY, copied_inputs={VIT: ("img_emb",)})}, _graphs())
     images = [torch.ones(4, 2), torch.zeros(4, 2)]
-    w._rebuilds._steps[NODE][R], w._rebuilds._kept[NODE][R] = 4, KeptIds([
+    w._rebuilds._accepted[NODE].add(R)
+    w._rebuilds._kept[NODE][R] = KeptIds([
         PrefillStep(PREFILL, (torch.tensor([1, 2]),)),
         *[PrefillStep(VIT, (), HostCopies({"img_emb": [image]}, {"image": i})) for i, image in enumerate(images)],
         PrefillStep(PREFILL, (torch.tensor([3, 4, 5]),)),
@@ -288,26 +289,30 @@ def _media(walk: str) -> PrefixSpan:
     return PrefixSpan(20, 1, walk, kind="digest")
 
 
-# Each request as its model lays it out: the spans, how many spans the keys cover, the labels, whether the request
-# speaks its answer, and the prefill steps it keeps when it is preemptible.
+# Each request as its model lays it out: the spans, how many spans the model keys, whether the request carries prefix
+# keys (it does while the prefix cache is on), the labels, whether the request speaks its answer, and whether it is
+# preemptible. A Bagel edit in think mode keys only its leading text, and so does a Qwen3-Omni prompt with a video.
 _TEXT, _CLOSE = PrefixSpan(5, 5, "prefill_text"), PrefixSpan(4, 4, "prefill_text")
 _EDIT = (_TEXT, _media("prefill_vae"), _media("prefill_vit"), _CLOSE)
+_VIDEO = (_TEXT, _media("prefill_vision"), _CLOSE)
 _MEDIA_REQUESTS = {
-    "Bagel image chat": ("Bagel", (_TEXT, _media("prefill_vit"), _CLOSE), 3, 1, False, 3),
-    "Bagel chat with two images": ("Bagel", (_TEXT, *[_media("prefill_vit")] * 2, _CLOSE), 4, 1, False, 4),
-    "Bagel edit with think mode": ("Bagel", _EDIT, 1, 1, False, None),
-    "Bagel edit with think mode, cache off": ("Bagel", _EDIT, 0, 1, False, 4),
-    "Bagel edit or guided generation": ("Bagel", (_TEXT, _media("prefill_vit"), _CLOSE), 3, 3, False, None),
-    "Qwen3-Omni audio in, text out": ("Qwen3-Omni", (_TEXT, _media("prefill_audio"), _CLOSE), 0, 1, False, 3),
-    "Qwen3-Omni image in, text out": ("Qwen3-Omni", (_TEXT, _media("prefill_vision"), _CLOSE), 0, 1, False, 3),
-    "Qwen3-Omni audio out": ("Qwen3-Omni", (_TEXT, _media("prefill_audio"), _CLOSE), 0, 1, True, None),
-    "Higgs transcription": ("Higgs", (_TEXT, _media("prefill_audio"), _CLOSE), 0, 1, False, 3),
+    "Bagel image chat": ("Bagel", (_TEXT, _media("prefill_vit"), _CLOSE), 3, True, 1, False, True),
+    "Bagel chat with two images": ("Bagel", (_TEXT, *[_media("prefill_vit")] * 2, _CLOSE), 4, True, 1, False, True),
+    "Bagel edit with think mode": ("Bagel", _EDIT, 1, True, 1, False, False),
+    "Bagel edit with think mode, cache off": ("Bagel", _EDIT, 1, False, 1, False, True),
+    "Bagel edit or guided generation": ("Bagel", (_TEXT, _media("prefill_vit"), _CLOSE), 3, True, 3, False, False),
+    "Qwen3-Omni audio in, text out": ("Qwen3-Omni", (_TEXT, _media("prefill_audio"), _CLOSE), 3, True, 1, False, True),
+    "Qwen3-Omni image in, text out": ("Qwen3-Omni", (_TEXT, _media("prefill_vision"), _CLOSE), 3, True, 1, False, True),
+    "Qwen3-Omni video in, text out": ("Qwen3-Omni", _VIDEO, 1, True, 1, False, False),
+    "Qwen3-Omni video in, cache off": ("Qwen3-Omni", _VIDEO, 1, False, 1, False, True),
+    "Qwen3-Omni audio out": ("Qwen3-Omni", (_TEXT, _media("prefill_audio"), _CLOSE), 3, True, 1, True, False),
+    "Higgs transcription": ("Higgs", (_TEXT, _media("prefill_audio"), _CLOSE), 3, True, 1, False, True),
 }
 
 
 @pytest.mark.parametrize("request_", _MEDIA_REQUESTS)
 def test_a_media_request_is_preemptible_only_where_its_models_rebuild_rows_can_write_it_again(request_):
-    name, spans, keyed, labels, speaks, steps = _MEDIA_REQUESTS[request_]
+    name, spans, keyed, cached, labels, speaks, preemptible = _MEDIA_REQUESTS[request_]
     model, node, cache = _models()[name]
     w, _ = _from_model(model, node, cache)
     ((_, loop),) = model.kv_labels()[cache]["main"].growth
@@ -315,7 +320,7 @@ def test_a_media_request_is_preemptible_only_where_its_models_rebuild_rows_can_w
     # the CFG nodes write their own copy of the prompt under each guidance label
     guidance = dict.fromkeys(("cfg_text", "cfg_img")[:labels - 1], StreamLayout(spans=(_TEXT,)))
     config = KVReqConfig(
-        loop_caps={loop: 8}, prefix_keys={"main": [b"k"]} if keyed else None, kv_layout={"main": layout, **guidance},
+        loop_caps={loop: 8}, prefix_keys={"main": [b"k"]} if cached else None, kv_layout={"main": layout, **guidance},
     )
     # an answer spoken aloud has the Talker write rows of the Thinker's states
     talker = KVReqConfig(kv_layout={"main": StreamLayout(spans=(PrefixSpan(9, 9, "talker_prefill", kind="rows"),))})
@@ -324,9 +329,9 @@ def test_a_media_request_is_preemptible_only_where_its_models_rebuild_rows_can_w
 
     w._guarantee(R, configs)
 
-    assert config.guaranteed == (steps is None), "a request no rows can rebuild would be preempted, or the reverse"
-    assert w._rebuilds._steps.get(node, {}).get(R) == steps, (
-        "the request could be dropped before its last image's step is kept, or keep steps no row reads"
+    assert config.guaranteed == (not preemptible), "a request no rows can rebuild would be preempted, or the reverse"
+    assert (R in w._rebuilds._accepted.get(node, set())) == preemptible, (
+        "a guaranteed request would record prefill steps no row reads, or a preemptible one would record none"
     )
 
 
@@ -360,7 +365,7 @@ def test_a_rebuilt_prompt_on_several_walks_holds_the_pages_and_positions_of_an_u
         (kv_step,), (position,) = [[s for s in steps if isinstance(s, kind)] for kind in (KVStep, PositionStep)]
         segments = (Segment(R, "main", length),)
         kv_step, ctx = replace(kv_step, segments=segments), StepContext((R,), walk, 0, False)
-        assert kv.admit(kv_step, ctx).ok
+        assert kv.admit(kv_step, ctx).ok, f"the pool refused {walk}"
         kv.plan(kv_step, ctx)
         kv.commit(kv_step, ctx)
         rope.commit(replace(position, segments=segments), ctx)
@@ -381,7 +386,7 @@ def test_a_rebuilt_prompt_on_several_walks_holds_the_pages_and_positions_of_an_u
     rope.drop(R)
     eng.prepare_rebuild = lambda node, rid, rebuild: kv.prepare_rebuild(rid, rebuild)
     eng.land_rebuild = lambda node, rid: kv.land_rebuild(rid)
-    assert w._rebuilds.keep(R, node, [layout])
+    assert w._rebuilds.keep(R, node, [KVReqConfig(kv_layout={"main": layout})])
     copied = model.rebuild_policies()[node].copied_inputs[digest_walk]
     copies = HostCopies({copied_name: [rows] if copied_name == input_name else [] for copied_name in copied}, {})
     # the samples before 9 are in the KV, and 9 is the next decode step's input

@@ -13,7 +13,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.engine.resources import Rebuild, SamplerStep
-from mstar.engine.resources.kv.config import StreamLayout, rebuild_refusal
+from mstar.engine.resources.kv.config import KVReqConfig, rebuild_refusal
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
 
@@ -59,9 +59,9 @@ class PrefillStep:
 
 
 class RebuildRow(NamedTuple):
-    """A row that runs one prefill step of a dropped request again. Its inputs are the step's ids, the last
-    step's with the ids sampled since but the last, and any host copies. With ``step_metadata`` None, the
-    row runs under the request's own step metadata."""
+    """A row that runs one prefill step of a dropped request again, with the step's ids and any host copies.
+    The last row's ids also carry every sampled id but the newest, which the next decode step reads. With
+    ``step_metadata`` None, the row runs under the request's own step metadata."""
     node: str
     walk: str
     inputs: NameToTensorList
@@ -84,8 +84,8 @@ def policies_run_here(
     """The policies whose rebuild this worker runs: it runs the node in the policy's walk and in every walk its
     loop grows the KV in. A disaggregated decode node can't run the prefill walk its rebuild needs.
 
-    Each keeps the copied walks this worker runs the node in. Above one rank it keeps none, since rank 0 decides
-    a drop from its own host copies, and a follower's may not have landed.
+    A policy keeps only the copied walks this worker runs the node in, and none above one rank, since rank 0
+    decides a drop from its own host copies, and a follower's may not have landed.
     """
     here = {}
     for node, policy in policies.items():
@@ -98,8 +98,8 @@ def policies_run_here(
 
 class Rebuilds:
     """The prefill steps and samples of each request on the nodes that declare a `RebuildPolicy`, checked
-    against the graph when the worker starts. ``side_stream`` gives the stream host copies queue on, behind
-    a step's own output copy, and None on a CPU device."""
+    against the graph when the worker starts. ``side_stream`` returns the worker's D2H stream, where host
+    copies queue behind a step's own output copy, or None without a device."""
 
     def __init__(
         self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
@@ -110,11 +110,10 @@ class Rebuilds:
         self._policies = dict(policies)
         self._side_stream = side_stream
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
-        # node -> handle -> the prefill steps its layout takes, for each request a rebuild there could
-        # write again (`keep`)
-        self._steps: dict[str, dict[int, int]] = {node: {} for node in policies}
-        # node -> handle -> its kept ids, from its first prefill step. Per node, since a colocated node of
-        # another partition samples ids of its own.
+        # node -> the requests `keep` accepted there, whose prefill steps are recorded until their first sample
+        self._accepted: dict[str, set[int]] = {node: set() for node in policies}
+        # node -> handle -> what the request keeps there, from its first prefill step. Per node, since a
+        # colocated node of another partition samples ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
 
     @property
@@ -128,41 +127,43 @@ class Rebuilds:
     def keeps_any(self, node: str) -> bool:
         return bool(self._kept.get(node))
 
-    def keep(self, rid: int, node: str, layouts: Iterable[StreamLayout]) -> bool:
+    def keep(self, rid: int, node: str, configs: Iterable[KVReqConfig]) -> bool:
         """Keep ``rid``'s prefill steps and samples on ``node`` from now on, and return True, when a rebuild
-        there could write its laid-out labels again: the node declares a policy, and its loop grows labels
-        that rebuild rows can lay out again, written in walks the policy prefills.
-
-        A prompt on one walk takes one prefill step, and a prompt on several walks one step per span, since
-        a model that prefills a prompt over several walks runs each span as a step of its own.
-        """
-        policy, layouts = self._policies.get(node), list(layouts)
+        there could write the labels its ``configs`` lay out again: the node declares a policy, and its loop
+        grows labels that rebuild rows can lay out again, written in walks the policy prefills."""
+        policy, configs = self._policies.get(node), list(configs)
+        layouts = [layout for config in configs for layout in (config.kv_layout or {}).values()]
         spans = [span for layout in layouts for span in layout.spans]
         if (
-            policy is None or not spans or rebuild_refusal(layouts) is not None
+            policy is None or not spans or rebuild_refusal(configs) is not None
             or any(loop != policy.loop for layout in layouts for loop, _ in layout.growth)
             or any(span.walk not in policy.prefill_walks for span in spans)
         ):
             return False
-        self._steps[node][rid] = 1 if len({span.walk for span in spans}) == 1 else len(spans)
+        self._accepted[node].add(rid)
         return True
 
     def keep_prefill(self, node_batch: ExecutingBatch, step_metadata: Callable[[int], dict]) -> None:
-        """Record each prefill step the step ran, or the prefix cache served whole, of a request this node
-        keeps that hasn't sampled yet. A step keeps the ids it read, as views of one copy shared by the step's
+        """Record the prefill step of each row, run or served whole by the prefix cache, whose request `keep`
+        accepted and hasn't sampled yet. A step keeps the ids it read, as views of one copy shared by the step's
         rows, and host copies of the other inputs of a copied walk. The host has waited on the step, so the
         copies need no wait. ``step_metadata`` gives a request's metadata for the step."""
         node = node_batch.node_name
-        policy, steps = self._policies.get(node), self._steps.get(node)
-        if policy is None or not steps:
+        policy, accepted = self._policies.get(node), self._accepted.get(node)
+        if policy is None or not accepted:
             return
-        kept_ids, ctx, inputs = self._kept[node], node_batch.step_context, node_batch.per_request_input_tensors
+        ctx = node_batch.step_context
+        # a step of a walk that prefills nothing, such as a decode step, has no row to record
+        if not node_batch.cached_rids and not ctx.request_walks and ctx.graph_walk not in policy.prefill_walks:
+            return
+        kept_ids, inputs = self._kept[node], node_batch.per_request_input_tensors
         rows = []
         for rid in (*node_batch.request_ids, *node_batch.cached_rids):
             kept, walk = kept_ids.get(rid), ctx.walk_of(rid)
-            # the prefill ends on its first kept sample, and a rebuild row runs a step that was recorded
+            # A prefill ends at its first kept sample. A rebuild row reruns a recorded step, so it isn't recorded
+            # again.
             if (
-                rid in steps and walk in policy.prefill_walks and rid not in node_batch.rebuild_rids
+                rid in accepted and walk in policy.prefill_walks and rid not in node_batch.rebuild_rids
                 and not (kept is not None and kept.sampled)
             ):
                 rows.append((rid, walk))
@@ -241,19 +242,19 @@ class Rebuilds:
 
     def refusal(self, rid: int, node: str, walk: str, loop_iters: Mapping[str, int]) -> str | None:
         """Why ``rid``, in ``walk``, can't be dropped on ``node`` now, or None when its kept ids cover its
-        KV: every prefill step its layout takes has run, with its host copies landed, the last step read ids
-        for the samples to follow, and the prefill and each iteration of the policy's loop sample one id,
-        of which the KV holds all but the last."""
+        KV: its prefill has sampled, so every prefill step has run, its host copies have landed, the last step
+        read ids for the samples to follow, and the prefill and each iteration of the policy's loop sample one
+        id, of which the KV holds all but the last."""
         policy = self._policies.get(node)
         if policy is None:
             return f"{node} declares no rebuild policy"
         kept = self._kept[node].get(rid)
         if kept is None:
             return f"it keeps no ids on {node}"
-        if len(kept.steps) != self._steps[node][rid]:
-            return f"it kept {len(kept.steps)} of the {self._steps[node][rid]} prefill steps its layout takes"
+        if not kept.sampled:
+            return "its prefill hasn't sampled yet"
         if not kept.steps[-1].ids:
-            return "its last prefill step read no ids, which the ids it sampled could follow"
+            return "its last prefill step read no ids for its samples to follow"
         if any(step.copies is not None and not step.copies.ready() for step in kept.steps):
             return "its host copies haven't landed"
         if walk not in self._loop_walks[node]:
@@ -290,9 +291,14 @@ class Rebuilds:
         rows = self._kept[node][rid].rows
         return rows.popleft() if rows else None
 
+    def drop_rows(self, rid: int, node: str) -> None:
+        """Forget the rows of ``rid``'s rebuild on ``node`` not handed out yet, whose inputs are back on the
+        device, since a drop between two rows starts the rebuild over."""
+        self._kept[node][rid].rows.clear()
+
     def remove_request(self, rid: int) -> None:
-        for steps in self._steps.values():
-            steps.pop(rid, None)
+        for accepted in self._accepted.values():
+            accepted.discard(rid)
         for kept in self._kept.values():
             kept.pop(rid, None)
 

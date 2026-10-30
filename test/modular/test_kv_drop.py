@@ -136,7 +136,7 @@ IMAGE = PrefixSpan(6, 4, WALK, kind="digest")
     ("keys short of the image", "keys only part of its prompt"),
     ("rows", "no rebuild recomputes"),
 ])
-def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout, why):
+def test_a_drop_is_refused_when_its_rows_couldnt_write_the_request_again(layout, why):
     kv = _manager()
     config = _config(list(range(PAGE_SIZE)))
     main = config.kv_layout["main"]

@@ -39,19 +39,13 @@ class RebuildPolicy:
         )
 
     def check(self, node: str, graphs: Mapping[str, GraphSection]) -> None:
-        """Raise unless ``walk`` runs ``node``, which reads only the ids there and outputs ``sample_output``,
-        each copied walk runs ``node``, which reads there only the inputs the worker copies and, if any, the
-        ids, and some walk runs ``node`` inside ``loop``."""
+        """Raise when the policy names a walk, input, output or loop that ``node`` doesn't have in ``graphs``,
+        or when a walk that reads the ids doesn't output the sample, since such a walk can end a prompt."""
         reads = self._reads(node, graphs, self.walk)
         if reads != {self.ids_input}:
             raise ValueError(
                 f"{node}'s rebuild row carries only {self.ids_input!r} in {self.walk!r}, and {node} reads "
                 f"{sorted(reads)} there"
-            )
-        if self.sample_output not in {edge.name for edge in graphs[self.walk].get_nodes()[node].outputs}:
-            raise ValueError(
-                f"{node}'s rebuild policy keeps samples from {self.sample_output!r}, which {node} doesn't output "
-                f"in {self.walk!r}"
             )
         for walk, copied in sorted(self.copied_inputs.items()):
             reads = self._reads(node, graphs, walk)
@@ -59,6 +53,15 @@ class RebuildPolicy:
                 raise ValueError(
                     f"{node}'s rebuild row carries {sorted(copied)}, with or without the ids, in {walk!r}, and "
                     f"{node} reads {sorted(reads)} there"
+                )
+        for walk in sorted(self.prefill_walks):
+            graph_node = graphs[walk].get_nodes()[node]
+            if self.ids_input in graph_node.input_names and self.sample_output not in {
+                edge.name for edge in graph_node.outputs
+            }:
+                raise ValueError(
+                    f"{node}'s rebuild policy keeps samples from {self.sample_output!r}, which {node} doesn't "
+                    f"output in {walk!r}, where it reads {self.ids_input!r}"
                 )
         if not self.loop_walks(node, graphs):
             raise ValueError(f"{node}'s rebuild policy names loop {self.loop!r}, which runs {node} in no walk")

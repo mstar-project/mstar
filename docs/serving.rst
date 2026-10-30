@@ -399,8 +399,8 @@ pools of a node that keeps no token ids to rebuild it. A request with media can 
 one rank: the worker keeps a host copy of what each prefill step read besides the token ids,
 the encoder's output included, and rebuilds the request from those copies in the order its
 prefill ran. That covers Qwen3.5 and Bagel image chats, Bagel edits in think mode with no
-guidance and the prefix cache off, Qwen3-Omni requests with audio, images or video in and text
-out, and Higgs Audio transcriptions. Requests that answer with audio, other Bagel generations
+guidance and the prefix cache off, Qwen3-Omni requests with audio or images in and text out,
+and with video in when the prefix cache is off, and Higgs Audio transcriptions. Requests that answer with audio, other Bagel generations
 and edits, Qwen3.5 videos and requests with media above one rank keep no copies and stay
 guaranteed. Voice requests then queue when the pool is short and are never preempted
 mid-stream.
