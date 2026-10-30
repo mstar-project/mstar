@@ -273,13 +273,25 @@ class Plan:
                 f.write(line + "\n")
 
 
+SYSFS_PCI = Path("/sys/bus/pci/devices")
+
+
 def _numa_of(gpu: int) -> int | None:
-    """NUMA node of HIP device ``gpu``. amd-smi 26 wraps its JSON in {"gpu_data": [...]}, older ones don't."""
-    for e in _entries(amd_smi_json("static", "--numa", "-g", str(smi_gpu(gpu)))):
+    """NUMA node of HIP device ``gpu``. amd-smi 26 wraps its JSON in {"gpu_data": [...]}, older ones don't. Where
+    amd-smi has no ``static --numa`` (the MI325X VF box), the node comes from the GPU's PCI device in sysfs, or
+    --numa would bind nothing."""
+    smi = smi_gpu(gpu)
+    for e in _entries(amd_smi_json("static", "--numa", "-g", str(smi))):
         node = (e.get("numa") or {}).get("node") if isinstance(e, dict) else None
         if isinstance(node, int):
             return node
-    return None
+    bdf = next((e.get("bdf") for e in _entries(amd_smi_json("list"))
+                if isinstance(e, dict) and e.get("gpu") == smi), None)
+    try:
+        node = int((SYSFS_PCI / str(bdf) / "numa_node").read_text())
+    except (OSError, ValueError):
+        return None
+    return node if bdf and node >= 0 else None
 
 
 def client_env(arm: Arm, row: Row, gpus: list[int]) -> dict:
