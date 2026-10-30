@@ -2350,17 +2350,22 @@ class Engine:
     ) -> FullAdmitOutcome:
         """Whether this node can run the request now.
 
-        An offloaded request is brought back first; it stays not-ready until
-        that fits, which is the scheduler's cue to run something else (and,
-        on OOM, to evict). A dropped request stays not-ready until its
-        rebuild lands. Then each resource takes in whatever the request
-        published elsewhere — a KV transfer from a prefill worker, say — and
-        reports whether that has landed.
+        The node's resources admit the request first, a returning one
+        included, and it is ``queued`` until they do. An offloaded request is
+        then brought back; it stays not-ready until that fits, which is the
+        scheduler's cue to run something else (and, on OOM, to evict). A
+        dropped request stays not-ready until its rebuild lands. Then each
+        resource takes in whatever the request published elsewhere — a KV
+        transfer from a prefill worker, say — and reports whether that has
+        landed.
 
         The outcome, not a bool: a resource can report the request
         unservable (``AdmitRuntimeError``), and the caller has to fail it
         rather than scan it again forever.
         """
+        waits = self.admit_request(node_name, request_id, request_info)
+        if waits is not None:
+            return waits
         if not self.is_resident(node_name, request_id):
             if not allow_reload or not self.is_offloaded(node_name, request_id):
                 return FULL_ADMIT_NOT_READY
@@ -2370,6 +2375,15 @@ class Engine:
             rid=request_id, node_name=node_name,
             graph_walk=request_info.graph_walk,
             published=request_info.resource_publish_info,
+        )
+
+    def admit_request(
+        self, node_name: str, request_id: str, request_info: CurrentForwardPassInfo,
+    ) -> FullAdmitOutcome | None:
+        """None once the node's resources have admitted the request, else why it waits or fails; see
+        `StepRunner.admit_request`."""
+        return self._runner.admit_request(
+            request_id, node_name, request_info.graph_walk, request_info.resource_publish_info,
         )
 
     def admit_waiting(
@@ -2594,12 +2608,22 @@ class Engine:
     def drop_request(self, node_name: str, request_id: int) -> int:
         """Discard the request's state on this node that can be recomputed from
         its token ids, and return the pages freed."""
-        resources = self._submodules[node_name].resources.values()
         # check every resource before dropping any, so a refusal changes nothing,
         # as `reload_request` checks `can_reload`
-        for resource in resources:
-            resource.check_drop(request_id)
-        return sum(resource.drop(request_id) for resource in resources)
+        refusal = self.drop_refusal(node_name, request_id)
+        if refusal is not None:
+            raise RuntimeError(refusal)
+        freed = sum(resource.drop(request_id) for resource in self._submodules[node_name].resources.values())
+        self._runner.readmit(request_id, node_name)
+        return freed
+
+    def drop_refusal(self, node_name: str, request_id: int) -> str | None:
+        """Why `drop_request` would refuse the request on this node, or None."""
+        for resource in self._submodules[node_name].resources.values():
+            refusal = resource.check_drop(request_id)
+            if refusal is not None:
+                return refusal
+        return None
 
     def prepare_rebuild(self, node_name: str, request_id: int, rebuild: Rebuild) -> None:
         """Tell each of the node's resources what the dropped request's rebuild row writes."""
@@ -2616,7 +2640,8 @@ class Engine:
 
         Returns what was reclaimed, in whatever each resource counts (pages,
         today); 0 means nothing moved and the caller should pick another
-        victim.
+        victim. A victim `KVManager.preempt` chose is the exception: it can
+        move with 0 reclaimed.
         """
         if node_name in self._tp_follower_nodes:
             # Rank 0 decides what this instance evicts, and its decision arrives
@@ -2628,6 +2653,7 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
+        self._runner.readmit(request_id, node_name)
         if freed > 0 and node_name in self._resident_delta:
             self._resident_delta[node_name].add_offloaded(
                 self._graph_runtime.get_rid_string(request_id)

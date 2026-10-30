@@ -32,7 +32,7 @@ from mstar.communication.tensors import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
-from mstar.engine.engine import ExecutingBatch
+from mstar.engine.engine import ExecutingBatch, PagedKVCache
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
@@ -95,7 +95,7 @@ from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_acr
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.rebuild import Rebuilds
+from mstar.worker.rebuild import Rebuilds, policies_run_here
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
@@ -104,7 +104,7 @@ from mstar.worker.speculation import (
     SpeculationPreparer,
 )
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker_metrics import WorkerMetrics
+from mstar.worker.worker_metrics import PreemptionCounts, WorkerMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +268,19 @@ class PendingBatch:
     # speculated step is handed off before the step it follows finishes, so
     # its step time starts at that finish anyway (see WorkerMetrics.step_done)
     submitted_at: float = 0.0
+
+
+@dataclass(slots=True)
+class Preempted:
+    """How often a request was preempted, and how many samples it had kept when it last returned."""
+    times: int = 0
+    returned_at: int = -1
+
+
+class Victim(NamedTuple):
+    """A request chosen to move off the device: the key of the cache that ran short, and by how many pages."""
+    key: str
+    pages_short: int
 
 
 class EvictionPolicy(Enum):
@@ -605,11 +618,30 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
-        # What a dropped request is rebuilt from, on each node whose model declares how.
-        self._rebuilds = (
-            Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs()) if model is not None
-            else Rebuilds({}, {})
-        )
+        # What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this
+        # worker runs: a disaggregated decode node can't run the prefill walk a rebuild needs.
+        self._rebuilds = Rebuilds({}, {})
+        if model is not None:
+            graphs = model.get_graph_walk_graphs()
+            self._rebuilds = Rebuilds(policies_run_here(model.rebuild_policies(), graphs, my_walks), graphs)
+        # `_kv_keys`: node -> the keys of its paged KV caches, and `_kv_caches`: key -> its cache.
+        # `_rebuilding`: the handles whose rebuild row is in the step in flight.
+        # `_dropped`: handle -> the node it was dropped on, until its rebuild row is queued.
+        # `_victims`: handle -> its `Victim`, until the request moves to the host or is dropped.
+        # `_preempted`: handle -> its `Preempted`. `_preemptions`: node -> its counts for the metrics.
+        self._kv_keys: dict[str, list[str]] = defaultdict(list)
+        self._kv_caches: dict[str, PagedKVCache] = {}
+        for kv in self.engine_manager.engine.paged_kv_caches():
+            self._kv_caches[kv.key] = kv
+            for node_name in kv.nodes:
+                self._kv_keys[node_name].append(kv.key)
+        self._rebuilding: frozenset[int] = frozenset()
+        self._dropped: dict[int, str] = {}
+        self._victims: dict[int, Victim] = {}
+        self._preempted: dict[int, Preempted] = {}
+        self._preemptions: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
+        # node -> when its last move of a victim was logged, and the moves since
+        self._drop_logged: dict[str, tuple[float, int]] = {}
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -638,6 +670,8 @@ class Worker:
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
         self.scheduler.pending_removes = self._pending_removes
+        # The scheduler hands each dropped request its node's resources admit again to `_readmit`.
+        self.scheduler.dropped, self.scheduler.readmit = self._dropped, self._readmit
 
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
         # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after
@@ -732,6 +766,7 @@ class Worker:
                 message_type=ConductorMessageType.WORKER_STATUS, body=status,
             )),
             enable_transfers=self.tensor_manager.enable_transfer_metrics,
+            preemptions=self._preemptions,
         )
 
     @staticmethod
@@ -1026,6 +1061,9 @@ class Worker:
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
         self._rebuilds.remove_request(request_id)
+        self._dropped.pop(request_id, None)
+        self._victims.pop(request_id, None)
+        self._preempted.pop(request_id, None)
         logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
@@ -1034,8 +1072,7 @@ class Worker:
     def _drop(self, request_id: int, node_name: str) -> int:
         """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
         the pages freed."""
-        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
-        why = self._rebuilds.refusal(request_id, node_name, info.graph_walk, info.dynamic_loop_iter_counts)
+        why = self._rebuild_refusal(request_id, node_name)
         if why is not None:
             raise RuntimeError(
                 f"Worker {self.worker_id}: {self._rid_str(request_id)} can't be dropped on {node_name}, since {why}"
@@ -1049,7 +1086,106 @@ class Worker:
                 f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step, a backlog or the rebuild queue "
                 f"on {node_name}"
             )
-        return self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
+        freed = self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
+        self._dropped[request_id] = node_name
+        # the drop asked the node's resources again, which may admit it at once or refuse it
+        self._readmit(request_id, node_name)
+        return freed
+
+    def _rebuild_refusal(self, request_id: int, node_name: str) -> str | None:
+        """Why the request's kept ids on ``node_name`` can't rebuild its KV there now, or None."""
+        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
+        return self._rebuilds.refusal(request_id, node_name, info.graph_walk, info.dynamic_loop_iter_counts)
+
+    def _preempt(self, node_batch: ExecutingBatch) -> bool:
+        """`KVManager.preempt` chooses victims for the request that hit KV OOM. Move each victim to the host or
+        drop it, now or once its step lands, and return True. Return False, so the offload and the hold run,
+        when the failed resource isn't a paged KV cache, when the node rebuilds no request here and the cache
+        has no host pool or isn't the node's only one, or when `KVManager.preempt` returns None."""
+        kv = self._kv_caches.get(node_batch.failed_resource)
+        node_name = node_batch.node_name
+        if kv is None or not (
+            node_name in self._rebuilds.nodes or (kv.cache.supports_eviction and self._kv_keys[node_name] == [kv.key])
+        ):
+            return False
+        reason, engine = node_batch.admit_error, self.engine_manager.get_engine(node_batch.node_name)
+        nodes = [node_name for node_name in kv.nodes if node_name in self._rebuilds.nodes]
+
+        def droppable(rid: int) -> bool:
+            held = [node_name for node_name in nodes if self._rebuilds.kept(rid, node_name) is not None]
+            return bool(held) and all(
+                self._rebuild_refusal(rid, node_name) is None and engine.drop_refusal(node_name, rid) is None
+                for node_name in held
+            )
+
+        victims = kv.cache.preempt(reason.request_id, reason.pages_short, droppable)
+        if victims is None:
+            return False
+        if not victims and kv.cache.waits(reason.request_id):
+            self._log_throttled(
+                self._hold_logged, (node_batch.node_name, node_batch.step_context.graph_walk),
+                "KV short on node=%s walk=%s: %s waits for room, since moving what the pool can move wouldn't "
+                "cover its shortage of %d pages (%d earlier waits not logged)",
+                node_batch.node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id),
+                reason.pages_short,
+            )
+        counts = self._preemptions[node_batch.node_name]
+        for rid in victims:
+            self._victims[rid] = Victim(kv.key, reason.pages_short)
+            record = self._preempted.setdefault(rid, Preempted())
+            record.times += 1
+            counts.victims += 1
+            counts.preempted_again += record.times == 2
+            kept = next((kept for node in nodes if (kept := self._rebuilds.kept(rid, node)) is not None), None)
+            counts.returns_preempted += kept is not None and record.returned_at == len(kept.sampled)
+        self._move_victims()
+        return True
+
+    def _move_victims(self) -> None:
+        """Once no step in flight holds a victim, move the victim to the host or drop it, as `KVManager.preempt`
+        decided. A backlogged row goes back to the runtime and a queued rebuild row leaves its queue first, so
+        neither runs on pages the move gave up."""
+        for rid, victim in list(self._victims.items()):
+            if rid in self._in_flight_rids:
+                continue
+            del self._victims[rid]
+            kv = self._kv_caches[victim.key]
+            if not kv.cache.is_victim(rid):
+                continue  # the request it was chosen for has left
+            arrival = kv.cache.arrival(rid)
+            self.scheduler.return_backlogged(rid)
+            self.scheduler.take_rebuilds((rid,))
+            if kv.cache.moves_to_host(rid):
+                for node_name in kv.nodes:
+                    freed = self.engine_manager.get_engine(node_name).offload_request(node_name, rid)
+                    self._log_throttled(
+                        self._drop_logged, node_name,
+                        "KV short on node=%s: moved %s (arrival %s) to the host, %d pages freed for a shortage of %d, "
+                        "preempted %d times (%d earlier moves not logged)",
+                        node_name, self._rid_str(rid), arrival, freed, victim.pages_short, self._preempted[rid].times,
+                    )
+                continue
+            for node_name in kv.nodes:
+                if self._rebuilds.kept(rid, node_name) is not None:
+                    freed = self._drop(rid, node_name)
+                    self._preemptions[node_name].drops += 1
+                    self._log_throttled(
+                        self._drop_logged, node_name,
+                        "KV short on node=%s: dropped %s (arrival %s), %d pages freed for a shortage of %d, "
+                        "preempted %d times (%d earlier moves not logged)",
+                        node_name, self._rid_str(rid), arrival, freed, victim.pages_short, self._preempted[rid].times,
+                    )
+
+    def _log_throttled(self, logged: dict, key, message: str, *args) -> None:
+        """Log ``message`` at most once per `_HOLD_LOG_INTERVAL` for ``key``, with the lines skipped since
+        as its last argument."""
+        now = _time.monotonic()
+        last, unlogged = logged.get(key, (None, 0))
+        if last is not None and now - last < _HOLD_LOG_INTERVAL:
+            logged[key] = (last, unlogged + 1)
+            return
+        logged[key] = (now, 0)
+        logger.warning(message, *args, unlogged)
 
     def _rebuild(self, request_id: int, node_name: str) -> None:
         """Queue a row that recomputes the dropped request's KV on ``node_name`` from its kept ids.
@@ -1060,11 +1196,30 @@ class Worker:
         engine = self.engine_manager.get_engine(node_name)
         if engine.is_resident(node_name, request_id) or engine.is_offloaded(node_name, request_id):
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} isn't dropped on {node_name}")
-        if self.scheduler.rebuild_queued(request_id) or request_id in self._in_flight_rids:
+        # Not `_in_flight_rids`: a step of another node on this worker, such as Orpheus's SNAC decoder, can hold
+        # the request while its KV here is dropped.
+        if self.scheduler.rebuild_queued(request_id) or request_id in self._rebuilding:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} is already being rebuilt")
         rebuild, row = self._rebuilds.rebuild(request_id, node_name, self.device)
         engine.prepare_rebuild(node_name, request_id, rebuild)
         self.scheduler.queue_rebuild(request_id, row)
+        self._dropped.pop(request_id, None)
+        self._preemptions[node_name].rebuild_tokens += len(rebuild.ids) - 1
+
+    def _readmit(self, rid: int, node_name: str) -> None:
+        """Rebuild the dropped request once its node's resources admit it again, the KV with its history and one
+        page more. Called at the drop, and by `MicroScheduler._unpark` once `admit_waiting` admits it."""
+        if self._is_tearing_down(rid):
+            return
+        info = self.request_state.get_fwd_info(rid, self.request_state.get_partition_for_node(node_name))
+        waits = self.engine_manager.get_engine(node_name).admit_request(node_name, rid, info)
+        if waits is not None:
+            if not waits.ok:
+                self._fail_requests({rid: f"Error in worker: {waits.reason.message}"})
+            return
+        if rid in self._preempted:
+            self._preempted[rid].returned_at = len(self._rebuilds.kept(rid, node_name).sampled)
+        self._rebuild(rid, node_name)
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -2412,7 +2567,7 @@ class Worker:
         # removals wait for that.
         self._apply_pending_removes_safe_to_drop(referenced_rids)
 
-        if self._is_tp_follower_node(batch.node_name):
+        if self._is_tp_follower_node(batch.node_name) or self._preempt(node_batch):
             return
 
         # A batch the pool cannot hold even with nothing else resident does not
@@ -2450,7 +2605,7 @@ class Worker:
                 len(batch_ids) - (1 if victim_id in batch_ids else 0),
             )
         else:
-            # Nothing could be evicted, so the batch has to get smaller or it will
+            # Nothing could be evicted or dropped, so the batch has to get smaller or it will
             # refuse identically for ever. Hold the one request the admit named,
             # not the whole batch, so the retry is immediate. When other rows
             # wait to run, the batch also gets a limit, or they refill it to the
@@ -2470,19 +2625,13 @@ class Worker:
                     batch.node_name, batch.graph_walk,
                     len(batch_ids) // 2 if fit is None else fit,
                 )
-            key = (batch.node_name, batch.graph_walk)
-            now = _time.monotonic()
-            last, unlogged = self._hold_logged.get(key, (None, 0))
-            if last is not None and now - last < _HOLD_LOG_INTERVAL:
-                self._hold_logged[key] = (last, unlogged + 1)
-                return
-            self._hold_logged[key] = (now, 0)
-            logger.warning(
+            self._log_throttled(
+                self._hold_logged, (batch.node_name, batch.graph_walk),
                 "OOM on node=%s walk=%s: no offload possible, holding %s of %d "
                 "requests so the retry is smaller (%d earlier holds not logged)",
                 batch.node_name, batch.graph_walk,
                 blamed if len(shed) == 1 else f"all {len(shed)}",
-                len(batch_ids), unlogged,
+                len(batch_ids),
             )
 
     # ------------------------------------------------------------------
@@ -4700,6 +4849,7 @@ class Worker:
             nonlocal pending
             pending = p
             self._in_flight_rids = set(p.batch.request_to_worker_graph) if p else set()
+            self._rebuilding = p.node_batch.rebuild_rids if p is not None else frozenset()
             if p is not None and p.node_batch.rebuild_rids:
                 # a REMOVE waits for the step instead of freeing pages under it
                 self._in_flight_rids |= p.node_batch.rebuild_rids
@@ -4777,6 +4927,8 @@ class Worker:
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
+                if self._victims:
+                    self._move_victims()
                 # Requests a resource declared unservable during last pass's
                 # readiness scans. They are in no batch, so nothing else would
                 # ever fail them.
@@ -5037,6 +5189,8 @@ class Worker:
                     self._apply_pending_drains(in_flight)
                     laps.lap("post_removes")
                     _set_pending(None)
+                    if self._victims:
+                        self._move_victims()
                     if spec_pending is None and self.is_tp_follower:
                         # N is done and nothing runs. Rank 0 tore down what N held
                         # here, and what it stamped with a step this rank dropped,

@@ -281,6 +281,27 @@ tensor or sequence parallel instance count once: the instance's first rank repor
    cache's tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool
    cuts to 0 still counts.
 
+``mstar_kv_preemptions_total{model_name, component}``
+   Counter. Requests chosen to move to the host or drop because a grant past a request's reservation ran short
+   of KV pages, on a single rank. Their pages go to the request that ran short.
+
+``mstar_kv_drops_total{model_name, component}``
+   Counter. Chosen requests whose KV was dropped. A request leaves before its drop when
+   its client goes away.
+
+``mstar_kv_rebuild_tokens_total{model_name, component}``
+   Counter. Tokens of kept history the rebuild rows prefilled, cache hits included.
+
+``mstar_kv_rebuild_cached_pages_total{model_name, component}``
+   Counter. Pages a rebuild row found in the prefix cache.
+
+``mstar_kv_preempted_again_total{model_name, component}``
+   Counter. Requests preempted a second time. A steady rate means the pool is too small
+   for the load, and more pages or fewer concurrent requests stop it.
+
+``mstar_kv_returns_preempted_total{model_name, component}``
+   Counter. Dropped requests preempted again after their return, before they kept another token.
+
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
    running: waiting for room in a step, or for the worker to pick the node.

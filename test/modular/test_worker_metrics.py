@@ -133,7 +133,7 @@ def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None, counting=T
         scheduler = SimpleNamespace(pending_rows=lambda: {})
     m = WorkerMetrics(
         "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler,
-        send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"),
+        send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={},
     )
     if counting:
         m.start_counting()
@@ -328,7 +328,8 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched, w.is_tp_follower = False, False
-    w._in_flight_rids = set()
+    w._in_flight_rids, w._dropped, w._victims, w._preempted = set(), {}, {}, {}
+    w._kv_caches = {}
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
@@ -355,7 +356,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._handle_main_loop_error = fail_loudly
     w._metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
                                SimpleNamespace(pending_rows=dict), send=sent.append,
-                               enable_transfers=lambda: EdgeTransfers("SHM"))
+                               enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={})
     w._metrics.start_counting()
     return w, sent, postprocessed, iteration
 
@@ -708,7 +709,7 @@ def _worker_status(worker_id, used, steps=(), pending=0):
     m = WorkerMetrics(
         worker_id, 3600.0, frozenset({NODE}), _engine([kv]),
         SimpleNamespace(pending_rows=lambda: {NODE: pending}), send=None,
-        enable_transfers=lambda: EdgeTransfers("SHM"),
+        enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={},
     )
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(worker_metrics, "time", clock)

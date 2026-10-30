@@ -132,7 +132,7 @@ def _preprocess(model: _Model, model_kwargs: dict) -> dict:
     return worker.communicator.sent[-1].body.model_kwargs
 
 
-def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, **config) -> _Comm:
+def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, rids=("r",), **config) -> _Comm:
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump({
         "max_seq_len": 4096, "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}], **config,
@@ -144,9 +144,9 @@ def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, **config)
     comm.batches.extend([
         [ConductorMessage(ConductorMessageType.SETUP_DONE, SetupDone(w)) for w in conductor.worker_ids],
         [ConductorMessage(ConductorMessageType.NEW_REQUEST, NewRequestConductor(
-            request_id="r", initial_signals={}, initial_input_modalities=["text"],
+            request_id=rid, initial_signals={}, initial_input_modalities=["text"],
             initial_output_modalities=["text"], input_metadata={}, model_kwargs=model_kwargs,
-        ))],
+        )) for rid in rids],
     ])
 
     def poll():
@@ -260,3 +260,19 @@ def test_a_layout_the_client_sent_is_dropped(tmp_path, monkeypatch):
     cfg = _ingest(model, kwargs, tmp_path, monkeypatch).request_info.resource_configs["kv"]
 
     assert cfg.kv_layout["main"].spans[0].length == PROMPT, "a client's layout would size another request's pages"
+
+
+def test_requests_carry_their_arrival_on_every_kv_config(tmp_path, monkeypatch):
+    model = _Model()
+    groups = [{"node_names": ["llm"], "ranks": [0]}, {"node_names": ["talker"], "ranks": [1]}]
+    kwargs = _preprocess(model, {"max_output_tokens": 30})
+
+    sent = _conduct(model, kwargs, tmp_path, monkeypatch, rids=("r", "s"), node_groups=groups).sent
+
+    frames = [msg.body for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"]
+    arrivals = {rid: set() for rid in ("r", "s")}
+    for frame in frames:
+        arrivals[frame.request_id].update(cfg.arrival for cfg in frame.request_info.resource_configs.values())
+    assert len(frames) == 4, "each worker hears of each request"
+    ((first,), (second,)) = arrivals["r"], arrivals["s"]
+    assert first < second, "a frame carried another number, or the later request didn't get the later one"

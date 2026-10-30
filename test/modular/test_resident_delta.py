@@ -195,6 +195,7 @@ class _Engine:
     check_ready = Engine.check_ready
     is_offloaded = Engine.is_offloaded
     is_resident = Engine.is_resident
+    admit_request = Engine.admit_request
     offload_request = Engine.offload_request
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
@@ -216,7 +217,9 @@ class _Engine:
         self._submodules = {
             "node": SimpleNamespace(resources={"kv": self.resource})
         }
-        self._runner = SimpleNamespace(admit_retrieve=lambda **kw: FULL_ADMIT_OK)
+        self._runner = SimpleNamespace(
+            admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None, readmit=lambda *args: None,
+        )
         self._resident_delta = (
             {"node": OffloadDelta.new()} if role == "leader" else {}
         )
@@ -709,8 +712,10 @@ class _Rank:
     _handle_allocation_failure = Worker._handle_allocation_failure
     _is_tp_follower_node = Worker._is_tp_follower_node
     _push_back_batch = Worker._push_back_batch
+    _preempt = Worker._preempt
 
     def __init__(self, *, leader: bool):
+        self._kv_caches = {}
         self.queue = _Queue()
         self._graph_runtime = self.queue
         self.held: list[str] = []
@@ -940,6 +945,7 @@ class _ForwardingLeader:
         self._pending_removes: dict[int, None] = {}
         self._last_active: dict = {}
         self._rebuilds = Rebuilds({}, {})
+        self._kv_keys, self._kv_caches, self._dropped, self._victims, self._preempted = {}, {}, {}, {}, {}
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it

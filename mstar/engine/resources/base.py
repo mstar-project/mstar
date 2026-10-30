@@ -418,9 +418,9 @@ class Resource(ABC):
         """Move the request's state off-device. Returns what was reclaimed."""
         return 0
 
-    def check_drop(self, rid: str) -> None:
-        """Raise if ``drop`` would refuse ``rid``. Changes nothing."""
-        return
+    def check_drop(self, rid: str) -> str | None:
+        """Why ``drop`` would refuse ``rid``, or None. Changes nothing."""
+        return None
 
     def drop(self, rid: str) -> int:
         """Discard the request's state that can be recomputed from its token

@@ -301,6 +301,10 @@ class MicroScheduler:
         # Rids with a deferred remove; stop initiating new work for them.
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: dict[int, None] = {}
+        # rid -> the node a request was dropped on, shared by reference with Worker._dropped, and the worker's
+        # `_readmit`, which `_unpark` calls once that node's resources admit the request again
+        self.dropped: dict[int, str] = {}
+        self.readmit: Callable[[int, str], None] = lambda rid, node_name: None
 
         # WIRE STRING -> number of committed (ZMQ received) tp follow batches
         # still queued. On the fail/abort path we drain these before ACKing
@@ -1280,6 +1284,16 @@ class MicroScheduler:
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
 
+    def return_backlogged(self, rid: int) -> None:
+        """Put ``rid``'s backlogged rows back on the runtime's ready queues, as `_build_and_schedule`
+        returns rows a step doesn't take."""
+        for (node_name, _), batch in self.backlog.items():
+            wg_id = batch.request_to_worker_graph.get(rid)
+            if rid in batch.request_to_worker_graph:
+                self._set_in_flight(node_name, {rid: wg_id}, False)
+                self.runtime.push_back_node(node_name, [rid], [wg_id])
+        self._drop_backlogged_rid(rid)
+
     def _drop_backlogged_rid(self, rid: int) -> None:
         """Take a request out of anything still queued for it.
 
@@ -1526,17 +1540,21 @@ class MicroScheduler:
         return False
 
     def _unpark(self, request_state: RequestStateManager) -> None:
-        """Let readiness ask the engine again about each parked request it has since admitted."""
-        if not any(self.parked.values()):
+        """Let readiness ask the engine again about each parked request it has since admitted, and readmit each
+        dropped request it has admitted."""
+        if not any(self.parked.values()) and not self.dropped:
             return
 
         def published_of(rid: int, node_name: str):
             fwd_info = request_state.get_fwd_info(rid, request_state.get_partition_for_node(node_name))
             return fwd_info.resource_publish_info
 
-        for engine in {*map(self.engine_manager.get_engine, self.parked)}:
+        for engine in {*map(self.engine_manager.get_engine, (*self.parked, *self.dropped.values()))}:
             for node_name, rid in engine.admit_waiting(published_of):
-                self.parked[node_name].discard(rid)
+                if rid not in self.dropped:
+                    self.parked[node_name].discard(rid)
+                elif self.dropped[rid] == node_name:
+                    self.readmit(rid, node_name)
 
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
