@@ -47,6 +47,7 @@ def test_preprocess_failure_emits_error_chunk():
     wt.in_queue = queue.Queue()
     wt._is_pending = lambda key: True
     wt.out_queue = queue.Queue()
+    wt.profile_queue = queue.Queue()
     wt.result_tensor_queue = queue.Queue()
     wt.cleanup_request_queue = queue.Queue()
     wt.abort_request_queue = queue.Queue()
