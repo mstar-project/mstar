@@ -13,7 +13,7 @@ def _reload(monkeypatch, name, value):
 
 def test_prefill_ladder_default_reaches_8k_and_the_knob_narrows_it(monkeypatch):
     m = _reload(monkeypatch, "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", None)
-    assert m.LLMSubmodule.PREFILL_TOKEN_BUCKETS[-1] == 8192
+    assert m.LLMSubmodule.PREFILL_TOKEN_BUCKETS[-1] == 8704
     assert m.LLMSubmodule.PREFILL_TOKEN_BUCKETS[0] == 32
     m = _reload(monkeypatch, "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "64,2048")
     assert m.LLMSubmodule.PREFILL_TOKEN_BUCKETS == [64, 2048]

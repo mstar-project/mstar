@@ -90,11 +90,14 @@ class LLMSubmodule(ARNodeSubmodule):
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
     # an eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
     # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
-    # ladder runs to 8192. MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or
-    # extends it (static buffers are sized by the largest bucket).
+    # ladder runs past 8192. From 256 up each bucket has 1/16 of slack, for the
+    # decode rows a mixed step carries beside its prompts and for batches a few
+    # tokens past a power of two, which would otherwise pad to twice the width.
+    # MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or extends it (static buffers
+    # are sized by the largest bucket).
     PREFILL_TOKEN_BUCKETS = [
         int(x) for x in os.environ.get(
-            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,4096,8192",
+            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,272,544,1088,2176,4352,8704",
         ).split(",")
     ]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]

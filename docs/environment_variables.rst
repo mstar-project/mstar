@@ -527,12 +527,14 @@ Worker scheduling
        worker starts and ``5`` is used; a negative value is raised to ``0``
        with a warning.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
-     - ``32,64,128,256,512,1024,2048,4096,8192``
+     - ``32,64,128,272,544,1088,2176,4352,8704``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
        graph (one per bucket and batch size). A prompt past the top bucket
        prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
-       spends 78 ms of wall time on 36 ms of kernels. The default now reaches
-       8192; narrow it to save graph memory and capture time, or extend it.
+       spends 78 ms of wall time on 36 ms of kernels. From 256 up each bucket
+       has 1/16 of slack past the power of two, for a mixed step's decode rows
+       and for prompts a few tokens over. Narrow it to save graph memory and
+       capture time, or extend it.
    * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
      - config's ``knobs: kv_chain_lazy_steps``, else ``1``
      - How many decode steps of sampled ids the KV manager holds back before
