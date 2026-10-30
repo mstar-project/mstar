@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
-from safetensors.torch import safe_open
+
+# safetensors is imported where it is used: mstar.model.base imports this
+# module, and safetensors is not a core dependency.
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,8 @@ def load_weights_from_file(
     modules: list[ModuleAndPrefix],
     device: str = "cpu",
 ):
+    from safetensors.torch import safe_open
+
     # Precompute expected keys for each module
     module_key_maps = []
     for mod in modules:
@@ -253,6 +257,8 @@ def load_weights_from_hf_shards(
     ``model.safetensors`` (no index — e.g. whisper-large-v3) are handled by
     treating that one file as the whole weight map.
     """
+    from safetensors.torch import safe_open
+
     repo_dir = Path(repo_dir)
     index_path = repo_dir / "model.safetensors.index.json"
     if index_path.exists():
