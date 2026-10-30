@@ -1533,6 +1533,17 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the cross-seed bar), and Z-Image-Turbo moves too far (two of 40 images half-way or more
    to another seed), so ``fp8`` is not recommended there.
 
+``fp8_keep_bf16``
+   Linears that stay bf16 under ``linear_dtype: fp8``, as module-name patterns matched
+   segment by segment, where a segment may be an index range: ``single_blocks.*.out``
+   (every single-stream block's output projection), ``single_blocks.0-3.*`` (the first
+   four single blocks), ``double_blocks.0-2.img_ff.linear_out``. An entry that names none
+   of the model's fp8 linears is an error at load. Each kept linear gives back its share of
+   the fp8 speedup; which ones buy the most quality per millisecond is a per-model
+   measurement (the 4-step klein samplers turn any small change into a comparable change
+   of the image, so the output projections, which read the most heavy-tailed activations,
+   matter more than any block's position).
+
 With the klein defaults every served image is within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
 images of the other engines are 10 to 16 dB from the diffusers reference for the same
