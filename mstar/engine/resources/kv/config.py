@@ -7,7 +7,7 @@ without pulling FlashInfer in behind it.
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
@@ -214,6 +214,13 @@ class RingKVConfig(KVConfig):
             self.num_sessions = num_sessions
 
 
+class SpanKind(StrEnum):
+    """What a span writes: token ``IDS``, a file's KV keyed by its ``DIGEST``, or ``ROWS`` of anything else."""
+    IDS = "ids"
+    DIGEST = "digest"
+    ROWS = "rows"
+
+
 @dataclass(frozen=True)
 class PrefixSpan:
     """One write to a keyed stream, as the preprocess worker laid it out.
@@ -227,9 +234,13 @@ class PrefixSpan:
     advance: int
     walk: str
     scratch: int = 0
-    kind: str = "ids"
+    kind: SpanKind = SpanKind.IDS
     digest: bytes | None = None
     end_key: bytes | None = None
+
+    def __post_init__(self):
+        # a layout row carries the kind as its string
+        object.__setattr__(self, "kind", SpanKind(self.kind))
 
 
 @dataclass

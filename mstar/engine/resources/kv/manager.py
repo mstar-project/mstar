@@ -29,6 +29,7 @@ from mstar.engine.resources.kv.config import (
     PagedKVConfig,
     PrefixSpan,
     RetentionPolicy,
+    SpanKind,
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
@@ -3077,7 +3078,7 @@ class KVManager(AttentionResource):
             if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
                 raise RuntimeError(f"KV {self.name}: {rid} has a step or a read in flight on its pages")
             layouts = (self._overrides[rid].kv_layout or {}).values()
-            if any(span.kind != "ids" for layout in layouts for span in layout.spans):
+            if any(span.kind != SpanKind.IDS for layout in layouts for span in layout.spans):
                 raise RuntimeError(f"KV {self.name}: {rid} holds KV that can't be recomputed from token ids")
 
     def drop(self, rid: str) -> int:
