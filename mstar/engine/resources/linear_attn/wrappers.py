@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from mstar.engine.resources.linear_attn.gdn_stage import stage_gdn_prefill_inputs
+
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
 _CONV_BLOCK_M = 8
@@ -123,6 +125,7 @@ class GDNPrefillWrapper(GDNWrapper):
         has_sink_state: bool = True,
         accelerator_graph: bool=False,
         null_slot_id: int = 0,
+        stage_inputs: bool = False,
     ):
         super().__init__(
             device=device,
@@ -135,6 +138,11 @@ class GDNPrefillWrapper(GDNWrapper):
             null_slot_id=null_slot_id,
         )
         self._has_sink_state = has_sink_state
+        # `gdn_stage_applies`: one kernel prepares q/k/v and the gates. It also
+        # normalizes q and k and reads the strided views as they are.
+        self._stage_inputs = stage_inputs
+        self.qk_l2norm_in_kernel = stage_inputs
+        self.takes_strided_inputs = stage_inputs
         # What this arch's chunked kernel reads as its packed state; the
         # manager picks it off the device capability.
         self._prefill_dtype = prefill_dtype
@@ -396,14 +404,6 @@ class GDNPrefillWrapper(GDNWrapper):
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
-        # The chunked kernel takes the decay and the learning rate already
-        # formed, where the decode kernel takes `a`/`b` raw and forms them from
-        # the same two weights. Keep the formula here so the paths agree.
-        g = -torch.exp(a_log.float()) * torch.nn.functional.softplus(
-            a.float() + dt_bias.float()
-        )
-        beta = torch.sigmoid(b.float())
-
         slots = self._plan_state.slots.to(torch.int64)
 
         # static per pool, so safe to branch on under capture
@@ -440,21 +440,36 @@ class GDNPrefillWrapper(GDNWrapper):
         rows = (
             self._plan_state.num_rows if self._accelerator_graph else self._plan_borrowed
         )
-        if rows:
-            q, k, v, g, beta = (
-                _with_room(t, rows) for t in (q, k, v, g, beta)
+        if self._stage_inputs:
+            q, k, v, alpha, beta = stage_gdn_prefill_inputs(
+                q, k, v, a, b, a_log, dt_bias, self._plan_state.token_mask, rows,
+                normalize=self._qk_l2norm,
             )
-
-        # zero the padded tail so inf there can't poison the result
-        keep = self._plan_state.token_mask[: q.shape[0], None, None].bool()
-        def blank(t, shape):
-            return torch.where(
-                keep.view(shape), t, torch.zeros((), dtype=t.dtype, device=t.device),
+        else:
+            # The chunked kernel takes the decay and the learning rate already
+            # formed, where the decode kernel takes `a`/`b` raw and forms them
+            # from the same two weights. Keep the formula here so the paths agree.
+            g = -torch.exp(a_log.float()) * torch.nn.functional.softplus(
+                a.float() + dt_bias.float()
             )
+            beta = torch.sigmoid(b.float())
+            if rows:
+                q, k, v, g, beta = (
+                    _with_room(t, rows) for t in (q, k, v, g, beta)
+                )
 
-        v = blank(v, (-1, 1, 1))
-        g = blank(g, (-1, 1))
-        beta = blank(beta, (-1, 1))
+            # zero the padded tail so inf there can't poison the result
+            keep = self._plan_state.token_mask[: q.shape[0], None, None].bool()
+            def blank(t, shape):
+                return torch.where(
+                    keep.view(shape), t, torch.zeros((), dtype=t.dtype, device=t.device),
+                )
+
+            v = blank(v, (-1, 1, 1))
+            g = blank(g, (-1, 1))
+            beta = blank(beta, (-1, 1))
+            # FlashInfer wants the decay exponentiated; FLA's takes log space
+            alpha = torch.exp(g)
 
         snapshot_args = {}
         if self._every:
@@ -466,15 +481,14 @@ class GDNPrefillWrapper(GDNWrapper):
             )
         out, final = chunk_gated_delta_rule(
             q=q, k=k, v=v,
-            # FlashInfer wants the decay exponentiated; FLA's takes log space
-            g=torch.exp(g),
+            g=alpha,
             beta=beta,
             scale=self._sm_scale,
             initial_state=initial,
             output_final_state=True,
             cu_seqlens=self._plan_state.cu_seqlens,
-            # ignored by this kernel (see `qk_l2norm_in_kernel`); the caller
-            # has already normalised q and k
+            # ignored by this kernel (see `qk_l2norm_in_kernel`); q and k are
+            # normalised by now
             use_qk_l2norm_in_kernel=False,
             **snapshot_args,
         )
@@ -642,11 +656,6 @@ class GDNMixedWrapper(GDNWrapper):
     cleared. A decode row after the run is a prompt row of one token.
     """
 
-    # the chunked half needs q/k normalised by the caller; the decode half is
-    # built not to normalise again
-    qk_l2norm_in_kernel: bool = False
-    takes_strided_inputs: bool = False
-
     def __init__(
         self,
         device: torch.device,
@@ -661,6 +670,7 @@ class GDNMixedWrapper(GDNWrapper):
         null_slot_id: int = 0,
         # the chunked half's prompt rows under capture; eagerly, the step's own
         max_prefill_rows: int | None = None,
+        stage_inputs: bool = False,
     ):
         super().__init__(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
@@ -670,17 +680,22 @@ class GDNMixedWrapper(GDNWrapper):
         if accelerator_graph and max_prefill_rows is None:
             raise ValueError("GDNMixedWrapper: a captured split needs max_prefill_rows")
         self._max_prefill_rows = max_prefill_rows
+        # A staged chunked half normalises its own q/k and reads the strided
+        # views, as the decode half can. Otherwise the caller normalises and
+        # copies, and the decode half is built not to normalise again.
+        self.qk_l2norm_in_kernel = stage_inputs
+        self.takes_strided_inputs = stage_inputs
         # one sequence more than the prompt rows: the decode run's
         self._prefill = GDNPrefillWrapper(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
             qk_l2norm=qk_l2norm, prefill_dtype=prefill_dtype,
             num_tokens=num_tokens, bs=max_prefill_rows + 1 if accelerator_graph else None,
             has_sink_state=has_sink_state, accelerator_graph=accelerator_graph,
-            null_slot_id=null_slot_id,
+            null_slot_id=null_slot_id, stage_inputs=stage_inputs,
         )
         self._decode = GDNDecodeWrapper(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
-            qk_l2norm=False, bs=bs, accelerator_graph=accelerator_graph,
+            qk_l2norm=qk_l2norm and stage_inputs, bs=bs, accelerator_graph=accelerator_graph,
             null_slot_id=null_slot_id,
         )
         self._stage = _PinnedIndexStage()

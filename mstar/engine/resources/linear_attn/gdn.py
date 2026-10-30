@@ -17,6 +17,7 @@ import torch
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
+from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
     GDNMixedWrapper,
@@ -82,6 +83,7 @@ class GDNManager(LinearAttnManager):
             state_dtype if state_dtype in allowed else torch.float32
         )
         self._check_state_dtype(state_dtype, geometry, has_sink)
+        self._stage_prefill = gdn_stage_applies(device, geometry)
 
         # See `build_cuda_graph_buffers`.
         self._cg_max_bs = 0
@@ -226,6 +228,7 @@ class GDNManager(LinearAttnManager):
                         split.max_prefill_rows(self._max_rows_in_combined, lease.bucket.bs)
                         if lease is not None else None
                     ),
+                    stage_inputs=self._stage_prefill,
                 )
             elif is_decode:
                 store[key] = GDNDecodeWrapper(
@@ -249,6 +252,7 @@ class GDNManager(LinearAttnManager):
                     accelerator_graph=lease is not None,
                     has_sink_state=self._has_sink,
                     null_slot_id=null_slot_id,
+                    stage_inputs=self._stage_prefill,
                 )
         return store[key]
 
