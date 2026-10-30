@@ -5,8 +5,9 @@ runs on two server instances and we report how often they agree (the noise floor
 reference saves its top-k logprobs per step: where the server first diverges, its token should be
 in that top-k within ``near_tie_nats`` of the argmax. Anything else gets flagged.
 
-The server streams one token per chunk with no ids, so chunk i is matched to reference step i by
-the text each token decodes to on its own.
+The server streams text with no ids, usually one token per chunk but several for a speculative
+step or a bursting server, so a chunk's tokens are found from its text: the reference's next tokens
+where they decode to it, else the tokenizer (see align_chunks).
 """
 
 from __future__ import annotations
@@ -14,12 +15,14 @@ from __future__ import annotations
 import functools
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 from benchmark.correctness import metrics as M
 from benchmark.correctness.client import Request, Response
 from benchmark.correctness.families.base import Family, failed_items, write_meta
 from benchmark.correctness.report import FamilyScore, band
 from benchmark.correctness.sets import SampleSet
+from benchmark.utils import clearly_multi_token
 
 TOPK = 8
 
@@ -58,26 +61,91 @@ def generate_reference(model, tok, prompt_ids: list[int], max_new_tokens: int, d
             "text": tok.decode(body, skip_special_tokens=True), "topk": topk, "max_new_tokens": max_new_tokens}
 
 
-def compare_chunks_to_reference(tok, ref: dict, chunks: list[str], near_tie_nats: float) -> tuple:
-    """Compare one prompt's server chunks with the reference. Returns the comparison and server ids."""
+class AlignedOutput(NamedTuple):
+    """A stream's chunks as tokens: reference-tokenizer ids (negative where a chunk has no id) and each one's text."""
+
+    ids: list[int]
+    texts: list[str]
+
+
+def _reference_run(tok, chunk: str, pos: int, ref_ids: list[int], ends: dict[str, int] | None = None) -> int:
+    """How far from ``pos`` the reference's tokens run inside ``chunk``: to the first point they decode to all of it or,
+    given the offsets ``ends`` a chunk may be cut at, the last that decodes to the start of it. ``pos`` if neither."""
+    end = pos
+    for j in range(pos + 1, len(ref_ids) + 1):
+        text = tok.decode(ref_ids[pos:j])
+        if text == chunk:
+            return j
+        if len(text) > len(chunk) + 4:  # a partial character can decode to one U+FFFD per byte
+            break
+        if ends and text in ends:
+            end = j
+    return end
+
+
+def _split_chunk(tok, chunk: str, pos: int, ref_ids: list[int]) -> list[int]:
+    """The ids of a chunk that is not one token of the reference's top-k: the reference's next tokens as far as they
+    run, then the tokenizer on the rest. A partial run has to end on one of the tokenizer's boundaries, or " the" would
+    match the start of " then". A run to the chunk's end needn't: it may split "\\n\\n" where the tokenizer wouldn't."""
+    enc = tok.encode(chunk, add_special_tokens=False)
+    ends = {tok.decode(enc[:k]): k for k in range(1, len(enc) + 1)}
+    end = _reference_run(tok, chunk, pos, ref_ids, ends)
+    if end == pos:
+        return enc or [-1 - pos]
+    text = tok.decode(ref_ids[pos:end])
+    return ref_ids[pos:end] + ([] if text == chunk else enc[ends[text]:])
+
+
+def _bytes_of_last_chunk(tok, dec, chunk: str, pos: int, ref_ids: list[int]) -> int:
+    """Text that ends inside a character doesn't show how many byte-level tokens it took: " \\xf0" and " \\xf0\\x9f"
+    both read " \\ufffd". If ``chunk`` only lines up further on, past such tokens, the last chunk held those too."""
+    for skip in range(4):  # a UTF-8 character has at most 4 bytes
+        p = pos + skip
+        if skip and (p > len(ref_ids) or "\ufffd" not in dec(ref_ids[p - 1])):
+            break
+        if tok.decode(ref_ids[p:_reference_run(tok, chunk, p, ref_ids)]) == chunk:
+            return skip
+    return 0
+
+
+def align_chunks(tok, ref: dict | None, chunks: list[str]) -> AlignedOutput:
+    """Turn a stream's chunks into tokens lined up with the reference. A chunk that is one token of the reference's
+    next step stays one token, whatever else it could be read as, so a one-token-per-chunk stream lines up chunk i with
+    step i."""
     dec = functools.lru_cache(maxsize=None)(lambda t: tok.decode([t]))
-    topk = [{int(a): b for a, b in step} for step in ref["topk"]]
-    ref_ids = ref["ids"]
-    out_ids = []
-    for i, c in enumerate(chunks):
+    topk = [{int(a): b for a, b in step} for step in ref["topk"]] if ref else []
+    ref_ids = ref["ids"] if ref else []
+    ids, texts = [], []
+    for c in chunks:
+        i = len(ids)
         if i < len(ref_ids) and dec(ref_ids[i]) == c:
-            out_ids.append(ref_ids[i])
+            ids.append(ref_ids[i])
+            texts.append(c)
             continue
         cands = [t for t in (topk[i] if i < len(topk) else {}) if dec(t) == c]
         if cands:
-            out_ids.append(cands[0])
+            ids.append(cands[0])
+            texts.append(c)
             continue
-        enc = tok.encode(c, add_special_tokens=False)
-        out_ids.append(enc[0] if len(enc) == 1 else -1 - i)  # unmappable: never equal to a real id
+        if texts and texts[-1].endswith("\ufffd"):
+            skip = _bytes_of_last_chunk(tok, dec, c, i, ref_ids)
+            ids += ref_ids[i:i + skip]
+            texts += [dec(t) for t in ref_ids[i:i + skip]]
+            i += skip
+        got = _split_chunk(tok, c, i, ref_ids)
+        ids += got
+        texts += [c] if len(got) == 1 else [dec(t) for t in got]
+    return AlignedOutput(ids, texts)
+
+
+def compare_chunks_to_reference(tok, ref: dict, chunks: list[str], near_tie_nats: float) -> tuple:
+    """Compare one prompt's server chunks with the reference. Returns the comparison and the aligned tokens."""
+    out = align_chunks(tok, ref, chunks)
+    topk = [{int(a): b for a, b in step} for step in ref["topk"]]
     n = ref["max_new_tokens"]
-    c = M.compare_greedy(ref_ids, out_ids, horizon=n, ref_topk=topk, eos_id=ref.get("eos_id") or tok.eos_token_id,
-                         ref_stopped=ref["stopped"], out_stopped=len(chunks) < n, near_tie_nats=near_tie_nats)
-    return c, out_ids
+    c = M.compare_greedy(ref["ids"], out.ids, horizon=n, ref_topk=topk, eos_id=ref.get("eos_id") or tok.eos_token_id,
+                         ref_stopped=ref["stopped"], out_stopped=len(out.ids) < n, near_tie_nats=near_tie_nats)
+    return c, out
 
 
 def score_greedy_text(sc: FamilyScore, tok, items, refs: dict, runs_chunks: list[dict], near_tie_nats: float,
@@ -87,21 +155,29 @@ def score_greedy_text(sc: FamilyScore, tok, items, refs: dict, runs_chunks: list
     n = len(items)
     for it in items:
         chunks = runs_chunks[0].get(it.id)
-        row = {"id": it.id, "out_tokens": len(chunks) if chunks is not None else None}
-        if chunks is not None and it.id in refs:
-            ref = refs[it.id]
-            c, out_ids = compare_chunks_to_reference(tok, ref, chunks, near_tie_nats)
+        ref = refs.get(it.id)
+        c, out = None, None
+        if chunks is not None and ref:
+            c, out = compare_chunks_to_reference(tok, ref, chunks, near_tie_nats)
+        elif chunks is not None:
+            out = align_chunks(tok, None, chunks)
+        row = {"id": it.id, "out_tokens": None, "out_chunks": None}
+        if out:
+            # Past a divergence a chunk's tokens come from the tokenizer, so this has the runner's drift.
+            row.update(out_tokens=len(out.ids) if clearly_multi_token(len(out.ids), len(chunks)) else len(chunks),
+                       out_chunks=len(chunks))
+        if c:
             comps.append(c)
             row.update(ref_tokens=len(ref["ids"]), exact=c.exact, first_div=c.first_divergence, gap=c.logprob_gap,
                        near_tie=c.near_tie, in_topk=c.out_in_ref_topk)
             if c.first_divergence is not None:
                 d = c.first_divergence
                 row["ref_at_div"] = tok.decode(ref["ids"][max(0, d - 4):d + 4])
-                row["out_at_div"] = "".join(chunks[max(0, d - 4):d + 4])
+                row["out_at_div"] = "".join(out.texts[max(0, d - 4):d + 4])
         if len(runs_chunks) > 1:
             other = runs_chunks[1].get(it.id)
-            if chunks is not None and other is not None:
-                row["r1_r2_first_div"] = M.first_divergence(chunks, other)
+            if out and other is not None:
+                row["r1_r2_first_div"] = M.first_divergence(out.texts, align_chunks(tok, ref, other).texts)
         row["out"] = "".join(chunks or [])[:160]
         rows.append(row)
     if comps:
