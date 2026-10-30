@@ -757,19 +757,21 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   shorter appends need several steps per frame and fall behind once a step
   takes longer than an append.
 - Encoder numerics, measured on CPU at the checkpoint's dimensions with random
-  weights: an upload is one encoder pass, bit for bit the offline encoder's in
-  fp32 and under bf16 autocast, save the last frame when the end of input
-  reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends put
-  the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
-  autocast (the bf16 figure was measured on the duplex encoder the shared
-  FastConformer replaced, and not since). So live and one-shot text should
-  agree token for token in fp32 (inferred from those frames, not measured on
-  served text); under the served bf16 a different chunking can flip a
-  knife-edge frame such as the agent's turn start. On CUDA under bf16 the
+  weights on the duplex encoder the shared FastConformer replaced, and not
+  since: an upload was one encoder pass, bit for bit that encoder's offline
+  pass in fp32 and under bf16 autocast, save the last frame when the end of
+  input reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends
+  put the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
+  autocast. The shared encoder's stream attention adds the relative-position
+  term before scaling and its offline attention after, so an upload is no
+  longer expected to match the offline pass bit for bit. From those figures,
+  live and one-shot text should agree token for token in fp32 (inferred, not
+  measured on served text); under the served bf16 a different chunking can flip
+  a knife-edge frame such as the agent's turn start. On CUDA under bf16 the
   shared blocks keep the residual in bf16 through all 24 layers, as the
-  offline FastConformer encoders do; the replaced encoder's carried it in
-  fp32 from the second layer on, so served bf16 frames differ slightly from
-  that encoder's (not yet measured on a GPU).
+  offline FastConformer encoders do; the replaced encoder carried it in fp32
+  from the second layer on, so served bf16 frames differ from that encoder's
+  by an amount not yet measured on a GPU.
 - The encoder keeps each call's state in a slot per session of three
   resources: its attention keys and values in a bounded KV (``encoder_kv``),
   which keeps a call's last 70 frames per layer and runs the attention, each new
