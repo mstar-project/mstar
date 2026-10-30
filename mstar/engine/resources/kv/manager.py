@@ -692,8 +692,9 @@ class KVManager(AttentionResource):
             # instance rank for a head shard, which a CFG rank isn't
             raise ValueError(
                 f"KV {spec.resource_key}: a node with cfg_size > 1 can't hold a paged KV "
-                "cache, since its CFG ranks run different branches. Give such a node its "
-                "branches as graph walks on separate node groups, as BAGEL does."
+                "cache, since its CFG ranks run different branches. Make each branch its own "
+                "node in a graph Parallel, on its own node group, as BAGEL's LLM_cfg_text "
+                "and LLM_cfg_img are."
             )
         # before the cache is allocated: it is sized off the head counts
         spec.config.shard(info.head_shards)

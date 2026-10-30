@@ -2029,8 +2029,9 @@ guidance combine and solver step on replicated latents. CFG ranks keep every att
 head; only TP and SP ranks split them. The ranks run in lockstep on the same requests, so
 any per-request resource the node declares must stay the same shape on every rank, and a
 node with ``cfg_size > 1`` can't hold a paged KV cache (the engine refuses one at
-start-up): branches that hold different KV (BAGEL's text and image branches) are separate
-graph walks on separate node groups instead. ``Wan22DitSubmodule`` is the reference.
+start-up): branches that hold different KV are separate nodes in a graph ``Parallel``
+instead, each on its own node group, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are.
+``Wan22DitSubmodule`` is the reference.
 
 .. _Expert parallelism (MoE):
 
