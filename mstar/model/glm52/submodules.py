@@ -233,8 +233,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 "decode runs eager, which is far slower. %s",
                 "the reference MoE dispatch is active" if fp8_reference
                 else "naive TP MoE dispatch is active",
-                "moe_quant_kernel 'auto' or 'triton' serves the capturable "
-                "fused fp8 kernel." if fp8_reference
+                "kernels: auto serves the capturable fused fp8 kernel where it "
+                "runs." if fp8_reference
                 else "Serve the fp8 checkpoint to get the fused kernel.",
             )
         return blocked
@@ -547,7 +547,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if graph_walk not in ("prefill", "decode"):
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
         rows = None
-        if graph_walk == "prefill" and self.config.prefill_last_layer_rows:
+        if graph_walk == "prefill" and self.config.tuned_kernels:
+            # the last layer's FFN on the rows it samples only: they take the small-batch MoE
+            # path, so the first token's numerics move (the reference runs every row)
             rows = self._last_row_index(engine_inputs, kwargs)
         hidden = self._hidden(input_ids, position_ids, rows=rows)
         if graph_walk == "prefill" and rows is None:

@@ -3,7 +3,8 @@
 ``config`` carries the MLA dims: ``hidden_size``, ``num_attention_heads``, ``q_lora_rank``,
 ``kv_lora_rank``, ``qk_nope_head_dim``, ``qk_rope_head_dim``, ``qk_head_dim``, ``v_head_dim``,
 ``padded_head_dim``, ``rms_norm_eps``, ``softmax_scale``, ``mla_absorb`` (the backend), and
-optionally ``mla_fused_prep`` and the fp8 block-scale fields ``dense_fp8_block`` reads:
+optionally the fp8 block-scale fields ``dense_fp8_block`` reads and ``kernels`` (``reference`` runs
+the fp8 linears dequantized per call and the latent prep op by op). The backends:
 
 * absorbed: once the weights load, ``kv_b_proj`` folds into the query (``w_kc``) and the output
   (``w_vc``), and the two down projections into one GEMM. Attention runs over the cache's compressed
@@ -31,7 +32,14 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
-from mstar.model.components.fp8_linear import COLUMN, ROW, Fp8Linear, dense_fp8_block, fp8_block_linear
+from mstar.model.components.fp8_linear import (
+    COLUMN,
+    ROW,
+    Fp8Linear,
+    dense_fp8_block,
+    fp8_block_linear,
+    fp8_reference,
+)
 from mstar.model.components.norm import RMSNorm
 from mstar.utils import mla_prep
 from mstar.utils.mla_latent_norm import mla_latent_norm, mla_latent_norm_available
@@ -83,21 +91,22 @@ class MLAAttention(nn.Module):
         # dense_fp8: the checkpoint's fp8 weights and block scales, except kv_b_proj, which
         # the absorbed path folds into bf16 w_kc / w_vc.
         self.fp8_block = fp8 = dense_fp8_block(config)
+        self.fp8_reference = ref = fp8_reference(config)
         kv_a_out = config.kv_lora_rank + config.qk_rope_head_dim
 
         self.q_a_proj = (
             nn.Linear(config.hidden_size, config.q_lora_rank, bias=False) if fp8 is None
-            else Fp8Linear(config.hidden_size, config.q_lora_rank, fp8))
+            else Fp8Linear(config.hidden_size, config.q_lora_rank, fp8, reference=ref))
         self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = (
             ColumnParallelLinear(comm_group, config.q_lora_rank, h * self.qk_head_dim, bias=False)
             if fp8 is None
             else Fp8Linear(config.q_lora_rank, h * self.qk_head_dim, fp8, comm_group,
-                           shard=COLUMN))
+                           shard=COLUMN, reference=ref))
 
         self.kv_a_proj_with_mqa = (
             nn.Linear(config.hidden_size, kv_a_out, bias=False) if fp8 is None
-            else Fp8Linear(config.hidden_size, kv_a_out, fp8))
+            else Fp8Linear(config.hidden_size, kv_a_out, fp8, reference=ref))
         self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             comm_group, config.kv_lora_rank,
@@ -108,7 +117,7 @@ class MLAAttention(nn.Module):
                 comm_group, h * config.v_head_dim, config.hidden_size,
                 bias=False, input_is_parallel=True, reduce_results=True) if fp8 is None
             else Fp8Linear(h * config.v_head_dim, config.hidden_size, fp8, comm_group,
-                           shard=ROW, reduce_results=True))
+                           shard=ROW, reduce_results=True, reference=ref))
 
         self.layer_idx = layer_idx
         # run_attention uses 1/sqrt(padded_head_dim); fold the intended
@@ -117,8 +126,12 @@ class MLAAttention(nn.Module):
         self.softmax_scale_boost = math.sqrt(self.padded_head_dim) * self.softmax_scale
 
         self.mla_absorb = config.mla_absorb
+        # The absorbed path's latent norms, RoPEs and cache write as two kernels (mla_prep.py)
+        # instead of seven, where they run. Each kernel has the bits of the ops it replaces,
+        # but a GLM-5.2 MTP step's cache rows and logits can differ, so the reference keeps
+        # the ops.
         self.mla_fused_prep = (
-            getattr(config, "mla_fused_prep", False) and self.mla_absorb and self.use_rope
+            not ref and self.mla_absorb and self.use_rope
             and mla_prep.supports(config.q_lora_rank, config.kv_lora_rank, self.qk_rope_head_dim))
         if self.mla_absorb:
             self.register_buffer("w_kc", None, persistent=False)  # (H_local, Dnope, L)
@@ -137,9 +150,9 @@ class MLAAttention(nn.Module):
         self._attn = resources[self._attn_key]
         self._pos = resources[self._pos_key] if self.use_rope else None
         if self.mla_fused_prep and self._pos.cos_sin_table is None:
-            raise RuntimeError(
-                "mla_fused_prep rotates from the position resource's cos/sin table: set "
-                "rope_table_dtype in the model's PositionConfig")
+            # the fused prep rotates from the position resource's cos/sin table
+            # (PositionConfig.rope_table_dtype); without one the op-by-op path serves
+            self.mla_fused_prep = False
 
     def _rope(
         self, position_ids: torch.Tensor, q_pe: torch.Tensor, k_pe: torch.Tensor,
@@ -241,7 +254,8 @@ class MLAAttention(nn.Module):
             fused = F.linear(hidden_states, self.fused_qkv_a_proj_weight)
         else:
             fused = fp8_block_linear(hidden_states, self.fused_qkv_a_proj_weight,
-                                     self.fused_qkv_a_proj_scale_inv, self.fp8_block)
+                                     self.fused_qkv_a_proj_scale_inv, self.fp8_block,
+                                     use_reference=self.fp8_reference)
         if (self.mla_fused_prep and (self._attends_written or not self._selects(**sparse))
                 and fused.is_cuda and fused.dtype == torch.bfloat16):
             attn_latent = self._fused_prep_and_attend(fused, hidden_states, position_ids, **sparse)
@@ -278,7 +292,8 @@ class MLAAttention(nn.Module):
             fused = F.linear(hidden_states, self.fused_qkv_a_proj_weight)
         else:
             fused = fp8_block_linear(hidden_states, self.fused_qkv_a_proj_weight,
-                                     self.fused_qkv_a_proj_scale_inv, self.fp8_block)
+                                     self.fused_qkv_a_proj_scale_inv, self.fp8_block,
+                                     use_reference=self.fp8_reference)
         if self.qk_rope_head_dim == 0:
             q_c, latent = self._latent_rows(fused)
             q_nope = self.q_b_proj(q_c).view(n, h, self.qk_head_dim)

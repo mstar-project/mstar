@@ -10,7 +10,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.distributed import ParallelGatedMLP
-from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
+from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block, fp8_reference
 from mstar.model.components.moe import (
     NoAuxTcRouter,
     _dispatch,
@@ -20,14 +20,12 @@ from mstar.model.components.moe import (
     _gate_up_weight_loader,
     dispatch_experts_fused,
 )
-from mstar.model.glm52.config import Glm52ModelConfig
+from mstar.model.glm52.config import KERNELS, Glm52ModelConfig
 from mstar.utils.fp8_block import dequantize_fp8_block_weight
 
 logger = logging.getLogger(__name__)
 
 _BACKEND_LOGGED = False
-# accepted moe_quant_kernel values; see Glm52ModelConfig.moe_quant_kernel
-MOE_QUANT_KERNELS = ("reference", "triton", "auto")
 # the weight scale block fused_experts_fp8 compiles for
 _FUSED_FP8_BLOCK = (128, 128)
 
@@ -39,12 +37,12 @@ def fused_fp8_available(device: torch.device, block_size: tuple[int, int]) -> bo
         return False
     try:
         from mstar.utils.fused_moe import fused_experts_fp8  # noqa: F401
-    except Exception as exc:  # noqa: BLE001 - 'auto' serves the reference loop, loudly
+    except Exception as exc:  # noqa: BLE001 - kernels: auto serves the reference loop, loudly
         logger.warning("fused fp8 MoE kernel unavailable (%r): the reference dispatch "
                        "serves eager, without CUDA graphs", exc)
         return False
     return True
-# Up to this many tokens moe_decode_kernel routes the block through the decode kernels.
+# Up to this many tokens the decode kernels serve the block (kernels: auto).
 _DECODE_MAX_TOKENS = 64
 
 
@@ -76,20 +74,22 @@ class Glm52SparseMoeBlock(nn.Module):
         self.fp8_experts = (
             config.quantization_config is not None and config.moe_fp8_resident
         )
-        self.quant_kernel = getattr(config, "moe_quant_kernel", "reference")
-        if self.quant_kernel not in MOE_QUANT_KERNELS:
+        self.kernels = getattr(config, "kernels", "reference")
+        if self.kernels not in KERNELS:
             # an unknown value would otherwise resolve to the uncapturable
             # reference loop and serve eager behind a healthy /health
-            raise ValueError(
-                f"moe_quant_kernel={self.quant_kernel!r} is not one of "
-                f"{MOE_QUANT_KERNELS}"
-            )
+            raise ValueError(f"kernels={self.kernels!r} is not one of {KERNELS}")
+        tuned = self.kernels == "auto"
         # Resolved on the real device by process_weights_after_loading;
         # blocks used without the load hook (CPU tests) stay on reference.
         self._use_fused = False
-        self._decode_kernel = bool(getattr(config, "moe_decode_kernel", False))
-        self._router_kernel = bool(getattr(config, "moe_router_kernel", False))
-        self._prefill_kernel = bool(getattr(config, "moe_prefill_kernel", False))
+        # on the fused path: the decode chain up to _DECODE_MAX_TOKENS (w8a16, fp32 routing
+        # weights) and the router kernel (ids can differ at exact ties, weights by an ulp)
+        # change numerics, so only kernels: auto takes them; the prefill kernels above it are
+        # the runner's bits with wider tiles, so every fused block does
+        self._decode_kernel = tuned
+        self._router_kernel = tuned
+        self._prefill_kernel = True
 
         self.gate = NoAuxTcRouter(
             hidden_size=config.hidden_size,
@@ -145,12 +145,10 @@ class Glm52SparseMoeBlock(nn.Module):
             )
         self._attach_expert_weight_loaders()
 
-        # One all-reduce per block instead of two: the shared expert's
-        # per-rank partial is summed with the routed partial and reduced once.
-        # Off by default — sum-then-reduce rounds differently from
-        # reduce-then-sum in bf16, so the emitted tokens can shift at ties.
-        # model_kwargs.moe_fused_allreduce turns it on.
-        self._fused_allreduce = self.tp_size > 1 and config.moe_fused_allreduce
+        # One all-reduce per block instead of two under kernels: auto: the shared expert's
+        # per-rank partial is summed with the routed partial and reduced once. Sum-then-reduce
+        # rounds differently from reduce-then-sum in bf16, so the reference reduces each.
+        self._fused_allreduce = self.tp_size > 1 and tuned
         # the two partials are summed before any reduce: one here, or none
         self._sum_partials = self.tp_size > 1 and (self._fused_allreduce or not reduce_results)
         shared_inter = config.moe_intermediate_size * config.n_shared_experts
@@ -158,7 +156,7 @@ class Glm52SparseMoeBlock(nn.Module):
         if dense_block is not None and config.fp8_shared_expert:
             self.shared_expert = Fp8ParallelGatedMLP(
                 config.hidden_size, shared_inter, dense_block, comm_group=comm_group,
-                reduce_results=not self._sum_partials)
+                reduce_results=not self._sum_partials, reference=fp8_reference(config))
         else:
             self.shared_expert = ParallelGatedMLP(
                 hidden_size=config.hidden_size,
@@ -265,9 +263,8 @@ class Glm52SparseMoeBlock(nn.Module):
         return out.view(input_shape)
 
     def _use_decode(self, flat: torch.Tensor) -> bool:
-        """Small batches take the decode kernels when moe_decode_kernel is set on the
-        fused path; they need bf16 activations and the shared expert in the routed experts'
-        shape and dtype."""
+        """Small batches take the decode kernels on the fused path under kernels: auto; they
+        need bf16 activations and the shared expert in the routed experts' shape and dtype."""
         if not (self._decode_kernel and self._use_fused
                 and flat.shape[0] <= _DECODE_MAX_TOKENS):
             return False
@@ -367,23 +364,14 @@ class Glm52SparseMoeBlock(nn.Module):
         return final
 
     def process_weights_after_loading(self, device) -> None:
-        """Resolve reference-vs-fused dispatch on the real device: explicit
-        "triton" must not silently downgrade, "auto" probes for the fused
-        path, "reference" keeps the bitwise loop."""
+        """Resolve reference-vs-fused dispatch on the real device: kernels: auto probes for
+        the fused path (and serves the reference loop where it can't run, with a warning and
+        no CUDA graphs), kernels: reference keeps the bitwise loop."""
         self.gate.finalize_weights()
         if not self.fp8_experts:
             return
         dev = torch.device(device) if device is not None else torch.device("cpu")
-        kernel = self.quant_kernel
-        fused_ok = fused_fp8_available(dev, self.block_size)
-        if kernel == "triton" and not fused_ok:
-            raise RuntimeError(
-                "moe_quant_kernel='triton' requested but the fused fp8 path "
-                f"is unavailable (needs CUDA, triton and {_FUSED_FP8_BLOCK} "
-                f"scale blocks; these are {tuple(self.block_size)}). Use "
-                "'auto' to fall back to the reference dispatch."
-            )
-        self._use_fused = kernel == "triton" or (kernel == "auto" and fused_ok)
+        self._use_fused = self.kernels == "auto" and fused_fp8_available(dev, self.block_size)
         if self._use_fused and self._router_kernel:
             from mstar.utils.fused_moe import decode as moe_decode  # registers the op
 
@@ -392,11 +380,10 @@ class Glm52SparseMoeBlock(nn.Module):
         if not _BACKEND_LOGGED:
             logger.info(
                 "Glm52SparseMoeBlock routed-expert backend: %s "
-                "(moe_quant_kernel=%s, moe_decode_kernel=%s, block_size=%s, "
-                "tp_size=%d).",
+                "(kernels=%s, decode kernels=%s, block_size=%s, tp_size=%d).",
                 "fused_experts_fp8 W8A8" if self._use_fused
                 else "fp8-resident reference dispatch",
-                kernel, self._decode_kernel and self._use_fused, self.block_size,
+                self.kernels, self._decode_kernel and self._use_fused, self.block_size,
                 self.tp_size,
             )
             _BACKEND_LOGGED = True
