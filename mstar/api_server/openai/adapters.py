@@ -24,17 +24,24 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
-import math
+import http.client
+import logging
 import re
+import ssl
+import urllib.error
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
+from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
 from mstar.model.whisper.config import WORDS_MARKER
+from mstar.utils.generation_kwargs import normalize_generation_kwargs
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -173,6 +180,14 @@ def _passthrough(req) -> dict:
     return dict(extra)
 
 
+def _forward_sent_speed(req, mk: dict) -> None:
+    """A client-sent ``speed`` into ``model_kwargs`` for a model with no speed
+    control, so the server logs it as ignored. ``SpeechRequest.speed`` defaults
+    to 1.0, so an unsent one stays out; it would warn on every request."""
+    if "speed" in getattr(req, "model_fields_set", ()):
+        mk.setdefault("speed", req.speed)
+
+
 def _refuse_tool_calls(req) -> None:
     """Refuse a chat that asks the model to call a tool.
 
@@ -207,8 +222,8 @@ def _apply_sampling(
     """Map the OpenAI-standard sampling fields onto a model's ``model_kwargs``.
 
     Behavior is common across models, but the target key names differ (e.g.
-    Qwen3-Omni's Thinker uses ``thinker_temperature`` and its Talker
-    ``talker_temperature``), so callers pass them in. ``setdefault`` lets an
+    Qwen3-Omni's speech route targets its Talker with ``talker_temperature``;
+    a plain key sets a model's primary stage), so callers pass them in. ``setdefault`` lets an
     explicit ``extra_body`` value win over the standard field.
 
     Handled (the OpenAI-standard scalars): ``temperature``, ``top_p``, ``seed``,
@@ -228,7 +243,10 @@ def _apply_sampling(
     if seed is not None:
         mk.setdefault("seed", seed)
     if max_tokens_key:
-        max_tokens = getattr(req, "max_completion_tokens", None) or getattr(req, "max_tokens", None)
+        # is-not-None, not ``or``: an explicit 0 must reach validation (a 400), not fall through
+        max_tokens = getattr(req, "max_completion_tokens", None)
+        if max_tokens is None:
+            max_tokens = getattr(req, "max_tokens", None)
         if max_tokens is not None:
             mk.setdefault(max_tokens_key, max_tokens)
     return mk
@@ -295,6 +313,10 @@ class OpenAIAdapter:
     # most sub-requests one input may split into; longer inputs get a 400
     speech_chunk_max_pieces: int = 32
 
+    def split_speech_text(self, text: str) -> list[str]:
+        """The sentence chunks of a ``/v1/audio/speech`` input that chunking applies to."""
+        return split_sentences(text, max_chars=self.speech_chunk_max_chars)
+
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
         # emits text, whereas BAGEL chat is text-only.
@@ -342,12 +364,25 @@ class OpenAIAdapter:
         raise NotImplementedError("realtime transcription is not supported by this model")
 
 
+def _size_kwargs(size: str | None, mk: dict) -> None:
+    """OpenAI ``size`` (``WxH``) onto the model's ``width`` / ``height``."""
+    if not size:
+        return
+    try:
+        width, height = (int(v) for v in size.lower().split("x"))
+    except ValueError:
+        raise ValueError(f"size must be 'WxH' (e.g. '1024x1024'); got {size!r}") from None
+    mk.setdefault("width", width)
+    mk.setdefault("height", height)
+
+
 class BagelAdapter(OpenAIAdapter):
     """BAGEL: text chat (text out) + text-to-image / image editing.
 
-    BAGEL's ``get_sampling_config`` reads the model config, so per-request
-    ``temperature`` / ``top_p`` are not honored; ``max_output_tokens`` and
-    ``seed`` are.
+    Chat honors ``temperature`` / ``top_p`` / ``max_tokens`` / ``seed``, and
+    ``top_k`` / ``repetition_penalty`` / ``penalize_prompt`` via ``extra_body``
+    (``min_p`` is refused). Images map ``size`` (``WxH``) onto ``width`` /
+    ``height``; on an edit they bound the output, keeping the input's aspect.
     """
 
     supports_chat = True
@@ -369,6 +404,7 @@ class BagelAdapter(OpenAIAdapter):
 
     def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
+        _size_kwargs(getattr(req, "size", None), mk)
         if getattr(req, "seed", None) is not None:
             mk.setdefault("seed", req.seed)
         return SubmitArgs(
@@ -381,24 +417,27 @@ class BagelAdapter(OpenAIAdapter):
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:
         # Image editing: the input image + prompt produce an edited image
         # (BAGEL's I2I path). Extra kwargs (e.g. cfg_*_scale, seed) pass through.
+        mk = dict(extra_kwargs or {})
+        _size_kwargs(mk.pop("size", None), mk)
         return SubmitArgs(
             text=prompt,
             file_paths={"image": [image_path]},
             input_modalities=["image", "text"],
             output_modalities=["image"],
-            model_kwargs=dict(extra_kwargs or {}),
+            model_kwargs=mk,
         )
 
 
 class Qwen3OmniAdapter(OpenAIAdapter):
     """Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.
 
-    Sampling is split across three stages: the Thinker (text) takes
+    Sampling is split across three stages: the Thinker (text) takes plain or
     ``thinker_*`` keys, the Talker (speech) ``talker_*``, and the Talker's
-    CodePredictor (residual codec groups) ``code_predictor_*``. Everything
+    CodePredictor (residual codec groups) ``code_predictor_*``; a stage key wins
+    over a plain one. Everything
     except temperature/top_p is not an OpenAI field (``talker_top_k``,
     ``talker_repetition_penalty``, ``code_predictor_top_k``, …) — pass those
-    via ``extra_body``.
+    via ``extra_body``. A speech request's ``speed`` is reported as ignored.
     """
 
     supports_chat = True
@@ -407,7 +446,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
     def _voice(self, req) -> str | None:
         audio_cfg = getattr(req, "audio", None) or {}
-        if isinstance(audio_cfg, dict) and audio_cfg.get("voice"):
+        if isinstance(audio_cfg, dict) and audio_cfg.get("voice") is not None:
             return audio_cfg["voice"]
         return getattr(req, "voice", None)
 
@@ -420,7 +459,8 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         out_mods = ["text", "audio"] if want_audio else ["text"]
         _apply_sampling(req, mk, temperature_key="thinker_temperature", top_p_key="thinker_top_p")
         voice = self._voice(req)
-        if voice:
+        # is-not-None: an empty voice reaches the model, which refuses it
+        if voice is not None:
             mk["voice"] = voice
         return SubmitArgs(
             text=text,
@@ -435,10 +475,11 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         # Qwen3-Omni is a chat model; /v1/audio/speech returns the audio of its
         # spoken response to ``input`` (the handler keeps only the audio).
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
         # Talker (speech) sampling; max_tokens is not an OpenAI speech field.
         _apply_sampling(req, mk, temperature_key="talker_temperature", top_p_key="talker_top_p", max_tokens_key=None)
+        _forward_sent_speed(req, mk)
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
@@ -451,11 +492,12 @@ class Qwen3_5Adapter(OpenAIAdapter):
     """Qwen3.5: text, image and video chat (``image_url`` / ``video_url`` parts), text out.
 
     Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
-    ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
+    ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus
     non-OpenAI fields via ``extra_body``:
 
-    * ``repetition_penalty`` — the sampler applies it over the prompt's tokens
-      as well as the generated ones.
+    * ``top_k``; ``min_p`` is refused (the sampler has no min-p filter).
+    * ``repetition_penalty`` — counts the prompt's tokens as well as the
+      generated ones unless ``penalize_prompt`` is false.
     * ``enable_thinking`` (default true) — the chat template opens a
       ``<think>`` block. Set it false for short answers.
     """
@@ -478,16 +520,19 @@ class Qwen3_5Adapter(OpenAIAdapter):
 
 
 class OrpheusAdapter(OpenAIAdapter):
-    """Orpheus: text-to-speech (audio out only). Honors temperature/top_p/seed
-    (its ``get_sampling_config`` reads model_kwargs)."""
+    """Orpheus: text-to-speech (audio out only). ``temperature`` / ``top_p`` /
+    ``seed`` map directly; ``top_k``, ``repetition_penalty`` and
+    ``penalize_prompt`` travel through ``extra_body``. ``speed`` is not an
+    Orpheus control and is reported as ignored."""
 
     supports_speech = True
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        _forward_sent_speed(req, mk)
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
@@ -522,7 +567,8 @@ class OmniVoiceAdapter(OpenAIAdapter):
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        if getattr(req, "voice", None) and not mk.get("instruct"):
+        # is-not-None, so an empty voice reaches the model and is refused there
+        if getattr(req, "voice", None) is not None and mk.get("instruct") is None:
             mk["instruct"] = req.voice
         mk.pop("voice", None)
         if getattr(req, "speed", None) is not None:
@@ -556,8 +602,9 @@ class Qwen3TTSAdapter(OpenAIAdapter):
     OpenAI field; ``instruct`` also accepted) carries the style or voice
     description. Non-standard knobs travel through ``extra_body``:
     ``language``, ``non_streaming_mode``, ``top_k``, ``repetition_penalty``,
-    the residual-group ``subtalker_*`` sampling, ``max_new_tokens``.
+    the residual-group ``code_predictor_*`` sampling, ``max_output_tokens``.
     ``temperature`` / ``top_p`` / ``seed`` map onto the Talker sampler.
+    ``speed`` is not a Qwen3-TTS control and is reported as ignored.
 
     Inputs of 600+ characters are synthesized as ordered sentence chunks
     (``serving_speech``): each Talker request stays near the lengths the
@@ -571,13 +618,14 @@ class Qwen3TTSAdapter(OpenAIAdapter):
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
         # OpenAI's field is ``instructions``; the model reads ``instruct``.
         instructions = mk.pop("instructions", None)
         if instructions:
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        _forward_sent_speed(req, mk)
         # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL (when
         # the server allows it) or bare base64. It becomes the
         # request's audio input for one request; ``ref_text`` and
@@ -616,7 +664,7 @@ class KokoroAdapter(OpenAIAdapter):
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk.setdefault("voice", req.voice)
         if getattr(req, "speed", None) is not None:
             mk.setdefault("speed", req.speed)
@@ -630,19 +678,49 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
+# A ref_audio URL that did not deliver: an HTTP error status or a refused
+# redirect (HTTPError), DNS or connect failures (URLError), a timeout, a dropped
+# connection, a TLS failure or a body cut short. These are the request's fault.
+_REF_AUDIO_FETCH_ERRORS = (
+    urllib.error.URLError,
+    http.client.HTTPException,
+    TimeoutError,
+    ConnectionError,
+    ssl.SSLError,
+)
+
+
+def _ref_audio_fetch_failure(exc: BaseException) -> str:
+    """What went wrong with a ref_audio fetch, in words that name no server path."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    return type(exc).__name__
+
+
 def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
     """A reference voice clip from the request: a data URL, an http(s) URL (only
     when the server allows remote fetch), or bare base64 that ``decoder`` (the
     model's audio loader) can open. Returns its path. Every form gets the same
     ``check_ref_audio``, so a clip the data worker would fail on, or one longer
-    than ``MAX_REF_AUDIO_SECONDS``, is a 400 here."""
+    than ``MAX_REF_AUDIO_SECONDS``, is a 400 here.
+
+    A clip that is not audio, malformed base64 and a failed fetch are 400s.
+    Failing to store the clip (a full disk, ``upload_dir`` permissions) is the
+    server's fault: a 500 whose text, like the 400s, names no server path."""
     if not isinstance(ref, str):
         raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
-    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
-        path = media_io.resolve_media_ref(ref, upload_dir)[1]
-        media_io.check_ref_audio(path, decoder)
-        return path
-    path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    try:
+        if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+            try:
+                path = media_io.resolve_media_ref(ref, upload_dir)[1]
+            except _REF_AUDIO_FETCH_ERRORS as exc:
+                raise ValueError(f"could not fetch ref_audio ({_ref_audio_fetch_failure(exc)})") from exc
+            media_io.check_ref_audio(path, decoder)
+            return path
+        path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    except OSError as exc:
+        logger.error("could not store a ref_audio upload under %s: %r", upload_dir, exc)
+        raise RuntimeError("the server could not store ref_audio") from None
     if path:
         return path
     raise ValueError(
@@ -660,21 +738,23 @@ class ChatterboxAdapter(OpenAIAdapter):
     (a data URL, bare base64 or, when the server allows it, an http(s) URL;
     paths on the server are refused, and so is a clip over 60 s or below
     8 kHz) and is loaded by the worker like an uploaded file.
-    The model's own knobs --
-    ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
-    ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
-    the multilingual checkpoint, ``language_id`` -- pass through ``extra_body``
-    verbatim; ``temperature``/``top_p``/``seed`` are the standard fields.
-    ``speed`` is not a Chatterbox control and is dropped.
+    The model's own knobs (``exaggeration``, ``cfg_weight``, ``min_p``,
+    ``repetition_penalty``, ``top_k``, ``n_cfm_timesteps``, ``watermark``,
+    ``max_output_tokens`` and, for the multilingual checkpoint,
+    ``language_id``) pass through ``extra_body`` verbatim;
+    ``temperature``/``top_p``/``seed`` are the standard fields. Turbo refuses a
+    non-zero ``cfg_weight`` / ``exaggeration`` / ``min_p``. ``speed`` is not a
+    Chatterbox control and is reported as ignored.
     """
 
     supports_speech = True
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk.setdefault("voice", req.voice)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        _forward_sent_speed(req, mk)
         file_paths = None
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
@@ -726,6 +806,124 @@ class FishS2ProAdapter(OpenAIAdapter):
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
+class CosyVoice3Adapter(OpenAIAdapter):
+    """Fun-CosyVoice3: TTS that always clones a voice.
+
+    ``voice`` names a preset in the deployment's ``voices_dir`` (with its
+    transcript in ``<voice>.txt``); ``ref_audio`` in ``extra_body`` uploads a
+    clip instead (a data URL, an http(s) URL when the server allows remote
+    media, or bare base64 audio; never a server path), with its transcript in
+    ``ref_text``. ``instructions`` becomes ``instruct``. ``temperature``,
+    ``top_p`` and ``seed`` are the standard fields; ``top_k``, ``ras_window``,
+    ``ras_tau``, ``n_cfm_timesteps`` and ``max_new_tokens`` (25 Hz speech
+    tokens) pass through ``extra_body``. ``speed`` is dropped.
+
+    Long text is synthesized in sentence chunks, as the reference frontend
+    (``text_normalize``) does: pieces of about 80 tokens, or 60 to 80
+    characters for text with Chinese, cut at sentence ends (and at ``：`` and
+    ``、`` with Chinese), with a short tail merged into the piece before it.
+    A Chinese piece over 300 characters is cut again at its commas.
+    In one request the LM ends long text early or garbles its end. Without Chinese, an estimate of the Qwen2 BPE token
+    count stands in for the reference's real one, so Hangul, kana and
+    Cyrillic pieces stay near 80 tokens as English ones do.
+    """
+
+    supports_speech = True
+    _CHARS_PER_TOKEN = 4
+    speech_chunk_max_chars = 80 * _CHARS_PER_TOKEN
+    # nothing shorter than the smallest piece (80 characters of Chinese) is split
+    speech_chunk_min_chars = 81
+
+    # A sentence of the reference's ``split_paragraph(lang="zh")``: up to a CJK
+    # sentence or clause mark (with a closing quote), or a Latin one before a
+    # space or the end, so "3.5" stays whole.
+    _ZH_SENTENCE = re.compile(r".*?(?:[。？！；：、][\"”]?|[.?!;](?=\s|\Z)|\Z)", re.DOTALL)
+    # The same with commas, for a piece too long for the LM.
+    _ZH_CLAUSE = re.compile(r".*?(?:[。？！；：、，][\"”]?|[.?!;,](?=\s|\Z)|\Z)", re.DOTALL)
+    # A Han character is one token of this tokenizer, and Latin text fewer per
+    # character, so a piece's length bounds its tokens. The LM takes 512 tokens
+    # of prompt text and text: 7 for the system prompt, at most about 200 for
+    # the transcript of a 30 s reference clip, and 300 for the piece.
+    _ZH_MAX_PIECE_CHARS = 300
+
+    def split_speech_text(self, text: str) -> list[str]:
+        if re.search(r"[\u4e00-\u9fff]", text):  # the reference's ``contains_chinese``
+            return self._split_chinese(text)
+        # The reference counts real tokens here; characters per token differ
+        # by script (Hangul or kana about 1.5, Cyrillic about 2.7, English about 4.7).
+        chars_per_token = len(text) / max(1.0, self._estimated_tokens(text))
+        max_chars = min(self.speech_chunk_max_chars, max(80, int(80 * chars_per_token)))
+        return split_sentences(text, max_chars=max_chars, min_chars=int(20 * chars_per_token))
+
+    @classmethod
+    def _split_chinese(cls, text: str) -> list[str]:
+        """Text with Chinese cut as the reference cuts it: sentences joined with
+        nothing between them until a piece is past 60 characters and the next
+        sentence would take it past 80, a tail under 20 merged into the piece
+        before it, and a longer sentence kept whole rather than wrapped.
+
+        A piece over ``_ZH_MAX_PIECE_CHARS``, which the reference would send
+        whole but which could take a request past the LM's 512 tokens (a 400,
+        or audio cut short when it is not the first piece), is cut again at
+        commas as well, as ``split_paragraph(comma_split=True)`` cuts, after a clause over
+        80 characters (a run with no punctuation) is cut into even parts; every
+        piece of that is under 160 characters."""
+        pieces: list[str] = []
+        for piece in cls._group_chinese(cls._ZH_SENTENCE.findall(text)):
+            if len(piece) <= cls._ZH_MAX_PIECE_CHARS:
+                pieces.append(piece)
+                continue
+            clauses = cls._ZH_CLAUSE.findall(piece)
+            pieces += cls._group_chinese([c for clause in clauses for c in _cut_evenly(clause, 80)])
+        return pieces
+
+    @staticmethod
+    def _group_chinese(sentences: list[str]) -> list[str]:
+        """The grouping of the reference's ``split_paragraph(lang="zh")``."""
+        pieces: list[str] = []
+        current = ""
+        for sentence in sentences:
+            if len(current + sentence) > 80 and len(current) > 60:
+                pieces.append(current)
+                current = ""
+            current += sentence
+        if current.strip():
+            if len(current) < 20 and pieces:
+                pieces[-1] += current
+            else:
+                pieces.append(current)
+        return [piece.strip() for piece in pieces]
+
+    @classmethod
+    def _estimated_tokens(cls, text: str) -> float:
+        """An upper estimate of the Qwen2 BPE token count of ``text``."""
+        return sum(
+            1 / cls._CHARS_PER_TOKEN if ord(ch) < 0x80 else 0.5 if ord(ch) < 0x800 else 1.0 for ch in text
+        )
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk.setdefault("voice", req.voice)
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        file_paths = None
+        input_modalities = ["text"]
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            file_paths = {"audio": [_resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")]}
+            input_modalities = ["text", "audio"]
+        return SubmitArgs(
+            text=req.input,
+            file_paths=file_paths,
+            input_modalities=input_modalities,
             output_modalities=["audio"],
             model_kwargs=mk,
         )
@@ -808,9 +1006,10 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
 
     Chat requests take the OpenAI ``messages`` layout with image / video
     attachments in order; ``temperature`` / ``top_p`` / ``max_tokens`` map to
-    the reasoner's sampler, and ``extra_body`` knobs (``enable_thinking``,
-    ``top_k``, ``repetition_penalty``, ``video_fps`` / ``video_num_frames``)
-    pass through.
+    the reasoner's sampler (``max_tokens`` defaults to 2048), and ``extra_body``
+    knobs (``enable_thinking``, ``top_k``, ``repetition_penalty``,
+    ``penalize_prompt``, ``video_fps`` / ``video_num_frames``) pass through;
+    ``min_p`` is refused.
     """
 
     supports_chat = True
@@ -825,7 +1024,8 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
         # malformed value refuses the request.
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if "enable_thinking" in template_kwargs:
-            mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+            # raw, not bool(): the model refuses a non-boolean rather than reading "false" as true
+            mk.setdefault("enable_thinking", template_kwargs["enable_thinking"])
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,
@@ -938,20 +1138,9 @@ class DiffusionImageAdapter(OpenAIAdapter):
 
     supports_images = True
 
-    @staticmethod
-    def _size_kwargs(size: str | None, mk: dict) -> None:
-        if not size:
-            return
-        try:
-            width, height = (int(v) for v in size.lower().split("x"))
-        except ValueError:
-            raise ValueError(f"size must be 'WxH' (e.g. '1024x1024'); got {size!r}") from None
-        mk.setdefault("width", width)
-        mk.setdefault("height", height)
-
     def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
-        self._size_kwargs(getattr(req, "size", None), mk)
+        _size_kwargs(getattr(req, "size", None), mk)
         if getattr(req, "seed", None) is not None:
             mk.setdefault("seed", req.seed)
         return SubmitArgs(
@@ -963,7 +1152,7 @@ class DiffusionImageAdapter(OpenAIAdapter):
 
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:
         mk = dict(extra_kwargs or {})
-        self._size_kwargs(mk.pop("size", None), mk)
+        _size_kwargs(mk.pop("size", None), mk)
         return SubmitArgs(
             text=prompt,
             file_paths={"image": [image_path]},
@@ -983,37 +1172,15 @@ _TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 
 
-# sampling knobs the engine reads as numbers; a string there fails every
-# request batched with it, so they are checked before submission
-_NUMERIC_KWARGS = {
-    "temperature": float, "top_p": float, "min_p": float, "repetition_penalty": float,
-    "top_k": int, "max_output_tokens": int, "seed": int,
-}
-
-
-def _check_numeric_kwargs(mk: dict) -> dict:
-    """Coerce the known numeric ``model_kwargs`` to numbers, or raise ValueError."""
-    for key, kind in _NUMERIC_KWARGS.items():
-        value = mk.get(key)
-        if value is None or (kind is int and isinstance(value, int) and not isinstance(value, bool)):
-            continue
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"{key} must be a number; got {value!r}") from None
-        if not math.isfinite(number) or (kind is int and not number.is_integer()):
-            raise ValueError(f"{key} must be a finite {kind.__name__}; got {value!r}")
-        mk[key] = kind(number)
-    return mk
-
-
 def _transcription_kwargs(req: TranscriptionRequest) -> dict:
     """Map the OpenAI transcription fields shared by every ASR model onto
     ``model_kwargs``. ``language`` / ``temperature`` / ``seed`` pass through
     under their own names; ``prompt`` becomes ``initial_prompt`` (the
     conditioning text, named as faster-whisper does — ``prompt`` itself is
     the request's text argument); a timestamped ``response_format`` or an
-    explicit granularity asks the model for timestamps."""
+    explicit granularity asks the model for timestamps. Neither served ASR
+    model reads ``initial_prompt`` or ``timestamps`` yet (and Higgs-Audio not
+    ``language``), so those are logged as ignored."""
     mk = _passthrough(req)
     if req.language:
         mk.setdefault("language", req.language)
@@ -1028,17 +1195,19 @@ def _transcription_kwargs(req: TranscriptionRequest) -> dict:
         mk.setdefault("timestamps", "word")
     elif granularities or req.response_format in ("verbose_json", "srt", "vtt"):
         mk.setdefault("timestamps", "segment")
-    return _check_numeric_kwargs(mk)
+    # checked here too, so a bad knob is a 400 before a stream commits to a 200
+    return normalize_generation_kwargs(mk)
 
 
 class WhisperAdapter(OpenAIAdapter):
     """Whisper (large-v3, large-v3-turbo): speech-to-text.
 
-    The transcript stream is Whisper's own token stream rendered as text:
-    a leading ``<|xx|>`` language token when the language was detected or
-    forced, and ``<|s.ss|>`` timestamp tokens around each segment when
-    timestamps were requested. ``parse_transcript`` lifts those into
-    :class:`Transcript`; ``stream_text`` hides them from streaming clients.
+    The transcript stream is Whisper's own token stream rendered as text.
+    ``parse_transcript`` lifts ``<|xx|>`` language and ``<|s.ss|>`` timestamp
+    tokens into :class:`Transcript` and ``stream_text`` hides them, but the model
+    today forces ``language`` (default ``en``, no detection) and
+    ``<|notimestamps|>``, so neither appears and long uploads are cut at fixed
+    window boundaries.
     """
 
     supports_transcriptions = True
@@ -1287,6 +1456,39 @@ class CanaryQwenAdapter(_UntimedTranscriptionAdapter):
         )
 
 
+class TransducerAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Parakeet / Nemotron ASR: transducer speech recognition.
+
+    Parakeet-TDT (``detects_language``) detects the language from the speech
+    and refuses only a ``language`` it doesn't know; Nemotron takes it as its
+    prompt (a locale such as ``en-US``, a bare code, or ``auto``), checked
+    against the checkpoint's locales when the upload is preprocessed. Neither
+    takes free-text conditioning or emits timestamps here.
+    """
+
+    supports_transcriptions = True
+    # full attention over the clip; longer uploads run as independent windows
+    max_audio_seconds = 600.0
+    long_form = "parallel"
+
+    def __init__(self, detects_language: bool = False):
+        self.detects_language = detects_language
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        mk = _untimed_transcription_kwargs(req, "this model")
+        if self.detects_language:
+            from mstar.model.parakeet.config import check_detected_language
+
+            check_detected_language(mk.get("language"))
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 class HiggsAudioAdapter(OpenAIAdapter):
     """Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI
     ``prompt`` is the transcription instruction (the model has a default)."""
@@ -1302,6 +1504,54 @@ class HiggsAudioAdapter(OpenAIAdapter):
             input_modalities=["audio", "text"],
             output_modalities=["text"],
             model_kwargs=mk,
+        )
+
+
+class TextChatAdapter(OpenAIAdapter):
+    """Text-only LLMs: chat messages in, text out. The model's ``process_prompt``
+    applies its own chat template; sampling fields reach it as model_kwargs."""
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
+        text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
+        # an image or audio part was decoded to disk and then dropped: the model
+        # answered as if it had seen it
+        other = sorted(set(modalities) - {"text"})
+        if other:
+            raise ValueError(f"this model takes text only; the messages carry {other}")
+        if not text:
+            raise ValueError("messages carry no text content")
+        for name in ("max_tokens", "max_completion_tokens"):
+            value = getattr(req, name, None)
+            if value is not None and value < 1:
+                raise ValueError(f"{name} must be at least 1, got {value}")
+        # what the model cannot serve is refused, not dropped: off, a field passes
+        if req.n not in (None, 1):
+            raise ValueError(f"n={req.n}: this model returns one choice")
+        if req.stop:
+            raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
+        mk = _passthrough(req)
+        for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
+                     "stop_token_ids"):
+            if mk.get(name):
+                raise ValueError(f"{name} is not supported; got {mk[name]!r}")
+            mk.pop(name, None)
+        if mk.pop("best_of", None) not in (None, 1):
+            raise ValueError("best_of is not supported; this model returns one choice")
+        if mk.pop("response_format", None) not in (None, {"type": "text"}):
+            raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
+        _apply_sampling(req, mk)
+        # extra_body can override max_tokens with anything; a string reached the
+        # conductor's min() and took its whole message batch down
+        mk = normalize_generation_kwargs(mk)
+        return SubmitArgs(
+            text=text,
+            input_modalities=["text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+            prompt_parts=parts,
         )
 
 
@@ -1353,6 +1603,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),
     "fish_s2_pro": FishS2ProAdapter(),
+    "cosyvoice3": CosyVoice3Adapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
@@ -1376,6 +1627,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "qwen3_asr_realtime": Qwen3ASRAdapter(),
     "canary": CanaryAdapter(),
     "canary_qwen": CanaryQwenAdapter(),
+    "parakeet": TransducerAdapter(detects_language=True),
+    "nemotron_asr": TransducerAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "omnilingual_asr_ctc_300m": OmnilingualASRAdapter(),
     "omnilingual_asr_ctc_1b": OmnilingualASRAdapter(),
@@ -1384,6 +1637,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
+    "glm52": TextChatAdapter(),
 }
 
 # One key per size; every size takes the same adapter.

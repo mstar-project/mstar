@@ -9,6 +9,7 @@ import triton.language as tl
 
 from mstar.engine.resources.attn.dense import flash_attn_varlen_func
 from mstar.engine.resources.attn.ragged.wrappers import (
+    PrefixedPrefillWrapper,
     RaggedCrossPrefillWrapper,
     RaggedPrefillWrapper,
     _RaggedPrefillBase,
@@ -103,3 +104,7 @@ class DenseRaggedPrefillWrapper(_DenseRaggedPrefillBase, RaggedPrefillWrapper):
 
 class DenseRaggedCrossPrefillWrapper(_DenseRaggedPrefillBase, RaggedCrossPrefillWrapper):
     """Ragged cross-attention through FA3 varlen."""
+
+
+class DensePrefixedPrefillWrapper(_DenseRaggedPrefillBase, PrefixedPrefillWrapper):
+    """Prefixed attention through FA3 varlen."""

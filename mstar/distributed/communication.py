@@ -75,8 +75,9 @@ class CommGroup:
         self.group_members = group_members
         self.world_size = len(group_members)
         self.device_group = None
-        # gloo twin of ``device_group``, for object collectives (workspace
-        # rendezvous) that should not go through NCCL
+        # host channel of ``device_group``, for rank votes (``agree``) and
+        # object collectives (workspace rendezvous) that should not go through
+        # NCCL: a gloo twin, or on XPU the mixed group's gloo side
         self.cpu_group = None
         self.initialized = False
         # see ``init_allreduce_fusion``
@@ -91,6 +92,20 @@ class CommGroup:
         ``AllReduce.new``). Collective across the group — every member calls
         this from ``init_dist`` at the same point."""
         self._all_reduce = AllReduce.new(self, mode, max_kb)
+
+    def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
+        """Reduce each of ``values`` over the group's ranks with ``op``: ``MIN`` ANDs
+        flags, ``MAX`` takes the largest. Collective: every member calls it at the
+        same point. Over ``cpu_group``, so the answer costs no device sync."""
+        if self.world_size == 1 or not values:
+            return list(values)
+        if self.cpu_group is None:
+            raise ValueError(
+                f"agree over ranks {self.group_members} before init_dist set up their cpu_group"
+            )
+        t = torch.tensor(values, dtype=torch.int64)
+        dist.all_reduce(t, op=op, group=self.cpu_group)
+        return t.tolist()
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -153,7 +168,7 @@ class CommGroup:
         from mstar.distributed.ar_fusion import create_workspace
 
         self._ar_fusion_ws = create_workspace(
-            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
+            self, max_tokens, hidden, dtype,
         )
         self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
         return self._ar_fusion_ws is not None
@@ -351,6 +366,12 @@ class JointGroups:
         tensor = self.tp_group.broadcast(tensor, tp_src)
         return self.sp_group.broadcast(tensor, sp_src)
 
+    def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
+        """``CommGroup.agree`` over the whole TP x SP block."""
+        for group in (self.tp_group, self.sp_group):
+            values = group.agree(values, op)
+        return values
+
 
 
 @dataclass
@@ -467,22 +488,35 @@ class WorkerParallelGroups:
         # iterates it identically; ``new_group`` is collective and
         # tag-ordered (see the field comment). A tuple shared by a TP and
         # an SP group (degenerate meshes) maps to one subgroup.
-        rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        #
+        # The gloo twins are members only. With the default group bound to a
+        # device, a non-member's subgroup creation joins an ncclCommSplit
+        # that members never call for a gloo group, and blocks forever. But
+        # torch names a members-only group after its ranks and the number of
+        # groups this process has made so far, and a non-member makes none.
+        # So a rank outside the tuple makes a gloo group of just itself, which
+        # keeps that count equal on every rank and the members agreeing on the
+        # name (and the store prefix their rendezvous uses). A 2x2 TP x SP
+        # mesh hung at startup without it. The device subgroups go after,
+        # since they're only registered on their members and would skew it.
         rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        for rank_tuple in self.world_parallel_groups:
+            if device.type == "xpu":
+                continue  # the device group doubles as the cpu group below
+            member = self.global_rank in rank_tuple
+            cpu_pg = dist.new_group(
+                ranks=list(rank_tuple) if member else [self.global_rank],
+                backend="gloo", use_local_synchronization=True, **timeout_kwargs,
+            )
+            if member:
+                rank_tuple_to_cpu_pg[rank_tuple] = cpu_pg
+        rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(
                 ranks=list(rank_tuple), **timeout_kwargs
             )
             if device.type == "xpu":
                 rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
-            else:
-                # Members only: with the default group bound to a device, a
-                # non-member's subgroup creation joins an ncclCommSplit that
-                # members never call for a gloo group, and blocks forever.
-                rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                    ranks=list(rank_tuple), backend="gloo",
-                    use_local_synchronization=True, **timeout_kwargs,
-                )
 
         seen: set[int] = set()
         for comm_group in (

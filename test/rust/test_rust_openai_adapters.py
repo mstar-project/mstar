@@ -33,6 +33,7 @@ from test_rust_frontend import (
     _wait_healthy,
 )
 
+from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, OpenAIAdapter
 from mstar.api_server.rust_frontend import OPENAI_ADAPTER_ENV, openai_adapter_class
 
@@ -49,6 +50,7 @@ ROUTES = {
 # /v1/audio/transcriptions and /v1/realtime have no route there at all.
 NOT_PORTED = {
     ("ChatterboxAdapter", "speech"),
+    ("CosyVoice3Adapter", "speech"),
     ("FishS2ProAdapter", "speech"),
     ("KokoroAdapter", "speech"),
     ("OmniVoiceAdapter", "speech"),
@@ -56,6 +58,7 @@ NOT_PORTED = {
     ("DiffusionImageAdapter", "images"),
     ("LTX25Adapter", "videos"),
     ("Wan22Adapter", "videos"),
+    ("TextChatAdapter", "chat"),
 }
 
 
@@ -220,7 +223,7 @@ def test_a_chat_class_listed_as_not_ported_passes_the_route_and_chat_checks(monk
 @pytest.mark.parametrize("fields", [{}, {"max_completion_tokens": 0}], ids=["fields", "zero-max"])
 @pytest.mark.parametrize("cls", CHAT_CLASSES)
 def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields, tmp_path):
-    """``max_completion_tokens: 0`` falls through to ``max_tokens`` in Python."""
+    """``max_completion_tokens: 0`` is kept, not replaced by ``max_tokens``, as in Python."""
     model = _model_of(cls)
     stub = _StubAPIServer()
     body = {**CHAT, **fields}
@@ -243,6 +246,8 @@ def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields,
 
 class _PythonServer:
     """What the Python routes call on APIServer, replying as the stub does."""
+
+    open_result_stream = APIServer.open_result_stream
 
     def __init__(self, model_name, upload_dir):
         self.model_name, self.upload_dir, self.model = model_name, upload_dir, None

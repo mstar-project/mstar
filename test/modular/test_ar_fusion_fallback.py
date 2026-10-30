@@ -45,8 +45,11 @@ def _worker(rank, store_path, fails, out_dir):
     built: list = []
     _install_fake_flashinfer(fails, rank, built)
     from mstar.distributed import ar_fusion
+    from mstar.distributed.communication import CommGroup
 
-    ws_id = ar_fusion.create_workspace(rank, WORLD, dist.group.WORLD, 128, 64, None)
+    group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(WORLD)))
+    group.cpu_group = dist.group.WORLD
+    ws_id = ar_fusion.create_workspace(group, 128, 64, None)
     chosen = None if ws_id is None else ar_fusion._WORKSPACES[ws_id].backend
     leaked = [ws.backend for ws in built if not ws.destroyed and ws.backend != chosen]
     with open(os.path.join(out_dir, str(rank)), "w") as f:
