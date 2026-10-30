@@ -34,7 +34,6 @@ from mstar.graph.runtime.base import (  # noqa: E402
     PopRidsOutput,
     ReadyNodeSpec,
     SpeculationOutput,
-    SpeculationPrepOutput,
 )
 from mstar.model.submodule_base import StepOrder  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
