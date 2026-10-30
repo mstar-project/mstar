@@ -160,8 +160,7 @@ class WorkerGraphQueues:
             f"Tried to stop loops for unknown request ID {_rid_name(self.rid_str, request_id)}"
         queue = self.per_request_queues[request_id]
         for name in loop_names:
-            if name in queue.loops:
-                queue.register_loop_finish_signal(name)
+            queue.register_loop_finish_signal(name)
 
     def mark_node_complete(
         self, request_id: int, node_name: str
