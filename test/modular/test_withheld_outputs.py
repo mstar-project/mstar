@@ -182,7 +182,6 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
-    w._last_active = {}
     w._innermost_loop_by_node = {}
     w._walk_drivers = {}  # no producer-driven walk transitions here
     w._graph_runtime = _RecordingRuntime()

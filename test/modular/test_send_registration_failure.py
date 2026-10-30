@@ -181,7 +181,6 @@ def _postprocess_worker(refuse, follower=False):
     w.worker_id = "w0"
     w.parallel_nodes = {"llm"} if follower else set()
     w.parallel_leader_nodes = set()
-    w._last_active = {}
     w._innermost_loop_by_node = {}
     w.log = SimpleNamespace(stop_checked=[], routed=[], registered=[], sent=[], conductor=[])
     w.scheduler = SimpleNamespace(failed_rids=set())
@@ -468,11 +467,10 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
     w._in_flight_rids = set()
     w._draining_rids, w._pending_drains, w._reads_done_sent = set(), set(), set()
     w._pending_removes = set()
-    w._last_active = {}
     w.streaming_buffers = {}
     w.tensor_manager = mgr
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, evictable_nodes=lambda: [],
+        remove_request=lambda rid: None,
     )
     w.request_state = SimpleNamespace(remove_request=lambda rid: None)
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)

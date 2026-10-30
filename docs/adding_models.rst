@@ -1447,7 +1447,7 @@ optional. For an autoregressive node, you normally want both. These two mechanis
 the most detailed rules in the submodule interface, so they are described here separately.
 
 **Continuous batching.** The worker's micro-scheduler groups compatible in-flight requests
-into one GPU call. A submodule controls this behavior with three methods:
+into one GPU call. A submodule controls this behavior with these methods:
 
 - ``can_batch(self, batch: ExecutingBatch, model_inputs) -> bool`` returns whether these
   requests can share one forward pass. The default is ``False``, which disables batching.
@@ -1458,6 +1458,19 @@ into one GPU call. A submodule controls this behavior with three methods:
   When a batch runs, the engine calls this method instead of the single-request
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
+- ``step_order(self, graph_walk) -> StepOrder | None`` says who runs first when more rows are
+  ready than ``max_batch_size`` allows. ``StepOrder.ARRIVAL`` is first come, first served to
+  completion: the requests holding the step keep it, then the request that arrived first, so a
+  loop whose output only matters at the end (a denoising loop) finishes each request as early as
+  it can. ``StepOrder.TURNS`` is longest-waiting first: a request that just ran gives way to one
+  that waited, so a node capped at one row advances its requests a step each in rotation, and
+  every stream keeps moving. The default (``None``) takes it from the graph: ``TURNS`` for a node
+  whose passes stream outputs while the request runs, to the client or over a streaming
+  connection to another partition (``Model.streaming_node_walks``), else ``ARRIVAL``. A combined
+  walk takes turns if any of its walks does. The order applies to the rows a speculation chain
+  continues, the backlog and the queued rows alike; when every ready row fits, it doesn't matter.
+  It also sets who is offloaded when an admit runs out of KV pages: under ``TURNS`` the row that
+  ran last, whose next turn is furthest away; under ``ARRIVAL`` the one that has waited longest.
 
 **Combined walks.** By default a step holds one walk. A model lets several walks of a node
 share a step by returning ``{node: {combined_walk: {walks}}}`` from

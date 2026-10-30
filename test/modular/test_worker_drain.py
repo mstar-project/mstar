@@ -64,7 +64,6 @@ def _worker(
             SimpleNamespace(groups=[]) if r in known_rids else None
         ),
     )
-    w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: w.cleared.append(rid),
@@ -81,7 +80,7 @@ def _worker(
         remove_request=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, evictable_nodes=lambda: [],
+        remove_request=lambda rid: None,
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
@@ -404,7 +403,6 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w.worker_id = "w0"
     w._draining_rids = set()
     w._unprocessed_messages = {}
-    w._last_active = {}
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
     w._graph_runtime = SimpleNamespace(
@@ -425,7 +423,6 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     )
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        evictable_nodes=lambda: ["n"],
         add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )
     w.tensor_manager = SimpleNamespace(
@@ -434,6 +431,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w.scheduler = SimpleNamespace(note_arrival=lambda rid: seen.setdefault("scheduler", rid))
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
@@ -443,8 +441,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     handle = w._graph_runtime.get_rid_handle("X")
     assert handle == 1
     assert info.rid_handle == handle
-    assert seen == {"state": handle, "engine": handle, "tensors": handle}
-    assert set(w._last_active) == {(handle, "n")}
+    assert seen == {"state": handle, "scheduler": handle, "engine": handle, "tensors": handle}
 
 
 # ── preprocess worker ───────────────────────────────────────────────────────
