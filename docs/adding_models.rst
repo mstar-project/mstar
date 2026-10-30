@@ -1051,8 +1051,8 @@ placed exactly as weights are.
   ``deferred``: modules called both before the step and in it, whose delta the node adds
   itself where the step's rows are planned (Qwen3.5 embeds a vision prompt's text in
   ``prepare_inputs``): bound as ``lora_deferred``, which the module's forward never adds.
-  ``embeddings=True`` only when every embedding call is in the step, or the embedding is
-  deferred. ``adapter_roots`` / ``aliases`` / ``adapter_stacked_params``: the prefixes,
+  ``embeddings=True`` only when every embedding call is in the step; a deferred
+  embedding is served without it. ``adapter_roots`` / ``aliases`` / ``adapter_stacked_params``: the prefixes,
   names and split projections adapters write, rewritten to the checkpoint's before the
   root's rules place them. ``ignore``: modules an adapter may carry that never run.
 - **Several nodes.** A model whose adapters reach several nodes (an LLM and its vision

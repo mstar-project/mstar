@@ -496,6 +496,15 @@ def test_linked_specs_leave_a_module_to_the_spec_that_places_it():
     assert text.ignored_modules("model.visual.blocks.0.q") and not vision.ignored_modules("model.visual.blocks.0.q")
 
 
+def test_a_deferred_embedding_is_served_without_embeddings():
+    with torch.device("meta"):
+        root = nn.Module()
+        root.embed_tokens = VocabParallelEmbedding(32, HIDDEN)
+        root.fc = nn.Linear(HIDDEN, HIDDEN)
+    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", deferred=["embed_tokens"])
+    assert set(spec.targets) == {"embed_tokens", "fc"} and spec.module_map.deferred == {"embed_tokens"}
+
+
 def test_a_stack_is_a_module_list_whatever_its_name():
     with torch.device("meta"):
         root = nn.Module()

@@ -253,7 +253,7 @@ def module_lora_spec(
       deployment never runs, neither loaded nor refused.
     * ``embeddings``: serve token-embedding targets. Off by default: a node that embeds
       in ``prepare_inputs`` calls the embedding outside its planned step; turn it on when
-      every call is in the step, or list the embedding in ``deferred``.
+      every call is in the step. An embedding listed in ``deferred`` is served either way.
 
     Linear-like modules that cannot take a delta (a depthwise conv, MoE experts) are
     recorded with the reason, which an adapter touching them is refused with, and so are
@@ -302,7 +302,7 @@ def module_lora_spec(
             unservable[path] = capability.reason
             continue
         target = capability.capable.lora_target(module)
-        if target.kind == "embedding" and not embeddings:
+        if target.kind == "embedding" and not embeddings and _match(path, deferred) is None:
             unservable[path] = "a token embedding, which this node does not serve LoRA on"
             continue
         found = _in_stack(path, stacks)
