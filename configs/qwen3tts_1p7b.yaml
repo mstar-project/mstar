@@ -10,9 +10,8 @@ model_kwargs:
   codec_dtype: bfloat16
   # A 4-frame first chunk (320 ms of audio, three Talker steps later): with a
   # 1-frame one (80 ms) the next chunk arrived after the client had played it
-  # under load, the one pause behind the misses near capacity. The 4/8/16
-  # ramp holds 1.000 attainment through 80 req/s on Seed-TTS and 28 on the
-  # passages (H200), for +30-60 ms TTFA.
+  # under load, the one pause behind the misses near capacity. It costs about
+  # 20 ms of first-audio latency on an idle server.
   codec_chunk_schedule: [4, 8, 16]
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
 # kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
