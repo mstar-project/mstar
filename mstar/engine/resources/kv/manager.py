@@ -33,6 +33,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
+from mstar.engine.resources.kv.host_writes import HostWrites
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -104,6 +105,8 @@ class PageArena:
     sealed: list[bool] = field(init=False, repr=False)
     index: PrefixIndex | None = field(default=None, init=False, repr=False)
     trail: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    # queues each page a release leaves to the index alone, for a copy to the host
+    writes: HostWrites | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.num_owners = [0] * self.allocator.max_num_pages
@@ -141,6 +144,8 @@ class PageArena:
                 freed.append(page)
             elif self.num_owners[page] == 1 and self.index is not None:
                 self.index.set_shared(page, False)
+                if self.writes is not None:
+                    self.writes.queue(self.index.key_of(page))
         self.allocator.free(freed)
 
     def copy_pages(self, src: list[int], dst: list[int]) -> None:
@@ -580,10 +585,16 @@ class KVManager(AttentionResource):
             needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
+        # requests whose every stream has been looked up for a copy from the host, with none arriving, so
+        # `_fetch_from_host` returns before reading their streams. Giving one of a request's streams a new chain
+        # takes the request out of the set.
+        self._looked_up: set[str] = set()
         # A copy is listed with `event` None until it is queued, since an event
         # that was never recorded reads as done.
         self._host_copies: list[HostCopy] = []
         self._arriving: dict[bytes, HostCopy] = {}
+        # set once both the prefix cache and the host pool are on
+        self._host_writes: HostWrites | None = None
         if cfg.cpu_offload_pages > 0:
             self._cpu_pool = CPUPagePool(
                 config=cfg, kv_cache=self.kv_cache,
@@ -762,7 +773,13 @@ class KVManager(AttentionResource):
             # The evictable set is counted only at one rank. When the arena reports to the index, `insert`
             # reads owner counts to decide a page's parent, and those counts can differ between ranks.
             self._arena.index = self._index
+        if self._cpu_pool is not None:
+            self._open_host_writes()
         return True
+
+    def _open_host_writes(self) -> None:
+        self._host_writes = HostWrites(self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes)
+        self._arena.writes = self._host_writes
 
     def close_prefix_cache(self) -> None:
         self._index = None
@@ -829,6 +846,7 @@ class KVManager(AttentionResource):
             if self._streams.get(rid, {}).get(label) is not stream:
                 return False
             chain.looked_up = True
+            self._note_looked_up(rid)
             rooted, ends = chain.rooted, chain.rooted_ends
             total = sum(span.length for span in chain.spans)
             # The lock was dropped to hash, so another thread's probe may have taken the lease already.
@@ -1132,11 +1150,26 @@ class KVManager(AttentionResource):
             self._cache_image_end(stream, chain, *ended)
 
     def _evict(self, n: int) -> int:
-        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host."""
-        dropped = self._index.evict(n)
+        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host. Pages still waiting
+        for their copy to the host go last."""
+        writes = self._host_writes
+        dropped = self._index.evict(n, None if writes is None else writes.awaits)
+        if writes is not None:
+            writes.evicted(dropped)
         if self._cpu_pool is not None:
             self._cpu_pool.count_dropped(dropped)
         return len(dropped)
+
+    def after_output_copy(self, step: KVStep) -> None:
+        """Copy up to a step's share of the queued pages to the host. The worker has seen ``step`` finish on the
+        device, so every page queued by its commit or an earlier one is final. Nothing waits on the copy."""
+        writes = self._host_writes
+        if writes is None or not writes.queued:
+            return
+        with self._lock:
+            write = writes.take(step.commits)
+        if write is not None:
+            writes.launch(write, self.kv_cache.tensor, self._lock)
 
     def _cache_image_end(self, stream: CacheStream, chain: PrefixChain, end: int, key: bytes) -> None:
         """Cache the page up to the image's end. When the text after the image changes,
@@ -1156,6 +1189,8 @@ class KVManager(AttentionResource):
             return
         self.kv_cache.copy_slots(stream.page_indices[page], copy[0], end % self.config.page_size)
         self._index.insert(rooted, copy[0], parent)
+        if self._host_writes is not None:
+            self._host_writes.add_image_end(rooted)
         # drop our reference, so the index is the page's one owner and can evict it
         self._arena.release(copy)
 
@@ -1310,6 +1345,7 @@ class KVManager(AttentionResource):
         stream.chain = PrefixChain.seed(
             keys, tail, layout.spans[:layout.keyed_spans], self.config.page_size,
         )
+        self._looked_up.discard(rid)
 
     @property
     def keys_prefix_chains(self) -> bool:
@@ -1755,6 +1791,8 @@ class KVManager(AttentionResource):
         """
         if self._cpu_pool is None or self._index is None or not self._cpu_pool.index.num_pages():
             return None
+        if rid in self._looked_up:
+            return None
         # Readiness is checked for every row on every pass, so return before
         # taking the lock when no stream still needs a lookup or waits on a copy.
         streams = self._streams.get(rid, {})
@@ -1784,6 +1822,7 @@ class KVManager(AttentionResource):
                 # The engine doesn't probe a walk that writes two labels, so no probe would read a copy.
                 # The chain is marked looked up, so later readiness checks return before taking the lock.
                 chain.looked_up = True
+                self._note_looked_up(rid)
                 return None
         self._root_chain(chain)
         with self._lock:
@@ -1810,6 +1849,7 @@ class KVManager(AttentionResource):
                 budget = self._allowance(rid) - sum(page in evictable for page in run)
             host = self._cpu_pool.retain_run(rooted[at:min(cap, at + budget)])
             if not host:
+                self._note_looked_up(rid)
                 return None
             # retained before the grant, whose eviction could drop the run's index-only pages
             held = self._retain_cached(rid, stream, run)
@@ -1828,6 +1868,16 @@ class KVManager(AttentionResource):
         self._cpu_pool.copy_in(self.kv_cache.tensor, PageCopies(gpu=fresh, cpu=host))
         copy.event = self._cpu_pool.record()
         return label
+
+    def _note_looked_up(self, rid: str) -> None:
+        """Add ``rid`` to `_looked_up` once each of its streams has been looked up for a copy from the
+        host and none waits on one. Callers hold the lock."""
+        streams = self._streams.get(rid)
+        if streams and all(
+            (stream.chain is None or stream.chain.looked_up) and stream.host_copy is None
+            for stream in streams.values()
+        ):
+            self._looked_up.add(rid)
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
@@ -1848,6 +1898,9 @@ class KVManager(AttentionResource):
                 self._forget_step_reservations(ctx)
             if self._host_copies:
                 self._land_host_copies()
+            # once a step, never in a readiness check
+            if self._host_writes is not None and self._host_writes.landing:
+                self._host_writes.land()
         if _DEBUG_ASSERTS and not step.commit:
             self._assert_scratch(step, ctx)
         # forks reserve here and copy later (plan for pre-, commit for post-),
@@ -2911,6 +2964,11 @@ class KVManager(AttentionResource):
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
+            writes = self._host_writes
+            if writes is not None:
+                writes.commits += 1
+                # read by `after_output_copy` once the worker has seen this step finish
+                object.__setattr__(step, "commits", writes.commits)
             # committed, so there is nothing left to unwind
             if self._admit_reserved_pages:
                 self._forget_step_reservations(ctx)
@@ -3426,6 +3484,7 @@ class KVManager(AttentionResource):
                     copy.stream.chain.from_host += linked
                 copy.stream.host_copy = None
                 copy.stream.read_pending = copy.stream.read_future is not None
+                self._note_looked_up(copy.rid)
                 landed.append(copy)
             copy.landed = True
         self._host_copies = pending
@@ -3705,6 +3764,7 @@ class KVManager(AttentionResource):
             # unwound against whichever request is given this handle next
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
+            self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
@@ -3824,6 +3884,8 @@ class KVManager(AttentionResource):
                 refs.update(state.cpu_page_indices)
         for copy in self._host_copies:
             refs.update(copy.host_pages)
+        if self._host_writes is not None:
+            refs.update(self._host_writes.host_pages_held())
         counts = {page: host.num_owners[page] for page in owned}
         assert counts == dict(refs), (
             "host owner counts disagree with the index and requests naming the pages: "
@@ -4088,6 +4150,7 @@ class KVManager(AttentionResource):
         if stream.host_copy is not None and stream.host_copy.landed:
             stream.host_copy = None
             stream.read_pending = stream.read_future is not None
+            self._note_looked_up(rid)
         if stream.read_error is not None:
             return False, AdmitRuntimeError(
                 f"KV retrieve for request {rid} label {label!r} failed: {stream.read_error_text}"

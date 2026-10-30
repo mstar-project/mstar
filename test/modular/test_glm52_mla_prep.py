@@ -1,7 +1,7 @@
 """GLM-5.2's fused MLA pre-attention (mla_prep.py) against the unfused ops it replaces, at
 one TP8 rank's dims: FlashInfer's rmsnorm, the position resource's RoPE and the cache scatter
-bit for bit, then a compiled attention layer with ``mla_fused_prep`` on against the same layer
-off."""
+bit for bit, then a compiled attention layer with the fused prep against the same layer
+without it."""
 import copy
 import importlib
 import sys
@@ -172,17 +172,18 @@ def test_kv_write_stops_at_the_planned_tokens():
     assert not torch.equal(cache[pages[:n], offsets[:n]], before[pages[:n], offsets[:n]])
 
 
-# ── the layer: compiled, flag on vs off, through the real MLA cache and attention ──
+# ── the layer: compiled, fused prep vs op by op, through the real MLA cache and attention ──
 
 
-def test_flag_needs_the_absorbed_path_and_supported_widths():
+def test_fused_prep_needs_the_absorbed_path_and_supported_widths():
     cfg = Glm52ModelConfig.reduced()
-    cfg.mla_fused_prep = True
     assert not Glm52MLAAttention(cfg).mla_fused_prep  # naive path, q_lora_rank 48
     cfg.mla_absorb = True
     assert not Glm52MLAAttention(cfg).mla_fused_prep  # q_lora_rank 48
     cfg.q_lora_rank, cfg.kv_lora_rank, cfg.qk_rope_head_dim = 256, 256, 8
     assert Glm52MLAAttention(cfg).mla_fused_prep
+    cfg.kernels = "reference"  # the numerics anchor runs the ops
+    assert not Glm52MLAAttention(cfg).mla_fused_prep
 
 
 def _gpu_resources(cfg, num_pages):
@@ -250,9 +251,9 @@ def test_compiled_layer_with_fused_prep_is_the_unfused_layer_bit_for_bit():
         for norm in (base.q_a_layernorm, base.kv_a_layernorm):
             norm.weight.normal_(1.0, 0.1)
     base.process_weights_after_loading()
+    assert base.mla_fused_prep  # where it runs, the layer takes it
     fused = copy.deepcopy(base)
-    fused.mla_fused_prep = True
-    assert not base.mla_fused_prep
+    base.mla_fused_prep = False
 
     runs = []
     for layer in (base, fused):

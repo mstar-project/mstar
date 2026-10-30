@@ -392,18 +392,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         static = self._build_static(
             [0] * 8, height, width, num_frames=frames, fps=24.0, has_image_condition=False, device=device,
         )
-        row = {
-            "latents": torch.zeros(
+        row = self.transformer.denoise_step_row(
+            static,
+            torch.zeros(
                 self._latent_shape(height, width, frames), device=device,
                 dtype=self.transformer.proj_in.weight.dtype,
             ),
-            "vision_timesteps": torch.zeros(static["num_noisy_vision_tokens"], device=device),
-            "position_ids_cond": static["vision_mrope_ids"],
-            "position_ids_uncond": static["vision_mrope_ids"],
-            "vision_token_shapes": static["vision_token_shapes"],
-            "vision_noisy_frame_indexes": static["vision_noisy_frame_indexes"],
-            "vision_mse_loss_indexes": static["mse_gen_indexes"],
-        }
+            torch.zeros(static["num_noisy_vision_tokens"], device=device),
+            static["rotary"],
+            static["rotary"],
+        )
         t0 = time.perf_counter()
         # as `forward_batched` runs it: native dtype, no autocast
         with torch.autocast(device_type=device.type, enabled=False):
@@ -2094,15 +2092,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # timestep so the shared forward can't index past the schedule, and
             # skip its scheduler step below.
             t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
-            reqs.append({
-                "latents": lat,
-                "vision_timesteps": torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=lat.device),
-                "rotary_cond": st["cond"]["rotary"],
-                "rotary_uncond": st["uncond"]["rotary"],
-                "vision_token_shapes": st["cond"]["vision_token_shapes"],
-                "vision_noisy_frame_indexes": st["cond"]["vision_noisy_frame_indexes"],
-                "vision_mse_loss_indexes": st["cond"]["mse_gen_indexes"],
-            })
+            reqs.append(self.transformer.denoise_step_row(
+                st["cond"],
+                lat,
+                torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=lat.device),
+                st["cond"]["rotary"],
+                st["uncond"]["rotary"],
+            ))
             meta.append((rid, st, lat, ti, t, step_index))
 
         results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
@@ -2147,20 +2143,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # scheduler step below.
             t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
             cond, unc = st["cond"], st["uncond"]
-            reqs.append({
-                "latents": lat,
-                "vision_timesteps": torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=lat.device),
-                "rotary_cond": cond["rotary"],
-                "rotary_uncond": unc["rotary"],
-                "vision_token_shapes": cond["vision_token_shapes"],
-                "vision_noisy_frame_indexes": cond["vision_noisy_frame_indexes"],
-                "vision_mse_loss_indexes": cond["mse_gen_indexes"],
-                "sound_latents": snd,
-                "sound_timesteps": torch.full((st["num_sound"],), t.item(), device=lat.device),
-                "sound_token_shapes": cond["sound_token_shapes"],
-                "sound_noisy_frame_indexes": cond["sound_noisy_frame_indexes"],
-                "sound_mse_gen_indexes": cond["sound_mse_gen_indexes"],
-            })
+            reqs.append(self.transformer.denoise_step_row(
+                cond,
+                lat,
+                torch.full((cond["num_noisy_vision_tokens"],), t.item(), device=lat.device),
+                cond["rotary"],
+                unc["rotary"],
+                sound_latents=snd,
+                sound_timesteps=torch.full((st["num_sound"],), t.item(), device=lat.device),
+            ))
             meta.append((rid, st, lat, snd, ti, t))
 
         results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
@@ -2487,16 +2478,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
         reqs = [
-            {
-                "latents": latents[i],
-                "vision_timesteps": vision_timesteps[i],
-                "rotary_cond": (cos_cond[i], sin_cond[i]),
-                "rotary_uncond": (cos_uncond[i], sin_uncond[i]),
-                "vision_token_shapes": layout["vision_token_shapes"],
-                "vision_noisy_frame_indexes": layout["vision_noisy_frame_indexes"],
-                "vision_mse_loss_indexes": layout["mse_gen_indexes"],
-                "noisy_token_mask": noisy_token_mask[i],
-            }
+            self.transformer.denoise_step_row(
+                layout,
+                latents[i],
+                vision_timesteps[i],
+                (cos_cond[i], sin_cond[i]),
+                (cos_uncond[i], sin_uncond[i]),
+                noisy_token_mask=noisy_token_mask[i],
+            )
             for i in range(latents.shape[0])
         ]
         results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)

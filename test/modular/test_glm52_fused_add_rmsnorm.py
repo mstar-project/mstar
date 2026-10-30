@@ -1,5 +1,5 @@
-"""GLM-5.2 with each all-reduce fused into the next add + RMSNorm: the layers carry
-(partial, residual) and emit what the unfused layers emit."""
+"""GLM-5.2 with each all-reduce fused into the next add + RMSNorm (kernels: auto): the
+layers carry (partial, residual) and emit what the unfused layers (the reference) emit."""
 from __future__ import annotations
 
 import copy
@@ -29,10 +29,18 @@ from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 
-def _fused(cfg: Glm52ModelConfig) -> Glm52ModelConfig:
+def _kernels(cfg: Glm52ModelConfig, kernels: str) -> Glm52ModelConfig:
     cfg = copy.deepcopy(cfg)
-    cfg.fused_add_rmsnorm = True
+    cfg.kernels = kernels
     return cfg
+
+
+def _fused(cfg: Glm52ModelConfig) -> Glm52ModelConfig:
+    return _kernels(cfg, "auto")
+
+
+def _plain(cfg: Glm52ModelConfig) -> Glm52ModelConfig:
+    return _kernels(cfg, "reference")
 
 
 class _FusingGroup(_RecordingGroup):
@@ -65,14 +73,15 @@ def _model(cfg, comm_group=None, seed=0) -> Glm52ForCausalLM:
     return model.eval()
 
 
-def _run(cfg, comm_group, prompts):
-    """Each request's emitted tokens and every hidden state lm_head saw."""
+def _run(cfg, comm_group, prompts, sub_cfg=None):
+    """Each request's emitted tokens and every hidden state lm_head saw. ``sub_cfg``: the
+    submodule's config where it differs from the model's (it picks the prefill rows)."""
     model = _model(cfg, comm_group)
     seen = []
     model.lm_head.register_forward_hook(lambda m, args, out: seen.append(args[0].clone()))
     tokens = {}
     for rid, prompt in prompts.items():
-        sub = Glm52LLMSubmodule(model, cfg)
+        sub = Glm52LLMSubmodule(model, sub_cfg or cfg)
         tokens[rid] = _drive(_Driver(sub, cfg, [rid]), prompt, _fwd_info(rid, 10, True))
     return model, tokens, seen
 
@@ -80,12 +89,14 @@ def _run(cfg, comm_group, prompts):
 @pytest.mark.parametrize("mla_absorb", [True, False], ids=["absorbed", "naive"])
 @pytest.mark.parametrize("last_layer_rows", [False, True])
 def test_fused_wiring_emits_what_the_unfused_does(mla_absorb, last_layer_rows):
+    """Both models prefill the same rows: the submodule's kernels pick them, the model's the
+    wiring."""
     cfg = _cfg(mla_absorb)
-    cfg.prefill_last_layer_rows = last_layer_rows
+    rows_cfg = _fused(cfg) if last_layer_rows else _plain(cfg)
     prompts = {"a": torch.arange(5, dtype=torch.long) + 3,
                "b": torch.arange(3, dtype=torch.long) + 9}
-    plain, plain_tokens, plain_seen = _run(cfg, None, prompts)
-    fused, fused_tokens, fused_seen = _run(_fused(cfg), None, prompts)
+    plain, plain_tokens, plain_seen = _run(_plain(cfg), None, prompts, rows_cfg)
+    fused, fused_tokens, fused_seen = _run(_fused(cfg), None, prompts, rows_cfg)
     assert not plain.model.fused_add_rmsnorm and fused.model.fused_add_rmsnorm
     assert len(set(plain_tokens["a"].tolist())) > 3  # a real stream
     # one rank: the same adds and norms in the same order, so the same bits
@@ -110,16 +121,15 @@ def test_fused_wiring_leaves_the_row_parallel_outputs_partial():
         else:
             assert not mlp.down_proj.reduce_results
     assert len(kinds) == 2  # dense and MoE layers
-    plain = Glm52ForCausalLM(cfg)
+    plain = Glm52ForCausalLM(_plain(cfg))
     assert all(layer.self_attn.o_proj.reduce_results for layer in plain.model.layers)
 
 
 def test_moe_partial_is_what_the_fused_allreduce_block_reduces():
     """reduce_results=False: no collective in the block, and the returned partial is the
-    routed + shared sum a moe_fused_allreduce block hands its one all-reduce."""
+    routed + shared sum a kernels: auto block hands its one all-reduce."""
     torch.manual_seed(3)
     cfg = Glm52ModelConfig.reduced()
-    cfg.moe_fused_allreduce = True
     g_reduce, g_partial = _RecordingGroup(), _RecordingGroup()
     reducing = Glm52SparseMoeBlock(cfg, comm_group=g_reduce)
     partial = Glm52SparseMoeBlock(cfg, comm_group=g_partial, reduce_results=False)
@@ -147,6 +157,7 @@ def test_dense_mlp_partial_skips_the_reduce():
 def test_norms_reduce_through_the_group_under_tp():
     cfg = _fused(_cfg(True))
     group = _FusingGroup()
-    _, tokens, seen = _run(cfg, group, {"a": torch.arange(5, dtype=torch.long) + 3})
+    # every prefill row through the last layer (the reference's rows), so each step fuses alike
+    _, tokens, seen = _run(cfg, group, {"a": torch.arange(5, dtype=torch.long) + 3}, _plain(cfg))
     # per forward: each layer's second norm, each later layer's first, and the final one
     assert group.fused == 2 * cfg.num_hidden_layers * len(seen) > 0
