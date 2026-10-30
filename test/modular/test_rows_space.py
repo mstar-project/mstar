@@ -145,3 +145,12 @@ def test_a_join_left_unwritten_is_refused():
     rows.write(lens, rows.diff.join_slots, np.array([3], np.int32))
     with pytest.raises(RuntimeError, match="other"):
         rows.stage()
+
+
+def test_copy_in_refuses_a_mirrored_buffer():
+    """Its mirror, the truth for the host, would not see the rows."""
+    space = RowSpace(4, torch.device("cpu"))
+    buf = space.buffer("x", (), torch.int32)
+    rows = space.propose([5])
+    with pytest.raises(ValueError, match="mirrored"):
+        rows.copy_in(buf, rows.diff.join_slots, torch.zeros(8, dtype=torch.int32), np.array([5]))
