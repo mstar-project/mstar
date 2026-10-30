@@ -114,11 +114,10 @@ class StepRunner:
         ]
         self._node_cap_order = self._per_node(node_resources, self._cap_order)
         self._node_trail_order = self._per_node(node_resources, self._trail_order)
-        self._after_output_copy_order = [
+        self._after_output_copy_keys = frozenset(
             key for key in self._order
             if type(self._resources[key]).after_output_copy is not Resource.after_output_copy
-        ]
-        self._node_after_output_copy_order = self._per_node(node_resources, self._after_output_copy_order)
+        )
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -245,9 +244,10 @@ class StepRunner:
                         walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
                     )
 
-    def after_output_copy(self, node_name: str) -> None:
-        for key in self._sweep(self._node_after_output_copy_order, self._after_output_copy_order, node_name):
-            self._resources[key].after_output_copy()
+    def after_output_copy(self, step: SubmoduleStep) -> None:
+        for key in self._keys_for(step):
+            if key in self._after_output_copy_keys:
+                self._resources[key].after_output_copy(step.get(key))
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Tell the node's resources that the cache served this walk whole."""

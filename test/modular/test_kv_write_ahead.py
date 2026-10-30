@@ -10,7 +10,6 @@ another request's bytes.
 from __future__ import annotations
 
 import sys
-from collections import OrderedDict
 
 sys.path.insert(0, ".")
 
@@ -34,7 +33,7 @@ from test_kv_host_index import (
     _serve,
     _stub_transfer,  # noqa: F401
 )
-from test_kv_prefix_offload import _step
+from test_kv_prefix_offload import _commit, _step
 
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.manager import KVManager
@@ -89,7 +88,43 @@ def test_a_page_with_a_held_page_below_it_is_copied_once_only_the_index_holds_it
     kv.remove_request("a")
     _step(kv)
 
-    assert kv._cpu_pool.written_out == raced, "a page b's held pages hang under was never copied"
+    # the seed's prefix goes first, so the raced pages land on the host under it
+    assert kv._cpu_pool.written_out == _pages(kv, "seed")[:4] + raced, (
+        "a page b's held pages hang under was never copied"
+    )
+
+
+def test_a_page_lands_on_the_host_under_a_prefix_another_request_still_holds():
+    kv = _manager()
+    _serve(kv, "b", SHARED + list(range(300, 300 + 2 * PAGE_SIZE)) + [1])
+    prompt = SHARED + list(range(100, 100 + 2 * PAGE_SIZE))
+    _serve(kv, "a", prompt + [1, 2])
+    pages = _pages(kv, "a")[:6]
+    keys = kv._streams["a"]["main"].chain.rooted[:6]
+    kv.remove_request("a")
+    _step(kv)
+    assert kv._cpu_pool.written_out == pages, "a's pages were copied before the prefix b holds"
+    _land(kv)
+
+    host = kv._cpu_pool.index
+    parents = [host.parent_key(host.page_for(key)) for key in keys]
+    assert parents == [None, *keys[:5]], "a page landed on the host with no parent while its prefix was cached"
+
+
+def test_a_write_never_evicts_the_host_page_its_pages_land_under():
+    kv = _manager(host_pages=5)
+    shared = _cached(kv, "a", SHARED)
+    _land(kv)
+    _serve(kv, "c", SHARED + list(range(100, 100 + 2 * PAGE_SIZE)) + [1, 2])
+    own = kv._streams["c"]["main"].chain.rooted[4:6]
+    kv.remove_request("c")
+    # one host page is free, and the shared prefix's last page is the host's only leaf
+    _step(kv)
+    _land(kv)
+
+    host = kv._cpu_pool.index
+    assert host.page_for(shared[-1]) is not None, "a write evicted the host page its first page lands under"
+    assert host.parent_key(host.page_for(own[0])) == shared[-1]
 
 
 def test_a_key_on_the_host_or_on_its_way_there_is_not_copied_again():
@@ -162,7 +197,7 @@ def test_writes_land_once_a_step_and_never_in_a_readiness_check(monkeypatch):
 
 def test_a_step_writes_at_most_its_share_and_the_rest_waits_for_later_steps():
     kv = _manager()
-    kv._writes_per_step = 2
+    kv._host_writes._per_step = 2
     _serve(kv, "a", A_PROMPT + [1, 2])
     pages = _pages(kv, "a")[:6]
     kv.remove_request("a")
@@ -174,40 +209,37 @@ def test_a_step_writes_at_most_its_share_and_the_rest_waits_for_later_steps():
     assert kv._cpu_pool.written_out == pages[:4], "the pages over a step's share didn't wait for the next step"
 
 
-def test_a_page_is_copied_only_once_the_commit_that_indexed_it_has_run():
+def test_a_page_is_copied_only_once_a_step_committed_after_it_has_finished():
     kv = _manager()
     _cached(kv, "x", C_PROMPT)
     written = len(kv._cpu_pool.written_out)
+    earlier = _commit(kv)
     _serve(kv, "a", A_PROMPT + [1, 2])
     kv.remove_request("a")
-    kv.after_output_copy()
-    assert len(kv._cpu_pool.written_out) == written, "a page was copied behind a commit that ran before its own"
-    commit = _Event()
-    kv._cpu_pool.record_compute = lambda: commit
+
+    kv.after_output_copy(earlier)
+    assert len(kv._cpu_pool.written_out) == written, "a page was copied once a step committed before it finished"
     _step(kv)
-    assert len(kv._cpu_pool.written_out) == written, "a page was copied before its commit had run"
 
-    commit.done = True
-    kv.after_output_copy()
-
-    assert len(kv._cpu_pool.written_out) == written + 6
+    assert len(kv._cpu_pool.written_out) == written + 6, "the pages waited past the step committed after them"
 
 
 def test_a_queued_key_released_again_keeps_its_place_and_its_commit():
     kv = _manager()
-    kv._writes_per_step = 1
+    kv._host_writes._per_step = 1
     _serve(kv, "a", A_PROMPT + [1, 2])
     pages = _pages(kv, "a")[:6]
     kv.remove_request("a")
-    _step(kv)
-    kv._cpu_pool.record_compute = _Event
-    _step(kv)
+    step = _commit(kv)
+    kv.after_output_copy(step)
+    kv.after_output_copy(step)
     assert kv._cpu_pool.written_out == pages[:2]
-    # b leases the queued pages and drops them after a commit the device hasn't run yet
+    # b leases the queued pages and drops them after a commit the device hasn't finished
     _probe(kv, "b", A_PROMPT + [7])
+    _commit(kv)
     kv.remove_request("b")
 
-    kv.after_output_copy()
+    kv.after_output_copy(step)
 
     assert kv._cpu_pool.written_out == pages[:3], "a key released again waited for the newest commit"
 
@@ -215,9 +247,9 @@ def test_a_queued_key_released_again_keeps_its_place_and_its_commit():
 def test_a_copy_from_the_host_that_lands_is_not_copied_back():
     kv = _manager()
     _serve(kv, "a", A_PROMPT + [1, 2])
-    kv._arena.pending = None
+    kv._arena.writes = None
     assert kv.offload("a") > 0
-    kv._arena.pending = OrderedDict()
+    kv._arena.writes = kv._host_writes
     kv._evict(6)
     _ingest(kv, "b", A_PROMPT + [7, 8])
     assert not _ready(kv, "b")
@@ -230,10 +262,10 @@ def test_a_copy_from_the_host_that_lands_is_not_copied_back():
 
 def test_a_pending_page_evicted_and_reused_before_the_drain_copies_nothing():
     kv = _manager(max_num_pages=16)
-    kv._arena.pending = None
+    kv._arena.writes = None
     _cached(kv, "a", B_PROMPT)
-    kv._arena.pending = OrderedDict()
-    # a lease dropped at prepare puts the pages' keys in `pending`, and no `after_output_copy` runs
+    kv._arena.writes = kv._host_writes
+    # a lease dropped at prepare queues the pages' keys, and no `after_output_copy` runs
     # before the hog evicts them
     _ingest(kv, "b", B_PROMPT + [7])
     inputs = ARNodeInputs(input_seq_len=len(B_PROMPT) + 1)
@@ -249,7 +281,7 @@ def test_a_pending_page_evicted_and_reused_before_the_drain_copies_nothing():
     kv.assert_pages_conserved()
 
 
-def test_a_copier_that_raises_files_nothing_and_frees_its_host_pages():
+def test_a_copier_that_raises_fails_no_request_files_nothing_and_frees_its_host_pages():
     kv = _manager()
 
     def fails(gpu_kv_cache, copies):
@@ -259,8 +291,7 @@ def test_a_copier_that_raises_files_nothing_and_frees_its_host_pages():
     _serve(kv, "a", A_PROMPT + [1, 2])
     keys = kv._streams["a"]["main"].chain.rooted[:6]
     kv.remove_request("a")
-    with pytest.raises(RuntimeError, match="copy failed"):
-        _step(kv)
+    _step(kv)
     assert kv._cpu_pool.arena.num_free == 58, "the host pages went back before the copies that write them landed"
     _land(kv)
 
@@ -272,7 +303,7 @@ def test_a_full_host_evicts_cached_pages_for_a_write_and_never_an_offloaded_requ
     _offloaded(kv, "x")
     held = list(_host_pages(kv, "x"))
     keys = _cached(kv, "a", C_PROMPT)
-    assert _host_pages(kv, "x") == held and kv._arena.pending == {}, "the drain took x's host pages"
+    assert _host_pages(kv, "x") == held and kv._host_writes.queued == {}, "the drain took x's host pages"
     _land(kv)
     assert _on_host(kv, keys) == 1, "a key with no host page left was copied"
 
@@ -284,10 +315,10 @@ def test_a_full_host_evicts_cached_pages_for_a_write_and_never_an_offloaded_requ
 def test_a_heads_host_run_survives_a_drain_while_its_copy_is_in_flight():
     kv = _manager(host_pages=7)
     _serve(kv, "a", A_PROMPT + [1, 2])
-    kv._arena.pending = None
+    kv._arena.writes = None
     assert kv.offload("a") > 0
     kv.remove_request("a")
-    kv._arena.pending = OrderedDict()
+    kv._arena.writes = kv._host_writes
     kv._evict(6)
     # `after_output_copy` needs host pages, and only a's cached prefix could give them
     _serve(kv, "c", B_PROMPT + [1, 2])
@@ -323,7 +354,7 @@ def test_a_request_removed_while_its_pages_are_copied_leaks_nothing(monkeypatch)
     _step(kv)
     _land(kv)
 
-    assert kv._writing == {} and kv._host_copies == []
+    assert kv._host_writes._writing == {} and kv._host_writes._in_flight == []
     kv.assert_pages_conserved()
 
 
@@ -336,7 +367,7 @@ def test_a_key_written_again_after_a_cancelled_write_is_cancelled_by_its_next_ev
     assert len(kv._cpu_pool.written_out) == 12, "a key whose write was cancelled was not written again"
     first.done = True
     with kv._lock:
-        kv._land_host_copies()
+        kv._host_writes.land()
 
     kv._evict(6)
     _land(kv)
@@ -354,7 +385,7 @@ def test_eviction_takes_pages_still_waiting_for_their_copy_last():
     _land(kv)
     # e's write is issued and never lands, and c's is never issued
     writing = _cached(kv, "e", list(range(800, 800 + 6 * PAGE_SIZE)))
-    kv._writes_per_step = 0
+    kv._host_writes._per_step = 0
     waiting = _cached(kv, "c", C_PROMPT)
     # b's hit makes the pages of a's prefix the newest, and b's release queues those pages' keys again
     _serve(kv, "b", B_PROMPT + [7, 8])

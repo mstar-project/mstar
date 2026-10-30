@@ -295,6 +295,8 @@ class ExecutingBatch:
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
     step: SubmoduleStep | None = None
+    # the step the batch committed last: a batch run row by row commits once per row
+    committed: SubmoduleStep | None = None
 
     # {request_id: {input_name: [tensor]}}, what prepare_inputs reads
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
@@ -1130,7 +1132,8 @@ class Engine:
         return mgmt.submodule.device_loopback_signals(graph_walk)
 
     def after_output_copy(self, batch: ExecutingBatch) -> None:
-        self._runner.after_output_copy(batch.node_name)
+        if batch.committed is not None:
+            self._runner.after_output_copy(batch.committed)
 
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
@@ -1739,6 +1742,7 @@ class Engine:
             t0 = phase_start()
             try:
                 self._runner.commit(step)
+                batch.committed = step
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:

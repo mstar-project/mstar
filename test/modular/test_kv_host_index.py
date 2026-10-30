@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from collections import OrderedDict
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -59,10 +58,6 @@ class _HostPool(CPUPagePool):
     def write(self, gpu_kv_cache, copies):
         self.written_out.extend(copies.gpu)
 
-    def record_compute(self):
-        # the steps run as soon as they are queued
-        return SimpleNamespace(query=lambda: True)
-
     def record(self):
         self.events.append(_Event())
         return self.events[-1]
@@ -96,8 +91,8 @@ def _manager(max_num_pages: int = 128, host_pages: int = 64) -> KVManager:
     )
     kv.enable_prefix_cache(ROOT)
     kv._cpu_pool = _HostPool(host_pages)
-    # `enable_prefix_cache` opens `pending` only when the host pool exists, and the stub comes after it
-    kv._arena.pending = OrderedDict()
+    # `enable_prefix_cache` opens the writes only when the host pool exists, and the stub comes after it
+    kv._open_host_writes()
     return kv
 
 
@@ -273,6 +268,7 @@ def _land(kv: KVManager) -> None:
     kv._cpu_pool.land()
     with kv._lock:
         kv._land_host_copies()
+        kv._host_writes.land()
 
 
 def test_a_prefix_on_the_host_is_copied_back_before_the_request_runs():

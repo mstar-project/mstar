@@ -364,16 +364,23 @@ def test_copies_by_key_do_not_block_the_host():
     assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on an offload and reload by key"
 
 
+def _commit(kv: KVManager) -> KVStep:
+    """A step's commit, as the engine runs it."""
+    step = KVStep(segments=())
+    kv.commit(step, StepContext(request_ids=(), graph_walk=WALK, slot=0, capture=False))
+    return step
+
+
 def _step(kv: KVManager) -> None:
-    """A step's commit and then its outputs on the host, as the worker runs them."""
-    kv.commit(KVStep(segments=()), StepContext(request_ids=(), graph_walk=WALK, slot=0, capture=False))
-    kv.after_output_copy()
+    """A step's commit, then its outputs on the host once the worker has seen the step finish."""
+    kv.after_output_copy(_commit(kv))
 
 
 def _land(kv: KVManager) -> None:
     torch.cuda.synchronize()
     with kv._lock:
         kv._land_host_copies()
+        kv._host_writes.land()
 
 
 @requires_cuda
@@ -392,10 +399,10 @@ def test_every_page_written_ahead_comes_back_byte_for_byte(layout):
     for i, page in enumerate(pages):
         kv.kv_cache.tensor[:, page] = 1.0 + i
     kv.remove_request("a")
-    _step(kv)
-    assert kv._writing == {}, "a drain copied pages before the commit after them had run"
+    step = _commit(kv)
+    # the worker waits on the step's completion event before the hook runs
     torch.cuda.synchronize()
-    kv.after_output_copy()
+    kv.after_output_copy(step)
     _land(kv)
     assert kv._evict(6) == 6
     _scribble_free(kv)
@@ -447,8 +454,4 @@ def test_a_write_ahead_does_not_block_the_host():
     _step(kv)
     elapsed = time.perf_counter() - start
     assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on a write ahead of eviction"
-
-    torch.cuda.synchronize()
-    kv.after_output_copy()
-
-    assert len(kv._writing) == 6, "the drain queued no write once the commit had run"
+    assert len(kv._host_writes._writing) == 6, "the step queued no write"
