@@ -25,6 +25,7 @@ from mstar.streaming.topology import Connection, PartitionTopology, ProducerWalk
 from mstar.utils.ipc_format import WorkerGraphsDone
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
@@ -160,20 +161,19 @@ def _fwd(walk, partition="Talker"):
     )
 
 
-def _worker(idle=True):
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w._draining_rids = set()
-    w._walk_driven_edges = {"thinker_states": "Talker"}
-    w.request_state = RequestStateManager(node_to_partition={"Talker": "Talker"})
-    w.request_state.add_request(0, _fwd("talker_prefill"))
-    w.walks = []
-    w._graph_runtime = SimpleNamespace(
-        get_rid_handle=lambda rid: 0,
+def _streams(idle=True):
+    request_state = RequestStateManager(node_to_partition={"Talker": "Talker"})
+    request_state.add_request(0, _fwd("talker_prefill"))
+    walks = []
+    runtime = SimpleNamespace(
         is_partition_idle=lambda rid, partition: idle,
-        set_walk=lambda rid, partition, walk: w.walks.append(walk),
+        set_walk=lambda rid, partition, walk: walks.append(walk),
     )
-    return w
+    streams = StreamBufferManager(
+        request_state, None, [], graph_runtime=runtime,
+        walk_driven_edges={"thinker_states": "Talker"},
+    )
+    return streams, request_state, walks
 
 
 @pytest.mark.parametrize("idle, allow, switched", [
@@ -182,20 +182,20 @@ def _worker(idle=True):
     (True, False, False),   # speculation: the step was built for this walk
 ])
 def test_a_chunk_for_another_walk_switches_only_an_idle_partition(idle, allow, switched):
-    w = _worker(idle=idle)
+    streams, request_state, _ = _streams(idle=idle)
     sbuf = _buffer()
     _feed(sbuf, ["talker_last_prefill"])
-    assert w._enter_chunk_walk(sbuf, "thinker_states", 0, allow) is switched
-    walk = w.request_state.get_fwd_info(0, "Talker").graph_walk
+    assert streams._enter_chunk_walk(sbuf, "thinker_states", 0, allow) is switched
+    walk = request_state.get_fwd_info(0, "Talker").graph_walk
     assert walk == ("talker_last_prefill" if switched else "talker_prefill")
 
 
 def test_a_chunk_for_the_current_walk_needs_no_switch():
-    w = _worker(idle=False)
+    streams, _, walks = _streams(idle=False)
     sbuf = _buffer()
     _feed(sbuf, ["talker_prefill"])
-    assert w._enter_chunk_walk(sbuf, "thinker_states", 0, allow_walk_change=False)
-    assert w.walks == []
+    assert streams._enter_chunk_walk(sbuf, "thinker_states", 0, allow_walk_change=False)
+    assert walks == []
 
 
 # --- producer ----------------------------------------------------------------

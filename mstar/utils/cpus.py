@@ -160,6 +160,13 @@ class CpuPlan:
         CPUs left."""
         return max(1, min(4, self.left // self.png_threads))
 
+    @property
+    def copy_workers(self) -> int:
+        """Threads a large output read copies over (``host_copy.HostCopier``):
+        one encode's share of the CPUs left. Reads run one at a time on the
+        data worker's thread, each ahead of its own encode."""
+        return max(1, self.left // self.encode_workers)
+
 
 _plan: CpuPlan | None = None
 
