@@ -1176,13 +1176,13 @@ class Worker:
 
     def _preempt(self, node_batch: ExecutingBatch) -> bool:
         """`KVManager.preempt` chooses victims for the request that hit KV OOM. Move each victim to the host or
-        drop it, now or once its step lands, and return True. Return False, so the offload and the hold
-        run, when the failed resource isn't a paged KV cache, when no request on the node keeps ids and the
-        cache has no host pool or isn't the node's only one, or when `KVManager.preempt` returns None."""
+        drop it, now or once its step lands, and return True. Return False, so the offload and the hold run,
+        when the failed resource isn't a paged KV cache, when the node rebuilds no request here and the cache
+        has no host pool or isn't the node's only one, or when `KVManager.preempt` returns None."""
         kv = self._kv_caches.get(node_batch.failed_resource)
         node_name = node_batch.node_name
         if kv is None or not (
-            self._rebuilds.keeps_any(node_name) or (kv.cache.supports_eviction and self._kv_keys[node_name] == [kv.key])
+            node_name in self._rebuilds.nodes or (kv.cache.supports_eviction and self._kv_keys[node_name] == [kv.key])
         ):
             return False
         reason, engine = node_batch.admit_error, self.engine_manager.get_engine(node_batch.node_name)

@@ -2906,9 +2906,9 @@ class Engine:
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down on every resource. Returns the resources it
-        held pages of that the teardown hands back, which `reclaimable` counts:
-        a KV cache whose pages reach the free list or are left to the prefix
-        index alone. An offloaded request, or one that never ran, frees none."""
+        held pages of that the teardown hands back, which `frees_on_remove`
+        counts: a KV cache whose pages reach the free list or are left to the
+        prefix index alone. An offloaded request, or one that never ran, frees none."""
         if self._resident_delta:
             wire_rid = self._graph_runtime.get_rid_string(request_id)
             for journal in self._resident_delta.values():
@@ -2916,7 +2916,7 @@ class Engine:
         self._loopback_steps.pop(request_id, None)
         freed = {
             key for key, resource in self._resources.items()
-            if resource.reclaimable(request_id)
+            if resource.frees_on_remove(request_id)
         }
         self._runner.remove_request(request_id)
         for submodule_mgmt in self._submodules.values():
