@@ -25,10 +25,12 @@ OWN_MARKER = "amd-bench"
 OWN_MARKERS = {OWN_MARKER, "ws-j"}
 # (summary key, header, scale, decimals) per family; the workload's primary metric also gets [min-max].
 COLUMNS = {
-    "text": [("tok_s", "out tok/s", 1, 0), ("ttft_p50_s", "TTFT p50 ms", 1e3, 1), ("ttft_p95_s", "TTFT p95 ms", 1e3, 1),
-             ("itl_p50_s", "ITL p50 ms", 1e3, 2), ("tpot_p50_s", "TPOT p50 ms", 1e3, 2),
+    "text": [("tok_s", "out tok/s", 1, 0), ("chunks_s", "chunks/s", 1, 0), ("ttft_p50_s", "TTFT p50 ms", 1e3, 1),
+             ("ttft_p95_s", "TTFT p95 ms", 1e3, 1), ("tpot_p50_s", "TPOT p50 ms (wall/token)", 1e3, 2),
+             ("itl_p50_s", "ITL p50 ms (one-token chunks only)", 1e3, 2),
+             ("chunk_gap_p50_s", "chunk gap p50 ms", 1e3, 2),
              ("e2e_p50_s", "E2E p50 s", 1, 2), ("out_tokens_per_req", "out tok/req", 1, 1),
-             ("in_tokens_per_req", "in tok/req", 1, 0)],
+             ("tokens_per_chunk", "tok/chunk", 1, 2), ("in_tokens_per_req", "in tok/req", 1, 0)],
     "tts": [("audio_s_per_s", "audio s/s", 1, 1), ("ttfa_p50_s", "TTFA p50 ms", 1e3, 1),
             ("ttfa_p95_s", "TTFA p95 ms", 1e3, 1), ("rtf_p50", "RTF p50", 1, 3),
             ("audio_s_per_req", "audio s/req", 1, 2), ("req_s", "req/s", 1, 2)],
@@ -198,7 +200,8 @@ def render(data: dict) -> str:
               f"GPUs {meta.get('gpus')}, lanes {meta.get('lanes')}, NUMA binding {meta.get('numa')}",
               f"- timed runs per cell after warmup: {meta.get('repeats')}. A cell over "
               f"{(meta.get('spread_limit') or 0):.0%} spread is re-run once. tok/s counts at most the requested "
-              "output length per request."]
+              "output length per request. Text tokens come from the server's usage count or, without one, the "
+              "re-tokenized output; chunks are counted apart."]
     if meta.get("note"):
         lines.append(f"- {meta['note']}")
     lines += [f"- note: {n}" for n in data.get("notes") or []]

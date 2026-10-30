@@ -16,7 +16,7 @@ import aiohttp
 import numpy as np
 
 from benchmark.base import Bagel, Chatterbox, DiffusionModel, Kokoro, Model, Orpheus, Qwen3TTS, RequestType, Status
-from benchmark.utils import _write_wav
+from benchmark.utils import _write_wav, clearly_multi_token
 
 
 @dataclass
@@ -86,24 +86,27 @@ class RequestMetrics:
     ttft: dict[str, float] = field(default_factory=dict)
 
     # Per-modality monotonic timestamps for every received chunk.
-    # Used to derive inter-chunk gaps and (for text) per-token-normalised ITL.
+    # Used to derive inter-chunk gaps and (for one-token-per-chunk text) ITL.
     chunk_arrivals: dict[str, list[float]] = field(default_factory=dict)
 
     e2e_latency: Optional[float] = None
     error: Optional[str] = None
 
     # Per-modality count of server-emitted framing units (one per record_token
-    # call). For text these are SSE / NDJSON messages, NOT tokens —
-    # vllm-omni and OurSystem emit one token per chunk while sglang-omni
-    # chunk-bursts ~5 tokens per message. For the actual text-token count use
-    # `output_text_tokens` (set from `usage.completion_tokens`).
+    # call). For text these are SSE / NDJSON messages, NOT tokens: most servers
+    # emit one token per chunk, sglang-omni bursts ~5 per message and a
+    # speculative mstar step 1..k+1. The text-token count is `output_text_tokens`.
     response_chunks: dict[str, int] = field(default_factory=dict)
     # Per-modality byte counts (raw bytes received)
     output_bytes: dict[str, int] = field(default_factory=dict)
-    # Text token count. Per-chunk increments accumulate while streaming and are
-    # overwritten by `usage.completion_tokens` from the final SSE chunk for
-    # vllm-omni / sglang-omni (see Fix 3).
+    # Text token count. One per chunk while streaming; `finalize_text_tokens` then
+    # sets it from `usage.completion_tokens` or the tokenizer.
     output_text_tokens: int = 0
+    # Where the count came from: "usage", "tokenizer", "chunks" (the tokenizer agrees
+    # with one token per chunk) or "unchecked" (no tokenizer to ask).
+    text_token_source: str = "unchecked"
+    # The server's own count, when it sent a nonzero one.
+    _usage_completion_tokens: Optional[int] = field(default=None, repr=False)
     # Prompt-token count from `usage.prompt_tokens` when emitted by the server.
     input_tokens: int = 0
 
@@ -220,6 +223,35 @@ class RequestMetrics:
         """Accumulate decoded token count for the text modality."""
         self.output_text_tokens += n_tokens
 
+    def record_usage(self, usage: Optional[dict]) -> None:
+        """Keep an OpenAI-style usage block's counts. Audio chunks and mstar's non-streaming
+        chat replies carry ``completion_tokens=0``, which says nothing about the text."""
+        if not usage:
+            return
+        if usage.get("completion_tokens"):
+            self._usage_completion_tokens = usage["completion_tokens"]
+        if (pt := usage.get("prompt_tokens")) is not None:
+            self.input_tokens = pt
+
+    def finalize_text_tokens(self, tokenizer=None) -> None:
+        """Set ``output_text_tokens`` to the generated count, once per request after the timed window:
+        the server's usage count if it sent one, else the joined text re-tokenized."""
+        if self._usage_completion_tokens is not None:
+            self.output_text_tokens, self.text_token_source = self._usage_completion_tokens, "usage"
+            return
+        chunks = self.response_chunks.get("text", 0)
+        if not chunks or tokenizer is None:
+            return
+        text = b"".join(self._text_chunks).decode("utf-8", errors="replace")
+        try:
+            tokens = len(tokenizer.encode(text, add_special_tokens=False))
+        except Exception:
+            return
+        if clearly_multi_token(tokens, chunks):
+            self.output_text_tokens, self.text_token_source = tokens, "tokenizer"
+        else:
+            self.output_text_tokens, self.text_token_source = chunks, "chunks"
+
     def record_completion(self):
         """
         Finalise timing and assemble output_content from buffered chunks.
@@ -329,42 +361,12 @@ class RequestMetrics:
             out[modality] = [arrivals[i + 1] - arrivals[i] for i in range(len(arrivals) - 1)]
         return out
 
-    def itl_per_token_text(self, tokenizer=None) -> Optional[list[float]]:
-        """Per-token-normalised inter-token latency for the text modality.
-
-        Mirrors sglang.bench_serving's `--accept-length` path: re-tokenize each
-        chunk individually, divide that chunk's gap by its actual token count,
-        then replicate the result by the token count so percentiles are
-        weighted by tokens (not by chunks). This makes sglang-omni's
-        chunk-bursting comparable to systems that stream one token per chunk
-        (OurSystem, vllm-omni) — both collapse to "per-token gap".
-
-        If `tokenizer` is None, falls back to raw per-chunk gaps (matches
-        sglang.bench_serving's default ITL path; not cross-system comparable
-        for sglang-omni vs others).
-        """
-        gaps = self.chunk_gaps.get("text")
-        if not gaps:
-            return None
-        # gap[i] is the time from chunk i's arrival to chunk i+1's arrival; we
-        # attribute it to chunk i+1 (the one that "took" that long to arrive).
-        if tokenizer is None or len(self._text_chunks) < 2:
-            return list(gaps)
-        out: list[float] = []
-        for i, gap in enumerate(gaps):
-            chunk_idx = i + 1
-            if chunk_idx >= len(self._text_chunks):
-                continue
-            chunk_text = self._text_chunks[chunk_idx].decode("utf-8", errors="replace")
-            try:
-                n_tokens = len(tokenizer.encode(chunk_text, add_special_tokens=False))
-            except Exception:
-                n_tokens = 1
-            if n_tokens <= 0:
-                continue
-            per_token = gap / n_tokens
-            out.extend([per_token] * n_tokens)
-        return out if out else None
+    @property
+    def one_token_per_chunk(self) -> bool:
+        """Whether this request's text chunk gaps are inter-token gaps. Multi-token chunks have no
+        per-token arrival times: their cost per token is TPOT, wall time over tokens."""
+        chunks = self.response_chunks.get("text", 0)
+        return chunks > 0 and not clearly_multi_token(self.output_text_tokens, chunks)
 
     @property
     def streaming_viability(self) -> Optional[float]:
@@ -393,6 +395,7 @@ class AggregateMetrics:
     wall_time: float
     ttft: dict[str, LatencyStats]
     e2e_latency: LatencyStats
+    # Text: gaps of one-token-per-chunk requests only. Audio: chunk gaps.
     itl: dict[str, LatencyStats]
     streaming_viability: Optional[LatencyStats]
     type_counts: dict[str, int]
@@ -412,6 +415,9 @@ class AggregateMetrics:
     total_input_tokens: int = 0
     request_throughput: Optional[float] = None  # successful req / wall_time
     text_token_throughput: Optional[float] = None  # text tokens / wall_time
+    text_chunk_throughput: Optional[float] = None  # text chunks / wall_time
+    text_chunk_gap: Optional[LatencyStats] = None  # gaps between text chunks, whatever they carry
+    text_token_sources: dict[str, int] = field(default_factory=dict)  # requests per text_token_source
     audio_seconds_throughput: Optional[float] = None  # synthesized audio sec / wall_time
     rtf: Optional[LatencyStats] = None  # per-request E2E / audio_duration
     audio_duration_mean_s: Optional[float] = None  # mean synthesized audio duration
@@ -436,6 +442,8 @@ class AggregateMetrics:
         itl_lines = "\n".join(
             f"ITL  ({m})" + (" " * (max_len - len(m))) + f"  : {s}" for m, s in sorted(self.itl.items())
         )
+        if self.text_chunk_gap is not None:
+            itl_lines = f"{itl_lines}\nChunk gap (text): {self.text_chunk_gap}"
         sv_line = (
             f"Audio SV {' ' * max_len}: {self.streaming_viability}\n" if self.streaming_viability is not None else ""
         )
@@ -446,6 +454,8 @@ class AggregateMetrics:
             tpt_lines += f"Throughput: {self.request_throughput:.2f} req/s (successful only)\n"
         if self.text_token_throughput is not None and self.total_text_tokens > 0:
             tpt_lines += f"Throughput: {self.text_token_throughput:.2f} text tok/s\n"
+        if self.text_chunk_throughput is not None:
+            tpt_lines += f"Throughput: {self.text_chunk_throughput:.2f} text chunks/s\n"
         if self.audio_seconds_throughput is not None and self.audio_seconds_throughput > 0:
             tpt_lines += (
                 f"Throughput: {self.audio_seconds_throughput:.2f} audio sec/s (synthesized audio per wall second)\n"
@@ -472,7 +482,8 @@ class AggregateMetrics:
         tok_lines = ""
         if self.total_text_tokens > 0:
             avg = f"{self.mean_text_tokens:.1f}" if self.mean_text_tokens is not None else "n/a"
-            tok_lines += f"Text tokens: {self.total_text_tokens} total ({avg} avg/req)\n"
+            sources = ", ".join(f"{k} {v}" for k, v in sorted(self.text_token_sources.items()))
+            tok_lines += f"Text tokens: {self.total_text_tokens} total ({avg} avg/req; counted by {sources})\n"
         if self.total_input_tokens > 0:
             tok_lines += f"Prompt tokens: {self.total_input_tokens} total\n"
         for modality, total_bytes in sorted(self.total_output_bytes.items()):
@@ -522,36 +533,31 @@ def aggregate_metrics(
         for modality, t in r.ttft.items():
             ttft_by_modality.setdefault(modality, []).append(t)
 
-    # ITL: per-chunk audio gaps and per-token-normalised text gaps, flattened
-    # across all requests. The text normalisation re-tokenises each chunk
-    # (matching sglang.bench_serving's --accept-length path) and replicates
-    # the per-token gap by the chunk's token count, weighting percentiles by
-    # tokens. For OurSystem and vllm-omni (one token per chunk) this
-    # collapses to raw per-chunk gaps; for sglang-omni it un-bursts the
-    # chunk-burst into per-token equivalents — making all three comparable.
     tokenizer = None
     if model is not None:
         try:
             tokenizer = model.get_tokenizer()
         except Exception as e:
             print(
-                f"WARNING: failed to load tokenizer ({e}); falling back to raw "
-                f"per-chunk text ITL (sglang default; not cross-system "
-                f"comparable for sglang-omni vs others).",
+                f"WARNING: failed to load tokenizer ({e}); without a usage count from the "
+                f"server, text tokens are counted one per chunk.",
                 file=sys.stderr,
             )
-    itl_text_per_token: list[float] = []
+    itl_text: list[float] = []
+    text_chunk_gaps: list[float] = []
     itl_audio_per_chunk: list[float] = []
     for r in requests:
-        text_itl = r.itl_per_token_text(tokenizer)
-        if text_itl:
-            itl_text_per_token.extend(text_itl)
-        audio_gaps = r.chunk_gaps.get("audio")
-        if audio_gaps:
+        r.finalize_text_tokens(tokenizer)
+        gaps = r.chunk_gaps
+        if text_gaps := gaps.get("text"):
+            text_chunk_gaps.extend(text_gaps)
+            if r.one_token_per_chunk:
+                itl_text.extend(text_gaps)
+        if audio_gaps := gaps.get("audio"):
             itl_audio_per_chunk.extend(audio_gaps)
     itl_by_modality: dict[str, LatencyStats] = {}
-    if itl_text_per_token:
-        itl_by_modality["text"] = _latency_stats(itl_text_per_token)
+    if itl_text:
+        itl_by_modality["text"] = _latency_stats(itl_text)
     if itl_audio_per_chunk:
         itl_by_modality["audio"] = _latency_stats(itl_audio_per_chunk)
 
@@ -589,6 +595,12 @@ def aggregate_metrics(
 
     request_throughput = n_success / wall_time if wall_time > 0 else None
     text_token_throughput = total_text_tokens / wall_time if wall_time > 0 and total_text_tokens > 0 else None
+    total_text_chunks = total_chunks.get("text", 0)
+    text_chunk_throughput = total_text_chunks / wall_time if wall_time > 0 and total_text_chunks > 0 else None
+    text_token_sources: dict[str, int] = {}
+    for r in requests:
+        if r.response_chunks.get("text"):
+            text_token_sources[r.text_token_source] = text_token_sources.get(r.text_token_source, 0) + 1
 
     type_counts: dict[str, int] = {}
     for r in requests:
@@ -615,6 +627,9 @@ def aggregate_metrics(
         total_input_tokens=total_input_tokens,
         request_throughput=request_throughput,
         text_token_throughput=text_token_throughput,
+        text_chunk_throughput=text_chunk_throughput,
+        text_chunk_gap=_latency_stats(text_chunk_gaps) if text_chunk_gaps else None,
+        text_token_sources=text_token_sources,
         audio_seconds_throughput=audio_seconds_throughput,
         rtf=rtf_stats,
         audio_duration_mean_s=audio_duration_mean_s,
@@ -794,7 +809,7 @@ class OurSystem(InferenceSystem):
                         modality=mod,
                         data_b64=data_b64,
                         arrival_time=arrival_time,
-                        n_tokens=1,  # mstar server emits one token per chunk
+                        n_tokens=1,  # one per chunk until finalize_text_tokens
                         metadata=msg.get("metadata"),
                     )
 
@@ -940,14 +955,7 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
     """
     arrival_time = time.monotonic()
 
-    usage = chunk.get("usage")
-    if usage:
-        ct = usage.get("completion_tokens")
-        if ct is not None:
-            metrics.output_text_tokens = ct
-        pt = usage.get("prompt_tokens")
-        if pt is not None:
-            metrics.input_tokens = pt
+    metrics.record_usage(chunk.get("usage"))
 
     chunk_modality = chunk.get("modality")
     for choice in chunk.get("choices", []):
@@ -1349,11 +1357,7 @@ class VLLMOmni(MediaRoutes, SpeechRoute, InferenceSystem):
                                     arrival_time=arrival_time,
                                     n_tokens=1,
                                 )
-                    usage = response_json.get("usage") or {}
-                    if (ct := usage.get("completion_tokens")) is not None:
-                        metrics.output_text_tokens = ct
-                    if (pt := usage.get("prompt_tokens")) is not None:
-                        metrics.input_tokens = pt
+                    metrics.record_usage(response_json.get("usage"))
                 elif resp.content_type == "application/json":
                     # vllm-omni honors stream=True for some paths (SSE) but
                     # returns a single non-streaming completion for others —
@@ -1371,11 +1375,7 @@ class VLLMOmni(MediaRoutes, SpeechRoute, InferenceSystem):
                                 arrival_time=arrival_time,
                                 n_tokens=1,
                             )
-                    usage = response_json.get("usage") or {}
-                    if (ct := usage.get("completion_tokens")) is not None:
-                        metrics.output_text_tokens = ct
-                    if (pt := usage.get("prompt_tokens")) is not None:
-                        metrics.input_tokens = pt
+                    metrics.record_usage(response_json.get("usage"))
                 else:
                     buffer = b""
                     async for raw_bytes in resp.content.iter_any():
@@ -1525,13 +1525,7 @@ class VLLMOmni(MediaRoutes, SpeechRoute, InferenceSystem):
                     f"No image outputs found: {response_json}"
             )
 
-            usage = response_json.get("usage") or {}
-
-            if (ct := usage.get("completion_tokens")) is not None:
-                metrics.output_text_tokens = ct
-
-            if (pt := usage.get("prompt_tokens")) is not None:
-                metrics.input_tokens = pt
+            metrics.record_usage(response_json.get("usage"))
 
         except Exception as e:
             metrics.record_error(str(e))
@@ -1660,14 +1654,7 @@ class SGLangOmni(SpeechRoute, InferenceSystem):
                     # may also emit chunks that carry both usage and audio (the
                     # same dual-payload pattern we hit with vllm-omni). Process
                     # choices unconditionally below.
-                    usage = chunk.get("usage")
-                    if usage:
-                        ct = usage.get("completion_tokens")
-                        if ct is not None:
-                            metrics.output_text_tokens = ct
-                        pt = usage.get("prompt_tokens")
-                        if pt is not None:
-                            metrics.input_tokens = pt
+                    metrics.record_usage(chunk.get("usage"))
 
                     for choice in chunk.get("choices", []):
                         delta = choice.get("delta") or {}
@@ -2034,11 +2021,7 @@ class OursOpenAI(VLLMOmni):
                     arrival_time=arrival_time,
                     n_tokens=1,
                 )
-            usage = response_json.get("usage") or {}
-            if (ct := usage.get("completion_tokens")) is not None:
-                metrics.output_text_tokens = ct
-            if (pt := usage.get("prompt_tokens")) is not None:
-                metrics.input_tokens = pt
+            metrics.record_usage(response_json.get("usage"))
         except Exception as e:
             metrics.record_error(str(e))
         else:

@@ -100,9 +100,8 @@ class Model(ABC):
         return self.get_hf_url()
 
     def get_tokenizer(self):
-        """Lazy-load the model's HF tokenizer for per-chunk re-tokenization in
-        ITL aggregation (matches sglang.bench_serving --accept-length path).
-        Cached on the instance to avoid repeated downloads."""
+        """Lazy-load the model's HF tokenizer, which counts the tokens of a stream
+        without a usage block. Cached on the instance to avoid repeated downloads."""
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
