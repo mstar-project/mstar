@@ -145,7 +145,7 @@ def test_only_a_deciding_kv_pool_preempts(case):
     pytest.param({(NODE, "prefill"), (NODE, "decode")}, True, id="a node whose walks all run here"),
     pytest.param({(NODE, "decode")}, False, id="a node whose prefill walk runs on another worker"),
 ])
-def test_only_a_node_whose_rebuild_runs_here_drops_requests(my_walks, rebuilds):
+def test_a_policy_runs_here_only_where_the_worker_runs_its_prefill_and_loop_walks(my_walks, rebuilds):
     assert bool(policies_run_here({NODE: POLICY}, _graphs(), my_walks)) == rebuilds
 
 
