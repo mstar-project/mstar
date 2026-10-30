@@ -534,6 +534,8 @@ class FlashInferDecodeWrapper:
         if (
             self._planner_args is not None and dtype is self.dtype and kv_lens is not None
             and window_left == -1
+            # the planner reads host int32 by raw pointer; plan() converts anything else
+            and kv_lens.dtype == torch.int32 and kv_lens.device.type == "cpu"
         ):
             self._plan_direct(paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens)
             return

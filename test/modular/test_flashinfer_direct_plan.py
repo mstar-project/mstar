@@ -131,3 +131,22 @@ def test_an_unchecked_flashinfer_version_plans_with_flashinfer(monkeypatch):
         assert w._planner_args is None
     finally:
         wrappers._direct_plan_supported.cache_clear()
+
+
+def test_direct_plan_only_takes_host_int32_lengths(monkeypatch):
+    """The planner reads ``kv_lens`` by raw pointer as host int32; any other
+    lengths go through ``plan()``, which converts them. Any FlashInfer version:
+    the direct planner is stubbed, only the gate is under test."""
+    wrapper = _wrapper()
+    batch = _batch(np.random.default_rng(0))
+    wrapper.plan(dtype=torch.bfloat16, **batch)  # sets the dtype the gate compares
+    calls = []
+    monkeypatch.setattr(wrapper, "_plan_direct", lambda *a: calls.append(a[-1]))
+    lens = batch["kv_lens"]
+    for kv_lens, direct in (
+        (lens, True), (lens.long(), False), (lens.cuda(), False),
+    ):
+        calls.clear()
+        wrapper._planner_args = []  # as if the first plan resolved to the direct path
+        wrapper.plan(dtype=torch.bfloat16, **{**batch, "kv_lens": kv_lens})
+        assert bool(calls) == direct, (kv_lens.dtype, kv_lens.device)
