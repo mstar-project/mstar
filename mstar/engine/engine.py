@@ -782,7 +782,8 @@ class Engine:
 
     def _build_rows(self, ag_runners: dict[str, AcceleratorGraphRunner]) -> None:
         """Each node's persistent-row walks, sized to the most rows a step of
-        the walk may hold: the submodule's cap and the walk's capture configs."""
+        the walk may hold: its batch cap (the submodule's and the walk's
+        capture configs'), padded up to the capture that holds it."""
         for node_name, submodule_mgmt in self._submodules.items():
             walks = submodule_mgmt.submodule.persistent_row_walks()
             if not walks:
@@ -797,7 +798,7 @@ class Engine:
             def max_rows(walk, submodule=submodule_mgmt.submodule, runner=ag_runners[node_name]):
                 caps = [submodule.max_batch_size(walk), runner.max_batch_size_for(walk)]
                 caps = [cap for cap in caps if cap is not None]
-                return min(caps) if caps else None
+                return runner.padded_batch_size_for(walk, min(caps)) if caps else None
 
             self._rows[node_name] = NodeRows.build(
                 node_name, walks, max_rows, submodule_mgmt.resources, self._device,
