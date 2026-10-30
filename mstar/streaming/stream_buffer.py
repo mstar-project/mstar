@@ -168,10 +168,10 @@ class StreamBuffer:
         pieces, concatenating and storing the result under a fresh uuid.
 
         A consumer that can take the pieces as they come should do that
-        instead, and set no ``join_dim`` -- which is where Qwen3-Omni's Talker
-        is headed. This is for a consumer that genuinely wants the whole
-        thing: it conditions on the complete prompt, or its shapes are
-        captured, and it has no use for a prefix.
+        instead (``ChunkingPolicy.per_chunk_outputs``), as Qwen3-Omni's Talker
+        does. This is for a consumer that genuinely wants the whole thing: it
+        conditions on the complete prompt, or its shapes are captured, and it
+        has no use for a prefix.
         """
         if len(pieces) == 1:
             return pieces[0]

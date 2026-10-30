@@ -50,7 +50,9 @@ def _wrap_node_in_loop(
     The node's real edges move onto the Loop, which is what makes a chunk's
     output the loop's business rather than the worker's: an edge the policy
     gathers gets every chunk's tensors at the end, and any other gets the
-    final chunk's alone, earlier ones dropped as the loop advances.
+    final chunk's alone, earlier ones dropped as the loop advances. A
+    ``per_chunk_outputs`` edge is the exception: it stays on the body, so
+    every chunk routes it as it completes.
 
     The body keeps a bare same-named edge to ``EMPTY_DESTINATION``. The Loop
     caches by edge NAME, so the body has to emit the name for the Loop to have
@@ -72,6 +74,9 @@ def _wrap_node_in_loop(
             return section
         ticks, final, gathered = [], [], []
         for edge in section.outputs:
+            if edge.name in policy.per_chunk_outputs:
+                ticks.append(edge)
+                continue
             ticks.append(GraphEdge(next_node=EMPTY_DESTINATION, name=edge.name))
             dest = gathered if edge.name in policy.accumulated_outputs else final
             dest.append(edge)

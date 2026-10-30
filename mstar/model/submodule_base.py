@@ -370,7 +370,12 @@ class ChunkingPolicy:
     gathered on the Loop and handed over as one item per chunk when the
     prompt finishes. A streamed edge's consumer gets them joined into one item
     by its ``StreamBuffer`` (``Connection.join_dim``). An edge not named here
-    carries the final chunk's tensors alone.
+    or in ``per_chunk_outputs`` carries the final chunk's tensors alone.
+
+    ``per_chunk_outputs``: streaming output edges sent on every chunk as it
+    runs, each chunk's piece an item of its own, for a consumer that can
+    start on a prefix (``ChunkPolicy.allow_partial_input``, checked at load).
+    Disjoint from ``accumulated_outputs``.
 
     ``reserve_whole_prefill``: whether a first chunk reserves the KV the
     whole prefill needs, so a part-done row cannot wedge on a full arena.
@@ -381,11 +386,19 @@ class ChunkingPolicy:
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
     chunkable: bool = False
     accumulated_outputs: frozenset[str] = frozenset()
+    per_chunk_outputs: frozenset[str] = frozenset()
     # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
     max_batch_tokens: int | None = None
     # whether a row may start past its cached prefix, asked before prepare; None is always
     reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
     reserve_whole_prefill: bool = True
+
+    def __post_init__(self):
+        both = self.accumulated_outputs & self.per_chunk_outputs
+        if both:
+            raise ValueError(
+                f"outputs {sorted(both)} are both gathered and sent per chunk; name each in one"
+            )
 
 
 NO_CHUNKING = ChunkingPolicy()

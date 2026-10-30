@@ -21,7 +21,9 @@ Producer-triggered Talker walks:
     KV cache in ``talker_prefill``; the first ``thinker_decode`` state runs
     ``talker_last_prefill``, which samples the first codec token, and the
     rest feed ``talker_decode``.  The Talker never needs to know how many
-    prefill walks the Thinker runs.
+    prefill walks the Thinker runs.  A chunked Thinker prefill streams each
+    chunk's states as it runs (``per_chunk_outputs``), and the Talker extends
+    its KV with each, so it keeps pace with the Thinker's prompt.
 
 Text-only mode:
     When output_modalities does not include "audio", only the Thinker
@@ -124,9 +126,11 @@ def apply_code2wav_serving_overrides(code2wav, model_kwargs: dict) -> None:
 
 def _thinker_to_talker_policy() -> FixedChunkPolicy:
     # Past the Thinker's end only the decode loop keeps running; an empty
-    # chunk in a prefill walk would run a prefill pass with nothing in it
+    # chunk in a prefill walk would run a prefill pass with nothing in it.
+    # Partial: the Talker extends its KV with each Thinker prefill chunk.
     return FixedChunkPolicy(
         chunk_size=1, continue_after_done=frozenset({"talker_decode"}),
+        allow_partial=True,
     )
 
 
@@ -377,9 +381,8 @@ class Qwen3OmniModel(Model):
             ChunkingPolicy(
                 walks=("prefill_text", "prefill_audio", "prefill_vision"),
                 chunkable=True, max_batch_tokens=budget,
-                # the Talker conditions on the whole prompt, so it needs every
-                # chunk's states, not just the last one's
-                accumulated_outputs=frozenset({"thinker_states", "thinker_mask"}),
+                # the Talker extends its KV with each chunk's states as it lands
+                per_chunk_outputs=frozenset({"thinker_states", "thinker_mask"}),
             ),
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=(THINKER_MIXED,), max_batch_tokens=budget),
@@ -649,8 +652,6 @@ class Qwen3OmniModel(Model):
                     edge_name="thinker_states",
                     chunk_policy_factory=_thinker_to_talker_policy,
                     consumer_walk=_talker_walk,
-                    # the Thinker's prefill chunks are pieces of one prompt
-                    join_dim=0,
                 ),
                 Connection(
                     from_partition="Thinker",
@@ -658,7 +659,6 @@ class Qwen3OmniModel(Model):
                     edge_name="thinker_mask",
                     chunk_policy_factory=_thinker_to_talker_policy,
                     consumer_walk=_talker_walk,
-                    join_dim=0,
                 ),
                 Connection(
                     from_partition="Talker",

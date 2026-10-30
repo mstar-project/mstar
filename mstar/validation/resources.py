@@ -15,7 +15,7 @@ from mstar.engine.resources.spec import (
     unknown_overrides_message,
 )
 from mstar.graph.base import GraphEdge, GraphSection
-from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
+from mstar.graph.special_destinations import EMPTY_DESTINATION, SPECIAL_DESTINATIONS
 from mstar.model.base import Model, keyed_labels
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.streaming.topology import StreamingGraphEdge
@@ -260,9 +260,12 @@ def streamed_partitions(specs: Sequence[NodeResourceSpec], model: Model) -> froz
 
 def _node_outputs(graph: GraphSection, name: str, walk: str) -> list[GraphEdge]:
     """The edges ``name``'s outputs leave the node on in ``walk``. A chunked
-    node's real edges are on its chunk Loop; its body routes only to
-    ``EMPTY_DESTINATION`` and back to itself."""
+    node's real edges are on its chunk Loop, but for the ``per_chunk_outputs``
+    its body still routes; the rest of the body's go to ``EMPTY_DESTINATION``
+    or back to itself (the tick)."""
+    node = graph.get_nodes()[name]
     loop = graph.get_loops().get(chunk_loop_name(name, walk))
-    if loop is not None:
-        return loop.outputs + loop.accumulated_outputs
-    return graph.get_nodes()[name].outputs
+    if loop is None:
+        return node.outputs
+    per_chunk = [e for e in node.outputs if e.next_node not in (EMPTY_DESTINATION, name)]
+    return loop.outputs + loop.accumulated_outputs + per_chunk
