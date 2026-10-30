@@ -967,6 +967,35 @@ def test_a_row_that_ran_another_node_keeps_its_place_at_a_capped_one():
     assert list(batch.request_to_worker_graph) == ["r0"]
 
 
+def test_last_ran_at_is_the_rows_latest_turn_at_that_node_on_any_walk():
+    sched = _scheduler(_Engine())
+    _turns(sched, ["r0"], ["r1"])
+    sched.note_ran(_batch(["r0"], walk="other"))
+    sched.note_ran(_batch(["r1"], node="talker", walk="stream"))
+
+    assert sched.last_ran_at(NODE, "r0") == 3
+    assert sched.last_ran_at(NODE, "r1") == 2, "a turn at another node counted here"
+    assert sched.last_ran_at(NODE, "r2") == 0
+
+    sched.clear_rid("r0", "wire-r0")
+    assert sched.last_ran_at(NODE, "r0") == 0
+
+
+def test_a_refused_step_of_a_real_walk_reads_its_combined_walks_order():
+    """Eviction asks with the step's label, which may be a real walk's."""
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: _Engine()),
+        parallel_leader_nodes={NODE},
+        combined_walk_of={(NODE, "prefill"): MIXED, (NODE, WALK): MIXED},
+        streaming_node_walks={(NODE, WALK)},
+    )
+
+    assert sched.takes_turns(NODE, "prefill")
+    assert sched.takes_turns(NODE, WALK)
+    assert sched.takes_turns(NODE, MIXED)
+    assert not sched.takes_turns(NODE, "unrelated")
+
+
 def test_rows_that_all_fit_keep_the_scan_order():
     sched = _scheduler(_Engine(max_bs=8))
     sched.note_ran(_batch(["r1"]))

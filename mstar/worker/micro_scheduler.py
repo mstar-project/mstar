@@ -329,6 +329,7 @@ class MicroScheduler:
         # every admitted step, given out in the order the step took its rows
         # (`note_ran`), so sorting by it is first come, first served. Kept per
         # key: a row that runs another node meanwhile has still waited here.
+        # Eviction reads the same stamps (`last_ran_at`).
         self.last_ran: dict[tuple[str, str], dict[int, int]] = {}
         self._turns = 0
         # scheduling key -> the first turn of its latest admitted step: the
@@ -444,6 +445,19 @@ class MicroScheduler:
         self._turns += len(rows)
         turns.update(zip(rows, range(first, self._turns + 1), strict=True))
         self._latest_step[key] = first
+
+    def last_ran_at(self, node_name: str, rid: int) -> int:
+        """``rid``'s latest turn at ``node_name``, on any of its scheduling
+        keys; 0 if it hasn't run there. One counter hands out every turn, so
+        they compare across keys."""
+        return max(
+            (turns.get(rid, 0) for (node, _), turns in self.last_ran.items() if node == node_name),
+            default=0,
+        )
+
+    def takes_turns(self, node_name: str, graph_walk: str) -> bool:
+        """Whether ``(node_name, graph_walk)``'s rows line up by `StepOrder.TURNS`."""
+        return self._order_of(self._key(node_name, graph_walk)) is StepOrder.TURNS
 
     def note_arrival(self, rid: int) -> None:
         """A request reached this worker; a request with several partitions

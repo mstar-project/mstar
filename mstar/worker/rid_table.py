@@ -10,10 +10,10 @@ be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog, last_ran,
-arrival} (purged by clear_rid), Worker.{_last_active, _pending_removes,
-_pending_loop_stops, streaming_buffers}, RequestStateManager.{per_request_info,
-_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the
-engine's and tensor manager's per-request state, RecurrentStatePool.{_keyed,
+arrival} (purged by clear_rid), Worker.{_pending_removes, _pending_loop_stops,
+streaming_buffers}, RequestStateManager.{per_request_info, _fwd_by_partition} and
+StreamBufferManager._rids (purged by remove_request), the engine's and tensor
+manager's per-request state, RecurrentStatePool.{_keyed,
 _leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
 _admit_snaps} (purged by remove_request), and WorkerProfileInfo.
 

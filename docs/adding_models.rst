@@ -1469,6 +1469,8 @@ into one GPU call. A submodule controls this behavior with these methods:
   connection to another partition (``Model.streaming_node_walks``), else ``ARRIVAL``. A combined
   walk takes turns if any of its walks does. The order applies to the rows a speculation chain
   continues, the backlog and the queued rows alike; when every ready row fits, it doesn't matter.
+  It also sets who is offloaded when an admit runs out of KV pages: under ``TURNS`` the row that
+  ran last, whose next turn is furthest away; under ``ARRIVAL`` the one that has waited longest.
 
 **Combined walks.** By default a step holds one walk. A model lets several walks of a node
 share a step by returning ``{node: {combined_walk: {walks}}}`` from

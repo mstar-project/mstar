@@ -162,7 +162,7 @@ class _FailingWorker(_EvictingWorker):
         super().__init__(holders)
         self.held: list[str] = []
         self.failed: dict[str, str] = {}
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, **_NO_LIMITS)
+        vars(self.scheduler).update(hold_requests=self.held.extend, **_NO_LIMITS)
 
     def _fail_requests(self, errors):
         self.failed.update(errors)
@@ -345,7 +345,7 @@ def _engine_manager(**pools: KVManager) -> SimpleNamespace:
         ),
     )
     return SimpleNamespace(
-        remove_request=lambda rid: Engine.remove_request(engine, rid), evictable_nodes=list,
+        remove_request=lambda rid: Engine.remove_request(engine, rid),
     )
 
 
@@ -371,8 +371,8 @@ def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under()
     manager = _Manager([*long_rows, *(f"s{i}" for i in range(32))])
     batch = _next_batch(sched, manager)
     assert list(batch.request_to_worker_graph) == long_rows
-    refuser = _EvictingWorker(holders=long_rows)
-    refuser.scheduler, refuser._graph_runtime = sched, manager.runtime
+    refuser = _EvictingWorker(long_rows, sched)
+    refuser._graph_runtime = manager.runtime
     refuser._handle_allocation_failure(batch, SimpleNamespace(
         node_name=SCHED_NODE, failed_resource="kv", admit_error=outcome.reason,
     ))

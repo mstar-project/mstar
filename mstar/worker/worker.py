@@ -271,7 +271,7 @@ class PendingBatch:
 
 class EvictionPolicy(Enum):
     """Strategy for choosing which request to offload to CPU on OOM."""
-    LRU = "lru"  # least-recently-used (by execution time)
+    LAST_RAN = "last_ran"  # by when each row last ran at the node, read through its StepOrder
     # TODO: PRIORITY — ask a named resource how much it wants each candidate
     # gone (``Engine.offload_priority``), for cases where "least recently used"
     # is the wrong question. Needs eviction-policy metadata naming which
@@ -599,9 +599,7 @@ class Worker:
         # dropped instead of parked. Keyed by the string: the handle is gone.
         self._removed_rids: RecentSet[str] = RecentSet(_REMOVED_RIDS_KEEP)
 
-        # CPU offloading: LRU tracking and eviction policy
-        self._last_active: dict[tuple[int, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
-        self.eviction_policy = EvictionPolicy.LRU
+        self.eviction_policy = EvictionPolicy.LAST_RAN
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
@@ -848,10 +846,6 @@ class Worker:
         )
         body.request_info.rid_handle = request_id
 
-        now = _time.monotonic()
-        for node_name in self.engine_manager.evictable_nodes():
-            self._last_active[(request_id, node_name)] = now
-
         self.request_state.add_request(request_id, body.request_info)
         self.scheduler.note_arrival(request_id)
         self.tensor_manager.register_request(
@@ -1018,8 +1012,6 @@ class Worker:
         self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.pop(request_id, None)
 
-        for node_name in self.engine_manager.evictable_nodes():
-            self._last_active.pop((request_id, node_name), None)
         logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
@@ -1537,11 +1529,12 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _try_offload_cold_request(
-        self, node_name: str, batch_ids: set[int],
+        self, node_name: str, graph_walk: str, batch_ids: set[int],
         affected_resources: set[str] | None= None,
         inside_only: bool = False,
     ) -> int | None:
-        """Offload one request's state for ``node_name``, freeing room to retry.
+        """Offload one request's state for a refused step of ``(node_name,
+        graph_walk)``, freeing room to retry.
 
         Prefers a victim outside *batch_ids*; falls back to one inside it (the
         caller then excludes it from execution). ``inside_only`` takes only
@@ -1553,8 +1546,8 @@ class Worker:
             return None
 
         active = [
-            rid for (rid, node) in self._last_active
-            if node == node_name and not engine.is_offloaded(node_name, rid)
+            rid for rid in self.scheduler.arrival
+            if not engine.is_offloaded(node_name, rid)
             and (not inside_only or rid in batch_ids)
         ]
 
@@ -1578,7 +1571,7 @@ class Worker:
 
         # prefer evicting requests that aren't currently executing
         external = [rid for rid in candidates if rid not in batch_ids]
-        victim_id = self._select_eviction_victim(node_name, external or candidates)
+        victim_id = self._select_eviction_victim(node_name, graph_walk, external or candidates)
         freed = engine.offload_request(node_name, victim_id)
         if freed <= 0:
             # A victim was found and would not move. The usual cause is the host
@@ -1599,19 +1592,19 @@ class Worker:
         return victim_id
 
     def _select_eviction_victim(
-        self, node_name: str, candidates: list[int]
+        self, node_name: str, graph_walk: str, candidates: list[int],
     ) -> int:
-        """Pick a victim from *candidates*.
+        """Pick a victim from *candidates* by when each last ran at the node
+        (``MicroScheduler.last_ran_at``; one that never ran there sorts oldest).
 
-        LRU only today; ``EvictionPolicy`` has no other member yet. Oldest
-        last_active first — a candidate the worker has never run sorts oldest,
-        which is what we want once the caller has filtered out the ones
-        holding nothing.
+        While the refused step's rows take turns the oldest stamp is next in
+        line, so take the newest: its next turn is furthest away. Otherwise the
+        row that has waited longest. Nothing is in flight here (no step is
+        built on a refusal), so the row that ran last has finished running.
         """
-        return min(
-            candidates,
-            key=lambda rid: self._last_active.get((rid, node_name), 0.0),
-        )
+        ran_at = partial(self.scheduler.last_ran_at, node_name)
+        pick = max if self.scheduler.takes_turns(node_name, graph_walk) else min
+        return pick(candidates, key=ran_at)
 
     # ------------------------------------------------------------------
     # Batch building
@@ -2320,9 +2313,10 @@ class Worker:
         symmetry: a follower voids a speculative head from its own verdict.
 
         Eviction is the one decision that is NOT derivable from the broadcast,
-        since LRU orders on wall clock. So only rank 0 picks a victim; its choice
-        rides out on the next ``ScheduleTPNode`` as a resident-set delta, and a
-        follow rank returns below without evicting or holding anything. Holding
+        since it reads this rank's own scheduler stamps. So only rank 0 picks a
+        victim; its choice rides out on the next ``ScheduleTPNode`` as a
+        resident-set delta, and a follow rank returns below without evicting or
+        holding anything. Holding
         in particular would be wrong rather than merely useless: a follow rank
         has no scheduling decision a backoff could improve, and rank 0 hit the
         same OOM on the same batch and is already driving the retry.
@@ -2361,7 +2355,7 @@ class Worker:
         # admit named one
         failed = node_batch.failed_resource
         victim_id = self._try_offload_cold_request(
-            node_batch.node_name, batch_ids,
+            node_batch.node_name, batch.graph_walk, batch_ids,
             affected_resources=None if failed is None else {failed},
             inside_only=too_big,
         )
@@ -3275,16 +3269,6 @@ class Worker:
                 batch_N.batch.discard_rid(rid)
 
         _pp_stage("pending_loop_stops")
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_push("worker.postprocess.update_lru", synchronize=False)
-
-        # Update LRU
-        t = _time.monotonic()
-        for rid in batch_N.node_batch.request_ids:
-            self._last_active[(rid, batch_N.node_name)] = t
-
-        _pp_stage("update_lru")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.synchronize_completion_event", synchronize=False)

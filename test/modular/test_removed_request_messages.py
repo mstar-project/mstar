@@ -85,7 +85,6 @@ def _worker(is_tp_follower=False) -> Worker:
     )
     w.request_state = RequestStateManager(node_to_partition={NODE: "default"})
     w.engine_manager = SimpleNamespace(
-        evictable_nodes=lambda: [NODE],
         add_request=lambda rid, cfgs: None,
         remove_request=lambda rid: None,
     )
@@ -108,7 +107,6 @@ def _worker(is_tp_follower=False) -> Worker:
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._removes_awaiting_step = {}
-    w._last_active = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)

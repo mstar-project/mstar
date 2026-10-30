@@ -27,6 +27,7 @@ import torch
 from test_micro_scheduler import MIXED, _combined_scheduler, _Engine, _Manager, _next_batch, _scheduler
 from test_micro_scheduler import NODE as SCHED_NODE
 from test_micro_scheduler import WALK as SCHED_WALK
+from test_micro_scheduler import _batch as _sched_batch
 
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import (
@@ -37,6 +38,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.model.submodule_base import StepOrder
 from mstar.utils.device import DeviceCapability
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -225,9 +227,9 @@ class _HoldingWorker:
     def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
         del in_flight_rids
 
-    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None, inside_only=False):
+    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
         # no victim
-        del node_name, batch_ids, affected_resources, inside_only
+        del node_name, graph_walk, batch_ids, affected_resources, inside_only
 
 
 def _hold(worker, monkeypatch, at: float, walk: str = "walk") -> None:
@@ -464,16 +466,20 @@ def test_a_mixed_step_held_under_its_cap_by_row_caps_is_limited():
 
 
 class _EvictingWorker(_HoldingWorker):
-    """The real victim search, over requests ``holders`` that hold pages."""
+    """The real victim search, over requests ``holders`` that hold pages and
+    ran a step each in that order."""
 
     _try_offload_cold_request = Worker._try_offload_cold_request
     _select_eviction_victim = Worker._select_eviction_victim
 
-    def __init__(self, holders):
+    def __init__(self, holders, sched=None):
         super().__init__()
         self.offloaded: list[str] = []
-        self.eviction_policy = SimpleNamespace(value="lru")
-        self._last_active = {(rid, SCHED_NODE): float(i) for i, rid in enumerate(holders)}
+        self.eviction_policy = SimpleNamespace(value="last_ran")
+        self.scheduler = sched or _scheduler(_SchedEngine())
+        for rid in holders:
+            self.scheduler.note_arrival(rid)
+            self.scheduler.note_ran(_sched_batch([rid]))
         engine = SimpleNamespace(
             evictable=lambda node: True,
             is_offloaded=lambda node, rid: rid in self.offloaded,
@@ -494,8 +500,7 @@ def test_a_batch_the_pool_cannot_hold_alone_is_capped_not_evicted_for():
     usable, row = 191, 12
     sched = _scheduler(_SchedEngine(max_bs=16))
     manager = _Manager([f"p{i}" for i in range(48)])
-    worker = _EvictingWorker(holders=[f"d{i}" for i in range(4)])
-    worker.scheduler = sched
+    worker = _EvictingWorker([f"d{i}" for i in range(4)], sched)
     worker._graph_runtime = manager.runtime
     sizes = []
     for _ in range(8):
@@ -531,8 +536,8 @@ def test_a_batch_too_big_alone_still_evicts_its_own_rows():
     """Running requests that outgrow the pool together: evicting one of
     them is what lets the rest step, as before."""
     # the request outside the batch is the least recently run
-    worker = _EvictingWorker(holders=["outside", "r0", "r1"])
-    worker.scheduler = SimpleNamespace(hold_requests=lambda rids: None, **_NO_LIMITS)
+    worker = _EvictingWorker(["outside", "r0", "r1"])
+    worker.scheduler.could_refill = _NO_LIMITS["could_refill"]
     batch, node_batch = _batches(_sized_refusal("r1", rows_fit=1, rows_fit_alone=1))
     node_batch.failed_resource = "kv"
     batch.node_name = node_batch.node_name = SCHED_NODE
@@ -540,6 +545,41 @@ def test_a_batch_too_big_alone_still_evicts_its_own_rows():
     worker._handle_allocation_failure(batch, node_batch)
 
     assert worker.offloaded == ["r0"], "an outside request was evicted for a batch it cannot help"
+
+
+@pytest.mark.parametrize("order, victim", [(StepOrder.TURNS, "r3"), (StepOrder.ARRIVAL, "r0")])
+def test_a_refused_step_offloads_by_the_nodes_order(order, victim):
+    """A step of r4 is refused, and r0 to r3 hold pages, r0 having run first.
+    While rows take turns r0 runs right after the retry, so offloading it only
+    makes it reload, and r3's next turn is the furthest away. Under ARRIVAL the
+    row that has waited longest goes."""
+    worker = _EvictingWorker([f"r{i}" for i in range(4)], _scheduler(_SchedEngine(order=order)))
+    worker.scheduler.could_refill = _NO_LIMITS["could_refill"]
+    batch = _sched_batch(["r4"])
+    node_batch = SimpleNamespace(node_name=SCHED_NODE, failed_resource="kv", admit_error=_alloc_failed("r4"))
+
+    worker._handle_allocation_failure(batch, node_batch)
+
+    assert worker.offloaded == [victim]
+
+
+@pytest.mark.parametrize("order, victim", [(StepOrder.TURNS, "ran"), (StepOrder.ARRIVAL, "never_ran")])
+def test_a_row_that_never_ran_at_the_node_sorts_oldest(order, victim):
+    """Its pages came some other way (a KV retrieve from another worker):
+    under TURNS it is first in line, and under ARRIVAL it has waited longest."""
+    worker = _EvictingWorker(["ran"], _scheduler(_SchedEngine(order=order)))
+    worker.scheduler.note_arrival("never_ran")
+    holders = {"ran", "never_ran"}
+    worker.engine_manager.get_engine(SCHED_NODE).reclaimable = lambda node, rid, resources: rid in holders
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == victim
+
+
+def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():
+    worker = _EvictingWorker(["outside", "r0", "r1"], _scheduler(_SchedEngine(order=StepOrder.TURNS)))
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "outside"
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "r1"
 
 
 def test_a_step_of_one_walk_lifts_its_combined_walks_limit():
@@ -834,8 +874,7 @@ def test_a_batch_too_big_alone_that_evicts_its_own_row_is_capped():
     sched = _scheduler(_SchedEngine(max_bs=16))
     rids_all = [f"r{i}" for i in range(48)]
     manager = _Manager(rids_all)
-    worker = _EvictingWorker(holders=rids_all)
-    worker.scheduler = sched
+    worker = _EvictingWorker(rids_all, sched)
     worker._graph_runtime = manager.runtime
     sizes = []
     for _ in range(8):

@@ -276,6 +276,41 @@ def test_a_refused_step_is_not_a_turn_for_note_ran():
     assert sched.last_ran == {KEY: {7: 1}}
 
 
+def test_a_refusal_under_turns_keeps_the_next_row_in_line_on_the_device():
+    """Rows 0-2 ran a step each and 3's first step is refused. 0 runs right
+    after the retry, so the eviction takes 2, whose next turn is furthest away."""
+    runtime = _Runtime()
+    sched, state = _scheduler(runtime, TURNS)
+    for rid in range(4):
+        runtime.requests[rid] = None
+        sched.note_arrival(rid)
+        if rid < 3:
+            _admitted(sched, ScheduledBatch(NODE, WALK, request_to_worker_graph={rid: 0}))
+    runtime.ready |= {0, 1, 2, 3}
+
+    refused = sched.get_next_batch(state)
+    assert list(refused.request_to_worker_graph) == [3]
+    _admitted(sched, refused, refused=True)
+    worker = SimpleNamespace(scheduler=sched)
+    assert Worker._select_eviction_victim(worker, NODE, WALK, [0, 1, 2]) == 2
+
+    runtime.ready.add(3)
+    retry = sched.get_next_batch(state)
+    assert list(retry.request_to_worker_graph) == [3]
+    _admitted(sched, retry)
+    assert list(sched.get_next_batch(state).request_to_worker_graph) == [0]
+
+
+def test_a_refusal_under_arrival_takes_the_row_that_waited_longest():
+    runtime = _Runtime()
+    sched, _ = _scheduler(runtime, ARRIVAL)
+    for rid in range(3):
+        sched.note_arrival(rid)
+        _admitted(sched, ScheduledBatch(NODE, WALK, request_to_worker_graph={rid: 0}))
+
+    assert Worker._select_eviction_victim(SimpleNamespace(scheduler=sched), NODE, WALK, [0, 1, 2]) == 0
+
+
 def test_a_lone_request_keeps_its_chain_without_a_scan():
     """Nothing else on the worker: the chain continues, so speculation still
     overlaps, and the queues are not scanned for it."""
