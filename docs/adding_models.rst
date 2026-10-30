@@ -604,8 +604,8 @@ The spec types are:
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
        fallback, which cannot be captured in a CUDA graph. The layer is ``MLAAttention``
-       (``mstar/model/components/mla.py``); its config picks rotated, unrotated (Kimi K3)
-       or no decoupled dims (GLM-5.3), an output gate and the latent norms' eps.
+       (``mstar/model/components/mla.py``); its config picks rotated decoupled dims (GLM-5.2)
+       or none (GLM-5.3).
        ``sliding_window=N`` lets each query attend to the last ``N`` positions, its
        own included. It needs the FlashInfer backend and causal attention, and the
        pages behind the window stay allocated.

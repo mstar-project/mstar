@@ -20,8 +20,9 @@ class Glm52LanguageModel(nn.Module):
     ) -> None:
         super().__init__()
         self.comm_group = comm_group or CommGroup.trivial()
-        # each layer takes and returns (FFN partial, residual); the last norm reduces
-        self.fused_add_rmsnorm = config.fused_add_rmsnorm
+        # kernels: auto fuses each all-reduce into the next add + RMSNorm: each layer takes and
+        # returns (FFN partial, residual), and the last norm reduces
+        self.fused_add_rmsnorm = config.tuned_kernels
         self.embed_tokens = build_embedding(config, comm_group=comm_group)
         self.layers = nn.ModuleList(
             [
@@ -106,18 +107,6 @@ class Glm52ForCausalLM(nn.Module):
             fp8_shared_expert=self.config.fp8_shared_expert,
             load_mtp=self.mtp is not None,
         )
-        if self.config.dense_fp8:
-            from mstar.model.components.fp8_linear import Fp8Linear
-
-            missing = {
-                f"{name}.{p}" for name, m in self.named_modules() if isinstance(m, Fp8Linear)
-                for p in ("weight", "weight_scale_inv")
-            } - loaded
-            if missing:
-                raise RuntimeError(
-                    f"dense_fp8 is on but {len(missing)} fp8 linear tensors received no "
-                    f"checkpoint weights (e.g. {sorted(missing)[:3]}) — the checkpoint "
-                    "does not store them as fp8 pairs.")
         if load_indexer:
             missing = {
                 name for name, _ in self.named_parameters() if ".self_attn.indexer." in name

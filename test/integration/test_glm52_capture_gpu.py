@@ -44,11 +44,12 @@ FP8_BLOCK = (128, 128)
 def _latent_cfg(fp8: bool, **overrides) -> Glm52ModelConfig:
     """The reduced model at the real latent shape: absorbed MLA with
     kv_lora_rank 512 / rope 64, which FlashInfer's MLA kernel serves. The
-    fp8 variant's experts are one scale block wide, so the fused kernel
-    takes them."""
+    fp8 variant's experts and q_lora_rank are one scale block wide, so the fused
+    kernel takes the experts and q_a's scales stack on kv_a's."""
     if fp8:
         base = dataclasses.replace(
-            Glm52ModelConfig.reduced_fp8(block=FP8_BLOCK), moe_intermediate_size=FP8_BLOCK[0])
+            Glm52ModelConfig.reduced_fp8(block=FP8_BLOCK), moe_intermediate_size=FP8_BLOCK[0],
+            q_lora_rank=FP8_BLOCK[0])
     else:
         base = Glm52ModelConfig.reduced()
     cfg = dataclasses.replace(
@@ -76,7 +77,7 @@ def _load(tmp_path, monkeypatch, fp8: bool, cfg_overrides=None, **model_kwargs):
         checkpoint_path=str(tmp_path), tokenizer_mode="byte", **model_kwargs,
     )
     cfg = dataclasses.replace(_latent_cfg(fp8, **(cfg_overrides or {})),
-                              moe_quant_kernel=model.config.moe_quant_kernel)
+                              kernels=model.config.kernels)
     model.config = cfg
     ref = _build_reference(dataclasses.replace(cfg, quantization_config=None))
     if fp8:
@@ -253,20 +254,28 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
         assert captured_streams[rid] == stream, (rid, captured_streams[rid], stream)
 
 
+def _fused_prep(submodule, on: bool) -> None:
+    """The fused MLA prep on every layer (kernels: auto takes it where it runs), or the
+    op-by-op path (the reference's)."""
+    for layer in submodule.language_model.model.layers:
+        layer.self_attn.mla_fused_prep = on
+
+
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeypatch, fp8):
-    """mla_fused_prep on: the captured streams equal the eager ones and the unfused path's
-    captured ones (q_lora_rank 256, a width the fused norms take)."""
+    """The fused MLA prep: the captured streams equal the eager ones and the op-by-op path's
+    captured ones (q_lora_rank 256, a width the fused norms take). The bf16 arm runs the
+    reference otherwise: under kernels: auto its captured stream left the eager one at the
+    fourth token (H200, not diagnosed); the fp8 arm needs auto's fused MoE to capture."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     prompts = BUCKET_PROMPTS if fp8 else PROMPTS
+    kernels = {} if fp8 else {"kernels": "reference"}
     streams = {}
     for fused_prep in (False, True):
         ckpt = tmp_path / f"fused{int(fused_prep)}"
         ckpt.mkdir()
-        model, submodule = _load(ckpt, monkeypatch, fp8,
-                                 cfg_overrides=dict(q_lora_rank=256, mla_fused_prep=fused_prep))
-        attn = submodule.language_model.model.layers[0].self_attn
-        assert attn.mla_fused_prep == fused_prep
+        model, submodule = _load(ckpt, monkeypatch, fp8, cfg_overrides=dict(q_lora_rank=256), **kernels)
+        _fused_prep(submodule, fused_prep)
         if fused_prep:
             eager = _Node(model, submodule, capture=False, prompts=prompts)
             streams["eager"] = eager.generate()

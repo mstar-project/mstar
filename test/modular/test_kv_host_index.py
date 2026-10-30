@@ -42,10 +42,11 @@ class _HostPool(CPUPagePool):
         self.offloaded = {}
         self._refused_logged_at = None
         self._refused_unlogged = 0
-        self.dropped = 0
+        self.dropped = self.written = self.cancelled = 0
         self._dropped_logged_at = None
         self.copied_out: list[int] = []
         self.copied_in: list[int] = []
+        self.written_out: list[int] = []
         self.events: list[_Event] = []
 
     def copy_out(self, gpu_kv_cache, copies):
@@ -54,9 +55,14 @@ class _HostPool(CPUPagePool):
     def copy_in(self, gpu_kv_cache, copies):
         self.copied_in.extend(copies.gpu)
 
+    def write(self, gpu_kv_cache, copies):
+        self.written_out.extend(copies.gpu)
+
     def record(self):
         self.events.append(_Event())
         return self.events[-1]
+
+    record_write = record
 
     def land(self):
         for event in self.events:
@@ -85,6 +91,8 @@ def _manager(max_num_pages: int = 128, host_pages: int = 64) -> KVManager:
     )
     kv.enable_prefix_cache(ROOT)
     kv._cpu_pool = _HostPool(host_pages)
+    # `enable_prefix_cache` opens the writes only when the host pool exists, and the stub comes after it
+    kv._open_host_writes()
     return kv
 
 
@@ -260,6 +268,7 @@ def _land(kv: KVManager) -> None:
     kv._cpu_pool.land()
     with kv._lock:
         kv._land_host_copies()
+        kv._host_writes.land()
 
 
 def test_a_prefix_on_the_host_is_copied_back_before_the_request_runs():
@@ -306,6 +315,38 @@ def test_a_request_removed_while_its_prefix_is_arriving_leaks_nothing():
     _land(kv)
     assert kv._host_copies == [] and kv._arriving == {}
     kv.assert_pages_conserved()
+
+
+class _Walked(dict):
+    """A request's streams, counting the walks `_fetch_from_host` makes over them."""
+    walks = 0
+
+    def items(self):
+        if sys._getframe(1).f_code.co_name == "_fetch_from_host":
+            self.walks += 1
+        return super().items()
+
+
+def test_a_request_looked_up_skips_the_host_walk_until_its_stream_resets():
+    kv = _manager()
+    _on_the_host_only(kv)
+    _ingest(kv, "b", A_PROMPT + [7, 8])
+    assert not _ready(kv, "b")
+    kv._streams["b"] = b_streams = _Walked(kv._streams["b"])
+    _land(kv)
+    # c's first readiness check looks its prompt up and finds nothing on the host
+    _ingest(kv, "c", list(range(600, 600 + 6 * PAGE_SIZE)) + [1, 2])
+    assert _ready(kv, "c")
+    kv._streams["c"] = c_streams = _Walked(kv._streams["c"])
+
+    assert _ready(kv, "b") and _ready(kv, "c")
+
+    assert b_streams.walks == c_streams.walks == 0, "a readiness check walked a looked-up request's streams"
+    kv.reset_request("b", free=True)
+    kv._evict(kv._index.num_pages())
+    copied = len(kv._cpu_pool.copied_in)
+    _ready(kv, "b")
+    assert len(kv._cpu_pool.copied_in) == copied + 6, "a request whose stream reset didn't look its prefix up again"
 
 
 
