@@ -68,10 +68,12 @@ logger = logging.getLogger(__name__)
 # request after each admit, commit, reset and remove, and after each change to
 # an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
-# steps up to this many tokens build their write addressing on the host; a
-# Python loop per token beats the packed path's kernels well past a decode
-# batch of k+1-token MTP rows
+# A step whose rows each write at most HOST_PLAN_MAX_SPAN tokens (decode, an MTP
+# verify's k + 1), up to HOST_PLAN_MAX_TOKENS in all, builds its write addressing
+# on the host: a Python loop per token beats the packed path's kernels there.
+# Wider rows (prefills) keep the packed path.
 HOST_PLAN_MAX_TOKENS = 512
+HOST_PLAN_MAX_SPAN = 8
 
 
 class RoomMark(NamedTuple):
@@ -2282,7 +2284,7 @@ class KVManager(AttentionResource):
                 # it wrote at prefill): nothing is written, so there is no
                 # addressing to upload and unpack
                 plan_state = self._empty_plan_state()
-            elif total_tokens <= HOST_PLAN_MAX_TOKENS:
+            elif total_tokens <= HOST_PLAN_MAX_TOKENS and indptrs.max_span() <= HOST_PLAN_MAX_SPAN:
                 plan_state = self._host_plan_state(indptrs.views)
             else:
                 indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
