@@ -480,6 +480,16 @@ def test_an_existing_lock_file_of_another_user_still_locks(gpu_locks, monkeypatc
     assert cpus.claim_gpus([A]) is None
 
 
+def test_the_lock_file_is_readable_by_other_users_whatever_the_umask(gpu_locks):
+    umask = os.umask(0o077)
+    try:
+        assert cpus.claim_gpus([A]) is None
+    finally:
+        os.umask(umask)
+    mode = (gpu_locks / f"mstar-gpu-{A}.lock").stat().st_mode & 0o777
+    assert mode == 0o644, "other users' servers couldn't open the lock, so none of them would pin on this GPU"
+
+
 @pytest.fixture
 def api_plan(tmp_path, monkeypatch):
     """``entrypoint.deployment_cpu_plan`` for a deployment on GPU ``A``, on the
