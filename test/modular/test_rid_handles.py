@@ -17,6 +17,7 @@ from mstar.utils.ipc_format import (
     TensorReceived,
 )
 from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
+from mstar.worker.rebuild import RebuildRow, Rebuilds
 from mstar.worker.rid_table import RidTable
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -169,6 +170,9 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._pending_removes = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._last_active = {}
+    w._rebuilds = Rebuilds({}, {})
+    w._rebuilds._kept = {"n": {a: None, b: None}}
+    w.scheduler.queue_rebuild(a, RebuildRow("n", "prefill", {}))
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
@@ -185,6 +189,8 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert b in w.request_state.per_request_info
     assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
+    assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
+    assert not w.scheduler.rebuilds, "the next request would run this one's rebuild row"
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
     assert t.intern("req-c") == a
@@ -258,6 +264,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w._draining_rids = set()
     w._last_active = {}
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w._rebuilds = Rebuilds({}, {})
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._unprocessed_messages = {}
     info = SimpleNamespace(
@@ -301,6 +308,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
+    w._rebuilds = Rebuilds({}, {})
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [Connection(
         from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",

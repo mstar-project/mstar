@@ -191,7 +191,7 @@ def _refuse_after_a_pool_filling_prefill(spans: dict[str, int]) -> _FailingWorke
     )
     worker._handle_admit_failure(batch, SimpleNamespace(
         node_name=SCHED_NODE, admit_error=outcome.reason,
-        failed_resource="kv", request_ids=list(spans), cached_rids=set(),
+        failed_resource="kv", request_ids=list(spans), cached_rids=set(), rebuild_rids=frozenset(),
     ))
     return worker
 
@@ -325,7 +325,7 @@ def test_a_row_the_cache_served_does_not_make_a_batch_too_big_alone():
     )
     worker._handle_admit_failure(batch, SimpleNamespace(
         node_name=SCHED_NODE, admit_error=reason, failed_resource="kv",
-        request_ids=list(spans), cached_rids={"cached"},
+        request_ids=list(spans), cached_rids={"cached"}, rebuild_rids=frozenset(),
     ))
 
     assert worker.offloaded == ["decoder"], "the request holding pages was not evicted"

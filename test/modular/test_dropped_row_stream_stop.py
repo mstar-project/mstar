@@ -26,6 +26,7 @@ from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
 NODE, WALK, LOOP = "vocoder", "w", "stream_loop"
@@ -119,6 +120,7 @@ def _worker(eng, runtime):
     w.enable_prof = False
     w.device = torch.device("cpu")
     w._last_active = {}
+    w._rebuilds = Rebuilds({}, {})
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(

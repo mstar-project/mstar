@@ -640,7 +640,7 @@ def test_engine_stop_check_takes_the_batched_path(request_walks):
     failures = {}
     batch = SimpleNamespace(
         node_name="decoder", request_ids=["eos", "word"], per_request_info_wrapped=infos,
-        register_failure=failures.setdefault,
+        register_failure=failures.setdefault, rebuild_rids=frozenset(),
         step_context=SimpleNamespace(graph_walk=DECODE_WALK, request_walks=request_walks),
     )
     engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
@@ -677,7 +677,7 @@ def test_a_batched_stop_check_that_raises_partway_records_each_token_once():
     failures = {}
     batch = SimpleNamespace(
         node_name="decoder", request_ids=["a", "b"], per_request_info_wrapped=_RaisesOnce(infos),
-        register_failure=failures.setdefault,
+        register_failure=failures.setdefault, rebuild_rids=frozenset(),
         step_context=SimpleNamespace(graph_walk=DECODE_WALK, request_walks=None),
     )
     engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})

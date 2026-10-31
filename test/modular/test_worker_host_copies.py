@@ -26,6 +26,7 @@ from mstar.graph.base import GraphEdge
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -90,6 +91,7 @@ def _worker(tmp_path):
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
     w._last_active = {}
+    w._rebuilds = Rebuilds({}, {})
     w._innermost_loop_by_node = {}
     w._graph_runtime = _AccumulatingRuntime()
     w.scheduler = SimpleNamespace(failed_rids=set())

@@ -1,4 +1,5 @@
 import functools
+import itertools
 import logging
 import time
 from collections import Counter, defaultdict, deque
@@ -19,6 +20,7 @@ from mstar.worker.batch_builder import (
 )
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import RebuildRow
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,9 @@ class ScheduledBatch:
     # A TP follower's copy of ``ScheduleTPNode.read_check``: the leader's rows,
     # in its order, including those this rank could not read; None for no check
     read_check_rids: tuple[int, ...] | None = None
+    # Rows that recompute dropped requests' KV (`MicroScheduler.queue_rebuild`). They run ahead of the
+    # batch's rows, under the batch's walk, and the graph runtime never sees them.
+    rebuild_rows: dict[int, RebuildRow] = field(default_factory=dict)
     # `rids_by_walk`, computed once; `merge` and `discard_rid` reset it
     _by_walk: dict[str, list[int]] | None = field(default=None, repr=False, compare=False)
 
@@ -276,6 +281,8 @@ class MicroScheduler:
 
         # (node, graph walk) -> ScheduledBatch
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
+        # (node, walk) -> handle -> its rebuild row, until the step that runs it goes out; see `queue_rebuild`
+        self.rebuilds: dict[tuple[str, str], dict[int, RebuildRow]] = {}
 
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
@@ -771,6 +778,11 @@ class MicroScheduler:
 
         if self.sched_type != SchedulingType.ROUND_ROBIN:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
+        if target is None and self.rebuilds:
+            # like a backlog, rebuild rows go before anything new starts, whatever `exclude_target` says
+            scheduled = self._schedule_rebuilds(request_state)
+            if scheduled is not None:
+                return scheduled
         # a targeted merge's pre-existing rows are of the target's own walk
         pre_existing_walk = target[1] if target is not None and pre_existing_batch_size else None
         # A chain merges and yields away within its own real walk, or its whole
@@ -837,6 +849,55 @@ class MicroScheduler:
         if rr_key is None or rr_key in keys:
             return None
         return schedule(rr_key, ready.get(rr_key, []))
+
+    def queue_rebuild(self, rid: int, row: RebuildRow) -> None:
+        """Queue ``rid``'s rebuild row. It stays queued until `take_rebuilds` is told its step went
+        out, so a step that is built and never launched loses no row."""
+        self.rebuilds.setdefault((row.node, row.walk), {})[rid] = row
+
+    def take_rebuilds(self, rids: Collection[int]) -> None:
+        """Unqueue the rebuild rows of ``rids``, whose step went out or whose request failed."""
+        for key in [*self.rebuilds]:
+            rows = self.rebuilds[key]
+            for rid in rids:
+                rows.pop(rid, None)
+            if not rows:
+                del self.rebuilds[key]
+
+    def rebuild_queued(self, rid: int) -> bool:
+        return any(rid in rows for rows in self.rebuilds.values())
+
+    def _runnable_rebuilds(self, node_walk: tuple[str, str]) -> dict[int, RebuildRow]:
+        """``node_walk``'s queued rebuild rows that aren't held, failed or being removed."""
+        now = time.monotonic()
+        return {
+            rid: row for rid, row in self.rebuilds.get(node_walk, {}).items()
+            if self.held_until.get(rid, 0.0) <= now and rid not in self.failed_rids
+            and rid not in self.pending_removes
+        }
+
+    def _schedule_rebuilds(self, request_state: RequestStateManager) -> ScheduledBatch | None:
+        """A step of the first (node, walk) with runnable rebuild rows: those rows up to the walk's cap,
+        then that walk's ready rows in the room left."""
+        for node_walk in [*self.rebuilds]:
+            rows = self._runnable_rebuilds(node_walk)
+            if not rows:
+                continue
+            node_name, walk = node_walk
+            cap = self._max_batch_size(node_name, walk)
+            if cap is not None:
+                rows = dict(itertools.islice(rows.items(), cap))
+            key = self._key(node_name, walk)
+            # a combined key's other walks wait, since the step runs the rebuild rows' walk alone. Scanning
+            # only this walk keeps their rows from paying a `check_ready`, which can read a request back in.
+            entries = self._scan_ready(request_state, node_walk, None).get(key, [])
+            batch = self._schedule_key(
+                request_state, key, entries, pre_existing_batch_size=len(rows),
+                capture_group_of=next(iter(rows)), pre_existing_walk=walk, only_walk=walk,
+            ) or ScheduledBatch(node_name=node_name, graph_walk=walk)
+            batch.rebuild_rows = rows
+            return batch
+        return None
 
     def _park_other_walks(
         self, request_state: RequestStateManager,
@@ -1442,6 +1503,9 @@ class MicroScheduler:
             scan_exclude = exclude_target
         if self._backlog_has_schedulable(exclude_target, exclude_walk):
             return True
+        # a speculation chain never merges a rebuild row, so one counts whatever the chain's walk
+        if any(self._runnable_rebuilds(node_walk) for node_walk in self.rebuilds):
+            return True
 
         # A failed rid is normally invisible here — get_next_batch refuses to
         # schedule it, so reporting it as ready would break the spec chain for
@@ -1531,6 +1595,8 @@ class MicroScheduler:
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)
+        for (node, _), queued in self.rebuilds.items():
+            rows[node] += sum(1 for rid in queued if rid not in exclude)
         for spec in self._rows_here(self.runtime.get_ready_nodes(exclude)):
             rows[spec.node_name] += len(spec.rids)
         return rows
@@ -1558,6 +1624,7 @@ class MicroScheduler:
         self.held_until.pop(rid, None)
         for rids in self.parked.values():
             rids.discard(rid)
+        self.take_rebuilds((rid,))
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)
 

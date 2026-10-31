@@ -31,6 +31,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 from mstar.worker.engine_manager import _refuse_speculated_spans  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
 NODE, WALK = "vocoder", "synth"
@@ -165,7 +166,7 @@ def _worker(engine: Engine) -> tuple[Worker, dict]:
         store_and_return_tensor_info_batch=store,
     )
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    worker._innermost_loop_by_node = {}
+    worker._innermost_loop_by_node, worker._rebuilds = {}, Rebuilds({}, {})
     worker.request_state = SimpleNamespace(buffer_publish_info=lambda *args: None)
     worker.scheduler = SimpleNamespace(failed_rids=set())
     return worker, stored

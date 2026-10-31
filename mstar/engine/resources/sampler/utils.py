@@ -2663,21 +2663,30 @@ class SamplerBuffers:
             0, self._slot_idx_gpu[cg_slot, :padded_bs]
         )
 
-    def _slots_of(self, request_ids: list[str]) -> torch.Tensor:
+    def _slots_of(
+        self, request_ids: list[str], kept_rids: "frozenset | None" = None,
+    ) -> torch.Tensor:
         slots = [
-            0 if isinstance(rid, int) and rid < 0 else self._rid_to_slot[rid]
+            0 if (isinstance(rid, int) and rid < 0)
+            or (kept_rids is not None and rid not in kept_rids)
+            else self._rid_to_slot[rid]
             for rid in request_ids
         ]
         return torch.tensor(slots, dtype=torch.long, device=self.last_token.master.device)
 
-    def write_last_tokens(self, request_ids: list[str], tokens: torch.Tensor) -> None:
+    def write_last_tokens(
+        self, request_ids: list[str], tokens: torch.Tensor,
+        kept_rids: "frozenset | None" = None,
+    ) -> None:
         """Eager-step write of ``tokens`` (``[len(request_ids)]``) to the
-        requests' master rows. Every request must be registered."""
+        requests' master rows. Every request must be registered. Rows outside
+        ``kept_rids`` go to the trash row, so their master rows stay unchanged."""
         if not request_ids:
             return
         self._sync_device_capacity()
         self.last_token.master.index_copy_(
-            0, self._slots_of(request_ids), tokens.to(self.last_token.master.dtype)
+            0, self._slots_of(request_ids, kept_rids),
+            tokens.to(self.last_token.master.dtype),
         )
 
     def last_tokens_for(self, request_ids: list[str]) -> torch.Tensor:
