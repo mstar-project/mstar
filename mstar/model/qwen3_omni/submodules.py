@@ -49,7 +49,6 @@ from mstar.engine.resources import (
     Segment,
     SlotLease,
     SubmoduleStep,
-    keep_final_chunk_samples,
 )
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -699,11 +698,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
             steps={
                 THINKER_KV: KVStep(),
                 THINKER_ATTN: AttentionStep(causal=True),
-                THINKER_SAMPLER: keep_final_chunk_samples(SamplerStep(
+                THINKER_SAMPLER: SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
                     kept_rids=kept_rids,
-                ), request_ids, inputs),
+                ),
                 THINKER_POS: PositionStep(
                     advance=pos_advance
                 )
@@ -1157,10 +1156,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
-        inputs = kwargs.get("inputs")
         return_token = request_info.graph_walk == "thinker_decode" or (
             request_info.step_metadata.get("is_last_prefill", False)
-            and (inputs is None or inputs.is_final_chunk)
         )
         if not return_token:
             outputs.pop("new_token", None)

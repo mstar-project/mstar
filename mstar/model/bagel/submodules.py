@@ -31,7 +31,6 @@ from mstar.engine.resources import (
     Segment,
     SlotLease,
     SubmoduleStep,
-    keep_final_chunk_samples,
 )
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
@@ -1120,14 +1119,14 @@ class LLMSubmodule(ARNodeSubmodule):
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
             # them — a sampled token is tracked by the sampler itself.
-            steps["sampler"] = keep_final_chunk_samples(SamplerStep(
+            steps["sampler"] = SamplerStep(
                 prefill_tracked_tokens={
                     rid: inp.input_ids
                     for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
                     if inp.input_ids is not None and walk == "prefill_text"
                 },
                 kept_rids=kept_rids,
-            ), request_ids, inputs)
+            )
         elif graph_walk == "prefill_vit":
             # prefill_vit is the last walk before decode for an image prompt,
             # so it samples the first token too (prefill_vae never does).
@@ -1700,10 +1699,8 @@ class LLMSubmodule(ARNodeSubmodule):
     ):
         if "new_token" not in outputs:
             return
-        inputs = kwargs.get("inputs")
         if request_info.graph_walk != "decode" and (
             not request_info.step_metadata.get("sample_prefill_token", False)
-            or (inputs is not None and not inputs.is_final_chunk)  # only the last chunk's token is real
         ):
             outputs.pop("new_token")
             return

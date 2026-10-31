@@ -21,7 +21,6 @@ from mstar.engine.resources import (
     Segment,
     SlotLease,
     SubmoduleStep,
-    keep_final_chunk_samples,
 )
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -143,10 +142,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             steps={
                 KV_CACHE: KVStep(),
                 ATTN: AttentionStep(causal=True),
-                SAMPLER: keep_final_chunk_samples(SamplerStep(
+                SAMPLER: SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens
-                ), request_ids, inputs),
+                ),
                 ROPE: PositionStep()
             }
         )
@@ -231,9 +230,6 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     ):
         # Metadata-only: rebind output name for graph routing. EOS check
         # moved to check_stop so the GPU thread doesn't sync on .item() here.
-        inputs = kwargs.get("inputs")
-        if inputs is not None and not inputs.is_final_chunk:
-            outputs.pop("new_token", None)  # only the last chunk's token is real
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]

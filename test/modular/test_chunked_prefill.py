@@ -643,25 +643,23 @@ def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(ca
 # ── sampler: a non-final chunk's token is not kept ────────────────────
 
 
-def test_a_non_final_chunks_row_leaves_the_kept_rows():
-    from mstar.engine.resources.sampler.config import SamplerStep, keep_final_chunk_samples
-    from mstar.model.submodule_base import ARNodeInputs
+def test_a_non_final_chunks_row_commits_no_sample():
+    """The sampler keeps a row mid-prefill out of what its draw commits by
+    itself, off the step context, so a model never has to know it chunks."""
+    from mstar.engine.resources.sampler.config import SamplerStep
+    from mstar.engine.resources.sampler.resource import SamplerResource
+    from mstar.engine.resources.step import StepContext
 
-    def row(start, total, n):
-        inp = ARNodeInputs(input_seq_len=n)
-        inp.chunk_start, inp.chunk_total = start, total
-        return inp
+    ctx = StepContext(request_ids=("d", "m", "l"), graph_walk="mixed", slot=0, capture=False)
+    ctx.chunk_tokens_after = {"m": 6}  # "l" runs its final chunk, "d" a decode token
 
-    whole, mid, last = ARNodeInputs(input_seq_len=1), row(0, 10, 4), row(4, 10, 6)
-
-    step = keep_final_chunk_samples(SamplerStep(), ["d", "m", "l"], [whole, mid, last])
-    assert step.kept_rids == {"d", "l"}
-
-    narrowed = keep_final_chunk_samples(SamplerStep(kept_rids=frozenset({"m"})), ["d", "m"], [whole, mid])
-    assert narrowed.kept_rids == frozenset()
+    assert SamplerResource._kept_rids_of(SamplerStep(), ctx) == {"d", "l"}
+    narrowed = SamplerStep(kept_rids=frozenset({"m", "l"}))
+    assert SamplerResource._kept_rids_of(narrowed, ctx) == {"l"}
 
     untouched = SamplerStep()
-    assert keep_final_chunk_samples(untouched, ["d"], [whole]) is untouched
+    plain = StepContext(request_ids=("d",), graph_walk="decode", slot=0, capture=False)
+    assert SamplerResource._kept_rids_of(untouched, plain) is None, "every row, as before"
 
 
 # ── load: the nodes the worker will not chunk ──────────────────────────

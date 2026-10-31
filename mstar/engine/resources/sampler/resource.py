@@ -118,7 +118,7 @@ class SamplerResource(Resource):
         # rid -> the prompt tokens a cache hit kept out of each walk's inputs. Keyed by the
         # position after them, so a repeated probe replaces its own entry.
         self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
-        # this step's `SamplerStep.kept_rids`, for the eager draw
+        # this step's kept rows (``_kept_rids_of``), for the eager draw
         self._kept_rids: frozenset[int] | None = None
         # row indices for `overwrite_rows`, H2D from a ring of pinned buffers
         self._row_stager: PinnedStager | None = None
@@ -358,10 +358,21 @@ class SamplerResource(Resource):
         lease = ctx.slot_lease
         return (tuple(ctx.padded_request_ids), lease.slot if lease is not None else None)
 
+    @staticmethod
+    def _kept_rids_of(step: SamplerStep, ctx: StepContext) -> frozenset[int] | None:
+        """The rows whose draw commits: ``step.kept_rids`` less any row mid-prefill.
+        A non-final chunk's token is not a real sample, so it advances no RNG
+        offset and marks no token seen."""
+        mid_prefill = ctx.chunk_tokens_after
+        if not mid_prefill:
+            return step.kept_rids
+        kept = frozenset(ctx.request_ids) if step.kept_rids is None else step.kept_rids
+        return kept - mid_prefill.keys()
+
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
-            self._kept_rids = step.kept_rids
+            self._kept_rids = self._kept_rids_of(step, ctx)
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -452,7 +463,7 @@ class SamplerResource(Resource):
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
-        kept = step.kept_rids
+        kept = self._kept_rids_of(step, ctx)
         keep = None if kept is None else [rid in kept for rid in ctx.request_ids]
         keep_gpu = None
         if self._keep_last_token and step.loopback_writes:

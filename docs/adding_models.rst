@@ -1209,17 +1209,12 @@ chunk is one iteration of a Loop around the node. To opt a walk in:
   (``tensor_inputs``, ``kwargs``, ``resource_step_info``).
 
 Each chunk is a full forward, so it samples a token, but only the final chunk's token is
-real (``inputs.is_final_chunk``). An autoregressive node that chunks must therefore:
-
-- In ``declare_step``, wrap its sampler step in ``keep_final_chunk_samples(step,
-  request_ids, inputs)``, so a non-final chunk's sample commits no RNG offset and marks no
-  token as seen.
-- Drop a non-final chunk's sampled token in ``postprocess``.
-
-``LLMSubmodule`` in ``mstar/model/qwen3_5/submodules.py`` does both. Nothing checks them at
-load, so cover them with a test: ``test/modular/test_chunked_prefill.py`` and
-``test/modular/test_bagel_chunked_prefill.py`` show how. A deployment can change the
-budgets (see *Chunked prefill budgets* in :doc:`serving`).
+real (``inputs.is_final_chunk``). The model need not handle that: the sampler commits no
+RNG offset or seen token for a row mid-prefill (it reads ``StepContext.chunk_tokens_after``),
+the Loop carries only the final chunk's outputs, and the worker takes no stop or prefix
+key from a non-final chunk. ``test/modular/test_chunked_prefill.py`` and
+``test/modular/test_bagel_chunked_prefill.py`` show how to test a chunking model. A
+deployment can change the budgets (see *Chunked prefill budgets* in :doc:`serving`).
 
 .. _Step 4a — Declare the step:
 

@@ -33,7 +33,7 @@ from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.sampler.config import SamplerStep, keep_final_chunk_samples
+from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
@@ -510,11 +510,11 @@ class LLMSubmodule(ARNodeSubmodule):
                 ATTN: AttentionStep(causal=True),
                 GDN_STATE: RecurrentStep(),
                 LINEAR_ATTN: LinearAttnStep(),
-                SAMPLER: keep_final_chunk_samples(SamplerStep(
+                SAMPLER: SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
                     kept_rids=kept_rids,
-                ), request_ids, inputs),
+                ),
                 ROPE: PositionStep(advance=advance),
             },
         )
@@ -621,11 +621,7 @@ class LLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        inputs = kwargs.get("inputs")
-        # only the last chunk's token is real
-        if not self._token_is_real(request_info) or (
-            inputs is not None and not inputs.is_final_chunk
-        ):
+        if not self._token_is_real(request_info):
             outputs.pop("new_token", None)
             return
         # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
