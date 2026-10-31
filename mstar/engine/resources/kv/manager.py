@@ -573,9 +573,9 @@ class KVManager(AttentionResource):
         self.config = cfg
         if len(cfg.groups) > 1 and needs_remote_transfer:
             raise ValueError(
-                f"KV {name}: a node on another instance reads this pool (its nodes or walks are "
-                "placed on more than one node group), and this pool keeps only a window of some "
-                "layers; serve its nodes from one node group"
+                f"KV {name}: a node on another instance reads this pool (replicas, or walks "
+                "placed on other ranks), and this pool keeps only a window of some layers; serve "
+                "its nodes from one TP group"
             )
         tp_cache = False
         if joint_comm_group is not None:
@@ -591,10 +591,10 @@ class KVManager(AttentionResource):
                 )
             if tp_cache and needs_remote_transfer:
                 raise ValueError(
-                    f"KV {name}: prefix_cache_tp needs this pool's nodes and walks in one node "
-                    "group (its replicas each keep their own cache). With a node or walk in another "
-                    "group the pool is shared, and a read from that group would take pages outside "
-                    "rank 0's order. Serve them from one node group or set prefix_cache_tp to false."
+                    f"KV {name}: prefix_cache_tp needs this pool's nodes on one TP group. With more "
+                    "than one (replicas, or walks placed on other ranks) the pool counts as shared, "
+                    "and a read from another group would take pages outside rank 0's order. Serve "
+                    "the nodes from one group or set prefix_cache_tp to false."
                 )
         self.kv_cache = KVCache(
             cfg, device, dtype
@@ -3056,6 +3056,8 @@ class KVManager(AttentionResource):
                         # that fills a page, and a plan off the cached one rereads a row whose
                         # pages changed (`_fast_decode_plan`): this touches no epoch.
                         self._apply_retention(segment.request_id, stream, group.retention, g, touch=False)
+                    if windows and segment.request_id in self._allotments:
+                        self._settle_window_allotment(segment, stream)
                     # The step's retention, if it declared one: drop what aged
                     # past the context budget now that this step's tokens
                     # count. Here, under the lock and before `commit_done`
@@ -3165,6 +3167,28 @@ class KVManager(AttentionResource):
         if touch:
             self._touch_plan_cache()
         return self._release_oldest_locked(rid, stream, excess, policy.protected_prefix, group)
+
+    def _settle_window_allotment(self, segment: Segment, stream: CacheStream) -> None:
+        """On the commit that writes the last of a stream's prompt, drop its window groups' share of
+        the allotment to the pages they hold. The allotment covers the prompt, and the pages a window
+        released while the prompt filled stayed in it for the prompt's later steps; past the prompt a
+        window's pages only cycle, so what it doesn't hold is room again. Under the lock."""
+        rid = segment.request_id
+        layout = self._held_layout(rid, segment.label)
+        if layout is None:
+            return
+        prompt = sum(span.length for span in layout.spans)
+        written = stream.stored_len + stream.released
+        overrides = self._overrides[rid]
+        if not written - segment.span < prompt <= written or segment.label not in overrides.opened_labels(self._nodes):
+            return
+        caps = dict.fromkeys(overrides.loop_caps or (), 0)
+        allotment = self._allotments[rid]
+        allotment.pages = max(0, allotment.pages - sum(
+            max(0, layout.pages(caps, group.page_size, group.retention) - len(stream.group(g).page_indices))
+            for g, group in self._windows
+        ))
+        self._recount(rid)
 
     def _release_oldest_locked(
         self, rid: str, stream: CacheStream, num_tokens: int, protected_prefix: int, group: int = 0,

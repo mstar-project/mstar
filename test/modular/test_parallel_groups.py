@@ -135,7 +135,6 @@ def test_global_instance_groups_determine_remote_transfer_need():
         "llm": frozenset({(0, 1)}),
         "llm_cfg": frozenset({(2, 3)}),
     }
-    groups.node_to_node_groups = {"llm": frozenset({0}), "llm_cfg": frozenset({1})}
 
     assert groups.resource_needs_remote_transfer(
         {"llm", "llm_cfg"}, {"llm"}
@@ -148,7 +147,7 @@ def test_global_instance_groups_determine_remote_transfer_need():
 
 
 def test_global_config_exposes_remote_replica_shapes_to_every_worker():
-    def worker_graph(node, ranks, tp_size, group):
+    def worker_graph(node, ranks, tp_size):
         return SimpleNamespace(
             section=SimpleNamespace(get_nodes=lambda: {node: None}),
             ranks=ranks,
@@ -158,13 +157,12 @@ def test_global_config_exposes_remote_replica_shapes_to_every_worker():
             _tp_ranks=[ranks] if tp_size > 1 else [],
             _sp_ranks=[],
             _instance_ranks=[ranks] if tp_size > 1 else [],
-            _group_id=group,
         )
 
     config = GlobalParallelConfig(
         worker_graphs={
-            "main": worker_graph("llm", [0, 1], 2, 0),
-            "cfg": worker_graph("llm_cfg", [2], 1, 1),
+            "main": worker_graph("llm", [0, 1], 2),
+            "cfg": worker_graph("llm_cfg", [2], 1),
         },
         worker_ids=["worker-0", "worker-1", "worker-2"],
     )
@@ -173,29 +171,6 @@ def test_global_config_exposes_remote_replica_shapes_to_every_worker():
     assert not worker_view.all_have_compatible_parallel_shape(
         {"llm", "llm_cfg"}
     )
-
-
-@pytest.mark.parametrize(("graphs", "remote"), [
-    ([("LLM", [0, 1], 1, 0)], False),                       # two replicas of one node group
-    ([("LLM", [0, 1, 2, 3], 2, 0)], False),                 # two TP2 replicas
-    ([("LLM", [0], 1, 0), ("LLM", [1], 1, 1)], True),       # a walk placed on other ranks
-    ([("LLM", [0], 1, 0), ("LLM_cfg", [1], 1, 1)], True),   # another node on other ranks
-    ([("LLM", [0], 1, None), ("LLM_cfg", [1], 1, None)], True),  # the same, node groups unset
-], ids=["replicas", "tp replicas", "walk elsewhere", "node elsewhere", "groups unset"])
-def test_only_another_node_group_reads_a_resource_remotely(graphs, remote):
-    """A request runs a node group's nodes on one of its replicas, so replicas never read
-    each other's copy of a resource."""
-    from mstar.model.base import WorkerGraph
-
-    worker_graphs = {
-        i: WorkerGraph(section=SimpleNamespace(get_nodes=lambda node=node: {node: None}),
-                       graph_walks={"decode"}, ranks=ranks, tp_size=tp,
-                       **({} if group is None else {"_group_id": group}))
-        for i, (node, ranks, tp, group) in enumerate(graphs)
-    }
-    config = GlobalParallelConfig(worker_graphs, [f"worker_{r}" for r in range(4)])
-    nodes = {node for node, *_ in graphs}
-    assert config.per_worker_config["worker_0"].resource_needs_remote_transfer(nodes, {"LLM"}) == remote
 
 
 @pytest.mark.parametrize(

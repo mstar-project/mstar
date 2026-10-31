@@ -427,8 +427,6 @@ class WorkerParallelGroups:
     node_to_instance_groups: dict[
         str, frozenset[tuple[int, ...]]
     ] = field(default_factory=dict)
-    # The config's node groups (by index) that run each node; one per walk at most
-    node_to_node_groups: dict[str, frozenset[int]] = field(default_factory=dict)
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
@@ -615,22 +613,17 @@ class WorkerParallelGroups:
     def resource_needs_remote_transfer(
         self, nodes: set[str], local_nodes: set[str],
     ) -> bool:
-        """Whether one request's reads of a logical resource can span more than one
-        worker instance. A request runs every node of a node group on one of its
-        replicas (`Conductor._assign_worker_graphs_to_workers`), so the replicas of a
-        group never read each other's copy."""
+        """Whether a logical resource spans more than one worker instance."""
         instance_groups: set[tuple[int, ...]] = set()
-        node_groups: set[int] = set()
         topology_known = True
         for node in nodes:
             groups = self.node_to_instance_groups.get(node)
-            if not groups or node not in self.node_to_node_groups:
+            if not groups:
                 topology_known = False
                 break
             instance_groups.update(groups)
-            node_groups.update(self.node_to_node_groups[node])
         if topology_known:
-            return len(instance_groups) > 1 and len(node_groups) > 1
+            return len(instance_groups) > 1
         # Preserve sensible behavior for hand-built/test configs that lack the
         # global maps: another named consumer necessarily needs a transfer.
         return bool(nodes - local_nodes)
@@ -680,7 +673,6 @@ class GlobalParallelConfig:
         )
         node_to_parallel_shapes: dict[str, set[tuple[int, int]]] = {}
         node_to_instance_groups: dict[str, set[tuple[int, ...]]] = {}
-        node_to_node_groups: dict[str, set[int]] = {}
         for wg in worker_graphs.values():
             shape = (wg._tp_comm_size, wg.sp_size)
             instance_groups = wg._instance_ranks or [
@@ -691,7 +683,6 @@ class GlobalParallelConfig:
                 node_to_instance_groups.setdefault(node, set()).update(
                     tuple(group) for group in instance_groups
                 )
-                node_to_node_groups.setdefault(node, set()).add(wg._group_id)
         frozen_parallel_shapes = {
             node: frozenset(shapes)
             for node, shapes in node_to_parallel_shapes.items()
@@ -727,12 +718,6 @@ class GlobalParallelConfig:
                 tp_allreduce_max_kb=tp_allreduce_max_kb,
                 node_to_parallel_shapes=frozen_parallel_shapes,
                 node_to_instance_groups=frozen_instance_groups,
-                # a WorkerGraph built without its node group (_group_id -1) leaves its
-                # nodes' topology unknown, so their pools count as shared
-                node_to_node_groups={
-                    node: frozenset(groups) for node, groups in node_to_node_groups.items()
-                    if min(groups) >= 0
-                },
             ) for i, wid in enumerate(worker_ids)
         }
 

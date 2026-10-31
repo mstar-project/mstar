@@ -165,6 +165,9 @@ def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceS
         cfg.keep_window(None, ())
         return problems
     if window is not None and cfg.prefix_cache:
+        if cfg.prefix_cache_given:
+            problems.append("keeps a sliding window, which doesn't prefix cache yet; drop its prefix_cache: true")
+            return problems
         logger.info("KV %s keeps a sliding window, which doesn't prefix cache yet: its prefix cache is off", name)
         cfg.prefix_cache = False
     return problems
