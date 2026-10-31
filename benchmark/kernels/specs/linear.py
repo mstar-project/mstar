@@ -118,13 +118,16 @@ def _graph_us(fn, x, weights, calls: int = 8) -> float:
         for i in range(calls):
             fn(x, weights[i % len(weights)])
     graph.replay()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
+    runs = []
     for _ in range(3):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
         graph.replay()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) * 1e3 / (3 * calls)
+        end.record()
+        end.synchronize()
+        runs.append(start.elapsed_time(end))
+    # a stall only adds time, so one in three replays must not move a ranking
+    return min(runs) * 1e3 / calls
 
 
 def _weights(w, nbytes: int, max_copies: int) -> list[torch.Tensor]:
