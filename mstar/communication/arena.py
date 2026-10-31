@@ -61,6 +61,7 @@ from mstar.communication.tensors import (
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.utils.containers import ParallelList
 from mstar.utils.host_copy import HostCopier
+from mstar.utils.threads import Thread
 
 logger = logging.getLogger(__name__)
 
@@ -945,7 +946,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 # staticmethod target closing over ONLY the queue: a bound
                 # method would pin the whole manager (and its arena — so
                 # segments never unlink) for the daemon thread's lifetime.
-                threading.Thread(
+                Thread(
                     target=self._watch_wakes, args=(self._wake_q,),
                     daemon=True,
                     name=f"arena-h2d-wake-{self.my_entity_id}").start()

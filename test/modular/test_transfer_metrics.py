@@ -21,9 +21,10 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.api_server import data_worker as data_worker_mod  # noqa: E402
-from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
+from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue  # noqa: E402
 from mstar.api_server.request_types import ResultTensors  # noqa: E402
 from mstar.communication.communicator import CommProtocol  # noqa: E402
+from mstar.communication.event import EventWakeup  # noqa: E402
 from mstar.communication.tensors import (  # noqa: E402
     AsyncMooncakeReader,
     MooncakeCommunicationManager,
@@ -374,8 +375,8 @@ def test_the_data_worker_loop_publishes_the_results_it_reads(tmp_path, monkeypat
     transfers = manager.enable_transfer_metrics()
     stop = threading.Event()
     thread = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
-        profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop, communicator=_Sink(),
         tensor_manager=manager, model=_TextModel(),

@@ -1,22 +1,23 @@
 """Denoise step prep reads no tensor on the host (Cosmos3, Wan 2.2, OmniVoice),
 and AR decode prep copies no pageable host data to the device (Higgs Audio).
 
-The loop-carried step counter (``time_index`` / ``step_index``) is the
-previous step's device output, so an ``.item()`` on it in ``prepare_inputs``
-waits for that step to finish and stalls the speculative preparation of the
-next one. These loops read the step from the engine's per-batch loop counter
-instead, as the DiT scaffold does, and keep Cosmos3's timesteps as a host list.
+A loop-carried step counter (``time_index`` / ``step_index``) is the previous
+step's device output, so an ``.item()`` on it in ``prepare_inputs`` waits for
+that step to finish and stalls the speculative preparation of the next one.
+These loops read the step from the engine's per-batch loop counter instead, as
+the DiT scaffold does, and keep Cosmos3's timesteps as a host list.
 
 Each test walks a short schedule (including the async-overshoot step the
 prepare vetoes) and checks, per step:
 
 * no host read of any tensor (``item`` / ``tolist`` / ``int()`` / ...) happens
   while preparing with the loop counter set, as the engine sets it;
-* the prepared inputs equal those of the edge-reading path, which is the
-  derivation the submodules used before (and still use for callers that pass
-  no loop counter).
+* for Cosmos3 and OmniVoice, the prepared inputs equal those of the edge-reading
+  path, which callers that pass no loop counter still use. Wan 2.2 carries no
+  such edge, so a missing counter is an error there.
 
-CPU only, no weights.
+No weights. Wan 2.2's whole step also runs under CUDA's sync-debug mode, which
+needs a GPU; everything else is CPU only.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 from torch.overrides import TorchFunctionMode
 
 from mstar.engine.windowing import WindowSchedule
@@ -114,29 +116,99 @@ def _check_schedule(prepare, walk_fwd, edge_inputs, loop, steps):
 
 # ---------------------------------------------------------------- Wan 2.2
 
+def _wan22_loop_inputs(shape, k):
+    return {
+        "text_embeds_pos": [torch.zeros(1, 8, 16)],
+        "text_embeds_neg": [torch.zeros(1, 8, 16)],
+        "latents": [torch.full(shape, float(k))],
+        "unipc_model_outputs": [torch.zeros((2, *shape))],
+        "unipc_last_sample": [torch.zeros(shape)],
+    }
+
+
 def test_wan22_step_prep_reads_no_tensor():
     sub = Wan22DitSubmodule(transformer=None, config=Wan22Config())
     shape = (1, 4, 2, 2, 2)
     steps = 3
 
-    def inputs(k):
-        return {
-            "text_embeds_pos": [torch.zeros(1, 8, 16)],
-            "text_embeds_neg": [torch.zeros(1, 8, 16)],
-            "latents": [torch.full(shape, float(k))],
-            "time_index": [torch.tensor([k], dtype=torch.int64)],
-            "unipc_model_outputs": [torch.zeros((2, *shape))],
-            "unipc_last_sample": [torch.zeros(shape)],
-        }
+    def prepare(k):
+        info = _fwd("r", "video_gen", {"num_inference_steps": steps}, DENOISE_LOOP_NAME, k)
+        return sub.prepare_inputs("video_gen", info, _wan22_loop_inputs(shape, k))
 
-    def fwd(loop, k):
-        return _fwd("r", "video_gen", {"num_inference_steps": steps}, loop, k)
+    for k in range(1, steps):
+        with _HostReads() as host:
+            got = prepare(k)
+        assert host.reads == [], f"step {k}: host reads {host.reads}"
+        assert got.tensor_inputs.keys() == _wan22_loop_inputs(shape, k).keys()
+        assert torch.equal(got.tensor_inputs["latents"], torch.full(shape, float(k)))
+    with _HostReads() as host:
+        assert prepare(steps) is None  # overshoot vetoed
+    assert host.reads == []
 
-    def prepare(fwd_info, inp):
-        return sub.prepare_inputs("video_gen", fwd_info, inp)
 
-    _check_schedule(prepare, fwd, inputs, DENOISE_LOOP_NAME, steps)
-    assert prepare(fwd(DENOISE_LOOP_NAME, steps), inputs(steps)) is None  # overshoot vetoed
+def test_wan22_step_prep_fails_without_the_loop_counter():
+    sub = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    info = _fwd("r", "video_gen", {"num_inference_steps": 3})
+    with pytest.raises(KeyError, match=DENOISE_LOOP_NAME):
+        sub.prepare_inputs("video_gen", info, _wan22_loop_inputs((1, 4, 2, 2, 2), 1))
+
+
+class _WanStubTransformer(nn.Module):
+    """The Wan DiT's call signature and output on device ops alone, so the only
+    host syncs a step can take are the submodule's and the solver's."""
+
+    dtype = torch.bfloat16
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states):
+        return hidden_states * (timestep[:, None, :, None, None] * 1e-3 + encoder_hidden_states.mean())
+
+
+def _wan22_steps(sub, walk, steps, latents, image_latent):
+    """``forward`` over a whole schedule as the engine drives it, the step from the
+    loop counter and the solver state over the loop-back edges."""
+    device = latents.device
+    ring, last = torch.zeros((2, *latents.shape), device=device), torch.zeros_like(latents)
+    text_pos = torch.full((1, 8, 16), 1.0, device=device, dtype=torch.bfloat16)
+    text_neg = torch.full((1, 8, 16), 0.5, device=device, dtype=torch.bfloat16)
+    for k in range(steps):
+        info = SimpleNamespace(
+            step_metadata={"num_inference_steps": steps, "guidance_scale": 5.0},
+            dynamic_loop_iter_counts={DENOISE_LOOP_NAME: k},
+        )
+        out = sub.forward(
+            walk, engine_inputs=SimpleNamespace(single_request_info=info),
+            latents=latents, unipc_model_outputs=ring, unipc_last_sample=last,
+            text_embeds_pos=text_pos, text_embeds_neg=text_neg, image_latent=image_latent,
+        )
+        latents, ring, last = out["latents"][0], out["unipc_model_outputs"][0], out["unipc_last_sample"][0]
+    return latents
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the host sync is a CUDA stream sync")
+@pytest.mark.parametrize("walk", ["video_gen", "video_gen_i2v"])
+def test_wan22_forward_takes_no_host_sync(walk):
+    """A step that waits on the GPU keeps the worker from queueing it behind the one
+    still running. Sync-debug mode raises on one: a host read of a device tensor, a
+    blocking copy from pageable memory, or ``linalg.solve``'s check of its info.
+    Four steps cover the predictor alone, both corrector orders and the last step."""
+    sub = Wan22DitSubmodule(_WanStubTransformer(), Wan22Config(in_channels=4, compile_dit=False))
+    gen = torch.Generator().manual_seed(0)
+    shape = (1, 4, 3, 4, 4)
+    latents = torch.randn(shape, generator=gen)
+    image_latent = torch.randn(shape, generator=gen) if walk == sub._I2V_WALK else None
+    want = _wan22_steps(sub, walk, 4, latents, image_latent)
+
+    latents = latents.cuda()
+    image_latent = None if image_latent is None else image_latent.cuda()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = _wan22_steps(sub, walk, 4, latents, image_latent)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    # the tables staged without a sync are the host's: the run lands where the host's does
+    assert torch.allclose(got.cpu(), want, atol=1e-2), (got.cpu() - want).abs().max()
 
 
 # ---------------------------------------------------------------- OmniVoice
