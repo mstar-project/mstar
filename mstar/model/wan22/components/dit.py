@@ -264,27 +264,22 @@ class Wan22DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             (self.scale_shift_table.unsqueeze(0) + timestep_proj.float()).chunk(6, dim=2)
         )
-        groups = timestep_proj.shape[1]
+        groups, dtype = timestep_proj.shape[1], hidden_states.dtype
 
         def grouped(tokens: torch.Tensor) -> torch.Tensor:
             return tokens.unflatten(1, (groups, -1))
 
-        norm_hidden = (grouped(self.norm1(hidden_states.float())) * (1 + scale_msa) + shift_msa)
-        attn_output = self.self_attn(
-            norm_hidden.flatten(1, 2).type_as(hidden_states), rotary_emb=rotary_emb, ragged=ragged_self,
-        )
-        hidden_states = (grouped(hidden_states.float()) + grouped(attn_output) * gate_msa).flatten(1, 2)
-        hidden_states = hidden_states.type_as(attn_output)
+        norm_hidden = grouped(self.norm1(hidden_states.float())) * (1 + scale_msa) + shift_msa
+        attn_output = self.self_attn(norm_hidden.flatten(1, 2).to(dtype), rotary_emb=rotary_emb, ragged=ragged_self)
+        hidden_states = (grouped(hidden_states.float()) + grouped(attn_output) * gate_msa).flatten(1, 2).to(dtype)
 
-        norm_hidden = self.norm2(hidden_states.float()).type_as(hidden_states)
+        norm_hidden = self.norm2(hidden_states.float()).to(dtype)
         attn_output = self.cross_attn(norm_hidden, encoder_hidden_states=encoder_hidden_states, ragged=ragged_cross)
         hidden_states = hidden_states + attn_output
 
         norm_hidden = grouped(self.norm3(hidden_states.float())) * (1 + c_scale_msa) + c_shift_msa
-        ff_output = self.ffn(norm_hidden.flatten(1, 2).type_as(hidden_states))
-        return (grouped(hidden_states.float()) + grouped(ff_output.float()) * c_gate_msa).flatten(1, 2).type_as(
-            hidden_states
-        )
+        ff_output = self.ffn(norm_hidden.flatten(1, 2).to(dtype))
+        return (grouped(hidden_states.float()) + grouped(ff_output.float()) * c_gate_msa).flatten(1, 2).to(dtype)
 
 
 class Wan22DiT(nn.Module):
