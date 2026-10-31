@@ -521,6 +521,74 @@ def act_and_mul_triton(
     )
 
 
+@triton.jit
+def act_and_mul_quant_fp8_kernel(
+    gateup_output_ptr,
+    q_ptr,
+    s_ptr,
+    inter,
+    SWIGLU_LIMIT,
+    eps,
+    fp8_min,
+    fp8_max,
+    GROUP: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    GROUPS_P2: tl.constexpr,
+    ACTIVATION_TYPE: tl.constexpr,
+    HAS_SWIGLU_CLAMP: tl.constexpr,
+):
+    """One slot's :func:`act_and_mul_kernel` row, quantized to e4m3 in ``GROUP``-wide groups as
+    :func:`mstar.utils.quant_fp8.per_token_group_quant_fp8_kernel` quantizes it: the same
+    values bit for bit, without the bf16 intermediate's round trip through memory."""
+    in_dtype = gateup_output_ptr.dtype.element_ty
+    row = tl.program_id(0).to(tl.int64)
+    g = tl.arange(0, GROUPS_P2)
+    offs = g[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+    mask = (g < NUM_GROUPS)[:, None]
+    gate = tl.load(gateup_output_ptr + row * 2 * inter + offs, mask=mask, other=0.0)
+    up = tl.load(gateup_output_ptr + row * 2 * inter + inter + offs, mask=mask, other=0.0)
+    if HAS_SWIGLU_CLAMP:
+        gate = tl.minimum(gate, SWIGLU_LIMIT)
+        up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+    activated = _apply_activation(gate, ACTIVATION_TYPE).to(in_dtype)
+    y = (activated * up).to(in_dtype).to(tl.float32)
+    y_s = tl.maximum(tl.max(tl.abs(y), axis=1), eps) / fp8_max
+    y_q = tl.minimum(tl.maximum(y / y_s[:, None], fp8_min), fp8_max).to(q_ptr.dtype.element_ty)
+    tl.store(q_ptr + row * inter + offs, y_q, mask=mask)
+    tl.store(s_ptr + row * NUM_GROUPS + g, y_s, mask=g < NUM_GROUPS)
+
+
+def act_and_mul_quant_fp8(
+    gateup_output: torch.Tensor,
+    group_size: int,
+    activation: str = "silu",
+    swiglu_limit: float | None = None,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`act_and_mul_triton` then ``per_token_group_quant_fp8(_, group_size)`` in one
+    launch: ``(q, s)``, e4m3 ``(M, inter)`` and fp32 ``(M, inter // group_size)``."""
+    assert gateup_output.is_contiguous() and gateup_output.dim() == 2
+    M, two_inter = gateup_output.shape
+    inter = two_inter // 2
+    assert inter % group_size == 0, f"inter {inter} must be a multiple of group_size {group_size}"
+    finfo = torch.finfo(FP8_DTYPE)
+    q = torch.empty((M, inter), dtype=FP8_DTYPE, device=gateup_output.device)
+    s = torch.empty((M, inter // group_size), dtype=torch.float32, device=gateup_output.device)
+    if M:
+        groups = inter // group_size
+        act_and_mul_quant_fp8_kernel[(M,)](
+            gateup_output, q, s, inter,
+            0.0 if swiglu_limit is None else swiglu_limit,
+            eps, finfo.min, finfo.max,
+            GROUP=group_size,
+            NUM_GROUPS=groups,
+            GROUPS_P2=triton.next_power_of_2(groups),
+            ACTIVATION_TYPE=activation,
+            HAS_SWIGLU_CLAMP=swiglu_limit is not None,
+        )
+    return q, s
+
+
 # ---------------------------------------------------------------------------
 # Sum-reduce over the top-k dimension
 # ---------------------------------------------------------------------------
