@@ -49,6 +49,7 @@ DECLARING_MODULES = (
     "mstar.engine.resources.sampler.unfiltered",
     "mstar.kernels.fp8_gemm",
     "mstar.platforms.rocm_gemm",
+    "mstar.platforms.rocm_dit_gemm",
 )
 
 _OPS: dict[str, KernelOp] = {}
