@@ -270,6 +270,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
         _device=torch.device("cpu"),
         _pre_plan_done={},
         _order_after_pre_plans=lambda: None,
+        _enter_rows=lambda batch, preplan: list(batch.request_ids),
         _runner=SimpleNamespace(
             pre_admit=lambda step: SimpleNamespace(ok=True),
             pre_plan=_raiser(RuntimeError("plan failed")),
