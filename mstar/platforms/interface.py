@@ -124,6 +124,12 @@ class Platform:
         """
         return {}
 
+    def compile_pool_overrides(self) -> dict[str, object]:
+        """``torch._inductor.config`` values in force while the engine builds
+        Inductor's compile pool. Unlike ``inductor_overrides`` these never reach
+        a graph's cache key. Empty keeps inductor's defaults."""
+        return {}
+
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         """Environment variables for settings a runtime or library reads once
         at init. Workers apply them with ``os.environ.setdefault`` before their
@@ -307,6 +313,13 @@ class RocmPlatform(Platform):
         if post is not None:
             overrides["post_grad_custom_post_pass"] = post
         return overrides
+
+    def compile_pool_overrides(self) -> dict[str, object]:
+        # Inductor's sidecar retires a pool that returned nothing for a minute
+        # without waiting for it. A worker of the next pool forked meanwhile
+        # inherits the old pool's shutdown lock held by a thread it doesn't
+        # have, and hangs at its first full GC with the first job it took.
+        return {"quiesce_async_compile_pool": False}
 
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         return {

@@ -1,4 +1,4 @@
-"""The platform's inductor settings, applied to one compiled callable."""
+"""The platform's inductor settings, applied to one compiled callable or to the compile pool."""
 
 from __future__ import annotations
 
@@ -35,3 +35,22 @@ def with_inductor_overrides(
             return fn(*args, **kwargs)
 
     return forward
+
+
+def start_compile_pool() -> None:
+    """Build Inductor's compile pool under the platform's ``compile_pool_overrides``.
+
+    Call before the process's first compile, since the first caller builds the
+    one pool. The pool reads these when built, and keeps them after the patch.
+    A value set in the environment would stay in the config instead, and so in
+    every graph's cache key.
+    """
+    overrides = current_platform.compile_pool_overrides()
+    if not overrides:
+        return
+
+    import torch._inductor.config as inductor_config
+    from torch._inductor.async_compile import AsyncCompile
+
+    with inductor_config.patch(**overrides):
+        AsyncCompile.warm_pool()
