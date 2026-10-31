@@ -1283,11 +1283,14 @@ first use. The first DiT call after startup is traced twice (a guard on the
 rotary table), so a server compiles at most two graphs per listed shape plus
 one.
 
-**UniPC runs inline, inside the DiT node.** Unlike cosmos3, the scheduler is not
-a separate stage: the solver state (the order-2 history buffer and the
-corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
-travels with the request rather than living in a scheduler object on one rank.
-Requests are therefore independent and the loop is resumable across ranks.
+**UniPC runs inline, inside the DiT node.** The scheduler is the DiT scaffold's
+(``components/diffusion/unipc.py``, which cosmos3 runs too), not a separate
+stage: the solver state (the order-2 history buffer and the corrector's
+``last_sample``) is carried on the denoise loop's own edges, so it travels with
+the request rather than living in a scheduler object on one rank. Requests are
+therefore independent and the loop is resumable across ranks. ``dit_max_batch_size``
+(default 1) lets requests at one latent grid and guidance scale share a forward,
+each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,

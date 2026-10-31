@@ -2,7 +2,7 @@
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
-    dit          -> Wan22DitSubmodule         (native 5B DiT + inline UniPC step)
+    dit          -> Wan22DitSubmodule         (native 5B DiT + the scaffold's UniPC)
     vae_decoder  -> Wan22VaeDecoderSubmodule  (Wan2.2-VAE decode)
 
 All four set ``disable_torch_compile``, so the engine never wraps their forwards: the
@@ -21,24 +21,18 @@ the v1 engine supplies neither the autocast nor the no-grad wrapper.
 import logging
 import os
 from contextlib import contextmanager
+from typing import NamedTuple
 
 import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
+from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.diffusion.unipc import make_unipc_tables
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.components.diffusion.unipc import (
-    SOLVER_ORDER,
-    UniPCState,
-    make_unipc_tables,
-    unipc_convert_model_output,
-    unipc_corrector_step,
-    unipc_effective_order,
-    unipc_predictor_step,
-)
 from mstar.model.wan22.config import Wan22Config
-from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -322,14 +316,25 @@ class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
 # dit
 # ---------------------------------------------------------------------------
 
-class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
-    """Dense 5B video DiT with the UniPC step run inline.
+class WanStepKey(NamedTuple):
+    """What has to match for two rows to share a dit forward."""
 
-    One loop iteration is one batch-2 transformer forward (the positive and
-    negative prompt embeddings stacked on the batch axis) plus one UniPC
-    predictor/corrector update from ``components/unipc.py``.
+    frames: int
+    height: int
+    width: int
+    # one combine per forward; above 1.0 is what turns the negative branch on
+    guidance: float
+    # I2V rows carry ``image_latent`` and keep frame 0 clean
+    i2v: bool
 
-    Loop-carried edges, all float32 over the latent grid:
+
+class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
+    """Dense 5B video DiT on the scaffold's denoise loop, stepped by its UniPC.
+
+    One loop iteration is one transformer forward over every row's positive and
+    negative embeddings, plus a UniPC predictor/corrector update per row.
+
+    Loop-carried edges, all float32 over ``[1, C, T, H, W]``:
 
         latents              current sample x_t
         unipc_model_outputs  ring buffer of the last two converted outputs;
@@ -340,40 +345,34 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     follow from the engine's loop counter and the per-request tables, so they are
     recomputed rather than shipped across an edge.
 
-    At iteration 0 the conductor sends the three edges empty and this submodule
-    seeds them (noise from the request's seed, on a CPU generator as diffusers
-    does). I2V also consumes the persisted ``image_latent``: frame 0 of the input
-    is replaced by it and its per-token timestep zeroed, and the conditioning is
-    written back into the output latents only on the final iteration, matching the
-    reference's post-loop injection.
+    At iteration 0 this submodule seeds the three edges (noise from the request's
+    seed, on a CPU generator as diffusers does). I2V also consumes the persisted
+    ``image_latent``: frame 0 of the input is replaced by it and its per-token
+    timestep zeroed, and the conditioning is written back into the output latents
+    only on the final iteration, matching the reference's post-loop injection.
     """
 
     # Mirrors Wan22Model.VIDEO_GEN_I2V_WALK; importing the model here would be a
     # circular import.
     _I2V_WALK = "video_gen_i2v"
 
-    # The WHOLE forward cannot be one compiled region: Inductor would fuse the UniPC
-    # step's `sample - sigma * output` and pass the 0-dim CPU-resident sigma as a
-    # device pointer, which fails on the first call. Moving sigma to CUDA would fix
-    # the launch but break bit-exactness against the reference (components/unipc.py).
-    # So the engine wrap stays OFF; instead the inner transformer region alone
-    # (patchify -> blocks -> head) is compiled in __init__ (config.compile_dit),
-    # leaving the solver, CFG combine, and everything touching sigma eager.
-    disable_torch_compile = True
-
     def __init__(self, transformer: nn.Module, config: Wan22Config):
-        super().__init__()
+        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size)
         self.transformer = transformer
         self.config = config
         self._record_fp32_islands()
-        # Compile the inner DiT region only (tensors in, tensor out; nothing
-        # CPU-resident crosses it), IN PLACE so ``self.transformer`` keeps its
-        # identity — fp32 islands, ``.dtype``, the tests' transformer swap.
-        # dynamic=False traces one graph per shape (first request at a new
-        # resolution pauses; logged in ``_noise_prediction``); fullgraph=False
-        # allows the SDPA graph break, matching cosmos3. Only the latent grids
-        # of ``config.compile_dit_sizes`` reach the compiled forward; every
-        # other grid runs ``_eager_forward``, the transformer's own forward.
+        # The WHOLE forward cannot be one compiled region: Inductor would fuse the
+        # UniPC step's `sample - sigma * output` and pass the 0-dim CPU-resident sigma
+        # as a device pointer, which fails on the first call. Moving sigma to CUDA
+        # would fix the launch but break bit-exactness against the reference
+        # (components/diffusion/unipc.py). So compile the inner DiT region only
+        # (tensors in, tensor out; nothing CPU-resident crosses it), IN PLACE so
+        # ``self.transformer`` keeps its identity — fp32 islands, ``.dtype``, the
+        # tests' transformer swap. dynamic=False traces one graph per shape (first
+        # request at a new resolution pauses; logged in ``_noise_prediction``);
+        # fullgraph=False allows the SDPA graph break, matching cosmos3. Only the
+        # latent grids of ``config.compile_dit_sizes`` reach the compiled forward;
+        # every other grid runs ``_eager_forward``, the transformer's own forward.
         self._compile_dit = bool(config.compile_dit)
         self._compile_grids = config.compile_dit_grids()
         self._compiled_shapes: set[tuple[int, ...]] = set()
@@ -391,123 +390,93 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                 sorted(self._compile_grids),
             )
 
-    def prepare_inputs(
-        self,
-        graph_walk: str,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        **kwargs,
-    ) -> NodeInputs | None:
-        tensor_inputs = {
-            "text_embeds_pos": inputs["text_embeds_pos"][0],
-            "text_embeds_neg": inputs["text_embeds_neg"][0],
-        }
-        if graph_walk == self._I2V_WALK:
-            tensor_inputs["image_latent"] = inputs["image_latent"][0]
+    def step_index(self, fwd_info: CurrentForwardPassInfo) -> int:
+        return _loop_step(fwd_info)
 
-        if "latents" not in inputs or len(inputs["latents"]) == 0:
-            # Iteration 0: the loop-back edges arrive empty, so seed them here.
-            device = self.get_device()
-            t_lat, h_lat, w_lat = _latent_grid(self.config, fwd_info.step_metadata)
-            shape = (1, self.config.in_channels, t_lat, h_lat, w_lat)
-            # randn_tensor parity: CPU generator, CPU randn, then move.
-            generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
-            latents = torch.randn(shape, generator=generator, dtype=torch.float32).to(device)
-            tensor_inputs["latents"] = latents
-            tensor_inputs["unipc_model_outputs"] = torch.zeros(
-                (SOLVER_ORDER, *shape), dtype=torch.float32, device=device
-            )
-            tensor_inputs["unipc_last_sample"] = torch.zeros(shape, dtype=torch.float32, device=device)
-        else:
-            k = _loop_step(fwd_info)
-            num_steps = int(fwd_info.step_metadata["num_inference_steps"])
-            if k >= num_steps:
-                # Async scheduling dispatched an iteration past this request's
-                # stop (check_stop fired at k == N - 1 but the conductor had
-                # already sent iteration N). Veto it: None makes the engine
-                # skip this forward — the cosmos3 pattern.
-                logger.info(
-                    "Wan2.2 dit: skipping async-overshoot iteration %d "
-                    "(request %s runs %d steps)",
-                    k, fwd_info.request_id, num_steps,
-                )
-                return None
-            tensor_inputs["latents"] = inputs["latents"][0]
-            tensor_inputs["unipc_model_outputs"] = inputs["unipc_model_outputs"][0]
-            tensor_inputs["unipc_last_sample"] = inputs["unipc_last_sample"][0]
-        return NodeInputs(tensor_inputs=tensor_inputs)
+    def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> WanStepKey:
+        meta = fwd_info.step_metadata
+        return WanStepKey(
+            *_latent_grid(self.config, meta), guidance=float(meta["guidance_scale"]),
+            i2v=fwd_info.graph_walk == self._I2V_WALK,
+        )
 
-    def forward(
+    def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey) -> FlowMatchSchedule:
+        sigmas, timesteps = make_unipc_tables(
+            int(fwd_info.step_metadata["num_inference_steps"]), self.config.flow_shift,
+        )
+        return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
+
+    def seed_latents(
+        self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey, generator: torch.Generator,
+    ) -> torch.Tensor:
+        shape = (1, self.config.in_channels, bucket_key.frames, bucket_key.height, bucket_key.width)
+        # randn_tensor parity: CPU generator, CPU randn, then move.
+        return torch.randn(shape, generator=generator, dtype=torch.float32)
+
+    def request_inputs(
+        self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, bucket_key: WanStepKey,
+    ) -> dict[str, torch.Tensor]:
+        tensors = {name: inputs[name][0] for name in ("text_embeds_pos", "text_embeds_neg")}
+        if bucket_key.i2v:
+            tensors["image_latent"] = inputs["image_latent"][0]
+        return tensors
+
+    def num_tokens(self, bucket_key: WanStepKey) -> int:
+        return bucket_key.frames * bucket_key.height * bucket_key.width // 4  # patch_size (1, 2, 2)
+
+    @staticmethod
+    def _first_frame_mask(sample: torch.Tensor) -> torch.Tensor:
+        """Zero on the frame an I2V request keeps clean, one elsewhere."""
+        mask = torch.ones(1, 1, *sample.shape[-3:], dtype=torch.float32, device=sample.device)
+        mask[:, :, 0] = 0
+        return mask
+
+    def denoise(
+        self, engine_inputs: ModelInputsFromEngine, bucket_key: WanStepKey, latents: torch.Tensor,
+        timestep: torch.Tensor, **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        """A row of ``latents`` is ``[1, C, T, H, W]``: it keeps the batch dim the
+        transformer and the solver see it with."""
+        with _inference_ctx():
+            out = super().denoise(engine_inputs, bucket_key, latents, timestep, **kwargs)
+            if bucket_key.i2v:
+                # The reference injects post-loop, and the final iteration is where
+                # the latents edge routes to the VAE decoder.
+                mask = self._first_frame_mask(latents)
+                infos = (engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids)
+                out[self.LATENTS] = torch.stack([
+                    (1 - mask) * image_latent + mask * sample
+                    if self.step_index(info) + 1 >= self.request_state(info.rid_handle)["num_steps"] else sample
+                    for info, image_latent, sample in zip(infos, kwargs["image_latent"], out[self.LATENTS], strict=True)
+                ])
+        return out
+
+    def model_output(
         self,
-        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
+        bucket_key: WanStepKey,
         latents: torch.Tensor,
-        unipc_model_outputs: torch.Tensor,
-        unipc_last_sample: torch.Tensor,
+        timestep: torch.Tensor,
         text_embeds_pos: torch.Tensor,
         text_embeds_neg: torch.Tensor,
         image_latent: torch.Tensor | None = None,
-        **kwargs,
-    ) -> NameToTensorList:
-        fwd_info = engine_inputs.single_request_info
-        step_metadata = fwd_info.step_metadata
-        num_steps = int(step_metadata["num_inference_steps"])
-        guidance_scale = float(step_metadata["guidance_scale"])
-        k = _loop_step(fwd_info)
-        device = latents.device
+    ) -> torch.Tensor:
+        batch = latents.flatten(0, 1)
+        if bucket_key.i2v:
+            mask = self._first_frame_mask(batch)
+            model_input = (1 - mask) * image_latent.flatten(0, 1) + mask * batch
+        else:
+            mask = torch.ones(1, 1, *batch.shape[2:], dtype=torch.float32, device=batch.device)
+            model_input = batch
 
-        with _inference_ctx():
-            sigmas, timesteps = make_unipc_tables(num_steps, self.config.flow_shift)
-            sigmas_device = to_device_nonblocking(sigmas, device)
-            t = to_device_nonblocking(timesteps, device)[k]
-
-            # All-ones for T2V; frame 0 zeroed for I2V.
-            mask = torch.ones(1, 1, *latents.shape[2:], dtype=torch.float32, device=device)
-            if graph_walk == self._I2V_WALK:
-                mask[:, :, 0] = 0
-                model_input = (1 - mask) * image_latent + mask * latents
-            else:
-                model_input = latents
-            model_input = model_input.to(self.transformer.dtype)
-
-            # expand_timesteps: every token of a latent frame takes its frame's
-            # timestep (patch_size (1, 2, 2) keeps the frame axis); I2V frame 0 gets 0.
-            temp_ts = mask[0, 0, :, 0, 0] * t
-            noise_pred = self._noise_prediction(
-                model_input, temp_ts, text_embeds_pos, text_embeds_neg, guidance_scale
-            )
-
-            # Inline UniPC step (exact port; see components/unipc.py).
-            m_k = unipc_convert_model_output(noise_pred, latents, sigmas, k)
-            sample = latents
-            if k > 0:
-                sample = unipc_corrector_step(
-                    UniPCState(model_outputs=unipc_model_outputs, last_sample=unipc_last_sample),
-                    this_model_output=m_k,
-                    this_sample=sample,
-                    sigmas=sigmas_device,
-                    step_index=k,
-                    order=unipc_effective_order(k - 1, num_steps),
-                )
-            new_ring = torch.stack([unipc_model_outputs[1], m_k])
-            new_latents = unipc_predictor_step(
-                UniPCState(model_outputs=new_ring, last_sample=sample),
-                sample=sample,
-                sigmas=sigmas_device,
-                step_index=k,
-                order=unipc_effective_order(k, num_steps),
-            )
-
-            if graph_walk == self._I2V_WALK and k + 1 >= num_steps:
-                # The reference injects post-loop, and the final iteration is where
-                # the latents edge routes to the VAE decoder.
-                new_latents = (1 - mask) * image_latent + mask * new_latents
-
-        return {
-            "latents": [new_latents],
-            "unipc_model_outputs": [new_ring],
-            "unipc_last_sample": [sample],
-        }
+        # expand_timesteps: every token of a latent frame takes its frame's
+        # timestep (patch_size (1, 2, 2) keeps the frame axis); I2V frame 0 gets 0.
+        temp_ts = (mask[0, 0, :, 0, 0] * timestep[:, None]).squeeze(0)
+        output = self._noise_prediction(
+            model_input.to(self.transformer.dtype), temp_ts, text_embeds_pos.flatten(0, 1),
+            text_embeds_neg.flatten(0, 1), bucket_key.guidance,
+        )
+        return output[:, None]
 
     def _noise_prediction(
         self,
@@ -517,17 +486,18 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         text_embeds_neg: torch.Tensor,
         guidance_scale: float,
     ) -> torch.Tensor:
-        """CFG noise prediction; one batch-2 forward instead of the
-        reference's two sequential forwards. The combine runs in the
-        transformer's output dtype (bf16), like the reference."""
+        """CFG noise prediction; one forward over every row's two branches instead
+        of the reference's two sequential forwards. The combine runs in the
+        transformer's output dtype (bf16), like the reference. ``temp_ts`` is per
+        row, ``[B, frames]``, or one row's ``[frames]``."""
         do_cfg = guidance_scale > 1.0
-        batch = 2 if do_cfg else 1
-        hidden_states = model_input.repeat(batch, 1, 1, 1, 1)
-        timestep = temp_ts.unsqueeze(0).expand(batch, -1)
+        branches = 2 if do_cfg else 1
+        hidden_states = model_input.repeat(branches, 1, 1, 1, 1)
+        timestep = temp_ts.repeat(branches, 1)
         # dynamic=False keys the compiled trace on the full input shape (batch
-        # included, so CFG and no-CFG are distinct graphs). Announce the one-time
-        # compile pause the first time a shape is seen, so an operator watching the
-        # log knows why the first request at a new resolution is slow.
+        # included, so each row count and CFG on or off are distinct graphs). Announce
+        # the one-time compile pause the first time a shape is seen, so an operator
+        # watching the log knows why the first request at a new resolution is slow.
         compiled = self._compile_dit and tuple(hidden_states.shape[2:]) in self._compile_grids
         if compiled:
             shape_key = tuple(hidden_states.shape)
@@ -551,30 +521,9 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         )
         if not do_cfg:
             return out
-        noise_cond, noise_uncond = out[0:1], out[1:2]
+        rows = model_input.shape[0]
+        noise_cond, noise_uncond = out[:rows], out[rows:]
         return noise_uncond + guidance_scale * (noise_cond - noise_uncond)
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        """Stop the denoise loop after exactly ``num_inference_steps`` iterations.
-
-        While iteration k (0-based) is being postprocessed the iteration count
-        still reads k, and the stop registered here ends the loop at the end of
-        that iteration. So for N steps it must fire at k == N - 1, i.e. when
-        ``k + 1 >= N``. The dit node runs with async scheduling, so the
-        conductor may dispatch a speculative iteration N before this stop
-        lands; ``prepare_inputs`` vetoes that overshoot by returning None, and
-        ``>=`` keeps the stop firing when the deferred count reads N.
-        """
-        iter_idx = request_info.dynamic_loop_iter_counts.get(DENOISE_LOOP_NAME, 0)
-        requested = int(request_info.step_metadata.get("num_inference_steps", 0) or 0)
-        if requested > 0 and iter_idx + 1 >= requested:
-            return {DENOISE_LOOP_NAME}
-        return set()
 
 
 # ---------------------------------------------------------------------------
