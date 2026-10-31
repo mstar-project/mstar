@@ -8,7 +8,7 @@ import time
 import time as _time
 from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -60,7 +60,7 @@ from mstar.model.submodule_base import BatchedModelOutput, HostRows
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.streaming.topology import Connection, ProducerWalkCtx
-from mstar.utils import knobs
+from mstar.utils import cpus, knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.device import DeviceCapability
@@ -91,6 +91,7 @@ from mstar.utils.profiler import (
     range_pop,
     range_push,
 )
+from mstar.utils.threads import ThreadPool, pin_thread
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -351,6 +352,11 @@ class Worker:
     _lockstep_led: frozenset[str] = frozenset()
     _lockstep_unread: Mapping[int, set[str]] = MappingProxyType({})
 
+    # The CPUs the main, GPU and plan threads share (None: not pinned) and
+    # the process mask everything else keeps; see ``mstar.utils.cpus``.
+    _step_cpus: cpus.StepCpus | None = None
+    _process_cpus: frozenset[int] = frozenset()
+
     @cached_property
     def device_capability(self) -> DeviceCapability:
         return DeviceCapability.of(self.device)
@@ -376,6 +382,7 @@ class Worker:
         tcp_transfer_device="",
         dist_init_method=None,
         status_interval_s: float | None = None,
+        local_worker_devices: list[str] | None = None,
         all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
     ):
         # before anything below builds a resource or a submodule that reads one
@@ -416,6 +423,7 @@ class Worker:
 
         if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
+        self._plan_step_cpus(worker_ids, local_worker_devices)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
@@ -1663,6 +1671,7 @@ class Worker:
             final_edges=final_edges,
             per_request_input_metadata=per_request_input_metadata,
             request_walks=batch.request_walks,
+            engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
         )
         node_batch.read_check_rids = batch.read_check_rids
         for rid in unresolved:
@@ -1955,11 +1964,43 @@ class Worker:
         lands on device 0's stream, unordered with the real compute.
 
         It also applies mstar's dynamo config, because dynamo config is
-        per-thread since torch 2.12 and this thread compiles.
+        per-thread since torch 2.12 and this thread compiles, and moves the
+        thread to the step CPUs.
         """
         if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
         apply_dynamo_config()
+        self._pin_step_thread()
+
+    def _plan_step_cpus(
+        self, worker_ids: list[str], local_worker_devices: list[str] | None,
+    ) -> None:
+        """Build this process's CPU plan, keep this worker's step CPUs and log
+        them. A ``step_thread_core`` number the mask can't honour raises.
+
+        ``local_worker_devices`` is the device of every worker the conductor
+        started, in ``worker_ids`` order; standalone, this worker is the only
+        one.
+        """
+        devices = local_worker_devices or [str(self.device)]
+        slot = worker_ids.index(self.worker_id) if local_worker_devices else 0
+        plan = cpus.devices_plan(knobs.step_thread_core(), devices)
+        cpus.install(plan)
+        self._process_cpus = plan.mask
+        self._step_cpus = plan.workers[slot] if plan.workers else None
+        step = self._step_cpus
+        if step is None:
+            logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, plan.why)
+        else:
+            logger.info(
+                "Worker %s: step threads (main, GPU, plan) on CPUs %s (%s; %s, worker %d of %d, mask %s)",
+                self.worker_id, cpus.format_cpu_list(step.cpus), step.why,
+                self.device, slot + 1, len(devices), cpus.format_cpu_list(plan.mask),
+            )
+
+    def _pin_step_thread(self) -> None:
+        if self._step_cpus is not None:
+            pin_thread(self._step_cpus.cpus, self._process_cpus)
 
     @contextmanager
     def _span(self, name: str, cpu: str | None = None):
@@ -2195,7 +2236,7 @@ class Worker:
 
     def _submit_gpu_step(
         self,
-        gpu_executor: ThreadPoolExecutor,
+        gpu_executor: ThreadPool,
         batch: ScheduledBatch,
         node_batch: ExecutingBatch,
         plan_future: Future | None,
@@ -2743,7 +2784,7 @@ class Worker:
         return SpeculationContext(
             graph_runtime=self._graph_runtime, tensor_manager=self.tensor_manager,
             request_state=self.request_state, scheduler=self.scheduler,
-            streams=self.streams,
+            streams=self.streams, engine_manager=self.engine_manager,
         )
 
     @cached_property
@@ -2979,7 +3020,7 @@ class Worker:
 
         new_request_to_worker_graph: dict[int, int] = {}
         per_request_inputs: dict[int, NameToTensorList] = {}
-        for rid in head_rids:  # wire order == the leader's batch order
+        for rid in head_rids:  # wire order == the leader's step order, split rows ordered
             if rid in prep_inputs:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
                 per_request_inputs[rid] = prep_inputs[rid]
@@ -3428,6 +3469,8 @@ class Worker:
             _pp_stage("route_and_send")
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+            engine.after_output_copy(batch_N.node_batch)
+            _pp_stage("after_output_copy")
             return
         stored, route_output, signals = self._store_and_route(
             batch_N, outputs, rids, walks, rid_walk_idx, cpu_outputs,
@@ -3479,6 +3522,8 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+        engine.after_output_copy(batch_N.node_batch)
+        _pp_stage("after_output_copy")
 
     def _route_and_send_fast(
         self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
@@ -4523,11 +4568,16 @@ class Worker:
             ),
         )
 
+        # The main thread hands every step to the GPU and plan threads and
+        # back, so all three move to the step CPUs (each executor thread in
+        # its initializer).
+        self._pin_step_thread()
+
         # The async worker path needs decode submission to return quickly so
         # the main loop can overlap queue/tensor polling and post-processing
         # with GPU execution. Run the engine unconditionally on a dedicated
         # 1-worker GPU thread.
-        gpu_executor = ThreadPoolExecutor(
+        gpu_executor = ThreadPool(
             max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}",
             initializer=self._init_engine_thread,
         )
@@ -4552,7 +4602,7 @@ class Worker:
         launch_wait_s = self._launch_wait_s
         plan_executor = None
         if pre_plan_spec:
-            plan_executor = ThreadPoolExecutor(
+            plan_executor = ThreadPool(
                 max_workers=1, thread_name_prefix=f"mstar-plan-{self.worker_id}",
                 initializer=self._init_engine_thread,
             )

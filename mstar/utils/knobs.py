@@ -19,6 +19,7 @@ KNOBS: dict[str, str] = {
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
+    "step_thread_core": "MSTAR_STEP_THREAD_CORE",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -41,7 +42,9 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
         )
     out = {}
     for key, value in settings.items():
-        if isinstance(value, bool):
+        if key == "step_thread_core":
+            out[key] = _step_thread_core_value(value)
+        elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
             out[key] = str(value)
@@ -50,6 +53,19 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
                 f"`knobs: {key}` must be a bool or an integer, got {value!r}"
             )
     return out
+
+
+def _step_thread_core_value(value: object) -> str:
+    # yaml reads a bare ``off`` as False
+    if isinstance(value, bool):
+        return "auto" if value else "off"
+    if isinstance(value, int) and value >= 0:
+        return str(value)
+    if isinstance(value, str) and value.strip().lower() in ("auto", "off"):
+        return value.strip().lower()
+    raise ValueError(
+        f"`knobs: step_thread_core` must be auto, off or a CPU number, got {value!r}"
+    )
 
 
 def configure(settings: Mapping[str, object] | None) -> None:
@@ -162,3 +178,19 @@ def pre_plan_enabled() -> bool:
     4 layers), where the step is too short to hide the planning in and the
     extra thread is just GIL contention."""
     return _setting("pre_plan", "1") == "1"
+
+
+def step_thread_core() -> str | int:
+    """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``off``):
+    pin each worker's main, GPU and plan threads, and the API server's result
+    threads, to CPUs of their own. ``auto`` places them by the GPU's rank on
+    its NUMA node, a number is the first worker's CPU (see
+    ``mstar.utils.cpus``)."""
+    value = _setting("step_thread_core", "off").strip().lower()
+    if value in ("auto", "off"):
+        return value
+    if value.isdigit():
+        return int(value)
+    raise ValueError(
+        f"MSTAR_STEP_THREAD_CORE must be auto, off or a CPU number, got {value!r}"
+    )

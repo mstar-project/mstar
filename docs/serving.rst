@@ -338,8 +338,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold`` and ``pre_plan``
-       (``true``/``false`` or an integer). Each one's environment variable
+       ``gc_gen0_threshold``, ``pre_plan`` and ``step_thread_core``
+       (``true``/``false`` or an integer; ``step_thread_core`` takes
+       ``off``, the default, ``auto`` or a CPU number). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
@@ -393,7 +394,10 @@ pool's pages divided by the pages one request needs, prompt and output together,
 safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload
 frees only the device pages no other running request reads, though, so a request that
 shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap.
+It doesn't replace the cap. With a host pool and the prefix cache on, a cached page is
+copied to the host once no request holds it, and a later request whose prefix the device
+evicted copies it back from there. So the host pool should hold more pages than the device's
+prefix cache.
 
 **Single GPU.** Everything on rank 0:
 

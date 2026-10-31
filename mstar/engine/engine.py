@@ -296,6 +296,8 @@ class ExecutingBatch:
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
     step: SubmoduleStep | None = None
+    # the step the batch committed last: a batch run row by row commits once per row
+    committed: SubmoduleStep | None = None
 
     # {request_id: {input_name: [tensor]}}, what prepare_inputs reads
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
@@ -487,6 +489,8 @@ class Engine:
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
+        # (node, combined walk) -> the walks whose rows a step of it runs last
+        self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -566,6 +570,7 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
+            self._add_split_row_order(spec, relevant_nodes)
             declared_by[spec.resource_key] = frozenset(spec.nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
@@ -1132,6 +1137,10 @@ class Engine:
         if mgmt is None:
             return frozenset()
         return mgmt.submodule.device_loopback_signals(graph_walk)
+
+    def after_output_copy(self, batch: ExecutingBatch) -> None:
+        if batch.committed is not None:
+            self._runner.after_output_copy(batch.committed)
 
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
@@ -1740,6 +1749,7 @@ class Engine:
             t0 = phase_start()
             try:
                 self._runner.commit(step)
+                batch.committed = step
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:
@@ -2276,6 +2286,33 @@ class Engine:
             graph_walk, {request_id: request_info},
             per_request_input_metadata={request_id: input_metadata},
         )
+
+    def _add_split_row_order(self, spec: NodeResourceSpec, nodes: set[str]) -> None:
+        """Record the row order ``spec``'s split kernels read (``CombinedSplit``)."""
+        for split in spec.combined_splits():
+            last = frozenset(split.prefill_walks)
+            for node in nodes:
+                key = (node, split.combined_walk)
+                if self._split_prompt_walks.setdefault(key, last) != last:
+                    raise ValueError(
+                        f"resource {spec.resource_key!r}: {node!r} splits combined walk "
+                        f"{split.combined_walk!r} with prefill walks {sorted(last)}, "
+                        f"another resource with {sorted(self._split_prompt_walks[key])}"
+                    )
+
+    def order_split_rows(
+        self, node_name: str, graph_walk: str, request_ids: list[int],
+        request_walks: Mapping[int, str],
+    ) -> list[int]:
+        """``request_ids`` as a step of ``graph_walk`` runs them: a walk run on
+        split kernels takes its prefill walks' rows last, in their order."""
+        last = self._split_prompt_walks.get((node_name, graph_walk))
+        if last is None:
+            return request_ids
+        first = [rid for rid in request_ids if request_walks.get(rid) not in last]
+        if len(first) == len(request_ids):
+            return request_ids
+        return first + [rid for rid in request_ids if request_walks.get(rid) in last]
 
     @staticmethod
     def _max_rows_in_combined(

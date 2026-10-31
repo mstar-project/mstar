@@ -10,12 +10,12 @@ from __future__ import annotations
 import io
 import struct
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
 
-from mstar.utils.cpus import usable_cpus
+from mstar.utils import cpus
+from mstar.utils.threads import ThreadPool
 
 
 def patchify_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -81,17 +81,15 @@ def pixels_to_uint8(image: torch.Tensor) -> torch.Tensor:
     return (image * 255).round().to(torch.uint8)
 
 
-PNG_WORKERS = min(8, usable_cpus())
-
-
 def uint8_to_png(
-    image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int = PNG_WORKERS,
+    image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int | None = None,
 ) -> bytes:
     """Encode one uint8 ``[3, H, W]`` (or ``[1, 3, H, W]``) tensor as PNG bytes, losslessly.
 
     The default writer emits every scanline with PNG filter 0 and deflates the image in
-    ``workers`` independent blocks stitched into one zlib stream (pigz-style: each block ends
-    on a byte boundary with a sync flush, one adler32 over the whole image). At level 1 on
+    ``workers`` independent blocks (default: the CPU plan's ``png_threads``) stitched into one
+    zlib stream (pigz-style: each block ends on a byte boundary with a sync flush, one adler32
+    over the whole image). At level 1 on
     8 threads a 1024x1024 image encodes in ~15 ms against ~440 ms for PIL's default
     (adaptive filters, zlib 6), which was half of a served request, at ~30% larger files.
     ``adaptive_filters=True`` hands the encode to PIL at the same zlib level for the smaller
@@ -115,7 +113,7 @@ def uint8_to_png(
     return b"".join((
         b"\x89PNG\r\n\x1a\n",
         _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),  # 8-bit RGB
-        _png_chunk(b"IDAT", _zlib_parallel(raw.tobytes(), compress_level, workers)),
+        _png_chunk(b"IDAT", _zlib_parallel(raw.tobytes(), compress_level, workers or cpus.plan().png_threads)),
         _png_chunk(b"IEND", b""),
     ))
 
@@ -138,7 +136,7 @@ def _zlib_parallel(data: bytes, level: int, workers: int, min_block: int = 1 << 
         out = compressor.compress(part)
         return out + compressor.flush(zlib.Z_FINISH if index == blocks - 1 else zlib.Z_SYNC_FLUSH)
 
-    with ThreadPoolExecutor(max_workers=blocks) as pool:
+    with ThreadPool(max_workers=blocks) as pool:
         deflated = list(pool.map(deflate, range(blocks), parts))
     # zlib header: deflate, 32K window, no preset dictionary, "fastest" level hint (FCHECK ok)
     return b"\x78\x01" + b"".join(deflated) + struct.pack(">I", zlib.adler32(data) & 0xFFFFFFFF)
