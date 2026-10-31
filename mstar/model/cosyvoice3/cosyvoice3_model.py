@@ -220,7 +220,7 @@ class CosyVoice3Model(Model):
             return
         kv = next(s for s in self.get_node_resources() if s.resource_key == LM_KV).config
         overrides = (config.get("resources") or {}).get(LM_KV) or {}
-        page_size = int(overrides.get("page_size", kv.page_size))
+        page_size = int(overrides.get("page_size", kv.tokens_per_page))
         max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
         need = 1 + int(cap) * -(-self._max_seq_len() // page_size)
         if need > max_num_pages:
