@@ -729,6 +729,13 @@ def filter_top_k_top_p(
     return _top_k_renorm_probs(probs, torch.minimum(n.to(torch.int32), k))
 
 
+def top_k_first_filter(probs: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
+    """The distribution FlashInfer's ``top_k_top_p_sampling_from_probs`` draws
+    from, as a vector: top-k, then top-p of the renormalised rest. ``top_k`` at
+    the vocabulary or above and ``top_p`` of 1 are off. Graph-safe."""
+    return _top_p_renorm_probs(_top_k_renorm_probs(probs, top_k), top_p)
+
+
 def apply_min_tokens_floor(probs: torch.Tensor, rows: HistoryRows) -> torch.Tensor:
     """Zero the stop ids for rows that have generated fewer than ``min_tokens``
     tokens, and renormalise. Upstream floors after top-k/top-p, so this runs on
@@ -1264,6 +1271,11 @@ _sampling_from_probs = PlatformDispatch(
     rocm=_rocm_sampling("sampling_from_probs"),
     default=_flashinfer_sampling("sampling_from_probs"),
 )
+_chain_speculative_sampling = PlatformDispatch(
+    "chain_speculative_sampling",
+    rocm=_rocm_op("chain_speculative_sampling"),
+    default=_flashinfer_sampling("chain_speculative_sampling"),
+)
 # the renorms filter_top_k_top_p uses past the fused kernel's vocabulary
 _top_k_renorm_probs = PlatformDispatch(
     "top_k_renorm_probs", rocm=_rocm_op("top_k_renorm_probs"), default=_flashinfer_sampling("top_k_renorm_probs"),
@@ -1326,25 +1338,6 @@ def _sample_cuda(
                 seed=seed, offset=rand_offset,
             )
         return result[0] if isinstance(result, tuple) else result
-
-
-def draw_tokens(
-    logits: torch.Tensor,
-    temperature: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    seed: torch.Tensor,
-    offset: torch.Tensor,
-) -> torch.Tensor:
-    """One token per row of ``logits`` from its top-k, then top-p, distribution
-    at its temperature (argmax where the temperature is 0), drawn with per-row
-    device ``seed``/``offset`` so a captured graph draws afresh on each replay
-    with the offsets it is handed. For a caller that samples rows of its own
-    (a speculative verify step); the sampler resource's per-request state is
-    not involved. Accelerator devices only."""
-    return _sample_cuda(
-        logits, temperature, top_k, top_p, 1.0, None, True, None, seed, offset,
-    )
 
 
 def _needs_explicit_filter(history: HistoryRows | None, order: FilterOrder | None) -> bool:
