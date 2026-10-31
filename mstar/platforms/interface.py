@@ -98,10 +98,13 @@ class Platform:
 
     def inductor_overrides(
         self, num_tokens: int | None = None, rows: int | None = None,
+        decode_rows: bool = False,
     ) -> dict[str, object]:
         """``torch._inductor.config`` values to patch in while the engine
         compiles a forward for ``num_tokens`` tokens in ``rows`` rows, a
         capture bucket's counts, or ``None`` when the forward serves any count.
+        ``decode_rows`` marks a bucket of several tokens a row that still
+        compiles as decode (a speculative verify step).
 
         Meant for inductor codegen settings on this stack (say, which GEMM
         backends to autotune at small sizes), not for picking kernels. Empty
@@ -247,6 +250,7 @@ class RocmPlatform(Platform):
 
     def inductor_overrides(
         self, num_tokens: int | None = None, rows: int | None = None,
+        decode_rows: bool = False,
     ) -> dict[str, object]:
         # At decode sizes inductor's autotuner can't reliably pick between its
         # Triton GEMM templates and hipBLASLt on MI300X. Its timings (12-17 us)
@@ -260,9 +264,12 @@ class RocmPlatform(Platform):
         # templates, which win there.
         if num_tokens is None:
             return {}
-        decode = rows is not None and rows == num_tokens
+        decode = rows is not None and (rows == num_tokens or decode_rows)
         limit = self.ATEN_GEMM_MAX_DECODE_ROWS if decode else self.ATEN_GEMM_MAX_TOKENS
-        if num_tokens > limit:
+        # a verify bucket's draft GEMMs run at its rows, its target's at a few
+        # times that, so its rows bound the shapes these choices are about
+        size = rows if decode_rows else num_tokens
+        if size > limit:
             return {}
         overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
         from mstar.platforms.rocm_gemm import (
@@ -275,12 +282,12 @@ class RocmPlatform(Platform):
         )
 
         post = None
-        if num_tokens <= DECODE_GEMV_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
+        if size <= DECODE_GEMV_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
             # linears of up to 16 rows on AITER's skinny GEMM or the Triton
             # weight stream, as the device's tuned config picks per shape
             overrides["pre_grad_custom_pass"], post = passes
         if (
-            decode and SKINNY_MAX_ROWS < num_tokens <= DECODE_LINEAR_MAX_ROWS
+            decode and SKINNY_MAX_ROWS < num_tokens and size <= DECODE_LINEAR_MAX_ROWS
             and (tuned := decode_linear_pass()) is not None
         ):
             # decode linears still on hipBLASLt take its tuned solution, where the device has one

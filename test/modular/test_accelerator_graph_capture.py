@@ -625,7 +625,8 @@ def test_compile_dynamic_compiles_one_graph_for_every_bucket(monkeypatch, dynami
         fn, backend=counter, fullgraph=kw["fullgraph"], dynamic=kw["dynamic"]))
     overrides = []
     monkeypatch.setattr(agr, "with_inductor_overrides",
-                        lambda fn, num_tokens=None, rows=None: overrides.append((num_tokens, rows)) or fn)
+                        lambda fn, num_tokens=None, rows=None, decode_rows=False: overrides.append((num_tokens, rows))
+                        or fn)
 
     def encode(graph_walk, engine_inputs, feats):
         return torch.nn.functional.gelu(feats @ feats.transpose(1, 2)).sum(-1)
