@@ -295,6 +295,30 @@ def test_only_rocm_turns_off_miopens_split_k_conv_solvers(solver):
         assert solver not in platform.process_env_defaults()
 
 
+def test_only_rocm_builds_inductors_compile_pool_without_its_quiesce():
+    assert RocmPlatform().compile_pool_overrides() == {"quiesce_async_compile_pool": False}
+    for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
+        assert platform.compile_pool_overrides() == {}
+
+
+def test_the_compile_pool_keeps_its_settings_out_of_the_cache_key():
+    # a real sidecar, in a process of its own since torch keeps the first pool it builds
+    code = """
+import torch._inductor.config as config
+from torch._inductor.async_compile import AsyncCompile
+from mstar.platforms import RocmPlatform, compile as platform_compile
+
+key = config.save_config_portable()
+platform_compile.current_platform = RocmPlatform()
+platform_compile.start_compile_pool()
+pool = AsyncCompile.process_pool()
+assert pool.timer is None, "the pool would still quiesce"
+assert config.save_config_portable() == key, "a graph's cache key moved"
+pool.shutdown()
+"""
+    subprocess.run([sys.executable, "-c", code], env={**os.environ, "TORCHINDUCTOR_COMPILE_THREADS": "2"}, check=True)
+
+
 IN_GRAPH_KNOBS = ("ingraph_decode_rope", "sampler_ingraph_scatter")
 
 

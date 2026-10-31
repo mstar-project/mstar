@@ -209,6 +209,13 @@ step.
   ``os.environ.setdefault`` in the conductor before it spawns workers, so values you
   export win. ROCm turns off MIOpen's split-K conv solver there (see
   :doc:`environment_variables`); the other platforms set nothing.
+- **Compile pool.** ``Platform.compile_pool_overrides()`` gives
+  ``torch._inductor.config`` values in force while the engine builds Inductor's compile
+  pool, at the top of warmup. The pool reads them once, so they stay out of every graph's
+  cache key, which the same setting in the environment would not (that recompiles every
+  graph a golden compile cache holds). ROCm turns off the pool's idle quiesce: the sidecar
+  retires a pool without waiting for it, and a worker of the next pool forked meanwhile can
+  hang forever on the old pool's shutdown lock, along with the compile that gave it a job.
 - **Capture refusal.** A resource whose kernel can't run some capture bucket inside a
   graph returns a reason from ``Resource.capture_refusal(spec)``. Both graph runners ask
   before capturing, and a refused bucket runs eagerly. Answer from the spec and the
