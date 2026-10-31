@@ -116,6 +116,8 @@ def test_effort_none_turns_thinking_off_where_the_model_can(client_and_stub):
     ({"tools": [dict(SHELL, strict=True)]}, "strict"),
     ({"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "data:"}]}]}, "reads text"),
     ({"text": {"format": {"type": "json_schema", "name": "x", "schema": {}}}}, "constrained decoding"),
+    ({"text": "json"}, "constrained decoding"),
+    ({"text": {"format": "json_object"}}, "constrained decoding"),
     ({"reasoning": {"effort": "high", "summary": "detailed"}}, "summary"),
     ({"include": ["message.output_text.logprobs"]}, "include"),
     ({"input": [{"type": "item_reference", "id": "msg_1"}]}, "item_reference"),

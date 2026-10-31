@@ -52,7 +52,8 @@ def to_chat_request(body, efforts: tuple[str, ...]) -> ChatCompletionRequest:
     if not isinstance(include, list) or set(include) - {"reasoning.encrypted_content"}:
         raise ValueError(f"include takes only 'reasoning.encrypted_content'; got {include!r}")
     text = body.get("text") or {}
-    if (text.get("format") or {"type": "text"}).get("type") != "text" or text.get("verbosity") not in (None, "medium"):
+    fmt = (text.get("format") or {"type": "text"}) if isinstance(text, dict) else None
+    if not isinstance(fmt, dict) or fmt.get("type") != "text" or text.get("verbosity") not in (None, "medium"):
         raise ValueError(f"text takes the text format only, structured output needs constrained decoding; "
                          f"got {text!r}")
 
@@ -60,7 +61,7 @@ def to_chat_request(body, efforts: tuple[str, ...]) -> ChatCompletionRequest:
     if body.get("instructions"):
         messages.append({"role": "system", "content": body["instructions"]})
     messages += _input(body.get("input"))
-    chat: dict = {"messages": messages, "stream": bool(body.get("stream"))}
+    chat: dict = {"messages": messages, "stream": body.get("stream") or False}
     if body.get("max_output_tokens") is not None:
         chat["max_tokens"] = body["max_output_tokens"]
     for key in ("temperature", "top_p", "parallel_tool_calls"):
@@ -197,6 +198,8 @@ def _reasoning(reasoning, efforts: tuple[str, ...]) -> dict:
         return {"enable_thinking": False}
     if effort not in _EFFORT_RANK:
         raise ValueError(f"reasoning.effort takes none, minimal, low, medium, high or xhigh; got {effort!r}")
+    if not efforts:
+        raise ValueError(f"reasoning.effort={effort!r}: this model has no reasoning levels")
     # GLM's level names; a template without the one asked for takes its lowest
     wanted = {0: "low", 1: "high", 2: "max"}[_EFFORT_RANK[effort]]
     return {"reasoning_effort": wanted if wanted in efforts else efforts[0]}

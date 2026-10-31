@@ -64,7 +64,7 @@ def to_chat_request(body, *, counting: bool = False) -> tuple[ChatCompletionRequ
         for key in ("temperature", "top_p", "top_k"):
             if body.get(key) is not None:
                 chat[key] = body[key]
-        chat["stream"] = bool(body.get("stream"))
+        chat["stream"] = body.get("stream") or False
     if body.get("tools"):
         chat["tools"] = _tools(body["tools"])
     if body.get("tool_choice") is not None:

@@ -271,6 +271,8 @@ class OpenAIAdapter:
     # text-only chat that serves roles and tools
     supports_messages: bool = False
     supports_responses: bool = False
+    # the chat template's reasoning_effort levels, least first, which /v1/responses maps onto
+    reasoning_efforts: tuple[str, ...] = ()
     # Longest clip the model transcribes in one request. Longer uploads are cut
     # into windows of this length by the transcription route (None means unlimited).
     max_audio_seconds: float | None = None

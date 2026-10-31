@@ -323,6 +323,14 @@ Endpoints and model coverage:
      - ``bagel``, ``qwen3_omni``, ``glm52``, ``glm5_next``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech. The GLMs take
        ``tools`` and return ``reasoning_content`` and ``tool_calls`` (not on ``--rust-frontend``).
+   * - ``POST /v1/messages``, ``POST /v1/messages/count_tokens``
+     - ``glm52``, ``glm5_next``
+     - Anthropic's Messages API, for Claude Code: streamed or whole, tools, thinking blocks
+       (not on ``--rust-frontend``).
+   * - ``POST /v1/responses``
+     - ``glm52``, ``glm5_next``
+     - OpenAI's Responses API, stateless, for Codex: streamed or whole, function tools,
+       reasoning items (not on ``--rust-frontend``).
    * - ``POST /v1/audio/speech``
      - ``kokoro``, ``orpheus``, ``qwen3_omni``
      - Text-to-speech (``kokoro`` streams sentence by sentence with ``stream=True``).
