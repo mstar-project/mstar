@@ -1473,6 +1473,17 @@ warning. The output moves by e4m3 rounding, so keep the default ``bf16`` unless 
 correctness family passes with fp8 on. On AMD GPUs a DiT's result also depends on the
 ``dit_exact_ops`` knob, so measure fp8 with the knob set the way the deployment sets it.
 
+A model on the DiT scaffold can also pick the dtype per denoise step: build the policy with
+``check_linear_dtype_steps`` from a ``linear_dtype_steps`` config value, pass it to
+``apply_linear_dtype(..., policy=...)`` and hand it to ``DenoiseLoopSubmodule`` as
+``step_dtypes`` when that call quantised something. The linears become ``SteppedFp8Linear``
+and hold both sets of weights. The base then keys each step on a ``StepBucket``, so rows batch
+and capture per dtype while the model's hooks keep seeing their own bucket key. An
+``fp8_partial`` step runs only the linears outside its own keep-list in fp8 (the third
+argument of ``check_linear_dtype_steps``). Run that node in lockstep
+(``enable_async_scheduling=False``): a speculated step keeps its rows together, and they can
+reach another dtype at different steps.
+
 .. _step-5:
 
 Step 5 — Continuous batching and CUDA graphs
