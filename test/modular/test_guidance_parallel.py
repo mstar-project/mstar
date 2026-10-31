@@ -560,3 +560,33 @@ def test_replica_policy_must_be_known(tmp_path):
     model, config, path = _wan22(tmp_path, cfg_size=2, replica_policy="busiest")
     with pytest.raises(DeploymentError, match="replica_policy must be one of"):
         validate_deployment(model, config, path)
+
+
+def _scheduler(**kwargs):
+    from mstar.worker.micro_scheduler import MicroScheduler
+
+    return MicroScheduler(engine_manager=None, parallel_leader_nodes={"dit"}, **kwargs)
+
+
+def test_a_lockstep_step_goes_ahead_of_local_work_a_bounded_number_of_times():
+    scheduler = _scheduler(lockstep_first_nodes={"dit"})
+    dit, vae = ("dit", WALK), ("vae_decoder", WALK)
+    ready = {vae: [1], dit: [2]}
+    limit = scheduler.LOCKSTEP_FIRST_STEPS
+    assert [scheduler._lockstep_first(vae, ready) for _ in range(limit)] == [dit] * limit
+    # and then the local work runs, whatever the node's backlog
+    assert scheduler._lockstep_first(vae, ready) == vae
+    assert scheduler._lockstep_first(vae, ready) == dit
+
+
+def test_local_work_runs_when_no_lockstep_step_is_ready():
+    scheduler = _scheduler(lockstep_first_nodes={"dit"})
+    vae = ("vae_decoder", WALK)
+    assert scheduler._lockstep_first(vae, {vae: [1]}) == vae
+    assert scheduler._lockstep_first(None, {}) is None
+
+
+def test_no_node_goes_first_unless_the_placement_asks():
+    scheduler = _scheduler()
+    dit, vae = ("dit", WALK), ("vae_decoder", WALK)
+    assert scheduler._lockstep_first(vae, {vae: [1], dit: [2]}) == vae
