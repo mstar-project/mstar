@@ -146,24 +146,6 @@ def test_text_node_pads_prompts_to_the_reference_length():
     assert (batch[TEXT_INPUTS][1, 7:] == config.text_encoder.pad_token_id).all()
 
 
-def test_text_node_can_pad_to_the_batch_caption_bucket():
-    """Without the reference's padding, rows pad to the longest caption bucket, capped at the reference length."""
-    from mstar.conductor.request_info import CurrentForwardPassInfo
-    from mstar.model.z_image.config import ZImageConfig
-    from mstar.model.z_image.submodules import TEXT_INPUTS, ZImageTextEncoderSubmodule
-
-    config = ZImageConfig()
-    node = ZImageTextEncoderSubmodule(None, config, pad_to_max_length=False)
-    info = CurrentForwardPassInfo(request_id="a", graph_walk="encode_text", fwd_index=0, random_seed=0, max_tokens=0)
-    rows = [node.prepare_inputs("encode_text", info, {TEXT_INPUTS: [torch.arange(1, n + 1)]}) for n in (40, 7)]
-    batch = node.preprocess("encode_text", None, rows)
-    assert batch[TEXT_INPUTS].shape == (2, 64) == batch["text_mask"].shape
-    assert batch["text_mask"].sum(dim=1).tolist() == [40, 7]
-    longest = [node.prepare_inputs("encode_text", info, {TEXT_INPUTS: [torch.arange(1, 513)]})]
-    width = config.text_encoder.max_sequence_length
-    assert node.preprocess("encode_text", None, longest)[TEXT_INPUTS].shape == (1, width)
-
-
 def test_requests_above_max_image_area_are_rejected():
     """An unbounded size let one request occupy the worker for minutes; the default cap is 2048^2 pixels."""
     import pytest
