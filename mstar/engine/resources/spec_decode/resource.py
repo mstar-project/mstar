@@ -89,6 +89,11 @@ class _StepImage(NamedTuple):
     params: torch.Tensor
     seeds: torch.Tensor          # seed steps: each request's sampling seed, int64
     num_accepted: torch.Tensor   # verify steps: the row's last accepted count, for the recurrent kernels
+    # What an argmax through the unfiltered draw reads, [rows * (k + 1)]:
+    # temperature 0, and offsets it stores back unchanged. Never read for a token.
+    zero_temperature: torch.Tensor
+    zero_seed: torch.Tensor
+    zero_offset: torch.Tensor
 
 
 class SpecDecodePlan(NamedTuple):
@@ -170,12 +175,6 @@ class SpecDecodeResource(Resource):
         self._stop_ids = torch.tensor(
             sorted(set(stop_token_ids)) or [-2], dtype=torch.long, device=device,
         )
-        # What an argmax through the unfiltered draw reads: temperature 0, and
-        # offsets it stores back unchanged. Never read for a token.
-        tokens = rows * self.tokens_per_row
-        self._zero_temperature = torch.zeros(tokens, dtype=torch.float32, device=device)
-        self._zero_seed = torch.zeros(tokens, dtype=torch.long, device=device)
-        self._zero_offset = torch.zeros(tokens, dtype=torch.long, device=device)
         self._zero_master = torch.zeros(rows, dtype=torch.long, device=device)
 
         self._lock = threading.Lock()
@@ -392,12 +391,16 @@ class SpecDecodeResource(Resource):
     def _new_image(self, rows: int) -> _StepImage:
         image = torch.zeros(len(_FIELDS) * rows, dtype=torch.int32, device=self._device)
         views = image.view(len(_FIELDS), rows)
+        tokens = rows * self.tokens_per_row
         return _StepImage(
             image=image, rows=views[0], real=views[1], base=views[2],
             budget=views[3], stop_on=views[4], top_k=views[5],
             params=torch.ones(2 * rows, dtype=torch.float32, device=self._device),
             seeds=torch.zeros(rows, dtype=torch.long, device=self._device),
             num_accepted=torch.ones(rows, dtype=torch.int32, device=self._device),
+            zero_temperature=torch.zeros(tokens, dtype=torch.float32, device=self._device),
+            zero_seed=torch.zeros(tokens, dtype=torch.long, device=self._device),
+            zero_offset=torch.zeros(tokens, dtype=torch.long, device=self._device),
         )
 
     def build_accelerator_graph_buffers(
@@ -496,9 +499,9 @@ class SpecDecodeResource(Resource):
 
     def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
         """Each row's argmax, through the unfiltered draw's two kernels."""
-        n = logits.shape[0]
+        n, image = logits.shape[0], self._plan_now(SpecPhase.VERIFY).image
         out = torch.empty(n, dtype=torch.long, device=logits.device)
-        SAMPLE_UNFILTERED(logits, self._zero_temperature[:n], self._zero_seed[:n], self._zero_offset[:n], out, 0)
+        SAMPLE_UNFILTERED(logits, image.zero_temperature[:n], image.zero_seed[:n], image.zero_offset[:n], out, 0)
         return out
 
     def _sample(self, logits: torch.Tensor) -> torch.Tensor:
@@ -577,7 +580,9 @@ class SpecDecodeResource(Resource):
             heads, kv_heads, head_dim, eps, gated,
         )
         if j == 0:
-            q, gate = q.index_select(0, self._keep), gate.index_select(0, self._keep)
+            q = q.index_select(0, self._keep)
+            if gated:
+                gate = gate.index_select(0, self._keep)
         return self._attn.attend_rows(q, layer, where.kv_lens), gate
 
     @torch.compiler.disable
@@ -586,10 +591,10 @@ class SpecDecodeResource(Resource):
         vocab]``): draft ``j + 1`` of the next step, written to its register by
         the same kernel, and the next pass's input."""
         plan = self._plan_now(SpecPhase.VERIFY)
-        b = plan.num_rows
+        b, image = plan.num_rows, plan.image
         drafted = torch.empty(b, dtype=torch.long, device=logits.device)
         SAMPLE_UNFILTERED(
-            logits, self._zero_temperature[:b], self._zero_seed[:b], self._zero_offset[:b], drafted, 0,
-            plan.image.rows[:b], self._zero_master, self._tokens[j + 1],
+            logits, image.zero_temperature[:b], image.zero_seed[:b], image.zero_offset[:b], drafted, 0,
+            image.rows[:b], self._zero_master, self._tokens[j + 1],
         )
         return drafted
