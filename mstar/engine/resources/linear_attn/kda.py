@@ -25,6 +25,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.platforms import current_platform
 from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,9 @@ class KDAPlan:
 
 
 def _default_kernels(device: torch.device, head_dim: int):
-    if device.type != "cuda" or not kda_triton._HAS_TRITON or not kda_triton.supported(head_dim):
+    # the Triton kernels inline NVIDIA PTX
+    if (device.type != "cuda" or current_platform.is_rocm() or not kda_triton._HAS_TRITON
+            or not kda_triton.supported(head_dim)):
         return kda_torch.TorchKDAKernels()
     return kda_triton.TritonKDAKernels()
 

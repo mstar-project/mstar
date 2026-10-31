@@ -134,8 +134,8 @@ def test_refuses_a_pool_it_cannot_run(kwargs, match):
 
 
 def test_default_kernels(monkeypatch):
-    """The torch reference off CUDA, and at a head dim the fused kernels aren't validated
-    for. A spec that leaves the config's default backend builds."""
+    """The torch reference off CUDA, on ROCm (the fused kernels inline PTX), and at a head
+    dim the fused kernels aren't validated for. A spec that leaves the config's default backend builds."""
     _, kda = build(backend=LinearAttnBackend.FLASHINFER)
     assert isinstance(kda, KDAManager) and isinstance(kda.kernels, TorchKDAKernels)
     from mstar.engine.resources.linear_attn import kda as kda_mod
@@ -145,6 +145,8 @@ def test_default_kernels(monkeypatch):
     cuda = torch.device("cuda")
     assert kda_mod._default_kernels(cuda, 128) == "bundle"
     assert isinstance(kda_mod._default_kernels(cuda, 16), TorchKDAKernels)
+    monkeypatch.setattr(kda_mod.current_platform, "is_rocm", lambda: True)
+    assert isinstance(kda_mod._default_kernels(cuda, 128), TorchKDAKernels)
 
 
 def test_eager_plans():
