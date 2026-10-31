@@ -54,7 +54,7 @@ from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -64,9 +64,11 @@ from mstar.distributed.guidance_parallel import GuidanceParallel
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
-from mstar.model.components.fp8_linear import StepDtypes
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
+
+if TYPE_CHECKING:
+    from mstar.model.components.fp8_linear import StepDtypes
 
 logger = logging.getLogger(__name__)
 
