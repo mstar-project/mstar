@@ -3,7 +3,8 @@ are rejected when it starts, not served wrongly later.
 
 ``validate_deployment`` refuses: a walk in no partition or in two, a
 partition naming an undefined walk, a node placed by no node_group or by two
-for one walk, a node_group naming an undefined walk, and the stream-driven
+for one walk, a node_group naming an undefined walk, a rank no walk runs on,
+and the stream-driven
 shapes the runtime and conductor can't account for: a self-triggered consumer
 (every input streamed) sharing its worker graph with another top-level entity,
 and a consumer walk across worker graphs, unless its consumers are gated and
@@ -163,6 +164,30 @@ def test_node_in_no_node_group_is_rejected(tmp_path):
     cfg = _config(tmp_path, [{"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill"]}])
     with pytest.raises(ValueError, match=r"node 'llm' of graph walk 'decode' is placed by no node_groups entry"):
         _validate(_ToyModel(_prefill_decode), cfg)
+
+
+def test_a_rank_no_walk_runs_on_is_rejected(tmp_path):
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0]},
+        {"node_names": ["left_over"], "ranks": [1, 2]},
+    ])
+    with pytest.raises(ValueError, match=r"names ranks \[1, 2\], but no node of any graph walk runs on them"):
+        _validate(_ToyModel(_prefill_decode), cfg)
+    # a group whose walks don't hold its node
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill", "decode"]},
+        {"node_names": ["other"], "ranks": [1], "graph_walks": ["decode"]},
+    ])
+    with pytest.raises(ValueError, match=r"node_groups names ranks \[1\]"):
+        _validate(_ToyModel(_prefill_decode), cfg)
+
+
+def test_a_left_over_group_on_a_rank_a_walk_uses_is_accepted(tmp_path, monkeypatch):
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0]},
+        {"node_names": ["left_over"], "ranks": [0]},
+    ])
+    assert _start_conductor(_ToyModel(_prefill_decode), cfg, tmp_path, monkeypatch)._sorted_ranks == [0]
 
 
 def test_node_group_naming_an_undefined_walk_is_rejected(tmp_path):
@@ -900,3 +925,5 @@ def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeyp
     model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
     conductor = _start_conductor(model, str(config_path), tmp_path, monkeypatch)
     assert conductor.worker_graphs
+    # the workers the API server places from the config are the ones the walks run on
+    assert conductor._sorted_ranks == sorted({rank for wg in conductor.worker_graphs.values() for rank in wg.ranks})

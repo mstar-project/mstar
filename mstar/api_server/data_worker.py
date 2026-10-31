@@ -9,7 +9,6 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
 
@@ -17,7 +16,6 @@ import torch
 
 from mstar.graph.base import TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.model.components.diffusion.image_io import PNG_WORKERS
 
 try:
     import torchaudio  # noqa: F401 — probes availability; real usage in callers
@@ -59,9 +57,8 @@ from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.streaming.topology import ClientStreamLimits, client_stream_limits
-from mstar.utils import profiler
+from mstar.utils import cpus, profiler
 from mstar.utils.client_errors import client_error_text
-from mstar.utils.cpus import usable_cpus
 from mstar.utils.ipc_format import (
     AbortRequest,
     ClientStreamInput,
@@ -76,6 +73,7 @@ from mstar.utils.ipc_format import (
     UnpersistTensors,
     WorkerMessageType,
 )
+from mstar.utils.threads import Thread, ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -92,26 +90,6 @@ def pooled_output(modality: str, loop_indices: NestedLoopIndices | None) -> bool
     and audio, whose chunks are cheap and carry inline metadata."""
     streamed = loop_indices is not None and bool(loop_indices.loop_name_order)
     return modality in ARTIFACT_MODALITIES and not streamed
-
-
-def encode_workers(cpus: int | None = None, png_workers: int | None = None) -> int:
-    """Outputs encoded at once. A PNG deflates on ``png_workers`` threads of
-    its own (``image_io.PNG_WORKERS``), so the pool times that stays within
-    the CPUs the process may use."""
-    if cpus is None:
-        cpus = usable_cpus()
-    if png_workers is None:
-        png_workers = PNG_WORKERS
-    return max(1, min(4, cpus // png_workers))
-
-
-def copy_workers(cpus: int | None = None, png_workers: int | None = None) -> int:
-    """Threads a large output read copies over (``host_copy.HostCopier``): one
-    encode's share of the CPUs in the budget ``encode_workers`` sets. Reads run
-    one at a time on the data worker's thread, each ahead of its own encode."""
-    if cpus is None:
-        cpus = usable_cpus()
-    return max(1, cpus // encode_workers(cpus, png_workers))
 
 
 def _sha256(path: str) -> bytes:
@@ -291,10 +269,10 @@ class PreprocessWorker:
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof,
-            copy_workers=copy_workers(),
+            copy_workers=cpus.plan().copy_workers,
         )
 
-        self.thread = threading.Thread(
+        self.thread = Thread(
             target=_preprocess_loop,
             kwargs=dict(
                 in_queue=self.request_input_queue,
@@ -561,7 +539,7 @@ class PreprocessWorkerThread:
     # class-level so a thread built without __init__ never sends ENABLE_METRICS
     worker_metrics_requested: threading.Event | None = None
     # None (a thread built without __init__) postprocesses every output inline
-    _encode_pool: ThreadPoolExecutor | None = None
+    _encode_pool: ThreadPool | None = None
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -662,8 +640,8 @@ class PreprocessWorkerThread:
         # with a bare communicator).
         self.wakeup = wakeup
         self.idle_wait_ms = 20
-        self._encode_pool = ThreadPoolExecutor(
-            max_workers=encode_workers(), thread_name_prefix="mstar-encode",
+        self._encode_pool = ThreadPool(
+            max_workers=cpus.plan().encode_workers, thread_name_prefix="mstar-encode",
         )
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
