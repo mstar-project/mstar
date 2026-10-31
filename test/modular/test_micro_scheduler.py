@@ -1656,6 +1656,39 @@ def test_a_full_mixing_merge_parks_another_walks_rows():
     assert sched.room_for_continuing((NODE, WALK)) == 7
 
 
+class _BudgetedEngine(_Engine):
+    """A combined walk under a token budget, as a chunking node's is."""
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        del node_name
+        return 2048 if graph_walk == MIXED else None
+
+
+def test_mixing_defaults_on_where_the_combined_walk_has_a_budget():
+    sched = _combined_scheduler(_BudgetedEngine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
+    manager = _Manager(["p0", "d6"], walks={"p0": "prefill"})
+
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=6)
+
+    assert sorted(merged.request_to_worker_graph) == ["d6", "p0"]
+    assert sched.speculation_mixes(NODE, "prefill")
+
+
+def test_mixing_defaults_off_without_a_budget():
+    """A merged prompt would run whole, so a chain without a budget keeps to its walk."""
+    sched = _combined_scheduler(_Engine(max_bs=8))
+
+    assert not sched.speculation_mixes(NODE, WALK)
+    assert not sched.speculation_mixes(NODE, "prefill")
+
+
+def test_the_config_turns_default_mixing_off():
+    sched = _combined_scheduler(_BudgetedEngine(max_bs=8), {NODE: {WALK: False}})
+
+    assert not sched.speculation_mixes(NODE, WALK)
+    assert sched.speculation_mixes(NODE, "prefill")
+
+
 def test_a_mixing_yield_away_skips_the_whole_combined_walk():
     sched = _combined_scheduler(_Engine(max_bs=8), {NODE: True})
     manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
@@ -2039,7 +2072,7 @@ def test_a_decode_merge_measures_none_of_the_prompts_parked_under_it():
     measuring them would only make every merge estimate its continuing rows
     (one call per row) while the backlog persists."""
     engine = _ChunkingEngine(max_bs=8)
-    sched = _chunking_scheduler(engine)
+    sched = _chunking_scheduler(engine, {NODE: False})
     parked = _batch(["p0", "p1"], walk=MIXED)
     parked.request_walks = {"p0": "prefill", "p1": "prefill"}
     sched.backlog[(NODE, MIXED)] = parked
@@ -2161,7 +2194,7 @@ def test_continuing_rows_leave_out_a_row_tearing_down_and_a_walk_not_speculated(
 
 
 def test_a_merge_that_keeps_to_its_walk_leaves_a_row_mid_prefill_to_its_chunk_landing():
-    sched = _chunking_scheduler(_ChunkingEngine(max_bs=8))
+    sched = _chunking_scheduler(_ChunkingEngine(max_bs=8), {NODE: False})
     manager = _Manager(["p0"], walks={"p0": "prefill"})
     _next_batch(sched, manager)
 
@@ -2208,7 +2241,7 @@ def test_the_last_chunk_of_a_row_mid_prefill_runs_whole_in_the_merge():
 def test_a_prompt_chain_alone_runs_the_next_chunk_of_its_row_in_flight():
     """A chunk-only step speculates with no continuing row: the merge is
     handed only the rows mid-prefill, and keeps to their walk."""
-    sched = _chunking_scheduler(_ChunkingEngine(max_bs=8))
+    sched = _chunking_scheduler(_ChunkingEngine(max_bs=8), {NODE: False})
     manager = _Manager(["p0"], walks={"p0": "prefill"})
     assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 4, 10, 4)}
     # a decode row comes ready behind it

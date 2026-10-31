@@ -344,8 +344,9 @@ class MicroScheduler:
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
         for (node, walk), combined in self.combined_walk_of.items():
             self._walks_of_key[(node, combined)].append(walk)
-        # (node, walk) whose speculation chain merges the other walks of its
-        # combined walk; see `speculation_mixes`
+        # (node, walk) -> whether its speculation chain merges the other walks
+        # of its combined walk: the config's settings, then each default as
+        # `speculation_mixes` first decides it
         self._mixing_chains = self._parse_speculation_mixes_walks(
             speculation_mixes_walks or {},
         )
@@ -441,13 +442,13 @@ class MicroScheduler:
 
     def _parse_speculation_mixes_walks(
         self, setting: Mapping[str, Any],
-    ) -> frozenset[tuple[str, str]]:
+    ) -> dict[tuple[str, str], bool]:
         """The serving config's ``speculation_mixes_walks``: per node, one bool
         for every walk of its combined walks, or a mapping of walk -> bool."""
         walks_of_node: dict[str, set[str]] = defaultdict(set)
         for node, walk in self.combined_walk_of:
             walks_of_node[node].add(walk)
-        on = set()
+        out: dict[tuple[str, str], bool] = {}
         for node, value in setting.items():
             if node not in walks_of_node:
                 raise ValueError(
@@ -464,17 +465,29 @@ class MicroScheduler:
                     raise ValueError(
                         f"speculation_mixes_walks for {node}/{walk}: {mixes!r} is not a bool"
                     )
-                if mixes:
-                    on.add((node, walk))
-        return frozenset(on)
+                out[(node, walk)] = mixes
+        return out
 
     def speculation_mixes(self, node_name: str, graph_walk: str) -> bool:
         """Whether a speculation chain on ``(node_name, graph_walk)`` merges
-        ready rows of the other walks of its combined walk. Off (the default),
-        the chain takes only its own walk's rows, and another walk's ready rows
-        make it yield; steps then mix walks only when the scheduler builds one
-        fresh, which plans inline."""
-        return (node_name, graph_walk) in self._mixing_chains
+        ready rows of the other walks of its combined walk. Off, the chain
+        takes only its own walk's rows, and another walk's ready rows make it
+        yield; steps then mix walks only when the scheduler builds one fresh,
+        which plans inline.
+
+        Unless the config says otherwise, on wherever the combined walk has a
+        token budget: chunked prompts then ride in decode steps rather than
+        decode sitting out every chunk step. Without one a merged prompt runs
+        whole and stretches the decode step it joins."""
+        key = (node_name, graph_walk)
+        mixes = self._mixing_chains.get(key)
+        if mixes is None:
+            combined = self.combined_walk_of.get(key)
+            mixes = combined is not None and self.engine_manager.get_engine(
+                node_name,
+            ).get_max_batch_tokens(node_name, combined) is not None
+            self._mixing_chains[key] = mixes
+        return mixes
 
     @property
     def last_consumed_tp_seq(self) -> int:
