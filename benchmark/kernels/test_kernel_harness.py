@@ -20,6 +20,7 @@ from benchmark.kernels import isa, search
 from benchmark.kernels.bench import Bench, Timing
 from benchmark.kernels.roofline import roofline
 from benchmark.kernels.spec import KernelSpec, load_shapes, shape_product
+from benchmark.kernels.specs import decode_gemv
 from benchmark.kernels.store import ResultsStore, shape_key
 from benchmark.kernels.trace import harvest, kseq, ktrace, kwindow
 from mstar.kernels import configs
@@ -220,6 +221,13 @@ def test_operand_copies_rotate_past_the_cache():
     assert bench_module.copies_needed(1 << 30, 512 << 20, max_copies=64, max_bytes=1 << 30) == 1
 
 
+def test_the_fastest_replay_can_stand_for_a_candidate():
+    ticks = iter([0.0, 3.0, 3.0, 4.0, 4.0, 7.0])
+    bench = Bench(torch.device("cpu"), calls=1, rounds=3, timer=lambda: next(ticks), stat=min)
+    timing = bench.time({"f": lambda x: x}, [(torch.zeros(1),)])["f"]
+    assert timing.us == min(timing.runs_us) == pytest.approx(1e6)
+
+
 def test_the_cpu_bench_times_with_its_clock(clock):
     def cost(us):
         def run(x):
@@ -387,3 +395,31 @@ def test_best_promotion_picks_an_implementation_per_shape(tmp_path):
     assert json.loads(path.read_text())["shapes"] == {"k32-n64-rows1": {"impl": "aiter"}}
     with pytest.raises(ValueError, match="no passing results"):
         store.promote_best(MI300X, "gemv", lambda family: None, lambda s: None, root=tmp_path / "configs")
+
+
+def test_a_choice_table_keeps_every_implementations_time_and_parameters(tmp_path):
+    store = ResultsStore(tmp_path / "store", stack="torch-test-hip-test-triton-test")
+    shape = {"rows": 16, "n": 64, "k": 32}
+    linear = [_timed("torch", 10.0), _timed("hipblaslt_tuned", 8.0, solution=7), _timed("triton_dot", 9.0, block_n=32),
+              _timed("registry", 1.0)]
+    gated = [_timed("torch", 11.0), _timed("hipblaslt_tuned", 9.0, solution=7), _timed("triton_dot", 9.5, block_n=16)]
+    store.write(MI300X, "decode_gemv", shape, torch.bfloat16,
+                {"shape": shape, "candidates": {f"c{i}": c for i, c in enumerate(linear)}})
+    store.write(MI300X, "decode_gemv_silu_mul", shape, torch.bfloat16,
+                {"shape": shape, "candidates": {f"c{i}": c for i, c in enumerate(gated)}})
+    path = decode_gemv.promote(store, MI300X, 0.01, root=tmp_path / "configs", provenance={"job": "test"})
+    assert path == tmp_path / "configs" / "gfx942" / "mi300x" / "decode_gemm.json"
+    table = json.loads(path.read_text())
+    assert table["classes"] == {"rows16": {"impl": "hipblaslt"}}
+    assert table["shapes"]["k32-n64-rows16"] == {"impl": "hipblaslt_tuned", "candidates": {
+        "hipblaslt": {"us": 10.0}, "hipblaslt_tuned": {"us": 8.0, "solution": 7},
+        "triton": {"us": 9.0, "block_n": 32, "use_dot": True}}}
+    # the pair beats the fused kernel here, so the gate/up stays unfused; its knobs stay in the table
+    assert table["shapes"]["gated1-k32-n64-rows16"] == {"impl": "unfused", "candidates": {
+        "unfused": {"us": 9.0}, "fused": {"us": 9.5, "block_n": 16, "use_dot": True}}}
+    # within the margin the fold keeps the shape: it launches one kernel less
+    tied = {"shape": shape, "candidates": {"c0": _timed("hipblaslt_tuned", 9.0, solution=7),
+                                           "c1": _timed("triton_dot", 9.05, block_n=16)}}
+    store.write(MI300X, "decode_gemv_silu_mul", shape, torch.bfloat16, tied)
+    path = decode_gemv.promote(store, MI300X, 0.01, root=tmp_path / "configs")
+    assert json.loads(path.read_text())["shapes"]["gated1-k32-n64-rows16"]["impl"] == "fused"
