@@ -1663,6 +1663,7 @@ class Worker:
             final_edges=final_edges,
             per_request_input_metadata=per_request_input_metadata,
             request_walks=batch.request_walks,
+            engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
         )
         node_batch.read_check_rids = batch.read_check_rids
         for rid in unresolved:
@@ -2743,7 +2744,7 @@ class Worker:
         return SpeculationContext(
             graph_runtime=self._graph_runtime, tensor_manager=self.tensor_manager,
             request_state=self.request_state, scheduler=self.scheduler,
-            streams=self.streams,
+            streams=self.streams, engine_manager=self.engine_manager,
         )
 
     @cached_property
@@ -2979,7 +2980,7 @@ class Worker:
 
         new_request_to_worker_graph: dict[int, int] = {}
         per_request_inputs: dict[int, NameToTensorList] = {}
-        for rid in head_rids:  # wire order == the leader's batch order
+        for rid in head_rids:  # wire order == the leader's step order, split rows ordered
             if rid in prep_inputs:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
                 per_request_inputs[rid] = prep_inputs[rid]
