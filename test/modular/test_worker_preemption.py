@@ -39,7 +39,7 @@ from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.rebuild import KeptIds, Rebuilds, policies_run_here
+from mstar.worker.rebuild import KeptIds, PrefillStep, Rebuilds, policies_run_here
 from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
@@ -71,7 +71,9 @@ def _worker(kv):
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
     w._kv_caches, w._kv_keys = {"kv": PagedKVCache("kv", frozenset({NODE}), kv)}, {NODE: ["kv"]}
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    w._rebuilds._kept[NODE] = {rid: KeptIds(torch.arange(5 * PAGE_SIZE), array("i", [0])) for rid in "rv"}
+    w._rebuilds._accepted[NODE] = set("rv")
+    prompt = PrefillStep("prefill", (torch.arange(5 * PAGE_SIZE),))
+    w._rebuilds._kept[NODE] = {rid: KeptIds([prompt], array("i", [0])) for rid in "rv"}
     w._in_flight_rids, w._victims, w._dropped, w._hold_logged = set(), {}, {}, {}
     w._preempted, w._preemptions, w._drop_logged, w._rid_str = {}, defaultdict(PreemptionCounts), {}, str
     w.held, w.tried, w.failed = [], [], {}

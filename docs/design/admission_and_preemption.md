@@ -272,9 +272,9 @@ class RebuildPolicy:
 
 A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup. A node without one never drops a request.
 
-The rebuild is one row of the engine's batch over the kept ids minus the last, under the walk the request prefilled in, in a step of its own. Its sample is discarded, it sends nothing, and its decode loop doesn't advance. Decoding resumes from the last kept id once the step lands.
+The rebuild runs each of the request's prefill steps again, in order, as one row of the engine's batch in a step of its own: one row per step the request's prefill ran, until its first kept sample, such as three for a Bagel image chat. Each row reads its step's kept ids, and the last row reads the ids sampled since but the last. A row's sample is discarded, it sends nothing, and the decode loop doesn't advance. Decoding resumes from the last kept id once the last row lands.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs one of the policy's prefill walks, as one device copy per step shared by its rows, and appends each sample from the stop check's host copy. A walk of `copied_inputs` reads more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs and the step's metadata to the host, and the rebuild row reads them back under that metadata. The worker keeps all of this per node and per handle, only for a request a rebuild could write again, and lists it in `rid_table.py`. A rebuild copies the prompt to the host once, for the KV's layout and keys.
+The worker records each prefill step once it has run, with the ids it read from the policy's input as one device copy per step shared by its rows, and appends each sample from the stop check's host copy. A walk of `copied_inputs` reads more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs and the step's metadata to the host, and the rebuild row reads them back under that metadata. The worker keeps all of this per node and per handle, only for a request a rebuild could write again, and lists it in `rid_table.py`. A rebuild copies the prompt to the host once, for the KV's layout and keys.
 
 Why this shape:
 
@@ -353,7 +353,7 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 ## 8. Trade-offs
 
 - **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
-- **Rebuild steps.** A rebuild runs in a step of its own, so the node's decode rows wait one step. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.
+- **Rebuild steps.** A rebuild row runs in a step of its own, so the node's decode rows wait one step per row. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.
 - **Kept ids.** A node with a rebuild policy keeps each request's prompt ids on the device, in the walk's input dtype, until the request finishes: 256 KB for a 32K-token request of int64 ids. A rebuild waits on one copy of them to the host.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.

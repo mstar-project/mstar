@@ -18,6 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo, Rebuild
@@ -33,7 +34,7 @@ from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, StepContext
-from mstar.model.base import LabelLayout, Span
+from mstar.model.base import LabelLayout, PrefixKeys, Span
 from mstar.model.submodule_base import HostRows
 
 PAGE_SIZE = 16
@@ -131,12 +132,11 @@ IMAGE = PrefixSpan(6, 4, WALK, kind="digest")
 @pytest.mark.parametrize("layout, why", [
     ("two labels", "more than one label"),
     ("two loops", "more than one label or growth loop"),
-    ("two walks", "more than one walk"),
     ("image last", "ends on a digest span"),
-    ("keyed text around an image", "can't key again"),
+    ("keys short of the image", "keys only part of its prompt"),
     ("rows", "no rebuild recomputes"),
 ])
-def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout, why):
+def test_a_drop_is_refused_when_its_rows_couldnt_write_the_request_again(layout, why):
     kv = _manager()
     config = _config(list(range(PAGE_SIZE)))
     main = config.kv_layout["main"]
@@ -148,12 +148,11 @@ def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout, 
         config.loop_caps["other_loop"] = 4
     else:
         spans = {
-            "two walks": (text, replace(IMAGE, walk="vit"), text),  # as a Bagel image chat, whose image has a walk
             "image last": (text, IMAGE),
-            "keyed text around an image": (text, IMAGE, text),
+            "keys short of the image": (text, IMAGE, text),
             "rows": (text, replace(IMAGE, kind="rows"), text),  # as a video's frames
         }[layout]
-        keyed = len(spans) if layout == "keyed text around an image" else 0
+        keyed = 1 if layout == "keys short of the image" else 0
         config.kv_layout["main"] = replace(main, spans=spans, keyed_spans=keyed)
     kv.ingest_request("r", config)
 
@@ -292,6 +291,73 @@ def test_a_second_rebuild_of_an_image_prompt_counts_each_sample_once():
     last = kv._overrides["r"].kv_layout["main"].spans[-1]
     assert last == PrefixSpan(6, 6, WALK), "the first rebuild's samples would be laid out twice"
     assert kv._overrides["r"].loop_caps["decode_loop"] == 46, "the samples would count twice in the footprint"
+
+
+def _keyed_chat(tokens: list[int], cap: int) -> KVReqConfig:
+    """A chat of three ids, an image whose walk is its own and the rest of ``tokens``, keyed as the data worker
+    keys it, as Bagel lays out an image chat. The image ends on a page boundary, so it has no end key."""
+    spans = (Span("ids", WALK, 3, 3, "text_inputs"), Span("digest", "vit", PAGE_SIZE - 3, 1, ("image", 0)),
+             Span("ids", WALK, len(tokens) - 3, len(tokens) - 3, "text_inputs"))
+    digests, texts = [None, b"image", None], {"text_inputs": [torch.tensor(tokens[:3]), torch.tensor(tokens[3:])]}
+    pages, items = PreprocessWorkerThread.__new__(PreprocessWorkerThread)._page_layout(
+        PrefixKeys("text_inputs", (WALK, "vit")), spans, digests, texts, PAGE_SIZE,
+    )
+    return KVReqConfig(
+        prefix_keys={"main": chain(pages, items)},
+        prefix_tail={"main": pages[-1] if sum(span.length for span in spans) % PAGE_SIZE else []},
+        prefix_decode={"main": "text_inputs"}, loop_caps={"decode_loop": cap},
+        kv_layout={"main": StreamLayout(spans=tuple(
+            PrefixSpan(span.length, span.advance, span.walk, kind=span.kind, digest=digest)
+            for span, digest in zip(spans, digests, strict=True)
+        ), growth=(("decode_loop", 1),), keyed_spans=3)},
+    )
+
+
+def test_a_rebuilt_label_with_an_image_is_keyed_as_a_fresh_prompt_of_its_ids_and_image():
+    kv = _manager()
+    prompt, sampled = list(range(10)), list(range(100, 160))
+    kv.ingest_request("r", _keyed_chat(prompt, cap=80))
+    _write(kv, "r", 3, PAGE_SIZE - 3, 7, *[1] * 29)
+
+    # the second rebuild starts from the keys and tail the first left
+    for upto in (30, 60):
+        kv.drop("r")
+        kv.prepare_rebuild("r", Rebuild(WALK, array("i", prompt + sampled[:upto])))
+        fresh = _manager()
+        fresh.ingest_request("f", _keyed_chat(prompt + sampled[:upto - 1], cap=80 - (upto - 1)))
+        fresh._streams["f"]["main"].chain.extend(sampled[upto - 1:upto], PAGE_SIZE)
+
+        rebuilt, want = kv._streams["r"]["main"].chain, fresh._streams["f"]["main"].chain
+        assert (rebuilt.keys, rebuilt.unkeyed, rebuilt.spans) == (want.keys, want.unkeyed, want.spans), (
+            f"after {upto} samples the rebuilt pages would be filed under keys no request with this image and these "
+            "ids can match"
+        )
+        # the rebuild rows, then 30 more decode steps
+        _write(kv, "r", 3, PAGE_SIZE - 3, 7 + upto - 1)
+        kv.land_rebuild("r")
+        _write(kv, "r", *[1] * 30)
+
+
+def test_a_request_dropped_between_its_rebuild_rows_frees_their_pages_and_is_laid_out_the_same():
+    kv = _manager()
+    # the image on a walk of its own, as Bagel lays out an image chat
+    layout = StreamLayout(spans=(PrefixSpan(3, 3, WALK), replace(IMAGE, length=20, walk="vit"), PrefixSpan(2, 2, WALK)),
+                          growth=(("decode_loop", 1),))
+    kv.ingest_request("r", KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode_loop": 50}))
+    _write(kv, "r", 3, 20, 2, 1)
+    kv.drop("r")
+    free, rebuild = kv._arena.num_free, Rebuild(WALK, array("i", [*range(5), 100, 101]))
+    kv.prepare_rebuild("r", rebuild)
+    spans = kv._overrides["r"].kv_layout["main"].spans
+    _write(kv, "r", 3, 20)  # the first two rows
+
+    kv.drop("r")
+    kv.prepare_rebuild("r", rebuild)
+
+    assert kv._arena.num_free == free, "the rows that ran would keep their pages"
+    assert kv._overrides["r"].kv_layout["main"].spans == spans and kv._streams["r"]["main"].span_cursor.done == 0, (
+        "the rebuild would lay the samples out twice, or resume past rows whose pages the drop gave up"
+    )
 
 
 def test_a_rebuild_row_beside_another_keyed_row_keys_none_of_its_discarded_sample():

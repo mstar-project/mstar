@@ -51,6 +51,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, SAMPLER, HiggsAudioModelConfig
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -178,6 +179,13 @@ class HiggsAudioModel(Model):
         return {KV_CACHE: {"main": KVLabel(
             growth=(("decode", "decode_loop"),),
         )}}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # every prompt carries audio, which is rebuilt from host copies of the encoder's output
+        return {"LLM": RebuildPolicy(
+            walk="prefill_text", ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
+            copied_inputs={"prefill_audio": ("audio_embeds",)},
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         llm_prefill_outputs = [

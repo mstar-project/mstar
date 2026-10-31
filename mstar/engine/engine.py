@@ -2668,7 +2668,7 @@ class Engine:
             resource.prepare_rebuild(request_id, rebuild)
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
-        """Make the dropped request resident again, once its rebuild row has run."""
+        """Make the dropped request resident again, once its last rebuild row has run."""
         for resource in self._submodules[node_name].resources.values():
             resource.land_rebuild(request_id)
 

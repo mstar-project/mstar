@@ -692,7 +692,8 @@ class Worker:
         # speculation, so syncing on default would also drain GPU(N+1) and
         # erase the overlap. The side stream waits on
         # ``output.completion_event`` (recorded after GPU(N)) and then runs
-        # an isolated D→H, so the main thread only blocks on the copy.
+        # an isolated D→H, so the main thread only blocks on the copy. The
+        # rebuild's host copies queue behind it, and copy back on it.
         # Lazy-initialized — workers without CUDA never touch it.
         self._d2h_stream: torch.Stream | None = None
         self._pinned_d2h_buffers: dict[
@@ -1096,7 +1097,7 @@ class Worker:
     def _guarantee(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
         """Where a node lays out KV for the request that no rebuild here can write again, no drop can free the
         request's pages, so the request is guaranteed in every paged KV cache of that node. Elsewhere the node
-        keeps the request's ids and host copies for its rebuild, unless the request is guaranteed already."""
+        keeps the request's prefill steps for its rebuild, unless the request is guaranteed already."""
         for node_name, keys in self._kv_keys.items():
             node_configs = [config for key in keys if isinstance(config := configs.get(key), KVReqConfig)]
             layouts = [layout for config in node_configs for layout in (config.kv_layout or {}).values()]
@@ -1104,7 +1105,7 @@ class Worker:
                 config.guaranteed for config in node_configs
             ):
                 continue
-            if not self._rebuilds.keep(request_id, node_name, layouts):
+            if not self._rebuilds.keep(request_id, node_name, node_configs):
                 for config in node_configs:
                     config.guaranteed = True
 
@@ -1126,6 +1127,7 @@ class Worker:
                 f"on {node_name}"
             )
         freed = self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
+        self._rebuilds.drop_rows(request_id, node_name)
         self._dropped[request_id] = node_name
         # the drop asked the node's resources again, which may admit it at once or refuse it
         self._readmit(request_id, node_name)
@@ -1227,10 +1229,11 @@ class Worker:
         logger.warning(message, *args, unlogged)
 
     def _rebuild(self, request_id: int, node_name: str) -> None:
-        """Queue a row that recomputes the dropped request's KV on ``node_name`` from its kept ids.
+        """Queue the first of the rows that recompute the dropped request's KV on ``node_name``, one for each
+        of its prefill steps. Each row's step queues the next once it has run (`_land_rebuilds`).
 
-        Only the engine's batch holds the row, so the graph runtime keeps the request in its decode
-        walk, with its loop-back input pending, and routes none of the row's outputs.
+        Only the engine's batch holds the rows, so the graph runtime keeps the request in its decode
+        walk, with its loop-back input pending, and routes none of the rows' outputs.
         """
         engine = self.engine_manager.get_engine(node_name)
         if engine.is_resident(node_name, request_id) or engine.is_offloaded(node_name, request_id):
@@ -1942,7 +1945,6 @@ class Worker:
             request_walks=batch.request_walks,
             engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
         )
-        self._rebuilds.keep_prompts(batch.node_name, batch.graph_walk, batch.request_walks, per_request_inputs)
         if rebuild:
             node_batch.rebuild_rids = frozenset(rebuild)
         node_batch.read_check_rids = batch.read_check_rids
@@ -2585,7 +2587,7 @@ class Worker:
         ``AllocationFailed``, or fails its request when the refusal is terminal, and the step's other rows
         go back to their queues untouched. A row whose `prepare_inputs` failed has left the step, and the
         main loop fails its request."""
-        prepared = node_batch.rebuild_rids & set(node_batch.request_ids)
+        prepared = node_batch.rebuild_rids & (set(node_batch.request_ids) | node_batch.cached_rids)
         for rid in prepared:
             self.scheduler.queue_rebuild(rid, batch.rebuild_rows[rid])
         named = {getattr(reason, "request_id", None), *getattr(reason, "request_ids", ())} & prepared
@@ -3069,12 +3071,6 @@ class Worker:
         speculation = self._spec_builder.build(
             pending, spec_target_info, prep, other_walks, fresh_final_edges,
         )
-        if speculation is not None:
-            spec = speculation.node_batch
-            self._rebuilds.keep_prompts(
-                spec.node_name, spec.step_context.graph_walk, spec.step_context.request_walks,
-                spec.per_request_input_tensors,
-            )
         laps.lap("assemble")
         return speculation
 
@@ -3358,14 +3354,8 @@ class Worker:
             is_same_node=True, spec_id=prep.spec_id, tp_seq=head.spec_seq,
             request_walks=request_walks,
         )
-        if speculation is not None:
-            spec = speculation.node_batch
-            self._rebuilds.keep_prompts(
-                spec.node_name, spec.step_context.graph_walk, spec.step_context.request_walks,
-                spec.per_request_input_tensors,
-            )
-            if head.read_check:
-                speculation.node_batch.read_check_rids = tuple(head_rids)
+        if head.read_check and speculation is not None:
+            speculation.node_batch.read_check_rids = tuple(head_rids)
         return speculation
 
     # How many "no speculative head from step s" seqs a follower remembers.
@@ -3665,8 +3655,11 @@ class Worker:
             )
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
+        state = self.request_state
+        self._rebuilds.keep_prefill(batch_N.node_batch, lambda rid: state.get_fwd_info(
+            rid, state.get_partition_for_node(batch_N.node_name),
+        ).step_metadata)
         self._rebuilds.keep_samples(batch_N.node_batch, cpu_outputs, host_rows)
-        self._rebuilds.keep_copies(batch_N.node_batch)
         # What the stop check withheld (``StopCheck.withheld``), and an output
         # cut to an empty span, is not stored, so not routed: a streaming edge
         # then carries no item for the row, and the producer's item count
@@ -3840,12 +3833,18 @@ class Worker:
         _pp_stage("after_output_copy")
 
     def _land_rebuilds(self, node_batch: ExecutingBatch) -> None:
-        """For each rebuild row that ran in the step, make its request resident again."""
+        """For each rebuild row the step ran, or the prefix cache served whole, queue its request's next row,
+        or make the request resident again once its last row has run."""
         if not node_batch.rebuild_rids:
             return
-        engine = self.engine_manager.get_engine(node_batch.node_name)
-        for rid in node_batch.rebuild_rids & set(node_batch.request_ids):
-            engine.land_rebuild(node_batch.node_name, rid)
+        node = node_batch.node_name
+        engine = self.engine_manager.get_engine(node)
+        for rid in node_batch.rebuild_rids & (set(node_batch.request_ids) | node_batch.cached_rids):
+            row = self._rebuilds.next_row(rid, node)
+            if row is None:
+                engine.land_rebuild(node, rid)
+            else:
+                self.scheduler.queue_rebuild(rid, row)
 
     def _route_and_send_fast(
         self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
@@ -4381,7 +4380,7 @@ class Worker:
 
 
     def _side_stream(self) -> torch.Stream | None:
-        """The stream host copies queue on, behind a step's own output copy, or None without a device."""
+        """The D2H stream, which also carries the rebuild's host copies, or None without a device."""
         if not self.device_capability.is_available:
             return None
         if self._d2h_stream is None:

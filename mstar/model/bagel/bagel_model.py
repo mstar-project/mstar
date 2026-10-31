@@ -1041,10 +1041,12 @@ class BagelModel(Model):
         return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # Only understanding decodes, and an image's KV can't be recomputed from ids, so the KV cache
-        # refuses to drop a prompt with one. The CFG nodes run only image generation.
-        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                     loop="decode_loop")}
+        # Understanding and a think-mode edit decode, and an image is rebuilt from host copies of the ViT's or the
+        # VAE's output. The CFG nodes run only image generation.
+        return {"LLM": RebuildPolicy(
+            walk="prefill_text", ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
+            copied_inputs={"prefill_vit": ("img_emb",), "prefill_vae": ("img_emb",)},
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --

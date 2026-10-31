@@ -371,9 +371,15 @@ class Qwen3OmniModel(Model):
         }}}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # the Talker's KV is built from the Thinker's states, which no ids recompute
-        return {"Thinker": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                         loop="thinker_decode_loop")}
+        # Audio, images and video are rebuilt from host copies of the encoders' outputs. The Talker's KV is built
+        # from the Thinker's states, which no rebuild recomputes.
+        return {"Thinker": RebuildPolicy(
+            walk="prefill_text", ids_input="text_inputs", sample_output="new_token", loop="thinker_decode_loop",
+            copied_inputs={
+                "prefill_audio": ("audio_embeds",),
+                "prefill_vision": ("vision_embeds", "deepstack", "video_second_per_grid", "image_grid_thw"),
+            },
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.

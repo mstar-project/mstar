@@ -12,6 +12,7 @@ from array import array
 from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -21,35 +22,42 @@ from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine, ExecutingBatch
-from mstar.engine.resources import AllocationFailed, StepContext
+from mstar.engine.resources import AllocationFailed, KVStep, PositionStep, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
-from mstar.engine.resources.step import AdmitRuntimeError
+from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout, mark_guaranteed
+from mstar.engine.resources.position.config import PositionConfig
+from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.step import AdmitRuntimeError, Segment
 from mstar.model.rebuild import RebuildPolicy
-from mstar.model.submodule_base import BatchedModelOutput
+from mstar.model.submodule_base import ARNodeInputs, BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.rebuild import HostCopies, KeptIds, RebuildRow, Rebuilds
+from mstar.worker.rebuild import HostCopies, KeptIds, PrefillStep, RebuildRow, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
-NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
+NODE, PREFILL, VIT, DECODE = "LLM", "prefill", "vit", "decode"
 R, A = 7, 8
 POLICY = RebuildPolicy(walk=PREFILL, ids_input="text_inputs", sample_output="new_token", loop="loop")
 
 
 def _graphs() -> dict:
-    """``NODE`` reads ``text_inputs`` and outputs ``new_token``, and loop ``loop`` runs it in ``DECODE``."""
+    """``NODE`` reads ``text_inputs`` and outputs ``new_token``, and loop ``loop`` runs it in ``DECODE``. In ``VIT``
+    it reads an image's ``img_emb`` alone, as Bagel's LLM does."""
     node = SimpleNamespace(input_names={"text_inputs"}, outputs=[SimpleNamespace(name="new_token")])
+    vit = SimpleNamespace(input_names={"img_emb"}, outputs=[])
     loop = SimpleNamespace(get_nodes=lambda: {NODE: node})
     return {
         PREFILL: SimpleNamespace(get_nodes=lambda: {NODE: node}, get_loops=dict),
+        VIT: SimpleNamespace(get_nodes=lambda: {NODE: vit}, get_loops=dict),
         DECODE: SimpleNamespace(get_nodes=lambda: {NODE: node}, get_loops=lambda: {"loop": loop}),
     }
 
 
-def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
-    return KeptIds(torch.tensor(prompt), array("i", sampled))
+def _keep(w: Worker, rid: int, *sampled: int, prompt=(1, 2, 3)) -> None:
+    """``rid`` kept a prompt of one step on ``NODE``, and ``sampled``."""
+    w._rebuilds._accepted[NODE].add(rid)
+    w._rebuilds._kept[NODE][rid] = KeptIds([PrefillStep(PREFILL, (torch.tensor(prompt),))], array("i", sampled))
 
 
 def _cleanup(node, rids, wgs):
@@ -107,7 +115,8 @@ def _rebuilding(fresh: dict[int, int] | None = None):
     hands that row out with ``fresh`` prompt rows of its walk."""
     w, eng = _worker()
     # A's prompt row carries no inputs here, so its ids count as kept already
-    w._rebuilds._kept[NODE].update({R: _kept(4), A: _kept()})
+    _keep(w, R, 4)
+    _keep(w, A)
     eng.dropped.append(R)
     w._rebuild(R, NODE)
     batch = ScheduledBatch(NODE, PREFILL, dict(fresh or {}), rebuild_rows=dict(w.scheduler.rows))
@@ -163,7 +172,8 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     eng, landed = _engine(_Sub()), []
     eng.land_rebuild = lambda node, rid: landed.append(rid)
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
-    w._rebuilds._policies, w._rebuilds._kept = {node: POLICY}, {node: {1: _kept()}}
+    w._rebuilds._policies = {node: POLICY}
+    w._rebuilds._kept = {node: {1: KeptIds([PrefillStep(walk, (torch.tensor([1]),))]), R: KeptIds()}}
     batch = _step((R, 1, 2), walk, node)
     eng.prepare_inputs(batch)
     pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
@@ -182,7 +192,7 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     eng.land_rebuild = lambda node, rid: None
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
     w._rebuilds._policies = {node: replace(POLICY, copied_inputs={walk: ("embeds",)})}
-    w._rebuilds._kept = {node: {1: KeptIds(torch.tensor([1]), array("i"), None, HostCopies(walk))}}
+    w._rebuilds._accepted, w._rebuilds._kept = {node: {1}}, {node: {R: KeptIds()}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
         rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
@@ -193,15 +203,215 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
                            is_new_iter=False, is_same_node=False)
         w._thread_outputs_to_speculative(spec, BatchedModelOutput({rid: {"embeds": [t]} for rid, t in embeds.items()}))
     for rid, info in batch.per_request_info.items():
-        info.graph_walk, info.step_metadata = walk, {"prefill_order": (rid,)}
+        info.step_metadata = {"prefill_order": (rid,)}
+    w.request_state.get_partition_for_node, w.request_state.get_fwd_info = lambda node: "p", batch.per_request_info.get
     eng.prepare_inputs(batch)
     pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
     outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
     with pytest.raises(_ReachedRoutingError):
         w._postprocess_batch(pending, outputs)
 
-    assert w._rebuilds._kept[node][1].copies.inputs == {"embeds": [embeds[1]]}, (
-        "a rebuild would need the encoder to run again"
+    (step,) = w._rebuilds._kept[node][1].steps
+    assert step.copies.inputs == {"embeds": [embeds[1]]}, "a rebuild would need the encoder to run again"
+    assert step.copies.step_metadata == {"prefill_order": (1,)}, "the rebuild row would run under decode's metadata"
+    assert w._rebuilds._kept[node][R].steps == [], "a rebuild row would be kept as a step of its prefill"
+
+
+def _rebuild_rows(w: Worker, run) -> list[RebuildRow]:
+    """Run each rebuild row the scheduler holds, through ``run(batch, node_batch)``, until none is left."""
+    rows = []
+    while w.scheduler.rows:
+        ((rid, row),) = w.scheduler.rows.items()
+        w.scheduler.take_rebuilds((rid,))  # as the step's launch does
+        batch = ScheduledBatch(row.node, row.walk, rebuild_rows={rid: row})
+        rows.append(row)
+        run(batch, w._build_executing_batch(batch))
+    return rows
+
+
+def test_a_prompt_on_several_walks_rebuilds_a_row_per_step_in_order_and_lands_after_the_last():
+    w, eng = _worker()
+    w._rebuilds = Rebuilds({NODE: replace(POLICY, copied_inputs={VIT: ("img_emb",)})}, _graphs())
+    images = [torch.ones(4, 2), torch.zeros(4, 2)]
+    w._rebuilds._accepted[NODE].add(R)
+    w._rebuilds._kept[NODE][R] = KeptIds([
+        PrefillStep(PREFILL, (torch.tensor([1, 2]),)),
+        *[PrefillStep(VIT, (), HostCopies({"img_emb": [image]}, {"image": i})) for i, image in enumerate(images)],
+        PrefillStep(PREFILL, (torch.tensor([3, 4, 5]),)),
+    ], array("i", [6, 7]))
+    eng.dropped.append(R)
+    w._rebuild(R, NODE)
+
+    served = []
+
+    def run(batch, node_batch):
+        assert not eng.landed, "the request would decode before its KV is whole"
+        if batch.graph_walk == VIT and not served:
+            # the cache serves the first image whole, as `Engine._skip_cached_prefix` takes the row out of the step
+            node_batch.drop_rids({R})
+            node_batch.cached_rids.add(R)
+            served.append(R)
+        pending = PendingBatch(batch, node_batch, NODE, "p", batch.graph_walk, Future())
+        w._postprocess_batch(pending, BatchedModelOutput())
+
+    rows = _rebuild_rows(w, run)
+
+    assert [row.walk for row in rows] == [PREFILL, VIT, VIT, PREFILL], "a row would write another walk's span"
+    assert [row.inputs.get("img_emb") for row in rows[1:3]] == [[images[0]], [images[1]]], (
+        "an image row would read another image"
+    )
+    assert [row.step_metadata for row in rows] == [None, {"image": 0}, {"image": 1}, None], (
+        "an image row would run under decode's metadata, or another step's"
+    )
+    assert rows[3].inputs["text_inputs"][0].tolist() == [3, 4, 5, 6], "the samples would follow another step"
+    assert eng.landed == [R], "a row the cache served would leave its request dropped"
+
+
+def _models() -> dict:
+    """Bagel, Qwen3-Omni and Higgs Audio, with the node that decodes text and its paged KV cache."""
+    from test_model_kv_layouts import _bagel, _higgs
+
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    bagel, omni = _bagel(), object.__new__(Qwen3OmniModel)
+    bagel.config.max_position_embeddings, bagel.config.num_timesteps, bagel._image_gen_remote_handoff = 4096, 3, False
+    omni.config = Qwen3OmniModelConfig()
+    return {"Bagel": (bagel, "LLM", "kv"), "Qwen3-Omni": (omni, "Thinker", "thinker_kv"),
+            "Higgs": (_higgs(), "LLM", "kv_cache")}
+
+
+def _from_model(model, node: str, cache: str) -> tuple[Worker, SimpleNamespace]:
+    """A worker that rebuilds ``node``'s requests as ``model`` declares, checked against its own walks."""
+    w, eng = _worker()
+    w._kv_keys = {node: [cache]}
+    w._rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs())
+    return w, eng
+
+
+def _media(walk: str) -> PrefixSpan:
+    return PrefixSpan(20, 1, walk, kind="digest")
+
+
+# Each request as its model lays it out: the spans, how many spans the model keys, whether the request carries prefix
+# keys (it does while the prefix cache is on), the labels, whether the request speaks its answer, and whether it is
+# preemptible. A Bagel edit in think mode keys only its leading text, and so does a Qwen3-Omni prompt with a video.
+_TEXT, _CLOSE = PrefixSpan(5, 5, "prefill_text"), PrefixSpan(4, 4, "prefill_text")
+_EDIT = (_TEXT, _media("prefill_vae"), _media("prefill_vit"), _CLOSE)
+_VIDEO = (_TEXT, _media("prefill_vision"), _CLOSE)
+_MEDIA_REQUESTS = {
+    "Bagel image chat": ("Bagel", (_TEXT, _media("prefill_vit"), _CLOSE), 3, True, 1, False, True),
+    "Bagel chat with two images": ("Bagel", (_TEXT, *[_media("prefill_vit")] * 2, _CLOSE), 4, True, 1, False, True),
+    "Bagel edit with think mode": ("Bagel", _EDIT, 1, True, 1, False, False),
+    "Bagel edit with think mode, cache off": ("Bagel", _EDIT, 1, False, 1, False, True),
+    "Bagel edit or guided generation": ("Bagel", (_TEXT, _media("prefill_vit"), _CLOSE), 3, True, 3, False, False),
+    "Qwen3-Omni audio in, text out": ("Qwen3-Omni", (_TEXT, _media("prefill_audio"), _CLOSE), 3, True, 1, False, True),
+    "Qwen3-Omni image in, text out": ("Qwen3-Omni", (_TEXT, _media("prefill_vision"), _CLOSE), 3, True, 1, False, True),
+    "Qwen3-Omni video in, text out": ("Qwen3-Omni", _VIDEO, 1, True, 1, False, False),
+    "Qwen3-Omni video in, cache off": ("Qwen3-Omni", _VIDEO, 1, False, 1, False, True),
+    "Qwen3-Omni audio out": ("Qwen3-Omni", (_TEXT, _media("prefill_audio"), _CLOSE), 3, True, 1, True, False),
+    "Higgs transcription": ("Higgs", (_TEXT, _media("prefill_audio"), _CLOSE), 3, True, 1, False, True),
+}
+
+
+@pytest.mark.parametrize("request_", _MEDIA_REQUESTS)
+def test_a_media_request_is_preemptible_only_where_its_models_rebuild_rows_can_write_it_again(request_):
+    name, spans, keyed, cached, labels, speaks, preemptible = _MEDIA_REQUESTS[request_]
+    model, node, cache = _models()[name]
+    w, _ = _from_model(model, node, cache)
+    ((_, loop),) = model.kv_labels()[cache]["main"].growth
+    layout = StreamLayout(spans=spans, growth=((loop, 1),), keyed_spans=keyed)
+    # the CFG nodes write their own copy of the prompt under each guidance label
+    guidance = dict.fromkeys(("cfg_text", "cfg_img")[:labels - 1], StreamLayout(spans=(_TEXT,)))
+    config = KVReqConfig(
+        loop_caps={loop: 8}, prefix_keys={"main": [b"k"]} if cached else None, kv_layout={"main": layout, **guidance},
+    )
+    # an answer spoken aloud has the Talker write rows of the Thinker's states
+    talker = KVReqConfig(kv_layout={"main": StreamLayout(spans=(PrefixSpan(9, 9, "talker_prefill", kind="rows"),))})
+    configs = {cache: config, **({"talker_kv": talker} if speaks else {})}
+    mark_guaranteed(configs, streaming=False, output_modalities=["text", "audio"] if speaks else ["text"])
+
+    w._guarantee(R, configs)
+
+    assert config.guaranteed == (not preemptible), "a request no rows can rebuild would be preempted, or the reverse"
+    assert (R in w._rebuilds._accepted.get(node, set())) == preemptible, (
+        "a guaranteed request would record prefill steps no row reads, or a preemptible one would record none"
+    )
+
+
+@pytest.mark.parametrize("name, digest_walk, input_name", [
+    ("Bagel", "prefill_vit", "img_emb"), ("Bagel", "prefill_vae", "img_emb"),
+    ("Qwen3-Omni", "prefill_audio", "audio_embeds"), ("Higgs", "prefill_audio", "audio_embeds"),
+])
+def test_a_rebuilt_prompt_on_several_walks_holds_the_pages_and_positions_of_an_uninterrupted_run(
+    monkeypatch, name, digest_walk, input_name,
+):
+    from test_bagel_guidance_sink import _llm
+    from test_kv_drop import _manager
+
+    from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    # every commit checks the walk that wrote each span
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    model, node, cache = _models()[name]
+    w, eng = _from_model(model, node, cache)
+    ((decode, loop),) = model.kv_labels()[cache]["main"].growth
+    declare = {
+        "Bagel": _llm().declare_step, "Qwen3-Omni": partial(ThinkerSubmodule.declare_step, None),
+        "Higgs": partial(HiggsAudioLLMSubmodule.declare_step, None),
+    }[name]
+    kv, rope, starts = _manager(), RopeManager(PositionConfig(kv_cache=cache), torch.device("cpu")), []
+
+    def write(walk, length):
+        starts.append(rope.position(R, "main"))
+        steps = declare(walk, [R], [ARNodeInputs(input_seq_len=length)], per_request_info={}).steps.values()
+        (kv_step,), (position,) = [[s for s in steps if isinstance(s, kind)] for kind in (KVStep, PositionStep)]
+        segments = (Segment(R, "main", length),)
+        kv_step, ctx = replace(kv_step, segments=segments), StepContext((R,), walk, 0, False)
+        assert kv.admit(kv_step, ctx).ok, f"the pool refused {walk}"
+        kv.plan(kv_step, ctx)
+        kv.commit(kv_step, ctx)
+        rope.commit(replace(position, segments=segments), ctx)
+
+    # An attachment holds its rows and two sentinels. A Bagel image moves the position by one, and audio by its length.
+    rows, attachment = torch.zeros(18, 2), _media(digest_walk)
+    spans = (_TEXT, attachment if name == "Bagel" else replace(attachment, advance=attachment.length), _CLOSE)
+    layout = StreamLayout(spans=spans, growth=((loop, 1),))
+    kv.ingest_request(R, KVReqConfig(kv_layout={"main": layout}, loop_caps={loop: 8}))
+    rope.ingest_request(R)
+    for span in spans:
+        write(span.walk, span.length)
+    for _ in range(2):
+        write(decode, 1)
+    stream = kv._streams[R]["main"]
+    held, uninterrupted = (stream.stored_len, len(stream.page_indices), rope.position(R, "main")), starts[:3]
+    kv.drop(R)
+    rope.drop(R)
+    eng.prepare_rebuild = lambda node, rid, rebuild: kv.prepare_rebuild(rid, rebuild)
+    eng.land_rebuild = lambda node, rid: kv.land_rebuild(rid)
+    assert w._rebuilds.keep(R, node, [KVReqConfig(kv_layout={"main": layout})])
+    copied = model.rebuild_policies()[node].copied_inputs[digest_walk]
+    copies = HostCopies({copied_name: [rows] if copied_name == input_name else [] for copied_name in copied}, {})
+    # the samples before 9 are in the KV, and 9 is the next decode step's input
+    w._rebuilds._kept[node][R] = KeptIds([
+        PrefillStep("prefill_text", (torch.arange(5),)), PrefillStep(digest_walk, (), copies),
+        PrefillStep("prefill_text", (torch.arange(5, 9),)),
+    ], array("i", [7, 8, 9]))
+    eng.dropped.append(R)
+    w._rebuild(R, node)
+    starts.clear()
+
+    def run(batch, node_batch):
+        inputs = node_batch.per_request_input_tensors[R]
+        write(batch.graph_walk, len(inputs["text_inputs"][0]) if "text_inputs" in inputs else len(rows) + 2)
+        w._land_rebuilds(node_batch)
+
+    _rebuild_rows(w, run)
+
+    assert starts == uninterrupted, "a row would place its span where the uninterrupted prefill didn't"
+    assert (stream.stored_len, len(stream.page_indices), rope.position(R, "main")) == held, (
+        "the rebuilt stream would hold other slots, pages or positions than before its drop"
     )
 
 
@@ -218,7 +428,8 @@ def test_a_rebuild_row_runs_under_its_copied_metadata_even_when_empty():
 @pytest.mark.parametrize("why", ["no ids", "in flight", "backlog", "rebuild queued", "prefill walk", "samples short"])
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
-    w._rebuilds._kept[NODE].update({} if why == "no ids" else {R: _kept(5)})
+    if why != "no ids":
+        _keep(w, R, 5)
     w._in_flight_rids.update({R} if why == "in flight" else ())
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
     w.scheduler.rows.update({R: RebuildRow(NODE, PREFILL, {})} if why == "rebuild queued" else {})
@@ -233,7 +444,7 @@ def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
 @pytest.mark.parametrize("state", ["resident", "queued", "in its step"])
 def test_a_request_is_rebuilt_only_once_per_drop(state):
     w, eng = _worker()
-    w._rebuilds._kept[NODE][R] = _kept(5)
+    _keep(w, R, 5)
     eng.dropped += [] if state == "resident" else [R]
     w.scheduler.rows.update(queued := {R: RebuildRow(NODE, PREFILL, {})} if state == "queued" else {})
     if state == "in its step":
@@ -249,7 +460,7 @@ def test_a_dropped_request_is_rebuilt_while_a_step_of_another_node_holds_it():
     """Orpheus's SNAC decoder can run on the LLM's worker, so a SNAC step can be in flight when the request's LLM
     KV is rebuilt."""
     w, eng = _worker()
-    w._rebuilds._kept[NODE][R] = _kept(5)
+    _keep(w, R, 5)
     eng.dropped.append(R)
     w._in_flight_rids.add(R)
 

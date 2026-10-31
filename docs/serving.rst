@@ -393,16 +393,18 @@ its pages, and is otherwise dropped if it can be rebuilt from its token ids. The
 ran short gets the pages freed, up to its shortage, unless it moved or was dropped itself. A
 request on the host waits at its place in the queue until its pages and one more page fit, and
 its pages are then copied back. A dropped request waits until its history and one more page
-fit, then recomputes its KV in one prefill row. A request that streams audio out, or holds KV
-made from another node's outputs, reserves its whole footprint in every pool, with every cache
-hit counted, and is never dropped or moved to the host. So does a request in the pools of a
-node that keeps no token ids to rebuild it. A request with images whose whole prompt runs on
-one prefill walk, such as a Qwen3.5 chat with images, can be dropped at one rank: the worker
-keeps a host copy of what that walk read besides the token ids, the encoder's output included,
-and rebuilds the request from it. Bagel, Qwen3-Omni and Higgs Audio requests with media, whose
-prompts run on several walks, and requests with images above one rank keep no copies and stay
-guaranteed. A Qwen3.5 video stays guaranteed for its frames. Voice requests then queue when the
-pool is short and are never preempted mid-stream.
+fit, then recomputes its KV in one row per prefill step. A request that streams audio out, or
+holds KV made from another node's outputs, reserves its whole footprint in every pool, with
+every cache hit counted, and is never dropped or moved to the host. So does a request in the
+pools of a node that keeps no token ids to rebuild it. A request with media can be dropped at
+one rank: the worker keeps a host copy of what each prefill step read besides the token ids,
+the encoder's output included, and rebuilds the request from those copies in the order its
+prefill ran. That covers Qwen3.5 and Bagel image chats, Bagel edits in think mode with no
+guidance and the prefix cache off, Qwen3-Omni requests with audio or images in and text out,
+and with video in when the prefix cache is off, and Higgs Audio transcriptions. Requests that answer with audio, other Bagel generations
+and edits, Qwen3.5 videos and requests with media above one rank keep no copies and stay
+guaranteed. Voice requests then queue when the pool is short and are never preempted
+mid-stream.
 
 Above one rank, a decode step that finds no page and nothing to offload holds its requests
 until they time out. At one rank, a request that runs short and can neither move to the host

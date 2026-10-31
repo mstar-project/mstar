@@ -96,8 +96,8 @@ class CachedPrefix(NamedTuple):
 
 
 class Rebuild(NamedTuple):
-    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
-    The last id is the one the next decode step reads."""
+    """What a dropped request's rebuild rows write: ``ids`` without the last one, which the next decode
+    step reads. ``walk`` is the last row's, which writes the ids sampled since."""
     walk: str
     ids: Sequence[int]
 
@@ -448,11 +448,11 @@ class Resource(ABC):
         return True
 
     def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
-        """Take in what the dropped request's rebuild row writes, before the row is queued."""
+        """Take in what the dropped request's rebuild rows write, before the first is queued."""
         return
 
     def land_rebuild(self, rid: str) -> None:
-        """The dropped request's rebuild row has run."""
+        """The dropped request's last rebuild row has run."""
         return
 
     def reload(self, rid: str) -> bool:

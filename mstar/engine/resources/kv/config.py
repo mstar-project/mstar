@@ -425,25 +425,27 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
 
 
-def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
-    """Why one rebuild row can't write a request's laid-out labels again, or None.
+def rebuild_refusal(configs: Iterable[KVReqConfig]) -> str | None:
+    """Why a request's rebuild rows can't write the labels its ``configs`` lay out again, or None.
 
-    The row writes one label, grown by one loop, in the one walk its spans were written in. It writes the ids
-    spans from the request's kept ids, a digest span from host copies of what that walk read, and the ids
-    sampled since at the end of the last span, which must be ids.
+    The rows write one label, grown by one loop, running its prefill steps again in order. They write the ids
+    spans from the request's kept ids, a digest span from host copies of what its step read, and the ids
+    sampled since at the end of the last span, which must be ids. A label that carries prefix keys is keyed
+    again, which needs every span keyed.
     """
-    laid_out = [layout for layout in layouts if layout.spans]
-    if any(span.kind == SpanKind.ROWS for layout in laid_out for span in layout.spans):
+    laid_out = [
+        (config, label, layout) for config in configs
+        for label, layout in (config.kv_layout or {}).items() if layout.spans
+    ]
+    if any(span.kind == SpanKind.ROWS for _, _, layout in laid_out for span in layout.spans):
         return "it holds KV made from another node's outputs, which no rebuild recomputes"
-    if len(laid_out) > 1 or any(len(layout.growth) != 1 for layout in laid_out):
-        return "it writes more than one label or growth loop, which one rebuild row can't lay out again"
-    for layout in laid_out:
-        if len({span.walk for span in layout.spans}) > 1:
-            return "its prompt was written in more than one walk, which one rebuild row can't run"
+    if len(laid_out) > 1 or any(len(layout.growth) != 1 for _, _, layout in laid_out):
+        return "it writes more than one label or growth loop, which its rebuild rows can't lay out again"
+    for config, label, layout in laid_out:
         if layout.spans[-1].kind != SpanKind.IDS:
             return "its prompt ends on a digest span, where the ids it sampled can't follow"
-        if len(layout.spans) > 1 and layout.keyed_spans:
-            return "it keys a prompt of more than one span, which a rebuild can't key again"
+        if (config.prefix_keys or {}).get(label) and layout.keyed_spans != len(layout.spans):
+            return "it keys only part of its prompt, which a rebuild can't key again"
     return None
 
 
@@ -540,7 +542,7 @@ class StreamLayout:
         )
 
     def rebuilt(self, ids: int) -> "StreamLayout":
-        """This layout once a rebuild row has written ``ids`` ids into it: the last span, which
+        """This layout once its rebuild rows have written ``ids`` ids into it: the last span, which
         `rebuild_refusal` requires to be ids, grows by the ids sampled since the layout was laid out."""
         grown = ids - sum(span.length for span in self.spans if span.kind == SpanKind.IDS)
         *spans, last = self.spans

@@ -785,14 +785,12 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     w, eng = _worker()
     w._rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs())
     eng.prepare_rebuild = lambda node, rid, rebuild: kv.prepare_rebuild(rid, rebuild)
-    inputs = {R: {"text_inputs": step.input_tensors["text_inputs"], **copied}}
-    assert w._rebuilds.keep(R, NODE, config.kv_layout.values()), "an image chat would be guaranteed"
-    w._rebuilds.keep_prompts(NODE, "prefill_vision", {}, inputs)
-    info = SimpleNamespace(graph_walk="prefill_vision", step_metadata=metadata)
-    w._rebuilds.keep_copies(SimpleNamespace(
-        node_name=NODE, request_ids=[R], per_request_info={R: info}, per_request_input_tensors=inputs,
+    assert w._rebuilds.keep(R, NODE, [config]), "an image chat would be guaranteed"
+    w._rebuilds.keep_prefill(SimpleNamespace(
+        node_name=NODE, request_ids=[R], cached_rids=set(), rebuild_rids=frozenset(),
         step_context=StepContext((R,), "prefill_vision", 0, False),
-    ))
+        per_request_input_tensors={R: {"text_inputs": step.input_tensors["text_inputs"], **copied}},
+    ), lambda rid: metadata)
     # the samples before 9 are in the KV, and 9 is the next decode step's input
     w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])
     eng.dropped.append(R)
