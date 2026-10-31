@@ -285,6 +285,15 @@ class ForwardPassInfoWrapper:
         return getattr(self.info, name)
 
 
+class VerifyRecord(NamedTuple):
+    """A verify step under device rewind, as its stop check emits it (`Engine._emit_record`)."""
+    walk: VerifyWalk
+    steps: list
+    rids: tuple
+    max_tokens: list
+    ignore_eos: list
+
+
 @dataclass
 class ExecutingBatch:
     node_name: str
@@ -365,6 +374,9 @@ class ExecutingBatch:
     failed_resource: str | None = None
     # a verify step's stops, settled with its emitted tokens (see `Engine._emit_verified`)
     verify_stops: dict[int, set[str]] | None = None
+    # under device rewind, a verify step whose tokens and stops the stop check reads
+    # (`Engine._emit_record`)
+    verify_record: VerifyRecord | None = None
 
     # Every output signal of this step stays on the device (the node's
     # ``device_loopback_signals``): collect builds no per-request output
@@ -1541,28 +1553,55 @@ class Engine:
 
     def _emit_verified(self, batch: ExecutingBatch, verifying: VerifyWalk) -> None:
         """A verify step's emitted tokens as each request's ``policy.emit`` output, and its
-        stops. Waits for the step's verdict, which the next step's rewinds wait for too."""
+        stops. Waits for the step's verdict, which the next step's rewinds wait for too; under
+        device rewind the stop check emits them instead (`_emit_record`)."""
         rids = batch.request_ids
         info = batch.per_request_info_wrapped
-        sampler = verifying.sampler
-        rows = verifying.resource.emitted_rows(
-            rids,
-            [info[rid].max_tokens for rid in rids],
-            [
-                getattr(info[rid].resource_configs.get(sampler), "ignore_eos", False) or False
-                for rid in rids
-            ],
-            verifying.policy,
+        dv = verifying.resource
+        batch.verify_record = None
+        max_tokens = [info[rid].max_tokens for rid in rids]
+        ignore_eos = self._ignore_eos(batch, verifying, rids)
+        if dv.device_rewind:
+            # Nothing waits for the verdict: the step after this one is launched while this one
+            # runs, as plain decode's is, and the stop check reads its tokens once it has landed.
+            batch.verify_record = VerifyRecord(verifying, dv.take_record(), tuple(rids), max_tokens, ignore_eos)
+            return
+        self._emit_rows(batch, verifying, dv.emitted_rows(rids, max_tokens, ignore_eos, verifying.policy))
+
+    def _emit_record(self, batch: ExecutingBatch) -> None:
+        """Under device rewind, a step's tokens and stops, at its stop check: the step has
+        landed."""
+        record, batch.verify_record = batch.verify_record, None
+        rows = record.walk.resource.emit_record(
+            record.steps, record.rids, record.max_tokens, record.ignore_eos, record.walk.policy,
         )
+        self._emit_rows(batch, record.walk, rows)
+
+    @staticmethod
+    def _ignore_eos(batch: ExecutingBatch, verifying: VerifyWalk, rids) -> list[bool]:
+        info = batch.per_request_info_wrapped
+        sampler = verifying.sampler
+        return [
+            getattr(info[rid].resource_configs.get(sampler), "ignore_eos", False) or False
+            for rid in rids
+        ]
+
+    def _emit_rows(self, batch: ExecutingBatch, verifying: VerifyWalk, rows) -> None:
+        """``rows`` as each request's ``policy.emit`` output, and the step's stops. Rows the
+        batch has dropped since the step ran (the worker drops a request whose loop stopped)
+        get nothing."""
         emit = verifying.policy.emit
         per_rid = batch.outputs.per_rid_outputs
+        running = batch.request_ids
         # numpy gives an empty mask result a stride of 0, which the transport can't view as bytes
         emitted = torch.from_numpy(rows.tokens) if rows.tokens.size else torch.empty(0, dtype=torch.long)
-        for rid, tokens in zip(rids, emitted.split(rows.counts.tolist()), strict=True):
-            per_rid.setdefault(rid, {})[emit] = [tokens]
+        kept = None if tuple(running) == rows.request_ids else set(running)
+        for rid, tokens in zip(rows.request_ids, emitted.split(rows.counts.tolist()), strict=True):
+            if kept is None or rid in kept:
+                per_rid.setdefault(rid, {})[emit] = [tokens]
         loops = {verifying.policy.loop}
         batch.verify_stops = {
-            rid: set(loops) for rid, done in zip(rids, rows.done.tolist(), strict=True) if done
+            rid: set(loops) for rid, done in zip(rows.request_ids, rows.done.tolist(), strict=True) if done
         }
 
     def _exec_single(
@@ -2171,6 +2210,8 @@ class Engine:
         Outputs the check withholds (``StopCheck`` / ``BatchedStopCheck``) go
         on ``batch.withheld_outputs``, for the caller to leave unrouted.
         """
+        if getattr(batch, "verify_record", None) is not None:
+            self._emit_record(batch)
         stops = getattr(batch, "verify_stops", None)
         if stops is not None:
             # settled with the step's emitted tokens; the engine owns a verify step's stop

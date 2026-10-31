@@ -3,7 +3,9 @@ engine's step path on the same requests, the drafter's weights skewed on rank 1 
 drafter whose reductions aren't bitwise alike would draft apart).
 
 Both ranks must emit the same tokens, rewind to the same lengths and hold the same target KV:
-they keep rank 0's drafts (``agree``) and rank 0's verdict.
+they keep rank 0's drafts (``agree``) and rank 0's verdict. The same when each verdict is taken
+back on the device in the step after it (``device_rewind``): the ranks stage it from the same
+host state at the same point, and take it back on the host at the same later one.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ def _entry(rank, store, out, mode):
 def _run(rank: int, mode: str) -> dict:
     cpu = torch.device("cpu")
     sub = ds.ToyDSparkSubmodule(
-        k=4, drafter_seed=5 + rank, kv_heads=toy.HEADS * WORLD,
+        k=4, drafter_seed=5 + rank, kv_heads=toy.HEADS * WORLD, device_rewind=mode.endswith("device"),
     )
     sub.rank = rank
     sub.logit_skew = 0.5
@@ -54,10 +56,7 @@ def _run(rank: int, mode: str) -> dict:
         drv.decode(live)
         lengths.append([(kv._streams[r]["main"].stored_len, pos.position(r, "main")) for r in live])
         live = [r for r in live if r not in drv.stops]
-    verdicts = dv.settle(rids)
-    if verdicts is not None:
-        kv.rewind(verdicts)
-        pos.rewind(verdicts)
+    ds.settle_all(eng, rids)
     rows = {}
     for rid in rids:
         stream = kv._streams[rid]["main"]
@@ -79,6 +78,14 @@ def _both(tmp_path, mode: str):
 
 def test_the_ranks_keep_rank_zeros_dspark_drafts_and_verdicts(tmp_path):
     r0, r1 = _both(tmp_path, "every_step")
+    ref = {rid: toy.reference(prompt, 16) for rid, prompt in enumerate(PROMPTS)}
+    assert r0["emitted"] == r1["emitted"] == ref
+    assert r0["lengths"] == r1["lengths"]
+    assert tp._rows_equal(r0["rows"], r1["rows"])
+
+
+def test_ranks_take_verdicts_back_on_the_device_alike(tmp_path):
+    r0, r1 = _both(tmp_path, "every_step_device")
     ref = {rid: toy.reference(prompt, 16) for rid, prompt in enumerate(PROMPTS)}
     assert r0["emitted"] == r1["emitted"] == ref
     assert r0["lengths"] == r1["lengths"]

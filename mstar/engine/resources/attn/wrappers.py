@@ -119,6 +119,71 @@ def _host_lens(kv_lens) -> np.ndarray:
     return np.asarray(kv_lens, dtype=np.int32)
 
 
+class _SplitPlan:
+    """A captured FA2 plan's split arrays, in the wrapper's int workspace (FlashInfer's
+    ``PrefillPlanInfo``): each CTA's request and KV chunk, which CTAs run, where each request's
+    partial outputs start (``o_indptr``) and each query row's (``merge_indptr``), and the KV chunk
+    size. The kernel counts a row's chunks from its length at run time (``num_kv_chunks``) and
+    places partials by it; the merge reads ``merge_indptr``. A row shortened across a chunk
+    boundary after the plan (device rewind) needs the three planned again from its length:
+    ``replan``, in the graph, which keeps the chunk size and drops the CTAs of chunks past a
+    row's new count."""
+
+    __slots__ = ("at", "rows", "request", "chunk_of", "merge", "o_indptr", "chunk", "valid", "window", "cta_q",
+                 "_qrows")
+
+    @staticmethod
+    def layout(fi) -> tuple:
+        info = [int(x) for x in fi._plan_info]
+        if len(info) != 15 or not info[13] or not info[14]:
+            raise RuntimeError(f"device rewind reads a captured FA2 plan's split arrays; its plan info is {info}")
+        return info[0], info[1], info[4], info[6], info[7], info[8], info[9], info[12], info[3]
+
+    @classmethod
+    def locate(cls, fi, rows: int) -> "_SplitPlan":
+        """Views of the arrays, and the buffers the re-plan keeps: once a wrapper, since its
+        graphs read what they were captured with."""
+        at = cls.layout(fi)
+        padded, total_rows = at[0], at[1]
+        info = [int(x) for x in fi._plan_info]
+        ws = fi._int_workspace_buffer
+
+        def i32(offset: int, n: int) -> torch.Tensor:
+            return ws[offset:offset + 4 * n].view(torch.int32)
+
+        out = cls()
+        out.at = at
+        out.rows = rows
+        out.request = i32(info[4], padded)
+        out.chunk_of = i32(info[6], padded)
+        out.merge = i32(info[7], total_rows + 1)
+        out.o_indptr = i32(info[8], rows + 1)
+        out.chunk = i32(info[9], 1)
+        out.valid = ws[info[12]:info[12] + padded]
+        window = getattr(fi, "_window_left", -1)
+        out.window = -1 if window is None else int(window)
+        out.cta_q = info[3]
+        out._qrows = torch.arange(total_rows, dtype=torch.int32, device=ws.device)
+        return out
+
+    def replan(self, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, last: torch.Tensor, page_size: int) -> None:
+        rows = self.rows
+        lens = (kv_indptr[1:rows + 1] - kv_indptr[:rows] - 1) * page_size + last
+        # the kernel's num_kv_chunks: over the window's keys only, under a sliding window
+        span = lens.clamp(min=1)
+        if self.window >= 0:
+            span = span.clamp(max=self.window + self.cta_q)
+        chunks = (span + self.chunk - 1) // self.chunk
+        request = self.request.long().clamp(0, rows - 1)
+        self.valid.mul_((self.chunk_of < chunks[request]).to(self.valid.dtype))
+        qo = qo_indptr[:rows + 1]
+        self.o_indptr[1:].copy_(torch.cumsum((qo[1:] - qo[:-1]) * chunks, 0, dtype=torch.int32))
+        self.o_indptr[:1].zero_()
+        q_row = torch.searchsorted(qo[1:], self._qrows, right=True).clamp(max=rows - 1)
+        self.merge[:-1].copy_((self.o_indptr[q_row] + (self._qrows - qo[q_row]) * chunks[q_row]).to(torch.int32))
+        self.merge[-1:].copy_(self.o_indptr[rows:rows + 1])
+
+
 class FlashInferPrefillWrapper:
     """Batched prefill attention with paged KV cache.
 
@@ -223,6 +288,10 @@ class FlashInferPrefillWrapper:
         # the row lengths the last plan was made for, and the stager `patch_kv_lens` copies through
         self._planned_lens: np.ndarray | None = None
         self._lens_stager = None
+        # under device rewind: the plan's rows' last page lengths on the device, and a captured FA2
+        # plan's split arrays (`locate_kv_lens`)
+        self._last_page_lens: torch.Tensor | None = None
+        self._split: _SplitPlan | None = None
 
     def _stage_pinned(self, qo_indptr, kv_indptr, last_page_len, kv_lens, indices):
         """Copy the plan's host arrays into this wrapper's page-locked buffers,
@@ -267,6 +336,7 @@ class FlashInferPrefillWrapper:
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
         window_left: int = -1,
+        disable_split_kv: bool = False,
         **kwargs
     ):
         """Plan attention and compute KV write indices.
@@ -319,6 +389,7 @@ class FlashInferPrefillWrapper:
             # host lengths, so plan neither rebuilds them nor copies pageable ones
             seq_lens=kv_lens,
             window_left=window_left,
+            disable_split_kv=disable_split_kv,
         )
 
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
@@ -450,6 +521,46 @@ class FlashInferPrefillWrapper:
         dst = fi._int_workspace_buffer[kv_len_at:kv_len_at + 4 * total].view(torch.int32)
         self._lens_stager.copy_(dst, new[rows])
         return True
+
+    def locate_kv_lens(self) -> None:
+        """After a plan, under device rewind: the rows' last pages' lengths on the device, which
+        FA2 computes each row's KV length from, for `correct_kv_lens` (None for another kernel's
+        plan: a prefill's, which nothing corrects); and a captured FA2 plan's split arrays. A
+        captured wrapper's stay in its static buffers, where its graphs read them."""
+        fi = self.attn_wrapper
+        if getattr(fi, "_backend", None) != "fa2":
+            self._last_page_lens = self._split = None
+            return
+        rows = fi._qo_indptr_buf.shape[0] - 1 if self._planned_lens is None else len(self._planned_lens)
+        self._last_page_lens = fi._paged_kv_last_page_len_buf[:rows]
+        if not self.accelerator_graph:
+            # an eager plan is unsplit under device rewind (the manager's), so nothing else moves
+            self._split = None
+            return
+        if self._split is None:
+            self._split = _SplitPlan.locate(fi, rows)
+        elif _SplitPlan.layout(fi) != self._split.at:
+            # the graphs captured against the old arrays would re-plan the wrong ones
+            raise RuntimeError(
+                f"FA2 moved its split plan's arrays under a captured graph: {self._split.at} -> {_SplitPlan.layout(fi)}"
+            )
+
+    def correct_kv_lens(self, rejected: torch.Tensor) -> None:
+        """Each row's KV length less its ``rejected`` (``[rows]`` int32), on the device: the plan,
+        made for longer rows whose pages still cover these, is then the shorter rows'. FA2
+        computes a row's length as ``(pages - 1) * page_size + last``, so a last page's length
+        of zero or below ends the row in the page before. Its kernel counts a row's KV chunks
+        from that length, so a split plan's chunk-dependent arrays are planned again from it,
+        in the graph (`_SplitPlan.replan`). Capturable."""
+        if self._last_page_lens is None:
+            raise RuntimeError(
+                "device rewind moves a row's KV length through FA2's last page lengths; this wrapper "
+                f"planned {getattr(self.attn_wrapper, '_backend', None)!r}"
+            )
+        self._last_page_lens.sub_(rejected)
+        if self._split is not None:
+            fi = self.attn_wrapper
+            self._split.replan(fi._qo_indptr_buf, fi._paged_kv_indptr_buf, self._last_page_lens, self.page_size)
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:

@@ -11,6 +11,8 @@ drafter's context K/V and its block, so a test can check the engine's drafts aga
 
 from __future__ import annotations
 
+import dataclasses
+
 import draft_verify_toy as toy
 import torch
 
@@ -28,6 +30,7 @@ from mstar.engine.resources import (
     draft_verify_step,
     with_draft_verify,
 )
+from mstar.engine.resources.base import RewindKind
 from mstar.model.components.dspark import DSpark, DSparkConfig, DSparkDrafter, DSparkKeys
 from mstar.model.submodule_base import BatchedModelOutput
 
@@ -63,10 +66,12 @@ class ToyDSparkSubmodule(toy.ToySubmodule):
 
     def __init__(self, k: int = 3, drafter_seed: int = 5, sample: bool = False, causal: bool = False,
                  capture_batch_sizes=(1, 2, 4), max_num_pages: int = 256, kv_heads: int = toy.HEADS,
-                 rope_dtype: torch.dtype | None = torch.float32):
+                 rope_dtype: torch.dtype | None = torch.float32, device_rewind: bool = False):
         self.decl = declaration(k, max_num_pages, kv_heads=kv_heads, sample=sample, causal=causal,
                                 rope_dtype=rope_dtype)
         super().__init__(k=k, capture_batch_sizes=capture_batch_sizes, taps=self.decl.config.taps)
+        # each verdict taken back on the device in the step after it (``DraftPolicy.device_rewind``)
+        self.device_rewind = device_rewind
         self.drafter = DSparkDrafter(self.decl)
         self.drafter.reset_parameters()
         gen = torch.Generator().manual_seed(drafter_seed)
@@ -84,6 +89,7 @@ class ToyDSparkSubmodule(toy.ToySubmodule):
             return None
         return DraftPolicy(
             max_drafts=self.k, stop_ids=frozenset({toy.STOP}), taps=self.decl.config.taps,
+            device_rewind=self.device_rewind,
         )
 
     def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, **kwargs):
@@ -155,6 +161,10 @@ def specs(sub: ToyDSparkSubmodule, attn: str = "toy", **kwargs):
             else spec
             for spec in drafter
         ]
+    elif "fi_backend" in kwargs:
+        for spec in drafter:
+            if isinstance(spec, AttentionSpec):
+                spec.config = dataclasses.replace(spec.config, flashinfer_backend=kwargs["fi_backend"])
     return toy.specs(attn, **kwargs) + drafter
 
 
@@ -177,6 +187,22 @@ def engine(sub: ToyDSparkSubmodule, device, attn: str = "toy", warmup: bool = Fa
     if warmup:
         eng.warmup()
     return eng
+
+
+def settle_all(eng, request_ids) -> None:
+    """Take back on the host every verdict of these requests still waiting there (under device
+    rewind the last committed step's wait until the request's next step would take them back
+    on the device), so their streams' lengths are the kept tokens'."""
+    dv = eng._resources[toy.DV]
+    device, dv.device_rewind = dv.device_rewind, False
+    try:
+        verdicts = dv.settle(list(request_ids))
+    finally:
+        dv.device_rewind = device
+    if verdicts is not None:
+        for resource in eng._resources.values():
+            if resource.rewind_kind is RewindKind.HOST:
+                resource.rewind(verdicts)
 
 
 def dspark_layout(decl: DSpark, prompt: int, max_tokens: int, lookahead: int) -> KVReqConfig:

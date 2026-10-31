@@ -63,7 +63,7 @@ from mstar.engine.resources.step import (
     StepContext,
 )
 from mstar.utils.client_errors import client_error_text
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import PinnedStager, to_device_nonblocking
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 from mstar.utils.profiler import PhaseLaps
 
@@ -76,6 +76,8 @@ logger = logging.getLogger(__name__)
 # request after each admit, commit, reset and remove, and after each change to
 # an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
+# the pages of a row a device rewind readdresses a verify block's writes across (`_stage_fixes`)
+_FIX_PAGES = 8
 
 
 class RoomMark(NamedTuple):
@@ -688,6 +690,12 @@ class KVManager(AttentionResource):
         self._preplanned = False
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
+        # Under device rewind, what `correct_on_device` readdresses a verify step's writes
+        # from (label -> [rows, 2 + _FIX_PAGES], `_stage_fixes`), per capture slot when leased.
+        self._current_fixes: dict[str, torch.Tensor] = {}
+        self._preplan_fixes: dict[str, torch.Tensor] = {}
+        self._static_fixes: dict[tuple[int, str], torch.Tensor] = {}
+        self._cg_max_bs = 0
         # a rewind moved pages under the staged step's addressing (a sealed tail, which a
         # node that verifies drafts can't have today): `correct_preplan` refuses
         self._preplan_unfixable = False
@@ -733,12 +741,13 @@ class KVManager(AttentionResource):
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ):
-        del slots, max_bs
+        del slots
         # the per-(slot, label) buffers themselves are built on first plan for
         # that key (which labels a walk plans under is the step's to declare),
         # all at this one max length so they outlive any single bucket. Every
         # runner capturing against this node calls in, so keep the largest
         self._cg_max_seq_len = max(self._cg_max_seq_len, max_seq_len)
+        self._cg_max_bs = max(self._cg_max_bs, max_bs)
 
     def _static_plan_state(self, slot: int, label: tuple[str, int]) -> KVPlanState:
         state = self._static_plan_states.get((slot, label))
@@ -2943,6 +2952,8 @@ class KVManager(AttentionResource):
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):
                 self._current_plan_states = self._preplan_states
+                self._current_fixes = self._preplan_fixes
+                self._preplan_fixes = {}
                 res = self._cached_plan_output
 
                 # Promotion: apply the fork copies staging left undone; see
@@ -3031,6 +3042,8 @@ class KVManager(AttentionResource):
             laps.lap("full")
         for g, outputs in enumerate(res.groups):
             self._setup_plan_states(outputs, ctx, ctx.slot_lease, g, eager_write=step.eager_write)
+        if self.device_correct:
+            self._stage_fixes(res if step.verify else {}, ctx)
         laps.lap("setup_states")
         if readonly:
             self._readonly_plans[slot] = (key, epochs, res)
@@ -3110,6 +3123,7 @@ class KVManager(AttentionResource):
         self._preplanned = False
         self._preplan_key = None
         self._preplan_states = {}
+        self._preplan_fixes = {}
         self._cached_plan_output = None
         self._preplan_unfixable = False
 
@@ -3192,6 +3206,71 @@ class KVManager(AttentionResource):
                 self._setup_plan_states(outputs, ctx, lease, g, eager_write=step.eager_write)
                 res.groups[g].update(outputs)
         return True
+
+    corrects_on_device = True
+
+    def _stage_fixes(self, res: dict[str, KVPlanOutput], ctx: StepContext) -> None:
+        """Under device rewind, what `correct_on_device` readdresses a verify step's writes
+        from, for each label: each row's planned first position (its stream's length before
+        the step), the first page a rewind of up to ``span - 1`` rows can move it to, and the
+        row's pages from that one on (`_FIX_PAGES`, padded with SINK_PAGE). Every row of a
+        verify step runs one block. A pool that verifies drafts has one group (`require_lookahead`)."""
+        fixes = self._preplan_fixes if ctx.is_preplan else self._current_fixes
+        fixes.clear()
+        page_size = self._groups[0].page_size
+        lease = ctx.slot_lease
+        for label, out in res.items():
+            ind = out.cpu_indptrs
+            spans = np.diff(ind.qo_indptr.numpy())
+            if not spans.size:
+                continue
+            span = int(spans[0])
+            if (spans != span).any() or ind.kv_lens is None:
+                raise ValueError(f"KV {self.name}: a step taken back on the device runs one block a row; got {spans}")
+            if 2 * span - 2 > (_FIX_PAGES - 2) * page_size:
+                raise ValueError(f"KV {self.name}: a block of {span} spans more pages than a device rewind stages")
+            start = ind.kv_lens.numpy().astype(np.int64) - span
+            first = np.maximum(start - (span - 1), 0) // page_size
+            indptr = ind.paged_kv_indptr.numpy().astype(np.int64)
+            indices = ind.paged_kv_indices.numpy().astype(np.int64)
+            held = indptr[1:] - indptr[:-1]
+            cols = first[:, None] + np.arange(_FIX_PAGES)
+            inside = cols < held[:, None]
+            flat = np.where(inside, indptr[:-1, None] + cols, 0)
+            pages = np.where(inside, indices[flat] if indices.size else SINK_PAGE, SINK_PAGE)
+            host = np.concatenate([start[:, None], first[:, None], pages], axis=1)
+            if lease is None:
+                fixes[label] = to_device_nonblocking(torch.from_numpy(host.astype(np.int64, copy=False)), self._device)
+                continue
+            buffer = self._static_fixes.get((lease.slot, label))
+            if buffer is None:
+                rows = max(self._cg_max_bs, host.shape[0])
+                buffer = self._static_fixes[(lease.slot, label)] = torch.zeros(
+                    (rows, host.shape[1]), dtype=torch.long, device=self._device,
+                )
+            view = buffer[: host.shape[0]]
+            self._plan_stager.copy_(view.view(-1), host.reshape(-1))
+            fixes[label] = view
+
+    @torch.compiler.disable
+    def correct_on_device(self, rejected) -> None:
+        """Readdress the step's writes for rows its plan placed past their rewound lengths:
+        each token goes ``rejected`` positions earlier, on the page that position falls in."""
+        page_size = self._groups[0].page_size
+        for label, fix in self._current_fixes.items():
+            state = self._current_plan_states[label, 0]
+            rows = rejected.token_rows
+            tokens = rows.shape[0]
+            if fix.shape[0] * rejected.span != tokens:
+                raise RuntimeError(
+                    f"KV {self.name}: {label!r} plans {fix.shape[0]} rows; the verdicts are for "
+                    f"{tokens // rejected.span}"
+                )
+            position = fix[:, 0].index_select(0, rows) - rejected.tokens + rejected.offsets
+            page_no = torch.div(position, page_size, rounding_mode="floor")
+            column = page_no - fix[:, 1].index_select(0, rows) + 2
+            state.token_to_page[:tokens].copy_(fix[rows, column])
+            state.token_to_cache[:tokens].copy_(position - page_no * page_size)
 
     def rewind(self, verdicts: "VerdictBatch") -> None:
         """Take each row's rejected drafts back off its stream's length. The pages stay with

@@ -52,12 +52,14 @@ from mstar.model.text_lm.submodules import TextLMSubmodule  # noqa: E402
 from mstar.model.text_lm.text_lm_model import TextLMModel  # noqa: E402
 
 GPU = torch.device("cuda", 0)
-MAX_TOKENS = 96
+# long enough that every row's context crosses 128 tokens, FA2's smallest KV chunk
+MAX_TOKENS = 160
 TIE = 0.25
 PROMPTS = [
     "Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring.",
     "Explain in three sentences why the sky is blue.",
     "List the planets of the solar system in order from the Sun, one per line.",
+    "Describe the history of the Roman Empire from its founding to its fall.",
 ]
 
 

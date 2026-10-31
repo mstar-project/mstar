@@ -324,7 +324,10 @@ class StepRunner:
     def plans_ahead(self, step: SubmoduleStep) -> bool:
         """Whether a pre-plan of ``step`` runs before its rows' last verdicts are read: the
         step verifies drafts and every one of its pre-planning resources can correct its
-        staged plan for the rewind that follows (`settle_preplan`). Fixed per resource set."""
+        staged plan for the rewind that follows (`settle_preplan`). Fixed per resource set.
+        Not under device rewind, which needs no verdict to plan: the rewind before the
+        pre-plan takes only verdicts that have landed, and the step's forward takes back the
+        last one (`DraftVerifyResource.apply_previous`)."""
         if not self._rewinders:
             return False
         keyset = frozenset(step.keys())
@@ -333,7 +336,8 @@ class StepRunner:
             ahead = self._plan_ahead_cache[keyset] = bool(self._rewind_hooks(keyset)) and all(
                 self._resources[key].corrects_preplan for key in self._preplan_keys_for(step)
             )
-        return ahead
+        # read each time: a walk's device rewind is bound when the walk is first asked
+        return ahead and not any(dv.device_rewind for dv, _ in self._rewind_hooks(keyset))
 
     def settle_preplan(self, step: SubmoduleStep) -> bool:
         """After the pre-plan of a step planned ahead: wait for its rows' last verdicts, rewind

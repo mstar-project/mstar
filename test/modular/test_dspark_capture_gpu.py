@@ -3,7 +3,10 @@ drafter's block non-causal, its last row hidden), captured at buckets of 1, 2 an
 three requests replaying in the bucket of 4 with a padding row. The drafter's pass, the heads,
 the target's verify, the verdict and the drafter's context write replay as one graph per
 bucket. Captured must equal eager, both plain greedy decode; steps planned ahead of their
-verdicts keep, in both caches, what steps planned after the rewind keep. Skips without CUDA."""
+verdicts keep, in both caches, what steps planned after the rewind keep. The same with each
+verdict taken back on the device in the step after it (``device_rewind``: FA2's last-page
+lengths, the KV writes and the positions moved in the replay), which must keep, bitwise, what
+steps planned after the host's rewind keep. Skips without CUDA."""
 
 from __future__ import annotations
 
@@ -30,9 +33,10 @@ PROMPTS = {0: [3, 9, 12, 40], 1: [5, 11], 2: [20, 21, 22, 23, 24, 25]}
 MAX_TOKENS = 20
 
 
-def _run(k: int, captured: bool, plan_ahead: bool = False, **sub_kwargs):
+def _run(k: int, captured: bool, plan_ahead: bool = False, fi_backend: str = "auto", **sub_kwargs):
     sub = ds.ToyDSparkSubmodule(k=k, rope_dtype=None, **sub_kwargs)
-    eng = ds.engine(sub, GPU, attn="flashinfer", warmup=captured, dtype=torch.float32, kv_dtype=torch.float16)
+    eng = ds.engine(sub, GPU, attn="flashinfer", warmup=captured, dtype=torch.float32, kv_dtype=torch.float16,
+                    fi_backend=fi_backend)
     drv = ds.Driver(eng, sub, plan_ahead=plan_ahead)
     drv.add_batch(PROMPTS, MAX_TOKENS)
     out = drv.run(list(PROMPTS))
@@ -83,3 +87,29 @@ def test_steps_planned_ahead_keep_what_steps_planned_after_the_rewind_keep(monke
     assert adrv.planned_ahead == len(adrv.leases) - 1 > 0
     rows_a, rows_b = _kept_rows(aeng), _kept_rows(beng)
     assert rows_a.keys() == rows_b.keys() and all(torch.equal(rows_a[key], rows_b[key]) for key in rows_a)
+
+
+@pytest.mark.parametrize("k", [3, 7])
+def test_verdicts_taken_back_on_the_device_replay_what_eager_and_plain_decode_emit(k):
+    captured, ceng, cdrv = _run(k, captured=True, device_rewind=True)
+    eager, _, _ = _run(k, captured=False, device_rewind=True)
+    assert captured == eager == _reference()
+    assert all(lease is not None and lease.bucket is not None for lease in cdrv.leases[1:])
+    dv = ceng._resources[toy.DV]
+    # rows rejected drafts, so steps took them back on the device
+    assert dv.device_rewind and dv.rows_verified and dv.drafts_accepted < k * dv.rows_verified
+
+
+def test_steps_planned_before_their_verdicts_keep_what_steps_planned_after_them_keep(monkeypatch):
+    """Every decode step pre-planned while the step before it is unsettled, its last verdict
+    taken back in its replay: both caches keep, bitwise, what steps planned after the host's
+    rewind keep (on the same kernel, FA2), inside the footprints."""
+    monkeypatch.setattr(kv_manager, "_DEBUG_ASSERTS", True)
+    device, deng, ddrv = _run(3, captured=True, plan_ahead=True, device_rewind=True)
+    host, heng, _ = _run(3, captured=True, fi_backend="fa2")
+    assert device == host == _reference()
+    assert ddrv.planned_ahead == len(ddrv.leases) - 1 > 0
+    for eng in (deng, heng):
+        ds.settle_all(eng, list(PROMPTS))
+    rows_d, rows_h = _kept_rows(deng), _kept_rows(heng)
+    assert rows_d.keys() == rows_h.keys() and all(torch.equal(rows_d[key], rows_h[key]) for key in rows_d)

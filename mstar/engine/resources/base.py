@@ -186,6 +186,23 @@ class Resource(ABC):
         del verdicts, step, ctx
         return False
 
+    # Under device rewind (``DraftPolicy.device_rewind``) a step is planned from lengths that
+    # still count the last block whole, so every resource whose plan reads lengths must correct
+    # it on the device; ``device_correct`` is set on those of such a node, whose plans stage it.
+    plan_reads_lengths: bool = True
+    corrects_on_device: bool = False
+    device_correct: bool = False
+
+    def correct_on_device(self, rejected) -> None:
+        """In a verify step's forward, before anything reads this resource's plan: the step was
+        planned from lengths that still counted its rows' last verify step's whole block, and
+        ``rejected`` (``draft_verify.resource.Rejected``: per row of the step, in its segment
+        order, and per token) is how many of those tokens each row's verdict took back. Make
+        the staged plan the one ``plan`` would give from the rewound lengths, in place, on the
+        device. Capturable: the plan is staged anew for every step, and corrected once."""
+        del rejected
+        raise NotImplementedError(f"{type(self).__name__} doesn't correct its plan on the device")
+
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
         """Open whatever this resource keeps across requests, under ``root``. The
         engine calls it, before any request, on the caches `opening_prefix_caches` opens."""

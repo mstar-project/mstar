@@ -45,6 +45,7 @@ class TapSpec(NodeResourceSpec):
 class TapResource(Resource):
     # keeps nothing per token across steps: a rejected row's taps die with the step
     rewind_kind = RewindKind.NONE
+    plan_reads_lengths = False
 
     def __init__(self, layers: tuple[int, ...], hidden_size: int, dtype: torch.dtype, device: torch.device):
         if not layers or len(set(layers)) != len(layers) or min(layers) < 0:

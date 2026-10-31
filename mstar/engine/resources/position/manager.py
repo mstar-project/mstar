@@ -224,6 +224,17 @@ class RopeManager(PositionManager):
             counters = self._counters.setdefault(rid, {})
             counters[label] = max(0, counters.get(label, 0) - rejected)
 
+    @property
+    def corrects_on_device(self) -> bool:
+        return self._config.scheme == PosScheme.SEQUENTIAL
+
+    @torch.compiler.disable
+    def correct_on_device(self, rejected) -> None:
+        """Each token of the step sits ``rejected`` positions earlier than planned."""
+        tokens = rejected.tokens.shape[0]
+        for pos_ids in self._current_pos_ids.values():
+            pos_ids[:tokens].sub_(rejected.tokens)
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
         prefix: CachedPrefix | None,

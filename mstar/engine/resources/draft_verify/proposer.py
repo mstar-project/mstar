@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 class DraftProposer(Resource):
     # it learns emitted tokens only, from verdicts, so a rejected draft leaves nothing to take back
     rewind_kind = RewindKind.NONE
+    plan_reads_lengths = False
 
     # the drafts a row takes from it, which the walk's policy asks for
     max_drafts: int

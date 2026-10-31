@@ -18,6 +18,15 @@ resource carries it across:
 - ``emitted_rows``, from the engine after the commit, cuts each row's tokens at a stop id and
   at ``max_tokens`` and says which rows stop.
 
+A walk whose policy takes its verdicts back on the device (``DraftPolicy.device_rewind``)
+waits for none. Its step is planned from lengths that still count the rows' last step's whole
+block; ``apply_previous``, first in its forward, reads that step's verdict where its forward
+left it (``verify`` keeps each row's rejected count on the device) and has every resource of
+the node correct its plan there (``Resource.correct_on_device``). The host takes those rows
+back at the request's next settle: ``settle`` hands out every verdict but the last committed
+step's. The engine reads a step's tokens at its stop check (``take_record``, ``emit_record``),
+once the step has landed, so no thread waits for a verdict while the step after it runs.
+
 The maps are keyed by the worker's request handle; ``ingest_request`` and ``remove_request``
 clear them.
 """
@@ -54,6 +63,8 @@ _LOG_EVERY = 4096
 _IDLE_S = 1.0
 # `_harvest`'s "every slot" default
 _ANY_SLOT = object()
+# rows a step may verify under device rewind (each one's rejected count stays on the device)
+_MAX_ROWS = 8192
 
 
 class VerdictTensors(NamedTuple):
@@ -61,6 +72,17 @@ class VerdictTensors(NamedTuple):
     tokens: torch.Tensor  # [n, k + 1]: the target's token at each row of the block
     accepted: torch.Tensor  # [n]: leading drafts equal to it; a row emits tokens[:accepted + 1]
     next_inputs: torch.Tensor  # [n, 1]: tokens[accepted], the next step's input
+
+
+class Rejected(NamedTuple):
+    """A verify step's rows' rejected counts from their last step, on the device, as
+    ``Resource.correct_on_device`` takes them: per row (the step's segment order), per token, and
+    each token's row and place in its row; every row runs ``span`` tokens."""
+    rows: torch.Tensor  # [n] int32
+    tokens: torch.Tensor  # [n * span] int64
+    token_rows: torch.Tensor  # [n * span]
+    offsets: torch.Tensor  # [n * span]
+    span: int
 
 
 class EmittedRows(NamedTuple):
@@ -97,6 +119,18 @@ class _Pending(NamedTuple):
     drafts: int
 
 
+class _Planned(NamedTuple):
+    """The verify step planned last, until its commit."""
+    seq: int
+    slot: int | None
+    drafts: int
+    label: str
+    # under device rewind: the rows whose last verdict this step takes back on the device, and
+    # the step that verdict came from
+    applied: frozenset
+    previous: int
+
+
 class _StepRecord(NamedTuple):
     seq: int
     slot: int | None
@@ -106,6 +140,7 @@ class _StepRecord(NamedTuple):
 
 class DraftVerifyResource(Resource):
     rewind_kind = RewindKind.NONE
+    plan_reads_lengths = False
     # keeps no per-token state; a request's verdicts are cleared at ingest
     prefix_skip_safe = True
 
@@ -131,8 +166,7 @@ class DraftVerifyResource(Resource):
         self._mirrors: dict[int | None, _Mirror] = {}
         self._cg_rows = 0
         self._seq = 0
-        # (seq, slot, drafts, label) of the step planned last, until its commit
-        self._planned: tuple[int, int | None, int, str] | None = None
+        self._planned: _Planned | None = None
         # the step an eager forward last staged; a replay runs no Python
         self._verified = 0
         # The plan thread settles a step ahead while the gpu thread commits and emits, so
@@ -142,9 +176,24 @@ class DraftVerifyResource(Resource):
         # request live.
         self._lock = threading.Lock()
         self._pending: dict[int, _Pending] = {}
-        self._settled: dict[int, tuple[str, int]] = {}
+        # once read, until a rewind takes them: (step, label, rejected), one a step
+        self._settled: dict[int, list[tuple[int, str, int]]] = {}
         self._rows: dict[int, np.ndarray] = {}
         self._emitted: dict[int, int | None] = {}
+        # Under device rewind (set at load): who corrects a plan on the device; a request's
+        # verdict before its last, unread; the last committed step and its rows (handle -> row);
+        # each row's rejected count on the device; each capture slot's source rows.
+        self.device_rewind = False
+        self._correctors: list[Resource] = []
+        self._pending_prev: dict[int, _Pending] = {}
+        self._committed_seq = 0
+        self._last_rows: dict[int, int] = {}
+        self._last_rej: torch.Tensor | None = None
+        self._src: dict = {}
+        self._src_stager = None
+        self._current_src: torch.Tensor | None = None
+        # (rows, span) -> each token's row and its place in the row, on the device
+        self._grids: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         # steps committed since the last `emitted_rows`
         self._steps: list[_StepRecord] = []
         self.rows_verified = 0
@@ -174,24 +223,40 @@ class DraftVerifyResource(Resource):
             if not any(resource is bound for bound in self._settlers):
                 self._settlers.append(resource)
 
+    def enable_device_rewind(self, correctors: Sequence[Resource]) -> None:
+        """Take each verdict back on the device in the step after it (``apply_previous``), by
+        ``correctors``: the node's resources whose plans read lengths. Bound by the engine at
+        load, for a walk whose policy asks it and whose node allows it."""
+        self.device_rewind = True
+        for resource in correctors:
+            if not any(resource is bound for bound in self._correctors):
+                self._correctors.append(resource)
+                resource.device_correct = True
+        if self._last_rej is None:
+            self._last_rej = torch.zeros(_MAX_ROWS, dtype=torch.int32, device=self._device)
+
     # ── request lifecycle ──
 
     def ingest_request(self, rid: int, overrides=None):
         del overrides
         with self._lock:
-            self._pending.pop(rid, None)
-            self._settled.pop(rid, None)
-            self._rows.pop(rid, None)
+            self._forget(rid)
             self._emitted[rid] = None
+
+    def _forget(self, rid: int) -> None:
+        self._pending.pop(rid, None)
+        self._pending_prev.pop(rid, None)
+        self._settled.pop(rid, None)
+        self._rows.pop(rid, None)
+        # a handle is recycled: its next request mustn't take this one's verdict back
+        self._last_rows.pop(rid, None)
 
     def ingest_capture_row(self, rid: int):
         return
 
     def remove_request(self, rid: int):
         with self._lock:
-            self._pending.pop(rid, None)
-            self._settled.pop(rid, None)
-            self._rows.pop(rid, None)
+            self._forget(rid)
             self._emitted.pop(rid, None)
 
     def reset_request(self, rid: int, free: bool = False):
@@ -231,13 +296,45 @@ class DraftVerifyResource(Resource):
         self._seq += 1
         # a kernel argument, not a host buffer, so no later plan can change it under the step
         mirror.seq_dev.fill_(self._seq)
-        self._planned = (self._seq, slot, step.drafts, label)
+        applied: frozenset = frozenset()
+        if self.device_rewind:
+            applied = self._stage_previous(step, ctx)
+        self._planned = _Planned(self._seq, slot, step.drafts, label, applied, self._committed_seq)
+
+    def _stage_previous(self, step: VerifyStep, ctx: StepContext) -> frozenset:
+        """Under device rewind: where each of the step's rows (in its segment order, the order
+        its resources plan them) sits in the last committed step, -1 for a row that didn't run
+        there, staged for ``apply_previous``. Returns the rows whose last verdict this step
+        takes back on the device."""
+        rows = [segment.request_id for segment in step.segments or ()]
+        n = len(rows)
+        if n > _MAX_ROWS:
+            raise ValueError(f"draft-verify: a step of {n} rows; device rewind takes {_MAX_ROWS} at most")
+        last = {} if ctx.capture else self._last_rows
+        src = [last.get(rid, -1) if not ctx.is_padding_row(rid) else -1 for rid in rows]
+        if self._src_stager is None:
+            from mstar.utils.h2d import PinnedStager
+
+            self._src_stager = PinnedStager(torch.int32)
+        lease = ctx.slot_lease
+        if lease is None:
+            from mstar.utils.h2d import to_device_nonblocking
+
+            self._current_src = to_device_nonblocking(src, self._device, dtype=torch.int32)
+        else:
+            # a capture slot's buffer, whose address its graphs keep
+            buffer = self._src.get(lease.slot)
+            if buffer is None:
+                buffer = self._src[lease.slot] = torch.full((_MAX_ROWS,), -1, dtype=torch.int32, device=self._device)
+            self._current_src = buffer[:n]
+            self._src_stager.copy_(self._current_src, src)
+        return frozenset(rid for rid, row in zip(rows, src, strict=True) if row >= 0)
 
     def commit(self, step: VerifyStep, ctx: StepContext) -> None:
         planned, self._planned = self._planned, None
         if planned is None:
             return
-        seq, slot, drafts, _ = planned
+        seq, slot, drafts, _, applied, previous = planned
         if ctx.slot_lease is None and self._verified != seq:
             raise RuntimeError("the forward of a verify step did not call DraftVerifyResource.verify")
         if ctx.capture:
@@ -249,7 +346,17 @@ class DraftVerifyResource(Resource):
             for row, rid in enumerate(ctx.padded_request_ids):
                 if ctx.is_padding_row(rid):
                     continue
-                if rid in self._pending or rid in self._settled:
+                if rid in applied:
+                    # Its verdict from the last committed step, which this step took back on the
+                    # device; the host takes it back at the request's next settle. Nothing older
+                    # may be left.
+                    pending = self._pending.get(rid)
+                    older = rid in self._pending_prev or any(s < previous for s, _, _ in self._settled.get(rid, ()))
+                    if older or (pending is not None and pending.seq != previous):
+                        raise RuntimeError(f"draft-verify: request {rid} has a verdict older than its last step's left")
+                    if pending is not None:
+                        self._pending_prev[rid] = pending
+                elif rid in self._pending or rid in self._settled or rid in self._pending_prev:
                     # the runner rewinds a request's last verdict before its next step admits
                     raise RuntimeError(
                         f"draft-verify: request {rid} verified again before its last verdict was rewound"
@@ -258,6 +365,10 @@ class DraftVerifyResource(Resource):
                 rows.append(rid)
                 positions.append(row)
             self._steps.append(_StepRecord(seq, slot, tuple(rows), tuple(positions)))
+            self._committed_seq = seq
+            if self.device_rewind:
+                # the rows the next step takes this step's verdicts back from
+                self._last_rows = dict(zip(rows, positions, strict=True))
 
     # ── forward side; capturable ──
 
@@ -269,6 +380,32 @@ class DraftVerifyResource(Resource):
         if self._group is None:
             return drafts
         return self._group.broadcast(drafts.contiguous(), src=0)
+
+    @torch.compiler.disable
+    def apply_previous(self) -> None:
+        """Under device rewind, first in a verify step's forward (``draft_verify_step`` calls
+        it): the step was planned from lengths that still count each row's last step's whole
+        block; take back on the device the rows that step's verdict rejected, in every
+        resource whose plan reads lengths (``Resource.correct_on_device``). A no-op otherwise.
+        Capturable."""
+        if not self.device_rewind:
+            return
+        if self._planned is None:
+            raise RuntimeError("DraftVerifyResource.apply_previous outside a planned verify step")
+        src = self._current_src
+        rows = torch.where(src >= 0, self._last_rej.index_select(0, src.clamp(min=0)), 0)
+        rejected = self._rejected(rows, self._planned.drafts + 1)
+        for resource in self._correctors:
+            resource.correct_on_device(rejected)
+
+    def _rejected(self, rows: torch.Tensor, span: int) -> Rejected:
+        n = rows.shape[0]
+        grid = self._grids.get((n, span))
+        if grid is None:
+            index = torch.arange(n * span, device=self._device)
+            grid = self._grids[(n, span)] = (torch.div(index, span, rounding_mode="floor"), index % span)
+        token_rows, offsets = grid
+        return Rejected(rows, rows.index_select(0, token_rows).to(torch.long), token_rows, offsets, span)
 
     @staticmethod
     def block_ids(inputs: torch.Tensor, drafts: torch.Tensor) -> torch.Tensor:
@@ -290,7 +427,7 @@ class DraftVerifyResource(Resource):
             raise RuntimeError("DraftVerifyResource.propose outside a planned verify step")
         rows = inputs.reshape(-1).shape[0]
         drafts, probs = self._proposer.propose(request_ids, rows)
-        expected = self._planned[2]
+        expected = self._planned.drafts
         if drafts.shape != (rows, expected):
             raise ValueError(f"the proposer drafted {tuple(drafts.shape)} for {rows} rows of {expected} drafts")
         return self.block_ids(inputs, self.agree(drafts)), probs
@@ -324,11 +461,14 @@ class DraftVerifyResource(Resource):
             raise RuntimeError("DraftVerifyResource.verify outside a planned verify step")
         if self._sampler is None:
             raise RuntimeError("DraftVerifyResource has no sampler bound; the engine binds it at load")
-        seq, slot, drafts, label = self._planned
+        seq, slot, drafts, label = self._planned[:4]
         if block.shape[1] != drafts + 1:
             raise ValueError(f"a verify block of {block.shape[1]} tokens where the step declared {drafts} drafts")
         tokens, accepted = self._sampler.verify(request_ids, block, logits, draft_probs)
         n = tokens.shape[0]
+        if self.device_rewind:
+            # each row's rejected count, where the next step's `apply_previous` reads it
+            self._last_rej[:n].copy_(drafts - accepted)
         mirror = self._mirrors[slot]
         mirror.dev[:n].copy_(torch.cat([accepted[:, None], block[:, :1], tokens], 1))
         mirror.host[:n].copy_(mirror.dev[:n], non_blocking=True)
@@ -344,23 +484,41 @@ class DraftVerifyResource(Resource):
     def settle(self, request_ids: Sequence[int]) -> VerdictBatch | None:
         """The rejected rows of these requests' last verify steps that no rewind has taken yet,
         each handed out once; None when there are none. Waits for a verdict that hasn't landed.
-        A fact about an earlier step, so a discarded pre-plan doesn't give it back."""
-        pending, settled = self._pending, self._settled
-        if not pending and not settled:
+        A fact about an earlier step, so a discarded pre-plan doesn't give it back. Under device
+        rewind, all but the last committed step's: the request's next step takes those back on
+        the device."""
+        pending, settled, previous = self._pending, self._settled, self._pending_prev
+        if not pending and not settled and not previous:
             return None
+        latest = self._committed_seq if self.device_rewind else None
         with self._lock:
-            want = [rid for rid in request_ids if rid in pending or rid in settled]
+            want = [
+                rid for rid in request_ids
+                if rid in settled or rid in previous
+                or (p := pending.get(rid)) is not None and (latest is None or p.seq < latest)
+            ]
         if not want:
             return None
-        self._harvest(rids=want)
+        self._harvest(rids=want, before=latest)
         out = VerdictBatch([], [], [])
         with self._lock:
             for rid in want:
-                verdict = settled.pop(rid, None)
-                if verdict is not None and verdict[1]:
-                    out.request_ids.append(rid)
-                    out.labels.append(verdict[0])
-                    out.rejected.append(verdict[1])
+                entries = settled.pop(rid, None)
+                if not entries:
+                    continue
+                if latest is not None:
+                    keep = [entry for entry in entries if entry[0] >= latest]
+                    entries = [entry for entry in entries if entry[0] < latest]
+                    if keep:
+                        settled[rid] = keep
+                by_label: dict[str, int] = {}
+                for _, label, rejected in entries:
+                    by_label[label] = by_label.get(label, 0) + rejected
+                for label, rejected in by_label.items():
+                    if rejected:
+                        out.request_ids.append(rid)
+                        out.labels.append(label)
+                        out.rejected.append(rejected)
         return out if out.request_ids else None
 
     def emitted_rows(
@@ -372,7 +530,21 @@ class DraftVerifyResource(Resource):
         including the first stop id (nothing when its input is one: the reply ended a step
         earlier), and no more than ``max_tokens`` counting what it emitted before. Once per
         verify step, after the commit."""
+        return self.emit_record(self.take_record(), request_ids, max_tokens, ignore_eos, policy)
+
+    def take_record(self) -> list:
+        """The steps committed since the last call (one, but for a per-request exec), which
+        ``emit_record`` reads once they have landed."""
         steps, self._steps = self._steps, []
+        return steps
+
+    def emit_record(
+        self, steps: list, request_ids: Sequence[int], max_tokens: Sequence[int],
+        ignore_eos: Sequence[bool], policy: DraftPolicy,
+    ) -> EmittedRows:
+        """``emitted_rows`` of the steps ``take_record`` took, read at the steps' stop check:
+        under device rewind no thread waits for a verdict before then. In step order, as the
+        counts it cuts by add up."""
         self._note_step()
         rids = tuple(request_ids)
         n = len(rids)
@@ -381,6 +553,10 @@ class DraftVerifyResource(Resource):
             self._wait(last.slot, last.seq)
             table = self._mirrors[last.slot].host_np[:n].copy()
         else:
+            if self.device_rewind:
+                # a request may have the next step's verdict pending too: its rows read here
+                # would be the wrong step's
+                raise RuntimeError("draft-verify: device rewind runs its steps batched, a step a batch")
             # a per-request exec ran a step per row, each over the last one's mirror rows
             ran = {rid for record in steps for rid in record.rows}
             missing = [rid for rid in rids if rid not in ran]
@@ -474,29 +650,34 @@ class DraftVerifyResource(Resource):
         )
         return mirror
 
-    def _harvest(self, rids: Sequence[int] | None = None, slot=_ANY_SLOT) -> None:
+    def _harvest(self, rids: Sequence[int] | None = None, slot=_ANY_SLOT, before: int | None = None) -> None:
         """Read pending verdicts out of the mirrors (these requests', or every one in
-        ``slot``), waiting for their steps to stage them."""
+        ``slot``; with ``before``, only those of steps numbered below it), waiting for their
+        steps to stage them."""
         with self._lock:
-            if rids is None:
-                entries = [(rid, p) for rid, p in self._pending.items() if slot is _ANY_SLOT or p.slot == slot]
-            else:
-                entries = [(rid, self._pending[rid]) for rid in rids if rid in self._pending]
+            entries = []
+            # the verdict before a request's last (device rewind) first: rows read in step order
+            for table in (self._pending_prev, self._pending):
+                if rids is None:
+                    found = [(rid, p) for rid, p in table.items() if slot is _ANY_SLOT or p.slot == slot]
+                else:
+                    found = [(rid, table[rid]) for rid in rids if rid in table]
+                entries += [(table, rid, p) for rid, p in found if before is None or p.seq < before]
         if not entries:
             return
         newest: dict[int | None, int] = {}
-        for _, p in entries:
+        for _, _, p in entries:
             newest[p.slot] = max(newest.get(p.slot, 0), p.seq)
         for s, seq in newest.items():
             self._wait(s, seq)
         with self._lock:
             proposer = self._proposer
-            for rid, p in entries:
-                if self._pending.get(rid) is not p:
+            for table, rid, p in entries:
+                if table.get(rid) is not p:
                     continue  # read by another thread, or removed
-                del self._pending[rid]
+                del table[rid]
                 row = self._rows[rid] = self._mirrors[p.slot].host_np[p.row].copy()
-                self._settled[rid] = (p.label, p.drafts - int(row[0]))
+                self._settled.setdefault(rid, []).append((p.seq, p.label, p.drafts - int(row[0])))
                 if proposer is not None:
                     proposer.observe(rid, row)
 

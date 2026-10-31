@@ -67,6 +67,7 @@ class SamplerResource(Resource):
     prefix_skip_safe = True
     # a verify marks no token seen, and the numbers it drew are spent whatever it keeps
     rewind_kind = RewindKind.NONE
+    plan_reads_lengths = False
 
     def can_capture(self) -> bool:
         return DeviceCapability.of(self._device).graph_backend is not None

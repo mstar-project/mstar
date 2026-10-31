@@ -75,15 +75,18 @@ SEED = 36
 
 class ToyAttention(AttentionResource):
     """Dense attention over the rows the KV resource holds, planned from its views: causal, or
-    every row over the stored rows but each segment's last ``hide_last`` (``AttentionStep``)."""
+    every row over the stored rows but each segment's last ``hide_last`` (``AttentionStep``).
+    Under device rewind each view is that many rows shorter (``correct_on_device``)."""
 
     rewind_kind = RewindKind.NONE
     requires_kv_write = True
+    corrects_on_device = True
 
     def __init__(self, kv: str):
         self._kv = kv
         self._views = None
         self._causal, self._hide = True, 0
+        self._rejected: list[int] | None = None
 
     @classmethod
     def build(cls, spec, info):
@@ -96,19 +99,25 @@ class ToyAttention(AttentionResource):
         self.reset_default_cursors()
         self._views = ctx.plan_results[self._kv]["main"].views
         self._causal, self._hide = step.causal, step.hide_last
+        self._rejected = None
+
+    @torch.compiler.disable
+    def correct_on_device(self, rejected):
+        self._rejected = rejected.rows.tolist()
 
     @torch.compiler.disable
     def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
         del label, k, v, layer_idx
         page_size = kv_cache_layer.shape[2]
         outs, row = [], 0
-        for view in self._views:
+        for i, view in enumerate(self._views):
+            length = view.length - (self._rejected[i] if self._rejected else 0)
             pages = torch.as_tensor(view.page_idxs, dtype=torch.long)
             rows = kv_cache_layer[pages].transpose(0, 1).reshape(
-                2, len(view.page_idxs) * page_size, *kv_cache_layer.shape[3:])[:, :view.length]
-            start = view.length - view.to_compute
+                2, len(view.page_idxs) * page_size, *kv_cache_layer.shape[3:])[:, :length]
+            start = length - view.to_compute
             for j in range(view.to_compute):
-                end = start + j + 1 if self._causal else view.length - self._hide
+                end = start + j + 1 if self._causal else length - self._hide
                 keys, vals = rows[0, :end].float(), rows[1, :end].float()
                 scores = torch.einsum("hd,thd->ht", q[row + j].float(), keys) * HEAD_DIM ** -0.5
                 outs.append(torch.einsum("ht,thd->hd", scores.softmax(-1), vals).to(q.dtype))
@@ -335,7 +344,8 @@ class ToySubmodule(ARNodeSubmodule):
 def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True,
           kv_heads: int = HEADS, sampled_verify: bool = False,
           argmax_prefill: bool | None = None, ngram: dict | None = None,
-          taps: tuple[int, ...] = (), tap_dtype: torch.dtype = torch.float32) -> list[NodeResourceSpec]:
+          taps: tuple[int, ...] = (), tap_dtype: torch.dtype = torch.float32,
+          fi_backend: str = "auto") -> list[NodeResourceSpec]:
     # ``kv_heads`` before sharding: a lockstep test gives each rank every head.
     # ``argmax_prefill``: the prefill's token is the argmax, so it draws nothing (on CPU always,
     # where the real draw has no kernel).
@@ -356,7 +366,7 @@ def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True
         out.append(ToyAttentionSpec(resource_key=ATTN, nodes={NODE}))
     else:
         out.append(AttentionSpec(resource_key=ATTN, nodes={NODE}, config=AttentionConfig(
-            kv_cache=KV, backend=AttnBackend(attn))))
+            kv_cache=KV, backend=AttnBackend(attn), flashinfer_backend=fi_backend)))
     if draft_verify:
         out.append(DraftVerifySpec(resource_key=DV, nodes={NODE}, sampler=SAMPLER))
     if taps:

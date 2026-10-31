@@ -1662,6 +1662,21 @@ do). A node pre-plans this way only when every pre-planning resource of its veri
 ``corrects_preplan``; otherwise its pre-plan waits for the verdict first. A resource that adds
 state to a verifying node and pre-plans should implement it: what the pre-plan read of a
 length the rewind moved has to be put right there, in place.
+
+A walk whose drafter runs in the forward can wait for no verdict at all:
+``DraftPolicy(device_rewind=True)`` (a DSpark drafter's policy sets it). Its step is planned
+from lengths that still count the last step's whole block, and ``draft_verify_step`` first
+has every resource of the node whose plan reads lengths take that step's rejected rows back on
+the device, from the verdict the step left there (``Resource.correct_on_device``: paged KV
+readdresses the step's writes, positions shift, FlashInfer shortens each row's last page). The
+host takes them back at the request's next settle, a step later, and the engine reads a step's
+tokens at its stop check, once it has landed, so the step after it is launched while it runs,
+as plain decode's is. A node gets it only when every resource whose plan reads lengths
+(``Resource.plan_reads_lengths``) corrects on the device (``corrects_on_device``: the
+FlashInfer manager on CUDA with backend ``auto`` or ``fa2``, whose verify blocks of 16 tokens
+a row or fewer then plan FA2's prefill kernel, which keeps a row's KV length as its pages and
+last page; a captured plan's KV chunks are planned again in the graph from the shortened
+lengths) and no engine-side proposer drafts; otherwise it waits for each verdict as above.
 Two kinds of drafter need no drafting code of the model's own, and a verify step's forward
 runs either through one helper, ``draft_verify_step(dv, request_ids, inputs, target,
 drafter=None)``: the drafts, ``agree``, ``target`` (the block's ids, flat, to the target's

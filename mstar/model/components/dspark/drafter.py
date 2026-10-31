@@ -133,8 +133,9 @@ class DSpark:
     # ── what the node declares ──
 
     def policy_fields(self) -> dict:
-        """What the walk's ``DraftPolicy`` carries for it: the target layers it reads."""
-        return {"taps": self.config.taps}
+        """What the walk's ``DraftPolicy`` carries for it: the target layers it reads, and that
+        its drafts need no verdict on the host (``device_rewind``)."""
+        return {"taps": self.config.taps, "device_rewind": True}
 
     def node_resources(self, nodes: set[str]) -> list[NodeResourceSpec]:
         keys = self.keys

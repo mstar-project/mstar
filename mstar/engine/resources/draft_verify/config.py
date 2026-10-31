@@ -56,6 +56,10 @@ class DraftPolicy:
     # (``TapSpec`` under ``DRAFT_TAPS``; ``num_layers`` is the stream after the last layer).
     # A verify step taps them (``with_draft_verify`` adds the ``TapStep``)
     taps: tuple[int, ...] = ()
+    # The step after a verify step takes its rejected rows back on the device
+    # (``DraftVerifyResource.apply_previous``), so nothing waits for the verdict. Only for a
+    # drafter in the forward on a node whose resources correct on the device; else it waits.
+    device_rewind: bool = False
 
     def __post_init__(self):
         for name in ("max_drafts", "emitted_before"):

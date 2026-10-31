@@ -27,6 +27,11 @@ from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
 
+# Under device rewind a verify block (at most this many tokens a row) plans FA2, whose lengths the
+# device can move (`FlashInferPrefillWrapper.correct_kv_lens`); FA3 keeps them in its plan. FA2
+# also reads a row's KV once a KV head, not once a query head: 0.5-0.9x FA3's time at these rows.
+_SHORT_BLOCK = 16
+
 
 class FlashInferManager(AttentionManager):
     def __init__(
@@ -155,7 +160,9 @@ class FlashInferManager(AttentionManager):
                 decode_wrapper=self._fmha_wrapper(decode_workspace, num_rows),
                 **kv_kwargs,
             )
-        elif bucket.bs == bucket.num_tokens and not force_prefill:
+        elif bucket.bs == bucket.num_tokens and not force_prefill and not self.device_correct:
+            # (under device rewind every step plans the prefill wrapper, whose rows' lengths
+            # `correct_on_device` can move; the decode kernels split them by length)
             wrapper = self._fmha_wrapper(buffer, num_rows) or FlashInferDecodeWrapper(
                 workspace_buffer=buffer,
                 batch_size=num_rows,
@@ -164,6 +171,7 @@ class FlashInferManager(AttentionManager):
                 **kv_kwargs,
             )
         else:
+            kv_kwargs["backend"] = self._prefill_backend(bucket.num_tokens, num_rows)
             wrapper = FlashInferPrefillWrapper(
                 workspace_buffer=buffer,
                 batch_size=num_rows,
@@ -192,16 +200,24 @@ class FlashInferManager(AttentionManager):
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
+    def _prefill_backend(self, tokens: int, rows: int) -> str:
+        """The prefill wrapper's FlashInfer backend: FA2 for a short block under device rewind
+        (`_SHORT_BLOCK`), else the configured one."""
+        if self.device_correct and tokens <= _SHORT_BLOCK * rows:
+            return "fa2"
+        return self._wrapper_kv_kwargs["backend"]
+
     def _eager_wrapper(
-        self, label: str, is_decode: bool, slot: int
+        self, label: str, is_decode: bool, slot: int, backend: str | None = None,
     ) -> AttentionWrapper:
-        """The persistent eager wrapper for one (label, kind, slot).
+        """The persistent eager wrapper for one (label, kind, slot), and prefill backend.
 
         Takes the workspace this slot's captured wrappers already hold: the
         two never run at once, since the pipeline retires step N before the
         host stages N+2 and a slot repeats no sooner than that.
         """
-        key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode)
+        backend = backend or self._wrapper_kv_kwargs["backend"]
+        key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode, backend=backend)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
             workspace = self._workspaces.get(label, slot)
@@ -212,7 +228,9 @@ class FlashInferManager(AttentionManager):
                     **self._wrapper_kv_kwargs,
                 )
             else:
-                wrapper = FlashInferPrefillWrapper(workspace_buffer=workspace, **self._wrapper_kv_kwargs)
+                wrapper = FlashInferPrefillWrapper(
+                    workspace_buffer=workspace, **{**self._wrapper_kv_kwargs, "backend": backend},
+                )
             self._eager_plan_states[key] = wrapper
         return wrapper
 
@@ -281,18 +299,27 @@ class FlashInferManager(AttentionManager):
                 num_rows = indptrs.qo_indptr.shape[0] - 1
                 wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
             else:
-                is_decode = not ctx.force_prefill and bool(
-                    indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1
+                rows = len(indptrs.qo_indptr) - 1
+                tokens = int(indptrs.qo_indptr[-1])
+                is_decode = not ctx.force_prefill and not self.device_correct and tokens == rows
+                wrapper = self._eager_wrapper(
+                    label, is_decode, ctx.slot, None if is_decode else self._prefill_backend(tokens, rows),
                 )
-                wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
 
             kwargs = indptrs.to_kwargs_dict()
+            if (lease is None and self.device_correct
+                    and getattr(getattr(wrapper, "attn_wrapper", None), "_backend", None) == "fa2"):
+                # an eager plan, whose split arrays no graph re-plans (`correct_kv_lens`): one KV
+                # chunk a row, so a row the device shortens keeps its chunk count
+                kwargs["disable_split_kv"] = True
             laps.lap("wrapper")
             # TODO: cache the latest plan state
             wrapper.plan(
                 causal=step.causal, dtype=self._dtype, window_left=self._window_left,
                 **kwargs,
             )
+            if self.device_correct:
+                wrapper.locate_kv_lens()
             laps.lap("wrapper_plan")
             plan_states[label] = wrapper
 
@@ -331,6 +358,18 @@ class FlashInferManager(AttentionManager):
                 **indptrs.to_kwargs_dict(),
             )
         return True
+
+    @property
+    def corrects_on_device(self) -> bool:
+        # a short block's FA2 prefill kernel reads each row's KV length on the device, from its
+        # last page's length (`FlashInferPrefillWrapper.correct_kv_lens`)
+        return self._device.type == "cuda" and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2")
+
+    @torch.compiler.disable
+    def correct_on_device(self, rejected) -> None:
+        """Each row's keys end ``rejected`` rows earlier than planned."""
+        for wrapper in self._current_plan_states.values():
+            wrapper.correct_kv_lens(rejected.rows)
 
     ### Submodule-level functionality
     @torch.compiler.disable

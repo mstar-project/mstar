@@ -261,6 +261,8 @@ class EagerSlotKey(NamedTuple):
     slot: int
     # decode and prefill take different wrapper classes
     is_decode: bool = False
+    # a prefill wrapper's FlashInfer backend ("" for the manager's own)
+    backend: str = ""
 
 
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper

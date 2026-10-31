@@ -99,6 +99,76 @@ def _drafts_against_reference(k: int, oracle: bool = False, **sub_kwargs):
     return checked, equal, ties, eng
 
 
+# ── verdicts taken back on the device (DraftPolicy.device_rewind) ──
+
+
+@pytest.mark.parametrize("k", [1, 3, 7])
+def test_verdicts_taken_back_on_the_device_emit_what_plain_decode_emits(k):
+    """Each step planned from lengths that count the last step's whole block, its rejected
+    rows taken back in its forward (KV writes, positions, attention), the host a step later."""
+    out, eng, *_ = _run(k, device_rewind=True)
+    assert out == _reference()
+    dv = eng._resources[toy.DV]
+    assert dv.device_rewind and dv.rows_verified > 0 and dv.drafts_accepted < k * dv.rows_verified
+
+
+def test_verdicts_taken_back_on_the_device_one_request_a_step():
+    """Each step runs one request, so the last committed step never holds the next step's row:
+    every verdict is taken back on the host instead, and nothing on the device."""
+    out, *_ = _run(3, batched=False, device_rewind=True)
+    assert out == _reference()
+
+
+def _kept_rows(eng) -> dict:
+    """Every KV row each request keeps, in both caches, every layer, once the host has taken
+    back every verdict."""
+    ds.settle_all(eng, list(PROMPTS))
+    rows = {}
+    for key in (toy.KV, ds.DKV):
+        kv = eng._resources[key]
+        page = kv.kv_cache.page_size
+        for rid in PROMPTS:
+            stream = kv._streams[rid]["main"]
+            pages = torch.tensor(stream.page_indices[: -(-stream.stored_len // page)])
+            for layer in range(kv.config.num_layers):
+                view = kv.layer_view(layer)[pages]
+                rows[(key, rid, layer)] = view.transpose(0, 1).reshape(2, -1, *view.shape[3:])[:, : stream.stored_len]
+    return rows
+
+
+def test_a_device_rewind_keeps_what_a_host_rewind_keeps(monkeypatch):
+    """The same rows, bitwise, in both caches; without the KV's correction the writes of a
+    step after a rejection land past the kept rows, and they don't."""
+    _, device, *_ = _run(3, device_rewind=True)
+    _, host, *_ = _run(3)
+    rows_d, rows_h = _kept_rows(device), _kept_rows(host)
+    assert rows_d.keys() == rows_h.keys() and all(torch.equal(rows_d[key], rows_h[key]) for key in rows_d)
+    monkeypatch.setattr(KVManager, "correct_on_device", lambda self, rejected: None)
+    _, broken, *_ = _run(3, device_rewind=True)
+    rows_b = _kept_rows(broken)
+    assert not all(torch.equal(rows_b[key], rows_h[key]) for key in rows_h)
+
+
+def test_a_drafter_whose_verdicts_are_taken_back_on_the_device_drafts_from_the_right_context():
+    checked, equal, ties, eng = _drafts_against_reference(4, oracle=True, device_rewind=True)
+    hist = eng._resources[toy.DV].accepted_hist.tolist()
+    assert sum(1 for count in hist[1:] if count) >= 3, hist
+    assert equal + ties == checked > 10, (checked, equal, ties)
+
+
+def test_device_rewind_stays_inside_the_footprints(monkeypatch, caplog):
+    from mstar.engine.resources.kv import manager as kv_manager
+
+    monkeypatch.setattr(kv_manager, "_DEBUG_ASSERTS", True)
+    out, eng, *_ = _run(5, device_rewind=True)
+    assert out == _reference()
+    assert "against a footprint" not in caplog.text
+    for key in (toy.KV, ds.DKV):
+        for rid in PROMPTS:
+            stream = eng._resources[key]._streams[rid]["main"]
+            assert len(stream.page_indices) <= stream.footprint, (key, rid)
+
+
 def test_after_partial_acceptances_the_drafter_still_drafts_from_the_right_context():
     """Some drafts replaced by the greedy stream's, so steps keep 0 to k of them: the drafter's
     context must hold the kept rows' taps and nothing of the rejected ones."""
@@ -185,7 +255,7 @@ def test_configs_read_from_each_checkpoint_format():
     assert q.taps == (2, 10, 18, 26, 34) and q.block_size == 7 and not q.causal
     assert q.backbone == "qwen3" and q.rope_scaling is None and q.rope_theta == 1e6
     decl = DSpark.for_target(q, 7, max_seq_len=8192, target_layers=36, target_hidden_size=4096)
-    assert decl.policy_fields() == {"taps": (2, 10, 18, 26, 34)}
+    assert decl.policy_fields() == {"taps": (2, 10, 18, 26, 34), "device_rewind": True}
     assert decl.verify_steps(7)["dspark_attn"].hide_last == 1 and "dspark_attn" not in decl.verify_steps(0)
     with pytest.raises(ValueError, match="block_size"):
         DSpark.for_target(q, 8, max_seq_len=8192, target_layers=36, target_hidden_size=4096)

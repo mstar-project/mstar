@@ -8,9 +8,10 @@ Two kinds of drafter feed the draft-verify core:
 - a drafter in the forward (``Drafter``: a draft model, a DSpark drafter, later EAGLE-3): the
   forward runs it over the step's inputs and hands its drafts to ``agree``.
 
-``draft_verify_step`` is the sequence both end in (drafts, agree, the target over the block,
-verify, and a drafter's ``observe`` of the verified block) and returns the next step's inputs,
-the loop-back edge. A drafter whose chain is interleaved with the target's own passes (GLM's
+``draft_verify_step`` is the sequence both end in (the last verdict taken back on the device
+under ``DraftPolicy.device_rewind``, drafts, agree, the target over the block, verify, and a
+drafter's ``observe`` of the verified block) and returns the next step's inputs, the loop-back
+edge. A drafter whose chain is interleaved with the target's own passes (GLM's
 MTP) calls the resource's steps itself.
 """
 
@@ -61,6 +62,9 @@ def draft_verify_step(
     last kept tokens, the token its block starts with last (``[n]`` or ``[n, w]``). Returns the
     next step's inputs: the target's next token per row, or what ``drafter.next_inputs`` makes
     of the verdict. Capturable."""
+    # under device rewind, the rows the last step's verdict rejected leave this step's plan
+    # before anything reads it
+    dv.apply_previous()
     if drafter is None:
         block, probs = dv.propose(request_ids, inputs)
     else:

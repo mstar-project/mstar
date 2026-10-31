@@ -3,6 +3,7 @@ it, and what the engine keeps for the walk once it passes."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -15,6 +16,8 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 
 if TYPE_CHECKING:
     from mstar.model.submodule_base import NodeSubmodule
+
+logger = logging.getLogger(__name__)
 
 
 class VerifyWalk(NamedTuple):
@@ -107,6 +110,19 @@ def verify_walk(
             res.require_lookahead(policy.loop, policy.lookahead)
     dv.bind_sampler(sampler)
     dv.bind_settlers([res for res in resources.values() if res.rewind_kind is RewindKind.DEVICE])
+    if policy.device_rewind:
+        unable = sorted(
+            key for key, res in resources.items() if res.plan_reads_lengths and not res.corrects_on_device
+        )
+        if proposer is None and not unable:
+            dv.enable_device_rewind([res for res in resources.values() if res.plan_reads_lengths])
+        else:
+            # waits for each verdict before the step after it, which is correct, just slower
+            logger.info(
+                "%s, taking verdicts back on the host: %s", where,
+                "an engine-side proposer drafts from them" if proposer is not None
+                else f"{unable} can't correct a plan on the device",
+            )
     if proposer is not None:
         dv.bind_proposer(proposer)
         proposer.bind_verifier(dv)
