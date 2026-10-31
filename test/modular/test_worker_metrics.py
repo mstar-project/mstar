@@ -529,8 +529,9 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
     message on the socket that carries every submission, ahead of the next."""
     from test_serving_metrics import TEXT, _StubTensorManager
 
-    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
     from mstar.api_server.request_types import PreprocessInput
+    from mstar.communication.event import EventWakeup
 
     class _Model:
         def process_prompt(self, *args, **kwargs):
@@ -545,8 +546,8 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
     facade.wakeup = None
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
-        profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
         # codec / try_send_bytes: the thread's outbox sends through them
