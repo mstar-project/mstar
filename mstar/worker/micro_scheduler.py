@@ -383,11 +383,20 @@ class MicroScheduler:
         if picked is None or not self.lockstep_first_nodes or picked[0] in self.lockstep_first_nodes:
             return picked
         first = next((key for key in ready if key[0] in self.lockstep_first_nodes), None)
-        if first is None or self.lockstep_first_steps >= self.LOCKSTEP_FIRST_STEPS:
+        return picked if self._local_turn(first is not None) or first is None else first
+
+    def _local_turn(self, contested: bool) -> bool:
+        """Whether this worker's other ready work takes this step from a lockstep-first
+        one. ``contested``: both are ready. Counts only such steps, so the bound is on how
+        long local work waits, not on how long the node has been running."""
+        if not contested:
             self.lockstep_first_steps = 0
-            return picked
+            return False
+        if self.lockstep_first_steps >= self.LOCKSTEP_FIRST_STEPS:
+            self.lockstep_first_steps = 0
+            return True
         self.lockstep_first_steps += 1
-        return first
+        return False
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -653,10 +662,10 @@ class MicroScheduler:
         head_key = self._key(first_tp_node.node_name, first_tp_node.graph_walk)
         if exclude_target is not None and head_key == self._key(*exclude_target):
             return
-        max_consecutive = self.max_consec_tp_follower_batches
         if first_tp_node.node_name in self.lockstep_first_nodes:
-            max_consecutive = self.LOCKSTEP_FIRST_STEPS
-        if self.num_consec_tp_follower_batches >= max_consecutive and \
+            if self._local_turn(self.has_ready_excluding(request_state, head_key)):
+                return
+        elif self.num_consec_tp_follower_batches >= self.max_consec_tp_follower_batches and \
                 self.has_ready_excluding(request_state, head_key):
             return
         # Check readiness for every rid to pop all-or-none. Use the
