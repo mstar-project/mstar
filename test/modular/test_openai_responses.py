@@ -46,7 +46,7 @@ def _codex(**kw):
         {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list the repo"}]}],
         "tools": [SHELL], "tool_choice": "auto", "parallel_tool_calls": False, "store": False, "stream": False,
         "reasoning": {"effort": "medium", "summary": "auto"}, "include": ["reasoning.encrypted_content"],
-        "prompt_cache_key": "conv-1", **kw}
+        "prompt_cache_key": "conv-1", "client_metadata": {"session_id": "s1"}, **kw}
 
 
 def test_input_items_translate_onto_the_chat_template():
@@ -76,7 +76,7 @@ def test_input_items_translate_onto_the_chat_template():
     assert extra["tools"] == [{"type": "function", "function": {
         "name": "shell", "parameters": SHELL["parameters"], "description": "Run a command"}}]
     assert extra["parallel_tool_calls"] is False and extra["reasoning_effort"] == "high"
-    assert req.max_tokens == 900 and "prompt_cache_key" not in extra
+    assert req.max_tokens == 900 and "prompt_cache_key" not in extra and "client_metadata" not in extra
     # the GLM template takes it as it is: tool results, calls, reasoning
     mk = adapters.get_adapter("glm5_next").chat_to_request(req, "/nonexistent").model_kwargs
     assert [m["role"] for m in mk["messages"]] == ["system", "system", "user", "assistant", "tool", "assistant", "user"]

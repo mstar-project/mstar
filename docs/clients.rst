@@ -524,13 +524,16 @@ stateless.
 - **Reasoning.** GLM-5.3 always reasons, so turning it off (``enable_thinking: false``,
   ``thinking: {"type": "disabled"}``, ``reasoning.effort: "none"``) is a ``400``. A Messages
   request without ``thinking`` gets the model's default, and ``thinking.budget_tokens`` is
-  checked as Anthropic checks it but not enforced. Thinking blocks carry an empty
-  ``signature``; a Responses reply carries its reasoning as a ``reasoning`` item's text.
+  checked as Anthropic checks it but not enforced. ``output_config.effort`` (Messages) and
+  ``reasoning.effort`` (Responses) pick the template's level. ``context_management`` is
+  served for keeping every thinking block; other edits are a ``400``. Thinking blocks carry
+  an empty ``signature``; a Responses reply carries its reasoning as a ``reasoning`` item's
+  text.
 - **Refused, not dropped.** On ``/v1/messages`` and ``/v1/responses``: fields the route does
   not know, images and documents (the model reads text), server tools, a reply prefilled with
   a final assistant turn, and what needs stored state (``previous_response_id``,
   ``store: true``, ``background``). Hints (``metadata``, ``cache_control``,
-  ``prompt_cache_key``) are dropped.
+  ``prompt_cache_key``, ``client_metadata``) are dropped.
 - **MTP** (``mtp_num_draft_tokens > 0``) verifies greedily: a ``temperature`` above 0 is a
   ``400``, and a request that sets none runs greedy.
 

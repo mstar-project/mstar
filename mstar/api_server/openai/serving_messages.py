@@ -10,7 +10,10 @@ Where the APIs differ:
 
 * ``thinking`` absent leaves the model's default, where Anthropic does not
   think unless asked. ``budget_tokens`` is checked as Anthropic checks it but
-  not enforced.
+  not enforced. ``output_config.effort`` picks the template's reasoning level.
+* ``context_management`` is served for keeping every thinking block, which the
+  template is told to do; other edits are a 400.
+* A system message between turns goes to the template where it is.
 * A reply's ``thinking`` block carries an empty ``signature``.
 * A call cut off by ``max_tokens`` has no ``input``: the message leaves it
   out, and the stream ends inside its ``input_json_delta`` pieces.
@@ -22,15 +25,17 @@ from __future__ import annotations
 import asyncio
 import json
 
-from mstar.api_server.openai import reply
+from mstar.api_server.openai import reply, serving_responses
 from mstar.api_server.openai._util import rid, sse
 from mstar.api_server.openai.protocol import ChatCompletionRequest
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.model.base import ProcessPromptOutput
 
 _FIELDS = {"model", "messages", "system", "max_tokens", "stop_sequences", "stream", "temperature", "top_p",
-           "top_k", "tools", "tool_choice", "thinking", "metadata"}
-_COUNT_FIELDS = {"model", "messages", "system", "tools", "tool_choice", "thinking"}
+           "top_k", "tools", "tool_choice", "thinking", "metadata", "context_management", "output_config"}
+_COUNT_FIELDS = {"model", "messages", "system", "tools", "tool_choice", "thinking", "context_management",
+                 "output_config"}
+_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "max": 2}
 
 _STOP_REASONS = {"tool_calls": "tool_use", "length": "max_tokens"}
 
@@ -47,9 +52,11 @@ def error_body(status: int, message: str) -> dict:
     return {"type": "error", "error": {"type": error_type(status), "message": message}}
 
 
-def to_chat_request(body, *, counting: bool = False) -> tuple[ChatCompletionRequest, list[str]]:
+def to_chat_request(body, *, counting: bool = False,
+                    efforts: tuple[str, ...] = ()) -> tuple[ChatCompletionRequest, list[str]]:
     """The chat request a Messages request asks for, and its stop sequences.
-    ``counting`` reads a ``count_tokens`` body, which has no ``max_tokens``."""
+    ``counting`` reads a ``count_tokens`` body, which has no ``max_tokens``.
+    ``efforts`` are the template's reasoning levels, least first."""
     if not isinstance(body, dict):
         raise ValueError("the request body must be a JSON object")
     unknown = sorted(set(body) - (_COUNT_FIELDS if counting else _FIELDS))
@@ -72,6 +79,9 @@ def to_chat_request(body, *, counting: bool = False) -> tuple[ChatCompletionRequ
     thinking = _thinking(body.get("thinking"), body.get("max_tokens"))
     if thinking is not None:
         chat["enable_thinking"] = thinking
+    if _keeps_all_thinking(body.get("context_management")):
+        chat["clear_thinking"] = False
+    chat.update(_output_config(body.get("output_config"), efforts))
     stops = body.get("stop_sequences") or []
     if not isinstance(stops, list) or not all(isinstance(s, str) and s for s in stops):
         raise ValueError(f"stop_sequences must be a list of non-empty strings; got {stops!r}")
@@ -107,9 +117,12 @@ def _messages(messages) -> list[dict]:
     out: list[dict] = []
     for m in messages:
         role = m.get("role") if isinstance(m, dict) else None
-        if role not in ("user", "assistant"):
-            raise ValueError(f"a message's role must be user or assistant, not {role!r}")
+        if role not in ("user", "assistant", "system"):
+            raise ValueError(f"a message's role must be user, assistant or system, not {role!r}")
         content = m.get("content")
+        if role == "system":
+            out += _system(content)
+            continue
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
         if not isinstance(blocks, list):
             raise ValueError(f"a message's content must be a string or a list of blocks; got {content!r}")
@@ -204,6 +217,41 @@ def _tool_choice(choice) -> dict:
     return out
 
 
+def _keeps_all_thinking(config) -> bool:
+    """``context_management``: whether it asks to keep every thinking block. Other
+    edits would take content out of the prompt, which is not served."""
+    if config is None:
+        return False
+    edits = config.get("edits") if isinstance(config, dict) else None
+    if not isinstance(edits, list) or set(config) != {"edits"}:
+        raise ValueError(f"context_management takes a list of edits; got {config!r}")
+    for edit in edits:
+        kind = edit.get("type") if isinstance(edit, dict) else None
+        if not (isinstance(kind, str) and kind.startswith("clear_thinking_") and edit.get("keep") == "all"
+                and set(edit) == {"type", "keep"}):
+            raise ValueError(f"context_management edit {edit!r} is not served; only clear_thinking with "
+                             "keep 'all' is")
+    return bool(edits)
+
+
+def _output_config(config, efforts: tuple[str, ...]) -> dict:
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError(f"output_config must be an object; got {config!r}")
+    if "format" in config:
+        raise ValueError("output_config.format (structured output) needs constrained decoding, which is not served")
+    if set(config) - {"effort"}:
+        raise ValueError(f"output_config takes effort only; got {sorted(config)}")
+    effort = config.get("effort")
+    if effort is None:
+        return {}
+    if effort not in _EFFORT_RANK:
+        raise ValueError(f"output_config.effort takes low, medium, high or max; got {effort!r}")
+    return {"reasoning_effort": serving_responses.template_level(
+        _EFFORT_RANK[effort], efforts, f"output_config.effort={effort!r}")}
+
+
 def _thinking(thinking, max_tokens) -> bool | None:
     if thinking is None:
         return None
@@ -224,7 +272,7 @@ def _thinking(thinking, max_tokens) -> bool | None:
 
 
 async def create_message(api, model_name, adapter, body, raw_request=None):
-    req, stops = to_chat_request(body)
+    req, stops = to_chat_request(body, efforts=adapter.reasoning_efforts)
     args = adapter.chat_to_request(req, api.upload_dir)
     parser = adapter.make_output_parser(req)
     request_id = rid("msg")
@@ -255,7 +303,7 @@ async def create_message(api, model_name, adapter, body, raw_request=None):
 async def count_tokens(api, adapter, body) -> dict:
     """``input_tokens`` of the prompt a Messages request renders: the model's
     own ``process_prompt``, called as the data worker calls it."""
-    req, _ = to_chat_request(body, counting=True)
+    req, _ = to_chat_request(body, counting=True, efforts=adapter.reasoning_efforts)
     args = adapter.chat_to_request(req, api.upload_dir)
     tensors = await asyncio.to_thread(
         api.model.process_prompt, args.text, args.input_modalities, args.output_modalities,

@@ -142,6 +142,43 @@ def test_a_conversation_translates_onto_the_chat_template(client_and_stub):
     assert req.max_tokens == 4096 and req.temperature == 0.2 and stops == ["END"]
 
 
+def test_claude_codes_request_translates():
+    # the shape Claude Code 2.1.309 sends: context editing, an effort, adaptive thinking,
+    # and a system message after the first user turn
+    from mstar.api_server.openai import adapters, serving_messages
+
+    adapter = adapters.get_adapter("glm5_next")
+    req, _ = serving_messages.to_chat_request(_body(
+        system=[{"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": "Be careful.", "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": [{"type": "text", "text": "fix the test"}]},
+                  {"role": "system", "content": [{"type": "text", "text": "# Environment\ncwd: /repo",
+                                                  "cache_control": {"type": "ephemeral"}}]}],
+        tools=[WEATHER], thinking={"type": "adaptive", "display": "updates"},
+        context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        output_config={"effort": "high"}, metadata={"user_id": "{}"}, max_tokens=32000,
+    ), efforts=adapter.reasoning_efforts)
+    assert [(m.role, m.content) for m in req.messages] == [
+        ("system", "You are Claude Code.\nBe careful."), ("user", "fix the test"),
+        ("system", "# Environment\ncwd: /repo")]
+    mk = adapter.chat_to_request(req, "/nonexistent").model_kwargs
+    assert [m["role"] for m in mk["messages"]] == ["system", "user", "system"]
+    # keep 'all' is the template's clear_thinking off; Anthropic's default effort is GLM-5.3's top level
+    assert mk["chat_template_kwargs"] == {"enable_thinking": True, "clear_thinking": False, "reasoning_effort": "max"}
+
+
+@pytest.mark.parametrize("effort, glm52, glm53", [
+    ("low", "high", "low"), ("medium", "high", "high"), ("high", "max", "max"), ("max", "max", "max"),
+])
+def test_effort_maps_onto_each_templates_levels(effort, glm52, glm53):
+    from mstar.api_server.openai import adapters, serving_messages
+
+    for model, want in (("glm52", glm52), ("glm5_next", glm53)):
+        req, _ = serving_messages.to_chat_request(_body(output_config={"effort": effort}),
+                                                  efforts=adapters.get_adapter(model).reasoning_efforts)
+        assert req.model_extra["reasoning_effort"] == want
+
+
 @pytest.mark.parametrize("choice, want", [
     ({"type": "any"}, "required"),
     ({"type": "tool", "name": "get_weather"}, {"type": "function", "function": {"name": "get_weather"}}),
@@ -167,7 +204,12 @@ def test_tool_choice_maps_onto_chat(choice, want):
     (_body(container="c1"), "container"),
     (_body(stop_sequences=["", "x"]), "stop_sequences"),
     (_body(tool_choice={"type": "tool"}), "name"),
-    (_body(messages=[{"role": "system", "content": "x"}]), "role"),
+    (_body(messages=[{"role": "tool", "content": "x"}]), "role"),
+    (_body(context_management={"edits": [{"type": "clear_tool_uses_20250919"}]}), "context_management"),
+    (_body(context_management={"edits": [{"type": "clear_thinking_20251015",
+                                           "keep": {"type": "thinking_turns", "value": 1}}]}), "keep 'all'"),
+    (_body(output_config={"format": {"type": "json_schema", "schema": {}}}), "constrained decoding"),
+    (_body(output_config={"effort": "extreme"}), "output_config.effort"),
     # a forced call opens the reply, so Anthropic refuses it with thinking on too
     (_body(tools=[WEATHER], tool_choice={"type": "any"}, thinking={"type": "enabled", "budget_tokens": 1024},
            max_tokens=4096), "enable_thinking"),

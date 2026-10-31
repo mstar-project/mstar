@@ -4,8 +4,8 @@ events come back as a response object or its server-sent events. What needs
 state or a server this does not have (``previous_response_id``,
 ``conversation``, ``store: true``, built-in and custom tools), constrained
 decoding (a ``strict`` schema, structured output), images and files are a
-400, as are unknown fields. ``metadata``, ``user``, ``prompt_cache_key``,
-``safety_identifier`` and ``stream_options`` are hints and drop.
+400, as are unknown fields. ``metadata``, ``client_metadata``, ``user``,
+``prompt_cache_key``, ``safety_identifier`` and ``stream_options`` are hints and drop.
 
 Where the APIs differ:
 
@@ -29,7 +29,8 @@ from mstar.api_server.streaming_response import ReleasingStreamingResponse
 _FIELDS = {"model", "input", "instructions", "tools", "tool_choice", "parallel_tool_calls", "max_output_tokens",
            "reasoning", "temperature", "top_p", "stream", "store", "include", "text", "truncation",
            "service_tier", "top_logprobs", "metadata", "user", "prompt_cache_key", "safety_identifier",
-           "stream_options", "previous_response_id", "conversation", "prompt", "background", "max_tool_calls"}
+           "stream_options", "previous_response_id", "conversation", "prompt", "background", "max_tool_calls",
+           "client_metadata"}
 # set to anything but their off value, these need what a stateless server does not have
 _OFF = {"previous_response_id": (None,), "conversation": (None,), "prompt": (None,), "store": (None, False),
         "background": (None, False), "max_tool_calls": (None,), "top_logprobs": (None, 0),
@@ -198,11 +199,16 @@ def _reasoning(reasoning, efforts: tuple[str, ...]) -> dict:
         return {"enable_thinking": False}
     if effort not in _EFFORT_RANK:
         raise ValueError(f"reasoning.effort takes none, minimal, low, medium, high or xhigh; got {effort!r}")
+    return {"reasoning_effort": template_level(_EFFORT_RANK[effort], efforts, f"reasoning.effort={effort!r}")}
+
+
+def template_level(rank: int, efforts: tuple[str, ...], asked: str) -> str:
+    """The template's reasoning level for an effort of ``rank`` (0 low, 1 medium,
+    2 high), by GLM's level names; a template without that one takes its lowest."""
     if not efforts:
-        raise ValueError(f"reasoning.effort={effort!r}: this model has no reasoning levels")
-    # GLM's level names; a template without the one asked for takes its lowest
-    wanted = {0: "low", 1: "high", 2: "max"}[_EFFORT_RANK[effort]]
-    return {"reasoning_effort": wanted if wanted in efforts else efforts[0]}
+        raise ValueError(f"{asked}: this model has no reasoning levels")
+    wanted = ("low", "high", "max")[rank]
+    return wanted if wanted in efforts else efforts[0]
 
 
 async def create_response(api, model_name, adapter, body, raw_request=None):
