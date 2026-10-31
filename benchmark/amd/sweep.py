@@ -479,7 +479,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
             info["reference"] = reference.run_arm(plan, row, arm, gpus, arm_dir)
         else:
             for wl in workloads:
-                request_kwargs = kwargs_by_wl.get(wl.name)
+                request_kwargs = {**arm.request_kwargs, **kwargs_by_wl.get(wl.name, {})} or None
                 for c in wl.concurrency if plan.fixed_concurrency else row.concurrency.get(wl.name, wl.concurrency):
                     cell = run_cell(plan, arm, row, wl, c, port, arm_dir, gpus, numa, request_kwargs)
                     s = cell["summary"].get(wl.primary[0], {})
