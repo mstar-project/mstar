@@ -621,6 +621,38 @@ def test_the_early_audio_ramp_streams_the_full_decode_around_each_boundary(bound
     assert torch.equal(torch.cat([audio for _, audio, _ in steps]), full)
 
 
+RAMP4_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "qwen3omni_colocated_ramp4.yaml"
+
+
+def test_the_ramp4_config_starts_audio_after_4_frames_inside_the_default_capture():
+    """Every window still pads to the default's 50 frames, so the arm serves
+    the vocoder graphs the default captures."""
+    from mstar.model.qwen3_omni.qwen3_omni_model import apply_code2wav_serving_overrides
+
+    kwargs = dict(yaml.safe_load(RAMP4_CONFIG.read_text())["model_kwargs"])
+    cfg = Code2WavConfig()
+    apply_code2wav_serving_overrides(cfg, kwargs)
+
+    assert cfg.codec_chunk_schedule == (4, 8, 16) and not kwargs
+    assert cfg.codec_max_window == Code2WavConfig().codec_max_window == 50
+    assert _windows(_scheduled_policy(cfg), 110) == [
+        (0, 4), (4, 12), (12, 28), (25, 50), (25, 50), (25, 50), (25, 32),
+    ]
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.parametrize("boundary", [4, 12, 28, 53, 78])
+def test_the_ramp4_schedule_streams_the_full_decode_around_each_boundary(boundary, offset):
+    decoder = _LookaheadDecoder()
+    submodule = Code2WavSubmodule(decoder, _config((4, 8, 16)))
+    codes = _codes(boundary + offset)
+
+    steps = _stream(submodule, codes, _scheduled_policy)
+    full = _to_pcm(decoder(codes.t()[None], torch.arange(boundary + offset)[None]))[0, 0]
+
+    assert torch.equal(torch.cat([audio for _, audio, _ in steps]), full)
+
+
 def test_one_context_frame_covers_the_lookahead_samples():
     """555 lookahead samples fit in one 1920-sample frame. A decoder without
     the 2x2 upsample stack (480 samples a frame) would need two."""
