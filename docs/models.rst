@@ -335,9 +335,7 @@ one paged KV cache, and the sliding layers attend it through a windowed
 attention resource. The cache keeps only the window of the sliding layers'
 K/V (``AttentionConfig.layers``) and returns the pages behind it to the
 pool, so a 32k-token request holds about 3.4x less KV than with every layer's
-history. Admission on one GPU still allots each request its whole prompt's
-pages and keeps the released ones allotted to it, so there the window doesn't
-yet let more requests in; above one rank it does. A page holds 192 tokens of the full layers, or 64 of the sliding
+history. A page holds 192 tokens of the full layers, or 64 of the sliding
 ones. Such a cache doesn't prefix cache yet, so the configs set
 ``prefix_cache: false``. Sampling defaults to the checkpoint's (temperature 1,
 top_p 0.95, top_k 64); a request's ``min_p`` above 0 is refused (a 400)
