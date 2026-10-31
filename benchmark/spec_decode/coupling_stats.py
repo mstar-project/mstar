@@ -9,6 +9,8 @@ one emits a token distributed exactly as q; they differ in how often that token 
 
 - ``leviathan``: rejection sampling on (p, q), sum min(p, q), the most any coupling can reach. Needs p(d) and q(d)
   and, on rejection, a draw from (q - p)+.
+- ``unfiltered_draft``: the same with the draft at the temperature alone, no top-k or top-p, which is what filtering
+  the draft buys: any distribution the draft really came from is valid.
 - ``argmax``: a deterministic draft, the head's argmax, against an independent draw from q: q(argmax).
 - ``cdf``: inverse CDF in token-id order with one shared uniform.
 - ``gumbel``: argmax of log + noise with shared per-token noise. The chance both pick x is 1 / sum_y max(p_y / p_x,
@@ -62,7 +64,8 @@ def tile_peak(kept: torch.Tensor, tile: int) -> int:
 
 
 class Observer:
-    def __init__(self, k: int):
+    def __init__(self, k: int, temperature: float):
+        self.temperature = temperature
         self.sums = [defaultdict(float) for _ in range(k)]
         self.counts = [0] * k
         self.kept: list[int] = []
@@ -73,6 +76,7 @@ class Observer:
         s = self.sums[position]
         self.counts[position] += 1
         s["leviathan"] += leviathan(p, q)
+        s["unfiltered_draft"] += leviathan(torch.softmax(draft_logits.float() / self.temperature, -1), q)
         s["argmax"] += float(q[draft_logits.argmax()])
         s["cdf"] += cdf_overlap(p, q)
         s["gumbel"] += gumbel_match(p, q)
@@ -113,7 +117,7 @@ def main(argv=None) -> int:
         (read_prompts(CHAT_PROMPTS, args.n_chat), args.max_new_chat),
         (read_prompts(LONG_PROMPTS, args.n_long), args.max_new_long),
     ]
-    observer = Observer(args.k)
+    observer = Observer(args.k, args.temperature)
     tokens = steps = i = 0
     for prompts, max_new in sets:
         for text in prompts:
@@ -125,7 +129,7 @@ def main(argv=None) -> int:
             steps += stats.steps
     schemes = {
         name: [s[name] / max(n, 1) for s, n in zip(observer.sums, observer.counts, strict=True)]
-        for name in ("leviathan", "argmax", "cdf", "gumbel")
+        for name in ("leviathan", "unfiltered_draft", "argmax", "cdf", "gumbel")
     }
     # tokens a step emits when each position accepts at its mean rate: 1 + a1 + a1 a2 + ...
     per_step = {}
