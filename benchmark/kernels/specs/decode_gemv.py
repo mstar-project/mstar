@@ -1,13 +1,17 @@
-"""``mstar::decode_gemv`` and ``mstar::decode_gemv_silu_mul``: linears of up to
-16 rows, a weight stream, on the Triton kernel over its knob space against
-hipBLASLt (``F.linear``) and AMD's skinny kernel. The floor is one pass over
-the weight at HBM bandwidth.
+"""``mstar::decode_gemv`` and ``mstar::decode_gemv_silu_mul``: decode linears, a
+weight stream, on the Triton kernel over its knob space (up to 16 rows) against
+hipBLASLt (``F.linear``), hipBLASLt at its best solution for the shape, and
+AMD's skinny kernel. The floor is one pass over the weight at HBM bandwidth.
 
 The Triton kernel comes as two families, ``triton_fma`` (fp32 multiply-adds,
 a reduction after the loop; for a few rows) and ``triton_dot`` (matrix cores,
 rows padded to 16), so a search can run either alone. The fused gated MLP
-projection is timed against the unfused pair the served graph runs: the
+projection is timed against the unfused pairs the served graph can run: a
 linear, then inductor's one ``silu(gate) * up`` kernel.
+
+``registry`` is what this tree serves for the shape, as the graph passes route
+it, and ``decode_linear`` the tree's tuned hipBLASLt solution where it has one
+(``F.linear`` elsewhere), so a search also reads what it would replace.
 """
 
 from __future__ import annotations
@@ -19,24 +23,29 @@ import torch.nn.functional as F
 
 from benchmark.kernels.candidates import Candidate, is_amd, search_order, space
 from benchmark.kernels.spec import KernelSpec, shape_product
+from benchmark.kernels.specs.linear import chosen_solution, hipblaslt_best
 from mstar.kernels.numerics import Tolerance
 from mstar.platforms.facts import DeviceFacts
 
 ROWS = (1, 2, 4, 8, 16)
+# decode buckets past the Triton kernel, which only hipBLASLt serves
+WIDE_ROWS = (32, 48, 64)
 # Qwen3.5 decode (n, k): GDN in_proj and out_proj, attention qkv and o, MLP
 # gate_up and down, the vocab head
 QWEN3_5_9B = ((12352, 4096), (4096, 4096), (10240, 4096), (24576, 4096), (4096, 12288), (248320, 4096))
 QWEN3_5_2B = ((8224, 2048), (2048, 2048), (5120, 2048), (12288, 2048), (2048, 6144), (248320, 2048))
+QWEN3_5_0_8B = ((8224, 1024), (1024, 2048), (5120, 1024), (7168, 1024), (1024, 3584), (248320, 1024))
 SHAPES = tuple(
     {"rows": s["rows"], "n": n, "k": k}
-    for (n, k) in QWEN3_5_9B + QWEN3_5_2B for s in shape_product(rows=ROWS)
+    for (n, k) in QWEN3_5_9B + QWEN3_5_2B + QWEN3_5_0_8B for s in shape_product(rows=ROWS + WIDE_ROWS)
 )
 # the gate_up projections, stacked [gate; up]
 SILU_MUL_SHAPES = tuple(
-    {"rows": rows, "n": n, "k": k} for (n, k) in ((24576, 4096), (12288, 2048)) for rows in ROWS
+    {"rows": rows, "n": n, "k": k} for (n, k) in ((24576, 4096), (12288, 2048), (7168, 1024)) for rows in ROWS
 )
 # AMD's wvSpltK serves up to four rows
 SKINNY_MAX_ROWS = 4
+TRITON_MAX_ROWS = max(ROWS)
 
 # Weight elements one thread loads per step along K stay between one 16-byte
 # vector and 64: fewer leaves loads too short to stream, more spills. Pipeline
@@ -111,7 +120,13 @@ def _triton(knobs, use_dot):
     from mstar.kernels.triton.gemv import decode_gemv
 
     knobs = {**knobs, "use_dot": use_dot}
-    return lambda x, w: decode_gemv(x, w, None, knobs)
+
+    def linear(x, w):
+        if x.shape[0] > TRITON_MAX_ROWS:
+            raise ValueError(f"the Triton kernel serves up to {TRITON_MAX_ROWS} rows")
+        return decode_gemv(x, w, None, knobs)
+
+    return linear
 
 
 def _triton_silu_mul(knobs, use_dot):
@@ -119,6 +134,38 @@ def _triton_silu_mul(knobs, use_dot):
 
     knobs = {**knobs, "use_dot": use_dot}
     return lambda x, w: decode_gemv_silu_mul(x, w, knobs)
+
+
+def _decode_linear():
+    return lambda x, w: torch.ops.mstar.decode_linear(x, w, None)
+
+
+def _registry():
+    """The linear as this tree's graph passes route it."""
+    from mstar.platforms.rocm_gemm import gemv_impl
+
+    def linear(x, w):
+        impl = gemv_impl(x.shape[0], w.shape[0], x.shape[1])
+        if impl == "aiter":
+            return torch.ops.mstar.skinny_gemm(x, w, None)
+        if impl == "triton":
+            return torch.ops.mstar.decode_gemv(x, w, None)
+        return torch.ops.mstar.decode_linear(x, w, None)
+
+    return linear
+
+
+def _registry_silu_mul():
+    from mstar.platforms.rocm_gemm import fuses_silu_mul
+
+    pair = _unfused(_registry())
+
+    def run(x, w):
+        if fuses_silu_mul(x.shape[0], w.shape[0], x.shape[1]):
+            return torch.ops.mstar.decode_gemv_silu_mul(x, w)
+        return pair(x, w)
+
+    return run
 
 
 def _unfused(linear):
@@ -133,6 +180,7 @@ def _unfused(linear):
     def run(x, w):
         return act(linear(x, w))
 
+    run.chosen = getattr(linear, "chosen", None)
     return run
 
 
@@ -150,14 +198,24 @@ def _triton_candidates(facts, budget, seeds, build) -> list[Candidate]:
 def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> list[Candidate]:
     found = [Candidate("torch", {}, lambda: F.linear)]
     if is_amd(facts):
-        found.append(Candidate("aiter_skinny", {}, _aiter_linear))
+        found.extend((
+            Candidate("registry", {}, _registry),
+            Candidate("aiter_skinny", {}, _aiter_linear),
+            Candidate("decode_linear", {}, _decode_linear),
+            Candidate("hipblaslt_tuned", {}, hipblaslt_best, shape_knobs=chosen_solution),
+        ))
     return found + _triton_candidates(facts, budget, seeds or {}, _triton)
 
 
 def silu_mul_candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> list[Candidate]:
     found = [Candidate("torch", {}, lambda: _unfused(F.linear))]
     if is_amd(facts):
-        found.append(Candidate("aiter_skinny", {}, lambda: _unfused(_aiter_linear())))
+        found.extend((
+            Candidate("registry", {}, _registry_silu_mul),
+            Candidate("aiter_skinny", {}, lambda: _unfused(_aiter_linear())),
+            Candidate("decode_linear", {}, lambda: _unfused(_decode_linear())),
+            Candidate("hipblaslt_tuned", {}, lambda: _unfused(hipblaslt_best()), shape_knobs=chosen_solution),
+        ))
     return found + _triton_candidates(facts, budget, seeds or {}, _triton_silu_mul)
 
 
@@ -166,7 +224,7 @@ def _shape_class(shape) -> str | None:
     for name, limit in (("rows1", 1), ("rows2", 2), ("rows4", 4), ("rows8", 8), ("rows16", 16)):
         if rows <= limit:
             return name
-    return None
+    return "wide"
 
 
 def _spec(name, shapes, reference, cands) -> KernelSpec:
