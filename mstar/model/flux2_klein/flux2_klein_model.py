@@ -150,7 +150,8 @@ class Flux2KleinModel(Model):
         self.linear_dtype = check_linear_dtype(linear_dtype)
         # fp8 linears kept in bf16 anyway (module-name patterns, block ranges like single_blocks.0-3.*)
         self.fp8_keep_bf16 = [str(p) for p in (fp8_keep_bf16 or [])]
-        # those linears' dtype per denoise step, past the list its last entry (docs/models.rst)
+        # those linears' dtype per denoise step, past the list its last entry, and the ones an fp8_partial step
+        # keeps in bf16 (docs/models.rst)
         self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype, fp8_partial_keep_bf16)
 
         self._snapshot = None
