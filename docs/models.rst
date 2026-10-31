@@ -1002,6 +1002,15 @@ Chatterbox notes
   by precision, eager vs. CUDA graph; ``gpu_util.py`` summarises
   ``nvidia-smi dmon`` samples taken during runs).
 
+Cosmos3 on two GPUs
+-------------------
+
+``configs/cosmos3_nano_cfg2.yaml`` runs each guidance branch on its own rank
+(``cfg_size: 2``, see :doc:`serving`) on the image and video walks. Both ranks prefill and
+hold both branches' text K/V, so the KV pool stays replicated and admits alike. The denoise
+steps run eager, with no captured denoise graph; the sound and action walks run both
+branches on both ranks, with no gain over one GPU.
+
 Cosmos3 environment requirements
 --------------------------------
 
