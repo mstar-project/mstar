@@ -143,6 +143,17 @@ def test_a_chunk_loop_is_uncapped_until_its_first_chunk():
     assert loop.max_iters == CHUNK_LOOP_END
 
 
+def test_an_accumulated_name_the_node_does_not_output_is_refused_at_load():
+    """Otherwise that edge would carry only the final chunk, with no error."""
+    import pytest
+
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    policy = ChunkingPolicy(walks=("prefill",), chunkable=True, accumulated_outputs=frozenset({"states"}))
+    with pytest.raises(ValueError, match=r"accumulates \['states'\]"):
+        _wrapped_walk(True, policy)
+
+
 def _wg(section):
     return WorkerGraph(
         section=section, graph_walks={"prefill"}, ranks=[0], worker_graph_id=0,

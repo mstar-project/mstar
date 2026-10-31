@@ -75,6 +75,13 @@ def _wrap_node_in_loop(
             ticks.append(GraphEdge(next_node=EMPTY_DESTINATION, name=edge.name))
             dest = gathered if edge.name in policy.accumulated_outputs else final
             dest.append(edge)
+        # a misspelt name would quietly carry only the final chunk
+        unknown = policy.accumulated_outputs - {edge.name for edge in section.outputs}
+        if unknown:
+            raise ValueError(
+                f"node {node_name!r} accumulates {sorted(unknown)} in walk "
+                f"{graph_walk!r}, which are not among its outputs there"
+            )
         tick = chunk_tick_name(node_name, graph_walk)
         ticks.append(GraphEdge(next_node=node_name, name=tick))
         return Loop(

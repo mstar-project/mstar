@@ -24,3 +24,11 @@ def test_a_decode_plan_keeps_every_token():
     hidden = torch.arange(3.0).unsqueeze(1)
 
     assert manager.select_last_hidden(hidden).flatten().tolist() == [0.0, 1.0, 2.0]
+
+
+def test_a_label_with_no_plan_fails_rather_than_keep_every_token():
+    import pytest
+
+    manager = _manager(SimpleNamespace())
+    with pytest.raises(RuntimeError, match="no plan for label 'other'"):
+        manager.select_last_hidden(torch.arange(3.0).unsqueeze(1), label="other")
