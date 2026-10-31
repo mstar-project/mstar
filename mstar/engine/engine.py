@@ -499,6 +499,9 @@ class Engine:
         self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
+        # node -> the event after its plan stream's latest pre-plan; see
+        # ``_order_after_pre_plans``
+        self._pre_plan_done: dict[str, Any] = {}
         self._graph_runtime = graph_runtime
 
         # node -> (offloaded, reloaded) since the last ``take_resident_delta``.
@@ -582,9 +585,6 @@ class Engine:
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
         self._loopback_steps: dict[int, tuple[str, str]] = {}
-        # node -> the event after its plan stream's latest pre-plan; see
-        # ``_order_after_pre_plans``
-        self._pre_plan_done: dict[str, Any] = {}
         self._runner = StepRunner(
             self._resources,
             # every node, including one that owns nothing (Code2Wav) — an
