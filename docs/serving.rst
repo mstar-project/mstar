@@ -494,8 +494,8 @@ ahead of a decode on its rank, a few steps at most, so a clip one step behind fi
 and the two decodes line up. ``cfg_size`` multiplies ``tp_size`` and ``sp_size`` into the
 instance. A node must be declared guidance-parallel by the model;
 ``configs/wan22_cfg2.yaml`` and ``configs/cosmos3_nano_cfg2.yaml`` ship it. These nodes run
-the serial lockstep protocol: at concurrency 2 on MI325X async scheduling served Wan2.2 at 9
-clips/min against 28 serial, so the default leaves it off for them.
+the serial lockstep protocol by default: a step here is GPU-bound, and async scheduling
+measured level with it on MI325X (Wan2.2 at concurrency 2, 29.4 against 29.6 clips/min).
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
