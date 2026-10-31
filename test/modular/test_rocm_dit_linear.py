@@ -76,7 +76,7 @@ def test_only_rocm_installs_the_pass(monkeypatch):
 def test_compile_site_applies_the_overrides_only_when_a_model_opts_in(monkeypatch, tuned_linears):
     seen = {}
 
-    def wrap(compiled, *, eager_rounding, overrides=None):
+    def wrap(compiled, *, eager_rounding, overrides=None, recompile_limit=None):
         seen["overrides"] = overrides
         return compiled
 
@@ -85,3 +85,12 @@ def test_compile_site_applies_the_overrides_only_when_a_model_opts_in(monkeypatc
     monkeypatch.setattr(compile_utils.current_platform, "dit_inductor_overrides", lambda: {"a": 1}, raising=False)
     compile_utils.compile_transformer_forward(torch.nn.Linear(2, 2), tuned_linears=tuned_linears)
     assert seen["overrides"] == ({"a": 1} if tuned_linears else None)
+
+
+def test_a_recompile_limit_holds_only_inside_the_compiled_forward():
+    before = torch._dynamo.config.recompile_limit
+    wrapped = compile_utils.with_inductor_rounding(
+        lambda: torch._dynamo.config.recompile_limit, eager_rounding=True, recompile_limit=before + 40,
+    )
+    assert wrapped() == before + 40
+    assert torch._dynamo.config.recompile_limit == before

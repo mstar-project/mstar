@@ -60,6 +60,7 @@ def exclude_from_compile(transformer: nn.Module, types: Sequence[type] = EXACT_O
 
 def compile_transformer_forward(
     transformer: nn.Module, eager_rounding: bool = True, exact_ops: ExactOps = False, tuned_linears: bool = False,
+    recompile_limit: int | None = None,
 ) -> None:
     """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
     captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
@@ -75,7 +76,8 @@ def compile_transformer_forward(
     The ``dit_exact_ops`` knob (off by default on AMD GPUs) drops ``exact_ops``, so a model
     config can keep its CUDA setting while each platform decides whether it applies. ``tuned_linears``
     runs the GEMMs a platform has a tuned kernel for on it (``dit_inductor_overrides``): the same
-    math with another summation order, so it is opt-in per model."""
+    math with another summation order, so it is opt-in per model. ``recompile_limit`` raises dynamo's
+    limit for this forward alone: past it a shape silently runs uncompiled, and is captured that way."""
     if exact_ops and not knobs.dit_exact_ops():
         logger.info("compile_exact_ops %s not applied: the dit_exact_ops knob is off (`knobs: dit_exact_ops: "
                     "true` keeps those modules eager)", exact_ops)
@@ -89,11 +91,13 @@ def compile_transformer_forward(
         torch.compile(transformer.forward, fullgraph=False, dynamic=False),
         eager_rounding=bool(eager_rounding),
         overrides=current_platform.dit_inductor_overrides() if tuned_linears else None,
+        recompile_limit=recompile_limit,
     )
 
 
 def with_inductor_rounding(
     compiled, *, eager_rounding: bool, deterministic: bool = False, overrides: dict[str, object] | None = None,
+    recompile_limit: int | None = None,
 ):
     """Wrap a compiled callable so ``emulate_precision_casts`` is in effect for the
     traces it builds, and only for those. This works with torch.compile's lazy
@@ -102,7 +106,7 @@ def with_inductor_rounding(
     deterministic compile option (``accelerator_graph_runner.
     deterministic_inductor_options``): no on-device benchmarking that changes
     numerics, so every process compiles the same kernels. ``overrides`` are further
-    inductor config values for those traces.
+    inductor config values for those traces, and ``recompile_limit`` dynamo's limit for them.
     """
     import torch._inductor.config as inductor_config
 
@@ -112,9 +116,10 @@ def with_inductor_rounding(
 
         options.update(deterministic_inductor_options())
     options.update(overrides or {})
+    dynamo_options = {"recompile_limit": recompile_limit} if recompile_limit else {}
 
     def forward(*args, **kwargs):
-        with inductor_config.patch(**options):
+        with inductor_config.patch(**options), torch._dynamo.config.patch(**dynamo_options):
             return compiled(*args, **kwargs)
 
     return forward
