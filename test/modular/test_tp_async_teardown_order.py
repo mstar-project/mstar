@@ -61,7 +61,7 @@ def _batch(seq: int, rids: list[int]):
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
-        launch_started_event=None, rebuild_rids=frozenset(), read_check_rids=None,
+        launch_started_event=None, read_check_rids=None, rebuild_rids=frozenset(),
     )
     return scheduled, executing
 
@@ -134,6 +134,7 @@ def _rank(
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w.streaming_buffers, w._last_active = {}, {}
     w._rebuilds = Rebuilds({}, {})
+    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:

@@ -59,6 +59,7 @@ def _worker(*, follower=False):
     w.reported: dict[int, str] = {}
     w._fail_requests = w.reported.update
     w._in_flight_rids = set()
+    w._kv_caches = {}
     w.parallel_nodes = {NODE} if follower else set()
     w.parallel_leader_nodes = set()
     w.engine_manager = SimpleNamespace(

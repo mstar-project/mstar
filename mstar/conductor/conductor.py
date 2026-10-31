@@ -1,5 +1,6 @@
 import atexit
 import hashlib
+import itertools
 import logging
 import multiprocessing as mp
 import os
@@ -431,6 +432,7 @@ class Conductor:
         status_interval_s: float | None = None,
     ):
         self.requests: dict[str, RequestData] = {}
+        self._arrivals = itertools.count()
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
         self.draining: dict[str, DrainingRequest] = {}
@@ -1351,6 +1353,7 @@ class Conductor:
         if not all(partition_states[name].is_done for name in self._streamed_partitions()):
             prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
+        arrival = next(self._arrivals)
         refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
@@ -1362,6 +1365,7 @@ class Conductor:
                 prefix_cache=prefix_cache,
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
+                arrival=arrival,
             )
         if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
             request_data.max_output_tokens, loop_caps = self._fit_loop_caps(

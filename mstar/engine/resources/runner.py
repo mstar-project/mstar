@@ -349,6 +349,12 @@ class StepRunner:
     ) -> None:
         """open state on all resources; `overrides` are per-resource. All or
         nothing: a resource that raises leaves the request on none of them."""
+        arrival = next((
+            config.arrival for config in (overrides or {}).values()
+            if getattr(config, "arrival", None) is not None
+        ), None)
+        if arrival is not None:
+            self._admission.set_arrival(rid, arrival)
         for i, key in enumerate(self._order):
             try:
                 self._resources[key].ingest_request(
@@ -421,13 +427,9 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
-        if not self._admission.admitted(rid, node_name):
-            waits = self._admission.admit(
-                rid, node_name, graph_walk, published,
-                self._sweep(self._node_ask_order, self._ask_order, node_name),
-            )
-            if waits is not None:
-                return waits
+        waits = self.admit_request(rid, node_name, graph_walk, published)
+        if waits is not None:
+            return waits
         ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
@@ -444,6 +446,21 @@ class StepRunner:
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
+
+    def admit_request(
+        self, rid: str, node_name: str, graph_walk: str,
+        published: Mapping[str, PublishedInfo] | None = None,
+    ) -> FullAdmitOutcome | None:
+        """None once ``rid`` is admitted on ``node_name``, else `FULL_ADMIT_QUEUED` while it waits, or why
+        it can never be admitted."""
+        if self._admission.admitted(rid, node_name):
+            return None
+        return self._admission.admit(
+            rid, node_name, graph_walk, published, self._sweep(self._node_ask_order, self._ask_order, node_name),
+        )
+
+    def readmit(self, rid: str, node_name: str) -> None:
+        self._admission.readmit(rid, node_name, self._sweep(self._node_ask_order, self._ask_order, node_name))
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],

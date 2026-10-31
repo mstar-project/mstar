@@ -11,7 +11,7 @@ harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog, rebuilds} (purged by
 clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
-streaming_buffers, _lockstep_unread}, Rebuilds._kept,
+streaming_buffers, _lockstep_unread, _dropped, _victims, _preempted}, Rebuilds._kept,
 RequestStateManager.{per_request_info, _fwd_by_partition} and StreamBufferManager._rids
 (purged by remove_request), the engine's and tensor manager's per-request state,
 RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode, _unkeyed,
