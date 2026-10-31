@@ -33,8 +33,8 @@ resources:
     page_size: 128
   kda_state:
     max_slots: 65
-# glm5_next_tp8_longctx.yaml's warmups: the eager windowed prefill (with its MTP pass) compiles before
-# the server binds, not on the first long request.
+# glm5_next_tp8_longctx.yaml's warmups: the eager windowed prefill, with its MTP pass, compiles
+# before the server binds.
 warmup_requests:
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}

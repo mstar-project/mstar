@@ -394,9 +394,9 @@ class Glm5NextModelConfig:
         as holes. Admission books every step's whole block (no draft accepted),
         so k + 1 rows a token keep the rows from refusing a request its context
         holds. Pages are taken as the rows fill, so the bound allocates nothing.
-        Under mtp_trims the host counts a step's whole block the same way, though
-        the device rewrites the rejected rows, within max_seq_len rows: a decode
-        score as wide as k + 1 windows would cost its memory k + 1 times."""
+        Under mtp_trims the device rewrites rejected rows, so the bound is max_seq_len,
+        though the host still books whole blocks against it: a decode score k + 1 windows
+        wide would cost k + 1 times the memory."""
         holes = self.mtp_num_draft_tokens > 0 and not self.mtp_trims
         return self.max_seq_len * (self.mtp_num_draft_tokens + 1 if holes else 1)
 

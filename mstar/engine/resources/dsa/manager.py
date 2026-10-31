@@ -94,8 +94,8 @@ class DSAManager(Resource):
         staged = self._int_stager.to_device(torch.cat(parts), self._device)
         lens = attn_lens(pos, topk, kpool)  # a padding row's is 1
         if mtp_trims and walk == "decode":
-            # these rows sit at or past their true ones (_trim_on_device): plan each for the
-            # longest it can be there, its spare entries masked
+            # a row sits at or past its true position: plan it for the longest it can be,
+            # its spare entries masked (SparseGraphPlan.attend's valid)
             lens = [min(p + 1, topk + kpool - 1) for p in pos]
         # score width: the step's most pools; a decode graph's the serving window's, and a
         # captured prefill holds whole prompts no longer than its bucket

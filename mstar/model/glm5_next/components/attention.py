@@ -83,8 +83,7 @@ class Glm5NextMLAAttention(MLAAttention):
         # every full-attention layer, the MTP layer's too, ships its own indexer
         self.indexer = Glm5NextIndexer(config)
         # dsa_long_context: this layer's index plane (its latent plane's, on the same pages; the
-        # MTP layer selects with its own indexer too), and the DSA resource whose context the
-        # submodule sets per forward
+        # MTP layer's too), and the DSA resource whose context the submodule sets per forward
         self.index_plane = kv_plane if config.dsa_long_context else None
         self._dsa: DSAManager | None = None
         self.dsa_group = (comm_group or CommGroup.trivial()) if config.dsa_shard_prefill else None

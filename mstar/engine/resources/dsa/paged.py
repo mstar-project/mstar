@@ -61,8 +61,8 @@ class DSAContext:
     needs_selection: bool = True
     decode_rows: bool = False
     sparse_plan: sparse_mla.SparseGraphPlan | sparse_mla.EagerSparsePlan | None = None
-    # a graph plan made for longer rows than the step's (MTP trimmed on device): each row's
-    # true length and the masked slot its spare entries attend
+    # a graph plan made for longer rows than the step's: each row's true length, and the
+    # masked slot its spare entries attend
     valid: torch.Tensor | None = None
     pad_slot: int | None = None
     last_selection: torch.Tensor | None = None

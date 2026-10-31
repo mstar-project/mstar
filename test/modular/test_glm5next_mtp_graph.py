@@ -318,11 +318,8 @@ def greedy_long_captured():
 @pytest.mark.parametrize("batch", list(LONG_LENGTHS))
 def test_long_context_captured_verify_matches_eager_and_greedy(greedy_long, greedy_long_captured,
                                                               k, batch):
-    """dsa_long_context: each step's block goes to its request's true rows on device (the
-    host plans it before the last verdict) and the MTP layer selects with its own indexer.
-    Captured (planned for the longest rows, padding masked) == eager (replanned exact),
-    both == greedy without MTP (the same near-tie rule as above), and the pre-planned order,
-    which plans a step before the last one has run, == captured."""
+    """Under dsa_long_context: captured (planned for the longest rows, spare entries masked)
+    == eager (exact rows) == pre-planned, and greedy without MTP to the near-tie rule above."""
     lengths = LONG_LENGTHS[batch]
     eng = _Engine(k=k, long_context=True)
     assert eng.sub.config.mtp_trims

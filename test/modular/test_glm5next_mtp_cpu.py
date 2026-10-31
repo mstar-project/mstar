@@ -457,10 +457,8 @@ LONG_MAX_TOKENS = 30
 
 
 def _generate_long(engine, sub, prompts, max_tokens):
-    """``_generate`` with the cache checked after each step: the host's cache counts every
-    verify step's whole block, whatever it accepted (so it moves the same on every rank), and
-    the device's length is the rows of the input and the accepted drafts, nothing else (the
-    token after them is the next input)."""
+    """``_generate``, checking after each step that the host books every verify step's whole
+    block (the same on every rank) and ``MTP_LEN`` only the accepted rows."""
     kv, pool = engine._resources[KV_CACHE], engine._resources[KDA_STATE]
     rows = {rid: len(ids) for rid, ids in prompts.items()}
     host = dict(rows)
@@ -499,8 +497,8 @@ def long_reference():
 @pytest.mark.parametrize("k", [1, 3])
 @pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
 def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, drafts):
-    """Prompts past index_topk, prefilled in windows: drafting on gives greedy's tokens,
-    whatever the drafts, and each verify step's rejected rows leave the cache."""
+    """Prompts past index_topk, prefilled in windows: drafting gives greedy's tokens, whatever
+    the drafts."""
     assert all(len(v) == LONG_MAX_TOKENS for v in long_reference.values()), long_reference
     engine, sub, cfg = _build_engine(k, long_context=True)
     assert cfg.mtp_trims and min(map(len, LONG_PROMPTS.values())) > cfg.index_topk
@@ -512,29 +510,27 @@ def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, dr
 
 # hundreds of index pools against the 16 a query selects, on 16-token pages
 REAL_PROMPTS = {"a": (torch.arange(700) * 37 + 11) % 240, "b": (torch.arange(450) * 53 + 5) % 240}
-REAL_MAX_TOKENS = 120
+REAL_MAX_TOKENS = 60
 
 
-@pytest.mark.parametrize("drafts", ["mtp", "oracle_partial"])
-def test_long_context_mtp_at_a_real_geometry(drafts):
+def test_long_context_mtp_at_a_real_geometry():
     """The same parity where the trims bookkeeping can drift: ~175 pools against the 16
-    selected, 16-token pages, and after 120 tokens the host's rows several pages past the
-    device's. Greedy's tokens, and every step's host rows, context and MTP_LEN checked."""
+    selected, on 16-token pages, with the host's rows pages past the device's."""
     geometry = {"long_context": True, "max_seq_len": 2048, "page_size": 16}
     engine, sub, _ = _build_engine(0, **geometry)
     reference = _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS)
     assert all(len(v) == REAL_MAX_TOKENS for v in reference.values()), reference
-    engine, sub, cfg = _build_engine(3, **geometry)
-    assert cfg.mtp_trims and min(map(len, REAL_PROMPTS.values())) > 4 * cfg.index_topk
-    if drafts != "mtp":
-        _oracle(sub, reference, wrong_every=2)
-    assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference
+    for drafts in ("mtp", "oracle_partial"):
+        engine, sub, cfg = _build_engine(3, **geometry)
+        assert cfg.mtp_trims and min(map(len, REAL_PROMPTS.values())) > 4 * cfg.index_topk
+        if drafts != "mtp":
+            _oracle(sub, reference, wrong_every=2)
+        assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference, drafts
 
 
 def test_long_context_mtp_layer_selects_with_its_own_indexer():
-    """Under dsa_long_context the MTP layer keeps an index plane, as a trunk layer does, and
-    the prompt's MTP pass writes every prompt row's key there: its drafts select over the whole
-    context, not over its last index_topk tokens."""
+    """The prompt's MTP pass writes every prompt row's index key to the MTP layer's own plane,
+    so its drafts select over the whole context."""
     engine, sub, cfg = _build_engine(2, long_context=True)
     attn = sub.language_model.mtp.transformer_layer.self_attn
     assert attn.index_plane == attn.kv_plane

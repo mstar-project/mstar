@@ -628,14 +628,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             pool.scatter_(MTP_LEN, ends[:, None], None)
 
     def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        """mtp_trims: move this verify step's block to each request's true rows. The host
-        plans every block after the last one's whole block, as with holes, and never takes
-        rows back, so its cache, and every rank's, moves the same whatever was accepted;
-        ``MTP_LEN`` (each slot's tokens in cache, advanced by every verify on device) gives
-        the true rows, and the rows' positions and the cache slots their latents and index
-        keys go to follow them. A captured step keeps its plan, made for the longest rows, and
-        masks each row's spare entries; an eager one replans exact rows. Returns each
-        request's ``MTP_LEN``."""
+        """mtp_trims: point this verify step's rows (their positions, and the cache slots their
+        latents and index keys go to) at each request's true rows, ``MTP_LEN`` on. The host's
+        plan, the same on every rank whatever was accepted, stays as made: a captured step masks
+        each row's spare entries, an eager one replans exact rows. Returns each ``MTP_LEN``."""
         ctx, kv = self._dsa_ctx, engine_inputs.resources[KV_CACHE]
         # a padding request reads 0 (the sink holds no state): the sink page's first rows,
         # as planned
@@ -955,7 +951,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         steps = request_info.dynamic_loop_iter_counts.get("decode_loop", 0)
         if request_info.graph_walk == "decode":
             steps += 1
-        # every verify step's block stays in the host's cache, holes or rows the device rewrote
         prompt, room = state.get("prompt_len", 0), 2 * self.mtp_block
         full = (prompt + generated + room > self.config.context_limit
                 or prompt + steps * self.mtp_block + room > self.config.kv_rows)

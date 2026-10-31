@@ -1,9 +1,7 @@
 model: "glm52"
-# glm52_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-78 draft module (greedy
-# requests only). A verify step takes its rejected rows back from the KV cache (the latents
-# and, on the same pages, the index keys) before the next step plans, and every verify row and
-# the draft module's own indexer select their top-2048 tokens like the trunk's. MTP's prefill
-# over DSA runs eager.
+# glm52_tp8_longctx.yaml with glm52_tp8_mtp.yaml's drafting (greedy requests only). A verify
+# step takes its rejected rows back, latents and index keys alike, before the next step plans;
+# the draft module selects with its own indexer. MTP's prefill over DSA runs eager.
 #
 # KV per token per rank: 79 MLA layers x (512 + 64) x 2 B + 22 index layers x 128 x 2 B
 # ~= 96 KB, so the pools below hold about one full window, as glm52_tp8_longctx.yaml's.
@@ -20,8 +18,7 @@ model_kwargs:
   max_seq_len: 262144
   prefill_chunk_tokens: 8192
   dsa_shard_prefill: true
-  # glm52_tp8.yaml's kernels (kernels: auto); the fused MLA prep serves the selecting
-  # path too
+  # glm52_tp8.yaml's prefill graphs, which MTP over DSA does not capture (its prefill runs eager)
   prefill_token_buckets: [
     64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
     832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
@@ -32,9 +29,8 @@ resources:
   kv:
     max_num_pages: 2304
     page_size: 128
-# MTP's prefill over DSA runs eager, a short prompt's too, in row chunks past
-# prefill_chunk_tokens, and its kernels compile on first use. Four lengths (1k, 6k, 12.5k
-# and 20k tokens) take those compiles before the server binds, not the first request.
+# Every prefill runs eager (in row chunks past prefill_chunk_tokens) and its kernels compile on
+# first use: four lengths (1k, 6k, 12.5k and 20k tokens) compile them before the server binds.
 warmup_requests:
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 100, model_kwargs: {max_output_tokens: 4}}
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
