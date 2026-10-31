@@ -755,7 +755,7 @@ class Wan22Model(Model):
         """
         from diffusers import UniPCMultistepScheduler
 
-        from mstar.model.wan22.components.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
+        from mstar.model.components.diffusion.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
 
         scheduler_config = UniPCMultistepScheduler.load_config(
             self.model_path_hf, subfolder="scheduler", cache_dir=self.cache_dir,

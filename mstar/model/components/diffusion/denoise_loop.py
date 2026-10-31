@@ -58,6 +58,14 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.diffusion.unipc import (
+    LAST_SAMPLE,
+    MODEL_OUTPUTS,
+    SOLVER_STATE,
+    UniPCState,
+    initial_state,
+    unipc_step,
+)
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.threads import ThreadPool
@@ -97,9 +105,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     MAIN_SPAN = "main"
 
     # Loop-back edges beyond LATENTS: solver state a multi-step scheduler carries
-    # between iterations, e.g. wan22's UniPC ("unipc_model_outputs",
-    # "unipc_last_sample"). :meth:`denoise` returns these alongside the new
-    # sample and :meth:`seed_loop_back` supplies iteration 0's values.
+    # between iterations, e.g. UniPC's (:class:`UniPCDenoiseLoopSubmodule`).
+    # :meth:`denoise` returns these alongside the new sample and
+    # :meth:`seed_loop_back` supplies iteration 0's values.
     SOLVER_STATE: tuple[str, ...] = ()
 
     # name -> where in the request's schedule this step's value comes from. A
@@ -341,10 +349,10 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         state = self.request_state(fwd_info.rid_handle)
         k = self.step_index(fwd_info)
         device = self.get_device()
-        # One schedule per (request, walk): a request whose walks run this node in
-        # successive stages (a draft loop, then a refinement loop) gets a fresh shape
-        # and schedule for each.
-        if state.get("schedule_walk") != graph_walk:
+        # One schedule per loop: a request whose walks run this node in successive
+        # stages (a draft loop, then a refinement loop) gets a fresh shape and
+        # schedule for each.
+        if k == 0 or state.get("schedule_walk") != graph_walk:
             bucket_key = self.bucket_key_for(fwd_info)
             schedule = self.schedule_for(fwd_info, bucket_key)
             state.add_all(
@@ -549,6 +557,68 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 input_seq_dims={key: 0 for key in tensors},
             ))
         return configs
+
+
+class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
+    """A denoise loop stepped by the scaffold's UniPC (``components/diffusion/unipc.py``).
+
+    The subclass predicts (:meth:`model_output`); the base carries the solver state
+    in ``SOLVER_STATE`` and steps each row from its own tables and the loop counter,
+    so rows at different steps share one forward. The solver is per row because the
+    order ramp is, and because it holds a host sigma, this path has no captured graph.
+    """
+
+    SOLVER_STATE = SOLVER_STATE
+    STEP_SCALARS = {"timestep": StepScalar("timesteps", broadcast=False, capture_fill=1000.0)}
+
+    def model_output(
+        self, engine_inputs: ModelInputsFromEngine, bucket_key: Hashable, latents: torch.Tensor,
+        timestep: torch.Tensor, **cond: torch.Tensor,
+    ) -> torch.Tensor:
+        """What the solver takes for a stacked batch, ``[B, ...]`` over the rows'
+        samples; ``latents`` and ``cond`` are stacked over the rows' tensors."""
+        raise NotImplementedError
+
+    def seed_loop_back(
+        self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, generator: torch.Generator,
+    ) -> dict[str, torch.Tensor]:
+        latents = self.seed_latents(fwd_info, bucket_key, generator)
+        return {self.LATENTS: latents, **initial_state(latents)}
+
+    def _step_scalar_sources(
+        self, schedule: FlowMatchSchedule, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        # the solver reads its sigmas from the table, by the row's step index
+        return {
+            **super()._step_scalar_sources(schedule, device),
+            "sigmas": to_device_nonblocking(schedule.sigmas, device),
+        }
+
+    def denoise(
+        self,
+        engine_inputs: ModelInputsFromEngine,
+        bucket_key: Hashable,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        unipc_model_outputs: torch.Tensor,
+        unipc_last_sample: torch.Tensor,
+        **cond: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        output = self.model_output(engine_inputs, bucket_key, latents, timestep, **cond)
+        steps = []
+        for i, rid in enumerate(engine_inputs.request_ids):
+            info = engine_inputs.per_request_info[rid]
+            state = self.request_state(info.rid_handle)
+            steps.append(unipc_step(
+                output[i], latents[i],
+                UniPCState(model_outputs=unipc_model_outputs[i], last_sample=unipc_last_sample[i]),
+                state["schedule"].sigmas, state["sigmas"], self.step_index(info), state["num_steps"],
+            ))
+        return {
+            self.LATENTS: torch.stack([step.sample for step in steps]),
+            MODEL_OUTPUTS: torch.stack([step.model_outputs for step in steps]),
+            LAST_SAMPLE: torch.stack([step.last_sample for step in steps]),
+        }
 
 
 # The default names, for callers that only need those (the module's own graph

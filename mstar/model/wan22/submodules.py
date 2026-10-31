@@ -28,7 +28,7 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.components.unipc import (
+from mstar.model.components.diffusion.unipc import (
     SOLVER_ORDER,
     UniPCState,
     make_unipc_tables,

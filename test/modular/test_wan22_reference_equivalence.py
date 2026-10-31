@@ -304,7 +304,7 @@ def t2v_trajectory(oracle_meta, text_embeds, dit_submodule) -> dict:
     """
     from diffusers import UniPCMultistepScheduler
 
-    from mstar.model.wan22.components.unipc import make_unipc_tables
+    from mstar.model.components.diffusion.unipc import make_unipc_tables
 
     meta = _step_metadata(oracle_meta)
     fwd_info = _fwd_info("video_gen", meta, seed=oracle_meta["seed"])
