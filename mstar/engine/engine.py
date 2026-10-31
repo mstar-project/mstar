@@ -1653,8 +1653,8 @@ class Engine:
         )
         slot_events: dict[int, Any] = {}
 
-        # A raise outside the per-rid try below is no one request's, so it
-        # fails the batch; the drain and `commit_done` still run on the way out.
+        # a raise outside the per-rid try fails the batch; the drain and
+        # `commit_done` still run
         try:
             for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
                 req_info = {rid: batch.per_request_info_wrapped[rid]}
@@ -1682,10 +1682,10 @@ class Engine:
                         graph_walk=batch.step_context.graph_walk,
                     ))
                 except Exception as error:
-                    # This rid's own forward: it fails alone and the worker drops
-                    # it, as for prepare_inputs. Its admitted state goes with the
-                    # REMOVE that follows, once the step is out of flight. Under
-                    # TP/SP the ranks stay in step only if every rank raised here.
+                    # this rid fails alone, as in prepare_inputs, and keeps its
+                    # admitted state (which queued kernels may still write) until
+                    # its REMOVE. Under TP/SP the ranks stay in step only if every
+                    # rank raises here.
                     batch.register_failure(rid, error)
                 finally:
                     # on every exit: a raise after plan can leave this slot's

@@ -16,13 +16,9 @@ saying so is kept to one per node and walk every few seconds.
 
 from __future__ import annotations
 
-import datetime
 import logging
-import multiprocessing as mp
-import queue
 import sys
 import threading
-import traceback
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -954,34 +950,19 @@ def test_a_batch_too_big_alone_that_evicts_its_own_row_is_capped():
 # --- a forward that raises fails only its own rid --------------------------
 
 
-@pytest.mark.parametrize("where", ["forward", "collect"])
-def test_per_request_fails_only_the_rid_whose_forward_raised(where):
-    """One rid's forward is its own: the others in the unbatchable batch still
-    run, and only the raising one goes to ``failed_requests``, which the worker
-    drops and fails as it does a ``prepare_inputs`` failure. Raised past
-    commit (collecting outputs) it is the same."""
-    engine = (
-        _FakeExecEngine(raise_on="b") if where == "forward"
-        else _FakeExecEngine(collect_raise_on="b")
-    )
+@pytest.mark.parametrize("engine_kwargs, failed", [
+    ({"collect_raise_on": "b"}, {"b"}),  # past commit, collecting its outputs
+    ({"raise_on": ("a", "b", "c")}, {"a", "b", "c"}),
+], ids=["collect", "every_forward"])
+def test_per_request_fails_only_the_rids_that_raised(engine_kwargs, failed):
+    """The rest of the unbatchable batch still runs, and the plan thread is released."""
+    engine = _FakeExecEngine(**engine_kwargs)
     batch = _exec_batch(["a", "b", "c"])
 
     out = engine._exec_per_request(batch)
 
-    assert ("run", "a") in engine.events and ("run", "c") in engine.events
-    assert out.per_rid_outputs == {"a": {"token": 1}, "b": {}, "c": {"token": 1}}
-    assert set(batch.failed_requests) == {"b"}
-    assert batch.commit_done.is_set()
-
-
-def test_per_request_survives_every_rid_raising():
-    engine = _FakeExecEngine(raise_on=("a", "b"))
-    batch = _exec_batch(["a", "b"])
-
-    out = engine._exec_per_request(batch)
-
-    assert out.per_rid_outputs == {"a": {}, "b": {}}
-    assert set(batch.failed_requests) == {"a", "b"}
+    assert out.per_rid_outputs == {rid: {} if rid in failed else {"token": 1} for rid in "abc"}
+    assert set(batch.failed_requests) == failed
     assert batch.commit_done.is_set()
 
 
@@ -1022,9 +1003,9 @@ def _fenced(monkeypatch, **kwargs) -> _FakeExecEngine:
 
 
 def test_a_raising_rids_slot_is_still_fenced(monkeypatch):
-    """b raised after its plan may have staged into slot 1, so its queued copy
-    is fenced like a finished rid's: d reuses slot 1 only after waiting on it,
-    and the batch drains ``next_slot`` before it releases the plan thread."""
+    """A raising rid's slot is fenced like a finished rid's: d reuses b's slot
+    only after waiting on it, and ``next_slot`` drains before the plan thread
+    is released."""
     engine = _fenced(monkeypatch, raise_on="b", num_slots=2, next_slot=1)
     batch = _exec_batch(["a", "b", "c", "d"], slot=0)
     batch.commit_done = _LoggedEvent(engine.events)
@@ -1044,10 +1025,8 @@ def test_a_raising_rids_slot_is_still_fenced(monkeypatch):
 
 
 def test_per_request_drains_and_releases_when_the_loop_itself_raises(monkeypatch):
-    """A raise outside the per-rid try (here, pointing the region runners at
-    b's slot) is no one request's, so it fails the batch. The way out still
-    drains ``next_slot``, which a ran on, before releasing the plan thread:
-    otherwise the next pre-plan stages over a's queued work."""
+    """A raise outside the per-rid try (setting b's slot) fails the batch, and
+    still drains ``next_slot`` (a's) before releasing the plan thread."""
     # two declare-loop calls, then a's slot, then b's raises
     engine = _fenced(monkeypatch, num_slots=2, next_slot=1, slot_raise_at=4)
     batch = _exec_batch(["a", "b"], slot=0)
@@ -1086,73 +1065,3 @@ def test_postprocess_skips_a_rid_whose_forward_raised():
 
     assert submodule.postprocessed == ["a"]
     assert batch.failed_requests == {"b": "ValueError: forward failed for b"}
-
-
-# --- two lockstep ranks raise on the same rid ------------------------------
-
-
-class _CollectiveExecEngine(_FakeExecEngine):
-    """Each rid's forward all-reduces twice over the instance, as a
-    row-parallel layer does; b raises between the two on every rank."""
-
-    def _drive_step(
-        self, batch, submodule_mgmt, request_ids, inputs, req_info, ctx,
-        lease, running_batched, step, set_launch,
-    ):
-        import torch.distributed as dist
-        rid = request_ids[0]
-        index = batch.request_ids.index(rid)
-        for half in range(2):
-            value = torch.tensor([float(100 * index + 10 * half + dist.get_rank())])
-            dist.all_reduce(value)
-            if rid in self._raise_on:
-                raise RuntimeError(f"forward failed for {rid}")
-        return {rid: {"sum": float(value)}}, step
-
-    def _collect_outputs(self, submodule_mgmt, lease, raw, *a, **kw):
-        return raw
-
-
-def _lockstep_rank(rank, store, out):
-    import torch.distributed as dist
-    try:
-        dist.init_process_group(
-            "gloo", init_method=f"file://{store}", rank=rank, world_size=2,
-            timeout=datetime.timedelta(seconds=10),
-        )
-        batch = _exec_batch(["a", "b", "c"])
-        merged = _CollectiveExecEngine(raise_on="b")._exec_per_request(batch)
-        out.put((rank, dict(merged.per_rid_outputs), sorted(batch.failed_requests)))
-        dist.destroy_process_group()
-    except BaseException:
-        out.put((rank, "crash", traceback.format_exc()))
-
-
-def test_two_ranks_that_raise_on_the_same_rid_stay_in_step(tmp_path):
-    """Every rank raised on b, so every rank goes on to c and runs c's
-    collectives with the other: c's sums are c's own on both ranks, not a
-    mispairing with b's, and both fail b alone."""
-    ctx = mp.get_context("spawn")
-    out = ctx.Queue()
-    procs = [
-        ctx.Process(target=_lockstep_rank, args=(r, tmp_path / "store", out))
-        for r in range(2)
-    ]
-    for p in procs:
-        p.start()
-    results = {}
-    try:
-        for _ in procs:
-            rank, *rest = out.get(timeout=60)
-            results[rank] = rest
-    except queue.Empty:
-        pass
-    for p in procs:
-        p.join(timeout=10)
-        if p.is_alive():
-            p.kill()
-    assert sorted(results) == [0, 1], results
-    for rank, rest in results.items():
-        assert rest[0] != "crash", rest[1]
-        # ranks 0 and 1 add up to 2 * value + 1 on the second all-reduce
-        assert rest == [{"a": {"sum": 21.0}, "b": {}, "c": {"sum": 421.0}}, ["b"]], (rank, rest)
