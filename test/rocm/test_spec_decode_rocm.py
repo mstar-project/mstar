@@ -366,7 +366,7 @@ def test_a_replay_equals_the_eager_step_at_the_same_registers():
         got = tuple(out) + tuple(r[regs] for r in (spec._tokens, spec._draft_ids, spec._draft_probs))
         for a, b in zip(got, want, strict=True):
             assert torch.equal(a, b)
-        assert spec._rng_offset[1:3].tolist() == [offset + 5, offset + 5]
+        assert spec._rng_offset[1:3].tolist() == [offset + sampled.words_per_step(2)] * 2
 
 
 @pytest.mark.parametrize("settings", [(0.7, 40, 0.9), (0.7, 0, 0.9), (1.0, 5, 1.0), (0.0, 0, 1.0), (0.8, 3, 0.5),
