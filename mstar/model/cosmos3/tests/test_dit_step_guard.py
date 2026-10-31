@@ -1,13 +1,10 @@
-"""A Cosmos3 DiT denoise step is never dispatched onto a scheduler that has
-already run all its steps.
+"""A Cosmos3 DiT denoise loop is never restarted over a request that ran it.
 
-UniPC counts its own steps; one past the last asserts ``this_order > 0`` inside
-the batched forward and fails every request batched with that one. Seen at 8
-concurrent kv rollouts: a finished request, re-queued after a refused admit,
-came back with no loop-back latents, so ``prepare_inputs`` took it for a fresh
-loop start (``time_index`` 0) over its last window's spent scheduler. The
-worker no longer re-queues it (see ``test_admit_failure_handling``); this is
-the DiT's own guard, which fails just that request.
+Seen at 8 concurrent kv rollouts: a finished request, re-queued after a refused
+admit, came back with no loop-back latents, so ``prepare_inputs`` took it for a
+fresh loop start over its last window. The worker no longer re-queues it (see
+``test_admit_failure_handling``); this is the DiT's own guard, which fails just
+that request.
 """
 
 from types import SimpleNamespace
@@ -23,6 +20,7 @@ from mstar.engine.engine import Engine  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
+    VIDEO_GEN_AR_LOOP,
     VIDEO_GEN_AR_WALK,
     Cosmos3DiTSubmodule,
 )
@@ -64,74 +62,67 @@ def _kv_rollout(dit, rid):
     return st
 
 
-def _prepare(dit, rid, inputs):
-    return dit.prepare_inputs(
-        VIDEO_GEN_AR_WALK,
-        SimpleNamespace(request_id=f"req-{rid}", rid_handle=rid, random_seed=0), inputs,
+def _fwd(rid, k):
+    return SimpleNamespace(
+        request_id=f"req-{rid}", rid_handle=rid, random_seed=0, dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: k},
     )
 
 
-def _step(dit, st, inp):
-    """What the forward does to the request's scheduler for one denoise step."""
-    sched = st["scheduler"]
+def _prepare(dit, rid, inputs, k=0):
+    return dit.prepare_inputs(VIDEO_GEN_AR_WALK, _fwd(rid, k), inputs)
+
+
+def _step(dit, st, inp, k):
+    """What the forward does to a request's latents and solver state for one denoise step."""
     lat = inp.tensor_inputs["latents"]
-    local = int(inp.tensor_inputs["time_index"].item()) % st["ar_iters_per_window"]
-    return dit._scheduler_step(st, torch.zeros_like(lat[0]), sched.timesteps[local], lat[0])
+    local = k % st["ar_iters_per_window"]
+    solver = {name: inp.tensor_inputs[name] for name in dit._solver_state}
+    return dit._scheduler_step(st, torch.zeros_like(lat), lat, local, solver)
 
 
 def test_rollout_steps_every_window_and_commit_unchanged():
-    """The guard leaves a rollout's sequence alone: each window's denoise steps,
-    the kv commit that runs on the spent scheduler, the next window's fresh
-    scheduler, and the loop's one extra dispatched step is still vetoed."""
+    """A whole two-window kv rollout: a step for each denoise iteration, the kv
+    commit, the next window's fresh solver state, and the loop's one extra
+    dispatched step is still vetoed."""
     dit = _dit()
     st = _kv_rollout(dit, 1)
     inp = _prepare(dit, 1, {})
     kinds = []
-    for _ in range(WINDOWS * (STEPS + 1)):
+    for k in range(WINDOWS * (STEPS + 1)):
         commit = inp.resource_step_info.commit
         kinds.append("commit" if commit else "gen")
-        ti = inp.tensor_inputs["time_index"]
         if commit:
-            assert st["scheduler"].step_index == STEPS
             st.add("scheduler", dit._new_scheduler(STEPS, "cpu", flow_shift=12.0))
             lat = inp.tensor_inputs["latents"]
+            solver = dit._first_solver_state(st, lat)
         else:
-            lat = _step(dit, st, inp).unsqueeze(0)
-        inp = _prepare(dit, 1, {"latents": [lat], "time_index": [ti + 1]})
+            lat, solver = _step(dit, st, inp, k)
+        inp = _prepare(dit, 1, {"latents": [lat], **{n: [t] for n, t in solver.items()}}, k + 1)
         if inp is None:
             break
     assert kinds == (["gen"] * STEPS + ["commit"]) * WINDOWS
     assert inp is None
 
 
-def test_finished_request_re_queued_fails_alone_instead_of_asserting():
-    """The B200 trace, on CPU: request 1 finished its last window; re-queued
-    with no loop-back latents it prepares as time_index 0 over the spent
-    scheduler. Request 2 is mid-window. Before, both prepared and the batched
-    forward asserted, failing both; now request 1 fails alone."""
+def test_finished_request_re_queued_fails_alone():
+    """The B200 trace, on CPU: request 1 finished its last window; re-queued with
+    no loop-back latents past iteration 0 it must not restart. Request 2 is
+    mid-window. It keeps running and request 1 fails alone."""
     dit = _dit()
-    done, live = _kv_rollout(dit, 1), _kv_rollout(dit, 2)
-    lat = _prepare(dit, 1, {}).tensor_inputs["latents"][0]
-    for t in done["scheduler"].timesteps:
-        lat = dit._scheduler_step(done, torch.zeros_like(lat), t, lat)
-    with pytest.raises(AssertionError):
-        # the crash being guarded: one step past the scheduler's last
-        dit._scheduler_step(done, torch.zeros_like(lat), done["scheduler"].timesteps[-1], lat)
+    _kv_rollout(dit, 1)
+    live = _kv_rollout(dit, 2)
     first = _prepare(dit, 2, {})
-    _step(dit, live, first)
+    new, solver = _step(dit, live, first, 0)
 
     batch = SimpleNamespace(
         node_name="dit", request_ids=[1, 2], graph_walk=VIDEO_GEN_AR_WALK,
         step_context=StepContext(
             request_ids=[1, 2], graph_walk=VIDEO_GEN_AR_WALK, slot=0, capture=False,
         ),
-        per_request_info_wrapped={
-            r: SimpleNamespace(request_id=f"req-{r}", rid_handle=r, random_seed=0)
-            for r in (1, 2)
-        },
+        per_request_info_wrapped={1: _fwd(1, STEPS), 2: _fwd(2, 1)},
         per_request_input_tensors={
             1: {},
-            2: {"latents": [first.tensor_inputs["latents"]], "time_index": [torch.tensor([1])]},
+            2: {"latents": [new], **{n: [t] for n, t in solver.items()}},
         },
         per_request_input_metadata={}, final_stream_rids=set(),
         skipped_rids=set(), failed_requests={}, inputs=None, running_batched=None,
@@ -149,7 +140,7 @@ def test_finished_request_re_queued_fails_alone_instead_of_asserting():
 
     assert batch.request_ids == [2], "the live request must still run"
     assert list(batch.failed_requests) == [1]
-    assert "ran all 4 steps" in batch.failed_requests[1]
+    assert "no loop-back latents" in batch.failed_requests[1]
     # The error reaches the conductor and the client, so it names the
     # request by its id, not by this worker's recycled handle.
     assert "request req-1 " in batch.failed_requests[1]

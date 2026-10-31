@@ -59,6 +59,14 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.windowing import WindowSchedule
+from mstar.model.components.diffusion.unipc import (
+    LAST_SAMPLE,
+    MODEL_OUTPUTS,
+    SOLVER_STATE,
+    UniPCState,
+    initial_state,
+    unipc_step,
+)
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -87,6 +95,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -206,37 +215,78 @@ def sound_frames(md: dict, config) -> tuple[int, int]:
     return target_samples, max(1, math.ceil(target_samples / hop))
 
 
-def _loop_step(fwd_info, graph_walk: str, time_index: torch.Tensor) -> int:
-    """The denoise iteration a step runs, from the engine's loop counter.
-
-    ``time_index`` holds the same value (global over a windowed request's
-    windows and commits, like the counter), but it is the previous step's
-    device output: reading it on the host waits for that step to finish, which
-    stalls the speculative preparation of this one. Callers that drive the
-    submodule without a loop counter (tests, harnesses) fall back to the edge.
-    """
-    loop = DENOISE_LOOP_FOR_WALK.get(graph_walk, IMAGE_GEN_LOOP)
-    counts = getattr(fwd_info, "dynamic_loop_iter_counts", None) or {}
-    if loop in counts:
-        return int(counts[loop])
-    return int(time_index.reshape(-1)[0].item())
+def _loop_step(fwd_info, graph_walk: str) -> int:
+    """The denoise iteration a step runs, from the engine's loop counter: global
+    over a windowed request's windows and commits. A value carried on a loop-back
+    edge would be the previous step's device output, and reading it on the host
+    waits for that step to finish, which stalls the speculative preparation of this
+    one."""
+    return int(fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_FOR_WALK.get(graph_walk, IMAGE_GEN_LOOP)])
 
 
-# Attribute a request's scheduler carries its timesteps under as a host list,
-# filled once at build time. ``set_timesteps`` puts them on the device, and a
-# per-step read there (the guidance-interval test) would be a host sync.
-_HOST_TIMESTEPS = "mstar_host_timesteps"
+def _first_iteration(inputs, step_index: int, request_id: str) -> bool:
+    """Whether this step starts the loop: no loop-back latents, which past iteration
+    0 is a request being replayed over a finished loop. Raised from
+    ``prepare_inputs``, that fails this request alone."""
+    if "latents" in inputs and len(inputs["latents"]) > 0:
+        return False
+    if step_index != 0:
+        raise RuntimeError(
+            f"Cosmos3 DiT: request {request_id} was dispatched denoise iteration "
+            f"{step_index} with no loop-back latents; refusing to restart its loop"
+        )
+    return True
 
 
-def _with_host_timesteps(scheduler):
-    setattr(scheduler, _HOST_TIMESTEPS, scheduler.timesteps.tolist())
-    return scheduler
+class _UniPCSampler:
+    """A request's UniPC: the scaffold's step over this request's tables. The tables
+    go up once, and the solver state rides the loop-back edges, so a step reads
+    nothing on the host and holds nothing between steps."""
+
+    def __init__(self, scheduler, device):
+        self.config = scheduler.config
+        self.host_sigmas = scheduler.sigmas
+        self.host_timesteps = scheduler.timesteps.tolist()
+        self.sigmas = to_device_nonblocking(scheduler.sigmas, device)
+        self.timesteps = to_device_nonblocking(scheduler.timesteps, device)
+
+    def initial_state(self, sample: torch.Tensor) -> dict[str, torch.Tensor]:
+        return initial_state(sample)
+
+    def step(self, model_output, sample, step_index: int, solver, generator=None):
+        step = unipc_step(
+            model_output, sample,
+            UniPCState(model_outputs=solver[MODEL_OUTPUTS], last_sample=solver[LAST_SAMPLE]),
+            self.host_sigmas, self.sigmas, step_index, len(self.host_timesteps),
+        )
+        return step.sample, {MODEL_OUTPUTS: step.model_outputs, LAST_SAMPLE: step.last_sample}
+
+
+class _DistilledSampler:
+    """The 4-step distilled sampler: diffusers' FlowMatchEuler with the checkpoint's
+    stochastic (SDE) step, which re-noises from the request's generator, so it has
+    no state to carry on an edge and keeps its own step count."""
+
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+        self.config = scheduler.config
+        self.host_timesteps = scheduler.timesteps.tolist()
+        self.timesteps = scheduler.timesteps
+
+    def initial_state(self, sample: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {}
+
+    def step(self, model_output, sample, step_index: int, solver, generator=None):
+        kwargs = {} if generator is None else {"generator": generator}
+        out = self.scheduler.step(model_output, self.timesteps[step_index], sample, return_dict=False, **kwargs)
+        return out[0], {}
 
 
 def _host_timesteps(scheduler) -> list:
-    """The scheduler's timesteps as Python numbers (the values ``.item()``
-    returns), from the host copy when it was built here."""
-    host = getattr(scheduler, _HOST_TIMESTEPS, None)
+    """The scheduler's timesteps as Python numbers (the values ``.item()`` returns),
+    from the host copy of the samplers above: a per-step read of the staged table
+    would be a host sync."""
+    host = getattr(scheduler, "host_timesteps", None)
     return host if host is not None else scheduler.timesteps.tolist()
 
 
@@ -305,9 +355,9 @@ class _WarmupAttention:
 class Cosmos3DiTSubmodule(ARNodeSubmodule):
     """Dual-pathway DiT node (understanding tower + generation denoiser)."""
 
-    # The denoise loop is data-dependent (per-step timestep .item(), scheduler
-    # step, classifier-free guidance combine), so torch.compile graph-breaks and
-    # buys little; CUDA-graph capture of the fixed-shape step is the accelerator.
+    # The denoise loop is data-dependent (scheduler step, classifier-free guidance
+    # combine), so torch.compile graph-breaks and buys little; CUDA-graph capture of
+    # the fixed-shape step is the accelerator.
     disable_torch_compile = True
 
     # Run the two classifier-free-guidance branches as a single batched forward
@@ -338,6 +388,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         super().__init__()
         self.transformer = transformer
         self.config = config
+        # The loop-back edges of this deployment's scheduler, beside the latents.
+        self._solver_state = () if config.distilled_sigmas else SOLVER_STATE
         # Re-encodes the frames a chained window (or a resumed session)
         # continues from; built only for deployments serving windowed video.
         self._window_head = (
@@ -570,23 +622,24 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             overrides["flow_shift"] = flow_shift
 
         scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config, **overrides)
+        # on the host: the sampler stages its tables without syncing the stream
         if native_flow:
             # Linspaced flow sigmas from 1 - 1/T down to (not including) 0,
             # the ``use_native_flow_schedule`` pipeline path; the scheduler
             # applies its flow shift on top.
             num_train = int(scheduler.config.num_train_timesteps)
             sigmas = native_flow_sigmas(num_inference_steps, num_train)
-            scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
+            scheduler.set_timesteps(num_inference_steps, device="cpu", sigmas=sigmas)
         else:
-            scheduler.set_timesteps(num_inference_steps, device=device)
-        return _with_host_timesteps(scheduler)
+            scheduler.set_timesteps(num_inference_steps, device="cpu")
+        return _UniPCSampler(scheduler, device)
 
     def _new_distilled_scheduler(self, device):
-        """The 4-step distilled sampler: a FlowMatchEuler scheduler with the
-        checkpoint's stochastic (SDE) step over the fixed sigma list — every
-        step re-noises with ``x' = (1 - sigma') (x - sigma v) + sigma' eps``
-        from the request's generator (see ``_scheduler_step``). Flow shift and
-        karras spacing do not apply: the sigmas are explicit."""
+        """A FlowMatchEuler scheduler with the checkpoint's stochastic (SDE) step
+        over the fixed sigma list: every step re-noises with
+        ``x' = (1 - sigma') (x - sigma v) + sigma' eps`` from the request's generator
+        (see ``_scheduler_step``). Flow shift and karras spacing do not apply: the
+        sigmas are explicit."""
         from diffusers import FlowMatchEulerDiscreteScheduler
 
         template = self._scheduler_template
@@ -599,38 +652,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 stochastic_sampling=bool(sc.stochastic_sampling),
             )
         scheduler.set_timesteps(sigmas=[float(x) for x in self.config.distilled_sigmas], device=device)
-        return _with_host_timesteps(scheduler)
+        return _DistilledSampler(scheduler)
 
     @staticmethod
-    def _check_scheduler_has_step(st, request_id: str, step_index: int) -> None:
-        """Refuse a denoise step the request's scheduler has already run out
-        for. The scheduler counts its own steps, and one past its last
-        timestep asserts inside diffusers (UniPC ``this_order > 0``) in the
-        middle of a batched forward, failing every request in the batch.
-        Raised here, from ``prepare_inputs``, the engine fails this request
-        alone."""
-        sched = st["scheduler"]
-        done = sched.step_index
-        if done is not None and done >= len(sched.timesteps):
-            raise RuntimeError(
-                f"Cosmos3 DiT: request {request_id} was dispatched denoise step "
-                f"{step_index} after its scheduler ran all {len(sched.timesteps)} "
-                "steps; refusing to step it again"
-            )
-
-    @staticmethod
-    def _scheduler_step(st, velocity, t, latents):
-        """One scheduler update of a ``[C, T, H, W]`` latent. A distilled
-        request carries its SDE generator (``sde_generator``, the same one its
-        initial noise came from, as in the reference), so the stochastic step
-        is seedable; UniPC takes no generator."""
-        kwargs = {}
-        gen = st.get("sde_generator")
-        if gen is not None:
-            kwargs["generator"] = gen
-        return st["scheduler"].step(
-            velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False, **kwargs,
-        )[0].squeeze(0)
+    def _scheduler_step(st, velocity, latents, step_index: int, solver):
+        """One scheduler update of a ``[C, T, H, W]`` latent, and the solver state
+        its loop-back edges carry. A distilled request carries its SDE generator
+        (``sde_generator``, the same one its initial noise came from, as in the
+        reference), so the stochastic step is seedable; UniPC takes no generator."""
+        new_latents, solver = st["scheduler"].step(
+            velocity.unsqueeze(0), latents.unsqueeze(0), step_index, solver, generator=st.get("sde_generator"),
+        )
+        return new_latents.squeeze(0), solver
 
     def _build_action_static(
         self, ids: list[int], height: int, width: int, num_frames: int, action_chunk: int,
@@ -962,7 +995,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         st.add("ar_retention", policies)
         return policies
 
-    def _prepare_commit(self, st, window_index, latents, time_index) -> ARNodeInputs:
+    def _prepare_commit(self, st, window_index, latents, solver) -> ARNodeInputs:
         """Inputs of a kv-mode commit iteration: the window's newly generated
         span, which the declaration appends and commits under every live
         guidance branch."""
@@ -971,7 +1004,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         cfg = st["uncond"] is not None
         return ARNodeInputs(
             input_seq_len=span,
-            tensor_inputs={"latents": latents, "time_index": time_index},
+            tensor_inputs={"latents": latents, **solver},
             resource_step_info=GenStepInfo(
                 cfg=cfg, cfg_active=cfg, capture_key=None, commit=True,
                 retention=self._window_retention(st) or None,
@@ -1009,7 +1042,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             },
         )
 
-    def _commit_window(self, attn, st, latents, time_index, window_index) -> dict:
+    def _commit_window(self, attn, st, latents, window_index) -> dict:
         """kv-mode commit iteration: run the generation tower over the
         window's finished clean latents (no timestep embedding — the clean-
         conditioning convention), appending their K/V to both guidance
@@ -1042,23 +1075,19 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     [tuple(t[offset:] for t in st["uncond"]["rotary"])],
                     UNCOND_LABEL, attn,
                 )
-        return self._finish_window(st, latents, time_index, window_index)
+        return self._finish_window(st, latents, window_index)
 
-    def _finish_window(self, st, window_latents, time_index, window_index) -> dict:
+    def _finish_window(self, st, window_latents, window_index) -> dict:
         """End of a window: emit the window's clean latents on the streaming
         edge and stage the next window — fresh scheduler, fresh noise, and
         (chained mode) the window's last frames, re-encoded as their own clip
         (``ChainedWindowHead``), pinned as clean overlap conditioning through
         the same vmask machinery video-to-video uses."""
         schedule = st["ar_schedule"]
-        outputs = {
-            "latents": [window_latents],
-            "time_index": [time_index + 1],
-            "window_latents": [window_latents],
-        }
+        outputs = {"latents": [window_latents], "window_latents": [window_latents]}
         if window_index + 1 >= schedule.num_windows:
             self._store_session_tail(st, window_latents)
-            return outputs
+            return {**outputs, **self._solver_edges(self._first_solver_state(st, window_latents))}
         plan = schedule.window(window_index + 1)
         device = window_latents.device
         dtype = self.transformer.proj_in.weight.dtype
@@ -1087,7 +1116,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             st.remove(["vmask", "cond_video_latents"])
         outputs["latents"] = [next_latents]
-        return outputs
+        return {**outputs, **self._solver_edges(self._first_solver_state(st, next_latents))}
+
+    @staticmethod
+    def _first_solver_state(st, latents: torch.Tensor) -> dict[str, torch.Tensor]:
+        # over the sample ``_scheduler_step`` steps
+        return st["scheduler"].initial_state(latents.unsqueeze(0))
+
+    @staticmethod
+    def _solver_edges(solver: Mapping[str, torch.Tensor]) -> dict[str, list[torch.Tensor]]:
+        return {name: [tensor] for name, tensor in solver.items()}
 
     @staticmethod
     def _slim_statics(cond: dict, uncond: dict | None) -> None:
@@ -1229,7 +1267,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         st = self.request_states[fwd_info.rid_handle]
         windowed = "ar_schedule" in st
-        if "latents" not in inputs or len(inputs["latents"]) == 0:
+        step_index = _loop_step(fwd_info, graph_walk)
+        scheduler = st["scheduler"]
+        if _first_iteration(inputs, step_index, fwd_info.request_id):
             self._ingest_cond_latents(st, inputs, device)
             gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
             if windowed:
@@ -1262,14 +1302,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # Video-to-video: pinned latent frames start clean, the rest
                 # from the noise drawn above (the reference RNG order).
                 latents = st["vmask"] * st["cond_video_latents"] + (1.0 - st["vmask"]) * latents
-            time_index = torch.zeros(1, dtype=torch.long, device=device)
-            step_index = 0
+            solver = self._first_solver_state(st, latents)
         else:
             latents = inputs["latents"][0]
-            time_index = inputs["time_index"][0]
-            step_index = _loop_step(fwd_info, graph_walk, time_index)
+            solver = {name: inputs[name][0] for name in self._solver_state}
 
-        scheduler = st["scheduler"]
         if windowed:
             # The loop counter is global over every window's iterations; the
             # schedule index is the within-window step, and in kv mode the
@@ -1278,12 +1315,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 return None
             window_index, local, commit = self._window_step(st, step_index)
             if commit:
-                return self._prepare_commit(st, window_index, latents, time_index)
+                return self._prepare_commit(st, window_index, latents, solver)
             step_index = local
         elif step_index >= len(scheduler.timesteps):
             return None
-        self._check_scheduler_has_step(st, fwd_info.request_id, step_index)
-        tensors = {"latents": latents, "time_index": time_index}
+        tensors = {"latents": latents, **solver}
         # The CUDA-graph capture reads the timestep, rotary tables and the
         # clean/noisy token mask as static buffers (it can't reach the
         # per-request scheduler at replay), so materialize them here. The eager
@@ -1328,7 +1364,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.rid_handle]
-        if "latents" not in inputs or len(inputs["latents"]) == 0:
+        step_index = _loop_step(fwd_info, VIDEO_SOUND_GEN_WALK)
+        scheduler = st["scheduler"]
+        if _first_iteration(inputs, step_index, fwd_info.request_id):
             self._ingest_cond_latents(st, inputs, device)
             # First iteration: video noise first, then sound noise from the same
             # generator (the reference pipeline's RNG order), so the video band
@@ -1345,23 +1383,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             sound_latents = torch.randn(
                 (1, self.config.sound_dim, st["num_sound"]), generator=gen, device=device, dtype=dtype
             )
-            time_index = torch.zeros(1, dtype=torch.long, device=device)
-            step_index = 0
+            solver = scheduler.initial_state(self._packed(latents, sound_latents))
         else:
             latents = inputs["latents"][0]
             sound_latents = inputs["sound_latents"][0]
-            time_index = inputs["time_index"][0]
-            step_index = _loop_step(fwd_info, VIDEO_SOUND_GEN_WALK, time_index)
+            solver = {name: inputs[name][0] for name in self._solver_state}
 
-        scheduler = st["scheduler"]
         if step_index >= len(scheduler.timesteps):
             return None
-        self._check_scheduler_has_step(st, fwd_info.request_id, step_index)
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"] + st["num_sound"],
-            tensor_inputs={
-                "latents": latents, "sound_latents": sound_latents, "time_index": time_index,
-            },
+            tensor_inputs={"latents": latents, "sound_latents": sound_latents, **solver},
             resource_step_info=self._step_info(
                 VIDEO_SOUND_GEN_WALK, st, step_index
             ),
@@ -1369,7 +1401,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def _prepare_action_gen(self, graph_walk, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.rid_handle]
-        if "latents" not in inputs or len(inputs["latents"]) == 0:
+        step_index = _loop_step(fwd_info, graph_walk)
+        scheduler = st["scheduler"]
+        if _first_iteration(inputs, step_index, fwd_info.request_id):
             self._ingest_cond_latents(st, inputs, device)
             # First iteration: build the joint [video | action] latents. Per the
             # mode masks, conditioning frames/action are clean and the predicted
@@ -1390,21 +1424,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             action_latents[..., raw:] = 0
             v_noise = randn_tensor(st["latent_shape"], generator=gen, device=device, dtype=dtype)
             latents = st["vmask"] * st["cond_video_latents"] + (1.0 - st["vmask"]) * v_noise
-            time_index = torch.zeros(1, dtype=torch.long, device=device)
-            step_index = 0
+            solver = scheduler.initial_state(self._packed(latents, action_latents))
         else:
             latents = inputs["latents"][0]
             action_latents = inputs["action_latents"][0]
-            time_index = inputs["time_index"][0]
-            step_index = _loop_step(fwd_info, graph_walk, time_index)
+            solver = {name: inputs[name][0] for name in self._solver_state}
 
-        scheduler = st["scheduler"]
         if step_index >= len(scheduler.timesteps):
             return None
-        self._check_scheduler_has_step(st, fwd_info.request_id, step_index)
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"] + st["cond"]["num_action_tokens"],
-            tensor_inputs={"latents": latents, "action_latents": action_latents, "time_index": time_index},
+            tensor_inputs={"latents": latents, "action_latents": action_latents, **solver},
             resource_step_info=self._step_info(ACTION_GEN_WALK, st, step_index),
         )
 
@@ -1621,46 +1651,19 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         rids = engine_inputs.request_ids
         if graph_walk in GEN_WALKS:
-            if len(rids) > 1:
-                return {
-                    "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
-                    "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
-                }
+            names = ("latents", *self._solver_state)
+        elif graph_walk in SOUND_WALKS:
+            names = ("latents", "sound_latents", *self._solver_state)
+        elif graph_walk in ACTION_WALKS:
+            names = ("latents", "action_latents", *self._solver_state)
+        else:
+            raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
+        if len(rids) > 1:
             return {
-                "latents": inputs[0].tensor_inputs["latents"],
-                "time_index": inputs[0].tensor_inputs["time_index"],
+                name: {r: inp.tensor_inputs[name] for r, inp in zip(rids, inputs, strict=True)}
+                for name in names
             }
-
-        if graph_walk in SOUND_WALKS:
-            if len(rids) > 1:
-                return {
-                    "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
-                    "sound_latents": {
-                        r: inp.tensor_inputs["sound_latents"] for r, inp in zip(rids, inputs, strict=True)
-                    },
-                    "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
-                }
-            return {
-                "latents": inputs[0].tensor_inputs["latents"],
-                "sound_latents": inputs[0].tensor_inputs["sound_latents"],
-                "time_index": inputs[0].tensor_inputs["time_index"],
-            }
-
-        if graph_walk in ACTION_WALKS:
-            if len(rids) > 1:
-                return {
-                    "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
-                    "action_latents": {
-                        r: inp.tensor_inputs["action_latents"] for r, inp in zip(rids, inputs, strict=True)
-                    },
-                    "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
-                }
-            return {
-                "latents": inputs[0].tensor_inputs["latents"],
-                "action_latents": inputs[0].tensor_inputs["action_latents"],
-                "time_index": inputs[0].tensor_inputs["time_index"],
-            }
-        raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
+        return {name: inputs[0].tensor_inputs[name] for name in names}
 
     # ------------------------------------------------------------------
     # forward
@@ -1695,12 +1698,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return self._forward_prefill(**kwargs)
         states = self._states(engine_inputs)
         attn = self._gen_attn(engine_inputs)
+        k = _loop_step(engine_inputs.per_request_info[rid], graph_walk)
         if graph_walk in GEN_WALKS:
-            return self._forward_image_gen(attn, states[rid], **kwargs)
+            return self._forward_image_gen(attn, states[rid], k, **kwargs)
         if graph_walk in SOUND_WALKS:
-            return self._forward_video_sound_gen(attn, states[rid], **kwargs)
+            return self._forward_video_sound_gen(attn, states[rid], k, **kwargs)
         if graph_walk in ACTION_WALKS:
-            return self._forward_action_gen(attn, states[rid], **kwargs)
+            return self._forward_action_gen(attn, states[rid], k, **kwargs)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
     def _forward_prefill(
@@ -1752,26 +1756,26 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         t = float(timesteps[step_index])
         return gi[0] <= t <= gi[1]
 
-    def _forward_image_gen(self, attn, st, latents, time_index, **kwargs) -> dict:
+    def _forward_image_gen(self, attn, st, k, latents, **solver) -> dict:
         scheduler = st["scheduler"]
-        step_index = int(time_index.reshape(-1)[0].item())
+        step_index = k
         windowed = "ar_schedule" in st
         if windowed:
             # The loop counter is global; each window runs its own fresh
             # scheduler over ar_steps steps, and in kv mode the extra
             # per-window iteration commits the finished window's K/V.
             if step_index >= st["ar_total_iters"]:
-                return {"latents": [latents], "time_index": [time_index]}
+                return {"latents": [latents], **self._solver_edges(solver)}
             window_index, local, commit = self._window_step(st, step_index)
             if commit:
-                return self._commit_window(attn, st, latents, time_index, window_index)
+                return self._commit_window(attn, st, latents, window_index)
             step_index = local
         elif step_index >= len(scheduler.timesteps):
             # The loop may dispatch one step past this request's own count
             # before its stop signal lands; that step is a no-op.
-            return {"latents": [latents], "time_index": [time_index]}
-        t = scheduler.timesteps[step_index]
-        vision_timesteps = torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=latents.device)
+            return {"latents": [latents], **self._solver_edges(solver)}
+        t = _host_timesteps(scheduler)[step_index]
+        vision_timesteps = torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=latents.device)
 
         # Classifier-free guidance is applied only when an uncond branch exists
         # (guidance_scale != 1) and, for the text-to-image recipe, only on the
@@ -1799,7 +1803,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             uncond_v = self._denoise(attn, st["uncond"], latents, vision_timesteps, UNCOND_LABEL)
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
 
-        new_latents = self._scheduler_step(st, velocity, t, latents)
+        new_latents, solver = self._scheduler_step(st, velocity, latents, step_index, solver)
         if st.get("vmask") is not None:
             # Video-to-video: re-inject the clean conditioning frames after the
             # scheduler step (the reference pipeline does the same) so scheduler
@@ -1808,8 +1812,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if windowed and local + 1 == st["ar_steps"] and not st.get("ar_kv_mode"):
             # Chained: the window ends at its last denoise step. kv windows
             # end at their commit iteration instead.
-            return self._finish_window(st, new_latents, time_index, window_index)
-        return {"latents": [new_latents], "time_index": [time_index + 1]}
+            return self._finish_window(st, new_latents, window_index)
+        return {"latents": [new_latents], **self._solver_edges(solver)}
 
     def _sound_kwargs(self, static, sound_latents, sound_ts) -> dict:
         return dict(
@@ -1820,7 +1824,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             sound_timesteps=sound_ts,
         )
 
-    def _sound_scheduler_step(self, st, latents, sound_latents, video_v, sound_v, t):
+    @staticmethod
+    def _packed(latents: torch.Tensor, band: torch.Tensor) -> torch.Tensor:
+        """The joint ``[1, N]`` state of the video latents and a second band."""
+        return torch.cat([latents.reshape(1, -1), band.reshape(1, -1)], dim=1)
+
+    def _sound_scheduler_step(self, st, latents, sound_latents, video_v, sound_v, step_index, solver):
         """One joint [video | sound] scheduler step: flatten both bands into one
         packed state so the request's scheduler advances them under a single
         multistep history (the flow update is linear per element), then split
@@ -1828,26 +1837,22 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         the sound band; the video band's i2v anchor stays clean because its
         predicted velocity is zero (as in the video-only path)."""
         nv = video_v.numel()
-        packed = torch.cat([video_v.reshape(1, -1), sound_v.reshape(1, -1)], dim=1)
-        packed_lat = torch.cat([latents.reshape(1, -1), sound_latents.reshape(1, -1)], dim=1)
-        packed_next = st["scheduler"].step(packed, t, packed_lat, return_dict=False)[0]
+        packed_next, solver = st["scheduler"].step(
+            self._packed(video_v, sound_v), self._packed(latents, sound_latents), step_index, solver,
+        )
         new_latents = packed_next[:, :nv].reshape(latents.shape)
         new_sound = packed_next[:, nv:].reshape(sound_latents.shape)
-        return new_latents, new_sound
+        return new_latents, new_sound, solver
 
-    def _forward_video_sound_gen(self, attn, st, latents, sound_latents, time_index, **kwargs) -> dict:
+    def _forward_video_sound_gen(self, attn, st, k, latents, sound_latents, **solver) -> dict:
         scheduler = st["scheduler"]
-        step_index = int(time_index.reshape(-1)[0].item())
+        step_index = k
         if step_index >= len(scheduler.timesteps):
             # One-past-the-end dispatch before the stop signal lands: no-op.
-            return {
-                "latents": [latents],
-                "sound_latents": [sound_latents],
-                "time_index": [time_index],
-            }
-        t = scheduler.timesteps[step_index]
-        vts = torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=latents.device)
-        sts = torch.full((st["num_sound"],), t.item(), device=latents.device)
+            return {"latents": [latents], "sound_latents": [sound_latents], **self._solver_edges(solver)}
+        t = _host_timesteps(scheduler)[step_index]
+        vts = torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=latents.device)
+        sts = torch.full((st["num_sound"],), t, device=latents.device)
         cfg_active = self._cfg_active(st, step_index)
 
         if not cfg_active:
@@ -1885,19 +1890,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
             sound_v = s_u + st["gs"] * (s_c - s_u)
 
-        new_latents, new_sound = self._sound_scheduler_step(
-            st, latents, sound_latents, velocity, sound_v, t
+        new_latents, new_sound, solver = self._sound_scheduler_step(
+            st, latents, sound_latents, velocity, sound_v, step_index, solver,
         )
         if st.get("vmask") is not None:
             # Video-to-video: re-inject the clean conditioning frames on the
             # video band after the joint step (the reference pipeline does the
             # same); the sound band has no clean frames.
             new_latents = (1.0 - st["vmask"]) * new_latents + st["vmask"] * st["cond_video_latents"]
-        return {
-            "latents": [new_latents],
-            "sound_latents": [new_sound],
-            "time_index": [time_index + 1],
-        }
+        return {"latents": [new_latents], "sound_latents": [new_sound], **self._solver_edges(solver)}
 
     def _denoise_action(self, attn, static, latents, action_latents, vts, ats, domain, label):
         return self.transformer.denoise_step(
@@ -1917,7 +1918,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             action_domain_id=domain,
         )
 
-    def _action_scheduler_step(self, st, latents, action_latents, video_v, action_v, t):
+    def _action_scheduler_step(self, st, latents, action_latents, video_v, action_v, step_index, solver):
         """One joint [video | action] scheduler step for an action request: mask
         the predicted velocities to their noisy bands, step the request's own
         scheduler over the packed [video | action] state, then re-inject the clean
@@ -1929,9 +1930,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         action_v = action_v * (1.0 - st["action_clean_mask"])
         action_v[..., raw:] = 0
         nv = video_v.numel()
-        packed = torch.cat([video_v.reshape(1, -1), action_v.reshape(1, -1)], dim=1)
-        packed_lat = torch.cat([latents.reshape(1, -1), action_latents.reshape(1, -1)], dim=1)
-        packed_next = st["scheduler"].step(packed, t, packed_lat, return_dict=False)[0]
+        packed_next, solver = st["scheduler"].step(
+            self._packed(video_v, action_v), self._packed(latents, action_latents), step_index, solver,
+        )
         new_latents = packed_next[:, :nv].reshape(latents.shape)
         new_action = packed_next[:, nv:].reshape(1, chunk, adim)
         new_latents = (1.0 - st["vmask"]) * new_latents + st["vmask"] * latents
@@ -1940,22 +1941,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             + st["action_clean_mask"] * action_latents
         )
         new_action[..., raw:] = 0
-        return new_latents, new_action
+        return new_latents, new_action, solver
 
-    def _forward_action_gen(self, attn, st, latents, action_latents, time_index, **kwargs) -> dict:
+    def _forward_action_gen(self, attn, st, k, latents, action_latents, **solver) -> dict:
         scheduler = st["scheduler"]
-        step_index = int(time_index.reshape(-1)[0].item())
+        step_index = k
         if step_index >= len(scheduler.timesteps):
             # One-past-the-end dispatch before the stop signal lands: no-op.
-            return {
-                "latents": [latents],
-                "action_latents": [action_latents],
-                "time_index": [time_index],
-            }
-        t = scheduler.timesteps[step_index]
+            return {"latents": [latents], "action_latents": [action_latents], **self._solver_edges(solver)}
+        t = _host_timesteps(scheduler)[step_index]
         device = latents.device
-        vts = torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=device)
-        ats = torch.full((st["cond"]["num_noisy_action_tokens"],), t.item(), device=device)
+        vts = torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=device)
+        ats = torch.full((st["cond"]["num_noisy_action_tokens"],), t, device=device)
         domain = st["domain_t"]
 
         if st["uncond"] is None:
@@ -1992,14 +1989,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             video_v = v_u + st["gs"] * (video_v - v_u)
             action_v = a_u + st["gs"] * (action_v - a_u)
 
-        new_latents, new_action = self._action_scheduler_step(
-            st, latents, action_latents, video_v, action_v, t
+        new_latents, new_action, solver = self._action_scheduler_step(
+            st, latents, action_latents, video_v, action_v, step_index, solver,
         )
-        return {
-            "latents": [new_latents],
-            "action_latents": [new_action],
-            "time_index": [time_index + 1],
-        }
+        return {"latents": [new_latents], "action_latents": [new_action], **self._solver_edges(solver)}
 
     # ------------------------------------------------------------------
     # Cross-request batching: run several requests' denoise step together.
@@ -2032,17 +2025,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 return False
             if batch.graph_walk not in GEN_WALKS:
                 # Windowed requests join only generation-loop batches; their
-                # prefill stays sequential (these passes carry no time_index,
-                # and the committed kv text prefix must not depend on which
-                # requests happened to arrive together).
+                # prefill stays sequential (the committed kv text prefix must not
+                # depend on which requests happened to arrive together).
                 return all("ar_schedule" not in st for st in sts)
-            for st, inp in zip(sts, model_inputs, strict=True):
-                if "ar_schedule" not in st:
-                    continue
-                ti = inp.tensor_inputs["time_index"]
-                if self._window_step(st, int(ti.reshape(-1)[0].item()))[2]:
-                    return False
-            return True
+            return not any(inp.resource_step_info.commit for inp in model_inputs)
         if batch.graph_walk in ACTION_WALKS:
             # Action batches when all requests share the guidance regime (all
             # single-branch -- guidance-scale-1 inverse/forward-dynamics and base
@@ -2062,7 +2048,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
-        latents=None, time_index=None, action_latents=None, sound_latents=None,
+        latents=None, action_latents=None, sound_latents=None,
         input_ids=None, text_mrope_ids=None, **kwargs,
     ):
         if graph_walk in PREFILL_WALKS:
@@ -2070,9 +2056,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             self.transformer.prefill_und(input_ids, text_mrope_ids, label)
             return {}
         if graph_walk in ACTION_WALKS:
-            return self._forward_batched_action(engine_inputs, latents, action_latents, time_index)
+            return self._forward_batched_action(graph_walk, engine_inputs, latents, action_latents, kwargs)
         if graph_walk in SOUND_WALKS:
-            return self._forward_batched_sound(engine_inputs, latents, sound_latents, time_index)
+            return self._forward_batched_sound(graph_walk, engine_inputs, latents, sound_latents, kwargs)
         if graph_walk not in GEN_WALKS:
             raise ValueError(f"Cosmos3 batched forward only supports generation walks, got {graph_walk!r}")
         states = self._states(engine_inputs)
@@ -2080,33 +2066,34 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         reqs, meta = [], []
         for rid in engine_inputs.request_ids:
             st = states[rid]
-            lat, ti = latents[rid], time_index[rid]
-            step_index = int(ti.reshape(-1)[0].item())
+            lat = latents[rid]
+            k = step_index = _loop_step(engine_inputs.per_request_info[rid], graph_walk)
             if "ar_schedule" in st:
                 # Windowed: the loop counter is global; the schedule index is
                 # the within-window step (commit iterations never batch).
                 step_index = self._window_step(st, step_index)[1]
-            n_steps = len(st["scheduler"].timesteps)
+            timesteps = _host_timesteps(st["scheduler"])
             # A request may be one step past its denoise count (a discarded extra
             # step) while others in the batch are still running; clamp its
             # timestep so the shared forward can't index past the schedule, and
             # skip its scheduler step below.
-            t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
+            t = timesteps[min(step_index, len(timesteps) - 1)]
             reqs.append(self.transformer.denoise_step_row(
                 st["cond"],
                 lat,
-                torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=lat.device),
+                torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=lat.device),
                 st["cond"]["rotary"],
                 st["uncond"]["rotary"],
             ))
-            meta.append((rid, st, lat, ti, t, step_index))
+            meta.append((rid, st, lat, k, step_index))
 
         results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
 
         out = {}
-        for (rid, st, lat, ti, t, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
+        for (rid, st, lat, k, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            new_latents = self._scheduler_step(st, velocity, t, lat)
+            solver = {name: kwargs[name][rid] for name in self._solver_state}
+            new_latents, solver = self._scheduler_step(st, velocity, lat, local, solver)
             if st.get("vmask") is not None:
                 # Video-to-video: re-inject the clean conditioning frames, as in
                 # the single-request path.
@@ -2118,13 +2105,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ):
                 # Chained window boundary inside a batch: emit + stage, as in
                 # the single-request path.
-                window_index = self._window_step(st, int(ti.reshape(-1)[0].item()))[0]
-                out[rid] = self._finish_window(st, new_latents, ti, window_index)
+                out[rid] = self._finish_window(st, new_latents, self._window_step(st, k)[0])
             else:
-                out[rid] = {"latents": [new_latents], "time_index": [ti + 1]}
+                out[rid] = {"latents": [new_latents], **self._solver_edges(solver)}
         return out
 
-    def _forward_batched_sound(self, engine_inputs, latents, sound_latents, time_index):
+    def _forward_batched_sound(self, graph_walk, engine_inputs, latents, sound_latents, solvers):
         """Run several sound requests' joint [video | sound] denoise step in one
         forward. Mirrors the image batched path with per-request sound bands:
         one batched transformer pass, then per request the guidance combine and
@@ -2134,45 +2120,42 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         reqs, meta = [], []
         for rid in engine_inputs.request_ids:
             st = states[rid]
-            lat, snd, ti = latents[rid], sound_latents[rid], time_index[rid]
-            step_index = int(ti.reshape(-1)[0].item())
-            n_steps = len(st["scheduler"].timesteps)
+            lat, snd = latents[rid], sound_latents[rid]
+            step_index = _loop_step(engine_inputs.per_request_info[rid], graph_walk)
+            timesteps = _host_timesteps(st["scheduler"])
             # A request may be one (discarded) step past its denoise count while
             # others in the batch are still running; clamp its timestep so the
             # shared forward can't index past the schedule, and skip its
             # scheduler step below.
-            t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
+            t = timesteps[min(step_index, len(timesteps) - 1)]
             cond, unc = st["cond"], st["uncond"]
             reqs.append(self.transformer.denoise_step_row(
                 cond,
                 lat,
-                torch.full((cond["num_noisy_vision_tokens"],), t.item(), device=lat.device),
+                torch.full((cond["num_noisy_vision_tokens"],), t, device=lat.device),
                 cond["rotary"],
                 unc["rotary"],
                 sound_latents=snd,
-                sound_timesteps=torch.full((st["num_sound"],), t.item(), device=lat.device),
+                sound_timesteps=torch.full((st["num_sound"],), t, device=lat.device),
             ))
-            meta.append((rid, st, lat, snd, ti, t))
+            meta.append((rid, st, lat, snd, step_index))
 
         results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
 
         out = {}
-        for (rid, st, lat, snd, ti, t), ((cond_v, s_c), (uncond_v, s_u)) in zip(meta, results, strict=True):
+        for (rid, st, lat, snd, k), ((cond_v, s_c), (uncond_v, s_u)) in zip(meta, results, strict=True):
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
             sound_v = s_u + st["gs"] * (s_c - s_u)
-            new_latents, new_sound = self._sound_scheduler_step(st, lat, snd, velocity, sound_v, t)
+            solver = {name: solvers[name][rid] for name in self._solver_state}
+            new_latents, new_sound, solver = self._sound_scheduler_step(st, lat, snd, velocity, sound_v, k, solver)
             if st.get("vmask") is not None:
                 # Video-to-video: re-inject the clean conditioning frames on the
                 # video band, as in the single-request path.
                 new_latents = (1.0 - st["vmask"]) * new_latents + st["vmask"] * st["cond_video_latents"]
-            out[rid] = {
-                "latents": [new_latents],
-                "sound_latents": [new_sound],
-                "time_index": [ti + 1],
-            }
+            out[rid] = {"latents": [new_latents], "sound_latents": [new_sound], **self._solver_edges(solver)}
         return out
 
-    def _forward_batched_action(self, engine_inputs, latents, action_latents, time_index):
+    def _forward_batched_action(self, graph_walk, engine_inputs, latents, action_latents, solvers):
         """Run several action requests' joint [video | action] denoise step in one
         forward. Mirrors the image batched path: build each request's static gen
         inputs (clamping a request that has run one step past its denoise count),
@@ -2185,20 +2168,20 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         reqs, meta = [], []
         for rid in rids:
             st = states[rid]
-            lat, act, ti = latents[rid], action_latents[rid], time_index[rid]
-            step_index = int(ti.reshape(-1)[0].item())
-            n_steps = len(st["scheduler"].timesteps)
+            lat, act = latents[rid], action_latents[rid]
+            step_index = _loop_step(engine_inputs.per_request_info[rid], graph_walk)
+            timesteps = _host_timesteps(st["scheduler"])
             # A request may be one (discarded) step past its denoise count while
             # others in the batch are still running; clamp its timestep so the
             # shared forward can't index past the schedule, and skip its scheduler
             # step below.
-            t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
+            t = timesteps[min(step_index, len(timesteps) - 1)]
             cond = st["cond"]
             req = {
                 "latents": lat,
                 "action_latents": act,
-                "vision_timesteps": torch.full((st["cond"]["num_noisy_vision_tokens"],), t.item(), device=lat.device),
-                "action_timesteps": torch.full((st["cond"]["num_noisy_action_tokens"],), t.item(), device=lat.device),
+                "vision_timesteps": torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=lat.device),
+                "action_timesteps": torch.full((st["cond"]["num_noisy_action_tokens"],), t, device=lat.device),
                 "rotary_cond": cond["rotary"],
                 "vision_token_shapes": cond["vision_token_shapes"],
                 "vision_noisy_frame_indexes": cond["vision_noisy_frame_indexes"],
@@ -2212,26 +2195,23 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 unc = st["uncond"]
                 req["rotary_uncond"] = unc["rotary"]
             reqs.append(req)
-            meta.append((rid, st, lat, act, ti, t))
+            meta.append((rid, st, lat, act, step_index))
 
         results = self.transformer.denoise_step_action_batched(
             reqs, CFG_BATCHED_LABEL, attn, with_cfg
         )
 
         out = {}
-        for (rid, st, lat, act, ti, t), branches in zip(meta, results, strict=True):
+        for (rid, st, lat, act, k), branches in zip(meta, results, strict=True):
             if with_cfg:
                 (cond_video, cond_action), (uncond_video, uncond_action) = branches
                 video_v = uncond_video + st["gs"] * (cond_video - uncond_video)
                 action_v = uncond_action + st["gs"] * (cond_action - uncond_action)
             else:
                 (video_v, action_v), = branches
-            new_latents, new_action = self._action_scheduler_step(st, lat, act, video_v, action_v, t)
-            out[rid] = {
-                "latents": [new_latents],
-                "action_latents": [new_action],
-                "time_index": [ti + 1],
-            }
+            solver = {name: solvers[name][rid] for name in self._solver_state}
+            new_latents, new_action, solver = self._action_scheduler_step(st, lat, act, video_v, action_v, k, solver)
+            out[rid] = {"latents": [new_latents], "action_latents": [new_action], **self._solver_edges(solver)}
         return out
 
     # ------------------------------------------------------------------
@@ -2498,8 +2478,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         """Captured-path tail: the classifier-free-guidance combine and the
         (Python, multistep) scheduler step the graph can't hold, finished from
         the step's own ``inputs``. Mirrors the tail of ``_forward_image_gen``.
-        Eager forwards already emit finished ``latents``/``time_index`` and
-        pass through untouched (no ``cond_v`` in their outputs)."""
+        Eager forwards already emit finished ``latents`` and pass through
+        untouched (no ``cond_v`` in their outputs)."""
         if request_info.graph_walk not in GEN_WALKS or "cond_v" not in outputs:
             return
         st = self.request_states[request_id]
@@ -2507,11 +2487,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             outputs["cond_v"][0] - outputs["uncond_v"][0]
         )
         latents = inputs.tensor_inputs["latents"]
-        time_index = inputs.tensor_inputs["time_index"]
+        solver = {name: inputs.tensor_inputs[name] for name in self._solver_state}
         outputs.clear()
         # step_index is in range here: prepare_inputs vetoes the loop's extra
         # dispatched step and the engine prunes vetoed requests before postprocess.
-        step_index = int(time_index.reshape(-1)[0].item())
+        step_index = _loop_step(request_info, request_info.graph_walk)
         windowed = "ar_schedule" in st
         window_index = local = None
         if windowed:
@@ -2522,15 +2502,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # The graph predicts every frame; clean frames (i2v anchor, chained
         # overlap) get the zero velocity the eager unpatchify gives them.
         velocity = velocity * self._noisy_masks(st, velocity.device)[1].to(velocity.dtype)
-        t = st["scheduler"].timesteps[step_index]
-        new_latents = self._scheduler_step(st, velocity, t, latents)
+        new_latents, solver = self._scheduler_step(st, velocity, latents, step_index, solver)
         if st.get("vmask") is not None:
             new_latents = (1.0 - st["vmask"]) * new_latents + st["vmask"] * st["cond_video_latents"]
         if windowed and local + 1 == st["ar_steps"]:
-            outputs.update(self._finish_window(st, new_latents, time_index, window_index))
+            outputs.update(self._finish_window(st, new_latents, window_index))
             return
         outputs["latents"] = [new_latents]
-        outputs["time_index"] = [time_index + 1]
+        outputs.update(self._solver_edges(solver))
 
     def check_stop(self, request_id, request_info, outputs) -> set[str]:
         """Stop this request's denoise loop once it has run its own step count.
