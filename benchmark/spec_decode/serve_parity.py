@@ -1,7 +1,7 @@
-"""Greedy outputs of a running server on T2's prompt set, and the comparison of two such runs.
+"""Outputs of a running server on T2's prompt set, and the comparison of two such runs.
 
     python -m benchmark.spec_decode.serve_parity save --url http://127.0.0.1:8100 --out spec.json \\
-        --tokenizer Qwen/Qwen3.5-9B [--concurrency 1]
+        --tokenizer Qwen/Qwen3.5-9B [--concurrency 1] [--temperature 0.7 --top-p 0.9 --top-k 40]
     python -m benchmark.spec_decode.serve_parity compare base.json spec.json
 
 The set is the one T2's acceptance harness used: the first 32 prompts of the sweep's chat set (256 new tokens)
@@ -9,6 +9,11 @@ and the 16 ~1k-token prompts (128 new), through the chat template with thinking 
 speculative server's multi-token chunks go through the same SSE path a client reads. ``save`` also records each
 request's decode rate (generated tokens after the first over the time from the first chunk to the last), which
 at concurrency 1 is the per-token latency a client sees.
+
+``--temperature`` samples instead, each prompt at a fixed seed (its index), so two runs at concurrency 1 keep every
+request on row 0 and comparing them shows whether the same seed repeats, between two launches or between a captured
+step and an eager one. A speculative step streams its tokens as one chunk, so the tokens per chunk are the accepted
+counts, from which ``acceptance`` gives the conditional rate at each draft position.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ def one(url: str, model: str, pid: str, prompt: str, max_new: int, timeout: floa
         "temperature": 0.0, "stream": True, "enable_thinking": False, **(sampling or {}),
     }
     t0 = time.monotonic()
-    arrivals, parts = [], []
+    arrivals, parts = [], []  # one entry per chunk that carried text
     with requests.post(f"{url}/v1/chat/completions", json=body, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         for raw in r.iter_lines():
@@ -59,9 +64,25 @@ def one(url: str, model: str, pid: str, prompt: str, max_new: int, timeout: floa
                 if content:
                     parts.append(content)
                     arrivals.append(time.monotonic())
-    return {"id": pid, "text": "".join(parts), "chunks": len(parts), "e2e_s": time.monotonic() - t0,
+    return {"id": pid, "text": "".join(parts), "chunks": len(parts), "chunk_texts": parts,
+            "e2e_s": time.monotonic() - t0,
             "ttft_s": arrivals[0] - t0 if arrivals else None,
             "decode_s": arrivals[-1] - arrivals[0] if len(arrivals) > 1 else 0.0}
+
+
+def acceptance(results: list[dict], max_tokens: int = 8) -> dict:
+    """Conditional acceptance at each draft position, from tokens per chunk: position j's rate is the steps that
+    emitted more than j + 1 tokens over those that emitted more than j. A request's first chunk is the prompt's own
+    token and its last may be cut by the budget, so both are left out."""
+    hist = [0] * (max_tokens + 1)
+    for r in results:
+        for n in r["chunk_tokens"][1:-1]:
+            hist[min(n, max_tokens)] += 1
+    reach = [sum(hist[j:]) for j in range(max_tokens + 1)]
+    rates = [reach[j + 1] / reach[j] for j in range(1, max_tokens) if reach[j + 1]]
+    steps = reach[1]
+    return {"steps": steps, "tokens_per_step": sum(j * hist[j] for j in range(max_tokens + 1)) / max(steps, 1),
+            "per_position": rates, "histogram": hist[1:]}
 
 
 def save(args) -> int:
@@ -69,14 +90,22 @@ def save(args) -> int:
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     items = prompt_set()
+    sampling = None
+    if args.temperature:
+        sampling = {"temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k}
     t0 = time.monotonic()
     with cf.ThreadPoolExecutor(args.concurrency) as pool:
-        futures = [pool.submit(one, args.url, args.tokenizer, pid, p, n, args.timeout) for pid, p, n in items]
+        futures = [
+            pool.submit(one, args.url, args.tokenizer, pid, p, n, args.timeout,
+                        {**sampling, "seed": i} if sampling else None)
+            for i, (pid, p, n) in enumerate(items)
+        ]
         results = [f.result() for f in futures]
     wall = time.monotonic() - t0
     for r in results:
         r["tokens"] = len(tok.encode(r["text"], add_special_tokens=False))
         r["ms_per_token"] = 1000 * r["decode_s"] / (r["tokens"] - 1) if r["tokens"] > 1 else None
+        r["chunk_tokens"] = [len(tok.encode(c, add_special_tokens=False)) for c in r.pop("chunk_texts")]
     rates = sorted(r["ms_per_token"] for r in results if r["ms_per_token"])
     sampled = []
     for pid, p, _ in items[:args.sampled]:
@@ -88,12 +117,12 @@ def save(args) -> int:
         except Exception as e:  # noqa: BLE001 - recorded, the greedy pass stands on its own
             sampled.append({"id": pid, "error": f"{type(e).__name__}: {e}"})
     out = {"url": args.url, "concurrency": args.concurrency, "wall_s": wall, "results": results,
-           "sampled": sampled,
+           "sampling": sampling, "sampled": sampled, "acceptance": acceptance(results),
            "ms_per_token_p50": rates[len(rates) // 2] if rates else None,
            "tokens_per_chunk": sum(r["tokens"] for r in results) / max(sum(r["chunks"] for r in results), 1)}
     Path(args.out).write_text(json.dumps(out, indent=1))
     print(f"{len(results)} prompts, wall {wall:.1f} s, decode p50 {out['ms_per_token_p50']} ms/token, "
-          f"{out['tokens_per_chunk']:.2f} tokens/chunk"
+          f"{out['tokens_per_chunk']:.2f} tokens/chunk, acceptance {out['acceptance']['per_position']}"
           + (f", sampled {sum(1 for x in sampled if 'texts' in x)}/{len(sampled)} answered, "
              f"{sum(1 for x in sampled if x.get('distinct'))} distinct" if sampled else ""))
     return 0
@@ -136,6 +165,9 @@ def main(argv=None) -> int:
     s.add_argument("--timeout", type=float, default=600)
     s.add_argument("--sampled", type=int, default=0,
                    help="also send this many prompts twice at temperature 0.7 (64 tokens)")
+    s.add_argument("--temperature", type=float, default=0.0, help="sample the whole set instead of greedy")
+    s.add_argument("--top-p", type=float, default=1.0)
+    s.add_argument("--top-k", type=int, default=0)
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")
