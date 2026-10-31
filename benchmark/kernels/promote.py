@@ -31,10 +31,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", help="config root to write under (default: the tree's)")
     parser.add_argument("--device", help="a device name, on a host without the GPU")
     parser.add_argument("--arch", default="gfx942", help="the architecture, with --device")
+    parser.add_argument("--note", help="what the store holds, kept in the table's provenance")
     args = parser.parse_args(argv)
     facts = facts_for("rocm", name=args.device, arch=args.arch) if args.device else current_platform.device_facts()
+    provenance = {"store": args.store, **({"note": args.note} if args.note else {})}
     path = TABLES[args.table](ResultsStore(args.store), facts, args.margin, root=Path(args.root) if args.root else None,
-                              provenance={"store": args.store})
+                              provenance=provenance)
     print(path)
     return 0
 
