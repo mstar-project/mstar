@@ -115,7 +115,6 @@ class CanvasItem:
     head GEMM, so building it would be close to twice the work for nothing.
     """
 
-    request_id: str
     prefix_ids: torch.Tensor
     prefix_audio_mask: torch.Tensor
     tokens: torch.Tensor
