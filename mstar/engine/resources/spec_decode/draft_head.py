@@ -8,10 +8,12 @@ stream, so one byte a weight in place of two halves that kernel.
 ``Fp8DraftHead`` keeps a copy of the head at one scale. Its logits are only
 good for an argmax over a row: each row carries its own scale.
 
-``mstar::fp8_skinny_gemm`` is ``x @ weight.T`` in fp8 on AITER's split-K kernel,
-which reads the weight once across every CU. It is 1.7-1.9x the bf16 kernel at
-one or two rows of a 248k x 4K head on MI325X, and from three rows on an order
-of magnitude slower, so wider steps read the bf16 head.
+``mstar::fp8_skinny_gemm`` quantises each row of ``x`` and runs ``x @ weight.T`` in
+fp8 on AITER's split-K kernel, which reads the weight once across every CU. It
+is 1.7-1.9x the bf16 kernel at one or two rows of a 248k x 4K head on MI325X,
+and from three rows on an order of magnitude slower, so wider steps read the
+bf16 head. The quantisation is inside the op because inductor does not get
+through compiling an fp8 cast over a whole row.
 """
 
 from __future__ import annotations
@@ -41,38 +43,43 @@ def _unit_scale(device: torch.device) -> torch.Tensor:
 
 def _aiter_skinny():
     from aiter.ops.custom import wvSplitKQ
+    from aiter.ops.triton.quant import dynamic_per_token_quant_fp8_i8
 
-    def fp8_skinny_gemm(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
-        out = torch.empty((x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device)
-        one = _unit_scale(x.device)
-        wvSplitKQ(weight, x, out, one, one, _cu_count(x.device.index or 0))
+    def fp8_skinny_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        rows, device = x.shape[0], x.device
+        xq = torch.empty(x.shape, dtype=weight.dtype, device=device)
+        dynamic_per_token_quant_fp8_i8(xq, x, torch.empty(rows, dtype=torch.float32, device=device))
+        out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=device)
+        one = _unit_scale(device)
+        wvSplitKQ(weight, xq, out, one, one, _cu_count(device.index or 0))
         return out
 
     return fp8_skinny_gemm
 
 
-def _reference(x, weight, out_dtype):
-    return (x.to(torch.float32) @ weight.to(torch.float32).T).to(out_dtype)
+def _reference(x, weight):
+    xq = quantize_rows(x, weight.dtype)[0]
+    return (xq.to(torch.float32) @ weight.to(torch.float32).T).to(x.dtype)
 
 
-def _fake(x, weight, out_dtype):
-    return x.new_empty((x.shape[0], weight.shape[0]), dtype=out_dtype)
+def _fake(x, weight):
+    return x.new_empty((x.shape[0], weight.shape[0]))
 
 
-def _shape(x, weight, out_dtype) -> dict[str, int]:
+def _shape(x, weight) -> dict[str, int]:
     return {"rows": x.shape[0], "n": weight.shape[0], "k": x.shape[1]}
 
 
 def _inputs(shape, dtype, device, generator=None):
     fp8 = current_platform.fp8_dtype() or torch.float8_e4m3fn
-    x = torch.randn(shape["rows"], shape["k"], device=device, generator=generator)
+    x = torch.randn(shape["rows"], shape["k"], device=device, generator=generator).to(dtype)
     weight = torch.randn(shape["n"], shape["k"], device=device, generator=generator) * shape["k"] ** -0.5
-    return quantize_rows(x, fp8)[0], quantize_rows(weight, fp8)[0], dtype
+    return x, quantize_rows(weight, fp8)[0]
 
 
 FP8_SKINNY_GEMM = KernelOp(
     "fp8_skinny_gemm",
-    "(Tensor x, Tensor weight, ScalarType out_dtype) -> Tensor",
+    "(Tensor x, Tensor weight) -> Tensor",
     fake=_fake,
     reference=_reference,
     impls={f"rocm:{arch}": _aiter_skinny for arch in ("gfx942", "gfx950")},
@@ -99,4 +106,4 @@ class Fp8DraftHead(nn.Module):
         self.register_buffer("weight", (weight.float() / scale).to(fp8), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return FP8_SKINNY_GEMM(quantize_rows(x, self.weight.dtype)[0], self.weight, x.dtype)
+        return FP8_SKINNY_GEMM(x, self.weight)
