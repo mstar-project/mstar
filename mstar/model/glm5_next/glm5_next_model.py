@@ -109,6 +109,11 @@ class Glm5NextModel(Model):
         for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
             if kwargs.get(key) is not None:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
+        long_only = sorted(k for k in ("max_seq_len", "prefill_window_tokens", "dsa_shard_prefill")
+                           if k in kwargs)
+        if long_only and not kwargs.get("dsa_long_context", False):
+            # they size and split the long-context path only; without it they would be dropped
+            raise ValueError(f"{long_only} apply only with dsa_long_context")
         if kwargs.get("dsa_long_context", False):
             # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource, dsa/kpool.py).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in

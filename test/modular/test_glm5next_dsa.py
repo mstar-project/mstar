@@ -387,6 +387,12 @@ def test_long_context_refuses_pools_per_page_off_a_power_of_two():
         cfg.check_long_context(page_size=cfg.index_kpool * 3)
 
 
+@pytest.mark.parametrize("key", ["max_seq_len", "prefill_window_tokens", "dsa_shard_prefill"])
+def test_long_context_keys_need_the_long_context_path(key):
+    with pytest.raises(ValueError, match="dsa_long_context"):
+        Glm5NextModel("x", config_variant="reduced", **{key: 4096})
+
+
 @pytest.mark.parametrize("version, refused", [("0.6.17", True), ("0.6.18", False), (None, False)])
 def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, version, refused):
     # None: a stub module with no version, as the CPU tests install

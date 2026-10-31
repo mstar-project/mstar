@@ -5,7 +5,6 @@ import functools
 from dataclasses import dataclass, field
 
 from mstar.engine.resources.kv.config import AuxPlanes
-
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 LINEAR_ATTENTION = "linear_attention"
