@@ -1783,14 +1783,17 @@ class Worker:
     # ------------------------------------------------------------------
     # Output handling
     # ------------------------------------------------------------------
-    def _push_back_batch(self, batch: ScheduledBatch) -> None:
-        """Return a whole batch's nodes to the ready set (admit refusal, OOM).
+    def _release_finished_prompts(self, batch: ScheduledBatch) -> None:
+        """Let go of the prepared input of each prompt whose last chunk just
+        landed; earlier chunks are cut from it (``Engine._prepare_chunk``)."""
+        engine = self.engine_manager.get_engine(batch.node_name)
+        for rid, chunk in batch.chunk_ranges.items():
+            if chunk.is_final and rid in batch.request_to_worker_graph:
+                engine.release_chunk_inputs(rid, batch.node_name)
 
-        The chunks this step was cut for did not run, so its lookahead goes
-        too: the retry is cut from where the last chunk landed.
-        """
+    def _push_back_batch(self, batch: ScheduledBatch) -> None:
+        """Return a whole batch's nodes to the ready set (admit refusal, OOM)."""
         rids = list(batch.request_to_worker_graph)
-        self.scheduler.drop_chunk_lookahead(rids, batch.node_name)
         self._graph_runtime.push_back_node(
             batch.node_name, rids,
             [batch.request_to_worker_graph[rid] for rid in rids],
@@ -2652,6 +2655,7 @@ class Worker:
             counts = [len(walk_rids) for walk_rids in groups.values()]
         ready_for_spec = self._graph_runtime.speculate_node(
             batch.node_name, list(groups), rows, counts,
+            self.chunk_loops.loop_strides(batch, rows),
         )
         if not ready_for_spec:
             return None
@@ -2728,6 +2732,7 @@ class Worker:
             ]
         prep = self._spec_preparer.prepare(
             batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
+            self.chunk_loops.loop_strides(batch_N, candidates),
         )
         laps.lap("continuing_inputs")
         continuing = prep.ready_rids
@@ -2735,7 +2740,10 @@ class Worker:
         # N's rows whose node needs another chunk take it in this step, not the
         # one after: their nodes stay off the ready queue until N's chunk lands
         mid_prefill = [
-            MidPrefillRow(r, batch_N.request_to_worker_graph[r], batch_N.walk_of(r), batch_N.chunk_ranges[r][1])
+            MidPrefillRow(
+                r, batch_N.request_to_worker_graph[r], batch_N.walk_of(r),
+                batch_N.chunk_ranges[r].end, batch_N.chunk_ranges[r].total,
+            )
             for r in held
             if r in batch_N.request_to_worker_graph and not self._is_tearing_down(r)
             and (spec_node_name, batch_N.walk_of(r)) in self.chunk_loops.speculated
@@ -2761,7 +2769,6 @@ class Worker:
                 speculating_same_node,
             ),
             mid_prefill=mid_prefill,
-            speculative=True,
         )
         laps.lap("fresh_schedule")
 
@@ -3375,10 +3382,7 @@ class Worker:
 
         _pp_stage("completion_event_sync")
         if batch_N.batch.chunk_ranges:
-            self.chunk_loops.advance(
-                batch_N.batch, self.scheduler,
-                self.engine_manager.get_engine(batch_N.node_name),
-            )
+            self._release_finished_prompts(batch_N.batch)
         # Waited on above, so the spans have landed; cut before anything reads
         # the outputs: the stop check, the store, a streaming edge.
         empty_spans: dict[int, list[str]] = {}
@@ -3418,11 +3422,15 @@ class Worker:
             if loop_name is not None:
                 stops.setdefault(rid, set()).add(loop_name)
 
-        mid_prefill_rids = self.chunk_loops.end_finished(batch_N.batch, stops)
+        # Until its last chunk a row's sampled token is not a real sample, so
+        # it decides no stop -- a spurious one would cut the prompt short --
+        # and keys no prefix. Its chunk Loop ends by its own count.
+        mid_prefill_rids = batch_N.batch.incomplete_node_rids
+        for rid in mid_prefill_rids:
+            stops.pop(rid, None)
 
         # The stop check's host copy, so a request ending here still indexes
-        # its pages. After the stop loops, which name the rows mid-prefill: a
-        # non-final chunk's sampled token is not a real sample and keys nothing.
+        # its pages.
         engine.extend_prefix_chains(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
             skip_rids=mid_prefill_rids,
@@ -3604,6 +3612,8 @@ class Worker:
         if (
             host_rows is None or batch.request_walks or self.enable_prof
             or batch_N.node_batch.stream_partition_done_rids
+            # the fused route takes no loop strides
+            or batch.graph_walk in self.chunk_loops.walks_by_node.get(batch_N.node_name, ())
             or not getattr(rt, "supports_route_and_send_inline", False)
             or not self._all_on_device(
                 engine, batch_N.node_name, batch_N.graph_walk, signals,
@@ -3769,6 +3779,7 @@ class Worker:
                 inline_values=inline_values,
                 walks=walks if rid_walk_idx is not None else None,
                 rid_walk_idx=rid_walk_idx,
+                loop_strides=self.chunk_loops.loop_strides(batch_N.batch, rids),
             ),
         )
         if self._phase_period:
@@ -4895,13 +4906,8 @@ class Worker:
                                 speculation.plan_future = None
                             if not speculation.is_yield_away:
                                 # The step will not run at all: un-ingest every
-                                # staged chunk and hand them all back. Its
-                                # chunk lookahead goes too, or the next step
-                                # would start past tokens nothing prefilled.
+                                # staged chunk and hand them all back.
                                 sb = speculation.scheduled_batch
-                                self.scheduler.drop_chunk_lookahead(
-                                    list(sb.request_to_worker_graph), sb.node_name,
-                                )
                                 self._settle_speculation(speculation, success=False)
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.

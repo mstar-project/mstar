@@ -164,7 +164,7 @@ class _FailingWorker(_EvictingWorker):
         self.failed: dict[str, str] = {}
         self.scheduler = SimpleNamespace(
             hold_requests=self.held.extend,
-            drop_chunk_lookahead=lambda *a: None, **_NO_LIMITS,
+            **_NO_LIMITS,
         )
 
     def _fail_requests(self, errors):

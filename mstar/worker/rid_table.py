@@ -10,7 +10,7 @@ be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog,
-chunk_progress, cached_prefix} (purged by clear_rid),
+chunk_started, cached_prefix} (purged by clear_rid),
 Worker.{_last_active, _pending_removes, _pending_loop_stops,
 streaming_buffers}, RequestStateManager.{per_request_info, _fwd_by_partition}
 and StreamBufferManager._rids (purged by remove_request), the engine's and

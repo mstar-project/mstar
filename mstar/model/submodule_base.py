@@ -371,11 +371,6 @@ class ChunkingPolicy:
     prompt finishes; the consumer joins the pieces itself. An edge not named
     here carries the final chunk's tensors alone.
 
-    ``max_chunks``: the chunk Loop's ``max_iters``, a runaway guard rather
-    than the real count, which is not known until the budget cuts each step.
-    Too small a cap reports a longer prompt done early, so the default is
-    effectively none (the runtimes hold ``max_iters`` as a u32).
-
     ``reserve_whole_prefill``: whether a first chunk reserves the KV the
     whole prefill needs, so a part-done row cannot wedge on a full arena.
     Counted in tokens, so a walk whose KV grows by something else sets False
@@ -385,7 +380,6 @@ class ChunkingPolicy:
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
     chunkable: bool = False
     accumulated_outputs: frozenset[str] = frozenset()
-    max_chunks: int = 2**31 - 1
     # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
     max_batch_tokens: int | None = None
     # whether a row may start past its cached prefix, asked before prepare; None is always
@@ -394,6 +388,12 @@ class ChunkingPolicy:
 
 
 NO_CHUNKING = ChunkingPolicy()
+
+
+# A chunk Loop's count before its prompt's first chunk sets the real cap (the
+# prompt's length), and the stride of a row that runs whole: it ends the Loop.
+# Within the u32 both runtimes hold loop counters in.
+CHUNK_LOOP_END = 2**31 - 1
 
 
 def chunk_loop_name(node_name: str, graph_walk: str) -> str:

@@ -8,7 +8,7 @@ that ran over their budget, for the warning.
 
 import logging
 from collections.abc import Collection, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from mstar.model.submodule_base import (
     NO_CHUNKING,
@@ -24,6 +24,25 @@ logger = logging.getLogger(__name__)
 # The serving config's ``min_chunk_tokens`` unless it sets one: one KV page at
 # the default page size.
 DEFAULT_MIN_CHUNK_TOKENS = 128
+
+
+class ChunkRange(NamedTuple):
+    """The tokens ``[start, end)`` a chunked row runs this step, of the
+    ``total`` its whole input was measured at.
+
+    ``stride`` is how far the chunk moves the row's chunk Loop, which counts
+    the tokens run up to ``total`` (``GraphRuntime.set_loop_caps``): ``end``
+    for a prompt's first chunk, whose Loop starts at 0 even when a cached
+    prefix moves ``start`` on, and ``end - start`` for each later one.
+    """
+    start: int
+    end: int
+    total: int
+    stride: int
+
+    @property
+    def is_final(self) -> bool:
+        return self.end >= self.total
 
 
 class ChunkingManagement:

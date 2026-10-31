@@ -86,9 +86,6 @@ class _Scheduler:
         self.steps = [STEP_N] + ([[HANDLES["kept"]]] if serial else [])
         self.last_consumed_tp_seq = -1
 
-    def drop_chunk_lookahead(self, rids, node_name=None):
-        """A step that is abandoned forgets the chunks it was cut for."""
-
     def get_next_batch(self, request_state, **kwargs):
         if self.last_consumed_tp_seq + 1 >= len(self.steps):
             return None

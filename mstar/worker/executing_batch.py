@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.model.submodule_base import InputMetadata
@@ -55,7 +56,7 @@ def make_executing_batch(
     per_request_input_metadata: dict[int, InputMetadata] | None = None,
     request_walks: dict[int, str] | None = None,
     engine: Engine | None = None,
-    chunk_ranges: dict[int, tuple[int, int, int]] | None = None,
+    chunk_ranges: dict[int, ChunkRange] | None = None,
 ) -> ExecutingBatch:
     """One step's batch, with the step context the engine drives it through.
 

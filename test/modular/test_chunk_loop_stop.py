@@ -1,7 +1,8 @@
 """Ending a chunkable walk's Loop.
 
-A chunk is one iteration of the node's Loop, so something has to end it on the
-last chunk -- nothing inside the node knows which one that is. Keyed on the
+A chunk is one iteration of the node's Loop, which counts the tokens its
+chunks ran and ends at the prompt's length. The worker hands each row's count
+to the runtime as its loop stride (``ChunkLoops.loop_strides``). Keyed on the
 walk, not on the row having a chunk range: a walk with no token budget is
 never measured or cut, so its prompts run whole and carry no range, and a Loop
 left unended runs to ``max_iters`` while the request holds its KV. That showed
@@ -12,10 +13,11 @@ import sys
 
 sys.path.insert(0, ".")
 
+from mstar.engine.chunking import ChunkRange
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
-from mstar.model.submodule_base import chunk_loop_name
+from mstar.model.submodule_base import CHUNK_LOOP_END
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
@@ -35,52 +37,35 @@ def _batch(rows, chunk_ranges=None):
     )
 
 
-def _run(rows, chunk_ranges=None, stops=None, chunkable=("prefill",)):
+def _strides(rows, chunk_ranges=None, chunkable=("prefill",)):
     # what the worker reads off its graphs at load
     loops = ChunkLoops((NODE, w) for w in chunkable)
-    stops = stops if stops is not None else {}
-    mid = loops.end_finished(_batch(rows, chunk_ranges), stops)
-    return stops, mid
+    return loops.loop_strides(_batch(rows, chunk_ranges), list(rows))
 
 
 def test_a_row_that_ran_whole_ends_its_loop():
     """No range at all: its walk has no budget, so it was never cut."""
-    stops, mid = _run({1: "prefill"})
-    assert stops == {1: {chunk_loop_name(NODE, "prefill")}}
-    assert not mid
+    assert _strides({1: "prefill"}) == [CHUNK_LOOP_END]
 
 
-def test_a_final_chunk_ends_its_loop():
-    stops, mid = _run({1: "prefill"}, {1: (4, 10, 10)})
-    assert stops == {1: {chunk_loop_name(NODE, "prefill")}}
-    assert not mid
+def test_a_chunk_moves_its_loop_by_its_stride():
+    """A first chunk counts from 0, past any cached prefix; a later one by
+    its own tokens. The Loop ends itself once the count reaches its cap."""
+    assert _strides({1: "prefill"}, {1: ChunkRange(6, 8, 10, 8)}) == [8]
+    assert _strides({1: "prefill"}, {1: ChunkRange(8, 10, 10, 2)}) == [2]
 
 
-def test_a_non_final_chunk_leaves_the_loop_running():
-    stops, mid = _run({1: "prefill"}, {1: (0, 4, 10)})
-    assert stops == {}
-    assert mid == {1}
+def test_a_walk_without_a_loop_counts_one():
+    """A decode row sharing a mixed step: its loop is the decode loop."""
+    assert _strides(
+        {1: "prefill", 2: "decode"}, {1: ChunkRange(0, 10, 10, 10)},
+    ) == [10, 1]
 
 
-def test_a_non_final_chunks_own_stop_is_dropped():
-    """Its sampled token is not a real sample, so a stop drawn from it would
-    cut the prompt short mid-prefill."""
-    stops, _ = _run({1: "prefill"}, {1: (0, 4, 10)}, stops={1: {"decode_loop"}})
-    assert stops == {}
-
-
-def test_a_walk_without_a_loop_is_left_alone():
-    """A decode row sharing a mixed step: no chunk Loop, so nothing to end."""
-    stops, mid = _run({1: "prefill", 2: "decode"}, {1: (0, 10, 10)})
-    assert stops == {1: {chunk_loop_name(NODE, "prefill")}}
-    assert not mid
-
-
-def test_a_node_that_chunks_nowhere_does_no_work_at_all():
-    """Most nodes never chunk; postprocess must not pay per row for them."""
+def test_a_node_that_chunks_nowhere_sends_no_strides():
+    """Most nodes never chunk; their routes carry no stride column."""
     rows = {rid: "decode" for rid in range(1, 21)}
-    stops, mid = _run(rows, chunkable=())
-    assert stops == {} and not mid
+    assert _strides(rows, chunkable=()) is None
 
 
 def test_a_decode_step_beside_a_chunk_loop_does_no_work_per_row():
@@ -98,18 +83,14 @@ def test_a_decode_step_beside_a_chunk_loop_does_no_work_per_row():
         node_name=NODE, graph_walk="decode",
         request_to_worker_graph=dict.fromkeys(range(1, 21), 0),
     )
-    stops = {rid: {"decode_loop"} for rid in (3, 7)}
-
-    mid = ChunkLoops({(NODE, "prefill")}).end_finished(batch, stops)
-
-    assert not mid and stops == {rid: {"decode_loop"} for rid in (3, 7)}
+    assert ChunkLoops({(NODE, "prefill")}).loop_strides(batch, list(range(1, 21))) is None
     assert _CountingBatch.looked_up == 0
 
 
 def test_a_mid_prefill_row_keys_no_prefix():
-    """Postprocess must hand the rows it names mid-prefill to the prefix
-    chain as skips: a non-final chunk's sampled token is not a real sample,
-    so keying the chain on it keys a token the request never generated.
+    """Postprocess must hand the rows mid-prefill to the prefix chain as
+    skips: a non-final chunk's sampled token is not a real sample, so keying
+    the chain on it keys a token the request never generated.
 
     A structural guard, not a behavioural one -- driving the real postprocess
     needs most of a worker. It is here because the call was dropped once and
@@ -128,16 +109,12 @@ def test_a_mid_prefill_row_keys_no_prefix():
 
 
 def test_a_loop_is_ended_even_where_the_deployment_chunks_nothing():
-    """``apply_chunking`` wraps the node from the MODEL's policy, so the Loop
-    is in the walk's graph whether or not this deployment chunks it. A null
-    budget or a node under TP/SP runs the walk inside the Loop, once, and it
-    still has to be ended -- otherwise it spins to max_iters holding the
-    request's KV, which reads as pool exhaustion rather than a hung loop."""
-    # The worker reads its set off the graphs it was given, so it holds a
-    # walk whose chunking the config or TP turned off -- the Loop is still
-    # there, built from the model's policy, and runs once.
-    stops, mid = _run({1: "prefill"}, chunkable=("prefill",))
-    assert stops == {1: {chunk_loop_name(NODE, "prefill")}} and not mid
+    """The Loop is in the walk's graph whether or not this deployment chunks
+    it. A null budget or a node under TP/SP runs the walk inside the Loop,
+    once, and it still has to be ended -- otherwise it spins to max_iters
+    holding the request's KV, which reads as pool exhaustion rather than a
+    hung loop."""
+    assert _strides({1: "prefill"}, chunkable=("prefill",)) == [CHUNK_LOOP_END]
 
 
 def _wrapped_walk(chunkable: bool, policy=None):
@@ -153,18 +130,17 @@ def _wrapped_walk(chunkable: bool, policy=None):
         return node
     return _wrap_node_in_loop(
         node, NODE, "prefill",
-        policy or ChunkingPolicy(walks=("prefill",), chunkable=True, max_chunks=8),
+        policy or ChunkingPolicy(walks=("prefill",), chunkable=True),
     )
 
 
-def test_a_default_chunk_loop_runs_a_long_prompt_to_its_end():
-    """A policy that leaves ``max_chunks`` unset must not cap its Loop: a
-    capped Loop reports the prompt done after its last allowed chunk, and the
-    next walk starts with the rest of the prompt still to run."""
+def test_a_chunk_loop_is_uncapped_until_its_first_chunk():
+    """The Loop's own cap only covers a row nothing has measured; a prompt's
+    first chunk caps it at the prompt's length (``set_loop_caps``)."""
     from mstar.model.submodule_base import ChunkingPolicy
 
     loop = _wrapped_walk(True, ChunkingPolicy(walks=("prefill",), chunkable=True))
-    assert loop.max_iters >= 1 << 20
+    assert loop.max_iters == CHUNK_LOOP_END
 
 
 def _wg(section):
@@ -203,18 +179,16 @@ def test_a_row_the_cache_served_whole_still_ends_its_loop():
     max_iters.
 
     Postprocess reconciles the scheduled batch down to ``request_ids |
-    cached_rids`` before the stop, so a served row is still there -- and it
+    cached_rids`` before routing, so a served row is still there -- and it
     carries no chunk range, nothing having been cut for it, which is the same
     shape as a row that ran whole.
     """
-    stops, mid = _run({1: "prefill"})
-    assert stops == {1: {chunk_loop_name(NODE, "prefill")}}
-    assert not mid, "nothing is mid-prefill: there was nothing left to prefill"
+    assert _strides({1: "prefill"}) == [CHUNK_LOOP_END]
 
 
 def test_a_cache_served_row_is_ended_even_beside_a_chunked_one():
     """A served row shares its step with rows that did run; the served one
-    ends, the one mid-prefill does not."""
-    stops, mid = _run({1: "prefill", 2: "prefill"}, {2: (0, 4, 10)})
-    assert stops == {1: {chunk_loop_name(NODE, "prefill")}}
-    assert mid == {2}
+    ends, the one mid-prefill moves on by its chunk."""
+    assert _strides(
+        {1: "prefill", 2: "prefill"}, {2: ChunkRange(0, 4, 10, 4)},
+    ) == [CHUNK_LOOP_END, 4]

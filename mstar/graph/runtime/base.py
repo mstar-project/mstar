@@ -395,6 +395,8 @@ class SpeculationPrepInput(NamedTuple):
     room_for_continuing: int
     streaming_edges: list[EdgeSpec]
     streaming_edges_per_rid: list[int]
+    # rids[i]'s ``RouteInput.loop_strides`` in the step in flight; None, 1 each
+    loop_strides: list[int] | None = None
 
 
 class SpeculationPrepOutput(NamedTuple):
@@ -492,6 +494,10 @@ class RouteInput(NamedTuple):
     # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
     walks: list[str] | None = None
     rid_walk_idx: list[int] | None = None
+    # How far each row's enclosing loop counts on when this completion ends
+    # its iteration, in wg_ids.keys() order; None, one each. A chunk loop
+    # counts tokens, so its row's stride is the chunk's.
+    loop_strides: list[int] | None = None
 
 
 class RouteOutput(NamedTuple):
@@ -855,6 +861,7 @@ class GraphRuntime(ABC):
         graph_walks: list[str],
         rids: list[int],
         walk_counts: list[int] | None = None,
+        loop_strides: list[int] | None = None,
     ) -> list[SpeculationOutput]:
         """
         The nodes ready for speculation, checking against whether the node is
@@ -866,7 +873,9 @@ class GraphRuntime(ABC):
         them for ``graph_walks[i]`` (None: one per walk). The first sets the
         targets; a loop-back target is kept only if some row of the walk can
         run another iteration of that loop, so a walk whose first row is on
-        its last iteration still speculates for the rest.
+        its last iteration still speculates for the rest. ``loop_strides[i]``
+        is how far the step in flight moves ``rids[i]``'s loop
+        (``RouteInput.loop_strides``); None, one each.
         """
         pass
 
@@ -885,6 +894,7 @@ class GraphRuntime(ABC):
     def prep_spec_rows(
         self, spec_node_name: str, curr_node_name: str, graph_walk: str,
         rids: list[int], room_for_continuing: int | None = None,
+        loop_strides: list[int] | None = None,
     ) -> "SpecRows":
         """``prep_spec_rids`` with no stream chunks to ingest, as columns, in
         a form a runtime can serve in one crossing (the worker uses it where
@@ -897,6 +907,7 @@ class GraphRuntime(ABC):
             graph_walk=graph_walk, rids=list(rids),
             room_for_continuing=room_for_continuing,
             streaming_edges=[], streaming_edges_per_rid=[0] * len(rids),
+            loop_strides=loop_strides,
         ))
         wg_ids = set(prep.wg_ids)
         assert len(wg_ids) <= 1, (
@@ -1011,25 +1022,28 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
-    def mark_do_not_speculate_loops(
-        self, rids: list[int], graph_walks: list[str], loop_names: list[str],
+    def set_loop_caps(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str], caps: list[int],
     ) -> None:
-        """Speculation offers row ``i`` no further iteration of
-        ``loop_names[i]`` (under ``graph_walks[i]``): its most recently
-        scheduled one is its last.
+        """Row i's ``loop_names[i]``, around ``node_name`` under
+        ``graph_walks[i]``, ends once its count reaches ``caps[i]``.
 
-        Only speculation reads this; the normal scheduling path does not, and
-        the loop still ends by its stop. So a mark left on an iteration that
-        never ran cannot end a loop early; it costs at most a step that is not
-        speculated. A mark goes when that loop's stop is applied, on
-        ``clear_do_not_speculate_loops`` and on removal.
+        Assigns the cap, where ``add_request``'s ``loop_caps`` only lower the
+        graph's: a chunk loop's cap is its prompt's length, set when the
+        prompt's first chunk is cut, and the walk's next prompt sets its own.
+        A row this worker does not hold is skipped.
         """
         pass
 
     @abstractmethod
-    def clear_do_not_speculate_loops(self, rids: list[int]) -> None:
-        """Drop every mark of ``rids``: the iteration marked did not run, and
-        its retry is marked again when scheduled."""
+    def loop_progress(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str],
+    ) -> tuple[list[int], list[int]]:
+        """``(counts, caps)``: row i's ``loop_names[i]`` (as ``set_loop_caps``),
+        its count so far and the count it ends at; -1 for both for a row this
+        worker does not hold."""
         pass
 
     @abstractmethod

@@ -32,6 +32,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
     SpeculationPrepOutput,
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
+from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.micro_scheduler import MicroScheduler, PopReadyResult, ScheduledBatch  # noqa: E402
 from mstar.worker.speculation import SpeculationBuilder, SpeculationContext, SpeculationPreparer  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
@@ -83,6 +84,7 @@ def _worker(scheduler, runtime):
             get_fwd_info=lambda rid, partition: fwd[rid],
         ),
         _in_flight_rids=set(),
+        chunk_loops=ChunkLoops(),
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
     )

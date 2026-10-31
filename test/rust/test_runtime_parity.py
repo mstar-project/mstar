@@ -2524,7 +2524,7 @@ def _chunk_loop_graph(out_edge, max_iters=2):
 CHUNK_WALK = "prefill_text"
 
 
-def _wrapped_chunk_walk(max_chunks=8):
+def _wrapped_chunk_walk():
     from mstar.model.base import _wrap_node_in_loop
     from mstar.model.submodule_base import ChunkingPolicy
 
@@ -2534,9 +2534,7 @@ def _wrapped_chunk_walk(max_chunks=8):
     )
     return _wrap_node_in_loop(
         node, "llm", CHUNK_WALK,
-        ChunkingPolicy(
-            walks=(CHUNK_WALK,), chunkable=True, max_chunks=max_chunks,
-        ),
+        ChunkingPolicy(walks=(CHUNK_WALK,), chunkable=True),
     )
 
 
@@ -2582,8 +2580,9 @@ def _enter_chunk_walk(rt, seed_tick=True, request_id="r1"):
     return rid
 
 
-def _run_chunk(rt, book, rid, uuid):
-    """One chunk: the submodule produces a token and nothing for the tick."""
+def _run_chunk(rt, book, rid, uuid, stride=1):
+    """One chunk of ``stride`` tokens: the submodule produces a token and
+    nothing for the tick."""
     signals = rt.get_output_signals("llm", CHUNK_WALK)
     rt.pop_rids("llm", CHUNK_WALK, [rid])
     book.put_tensor(uuid, _info(uuid))
@@ -2598,7 +2597,7 @@ def _run_chunk(rt, book, rid, uuid):
     return rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=CHUNK_WALK, node_name="llm",
         output_signals=list(signals), wg_ids=ParallelList([rid], [WG_ID]),
-        tensors=tensors, num_tensors=counts,
+        tensors=tensors, num_tensors=counts, loop_strides=[stride],
     ))
 
 
@@ -2641,13 +2640,10 @@ def test_only_the_final_chunks_token_leaves_the_loop(which):
     takes the engine out of the business of joining them."""
     rt, book = _chunk_runtime(which)
     rid = _enter_chunk_walk(rt)
-    _run_chunk(rt, book, rid, 1)
-    _run_chunk(rt, book, rid, 2)
-    rt.stop_loops_batched(
-        partition="default", graph_walk=CHUNK_WALK, last_node_run="llm",
-        loop_names=ParallelList([rid], [["chunk_loop:llm:prefill_text"]]),
-    )
-    out = _run_chunk(rt, book, rid, 3)
+    _cap(rt, rid, 10)
+    _run_chunk(rt, book, rid, 1, stride=4)
+    _run_chunk(rt, book, rid, 2, stride=4)
+    out = _run_chunk(rt, book, rid, 3, stride=2)
 
     assert sorted(out.register_uuids) == [3]
     assert _ready(rt) == [], "the loop is over, so the node is not ready again"
@@ -2659,12 +2655,9 @@ def test_re_entering_a_chunk_walk_needs_another_seed(which):
     from every entry, not only the request's first."""
     rt, book = _chunk_runtime(which)
     rid = _enter_chunk_walk(rt)
-    _run_chunk(rt, book, rid, 1)
-    rt.stop_loops_batched(
-        partition="default", graph_walk=CHUNK_WALK, last_node_run="llm",
-        loop_names=ParallelList([rid], [["chunk_loop:llm:prefill_text"]]),
-    )
-    _run_chunk(rt, book, rid, 2)
+    _cap(rt, rid, 6)
+    _run_chunk(rt, book, rid, 1, stride=4)
+    _run_chunk(rt, book, rid, 2, stride=2)
     assert _ready(rt) == []
 
     from mstar.model.submodule_base import chunk_tick_name
@@ -2675,96 +2668,144 @@ def test_re_entering_a_chunk_walk_needs_another_seed(which):
     assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
 
 
-# --- do-not-speculate marks --------------------------------------------------
+# --- a chunk Loop counts tokens -----------------------------------------------
 #
-# A row whose scheduled chunk is its last runs a loop iteration nothing follows,
-# so the step after it must not be speculated into another. The mark says so
-# before the stop that ends the loop exists.
+# Each chunk moves the Loop by its tokens (``RouteInput.loop_strides``), and
+# the Loop ends at the prompt's length, set as its cap on the first chunk. So
+# the Loop ends itself on the last chunk, and speculation offers no chunk past
+# it, given how far the chunk in flight moves the count.
 
 CHUNK_LOOP = "chunk_loop:llm:prefill_text"
 
 
-def _chunk_spec_targets(rt, rids):
+def _cap(rt, rid, cap):
+    rt.set_loop_caps("llm", [rid], [CHUNK_WALK], [CHUNK_LOOP], [cap])
+
+
+def _progress(rt, rids):
+    counts, caps = rt.loop_progress("llm", rids, [CHUNK_WALK] * len(rids), [CHUNK_LOOP] * len(rids))
+    return list(zip(counts, caps, strict=True))
+
+
+def _chunk_spec_targets(rt, rids, strides=None):
     return [
         (t.node_name, t.is_new_loop_iter)
-        for t in rt.speculate_node("llm", [CHUNK_WALK], rids, [len(rids)])
+        for t in rt.speculate_node("llm", [CHUNK_WALK], rids, [len(rids)], strides)
     ]
 
 
-def _chunk_prep(rt, rids):
+def _chunk_prep(rt, rids, strides=None):
     return rt.prep_spec_rids(SpeculationPrepInput(
         spec_node_name="llm", curr_node_name="llm", graph_walk=CHUNK_WALK,
         rids=rids, room_for_continuing=None,
         streaming_edges=[], streaming_edges_per_rid=[0] * len(rids),
+        loop_strides=strides,
     )).ready_rids
 
 
+def _chunk_prep_rows(rt, rids, strides=None):
+    return rt.prep_spec_rows(
+        "llm", "llm", CHUNK_WALK, rids, None, strides,
+    ).ready_rids
+
+
 @pytest.mark.parametrize("which", ["python", "rust"])
-def test_a_row_marked_do_not_speculate_offers_no_loop_back_target(which):
-    rt, _book = _chunk_runtime(which)
+def test_a_chunk_loop_counts_its_tokens_up_to_its_cap(which):
+    rt, book = _chunk_runtime(which)
     rid = _enter_chunk_walk(rt)
-    rt.pop_rids("llm", CHUNK_WALK, [rid])
-    assert _chunk_spec_targets(rt, [rid]) == [("llm", True)]
-
-    rt.mark_do_not_speculate_loops([rid], [CHUNK_WALK], [CHUNK_LOOP])
-    assert _chunk_spec_targets(rt, [rid]) == []
-    assert _chunk_prep(rt, [rid]) == []
-
-    rt.clear_do_not_speculate_loops([rid])
-    assert _chunk_spec_targets(rt, [rid]) == [("llm", True)]
+    _cap(rt, rid, 10)
+    assert _progress(rt, [rid]) == [(0, 10)]
+    _run_chunk(rt, book, rid, 1, stride=4)
+    assert _progress(rt, [rid]) == [(4, 10)]
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+    _run_chunk(rt, book, rid, 2, stride=4)
+    assert _progress(rt, [rid]) == [(8, 10)]
+    out = _run_chunk(rt, book, rid, 3, stride=2)
+    assert sorted(out.register_uuids) == [3], "the last chunk ends the Loop"
+    assert _ready(rt) == []
 
 
 @pytest.mark.parametrize("which", ["python", "rust"])
-def test_speculation_searches_past_a_first_row_marked_do_not_speculate(which):
-    """A marked first row does not end the walk's speculation: the target
-    stays for the row that continues, and only that row is prepped."""
+def test_a_first_chunk_past_a_cached_prefix_counts_from_zero(which):
+    """A first chunk starting at a cached prefix of 6 and ending at 8 moves
+    the Loop by 8, so the Loop's count is the next chunk's start."""
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _cap(rt, rid, 10)
+    _run_chunk(rt, book, rid, 1, stride=8)
+    assert _progress(rt, [rid]) == [(8, 10)]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_row_that_runs_whole_ends_its_loop(which):
+    """A walk with no token budget never caps the Loop; the row's stride
+    ends it."""
+    from mstar.model.submodule_base import CHUNK_LOOP_END
+
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    out = _run_chunk(rt, book, rid, 1, stride=CHUNK_LOOP_END)
+    assert sorted(out.register_uuids) == [1]
+    assert _ready(rt) == []
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_speculation_offers_no_chunk_past_the_last(which):
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _cap(rt, rid, 10)
+    rt.pop_rids("llm", CHUNK_WALK, [rid])
+    # the chunk in flight runs [0, 4): another follows
+    assert _chunk_spec_targets(rt, [rid], [4]) == [("llm", True)]
+    assert _chunk_prep(rt, [rid], [4]) == [rid]
+    assert _chunk_prep_rows(rt, [rid], [4]) == [rid]
+    # the chunk in flight runs [0, 10): nothing follows
+    assert _chunk_spec_targets(rt, [rid], [10]) == []
+    assert _chunk_prep(rt, [rid], [10]) == []
+    assert _chunk_prep_rows(rt, [rid], [10]) == []
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_speculation_searches_past_a_first_row_on_its_last_chunk(which):
+    """A first row on its last chunk does not end the walk's speculation: the
+    target stays for the row that continues, and only that row is prepped."""
     rt, _book = _chunk_runtime(which)
     done = _enter_chunk_walk(rt, request_id="r1")
     going = _enter_chunk_walk(rt, request_id="r2")
+    for rid in (done, going):
+        _cap(rt, rid, 10)
     rt.pop_rids("llm", CHUNK_WALK, [done, going])
-    rt.mark_do_not_speculate_loops([done], [CHUNK_WALK], [CHUNK_LOOP])
 
-    assert _chunk_spec_targets(rt, [done, going]) == [("llm", True)]
-    assert _chunk_prep(rt, [done, going]) == [going]
+    assert _chunk_spec_targets(rt, [done, going], [10, 4]) == [("llm", True)]
+    assert _chunk_prep(rt, [done, going], [10, 4]) == [going]
 
 
 @pytest.mark.parametrize("which", ["python", "rust"])
-def test_a_mark_does_not_outlive_its_loop(which):
-    """Applying the loop's stop takes the mark with it, so a re-entered walk
-    speculates its chunks again."""
+def test_each_prompt_sets_its_own_cap(which):
+    """A walk entered twice (BAGEL's think-mode prefills twice) is capped by
+    each prompt's own length: the cap is assigned, not lowered."""
     from mstar.model.submodule_base import chunk_tick_name
 
     rt, book = _chunk_runtime(which)
     rid = _enter_chunk_walk(rt)
-    rt.mark_do_not_speculate_loops([rid], [CHUNK_WALK], [CHUNK_LOOP])
-    rt.stop_loops_batched(
-        partition="default", graph_walk=CHUNK_WALK, last_node_run="llm",
-        loop_names=ParallelList([rid], [[CHUNK_LOOP]]),
-    )
-    _run_chunk(rt, book, rid, 1)
-    rt.clear_pending_loop_stops()
+    _cap(rt, rid, 4)
+    _run_chunk(rt, book, rid, 1, stride=4)
+    assert _ready(rt) == []
 
     rt.ingest_inputs_batch(_ingest_block(
         [rid, rid],
         [_spec("text_inputs", "llm"), _spec(chunk_tick_name("llm", CHUNK_WALK), "llm")],
     ))
-    rt.pop_rids("llm", CHUNK_WALK, [rid])
-    assert _chunk_spec_targets(rt, [rid]) == [("llm", True)]
+    _cap(rt, rid, 12)
+    assert _progress(rt, [rid]) == [(0, 12)]
+    _run_chunk(rt, book, rid, 2, stride=8)
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
 
 
 @pytest.mark.parametrize("which", ["python", "rust"])
-def test_a_mark_is_purged_with_its_request(which):
-    """Handles are recycled: a mark left behind would attach to the next
-    request given this handle."""
+def test_loop_progress_names_a_row_not_here(which):
     rt, _book = _chunk_runtime(which)
-    rid = _enter_chunk_walk(rt, request_id="r1")
-    rt.mark_do_not_speculate_loops([rid], [CHUNK_WALK], [CHUNK_LOOP])
-    rt.remove_request(rid)
-
-    again = _enter_chunk_walk(rt, request_id="r2")
-    assert again == rid, "the case needs the handle recycled"
-    rt.pop_rids("llm", CHUNK_WALK, [again])
-    assert _chunk_spec_targets(rt, [again]) == [("llm", True)]
+    assert _progress(rt, [7]) == [(-1, -1)]
 
 
 def _chunk_loop(which, remote=True):

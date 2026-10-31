@@ -23,7 +23,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
-from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement
+from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -323,9 +323,8 @@ class ExecutingBatch:
     # this step reports the partition done
     stream_partition_done_rids: set[int] = field(default_factory=set)
 
-    # rid -> (start, end, total): [start, end) of a chunked row's input this
-    # step, and the whole input's length as the scheduler measured it
-    chunk_ranges: Mapping[int, tuple[int, int, int]] = field(default_factory=dict)
+    # rid -> the part of a chunked row's input this step runs
+    chunk_ranges: Mapping[int, ChunkRange] = field(default_factory=dict)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -1173,7 +1172,7 @@ class Engine:
         return mgmt.submodule.inline_client_signals(graph_walk)
 
     def _prepare_chunk(
-        self, batch: ExecutingBatch, rid: int, walk: str, chunk: tuple[int, int, int],
+        self, batch: ExecutingBatch, rid: int, walk: str, chunk: ChunkRange,
     ) -> NodeInputs | None:
         """One chunk of a row's input, cut from the whole input prepared once
         on its first chunk and kept until the last one lands
@@ -1185,7 +1184,7 @@ class Engine:
         submodule = self._submodules[batch.node_name].submodule
         key = (rid, batch.node_name)
         full = self._chunking.prepared.get(key)
-        start, end, total = chunk
+        start, end, total = chunk.start, chunk.end, chunk.total
         if full is None:
             full = submodule.prepare_inputs(
                 graph_walk=walk,

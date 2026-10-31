@@ -32,6 +32,7 @@ from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.submodule_base import (
+    CHUNK_LOOP_END,
     ChunkingPolicy,
     chunk_loop_name,
     chunk_tick_name,
@@ -56,6 +57,10 @@ def _wrap_node_in_loop(
     persisting or counting a per-chunk tick would stage it and bill the
     conductor for a token per chunk.
 
+    The Loop counts tokens rather than iterations: each chunk moves it by its
+    ``ChunkRange.stride``, and it ends at the prompt's length, which the
+    scheduler sets as its cap on the first chunk.
+
     The body also routes ``chunk_tick_name`` back to itself, which is what
     makes the next chunk a speculation target; see that function for why the
     conductor seeds the first one. The submodule produces no tensor for it, and
@@ -77,7 +82,7 @@ def _wrap_node_in_loop(
                 section, outputs=ticks,
                 input_names=set(section.input_names) | {tick},
             ),
-            max_iters=policy.max_chunks,
+            max_iters=CHUNK_LOOP_END,
             outputs=final,
             accumulated_outputs=gathered,
         )

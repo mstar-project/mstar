@@ -13,6 +13,7 @@ sys.path.insert(0, ".")
 
 import torch
 
+from mstar.engine.chunking import ChunkRange
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.worker.batch_builder import fill_token_budget, fill_token_budget_in_start_order
 
@@ -231,8 +232,8 @@ def test_a_chunked_row_is_prepared_once_and_cut_per_chunk():
     sub = _Prompt(10)
     engine = _engine_with(sub)
 
-    first = engine._prepare_chunk(_batch(), 0, "prefill", (0, 4, 10))
-    last = engine._prepare_chunk(_batch(), 0, "prefill", (4, 10, 10))
+    first = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+    last = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(4, 10, 10, 6))
 
     assert sub.prepares == 1
     assert first.input_ids.tolist() == [0, 1, 2, 3] and not first.is_final_chunk
@@ -244,8 +245,8 @@ def test_the_whole_input_is_kept_until_the_last_chunk_lands():
     """A refused admit retries the last chunk: it must not prepare again."""
     sub = _Prompt(10)
     engine = _engine_with(sub)
-    engine._prepare_chunk(_batch(), 0, "prefill", (0, 10, 10))
-    engine._prepare_chunk(_batch(), 0, "prefill", (0, 10, 10))
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 10, 10, 10))
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 10, 10, 10))
     assert sub.prepares == 1
 
     engine.release_chunk_inputs(0, "LLM")
@@ -263,7 +264,7 @@ def test_a_request_removed_mid_prompt_drops_its_prepared_input():
     engine = _engine_with(_Sub(10))
     engine._loopback_steps = {}
     engine._runner = SimpleNamespace(remove_request=lambda rid: None)
-    engine._prepare_chunk(_batch(), 0, "prefill", (0, 4, 10))
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
 
     engine.remove_request(0)
 
@@ -347,8 +348,8 @@ def test_a_row_its_model_will_not_cut_is_measured_whole():
 def test_the_first_chunk_applies_the_prefix_it_starts_past():
     engine = _keyed_engine(_KeyedPrompt(10), matched=4)
 
-    first = engine._prepare_chunk(_batch(), 0, "prefill", (4, 6, 10))
-    engine._prepare_chunk(_batch(), 0, "prefill", (6, 10, 10))
+    first = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(4, 6, 10, 6))
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(6, 10, 10, 4))
 
     assert engine._runner.applied == [(0, 10, 4)], "once, with the whole input"
     assert first.input_ids.tolist() == [4, 5] and first.chunk_start == 4
@@ -357,7 +358,7 @@ def test_the_first_chunk_applies_the_prefix_it_starts_past():
 def test_a_row_with_no_cached_prefix_drops_any_lease():
     engine = _keyed_engine(_KeyedPrompt(10), matched=0)
 
-    engine._prepare_chunk(_batch(), 0, "prefill", (0, 4, 10))
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
 
     assert engine._runner.applied == [(0, 10, 0)]
 
@@ -365,7 +366,7 @@ def test_a_row_with_no_cached_prefix_drops_any_lease():
 def test_a_row_chunked_from_the_start_writes_over_a_lease_it_declined():
     engine = _keyed_engine(_KeyedPrompt(10, reuses=False), matched=4)
 
-    engine._prepare_chunk(_batch(), 0, "prefill", (0, 4, 10))
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
 
     assert engine._runner.applied == [(0, 10, None)]
 
@@ -376,7 +377,7 @@ def test_a_first_chunk_past_a_prefix_its_inputs_cannot_skip_fails():
     engine = _keyed_engine(_KeyedPrompt(10, guided=True), matched=4)
 
     with pytest.raises(RuntimeError, match="start past a 4-token cached prefix"):
-        engine._prepare_chunk(_batch(), 0, "prefill", (4, 6, 10))
+        engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(4, 6, 10, 6))
 
 
 def test_a_row_prepared_at_another_length_than_it_was_cut_by_fails():
@@ -385,7 +386,7 @@ def test_a_row_prepared_at_another_length_than_it_was_cut_by_fails():
     engine = _engine_with(_Prompt(10))
 
     with pytest.raises(RuntimeError, match="measured at 12 tokens .* prepared inputs hold 10"):
-        engine._prepare_chunk(_batch(), 0, "prefill", (0, 4, 12))
+        engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 12, 4))
     assert not engine._chunking.prepared, "a failed row keeps no prepared input"
 
 
@@ -413,7 +414,7 @@ def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
     batch = ExecutingBatch(
         node_name="LLM",
         per_request_info={1: 1, 2: 2},
-        chunk_ranges={1: (0, 4, 12)},  # measured at 12, prepares 10
+        chunk_ranges={1: ChunkRange(0, 4, 12, 4)},  # measured at 12, prepares 10
         step_context=StepContext(request_ids=(1, 2), graph_walk="prefill", slot=0, capture=False),
     )
 

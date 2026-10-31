@@ -18,7 +18,7 @@ from mstar.worker.worker import SpeculationTarget, Worker
 class _Preparer:
     """Records the rids speculation asked to prep."""
 
-    def prepare(self, batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps):
+    def prepare(self, batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps, loop_strides=None):
         self.prepped = list(candidates)
         return SimpleNamespace(ready_rids=[])
 

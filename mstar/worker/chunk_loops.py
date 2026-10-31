@@ -1,16 +1,16 @@
 """The worker's side of chunked prefill: which (node, walk) pairs run as a
-chunk Loop, ending a Loop on its final chunk, and recording what each chunk
-ran. The Loop itself does the rest (``Model.apply_chunking``)."""
+chunk Loop, and how far each step moves them. The Loop itself does the rest
+(``Model.apply_chunking``): it counts the tokens its chunks ran and ends at
+its prompt's length."""
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 from mstar.model.submodule_base import chunk_loop_name
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch, runs_final_chunk
+from mstar.worker.micro_scheduler import ScheduledBatch, chunk_loop_stride
 
 if TYPE_CHECKING:
-    from mstar.engine.engine import Engine
     from mstar.model.base import WorkerGraph
 
 
@@ -64,55 +64,28 @@ class ChunkLoops:
             )
         return frozenset(found)
 
-    def end_finished(self, batch: ScheduledBatch, stops: dict) -> set[int]:
-        """End the chunk Loop of every row that just ran its last chunk, and
-        name the rows still mid-prefill.
+    def loop_strides(
+        self, batch: ScheduledBatch, rids: Iterable[int],
+    ) -> list[int] | None:
+        """``RouteInput.loop_strides`` for ``rids`` of ``batch``, in that
+        order: a row of a chunk-Loop walk moves its Loop by its chunk
+        (``chunk_loop_stride``), and any other row its loop by one. None for a
+        step with no row in a chunk Loop, which is every decode step.
 
         Keyed on the walk having a Loop rather than on the row having a chunk
-        range: a row with no range ran whole, which is also a final chunk -- a
-        walk with no token budget is never measured or cut, and without this
-        its Loop would run to ``max_iters`` and the request would never release
-        its state.
-
-        Until its last chunk a row's sampled token is not a real sample, so it
-        decides no stop -- a spurious one would cut the prompt short
-        mid-prefill -- and keys no prefix. Its own output the Loop drops.
+        range: a row with no range ran whole, which also ends the Loop -- a
+        walk with no token budget is never measured or cut.
         """
-        node = batch.node_name
-        mid_prefill: set[int] = set()
-        walks = self.walks_by_node.get(node)
+        walks = self.walks_by_node.get(batch.node_name)
         # one lookup for a single-walk step outside a chunk Loop (decode)
         if not walks or (not batch.request_walks and batch.graph_walk not in walks):
-            return mid_prefill
-        for rid in batch.request_to_worker_graph:
-            walk = batch.walk_of(rid)
-            if walk not in walks:
-                continue
-            loop_name = chunk_loop_name(node, walk)
-            if runs_final_chunk(batch.chunk_ranges.get(rid)):
-                stops.setdefault(rid, set()).add(loop_name)
-            else:
-                stops.pop(rid, None)
-                mid_prefill.add(rid)
-        return mid_prefill
-
-    @staticmethod
-    def advance(
-        batch: ScheduledBatch, scheduler: MicroScheduler, engine: "Engine",
-    ) -> None:
-        """Record what each chunked row ran, and let go of a finished prompt's
-        prepared input.
-
-        The chunk Loop does the rest: the re-injected prompt re-readies the
-        node, and the Loop's edges drop or gather each chunk's output.
-        """
-        node = batch.node_name
-        for rid, (_, end, total) in batch.chunk_ranges.items():
-            if rid not in batch.request_to_worker_graph:
-                continue
-            scheduler.advance_chunk(rid, node, end)
-            if end >= total:
-                engine.release_chunk_inputs(rid, node)
+            return None
+        ranges = batch.chunk_ranges
+        walk_of = batch.walk_of
+        return [
+            chunk_loop_stride(ranges.get(rid)) if walk_of(rid) in walks else 1
+            for rid in rids
+        ]
 
 
 def mid_prefill_speculation_off(

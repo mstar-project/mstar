@@ -490,6 +490,15 @@ impl RequestState {
         &mut self, g: &CompiledGraph, node: NodeId,
         out_tensors: &[Vec<TensorRef>],
     ) -> Completed {
+        self.complete_strided(g, node, out_tensors, 1)
+    }
+
+    /// `complete`, the node's enclosing loop counting `loop_stride` on if
+    /// this completion ends its iteration (Python's `GraphNode.complete`).
+    pub fn complete_strided(
+        &mut self, g: &CompiledGraph, node: NodeId,
+        out_tensors: &[Vec<TensorRef>], loop_stride: u32,
+    ) -> Completed {
         let spec = g.node(node);
         let prev_done = self.is_done;
         let mut out: Vec<RoutedEdge> = Vec::with_capacity(spec.outputs.len() + 2);
@@ -525,7 +534,7 @@ impl RequestState {
 
         match spec.loop_id {
             None => self.root_entity_done(),
-            Some(lid) => self.entity_completed(g, lid, 0, &mut out),
+            Some(lid) => self.entity_completed(g, lid, 0, &mut out, loop_stride),
         }
 
         if self.is_done && !prev_done {
@@ -552,7 +561,7 @@ impl RequestState {
     /// Mirrors `LoopStateRegistry.mark_entity_complete` + `Loop.complete_iter`.
     fn entity_completed(
         &mut self, g: &CompiledGraph, lid: LoopId, edges_from: usize,
-        out: &mut Vec<RoutedEdge>,
+        out: &mut Vec<RoutedEdge>, stride: u32,
     ) {
         let lspec = g.lp(lid);
         self.cache_outputs(g, lid, edges_from, out);
@@ -568,12 +577,12 @@ impl RequestState {
 
         let finishing = {
             let st = &self.loops[lid as usize];
-            st.finish_signal || st.max_iters == st.curr_iter + 1
+            st.finish_signal || st.curr_iter.saturating_add(stride) >= st.max_iters
         };
         if finishing {
             self.finish_loop(g, lid, out);
         } else {
-            self.advance_loop(g, lid, out);
+            self.advance_loop(g, lid, out, stride);
         }
     }
 
@@ -656,16 +665,17 @@ impl RequestState {
         //     to the same `out`.
         match lspec.parent {
             None => self.root_entity_done(),
-            Some(p) => self.entity_completed(g, p, own_edges_from, out),
+            Some(p) => self.entity_completed(g, p, own_edges_from, out, 1),
         }
     }
 
     fn advance_loop(
         &mut self, g: &CompiledGraph, lid: LoopId, out: &mut Vec<RoutedEdge>,
+        stride: u32,
     ) {
         {
             let st = &mut self.loops[lid as usize];
-            st.curr_iter += 1;
+            st.curr_iter = st.curr_iter.saturating_add(stride);
         }
         self.reset_subtree_for_iter(g, lid);
         // Loop._uncache_outputs, after the reset as in `_advance_one_iter`.
@@ -778,6 +788,11 @@ impl RequestState {
     pub fn cap_loop(&mut self, lid: LoopId, cap: u32) {
         let st = &mut self.loops[lid as usize];
         st.max_iters = st.max_iters.min(cap);
+    }
+
+    /// `GraphRuntime.set_loop_caps`: assigns, unlike `cap_loop`.
+    pub fn set_loop_cap(&mut self, lid: LoopId, cap: u32) {
+        self.loops[lid as usize].max_iters = cap;
     }
 
     pub fn loop_indices(&self) -> Vec<u32> {

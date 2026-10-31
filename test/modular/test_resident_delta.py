@@ -709,7 +709,7 @@ class _Rank:
         self.queue = _Queue()
         self._graph_runtime = self.queue
         self.held: list[str] = []
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, drop_chunk_lookahead=lambda *a: None)
+        self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
         self._hold_logged = {}
         self.parallel_nodes = {"node"}
         self.parallel_leader_nodes = {"node"} if leader else set()

@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import (
@@ -119,22 +120,29 @@ class SpeculationPreparer:
     def prepare(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None = None,
     ) -> PreparedSpeculation:
+        """``loop_strides``: ``candidates``' in N (``RouteInput.loop_strides``),
+        which decide whose loop N ends."""
         if self.rows_eligible():
             return self._prepare_rows(
                 batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
+                loop_strides,
             )
         return self._prepare_dicts(
             batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
+            loop_strides,
         )
 
     def _prepare_rows(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None,
     ) -> PreparedSpeculation:
         ctx = self._ctx
         rows = ctx.graph_runtime.prep_spec_rows(
             spec_node_name, batch_N.node_name, graph_walk, candidates, max_continuing,
+            loop_strides,
         )
         laps.lap("prep_spec_rows")
         prep = PreparedSpeculation(rows.ready_rids, rows.spec_id, rows.wg_id)
@@ -150,6 +158,7 @@ class SpeculationPreparer:
     def _prepare_dicts(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None,
     ) -> PreparedSpeculation:
         """``prep_spec_rids`` with the stream polls, filling the per-row dicts
         for the ready rids."""
@@ -180,6 +189,7 @@ class SpeculationPreparer:
                 ) for _r, (e, _chunk) in polled
             ],
             streaming_edges_per_rid=per_rid_counts,
+            loop_strides=loop_strides,
         ))
         laps.lap("prep_spec_rids")
 
@@ -222,7 +232,7 @@ class SpeculationBuilder:
         self, pending: PendingBatch, spec_target: SpeculationOutput,
         prep: PreparedSpeculation, other_walks: dict[int, str],
         fresh_final_edges: dict[int, set[str]],
-        chunk_ranges: dict[int, tuple[int, int, int]] | None = None,
+        chunk_ranges: dict[int, ChunkRange] | None = None,
         incomplete_node_rids: set[int] | None = None,
     ) -> Speculation:
         """The speculation from ``prep`` plus the fresh rows merged into its
@@ -275,7 +285,7 @@ class SpeculationBuilder:
         spec_id: int = 0,
         tp_seq: int = -1,
         request_walks: dict[int, str] | None = None,
-        chunk_ranges: dict[int, tuple[int, int, int]] | None = None,
+        chunk_ranges: dict[int, ChunkRange] | None = None,
         incomplete_node_rids: set[int] | None = None,
     ) -> Speculation:
         """Package prepared rids (batch order, which ``make_executing_batch``

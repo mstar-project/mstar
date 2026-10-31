@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.engine.chunking import ChunkingManagement
+from mstar.engine.chunking import ChunkingManagement, ChunkRange
 from mstar.engine.engine import Engine
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
@@ -193,14 +193,14 @@ def _declare(sub: "_Sub", other_walk_row: bool = False):
         request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False,
         request_walks={4: "other"} if other_walk_row else {},
     )
-    chunk_ranges = {1: (0, 4, 10), 2: (4, 10, 10)}
+    chunk_ranges = {1: ChunkRange(0, 4, 10, 4), 2: ChunkRange(4, 10, 10, 6)}
     inputs = [
         ARNodeInputs(input_seq_len=4, chunk_start=0, chunk_total=10),   # more to come
         ARNodeInputs(input_seq_len=6, chunk_start=4, chunk_total=10),   # its last chunk
         ARNodeInputs(input_seq_len=1),                                  # not chunked
     ]
     if other_walk_row:
-        chunk_ranges[4] = (0, 4, 10)
+        chunk_ranges[4] = ChunkRange(0, 4, 10, 4)
         inputs.append(ARNodeInputs(input_seq_len=4, chunk_start=0, chunk_total=10))
     batch = SimpleNamespace(
         node_name="LLM", graph_walk="prefill", per_request_info={},
