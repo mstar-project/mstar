@@ -143,6 +143,21 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
     assert _admitted(kv, "v") and kv._allotments["v"].pages == 7, "v didn't reserve its history and a page"
 
 
+def test_a_dropped_request_with_an_image_returns_with_pages_for_the_image_too():
+    kv = _pool()
+    image = PrefixSpan(3 * PAGE_SIZE, 4, WALK, kind="digest")
+    text = (PrefixSpan(PAGE_SIZE - 1, PAGE_SIZE - 1, WALK), PrefixSpan(1, 1, WALK))
+    layout = StreamLayout(spans=(text[0], image, text[1]), growth=(("decode", 1),))
+    _runner(kv).ingest_request("v", {"kv": KVReqConfig(
+        kv_layout={"main": layout}, loop_caps={"decode": 8 * PAGE_SIZE}, arrival=1,
+    )})
+    assert _ready(kv, "v") and _step(kv, "v", 4 * PAGE_SIZE).ok
+    _drop(kv, "v")
+
+    # its history is a page of text and the sample its next step writes, and its rebuild writes the image's rows too
+    assert _admitted(kv, "v") and kv._allotments["v"].pages == 6, "the rebuild would run out of pages in the image"
+
+
 def test_a_victim_still_to_move_is_chosen_for_no_other_request():
     kv = _pool()
     _running(kv, "r1", 3, arrival=1)

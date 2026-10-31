@@ -106,7 +106,7 @@ KV_PREEMPTIONS = Family(
 )
 KV_DROPS = Family(
     "mstar_kv_drops_total", COUNTER,
-    "Preempted requests whose KV was dropped, to be rebuilt from their token ids.",
+    "Preempted requests whose KV was dropped, to be rebuilt from their token ids and any host copies.",
     ("component",),
 )
 KV_REBUILD_TOKENS = Family(

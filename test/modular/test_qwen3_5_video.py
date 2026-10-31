@@ -230,11 +230,13 @@ def an_image() -> torch.Tensor:
 
 
 LAYOUTS = {
+    "images": (["text", "image", "text", "image", "text"], []),
     "video_then_question": (["video", "text"], ["odd"]),
     "question_then_video": (["text", "video"], ["even"]),
     "mixed": (["text", "image", "text", "video", "text"], ["odd"]),
     "two_videos_around_image": (["video", "image", "video", "text"], ["short", "even"]),
 }
+VIDEO_LAYOUTS = [name for name, (_, videos) in LAYOUTS.items() if videos]
 
 
 def run_both(model, processor, layout: str):
@@ -342,7 +344,7 @@ def test_video_plan_puts_text_around_every_group():
 
 
 @needs_new_layout
-@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("layout", VIDEO_LAYOUTS)
 def test_prompt_ids_match_processor(model, processor, layout):
     parts, out, ref = run_both(model, processor, layout)
     tensors, groups = out.new_input_tensors, out.metadata["video_groups"]
@@ -359,7 +361,7 @@ def test_an_attachment_prompt_keys_nothing_for_the_prefix_cache(model, processor
     assert out.metadata["kv_layout"][KV_CACHE]["main"].keyed_count() == 0
 
 
-@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("layout", VIDEO_LAYOUTS)
 def test_patches_and_grids_match_processor(model, processor, layout):
     _, out, ref = run_both(model, processor, layout)
     tensors = out.new_input_tensors
@@ -388,7 +390,7 @@ IMAGE_MARK, VIDEO_MARK = -1.0, -2.0
 
 
 @needs_new_layout
-@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("layout", VIDEO_LAYOUTS)
 def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout):
     """The schedule and the LLM's `prefill_vision` row, against transformers:
     the row's token order and its 3D positions, plus where decode resumes."""
@@ -716,3 +718,95 @@ def test_adapter_maps_video_url_to_a_video_attachment(tmp_path):
     assert Path(path).suffix == ".mp4" and Path(path).read_bytes().startswith(b"\x00\x00\x00\x18")
     assert [p.modality for p in args.prompt_parts] == ["text", "video", "text"]
     assert args.prompt_parts[1] == PromptPart(modality="video", index=0, role="user")
+
+
+@pytest.mark.parametrize("samples", [0, 2])
+def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupted_run(model, samples):
+    from test_worker_rebuild import NODE, R, _worker
+
+    from mstar.communication.tensors import LocalTransferEngine
+    from mstar.engine.resources import StepContext
+    from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
+    from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.engine.resources.position.config import PositionConfig, PositionStep
+    from mstar.engine.resources.position.manager import RopeManager
+    from mstar.engine.resources.step import Segment
+    from mstar.model.qwen3_5.config import KV_CACHE, ROPE
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+    from mstar.worker.micro_scheduler import ScheduledBatch
+    from mstar.worker.rebuild import Rebuilds
+
+    modalities, _ = LAYOUTS["images"]
+    texts = [f"Question {i}: what happens?" for i in range(modalities.count(TEXT))]
+    out = model.process_prompt(
+        "\n".join(texts), modalities, ["text"], tensors={"image_inputs": [an_image(), an_image()], "video_inputs": []},
+        prompt_parts=parts_from_modalities(modalities, texts), input_metadata={"video_inputs": []},
+    )
+    tensors, layout = out.new_input_tensors, out.metadata["kv_layout"][KV_CACHE]["main"]
+    (step,) = model._prefill_schedule(modalities, tensors, out.metadata["video_groups"])
+    grids = step.input_tensors["image_grid_thw"]
+    rows = sum(int(g.prod()) for g in grids) // model.vision_config.spatial_merge_size ** 2
+    copied = {"image_grid_thw": grids, "vision_embeds": [torch.full((rows, 1), IMAGE_MARK)]}
+    llm = LLMSubmodule(_Embed(len(model.tokenizer)), model.config, model.vision_config)
+    rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
+    llm.node_resources = {ROPE: rope}
+    metadata = {"is_prefill": True, "last_prefill": True, "prefill_order": step.order}
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=32, page_size=16),
+        name="kv", joint_comm_group=None, device=torch.device("cpu"), dtype=torch.float32,
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
+    )
+
+    def write(walk, row=None):
+        """A decode step when ``row`` is None, else a `prefill_vision` row."""
+        span = 1 if row is None else row.input_seq_len
+        advance = None if row is None else llm.declare_step(walk, [R], [row]).steps[ROPE].advance
+        segments = (Segment(R, "main", span),)
+        kv_step, ctx = KVStep(segments=segments), StepContext((R,), walk, 0, False)
+        assert kv.admit(kv_step, ctx).ok
+        kv.plan(kv_step, ctx)
+        kv.commit(kv_step, ctx)
+        rope.commit(PositionStep(segments=segments, advance=advance), ctx)
+
+    config = KVReqConfig()
+    config.apply_conductor_config(kv_layout={"main": layout.row()}, loop_caps={"decode_loop": 8})
+    kv.ingest_request(R, config)
+    rope.ingest_request(R)
+    prefill = llm._vision_inputs(SimpleNamespace(request_id=R, step_metadata=metadata), {
+        "text_inputs": step.input_tensors["text_inputs"], **copied,
+    })
+    for walk, row in (("prefill_vision", prefill), *[("decode", None)] * samples):
+        write(walk, row)
+    stream = kv._streams[R]["main"]
+    held = (stream.stored_len, len(stream.page_indices), rope.position(R, "main"))
+    kv.drop(R)
+    rope.drop(R)
+    w, eng = _worker()
+    w._rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs())
+    eng.prepare_rebuild = lambda node, rid, rebuild: kv.prepare_rebuild(rid, rebuild)
+    inputs = {R: {"text_inputs": step.input_tensors["text_inputs"], **copied}}
+    assert w._rebuilds.keep(R, NODE, config.kv_layout.values()), "an image chat would be guaranteed"
+    w._rebuilds.keep_prompts(NODE, "prefill_vision", {}, inputs)
+    info = SimpleNamespace(graph_walk="prefill_vision", step_metadata=metadata)
+    w._rebuilds.keep_copies(SimpleNamespace(
+        node_name=NODE, request_ids=[R], per_request_info={R: info}, per_request_input_tensors=inputs,
+        step_context=StepContext((R,), "prefill_vision", 0, False),
+    ))
+    # the samples before 9 are in the KV, and 9 is the next decode step's input
+    w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])
+    eng.dropped.append(R)
+    w._rebuild(R, NODE)
+    batch = w._build_executing_batch(ScheduledBatch(NODE, "prefill_vision", rebuild_rows=dict(w.scheduler.rows)))
+    rebuilt = llm._vision_inputs(batch.per_request_info[R], batch.per_request_input_tensors[R])
+    write("prefill_vision", rebuilt)
+
+    advance, sampled = prefill.tensor_inputs["mrope_advance"], torch.tensor([7.0, 8.0][:samples])
+    after = torch.arange(advance, advance + samples).expand(3, -1)
+    positions = torch.cat([prefill.custom_pos_ids.long(), after], dim=1)
+    assert torch.equal(rebuilt.input_embeds[:, 0], torch.cat([prefill.input_embeds[:, 0], sampled]))
+    assert torch.equal(rebuilt.custom_pos_ids.long(), positions), "decode would resume at another position"
+    stream = kv._streams[R]["main"]
+    assert (stream.stored_len, len(stream.page_indices), rope.position(R, "main")) == held, (
+        "the rebuilt KV would sit in other slots, or decode would resume at another position"
+    )

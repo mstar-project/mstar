@@ -633,7 +633,10 @@ class Worker:
         self._rebuilds = Rebuilds({}, {})
         if model is not None:
             graphs = model.get_graph_walk_graphs()
-            self._rebuilds = Rebuilds(policies_run_here(model.rebuild_policies(), graphs, my_walks), graphs)
+            self._rebuilds = Rebuilds(
+                policies_run_here(model.rebuild_policies(), graphs, my_walks, self.parallel_nodes), graphs,
+                self._side_stream,
+            )
         # `_kv_keys`: node -> the keys of its paged KV caches, and `_kv_caches`: key -> its cache.
         # `_rebuilding`: the handles whose rebuild row is in the step in flight.
         # `_dropped`: handle -> the node it was dropped on, until its rebuild row is queued.
@@ -1092,13 +1095,16 @@ class Worker:
 
     def _guarantee(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
         """Where a node lays out KV for the request that no rebuild here can write again, no drop can free the
-        request's pages, so the request is guaranteed in every paged KV cache of that node."""
+        request's pages, so the request is guaranteed in every paged KV cache of that node. Elsewhere the node
+        keeps the request's ids and host copies for its rebuild, unless the request is guaranteed already."""
         for node_name, keys in self._kv_keys.items():
             node_configs = [config for key in keys if isinstance(config := configs.get(key), KVReqConfig)]
             layouts = [layout for config in node_configs for layout in (config.kv_layout or {}).values()]
-            if any(layout.spans or layout.growth for layout in layouts) and not self._rebuilds.can_rebuild(
-                node_name, layouts,
+            if not any(layout.spans or layout.growth for layout in layouts) or any(
+                config.guaranteed for config in node_configs
             ):
+                continue
+            if not self._rebuilds.keep(request_id, node_name, layouts):
                 for config in node_configs:
                     config.guaranteed = True
 
@@ -1916,9 +1922,11 @@ class Worker:
         rebuild = batch.rebuild_rows
         if rebuild:
             for rid, row in rebuild.items():
+                info = self.request_state.get_fwd_info(rid, batch_partition)
                 per_request_inputs[rid] = row.inputs
                 per_request_info[rid] = replace(
-                    self.request_state.get_fwd_info(rid, batch_partition), graph_walk=row.walk,
+                    info, graph_walk=row.walk,
+                    step_metadata=info.step_metadata if row.step_metadata is None else row.step_metadata,
                 )
             request_ids = [*rebuild, *request_ids]
 
@@ -3658,6 +3666,7 @@ class Worker:
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
         self._rebuilds.keep_samples(batch_N.node_batch, cpu_outputs, host_rows)
+        self._rebuilds.keep_copies(batch_N.node_batch)
         # What the stop check withheld (``StopCheck.withheld``), and an output
         # cut to an empty span, is not stored, so not routed: a streaming edge
         # then carries no item for the row, and the producer's item count
@@ -4371,6 +4380,14 @@ class Worker:
         return 1 << max(numel - 1, 0).bit_length()
 
 
+    def _side_stream(self) -> torch.Stream | None:
+        """The stream host copies queue on, behind a step's own output copy, or None without a device."""
+        if not self.device_capability.is_available:
+            return None
+        if self._d2h_stream is None:
+            self._d2h_stream = torch.Stream(device=self.device)
+        return self._d2h_stream
+
     def _d2h_batched(
         self, buffers: dict, side: torch.Stream,
     ) -> dict[str, torch.Tensor]:
@@ -4477,9 +4494,7 @@ class Worker:
         if not source:
             return source, None
 
-        if self._d2h_stream is None:
-            self._d2h_stream = torch.Stream(device=self.device)
-        side = self._d2h_stream
+        side = self._side_stream()
         side.wait_event(completion_event)
 
         if outputs.check_stop_buffers is not None and row_rids is not None:

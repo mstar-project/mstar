@@ -353,7 +353,7 @@ class Allotment:
 
 
 class Dropped(NamedTuple):
-    """A dropped request until its rebuild lands: the pages it asks to return with, and the tokens its
+    """A dropped request until its rebuild lands: the pages it asks to return with, and the slots its
     laid-out label held, which its rebuild must write again."""
     returns: int
     held: int
@@ -3242,10 +3242,11 @@ class KVManager(AttentionResource):
             return self._arena.num_free - free
 
     def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
-        """Lay ``rid``'s label out again as one ids span of the rebuild's walk over its ids without the last
-        one, keyed as a prompt of those ids would be.
+        """Lay ``rid``'s label out again as its rebuild row writes it over the rebuild's ids without the last
+        one: the label's spans, the last grown by the ids sampled since (`StreamLayout.rebuilt`). A label of
+        one ids span is keyed as a prompt of those ids would be.
 
-        The growth loop's cap drops by the iterations the span now covers, so the footprint stays
+        The growth loop's cap drops by the iterations the last span now covers, so the footprint stays
         the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
@@ -3254,20 +3255,20 @@ class KVManager(AttentionResource):
         if not laid_out:
             return
         (label,) = laid_out
-        ids, walk = rebuild.ids, rebuild.walk
+        ids, layout = rebuild.ids, overrides.kv_layout[label]
         prompt, page_size = ids[:-1], self.config.page_size
         length = len(prompt)
-        held = self._dropped[rid].held
-        if length != held:
-            raise RuntimeError(f"KV {self.name}: {rid}'s rebuild writes {length} tokens, but its label held {held}")
+        rebuilt = layout.rebuilt(length)
+        written, held = sum(span.length for span in rebuilt.spans), self._dropped[rid].held
+        if written != held:
+            raise RuntimeError(f"KV {self.name}: {rid}'s rebuild writes {written} slots, but its label held {held}")
         pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
         keyed = bool((overrides.prefix_keys or {}).get(label))
         # hashed before the lock, as `resolve_cached_prefix` hashes outside it
         keys = chain(pages) if keyed else None
         with self._lock:
-            layout = overrides.kv_layout[label]
             ((loop, slots),) = layout.growth
-            grown = length - sum(span.length for span in layout.spans)
+            grown = written - sum(span.length for span in layout.spans)
             changes = {}
             if keyed:
                 changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
@@ -3276,10 +3277,7 @@ class KVManager(AttentionResource):
                 }
             self._overrides[rid] = replace(
                 overrides,
-                kv_layout={
-                    **overrides.kv_layout,
-                    label: replace(layout, spans=(PrefixSpan(length, length, walk),), keyed_spans=int(keyed)),
-                },
+                kv_layout={**overrides.kv_layout, label: replace(rebuilt, keyed_spans=int(keyed))},
                 loop_caps={**overrides.loop_caps, loop: overrides.loop_caps[loop] - grown // slots},
                 **changes,
             )

@@ -11,6 +11,7 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +28,7 @@ from mstar.engine.resources.step import AdmitRuntimeError
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.rebuild import KeptIds, RebuildRow, Rebuilds
+from mstar.worker.rebuild import HostCopies, KeptIds, RebuildRow, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 from mstar.worker.worker_metrics import PreemptionCounts
@@ -171,6 +172,47 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
         w._postprocess_batch(pending, outputs)
     assert list(w._rebuilds._kept[node][1].sampled) == [5], "a drop would find no samples and refuse"
     assert landed == [R], "the rebuilt request would never be ready to decode again"
+
+
+@pytest.mark.parametrize("build", ["executing", "speculative"])
+def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_ids(build):
+    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
+
+    eng = _engine(_Sub())
+    eng.land_rebuild = lambda node, rid: None
+    w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
+    w._rebuilds._policies = {node: replace(POLICY, copied_inputs={walk: ("embeds",)})}
+    w._rebuilds._kept = {node: {1: KeptIds(torch.tensor([1]), array("i"), None, HostCopies(walk))}}
+    embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
+    batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
+        rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
+    })
+    if build == "speculative":
+        # a speculated step gets its embeds only once the encoder has run
+        spec = Speculation(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, {("embeds", node)}, {R, 1, 2}, "p",
+                           is_new_iter=False, is_same_node=False)
+        w._thread_outputs_to_speculative(spec, BatchedModelOutput({rid: {"embeds": [t]} for rid, t in embeds.items()}))
+    for rid, info in batch.per_request_info.items():
+        info.graph_walk, info.step_metadata = walk, {"prefill_order": (rid,)}
+    eng.prepare_inputs(batch)
+    pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
+    outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
+    with pytest.raises(_ReachedRoutingError):
+        w._postprocess_batch(pending, outputs)
+
+    assert w._rebuilds._kept[node][1].copies.inputs == {"embeds": [embeds[1]]}, (
+        "a rebuild would need the encoder to run again"
+    )
+
+
+def test_a_rebuild_row_runs_under_its_copied_metadata_even_when_empty():
+    w, _ = _worker()
+    w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
+    row = RebuildRow(NODE, PREFILL, {"text_inputs": [torch.tensor([1, 2])]}, {})
+
+    node_batch = w._build_executing_batch(ScheduledBatch(NODE, PREFILL, rebuild_rows={R: row}))
+
+    assert node_batch.per_request_info[R].step_metadata == {}, "the rebuild row would run under decode's metadata"
 
 
 @pytest.mark.parametrize("why", ["no ids", "in flight", "backlog", "rebuild queued", "prefill walk", "samples short"])

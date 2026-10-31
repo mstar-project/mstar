@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from array import array
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -124,21 +125,39 @@ def test_a_refused_drop_changes_nothing(refusal):
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
 
 
-@pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
-def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout):
+IMAGE = PrefixSpan(6, 4, WALK, kind="digest")
+
+
+@pytest.mark.parametrize("layout, why", [
+    ("two labels", "more than one label"),
+    ("two loops", "more than one label or growth loop"),
+    ("two walks", "more than one walk"),
+    ("image last", "ends on a digest span"),
+    ("keyed text around an image", "can't key again"),
+    ("rows", "no rebuild recomputes"),
+])
+def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout, why):
     kv = _manager()
     config = _config(list(range(PAGE_SIZE)))
-    spans, growth = config.kv_layout["main"].spans, config.kv_layout["main"].growth
+    main = config.kv_layout["main"]
+    (text,) = main.spans
     if layout == "two labels":
-        config.kv_layout["uncond"] = config.kv_layout["main"]
-    elif layout == "two spans":  # as a prompt prefilled over two rows
-        config.kv_layout["main"] = StreamLayout(spans=(*spans, PrefixSpan(4, 4, WALK)), growth=growth)
-    else:
-        config.kv_layout["main"] = StreamLayout(spans=spans, growth=(*growth, ("other_loop", 1)))
+        config.kv_layout["uncond"] = main
+    elif layout == "two loops":
+        config.kv_layout["main"] = replace(main, growth=(*main.growth, ("other_loop", 1)))
         config.loop_caps["other_loop"] = 4
+    else:
+        spans = {
+            "two walks": (text, replace(IMAGE, walk="vit"), text),  # as a Bagel image chat, whose image has a walk
+            "image last": (text, IMAGE),
+            "keyed text around an image": (text, IMAGE, text),
+            "rows": (text, replace(IMAGE, kind="rows"), text),  # as a video's frames
+        }[layout]
+        keyed = len(spans) if layout == "keyed text around an image" else 0
+        config.kv_layout["main"] = replace(main, spans=spans, keyed_spans=keyed)
     kv.ingest_request("r", config)
 
-    with pytest.raises(RuntimeError, match="one rebuild row"):
+    with pytest.raises(RuntimeError, match=why):
         kv.drop("r")
     assert "r" not in kv._dropped, "a request its rebuild couldn't bring back would be dropped"
 
@@ -232,6 +251,47 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     assert (rebuilt.chain.keys, rebuilt.chain.unkeyed) == (want.chain.keys, want.chain.unkeyed), (
         "the rebuilt pages would be filed under keys another request with these ids can't match"
     )
+
+
+def _image_prompt(kv: KVManager, decoded: int) -> None:
+    """Ingest ``r`` with three ids, an image and two ids on one walk, as Qwen3.5 lays out an image chat, write
+    them and ``decoded`` tokens after them, then drop it."""
+    layout = StreamLayout(spans=(PrefixSpan(3, 3, WALK), IMAGE, PrefixSpan(2, 2, WALK)), growth=(("decode_loop", 1),))
+    kv.ingest_request("r", KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode_loop": 50}))
+    _write(kv, "r", 11, *[1] * decoded)
+    kv.drop("r")
+
+
+def test_a_rebuild_keeps_an_image_prompts_spans_and_writes_its_samples_after_its_last_text():
+    kv = _manager()
+    _image_prompt(kv, decoded=2)
+    footprint = kv._streams["r"]["main"].footprint
+
+    # the prompt's 5 ids, then the prefill's sample and one per decode step
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(5), 100, 101, 102])))
+
+    assert kv._overrides["r"].kv_layout["main"].spans == (PrefixSpan(3, 3, WALK), IMAGE, PrefixSpan(4, 4, WALK)), (
+        "the image would lose its slots or its advance, or the samples would land at other positions"
+    )
+    assert kv._overrides["r"].loop_caps["decode_loop"] == 48 and kv._streams["r"]["main"].footprint == footprint, (
+        "the rebuild would hold more pages than the request declared"
+    )
+
+
+def test_a_second_rebuild_of_an_image_prompt_counts_each_sample_once():
+    kv = _manager()
+    _image_prompt(kv, decoded=2)
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(5), 100, 101, 102])))
+    _write(kv, "r", 13)  # the rebuild row
+    kv.land_rebuild("r")
+    _write(kv, "r", 1, 1)
+    kv.drop("r")
+
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(5), *range(100, 105)])))
+
+    last = kv._overrides["r"].kv_layout["main"].spans[-1]
+    assert last == PrefixSpan(6, 6, WALK), "the first rebuild's samples would be laid out twice"
+    assert kv._overrides["r"].loop_caps["decode_loop"] == 46, "the samples would count twice in the footprint"
 
 
 def test_a_rebuild_row_beside_another_keyed_row_keys_none_of_its_discarded_sample():

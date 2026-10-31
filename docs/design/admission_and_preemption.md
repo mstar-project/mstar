@@ -267,13 +267,14 @@ class RebuildPolicy:
     ids_input: str       # the walk's input that carries the prompt's ids
     sample_output: str   # the output that carries each sampled id
     loop: str            # the loop each of whose iterations samples one id
+    copied_inputs: Mapping[str, tuple[str, ...]]   # another prefill walk -> what it reads besides the ids
 ```
 
 A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup. A node without one never drops a request.
 
-The rebuild is one row of the engine's batch over the kept ids minus the last, under the policy's walk, in a step of its own. Its sample is discarded, it sends nothing, and its decode loop doesn't advance. Decoding resumes from the last kept id once the step lands.
+The rebuild is one row of the engine's batch over the kept ids minus the last, under the walk the request prefilled in, in a step of its own. Its sample is discarded, it sends nothing, and its decode loop doesn't advance. Decoding resumes from the last kept id once the step lands.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, as one device copy per step shared by its rows, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`. A rebuild copies the prompt to the host once, for the KV's layout and keys.
+The worker keeps a request's prompt ids from the policy's input the first time a step runs one of the policy's prefill walks, as one device copy per step shared by its rows, and appends each sample from the stop check's host copy. A walk of `copied_inputs` reads more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs and the step's metadata to the host, and the rebuild row reads them back under that metadata. The worker keeps all of this per node and per handle, only for a request a rebuild could write again, and lists it in `rid_table.py`. A rebuild copies the prompt to the host once, for the KV's layout and keys.
 
 Why this shape:
 

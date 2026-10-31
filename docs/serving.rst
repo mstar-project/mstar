@@ -394,10 +394,15 @@ ran short gets the pages freed, up to its shortage, unless it moved or was dropp
 request on the host waits at its place in the queue until its pages and one more page fit, and
 its pages are then copied back. A dropped request waits until its history and one more page
 fit, then recomputes its KV in one prefill row. A request that streams audio out, or holds KV
-made from media or another node's outputs, reserves its whole footprint in every pool, with
-every cache hit counted, and is never dropped or moved to the host. So does a request in the
-pools of a node that keeps no token ids to rebuild it. Voice requests then queue when the pool
-is short and are never preempted mid-stream.
+made from another node's outputs, reserves its whole footprint in every pool, with every cache
+hit counted, and is never dropped or moved to the host. So does a request in the pools of a
+node that keeps no token ids to rebuild it. A request with images whose whole prompt runs on
+one prefill walk, such as a Qwen3.5 chat with images, can be dropped at one rank: the worker
+keeps a host copy of what that walk read besides the token ids, the encoder's output included,
+and rebuilds the request from it. Bagel, Qwen3-Omni and Higgs Audio requests with media, whose
+prompts run on several walks, and requests with images above one rank keep no copies and stay
+guaranteed. A Qwen3.5 video stays guaranteed for its frames. Voice requests then queue when the
+pool is short and are never preempted mid-stream.
 
 Above one rank, a decode step that finds no page and nothing to offload holds its requests
 until they time out. At one rank, a request that runs short and can neither move to the host
