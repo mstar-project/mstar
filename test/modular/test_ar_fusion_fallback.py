@@ -113,8 +113,14 @@ def test_a_shared_group_keeps_a_workspace_per_width_and_dtype(monkeypatch):
         group.allreduce_add_rmsnorm(x, torch.zeros_like(x), torch.ones(hidden, dtype=dtype), 1e-6)
     assert used == [0, 3, 2, "nccl", "nccl"]
     # the norm with no residual adds its workspace's zeros, cut to the input's rows
+    residuals = []
+    monkeypatch.setattr(
+        ar_fusion, "allreduce_add_rmsnorm",
+        lambda x, residual, weight, eps, bias, ws_id: residuals.append(residual) or used.append(ws_id) or (x, residual),
+    )
     used.clear()
     for rows, hidden in ((4, 8), (9, 16)):
         x = torch.ones(rows, hidden)
         group.allreduce_rmsnorm(x, torch.ones(hidden), 1e-6)
     assert used == [3, "nccl"]
+    assert [r.shape for r in residuals] == [(4, 8)] and not residuals[0].any()
