@@ -225,3 +225,21 @@ def test_an_encode_finishing_after_teardown_delivers_nothing(worker):
 def test_a_thread_built_without_init_encodes_inline():
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     assert wt._encode_pool is None and wt._release_encoded() is False
+
+
+@pytest.mark.parametrize("modality", ["image", "text"], ids=["pooled", "inline"])
+def test_postprocess_s_is_the_time_in_postprocess_alone(worker, monkeypatch, modality):
+    """Not the tensor read before it, nor a wait for a pool thread."""
+    clock = [0.0]
+    monkeypatch.setattr("mstar.api_server.data_worker.time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    read = worker.tensor_manager.get_tensor
+
+    def slow_read(uuid):
+        clock[0] += 100.0
+        return read(uuid)
+    worker.tensor_manager.get_tensor = slow_read
+    worker.enable_prof = True
+    _output(worker, "a", modality, [1])
+    worker.model.gate(1).set()
+    (chunk,) = _pass_until(worker, 1)
+    assert chunk.read_time == 0.0 and chunk.postprocess_s == 0.0

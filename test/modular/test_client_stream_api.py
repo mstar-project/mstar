@@ -20,7 +20,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from api_server_helpers import make_test_api_server  # noqa: E402
+from api_server_helpers import idle_poll, make_test_api_server  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -757,7 +757,9 @@ def test_an_append_after_the_model_ended_the_call_is_late_not_rejected(monkeypat
                 server.running = False
             return [messages.pop()] if messages else []
 
-        server.communicator = SimpleNamespace(get_all_new_messages=one_pass)
+        server.communicator = SimpleNamespace(
+            poll_for_messages=idle_poll, get_all_new_messages=one_pass,
+        )
         server.conductor_proc = None
         server._liveness_interval_s = 0.5
         server.running = True
@@ -1132,6 +1134,7 @@ def test_a_rejected_call_completing_meanwhile_leaves_delivery_running():
     ))] for rid in (call, other)]
 
     server.communicator = SimpleNamespace(
+        poll_for_messages=idle_poll,
         get_all_new_messages=lambda: batches.pop(0) if batches else [],
     )
     server.conductor_proc = None

@@ -28,7 +28,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import idle_poll, make_test_api_server
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _request_data
@@ -394,6 +394,7 @@ def _run_message_thread(s, pw, chunks=(), messages=(), until=lambda: True):
     pw.get_profile_updates = lambda: []
     pw.finished_reading = lambda rid, drained: None
     s.communicator = SimpleNamespace(
+        poll_for_messages=idle_poll,
         get_all_new_messages=lambda: [messages.pop(0)] if messages else [],
     )
     s.conductor_proc = None

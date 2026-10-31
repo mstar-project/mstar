@@ -455,6 +455,23 @@ def test_capture_cudnn_benchmark_covers_warmup_only(monkeypatch):
     assert warmups == [("tuned", True), ("plain", False), ("forward", False)]
     assert torch.backends.cudnn.benchmark is False
 
+    # A capture the plan sized runs no warm-up of its own: sizing ran its
+    # forwards, so the search is on there too, or the graph records cuDNN's
+    # heuristic picks (one bf16 conv of the Qwen3-TTS codec took 30x as long).
+    sized: list[tuple[str, bool]] = []
+
+    def sizer(name):
+        return lambda *args: sized.append((name, torch.backends.cudnn.benchmark)) or {}
+
+    runners = {name: SimpleNamespace(size_captures=sizer(name), size_lent_captures=sizer(name))
+               for name in ("tuned", "plain")}
+    monkeypatch.setattr(engine, "_device", torch.device("cuda"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 31))
+    engine._plan_captures(runners, {"tuned": {}, "plain": {}})
+    assert sized == [("tuned", True), ("plain", False)] * 2
+    assert torch.backends.cudnn.benchmark is False
+
 
 def test_compile_regions_are_compiled_and_warmed(monkeypatch):
     """A node's ``compile_regions`` are compiled by the engine, a module by its

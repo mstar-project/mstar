@@ -242,6 +242,10 @@ class FlashInferManager(AttentionManager):
         # decode wrappers never set one
         return getattr(self._current_plan_states[label], "_qo_indptr_buf", None)
 
+    # Eager as a whole: a break inside it leaves a compiled frame that holds the
+    # bucket's static token count beside its row count, which captured forwards
+    # recompile per prefill bucket until Dynamo's recompile limit.
+    @torch.compiler.disable
     def select_last_hidden(
         self, hidden: torch.Tensor, label: str="main"
     ) -> torch.Tensor:

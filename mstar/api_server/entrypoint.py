@@ -40,7 +40,7 @@ from mstar.api_server.auth import (
     warn_if_no_api_key,
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware
-from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.data_worker import PreprocessWorker, _positive_int, unlink_files
 from mstar.api_server.request_types import (
     APIServerMessage,
     ClientAppend,
@@ -478,6 +478,8 @@ class APIServer:
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
+        # the message thread's poll also wakes for the data worker's chunks
+        self.communicator.register_event_for_poll(self.preprocess_worker.output_ready)
 
         # Background thread that drains results from the conductor. Started by
         # finalize_setup() once the workers report ready — before that there's
@@ -1146,6 +1148,9 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if result_chunk.read_time is not None:
+                            req.profile.timing.last_output_read_time = result_chunk.read_time
+                        req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1198,11 +1203,13 @@ class APIServer:
                         sink.loop.call_soon_threadsafe(self._relay_chunks, sink, reqs)
                     except RuntimeError:
                         pass  # the loop is closed: its clients are gone
+                # wakes at once for a conductor or worker message, or a chunk
+                # from the data worker (PreprocessWorker.output_ready)
+                self.communicator.poll_for_messages(timeout_ms=1)
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-            time.sleep(0.001)
 
     # ----------------------------------------------------------
     # Streaming helper
@@ -1725,12 +1732,6 @@ class WarmupMedia:
                 f"cannot determine modality for warmup file {path!r}; set 'modality'"
             )
         return cls(path=path, modality=modality)
-
-
-def _positive_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    return value
 
 
 @dataclass

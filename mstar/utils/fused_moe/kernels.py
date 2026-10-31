@@ -325,6 +325,13 @@ def invoke_fused_moe_kernel(
 
     K = B.shape[2]
     even_Ks = (K % config["BLOCK_SIZE_K"]) == 0
+    if torch.compiler.is_compiling():
+        # The table lookup graph-breaks, so under a dynamic-shape compile the
+        # config enters this frame as an input whose ints dynamo makes symbols,
+        # and its Triton wrapper takes launch options only as constants. A
+        # traced launch keeps the tuned tiles with Triton's default warps and
+        # stages (within 1% on the tuned shapes); eager launches keep them all.
+        config = {k: v for k, v in config.items() if k not in ("num_warps", "num_stages")}
 
     fused_moe_kernel[grid](
         A,

@@ -24,7 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from api_server_helpers import make_test_api_server
+from api_server_helpers import idle_poll, make_test_api_server
 
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import (
@@ -183,7 +183,8 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
 def _api_server(messages):
     s = make_test_api_server(
         communicator=SimpleNamespace(
-            get_all_new_messages=lambda: messages.pop(0) if messages else []
+            poll_for_messages=idle_poll,
+            get_all_new_messages=lambda: messages.pop(0) if messages else [],
         ),
     )
     s.cleaned = []

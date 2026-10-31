@@ -5,6 +5,8 @@ the preprocess worker and opens sockets). A field __init__ sets but the helper
 misses would surface as an AttributeError in whichever test reaches it first,
 so this compares the two directly.
 """
+from types import SimpleNamespace
+
 import pytest
 from api_server_helpers import make_test_api_server
 
@@ -13,8 +15,10 @@ from mstar.api_server import entrypoint
 
 @pytest.fixture
 def real_server(monkeypatch, tmp_path):
-    monkeypatch.setattr(entrypoint, "PreprocessWorker", lambda **kwargs: object())
-    monkeypatch.setattr(entrypoint, "make_communicator", lambda **kwargs: object())
+    monkeypatch.setattr(entrypoint, "PreprocessWorker", lambda **kwargs: SimpleNamespace(output_ready=None))
+    monkeypatch.setattr(
+        entrypoint, "make_communicator", lambda **kwargs: SimpleNamespace(register_event_for_poll=lambda event: None),
+    )
     return entrypoint.APIServer(upload_dir=str(tmp_path / "uploads"))
 
 

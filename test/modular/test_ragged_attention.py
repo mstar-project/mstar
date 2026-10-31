@@ -216,19 +216,30 @@ def test_graph_replay_survives_a_poisoned_output_tail():
     """The kernel writes only the planned rows, and reads KV past
     ``cu_seqlens[-1]`` out to the last segment's tile boundary, masking that
     overread additively. Finite values die correctly but NaN/Inf survive
-    (NaN + -inf = NaN), so a poisoned tail would corrupt the last segment's
-    real rows. The wrapper owns the output buffer and re-zeros the tail on
-    every plan so no such value can be there.
+    (NaN + -inf = NaN), so a poisoned output tail, from which the next layer's
+    KV is built, would corrupt the last segment's real rows. The captured graph
+    zeros its output on every replay, so no such value can be there.
     """
     w = graph_wrapper()
     graph, static, out = capture_wrapper(w)
     seg_lens = [100, 60, 30, 0]
     total = sum(seg_lens)
 
-    w._out_buf[total:].fill_(float("nan"))
+    out.fill_(float("nan"))
     close(*replay(w, graph, static, out, seg_lens))
     assert torch.isfinite(out[:total]).all()
-    assert (w._out_buf[total:] == 0).all()
+    assert (out[total:] == 0).all()
+
+
+def test_strided_views_need_no_copy():
+    """q / k / v sliced out of one fused projection are read in place, with the
+    contiguous result."""
+    w, layout = wrapper(head_dim=128), cu([100, 60])
+    fused = torch.randn(160, 3 * HEADS * 128, dtype=DTYPE, device=DEVICE)
+    q, k, v = (t.view(160, HEADS, 128) for t in fused.chunk(3, dim=-1))
+    assert w._pad_head_dim(q) is q
+    w.plan(layout)
+    torch.testing.assert_close(w.run(q, k, v), w.run(q.contiguous(), k.contiguous(), v.contiguous()), rtol=0, atol=0)
 
 
 def test_graph_mode_pads_fewer_segments():

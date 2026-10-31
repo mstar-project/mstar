@@ -676,6 +676,107 @@ def _fused_filter_kernel(
     tl.store(out_ptr + row * stride_out + offs, out / tl.maximum(total, 1e-30), mask=valid)
 
 
+@triton.jit
+def _kth_largest_key(key, k, HI: tl.constexpr, ITERS: tl.constexpr):
+    """The largest ``t`` in ``[0, HI]`` with at least ``k`` entries of ``key`` >= t."""
+    lo = 0
+    hi = HI
+    for _ in range(ITERS):
+        mid = lo + (hi - lo + 1) // 2
+        ok = tl.sum((key >= mid).to(tl.int32), axis=0) >= k
+        lo = tl.where(ok, mid, lo)
+        hi = tl.where(ok, hi, mid - 1)
+    return lo
+
+
+@triton.jit
+def _fused_sample_kernel(
+    logits_ptr, temperature_ptr, top_k_ptr, top_p_ptr, seed_ptr, offset_ptr,
+    penalty_ptr, seen_ptr, out_ptr,
+    V, stride_l, seen_stride_b, seen_stride_v,
+    APPLY_PENALTY: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """One row's token, from its logits, in registers: the repetition penalty,
+    temperature softmax, top-k then top-p over the renormalised top-k
+    (FlashInfer's order), and an inverse-CDF draw from Philox at the row's
+    own (seed, offset), so a request draws the same token at any batch
+    position. Temperature 0 takes the argmax.
+
+    The cuts rank tokens by their probability's top 16 bits (bf16
+    precision, truncated): a search over 2^14 keys instead of 2^31, so
+    tokens within one bf16 step of the k-th probability are kept with it."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    valid = offs < V
+    x = tl.load(logits_ptr + row * stride_l + offs, mask=valid, other=-float("inf")).to(tl.float32)
+    if APPLY_PENALTY:
+        seen = tl.load(
+            seen_ptr + row * seen_stride_b + offs * seen_stride_v, mask=valid, other=0,
+        ).to(tl.int1)
+        x = _penalize(x, seen, tl.load(penalty_ptr + row))
+    temp = tl.load(temperature_ptr + row)
+    greedy = temp == 0
+    x_max, arg = tl.max(x, axis=0, return_indices=True)
+    inv_temp = tl.where(greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
+    # unnormalised: the largest is 1, so every key is at most 1.0's, 0x3F80
+    e = tl.where(valid, tl.exp((x - x_max) * inv_temp), 0.0)
+    key = e.to(tl.int32, bitcast=True) >> 16
+    k = tl.load(top_k_ptr + row)
+    t = 0
+    if k > 0:
+        if k < V:  # a branch, not tl.where: skip the search when nothing is cut
+            t = _kth_largest_key(key, k, 0x3F80, 14)
+    top_p = tl.load(top_p_ptr + row)
+    if top_p < 1.0:
+        # top-p keeps token i iff the mass strictly above it is < p * mass. That
+        # mass falls as i's key rises: search for the smallest key t' with
+        # mass(> t') < p * mass
+        target = top_p * tl.sum(tl.where(key >= t, e, 0.0), axis=0)
+        lo = t
+        hi = 0x3F80
+        for _ in range(14):
+            mid = lo + (hi - lo) // 2
+            ok = tl.sum(tl.where(key > mid, e, 0.0), axis=0) < target
+            hi = tl.where(ok, mid, hi)
+            lo = tl.where(ok, lo, mid + 1)
+        t = lo
+    q = tl.where(key >= t, e, 0.0)
+    # u in (0, mass]: the first token whose running mass reaches u, never one
+    # with no mass
+    u = (1.0 - tl.rand(tl.load(seed_ptr + row), tl.load(offset_ptr + row))) * tl.sum(q, axis=0)
+    drawn = tl.sum((tl.cumsum(q, axis=0) < u).to(tl.int32), axis=0)
+    drawn = tl.minimum(drawn, tl.max(tl.where(q > 0, offs, 0), axis=0))
+    tl.store(out_ptr + row, tl.where(greedy, arg, drawn).to(tl.int64))
+
+
+# Vocabularies up to this size draw in one ``_fused_sample_kernel`` launch, one
+# program per row holding the whole row; larger ones through FlashInfer.
+FUSED_SAMPLE_MAX_VOCAB = 4096
+
+
+def fused_sample(
+    logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
+    seed: torch.Tensor, offset: torch.Tensor,
+    rep_penalty: torch.Tensor | None = None, seen_tokens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``[B]`` int64 tokens drawn from ``logits [B, V]`` (V up to
+    ``FUSED_SAMPLE_MAX_VOCAB``) in one launch: the work of
+    ``fused_temperature_softmax`` plus FlashInfer's top-k/top-p draw, which
+    is a handful of launches of a few microseconds each at a small vocab.
+    Graph-safe."""
+    B, V = logits.shape
+    out = torch.empty(B, dtype=torch.int64, device=logits.device)
+    penalty = rep_penalty is not None and seen_tokens is not None
+    _fused_sample_kernel[(B,)](
+        logits, temperature, top_k, top_p, seed, offset,
+        rep_penalty if penalty else temperature, seen_tokens if penalty else logits, out,
+        V, logits.stride(0),
+        seen_tokens.stride(0) if penalty else 0, seen_tokens.stride(1) if penalty else 0,
+        APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V), num_warps=4 if V <= 2048 else 8,
+    )
+    return out
+
+
 def filter_top_k_top_p(
     probs: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     order: FilterOrder | None = None, fused: bool = True,
@@ -1515,9 +1616,16 @@ def sample_accelerator_graphable_gpu(
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    Routes through the fused Triton prep kernel (``fused_temperature_softmax``)
-    so the CUDA-graph path can apply the same sign-aware repetition penalty as
-    the regular ``Sampler``, then samples with
+    On CUDA, a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB`` without
+    ``min_p``, ``history`` or ``order`` draws in one ``fused_sample`` launch:
+    per-row seeds, so batch-invariant, but its cuts rank on bf16-truncated
+    keys (see ``_fused_sample_kernel``), and the eager ``Sampler`` path
+    (``_sample_cuda``) keeps FlashInfer, so for those vocabularies an eager
+    and a captured step draw differently for the same seed.
+
+    Otherwise it routes through the fused Triton prep kernel
+    (``fused_temperature_softmax``) so the CUDA-graph path can apply the same
+    sign-aware repetition penalty as the regular ``Sampler``, then samples with
     ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
     — the graph-safe variant that avoids CPU-seeded RNG paths). Greedy rows keep
     ``temperature == 0`` in the device buffer and the prep kernel turns them into
@@ -1569,6 +1677,14 @@ def sample_accelerator_graphable_gpu(
         import flashinfer
 
         with torch.cuda.device(logits.device):
+            if (
+                logits.shape[1] <= FUSED_SAMPLE_MAX_VOCAB and min_p is None
+                and history is None and order is None
+            ):
+                return fused_sample(
+                    logits, temperature, top_k, top_p, seed, offset,
+                    rep_penalty if apply_penalty else None, seen_tokens if apply_penalty else None,
+                )
             probs = fused_temperature_softmax(
                 logits, temperature,
                 penalty=rep_penalty if apply_penalty else None,
@@ -1581,12 +1697,13 @@ def sample_accelerator_graphable_gpu(
             if _needs_explicit_filter(history, order):
                 return _filter_floor_and_draw(probs, top_k, top_p, seed, offset, history, order).to(torch.int64)
             top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-            # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
+            # NOTE: this FlashInfer path (not ``fused_sample``'s) is NOT
+            # batch-invariant. FlashInfer reads only row 0's seed
             # and offset and folds the row index into philox, so identical (probs,
             # seed, offset) yield different tokens at different batch positions.
             # Sampling is thus reproducible only within a fixed batch layout; under
             # continuous batching (shifting positions) a request's stream is not.
-            # Measured in test/sampling_test/flashinfer_batch_test.py.
+            # Measured in test/sampling_test/flashinfer_batch_test.py (raw FlashInfer).
             samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
                 probs, top_k, top_p, deterministic=True,
                 seed=seed, offset=offset,

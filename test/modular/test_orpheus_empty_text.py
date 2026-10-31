@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import torch
-from api_server_helpers import make_test_api_server
+from api_server_helpers import idle_poll, make_test_api_server
 from test_request_id_reuse import _Socket, _TensorManager
 
 from mstar.api_server import entrypoint
@@ -81,7 +81,7 @@ class _Server:
         facade.received_chunk_counts = {}
         facade.per_request_reading_tensors = {}
         self.api = make_test_api_server(preprocess_worker=facade, model=worker.model, model_name="orpheus")
-        self.api.communicator = SimpleNamespace(get_all_new_messages=lambda: [])
+        self.api.communicator = SimpleNamespace(poll_for_messages=idle_poll, get_all_new_messages=lambda: [])
         self.api.conductor_proc = None
         self.api._liveness_interval_s = 0.5
         self.api.running = True

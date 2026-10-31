@@ -67,6 +67,9 @@ class _StubComm:
     def send(self, entity_id, msg):
         self.sent.append((entity_id, msg))
 
+    def poll_for_messages(self, timeout_ms=1):
+        return bool(self.batches)
+
     def get_all_new_messages(self):
         return self.batches.popleft() if self.batches else []
 

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from api_server_helpers import idle_poll
 
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorker
 from mstar.api_server.request_types import ResultTensors, ResultTokens
@@ -253,6 +254,8 @@ class _ScriptedApiComm:
     def __init__(self, server, batches, req):
         self.server, self.batches, self.req = server, list(batches), req
         self.released_before = []
+
+    poll_for_messages = staticmethod(idle_poll)
 
     def get_all_new_messages(self):
         self.released_before.append(self.req.event.is_set())

@@ -203,6 +203,8 @@ class RaggedBlockCausalWrapper:
         As with the ragged wrapper, rows past the planned total are not a
         valid result; the caller slices.
         """
+        # q/k/v padded by the caller come back padded
+        padded_in = q.shape[-1] == self.padded_head_dim
         qp, kp, vp = (self._pad_head_dim(t.to(self.q_data_type)) for t in (q, k, v))
         # each token is a page of one: [num_pages, page_size=1, H, D]
         kv = (kp.unsqueeze(1), vp.unsqueeze(1))
@@ -215,6 +217,6 @@ class RaggedBlockCausalWrapper:
                 f"{self.max_total_tokens} this graph-mode wrapper was built for"
             )
             out = self.attn_wrapper.run(qp, kv, out=self._out_buf[:n])
-        if self.padded_head_dim != self.head_dim:
+        if self.padded_head_dim != self.head_dim and not padded_in:
             return out[..., : self.head_dim].contiguous()
         return out.clone() if self._out_buf is not None else out

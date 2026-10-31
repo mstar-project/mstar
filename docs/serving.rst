@@ -340,6 +340,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Largest message, in KiB, the non-NCCL path takes;
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
+   * - ``preprocess_workers``
+     - *(optional)* Requests whose media load and ``process_prompt`` the API server
+       runs at once, on a thread pool: a positive integer, default
+       ``Model.PREPROCESS_WORKERS``. A model class sets that above 1 only when its
+       ``load_*`` and ``process_prompt`` are thread-safe, so a value above 1 for a
+       class that leaves it at 1 fails at startup, as does a value that is not a
+       positive integer. 1 prepares one request at a time on the data-worker thread.
+       Requests are still handed to the conductor in arrival order.
    * - ``api_switch_interval_s``
      - *(optional)* GIL switch interval of the API server process, in seconds
        (``sys.setswitchinterval``), a positive number; an explicit ``null`` keeps
@@ -897,10 +905,10 @@ work.
   route and long transcriptions send WAV files they write from the decoded audio, so
   those count the WAV sizes. Requests refused before they were submitted (an oversized
   body, a bad form) are not counted.
-- ``mstar_data_worker_queue_depth{model_name}``: gauge, read at scrape time, requests
-  submitted and not yet taken up by the data worker (the one it is working on is not
-  counted). A request whose client went away still counts until the data worker takes
-  it up.
+- ``mstar_data_worker_queue_depth{model_name}``: gauge, read at scrape time, inputs
+  (requests and client-stream appends) waiting in the data worker: submitted, and
+  neither being prepared nor handed on to the conductor yet. One whose client went away
+  still counts until its turn comes and it is dropped.
 
 .. code-block:: bash
 

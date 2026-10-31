@@ -11,9 +11,18 @@ Import it by module name (``from api_server_helpers import ...``): on CI the
 stdlib ``test`` package shadows the repo's ``test/`` directory.
 """
 import tempfile
+import time
 from pathlib import Path
 
 from mstar.api_server.entrypoint import APIServer
+
+
+def idle_poll(timeout_ms: int = 1) -> bool:
+    """``poll_for_messages`` for a stand-in transport with nothing queued: it
+    waits out the timeout as the socket's poll does, so an API server message
+    loop on a thread doesn't spin on the GIL."""
+    time.sleep(timeout_ms / 1000)
+    return False
 
 
 def make_test_api_server(**overrides) -> APIServer:

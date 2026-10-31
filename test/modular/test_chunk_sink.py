@@ -4,7 +4,7 @@ The Rust-frontend bridge relays every chunk the message thread drained in a
 pass as one message, instead of each request's handler waking per chunk.
 The handler still owns completion, errors and the timeout."""
 import asyncio
-import types
+import sys
 
 import pytest
 from api_server_helpers import make_test_api_server
@@ -12,6 +12,7 @@ from api_server_helpers import make_test_api_server
 from mstar.api_server import entrypoint as ep
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import ResultChunk
+from mstar.profile.format import RequestProfile
 
 
 class _PreprocessWorker:
@@ -45,8 +46,17 @@ class _PreprocessWorker:
 
 
 class _Comm:
+    """Ends ``_process_messages`` after one pass, at its end-of-pass wait."""
+
+    def __init__(self):
+        self.server = None
+
     def get_all_new_messages(self):
         return []
+
+    def poll_for_messages(self, timeout_ms=1):
+        self.server.running = False
+        return False
 
 
 class _Sink:
@@ -59,16 +69,16 @@ class _Sink:
 
 
 def _server():
-    return make_test_api_server(preprocess_worker=_PreprocessWorker(), communicator=_Comm())
+    comm = _Comm()
+    comm.server = make_test_api_server(preprocess_worker=_PreprocessWorker(), communicator=comm)
+    return comm.server
 
 
 def _register(server, key):
     req = PendingRequest(
         streaming=True, input_modalities=["text"], output_modalities=["text"], profile=None,
     )
-    req.profile = types.SimpleNamespace(timing=types.SimpleNamespace(
-        first_chunk_time=None, last_chunk_time=None,
-    ))
+    req.profile = RequestProfile(rid=key)
     server.pending_requests[key] = req
     server._live[key] = key
     server._client_ids[key] = key
@@ -80,15 +90,15 @@ def _chunk(key, data, modality="text", **metadata):
 
 
 def _one_pass(server, monkeypatch):
-    """``_process_messages`` for one pass: its end-of-pass sleep stops it."""
-    shim = types.SimpleNamespace(
-        monotonic=ep.time.monotonic, time=ep.time.time, perf_counter=ep.time.perf_counter,
-        sleep=lambda _s: setattr(server, "running", False),
-    )
-    monkeypatch.setattr(ep, "time", shim)
-    server.running = True
-    server._process_messages()
-    monkeypatch.undo()
+    """``_process_messages`` for one pass: its end-of-pass wait stops it. An
+    error in the pass is raised here instead of logged and the pass retried."""
+    def reraise(*_args, **_kwargs):
+        raise sys.exception()
+
+    with monkeypatch.context() as m:
+        m.setattr(ep.logger, "exception", reraise)
+        server.running = True
+        server._process_messages()
 
 
 def test_a_pass_hands_the_sink_every_request_s_chunks_in_one_call(monkeypatch):

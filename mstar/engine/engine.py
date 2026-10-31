@@ -99,6 +99,16 @@ _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
 
 
+@contextmanager
+def _capture_scope(submodule_mgmt) -> Iterator[None]:
+    """The node's fp32 precision, and ``torch.backends.cudnn.benchmark`` on
+    when it asks (``NodeSubmodule.capture_cudnn_benchmark``): the kernels a
+    capture (and the compile inside it) picks are what every replay runs."""
+    with fp32_precision_scope(submodule_mgmt.fp32_precision), \
+            cudnn_benchmark(submodule_mgmt.submodule.capture_cudnn_benchmark):
+        yield
+
+
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -750,11 +760,7 @@ class Engine:
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = ag_runners[node_name]
-            benchmark = submodule_mgmt.submodule.capture_cudnn_benchmark
-            # the kernels a capture (and the compile inside it) picks are what
-            # every replay runs, so it happens under the node's precision
-            with self._capture_into(plan, node_name) as planned, \
-                    fp32_precision_scope(submodule_mgmt.fp32_precision), cudnn_benchmark(benchmark):
+            with self._capture_into(plan, node_name) as planned, _capture_scope(submodule_mgmt):
                 runner.warmup_and_capture(planned)
             if plan is not None or runner.any_graphs:
                 submodule_mgmt.capture_runner = runner
@@ -764,7 +770,7 @@ class Engine:
             captured: dict[str, PiecewiseAcceleratorGraphRunner] = {}
             with self._capture_into(plan, f"{node_name} piecewise") as planned:
                 for label, pw_runner in piecewise[node_name].items():
-                    with fp32_precision_scope(submodule_mgmt.fp32_precision), cudnn_benchmark(benchmark):
+                    with _capture_scope(submodule_mgmt):
                         pw_runner.warmup_and_capture(
                             None if planned is None else {bucket for region, bucket in planned if region == label}
                         )
@@ -817,8 +823,9 @@ class Engine:
             """A plan over what ``size`` says each runner's buckets cost."""
             pools: dict[str, dict] = {}
             for node_name, submodule_mgmt in self._submodules.items():
-                # sizing runs the forwards and captures, so under the node's precision too
-                with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                # sizing runs the forwards and captures (a sized capture runs none of its own),
+                # so under the node's precision and cuDNN search too
+                with _capture_scope(submodule_mgmt):
                     pools[node_name] = size(ag_runners[node_name])
                     # one pool for all of a node's regions (see `_build_piecewise_runners`)
                     pools[f"{node_name} piecewise"] = {
@@ -1185,7 +1192,7 @@ class Engine:
             self._runner.after_output_copy(batch.committed)
 
     def extend_prefix_chains(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
     ) -> None:
         """Key what this step generated, from the stop check's host copy."""
@@ -1205,7 +1212,7 @@ class Engine:
             return
         for rid in batch.request_ids:
             per_rid = outputs.get(rid)
-            if isinstance(per_rid, dict):
+            if isinstance(per_rid, Mapping):
                 self._runner.extend_prefix_chains(
                     rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
                     keys=keys,
@@ -1483,11 +1490,14 @@ class Engine:
     def _exec_per_request(
         self, batch: ExecutingBatch
     ) -> dict[str, NameToTensorList]:
-        """Full step cycle per request, eager (no lease), outputs merged.
+        """Full step cycle per request, without a whole-forward lease, outputs merged.
 
-        The unbatchable fallback: no capture applies (a lease would have set
-        ``running_batched``), so each request declares/admits/plans/commits on
-        its own, keeping the plan matched to its single-request forward.
+        The unbatchable fallback: no whole-forward capture applies (a lease
+        would have set ``running_batched``), so each request declares/admits/
+        plans/commits on its own, keeping the plan matched to its
+        single-request forward. Each request still takes its own
+        piecewise-region leases in ``_declare_and_admit``, so a captured inner
+        loop can replay per request.
         """
         nvtx = self._enable_nvtx
         submodule_mgmt = self._submodules[batch.node_name]
@@ -1928,7 +1938,7 @@ class Engine:
         return outputs
 
     def check_stop_for_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
         """Each rid's ``submodule.check_stop``, as rid -> loops that should stop.

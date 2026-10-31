@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import idle_poll, make_test_api_server
 from fastapi import HTTPException
 
 from mstar.api_server.entrypoint import DeadConductorError, PendingRequest
@@ -95,7 +95,7 @@ def _conductor(procs, inbox=()):
     c.sent = []
     c.communicator = SimpleNamespace(
         send=lambda entity, msg: c.sent.append((entity, msg)),
-        get_all_new_messages=_inbox(inbox),
+        poll_for_messages=lambda timeout_ms=1: False, get_all_new_messages=_inbox(inbox),
     )
     c.worker_ids = [f"worker_{i}" for i in range(len(procs))]
     c._worker_processes = list(procs)
@@ -329,7 +329,7 @@ def _api_server(conductor_proc, inbox=()):
     server = make_test_api_server(
         conductor_proc=conductor_proc,
         _liveness_interval_s=0.0,
-        communicator=SimpleNamespace(get_all_new_messages=_inbox(inbox)),
+        communicator=SimpleNamespace(poll_for_messages=idle_poll, get_all_new_messages=_inbox(inbox)),
         preprocess_worker=SimpleNamespace(
             get_profile_updates=lambda: [], get_result_chunks=lambda: []
         ),
@@ -364,6 +364,24 @@ def test_message_loop_runs_while_the_conductor_lives():
     server.running = False
     thread.join(timeout=5)
     assert not thread.is_alive()
+    assert server.fatal_error is None
+
+
+def test_a_failed_message_wait_does_not_end_the_message_loop():
+    """A transport error from the idle wait is a failed pass, not the end of
+    the thread that delivers every request's results."""
+    server = _api_server(_Proc(5))
+    waits = []
+
+    def poll(timeout_ms=1):
+        waits.append(timeout_ms)
+        if len(waits) == 1:
+            raise RuntimeError("socket closed")
+        server.running = False
+        return False
+    server.communicator.poll_for_messages = poll
+    server._process_messages()
+    assert len(waits) == 2
     assert server.fatal_error is None
 
 

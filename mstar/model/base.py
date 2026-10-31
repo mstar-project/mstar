@@ -460,6 +460,13 @@ class Model(ABC):
     # either. See ``entrypoint._set_switch_interval``.
     API_SWITCH_INTERVAL_S: float | None = None
 
+    # Requests whose media load and ``process_prompt`` the API server runs at
+    # once, on a thread pool. 1 runs them inline on the data worker thread, one
+    # at a time. Above 1, ``load_*`` and ``process_prompt`` must be thread-safe,
+    # and ``preprocess_workers`` in the serving config may resize the pool; at 1
+    # the config cannot add one.
+    PREPROCESS_WORKERS: int = 1
+
     def _get_worker_graphs_for_graph_walk(
         self,
         graph_walk: str,

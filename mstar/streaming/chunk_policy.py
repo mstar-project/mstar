@@ -247,7 +247,9 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
     up to ``left_context`` already-delivered items in front of them, so a
     causal decoder can warm up on frames it has processed before. Unlike
     ``LeftContextChunkPolicy`` the first chunk may be smaller than the
-    context: the context is whatever has been delivered so far, capped.
+    context: the context is whatever has been delivered so far, capped at
+    ``left_context``, except a first chunk's primed context (``prime``),
+    which may exceed it.
 
     Example (Qwen3-TTS, 12 Hz frames): ``schedule=(4, 8, 16)``, ``chunk=25``,
     ``left_context=25`` pops windows of 4, 4+8, 12+16, 25+25, 25+25, ...
@@ -270,11 +272,11 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
         self._delivered = 0  # new items handed to the consumer so far
 
     def prime(self, context_items: int) -> None:
-        if not 0 <= context_items <= self._left_context or self._chunks_popped:
-            raise ValueError(
-                f"can prime 0..{self._left_context} context items before the first chunk, "
-                f"got {context_items}"
-            )
+        """The first chunk leads with ``context_items`` context-only items, however
+        many ``left_context`` allows later chunks (a stateful consumer warms up
+        on them once and needs no context after)."""
+        if context_items < 0 or self._chunks_popped:
+            raise ValueError(f"can prime context items only before the first chunk, got {context_items}")
         self._delivered = context_items
 
     def _new_items(self) -> int:
@@ -283,6 +285,8 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
         return self._chunk
 
     def _context(self) -> int:
+        if not self._chunks_popped:
+            return self._delivered   # what was primed
         return min(self._left_context, self._delivered)
 
     def is_ready(self, buffer_len: int) -> bool:
