@@ -7,6 +7,7 @@ import contextlib
 import itertools
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import re
@@ -817,7 +818,12 @@ class APIServer:
     def _retire(self, key: str) -> None:
         """Forget ``key``'s request_id once neither dict holds the key.
         Caller holds ``request_lock``."""
-        if key in self.pending_requests or key in self.recently_completed:
+        if key in self.recently_completed:
+            if key not in self.pending_requests:
+                # its client let go: the message thread's prune releases it
+                self._wake_message_loop()
+            return
+        if key in self.pending_requests:
             return
         request_id = self._client_ids.pop(key, None)
         if request_id is not None and self._live.get(request_id) == key:
@@ -924,6 +930,7 @@ class APIServer:
             # it; the result thread reads the data worker's bookkeeping for
             # it until then.
             self.recently_completed[key] = time.time()
+            self._wake_message_loop()  # its TTL starts now
         req.notify()
         self.preprocess_worker.forward_abort(key)
         return True
@@ -932,9 +939,13 @@ class APIServer:
     # Result collection (background thread)
     # ----------------------------------------------------------
 
-    def _prune_recently_completed(self) -> None:
+    def _prune_recently_completed(self) -> float | None:
+        """Release the finished requests whose outputs are all delivered, or
+        whose client let go, and fail the ones past the delivery TTL. Returns
+        when the TTL of the oldest one kept runs out (``time.time``)."""
         now = time.time()
         stale = []
+        oldest = None
         for rid, ts in self.recently_completed.items():
             # The client handler pops pending_requests on its own timeout (and
             # a streaming client after its final flush), so the entry can be
@@ -952,6 +963,8 @@ class APIServer:
                 stale.append((rid, False, drained))
             elif (now - ts) >= self._recently_completed_ttl:
                 stale.append((rid, True, drained))
+            elif oldest is None or ts < oldest:
+                oldest = ts
         for rid, lost_outputs, drained in stale:
             # only set the event when there are no more pending chunks
             req = self.pending_requests.get(rid)
@@ -989,6 +1002,7 @@ class APIServer:
             self.preprocess_worker.finished_reading(rid, drained=drained)
             self.recently_completed.pop(rid, None)
             self._retire(rid)
+        return None if oldest is None else oldest + self._recently_completed_ttl
 
     def _process_messages(self) -> None:
         """Drain the ZMQ pull socket and route results to pending requests.
@@ -996,6 +1010,7 @@ class APIServer:
         request is failed and the HTTP server is told to stop."""
         self.pin_result_thread()
         next_liveness_check = 0.0
+        self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -1004,11 +1019,8 @@ class APIServer:
                 if exited is not None:
                     self._fail_pending_for_dead_conductor(exited)
                     return
+            next_expiry = None
             try:
-                with self.request_lock:
-                    if len(self.recently_completed) > 0:
-                        self._prune_recently_completed()
-
                 for message in self.communicator.get_all_new_messages():
                     if not isinstance(message, APIServerMessage):
                         logger.warning("Unexpected message type: %s", type(message))
@@ -1225,11 +1237,30 @@ class APIServer:
                         sink.loop.call_soon_threadsafe(self._relay_chunks, sink, reqs)
                     except RuntimeError:
                         pass  # the loop is closed: its clients are gone
+                # Last, so a request whose final chunk or completion came in
+                # this pass is released in this pass.
+                with self.request_lock:
+                    if self.recently_completed:
+                        next_expiry = self._prune_recently_completed()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-            time.sleep(0.001)
+                # the prune may not have run: the next pass goes after the back-off
+                next_expiry = time.time()
+            # Everything else that changes what a pass reads signals the poll:
+            # a message, the data worker's flush (``ResultQueue``) and a
+            # request handler (``_wake_message_loop``). Only the liveness
+            # check and the delivery TTL are on a timer.
+            wait_s = next_liveness_check - time.monotonic()
+            if next_expiry is not None:
+                wait_s = min(wait_s, next_expiry - time.time())
+            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+
+    def _wake_message_loop(self) -> None:
+        """End the message thread's wait: a request handler changed what its
+        next pass reads."""
+        self.preprocess_worker.results_wakeup.signal()
 
     # ----------------------------------------------------------
     # Streaming helper
@@ -1714,6 +1745,7 @@ class APIServer:
     def cleanup(self) -> None:
         self.preprocess_worker.shutdown()
         self.running = False
+        self._wake_message_loop()
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
 

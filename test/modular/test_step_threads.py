@@ -782,15 +782,16 @@ def test_bare_threads_are_refused_under_mstar_only(path, flagged):
 
 @needs_affinity
 def test_the_api_message_thread_and_the_bridge_move_to_the_result_cpu(monkeypatch):
-    from api_server_helpers import make_test_api_server
+    from api_server_helpers import StandInSocket, make_test_api_server
 
     from mstar.api_server.rust_frontend import RustFrontendBridge
+    from mstar.communication.event import EventWakeup
 
     allowed, cpu = _two_cpus()
     exited = SimpleNamespace(pid=5, is_alive=lambda: False, exitcode=1)
     server = make_test_api_server(
         conductor_proc=exited, _liveness_interval_s=0.0, _result_cpu=cpu, _process_cpus=allowed,
-        communicator=SimpleNamespace(get_all_new_messages=list),
+        communicator=StandInSocket(), preprocess_worker=SimpleNamespace(results_wakeup=EventWakeup()),
     )
     seen = {}
 

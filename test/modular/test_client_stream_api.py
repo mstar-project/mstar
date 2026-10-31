@@ -20,12 +20,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from api_server_helpers import make_test_api_server  # noqa: E402
+from api_server_helpers import StandInSocket, make_test_api_server  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server import entrypoint  # noqa: E402
-from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
+from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue  # noqa: E402
 from mstar.api_server.entrypoint import PendingRequest  # noqa: E402
 from mstar.api_server.request_types import (  # noqa: E402
     APIServerMessage,
@@ -33,6 +33,7 @@ from mstar.api_server.request_types import (  # noqa: E402
     PreprocessInput,
     RequestComplete,
 )
+from mstar.communication.event import EventWakeup  # noqa: E402
 from mstar.graph.base import TensorPointerInfo  # noqa: E402
 from mstar.model.base import TensorAndMetadata  # noqa: E402
 from mstar.profile.format import RequestProfile, RequestTiming  # noqa: E402
@@ -132,9 +133,10 @@ def _thread(model=None, is_pending=None, model_config=None):
     sent = []
     tm = _TensorManager()
     queues = {name: queue.Queue() for name in (
-        "in_queue", "result_tensor_queue", "out_queue", "profile_queue", "cleanup_request_queue",
+        "in_queue", "result_tensor_queue", "cleanup_request_queue",
         "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
     )}
+    queues["out_queue"], queues["profile_queue"] = ResultQueue(EventWakeup()), ResultQueue(EventWakeup())
     wt = PreprocessWorkerThread(
         **queues, stop_event=threading.Event(),
         communicator=SimpleNamespace(
@@ -442,6 +444,7 @@ def test_items_the_model_routes_to_an_ended_stream_are_late_and_neither_charged_
 
 class _RecordingPreprocess:
     def __init__(self):
+        self.results_wakeup = EventWakeup()
         self.items = []
         self.aborted = []
 
@@ -757,7 +760,7 @@ def test_an_append_after_the_model_ended_the_call_is_late_not_rejected(monkeypat
                 server.running = False
             return [messages.pop()] if messages else []
 
-        server.communicator = SimpleNamespace(get_all_new_messages=one_pass)
+        server.communicator = StandInSocket(one_pass)
         server.conductor_proc = None
         server._liveness_interval_s = 0.5
         server.running = True
@@ -1119,6 +1122,7 @@ def test_a_rejected_call_completing_meanwhile_leaves_delivery_running():
                  "reads_done_queue", "output_queue", "profile_queue"):
         setattr(facade, name, _queue.Queue())
     facade._signal = lambda: None
+    facade.results_wakeup = EventWakeup()
     facade.per_request_reading_tensors, facade.received_chunk_counts = {}, {}
     server = _server()
     server.preprocess_worker = facade
@@ -1131,9 +1135,7 @@ def test_a_rejected_call_completing_meanwhile_leaves_delivery_running():
         conductor_finish_time=0.0,
     ))] for rid in (call, other)]
 
-    server.communicator = SimpleNamespace(
-        get_all_new_messages=lambda: batches.pop(0) if batches else [],
-    )
+    server.communicator = StandInSocket(lambda: batches.pop(0) if batches else [])
     server.conductor_proc = None
     server._liveness_interval_s = 0.5
     server.running = True
