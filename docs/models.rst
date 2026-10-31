@@ -407,7 +407,9 @@ requests); the KV cache gains one layer for the head. The ``mtp3`` configs verif
 greedily and refuse ``temperature > 0``; the ``mtp2`` ones set ``spec_sampling:
 true`` and also sample (temperature, ``top_p``, ``top_k``; a second decode capture),
 seeded by the request but not reproducing the plain path's draws. Neither takes
-``repetition_penalty``. They need
+``repetition_penalty``. ``model_kwargs: {draft_head: fp8}`` reads the drafts from an
+fp8 copy of ``lm_head`` (AMD GPUs, one rank), which trades a little acceptance for
+a cheaper step; the verify always reads the full head. They need
 AITER's attention (device-side KV lengths) and are checked on text prompts. See "Speculative decoding" in :doc:`adding_models` for the design.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
