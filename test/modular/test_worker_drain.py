@@ -456,6 +456,7 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
     w.engine_manager.engine = SimpleNamespace(publisher_nodes={})
     w.tensor_manager.register_request = lambda rid, cfg: None
     w.tensor_manager.start_read_tensors = lambda rid, inputs, graph_walk: []
+    w.scheduler.note_arrival = lambda rid: None
 
     Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
     assert not _reads_done(w)
