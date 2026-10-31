@@ -8,6 +8,8 @@ import json
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+from mstar.model.components.qwen_vision import QwenVisionConfig
+
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
@@ -29,59 +31,9 @@ SAMPLER = "sampler"
 VISION_ATTN = "vision_attn"
 
 
-@dataclass
-class Qwen3_5VisionConfig:
-    """The ViT tower's own config, read off ``config.json``'s ``vision_config``."""
-
-    depth: int
-    hidden_size: int
-    intermediate_size: int
-    num_heads: int
-    in_channels: int
-    patch_size: int
-    temporal_patch_size: int
-    spatial_merge_size: int
-    num_position_embeddings: int
-    out_hidden_size: int
-
-    hidden_act: str = "gelu_pytorch_tanh"
-    rope_theta: float = 10_000.0
-    # Kept only so a checkpoint that sets it fails loudly: `[]` on every
-    # released size and unread by transformers' Qwen3.5 (live in Qwen3-VL).
-    deepstack_visual_indexes: tuple[int, ...] = ()
-
-    @property
-    def head_dim(self) -> int:
-        return self.hidden_size // self.num_heads
-
-    @property
-    def num_grid_per_side(self) -> int:
-        """The learned position table is a square grid."""
-        return int(self.num_position_embeddings**0.5)
-
-    @property
-    def merge_unit(self) -> int:
-        return self.spatial_merge_size**2
-
-    @classmethod
-    def from_hf(cls, path: str | Path) -> "Qwen3_5VisionConfig":
-        config = cls.from_hf_or_none(path)
-        if config is None:
-            raise ValueError(f"{path} has no `vision_config`")
-        return config
-
-    @classmethod
-    def from_hf_or_none(cls, path: str | Path) -> "Qwen3_5VisionConfig | None":
-        """None when the checkpoint is text-only."""
-        path = Path(path)
-        if path.is_dir():
-            path = path / "config.json"
-        raw = json.loads(path.read_text()).get("vision_config")
-        if raw is None:
-            return None
-        merged = {**raw, **raw.get("rope_parameters", {})}
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in merged.items() if k in known})
+# The ViT tower's config is the shared Qwen one (read off ``config.json``'s
+# ``vision_config``); Qwen3.5 refuses deepstack in ``Qwen3_5VisionModel``.
+Qwen3_5VisionConfig = QwenVisionConfig
 
 
 @dataclass

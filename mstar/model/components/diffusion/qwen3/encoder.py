@@ -5,7 +5,10 @@ a Qwen3 language model (klein: layers 9/18/27 of Qwen3-4B/8B concatenated), not 
 its logits. This module is that encoder built from M*'s transformer components:
 ``DecoderLayer`` + ``GatedMLP`` + an HF-order RMSNorm with a GQA attention that carries
 per-head q/k RMSNorm and plain RoPE, run only through the deepest tapped layer
-(klein skips the last quarter of the LM).
+(klein skips the last quarter of the LM). MiniMax-H3 taps layer 50 of Qwen3-VL-32B's
+language model the same way (``Qwen3EncoderConfig.from_qwen3_vl``); a prompt with images
+comes in through ``vl_prompt.qwen3_vl_prompt``, which hands ``forward`` the spliced
+embeddings, the 3-D MRoPE tables and the deepstack features.
 
 Prompts arrive right-padded to one length (the pipelines pad to
 ``max_sequence_length`` and feed every position, pad tokens included, to the
@@ -78,6 +81,10 @@ class Qwen3EncoderConfig:
     # Pipeline recipe (Flux2KleinPipeline.encode_prompt defaults).
     hidden_state_layers: tuple[int, ...] = (9, 18, 27)
     max_sequence_length: int = 512
+    # One q/k/v GEMM, or three as transformers runs them. cuBLAS may pick another kernel
+    # for the fused shape, and then k and v differ from the reference's in the last bit
+    # (Qwen3-VL-32B's 1024-wide k/v do; Qwen3-4B/8B's don't).
+    fused_qkv: bool = True
 
     def __post_init__(self):
         if not self.hidden_state_layers or min(self.hidden_state_layers) < 1:
@@ -121,6 +128,26 @@ class Qwen3EncoderConfig:
             **overrides,
         )
 
+    @classmethod
+    def from_qwen3_vl(cls, cfg: dict, **overrides) -> "Qwen3EncoderConfig":
+        """The language model of a Qwen3-VL checkpoint (its ``config.json``, which nests
+        it under ``text_config``).
+
+        Qwen3-VL rotates with interleaved MRoPE. A text token sits at the same position
+        on all three axes, so interleaving selects among three identical angle rows and
+        its rotation equals plain RoPE bit for bit: the encoder's own tables serve a
+        text-only prompt. A prompt with images brings its 3-D tables
+        (``vl_prompt.qwen3_vl_prompt``)."""
+        text = cfg.get("text_config", cfg)
+        if text.get("model_type") not in (None, "qwen3_vl_text"):
+            raise NotImplementedError(f"text model_type {text.get('model_type')!r} is not Qwen3-VL's")
+        rope = text.get("rope_scaling") or text.get("rope_parameters") or {}
+        if rope.get("rope_type", "default") != "default" or not rope.get("mrope_interleaved", True):
+            raise NotImplementedError(f"Qwen3-VL rope {rope!r}: only default interleaved MRoPE is supported")
+        theta = text.get("rope_theta", rope.get("rope_theta", 5_000_000.0))
+        plain = {k: v for k, v in text.items() if k not in ("model_type", "rope_scaling", "rope_parameters")}
+        return cls.from_dict({**plain, "rope_theta": theta}, **overrides)
+
 
 class Qwen3RMSNorm(nn.Module):
     """RMSNorm in the HF ``Qwen3RMSNorm`` rounding order: normalize in fp32, round to the
@@ -141,18 +168,24 @@ class Qwen3RMSNorm(nn.Module):
 
 
 class Qwen3EncoderAttention(nn.Module):
-    """GQA self-attention with per-head q/k RMSNorm (Qwen3), fused qkv GEMM, masked SDPA."""
+    """GQA self-attention with per-head q/k RMSNorm (Qwen3), fused (or HF's three) q/k/v
+    GEMMs, masked SDPA."""
 
     def __init__(
         self, hidden_size: int, num_heads: int, num_kv_heads: int, head_dim: int, eps: float, rope_theta: float,
+        fused_qkv: bool = True,
     ):
         super().__init__()
         self.num_heads, self.num_kv_heads, self.head_dim = num_heads, num_kv_heads, head_dim
         self.rope_theta = rope_theta
-        self.qkv_proj = FusedColumnLinear(
-            hidden_size, {"q": num_heads * head_dim, "k": num_kv_heads * head_dim, "v": num_kv_heads * head_dim},
-            bias=False,
-        )
+        sizes = {"q": num_heads * head_dim, "k": num_kv_heads * head_dim, "v": num_kv_heads * head_dim}
+        if fused_qkv:
+            self.qkv_proj = FusedColumnLinear(hidden_size, sizes, bias=False)
+        else:
+            self.qkv_proj = None
+            self.q_proj, self.k_proj, self.v_proj = (
+                nn.Linear(hidden_size, size, bias=False) for size in sizes.values()
+            )
         self.o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
         self.q_norm = Qwen3RMSNorm(head_dim, eps=eps)
         self.k_norm = Qwen3RMSNorm(head_dim, eps=eps)
@@ -162,10 +195,13 @@ class Qwen3EncoderAttention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq, _ = hidden_states.shape
-        q, k, v = self.qkv_proj(hidden_states).split(
-            [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim],
-            dim=-1,
-        )
+        if self.qkv_proj is None:
+            q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+        else:
+            q, k, v = self.qkv_proj(hidden_states).split(
+                [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim],
+                dim=-1,
+            )
         q = self.q_norm(q.view(batch, seq, self.num_heads, self.head_dim)).transpose(1, 2)
         k = self.k_norm(k.view(batch, seq, self.num_kv_heads, self.head_dim)).transpose(1, 2)
         v = v.view(batch, seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -203,6 +239,7 @@ class Qwen3HiddenStateEncoder(nn.Module):
         rms_norm_eps: float,
         rope_theta: float,
         tap_layers: tuple[int, ...],
+        fused_qkv: bool = True,
     ):
         super().__init__()
         if min(tap_layers) < 1:
@@ -213,7 +250,7 @@ class Qwen3HiddenStateEncoder(nn.Module):
         self.layers = nn.ModuleList(
             DecoderLayer(
                 self_attn=Qwen3EncoderAttention(
-                    hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps, rope_theta,
+                    hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps, rope_theta, fused_qkv,
                 ),
                 mlp=GatedMLP(hidden_size, intermediate_size, activation="silu", bias=False),
                 input_layernorm=Qwen3RMSNorm(hidden_size, eps=rms_norm_eps),
@@ -226,25 +263,44 @@ class Qwen3HiddenStateEncoder(nn.Module):
     def dtype(self) -> torch.dtype:
         return self.embed_tokens.weight.dtype
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
+        deepstack: tuple[torch.Tensor, list[torch.Tensor]] | None = None,
+    ) -> torch.Tensor:
         """``input_ids, attention_mask [B, S]`` (right padded) -> ``[B, S, len(taps) * hidden]``.
 
         Follows HF's two attention paths exactly: a batch without padding attends mask-free
         (``is_causal`` + native GQA), a padded one through a boolean causal-and-key-padding
         mask; the two pick different SDPA kernels, so the choice is part of parity.
+
+        For a Qwen3-VL prompt with images: ``inputs_embeds`` replaces the token embeddings
+        (the vision rows spliced in by the caller), ``rotary`` the 1-D tables (fp32
+        ``cos, sin [S, head_dim]``, from the prompt's 3-D MRoPE positions), and
+        ``deepstack = (rows, features)`` adds ``features[i]`` at ``rows`` after decoder
+        layer ``i`` (0-indexed), as ``Qwen3VLTextModel._deepstack_process`` does.
         """
         seq = input_ids.shape[1]
-        rotary = qwen3_rotary_tables(torch.arange(seq, device=input_ids.device), self.head_dim, self.rope_theta)
+        if rotary is None:
+            rotary = qwen3_rotary_tables(torch.arange(seq, device=input_ids.device), self.head_dim, self.rope_theta)
         # No padding anywhere in the batch: HF's create_causal_mask returns None and attention
         # runs its is_causal path; mirror that rather than passing an all-True mask.
         mask = None if bool(attention_mask.all()) else padded_causal_mask(attention_mask)
-        hidden = self.embed_tokens(input_ids)
+        hidden = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         taps = []
         for layer_idx, layer in enumerate(self.layers, start=1):
             layer.self_attn.rotary = rotary
             layer.self_attn.attn_mask = mask
             hidden = layer(hidden)
             if layer_idx in self.tap_layers:
-                taps.append(hidden)
+                taps.append(hidden)  # HF records a layer's output before the deepstack add
+            if deepstack is not None and layer_idx <= len(deepstack[1]):
+                rows, features = deepstack
+                hidden = hidden.clone()
+                hidden[:, rows] = hidden[:, rows] + features[layer_idx - 1].to(hidden.dtype)
         # stack(dim=1).permute(0, 2, 1, 3).reshape(...) == concatenation along the feature dim
         return torch.cat(taps, dim=-1)
