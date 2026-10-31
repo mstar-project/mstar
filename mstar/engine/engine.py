@@ -625,6 +625,9 @@ class Engine:
             if isinstance(resource, KVManager)
         ]
 
+    def submodules_by_node(self) -> dict[str, NodeSubmodule]:
+        return {name: mgmt.submodule for name, mgmt in self._submodules.items()}
+
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
 

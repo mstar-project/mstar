@@ -232,6 +232,9 @@ class MicroScheduler:
             self._walks_of_key[(node, combined)].append(walk)
         # (node, walk) whose speculation chain merges the other walks of its
         # combined walk; see `speculation_mixes`
+        # (node, walk) keys that run beside the chain (``SideStepLane``), which
+        # asks for them by target: nothing else schedules them or yields to them
+        self.side_keys: frozenset[tuple[str, str]] = frozenset()
         self._mixing_chains = self._parse_speculation_mixes_walks(
             speculation_mixes_walks or {},
         )
@@ -815,7 +818,7 @@ class MicroScheduler:
         # step comes out empty (every backlogged row blocked) is passed over
         # rather than leaving the worker idle behind it. `exclude_target` is
         # only a fairness hint, and finishing a split set beats fairness.
-        keys = [k for k in self.backlog if target is None or k == target]
+        keys = [k for k in self.backlog if k == target or (target is None and k not in self.side_keys)]
         for key in keys:
             # no fresh row could join a step its backlog fills, unless every backlogged row is blocked
             if self._backlog_fills(key, pre_existing_walk, pre_existing_batch_size):
@@ -908,9 +911,12 @@ class MicroScheduler:
     ):
         """``runtime.get_ready_nodes`` for scheduling keys, which the runtime
         matches against both real and combined walks."""
-        return self.runtime.get_ready_nodes(
+        specs = self.runtime.get_ready_nodes(
             exclude, target=target, exclude_target=exclude_target,
         )
+        if target is None and self.side_keys:
+            specs = [spec for spec in specs if (spec.node_name, spec.graph_walk) not in self.side_keys]
+        return specs
 
     def _rows_here(
         self, specs: Iterable[ReadyNodeSpec],
@@ -1361,6 +1367,8 @@ class MicroScheduler:
         under ``exclude_target`` are outside it."""
         now = time.monotonic()
         for node_walk, batch in self.backlog.items():
+            if node_walk in self.side_keys:
+                continue
             only_other = node_walk == exclude_target and exclude_walk is not None
             if node_walk == exclude_target and not only_other:
                 continue

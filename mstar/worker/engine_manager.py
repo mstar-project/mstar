@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass, field
 
 import torch
@@ -10,6 +11,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs
 from mstar.utils.device import DeviceCapability
@@ -51,6 +53,21 @@ def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
                         f"feeds {edge.next_node!r} on the same worker in walk {walk!r}; "
                         "set enable_async_scheduling=False on one of them"
                     )
+
+
+def _refuse_unsuitable_side_walks(submodules: dict, specs: list, model: Model) -> None:
+    """A side step is planned inline and nothing speculates into it, so it takes
+    a walk of one node with no resources: nothing to pre-plan, no admit to
+    refuse, and no edge inside the walk for the chain to wait on."""
+    walks = model.get_graph_walk_graphs()
+    for name, submodule in submodules.items():
+        for walk in submodule.side_stream_walks:
+            if not isinstance(walks.get(walk), GraphNode) or walks[walk].name != name:
+                raise ValueError(f"{type(model).__name__}: {name!r} declares side stream walk {walk!r}, "
+                                 "which is not a walk of that one node")
+            if any(name in spec.nodes for spec in specs):
+                raise ValueError(f"{type(model).__name__}: {name!r} declares side stream walk {walk!r} "
+                                 "but holds resources")
 
 
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
@@ -156,6 +173,7 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
+        _refuse_unsuitable_side_walks(submodules, specs, model)
 
         engine = Engine(
             graph_runtime=graph_runtime,
@@ -177,6 +195,20 @@ class EngineManager:
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
         return cls(engine=engine, node_names=set(node_names))
+
+    def side_stream_keys(self, accelerator: bool, parallel_nodes: Collection[str]) -> list[tuple[str, str]]:
+        """The (node, walk) keys that run beside this worker's chain: what the
+        nodes declare, on a device with streams, and only beside a node to run
+        them next to. A parallel node stays on the chain: when a step lands is
+        per rank, and every rank of a lockstep instance has to agree."""
+        submodules = self.engine.submodules_by_node()
+        if not accelerator or len(submodules) < 2:
+            return []
+        return sorted(
+            (name, walk) for name, submodule in submodules.items()
+            for walk in submodule.side_stream_walks
+            if name not in parallel_nodes
+        )
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

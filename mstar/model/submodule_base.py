@@ -582,6 +582,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # params to the autocast dtype nor wraps its forward (or capture) in
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
+    # Walks whose steps run beside the worker's main chain, on a second stream
+    # (``mstar.worker.side_steps``), when another node shares the worker. For a
+    # stream-fed walk with no resources that a step of the chain never waits on;
+    # ``EngineManager.build`` refuses anything else.
+    side_stream_walks: frozenset[str] = frozenset()
 
     # Float32 math for this node's forward, where the process default (TF32
     # matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:
