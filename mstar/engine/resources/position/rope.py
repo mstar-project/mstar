@@ -22,7 +22,7 @@ def rope_apply_qk_inplace(
 ) -> None:
     """Reject devices without a registered RoPE kernel."""
     raise NotImplementedError(
-        f"RoPE is only implemented for CUDA and XPU, not {q.device.type}"
+        f"RoPE is only implemented for CUDA, XPU and CPU, not {q.device.type}"
     )
 
 
@@ -109,6 +109,45 @@ def _rope_apply_qk_inplace_xpu(
         cos_sin_cache,
         not interleave,
     )
+
+
+@torch.library.register_kernel(rope_apply_qk_inplace, "cpu")
+def _rope_apply_qk_inplace_cpu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    rotary_dim: int | None,
+    interleave: bool,
+    rope_scale: float,
+    rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    """Plain RoPE in torch, for the CPU tests of models that rotate (a drafter's layers):
+    FlashInfer's formula (``rope_scale`` divides the positions), fp32 angles."""
+    llama31 = any(value is not None for value in (low_freq_factor, high_freq_factor, old_context_len))
+    if llama31 and rope_scale != 1.0:
+        # at a scale of 1 the Llama 3.1 rule leaves every frequency as it is
+        raise NotImplementedError("Llama 3.1 RoPE scaling is not implemented on CPU")
+    dim = rotary_dim or q.shape[-1]
+    if cos_sin_cache is not None:
+        cos, sin = cos_sin_cache[pos_ids.long()].float().chunk(2, dim=-1)
+    else:
+        inv = 1.0 / (rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        angles = torch.outer(pos_ids.float() / rope_scale, inv)
+        cos, sin = angles.cos(), angles.sin()
+    cos, sin = cos[:, None, :], sin[:, None, :]
+    for x in (q, k):
+        rot = x[..., :dim].float()
+        if interleave:
+            a, b = rot[..., 0::2], rot[..., 1::2]
+            out = torch.stack((a * cos - b * sin, b * cos + a * sin), dim=-1).flatten(-2)
+        else:
+            a, b = rot[..., : dim // 2], rot[..., dim // 2:]
+            out = torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1)
+        x[..., :dim].copy_(out)
 
 
 @rope_apply_qk_inplace.register_fake

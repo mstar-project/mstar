@@ -13,7 +13,8 @@ resource carries it across:
   number has the verdict.
 - ``commit`` notes which mirror row holds each real request's verdict.
 - ``settle``, from the runner before a request's next step admits anywhere, reads the rows'
-  verdicts (waiting for the number) and hands the rewinds each one once.
+  verdicts (waiting for the number) and hands the rewinds each one once. An engine-side
+  proposer is handed each verdict as it is read (``DraftProposer.observe``).
 - ``emitted_rows``, from the engine after the commit, cuts each row's tokens at a stop id and
   at ``max_tokens`` and says which rows stop.
 
@@ -39,6 +40,7 @@ from mstar.engine.resources.step import StepContext
 
 if TYPE_CHECKING:
     from mstar.distributed.communication import JointGroups
+    from mstar.engine.resources.draft_verify.proposer import DraftProposer
     from mstar.engine.resources.sampler.resource import SamplerResource
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,9 @@ logger = logging.getLogger(__name__)
 WAIT_TIMEOUT_S = 120.0
 # verified rows between acceptance log lines
 _LOG_EVERY = 4096
+# a verify step this long after the last one logs the counts as they stood before it (a
+# benchmark reads them around a burst of requests)
+_IDLE_S = 1.0
 # `_harvest`'s "every slot" default
 _ANY_SLOT = object()
 
@@ -118,6 +123,8 @@ class DraftVerifyResource(Resource):
         )
         self.sampler_key = sampler
         self._sampler: SamplerResource | None = None
+        # the walk's engine-side proposer, bound by the engine at load
+        self._proposer: DraftProposer | None = None
         # the node's resources that `verify` settles on the device (RewindKind.DEVICE)
         self._settlers: list[Resource] = []
         # capture slot (None: eager) -> its mirror
@@ -146,6 +153,7 @@ class DraftVerifyResource(Resource):
         # chain that degrades
         self.accepted_hist = np.zeros(1, dtype=np.int64)
         self._logged = 0
+        self._last_step = 0.0
 
     @classmethod
     def build(cls, spec: DraftVerifySpec, info: EngineResourceInfo) -> DraftVerifyResource:
@@ -154,6 +162,10 @@ class DraftVerifyResource(Resource):
     def bind_sampler(self, sampler: SamplerResource) -> None:
         """The node's sampler, which `verify` runs; bound by the engine at load."""
         self._sampler = sampler
+
+    def bind_proposer(self, proposer: DraftProposer) -> None:
+        """The engine-side proposer `propose` asks, which sees every verdict; bound at load."""
+        self._proposer = proposer
 
     def bind_settlers(self, resources: Sequence[Resource]) -> None:
         """The node's ``RewindKind.DEVICE`` resources, which `verify` settles; bound by the
@@ -264,6 +276,26 @@ class DraftVerifyResource(Resource):
         return torch.cat([inputs.reshape(-1, 1).to(drafts.dtype), drafts], 1)
 
     @torch.compiler.disable
+    def propose(
+        self, request_ids: list[int], inputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The block of a verify step whose walk drafts with an engine-side proposer
+        (``DraftPolicy.proposer``): ``[n, k + 1]``, each row's input token and the drafts the
+        proposer staged for it, agreed across a lockstep instance; and their distributions,
+        for ``verify``'s ``draft_probs`` (None: taken as certain). ``inputs`` holds a token per
+        row the forward runs. Capturable."""
+        if self._proposer is None:
+            raise RuntimeError("DraftVerifyResource.propose on a walk whose policy names no proposer")
+        if self._planned is None:
+            raise RuntimeError("DraftVerifyResource.propose outside a planned verify step")
+        rows = inputs.reshape(-1).shape[0]
+        drafts, probs = self._proposer.propose(request_ids, rows)
+        expected = self._planned[2]
+        if drafts.shape != (rows, expected):
+            raise ValueError(f"the proposer drafted {tuple(drafts.shape)} for {rows} rows of {expected} drafts")
+        return self.block_ids(inputs, self.agree(drafts)), probs
+
+    @torch.compiler.disable
     def draft_sample(
         self, request_ids: list[int], logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -341,6 +373,7 @@ class DraftVerifyResource(Resource):
         earlier), and no more than ``max_tokens`` counting what it emitted before. Once per
         verify step, after the commit."""
         steps, self._steps = self._steps, []
+        self._note_step()
         rids = tuple(request_ids)
         n = len(rids)
         last = steps[-1] if steps else None
@@ -396,9 +429,16 @@ class DraftVerifyResource(Resource):
             rids, tokens[np.arange(width) < counts[:, None]], counts, stopped | (total >= limit),
         )
 
+    def _note_step(self) -> None:
+        """Before a step is counted: after an idle second, the counts as they stand."""
+        now = time.monotonic()
+        if self.rows_verified and now - self._last_step >= _IDLE_S:
+            logger.info("draft-verify, idle: %s", self.stats())
+        self._last_step = now
+
     def stats(self) -> str:
-        """Rows verified, drafts accepted per row, and the rate at which each draft is
-        accepted given the ones before it were."""
+        """Rows verified, drafts accepted per row, the rate at which each draft is accepted
+        given the ones before it were, and the rows by drafts accepted."""
         mean = self.drafts_accepted / self.rows_verified if self.rows_verified else 0.0
         reached = self.accepted_hist[::-1].cumsum()[::-1]
         rates = " ".join(
@@ -406,7 +446,8 @@ class DraftVerifyResource(Resource):
         )
         return (
             f"{self.rows_verified} verify rows, {mean:.2f} drafts accepted per row "
-            f"({mean + 1:.2f} tokens per step); accepted by position {rates or '-'}"
+            f"({mean + 1:.2f} tokens per step); accepted by position {rates or '-'}; "
+            f"rows by drafts accepted {' '.join(str(int(x)) for x in self.accepted_hist)}"
         )
 
     # ── mirrors ──
@@ -449,12 +490,21 @@ class DraftVerifyResource(Resource):
         for s, seq in newest.items():
             self._wait(s, seq)
         with self._lock:
+            proposer = self._proposer
             for rid, p in entries:
                 if self._pending.get(rid) is not p:
                     continue  # read by another thread, or removed
                 del self._pending[rid]
                 row = self._rows[rid] = self._mirrors[p.slot].host_np[p.row].copy()
                 self._settled[rid] = (p.label, p.drafts - int(row[0]))
+                if proposer is not None:
+                    proposer.observe(rid, row)
+
+    def harvest(self, request_ids: Sequence[int]) -> None:
+        """Read these requests' pending verdicts, waiting for their steps to stage them: a
+        reader that needs them before the runner's rewinds take them (a proposer's plan)."""
+        if self._pending:
+            self._harvest(rids=request_ids)
 
     def _wait(self, slot: int | None, seq: int) -> None:
         """Until the verdict of step ``seq`` is in ``slot``'s mirror. A host spin, so the

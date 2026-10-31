@@ -8,7 +8,9 @@ attention skipped, so the target agrees with it often but not always. ``corrupt`
 wrong token at every position divisible by it, and ``skew`` at some others on ranks above 0, so
 a test controls where verify steps reject; ``oracle``, one request's whole stream by position,
 drafts every token right. With ``sampled_drafts`` the head samples its drafts instead
-(``draft_sample``) and hands verify the distributions they came from.
+(``draft_sample``) and hands verify the distributions they came from. With ``proposer="ngram"``
+the head is unused: the engine's n-gram proposer drafts (``DraftVerifyResource.propose``), from
+the prompts the prefill steps declare.
 
 ``ToyAttention`` is a dense reference over the KV resource's pages for CPU runs; on a GPU the
 toy runs the FlashInfer attention resource, which a graph can capture.
@@ -26,7 +28,9 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import (
+    DRAFT_TAPS,
     DRAFT_VERIFY,
+    NGRAM,
     AttentionConfig,
     AttentionSpec,
     AttentionStep,
@@ -41,16 +45,20 @@ from mstar.engine.resources import (
     PositionConfig,
     PositionSpec,
     PositionStep,
+    ProposeStep,
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
     Segment,
     StepContext,
     SubmoduleStep,
+    TapSpec,
+    draft_verify_step,
     with_draft_verify,
 )
 from mstar.engine.resources.base import AttentionResource, RewindKind
 from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.resources.draft_verify.ngram import NgramSpec
 from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.base import Model
@@ -66,7 +74,8 @@ SEED = 36
 
 
 class ToyAttention(AttentionResource):
-    """Dense causal attention over the rows the KV resource holds, planned from its views."""
+    """Dense attention over the rows the KV resource holds, planned from its views: causal, or
+    every row over the stored rows but each segment's last ``hide_last`` (``AttentionStep``)."""
 
     rewind_kind = RewindKind.NONE
     requires_kv_write = True
@@ -74,6 +83,7 @@ class ToyAttention(AttentionResource):
     def __init__(self, kv: str):
         self._kv = kv
         self._views = None
+        self._causal, self._hide = True, 0
 
     @classmethod
     def build(cls, spec, info):
@@ -85,6 +95,7 @@ class ToyAttention(AttentionResource):
     def plan(self, step, ctx):
         self.reset_default_cursors()
         self._views = ctx.plan_results[self._kv]["main"].views
+        self._causal, self._hide = step.causal, step.hide_last
 
     @torch.compiler.disable
     def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
@@ -97,7 +108,8 @@ class ToyAttention(AttentionResource):
                 2, len(view.page_idxs) * page_size, *kv_cache_layer.shape[3:])[:, :view.length]
             start = view.length - view.to_compute
             for j in range(view.to_compute):
-                keys, vals = rows[0, :start + j + 1].float(), rows[1, :start + j + 1].float()
+                end = start + j + 1 if self._causal else view.length - self._hide
+                keys, vals = rows[0, :end].float(), rows[1, :end].float()
                 scores = torch.einsum("hd,thd->ht", q[row + j].float(), keys) * HEAD_DIM ** -0.5
                 outs.append(torch.einsum("ht,thd->hd", scores.softmax(-1), vals).to(q.dtype))
             row += view.to_compute
@@ -159,7 +171,8 @@ class ToySubmodule(ARNodeSubmodule):
     """``k`` drafts per verify step; ``k=0`` decodes one token a step through the sampler."""
 
     def __init__(self, k: int = 3, corrupt: int = 0, skew: int = 0, attn_scale: float = 0.6,
-                 seed: int = SEED, capture_batch_sizes=(1, 2, 4), sampled_drafts: bool = False):
+                 seed: int = SEED, capture_batch_sizes=(1, 2, 4), sampled_drafts: bool = False,
+                 proposer: str | None = None, taps: tuple[int, ...] = ()):
         super().__init__()
         gen = torch.Generator().manual_seed(seed)
         self.embed = nn.Embedding(VOCAB, HIDDEN)
@@ -171,6 +184,7 @@ class ToySubmodule(ARNodeSubmodule):
             p.data = torch.randn(p.shape, generator=gen) * std / (1 if "embed" in name else p.shape[-1] ** 0.5)
         self.k, self.corrupt, self.skew = k, corrupt, skew
         self.sampled_drafts = sampled_drafts
+        self.proposer = proposer
         self.rank = 0
         self.logit_skew = 0.0
         self.oracle: torch.Tensor | None = None
@@ -178,6 +192,11 @@ class ToySubmodule(ARNodeSubmodule):
         self.attn_dtype: torch.dtype | None = None
         self.capture_batch_sizes = list(capture_batch_sizes)
         self.attend = None
+        # target layers a drafter reads (``TapSpec``): the trunk writes the stream entering
+        # each; ``tap_log`` keeps each verify step's block and taps for a test to check
+        self.taps = tuple(taps)
+        self.tap_resource = None
+        self.tap_log: list | None = None
 
     @property
     def block(self) -> int:
@@ -186,11 +205,12 @@ class ToySubmodule(ARNodeSubmodule):
     def bind_node_resources(self, resources):
         super().bind_node_resources(resources)
         self.attend = AttentionCallable(kv=resources[KV], attn=resources[ATTN])
+        self.tap_resource = resources.get(DRAFT_TAPS)
 
     def get_draft_policy(self, graph_walk):
         if graph_walk != "decode" or not self.k:
             return None
-        return DraftPolicy(max_drafts=self.k, stop_ids=frozenset({STOP}))
+        return DraftPolicy(max_drafts=self.k, stop_ids=frozenset({STOP}), proposer=self.proposer, taps=self.taps)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
         ids = inputs["text_inputs"][0].reshape(-1).to(torch.long)
@@ -206,6 +226,11 @@ class ToySubmodule(ARNodeSubmodule):
         policy = self.get_draft_policy(graph_walk)
         if policy is None:
             steps[SAMPLER] = SamplerStep(apply_penalty=False)
+        if self.proposer is not None and graph_walk == "prefill":
+            # the prompt is the history the proposer looks drafts up in
+            steps[self.proposer] = ProposeStep(
+                history={rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)},
+            )
         step = SubmoduleStep(
             steps=steps,
             segments=[Segment(rid, "main", inp.input_seq_len) for rid, inp in zip(request_ids, inputs, strict=True)],
@@ -223,9 +248,15 @@ class ToySubmodule(ARNodeSubmodule):
     def _trunk(self, ids, positions):
         x = self.embed(ids) + self.pos_emb(positions)
         self.attend.bind_step("main")
+        taps = self.tap_resource
+        tapped = taps.columns if taps is not None else ()
         for i, block in enumerate(self.blocks):
+            if i in tapped:
+                taps.write(i, x)
             self.attend.set_layer_idx(i)
             x = block(x, self.attend, self.attn_dtype)
+        if LAYERS in tapped:
+            taps.write(LAYERS, x)
         return self.lm_head(x).float()
 
     def _skewed(self, logits):
@@ -274,10 +305,16 @@ class ToySubmodule(ARNodeSubmodule):
             dv = res[DV]
             positions = pos[: n * self.block].view(n, self.block)
             rids = list(engine_inputs.request_ids)
+            if self.proposer is not None:
+                # an engine-side proposer drafts; the shared step takes its block
+                target = lambda ids: self._skewed(self._trunk(ids, positions.reshape(-1)))  # noqa: E731
+                return BatchedModelOutput(row_outputs={"text_inputs": draft_verify_step(dv, rids, input_ids, target)})
             drafts, draft_probs = self._draft(input_ids, positions, dv, rids)
             block = dv.block_ids(input_ids, dv.agree(drafts))
             logits = self._skewed(self._trunk(block.view(-1), positions.reshape(-1)))
             verdict = dv.verify(rids, block, logits, draft_probs)
+            if self.tap_log is not None and self.taps:
+                self.tap_log.append((block.clone(), res[DRAFT_TAPS].read().clone()))
             return BatchedModelOutput(row_outputs={"text_inputs": verdict.next_inputs})
         logits = self._trunk(input_ids, pos[:n])
         if last is not None:
@@ -297,7 +334,8 @@ class ToySubmodule(ARNodeSubmodule):
 
 def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True,
           kv_heads: int = HEADS, sampled_verify: bool = False,
-          argmax_prefill: bool | None = None) -> list[NodeResourceSpec]:
+          argmax_prefill: bool | None = None, ngram: dict | None = None,
+          taps: tuple[int, ...] = (), tap_dtype: torch.dtype = torch.float32) -> list[NodeResourceSpec]:
     # ``kv_heads`` before sharding: a lockstep test gives each rank every head.
     # ``argmax_prefill``: the prefill's token is the argmax, so it draws nothing (on CPU always,
     # where the real draw has no kernel).
@@ -321,6 +359,12 @@ def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True
             kv_cache=KV, backend=AttnBackend(attn))))
     if draft_verify:
         out.append(DraftVerifySpec(resource_key=DV, nodes={NODE}, sampler=SAMPLER))
+    if taps:
+        out.append(TapSpec(resource_key=DRAFT_TAPS, nodes={NODE}, layers=tuple(taps), hidden_size=HIDDEN,
+                           dtype=tap_dtype))
+    if ngram is not None:
+        # ``ngram``: the NgramSpec's settings (max_drafts, min_ngram, max_ngram, table_bits)
+        out.append(NgramSpec(resource_key=NGRAM, nodes={NODE}, **ngram))
     return out
 
 
@@ -379,6 +423,10 @@ def engine(sub: ToySubmodule, device, attn: str = "toy", comm=None, warmup: bool
     kv_dtype = kv_dtype or dtype
     sub.attn_dtype = kv_dtype
     eng = Engine(None, autocast_dtype=None)
+    if sub.proposer == NGRAM and "ngram" not in spec_kwargs:
+        spec_kwargs["ngram"] = {"max_drafts": sub.k}
+    if sub.taps and "taps" not in spec_kwargs:
+        spec_kwargs.update(taps=sub.taps, tap_dtype=dtype)
     eng.load_model(
         submodules={NODE: sub}, specs=specs(attn, draft_verify=bool(sub.k), **spec_kwargs),
         parallel_groups=_Group(comm), device=device,

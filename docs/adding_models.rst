@@ -775,6 +775,15 @@ The spec types are:
      - Carries a verify step's verdict from the forward to the host, for a node whose
        decode walk verifies drafts (speculative decoding). ``sampler`` names the node's
        sampler, which verifies. See `Draft-verify decoding`_.
+   * - ``NgramSpec(max_drafts=..., min_ngram=..., max_ngram=...)``
+     - Drafts a verify step's tokens by prompt lookup, from each request's prompt and
+       reply: no drafter weights. Named by ``DraftPolicy.proposer``. See
+       `Draft-verify decoding`_.
+   * - ``TapSpec(layers=..., hidden_size=..., dtype=...)``
+     - The target's residual stream entering each of ``layers``, for every row a step runs,
+       for a drafter that reads it in the same forward (DSpark's context; EAGLE-3's
+       features). Declared under ``DRAFT_TAPS`` when ``DraftPolicy.taps`` names layers;
+       keeps nothing across steps. See `Draft-verify decoding`_.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
@@ -1653,6 +1662,79 @@ do). A node pre-plans this way only when every pre-planning resource of its veri
 ``corrects_preplan``; otherwise its pre-plan waits for the verdict first. A resource that adds
 state to a verifying node and pre-plans should implement it: what the pre-plan read of a
 length the rewind moved has to be put right there, in place.
+Two kinds of drafter need no drafting code of the model's own, and a verify step's forward
+runs either through one helper, ``draft_verify_step(dv, request_ids, inputs, target,
+drafter=None)``: the drafts, ``agree``, ``target`` (the block's ids, flat, to the target's
+logits) and ``verify``; it returns the next step's inputs.
+
+- An engine-side proposer: ``DraftPolicy(proposer=NGRAM)`` names the node's ``NgramSpec``
+  (prompt lookup: the tokens that followed the last earlier occurrence of the request's
+  suffix), and ``draft_verify_step`` with no drafter takes the block from
+  ``DraftVerifyResource.propose``. The proposer learns the prompt from the prefill steps,
+  which declare ``ProposeStep(history={rid: prompt_ids})`` under its key, and every emitted
+  token from the verdicts. A proposer is a ``DraftProposer`` resource: ``observe`` takes each
+  verdict once, ``plan`` stages a verify step's drafts and ``propose`` hands them to the
+  forward. It fits drafters whose state is per-request host data.
+- A drafter with weights runs in the forward as a ``Drafter`` (``propose(inputs, dv,
+  request_ids) -> Drafts``, ``next_inputs(block, verdict)``, and optionally ``observe(block,
+  verdict)``, run after the verify), passed to ``draft_verify_step``. A target integrates any
+  kind through ``mstar/model/components/drafters.py``: ``in_node_drafter(draft_config,
+  TargetInfo(...))`` is the declaration (its ``policy_fields``, ``node_resources``,
+  ``kv_labels``, ``kv_layout``, ``check_prompt``, ``prefill_steps``, ``verify_steps(drafts)``,
+  ``carry_width``, ``prefill_inputs``) and its ``build(...)`` the module (the ``Drafter`` plus
+  ``prefill(tokens=, **inputs)``); the text LM names no drafter kind. A separate draft model (a
+  small LLM with the target's tokenizer) is
+  one, in ``mstar/model/components/draft_model.py``: ``DraftModel`` is the declaration
+  (``max_drafts``, the drafter's ``PagedKVConfig``, the resource keys under ``DraftKeys``,
+  ``sample`` to draw drafts as the request samples) and ``DraftLLMProposer`` wraps the
+  drafter's LM (``embed`` / call / ``logits``) bound to those keys. The target adds
+  ``draft.node_resources(nodes)`` to its resources (the drafter's own KV, attention and
+  positions, which the runner rewinds by the same verdict as the target's);
+  ``draft.kv_layout(prompt_len, prefill_walk, loop, policy.lookahead)`` beside its own layout
+  in ``process_prompt``, and ``draft.check_prompt(len)``; ``draft.prefill_steps(request_ids,
+  spans)`` to its prefill step and ``draft.verify_steps()`` to its verify step; and
+  ``proposer.prefill`` over each prompt but its last token in the prefill forward. The
+  drafter's KV runs one token behind the target's: a verify row's input is the request's last
+  two kept tokens ``[prev, bonus]`` (a two-token loop-back, and a prefill that hands the
+  decode loop ``[last prompt token, sampled token]``), and its block ``[prev, bonus, d1 ..
+  d(k-1)]`` sits one position before the target's ``[bonus, d1 .. dk]``. Both span ``k + 1``
+  rows, so the verdict takes back the same rows from both. Each of the ``k`` draft passes
+  runs the whole block under the step's one causal attention plan and reads its own row.
+- A DSpark drafter (``mstar/model/components/dspark``): one module for every DSpark
+  checkpoint, configured by ``DSparkConfig.from_hf`` (DeepSeek's Qwen3 drafters, the DFlash /
+  TorchSpec and speculators formats, DeepSeek-V4.1's ``dspark_*`` keys, Kimi K3's). It reads the
+  target's layers (``DraftPolicy(taps=...)``, see above), keeps the projected context as KV of
+  its own (``dspark_kv``) level with the target's, so a verify step's KV step is the verify
+  block and the verdict rewinds both alike, and per step runs its backbone once over
+  ``[anchor, mask x L]`` (``AttentionStep(causal=False, hide_last=1)``: every row sees the
+  context and the block's first ``L`` rows; the trailing row is a placeholder) and the Markov
+  head left to right; after the verify it writes the block's context K/V
+  from the taps. A prefill writes the prompt's. ``DSpark.for_target`` checks the taps and width
+  against the target. A family whose drafter layers are its own blocks (DeepSeek-V4.1's MTP
+  blocks, an MLA drafter) passes ``build(backbone=...)``: its stack with ``embed``, a call,
+  ``logits``, ``load_weights`` and, per layer, ``self_attn.write_context(features)``.
+
+A drafter that reads the target's hidden states declares the layers on its policy,
+``DraftPolicy(taps=(...))``: the residual stream entering each (``num_layers`` is the stream
+after the last layer, before the final norm). The node declares ``TapSpec(layers=...,
+hidden_size=..., dtype=...)`` under ``DRAFT_TAPS`` (the load refuses a walk whose taps the node
+doesn't declare), ``with_draft_verify`` adds its ``TapStep`` to every verify step, and a
+prefill step that feeds the drafter declares one itself. The target's forward hands the
+resource each tapped stream, ``taps.write(layer, stream)`` for each layer in
+``taps.columns``, for every row the step runs (the shared ``Qwen3DenseLM`` does this when
+built with ``tap_key=DRAFT_TAPS``); the drafter reads ``taps.read()``, ``[rows, len(layers),
+hidden]``, later in the same forward. A captured step writes its capture slot's buffer, so a
+replay uses the addresses its graph recorded. Taps keep nothing across steps: what the
+drafter keeps from them (its context KV) is in its own resources, which grow by the block and
+are rewound with the target's.
+
+``DraftConfig.from_kwargs(model_kwargs["draft"])`` reads a deployment's ``draft:`` settings
+for each (``method: ngram``; ``method: draft_model`` with the drafter's ``model``; ``method:
+dspark`` with the drafter's ``model``, which drafts the whole block in one pass), and
+its ``policy`` and ``resources`` give the walk's policy and the specs to declare; read the
+layouts' lookahead off ``policy().lookahead`` rather than repeating its formula. The toys in
+``test/modular/draft_verify_toy.py`` (both kinds), ``draft_model_toy.py`` and ``dspark_toy.py``
+are the CPU consumers.
 
 Verification is greedy unless the sampler declares ``enable_sampled_verify=True``: a
 greedy verify keeps the drafts that equal the target's argmax, and refuses a request with a

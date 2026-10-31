@@ -880,6 +880,19 @@ def _text_lm(name, model_kwargs, tmp_path, monkeypatch):
         "model_type": "qwen3",
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
+    draft = model_kwargs.get("draft") or {}
+    if draft.get("model"):
+        # a draft model's config.json beside it (the target's own, so it tokenizes alike); a
+        # DSpark drafter's reads two of the target's layers
+        drafter = tmp_path / "drafter"
+        drafter.mkdir()
+        drafter_config = config if draft.get("method") != "dspark" else {
+            **config, "architectures": ["Qwen3DSparkModel"], "num_hidden_layers": 1, "markov_rank": 16,
+            "block_size": draft.get("max_drafts", 7), "mask_token_id": 151669, "target_layer_ids": [0, 1],
+            "enable_confidence_head": True, "confidence_head_with_markov": True,
+        }
+        (drafter / "config.json").write_text(json.dumps(drafter_config))
+        model_kwargs = {**model_kwargs, "draft": {**draft, "model": str(drafter)}}
     return _constructed(name, model_kwargs, checkpoint_path=str(tmp_path))
 
 

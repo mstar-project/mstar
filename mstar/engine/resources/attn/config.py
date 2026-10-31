@@ -255,11 +255,16 @@ class AttentionStep(ResourceStep):
     # `segments` then carry the query counts, the cache's segments the appended counts.
     # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
     context_only: bool = False
+    # Each segment's last ``hide_last`` rows are written but no query attends to them (a
+    # parallel drafter's placeholder row). Non-causal only; only FlashInfer reads it.
+    hide_last: int = 0
 
 
 def refuse_context_only(step: AttentionStep, manager: str) -> None:
-    """For the attention resources that don't read ``context_only``: planned without it,
-    the step's queries would attend to the tokens it appends as well."""
+    """For the attention resources that don't read ``context_only`` or ``hide_last``: planned
+    without them, the step's queries would attend to rows they must not see."""
+    if step.hide_last:
+        raise ValueError(f"{manager} does not read AttentionStep.hide_last; the FlashInfer backend does")
     if step.context_only:
         raise ValueError(
             f"{manager} does not read AttentionStep.context_only; only the "

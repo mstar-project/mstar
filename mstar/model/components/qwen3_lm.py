@@ -129,11 +129,15 @@ class Qwen3DenseLM(nn.Module):
         kv_key: str,
         pos_key: str,
         comm_group: CommGroup | None = None,
+        tap_key: str | None = None,
     ):
         super().__init__()
         if config.num_experts and type(self) is Qwen3DenseLM:
             raise ValueError("a qwen3_moe config builds Qwen3MoeLM, not the dense Qwen3 LM")
         self.config = config
+        # the node's target taps (``TapSpec``), when this LM is the target a drafter reads
+        self._tap_key = tap_key
+        self._taps = None
         comm_group = comm_group or CommGroup.trivial()
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -205,6 +209,10 @@ class Qwen3DenseLM(nn.Module):
             )
         return loaded
 
+    def bind_resources(self, resources: dict) -> None:
+        if self._tap_key is not None:
+            self._taps = resources.get(self._tap_key)
+
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -221,6 +229,10 @@ class Qwen3DenseLM(nn.Module):
         # kernel (in place) per norm instead of an add and a norm, 56 fewer
         # launches a decode step on a 28-layer model.
         residual = None
+        # a drafter reads the stream entering some layers (the norms update it in place, so
+        # the taps copy it out as it passes)
+        taps = self._taps
+        tapped = taps.columns if taps is not None else ()
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.set_layer_idx(layer_idx)
             if residual is None:
@@ -228,10 +240,14 @@ class Qwen3DenseLM(nn.Module):
                 h = layer.input_layernorm(hidden_states)
             else:
                 h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
+            if layer_idx in tapped:
+                taps.write(layer_idx, residual)
             h = layer.self_attn(h)
             h, residual = layer.post_attention_layernorm.forward_residual(h, residual)
             hidden_states = layer.mlp(h)
-        normed, _ = self.norm.forward_residual(hidden_states, residual)
+        normed, residual = self.norm.forward_residual(hidden_states, residual)
+        if len(self.layers) in tapped:
+            taps.write(len(self.layers), residual)
         return normed
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -252,6 +268,7 @@ class Qwen3MoeLM(Qwen3DenseLM):
         pos_key: str,
         comm_group: CommGroup | None = None,
         moe_parallel: MoeParallelConfig | None = None,
+        tap_key: str | None = None,
     ):
         from mstar.model.components.moe_parallel import MoeParallelConfig
 
@@ -262,7 +279,9 @@ class Qwen3MoeLM(Qwen3DenseLM):
             raise ValueError("Qwen3MoeLM does not mask padding rows or log expert load")
         # a plain attribute, set first: the base __init__ builds the layers through _make_mlp
         self.moe_parallel = moe_parallel
-        super().__init__(config, attn_key=attn_key, kv_key=kv_key, pos_key=pos_key, comm_group=comm_group)
+        super().__init__(
+            config, attn_key=attn_key, kv_key=kv_key, pos_key=pos_key, comm_group=comm_group, tap_key=tap_key,
+        )
 
     def _make_mlp(self, layer_idx: int, comm_group: CommGroup) -> nn.Module:
         from mstar.model.components.moe_parallel import instantiate_moe_block

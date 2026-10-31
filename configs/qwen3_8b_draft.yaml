@@ -1,0 +1,24 @@
+model: "qwen3_8b"
+# configs/qwen3_8b.yaml with Qwen3-0.6B (same tokenizer) drafting 4 tokens a step for Qwen3-8B.
+# The drafter runs inside the LLM node on KV of its own, one token behind the target's, and a
+# decode step (the drafter's 4 passes, the target over 5 rows, the verdict) replays as one
+# CUDA graph. Greedy replies are the target's; temperature > 0 verifies by rejection sampling.
+# A repetition penalty or min_tokens is refused per request (a verify step can't apply them
+# per draft position), and so is a one-token prompt. Off: drop `draft`.
+max_seq_len: 32768
+model_kwargs:
+  max_seq_len: 32768
+  draft:
+    method: draft_model
+    model: Qwen/Qwen3-0.6B
+    max_drafts: 4
+resources:
+  kv_cache:
+    # 144 KiB a token: 1024 pages of 128 tokens = 131k tokens, 18 GiB
+    max_num_pages: 1024
+  draft_kv:
+    # Qwen3-0.6B's, 112 KiB a token: as many tokens as the target's, 14 GiB
+    max_num_pages: 1024
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]

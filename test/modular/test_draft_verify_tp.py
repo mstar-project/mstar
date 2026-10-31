@@ -7,7 +7,8 @@ emit the same tokens, rewind to the same lengths at every step, and hold the sam
 they keep rank 0's drafts (``agree``) and rank 0's verdict (the sampler's ``verify``). Without
 either, the ranks come apart, which shows the test can tell. The same holds at temperature
 > 0, with drafts sampled from distributions rank 1 reads differently: each rank draws its own
-verdict, and rank 0's is the one kept.
+verdict, and rank 0's is the one kept. With the n-gram proposer drafting instead, each rank
+looks drafts up in a history it builds from the same verdicts, so the ranks draft alike.
 """
 
 from __future__ import annotations
@@ -53,7 +54,9 @@ def _entry(rank, store, out, mode):
 def _run(rank: int, mode: str) -> dict:
     cpu = torch.device("cpu")
     sampled = mode.startswith("sampled")
-    if sampled:
+    if mode == "ngram":
+        sub = toy.ToySubmodule(k=3, proposer="ngram")
+    elif sampled:
         # rank 1 reads both the draft head's logits and the target's differently, so it draws
         # other drafts from other distributions, and verifies them differently
         sub = toy.ToySubmodule(k=3, sampled_drafts=True)
@@ -69,7 +72,7 @@ def _run(rank: int, mode: str) -> dict:
         eng._resources[toy.SAMPLER]._comm_group = None
     drv = toy.Driver(eng, sub)
     rids = list(range(len(PROMPTS)))
-    stopping = mode in ("both", "sampled")
+    stopping = mode in ("both", "sampled", "ngram")
     sampling = {"temperature": 0.9, "top_k": 12} if sampled else {}
     for rid, prompt in enumerate(PROMPTS):
         drv.add(rid, prompt, 16, ignore_eos=not stopping, seed=7 + rid, **sampling)
@@ -99,7 +102,11 @@ def _run(rank: int, mode: str) -> dict:
             kv.layer_view(layer)[pages].transpose(0, 1).reshape(2, -1, toy.HEADS, toy.HEAD_DIM)[:, :stream.stored_len]
             for layer in range(toy.LAYERS)
         ])
-    return {"emitted": dict(drv.emitted), "lengths": lengths, "rows": rows, "accepted": dv.drafts_accepted}
+    out = {"emitted": dict(drv.emitted), "lengths": lengths, "rows": rows, "accepted": dv.drafts_accepted}
+    if mode == "ngram":
+        prop = eng._resources["ngram"]
+        out["history"] = {rid: list(prop._histories[rid].tokens) for rid in rids}
+    return out
 
 
 def _both(tmp_path, mode: str):
@@ -120,6 +127,16 @@ def test_the_ranks_keep_rank_zeros_drafts_and_verdicts(tmp_path):
     assert r0["emitted"] == r1["emitted"] == ref
     assert r0["lengths"] == r1["lengths"]
     assert _rows_equal(r0["rows"], r1["rows"])
+    assert r0["accepted"] == r1["accepted"] > 0
+
+
+def test_ngram_ranks_draft_alike_from_the_same_verdicts(tmp_path):
+    r0, r1 = _both(tmp_path, "ngram")
+    ref = {rid: toy.reference(prompt, 16) for rid, prompt in enumerate(PROMPTS)}
+    assert r0["emitted"] == r1["emitted"] == ref
+    assert r0["lengths"] == r1["lengths"]
+    assert _rows_equal(r0["rows"], r1["rows"])
+    assert r0["history"] == r1["history"]
     assert r0["accepted"] == r1["accepted"] > 0
 
 

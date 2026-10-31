@@ -7,8 +7,10 @@ from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.engine.resources.base import Resource, RewindKind
-from mstar.engine.resources.draft_verify.config import DraftPolicy
+from mstar.engine.resources.draft_verify.config import DRAFT_TAPS, DraftPolicy
+from mstar.engine.resources.draft_verify.proposer import DraftProposer
 from mstar.engine.resources.draft_verify.resource import DraftVerifyResource
+from mstar.engine.resources.draft_verify.taps import TapResource
 from mstar.engine.resources.sampler.resource import SamplerResource
 
 if TYPE_CHECKING:
@@ -55,6 +57,27 @@ def verify_walk(
             f"{where}, but {undeclared} declare no rewind_kind, so a verify step's rejected rows "
             "would stay in them; draft verify rewinds paged KV and sequential positions so far"
         )
+    proposer = None
+    if policy.proposer is not None:
+        proposer = resources.get(policy.proposer)
+        if not isinstance(proposer, DraftProposer):
+            raise ValueError(
+                f"{where}, drafting with the proposer {policy.proposer!r}, which the node "
+                f"{'declares as a ' + type(proposer).__name__ if proposer is not None else 'lacks'}"
+            )
+        if proposer.max_drafts != policy.max_drafts:
+            raise ValueError(
+                f"{where} with {policy.max_drafts} drafts a step, but its proposer "
+                f"{policy.proposer!r} drafts {proposer.max_drafts}"
+            )
+    if policy.taps:
+        taps = resources.get(DRAFT_TAPS)
+        if not isinstance(taps, TapResource) or taps.layers != policy.taps:
+            have = taps.layers if isinstance(taps, TapResource) else None
+            raise ValueError(
+                f"{where}, whose drafter reads target layers {policy.taps}: declare a TapSpec under "
+                f"{DRAFT_TAPS!r} with those layers (the node's taps {have})"
+            )
     if walk in combined_walks:
         raise ValueError(
             f"{where}, which a combined walk batches with others; a verify row needs a step of its own walk"
@@ -84,4 +107,7 @@ def verify_walk(
             res.require_lookahead(policy.loop, policy.lookahead)
     dv.bind_sampler(sampler)
     dv.bind_settlers([res for res in resources.values() if res.rewind_kind is RewindKind.DEVICE])
+    if proposer is not None:
+        dv.bind_proposer(proposer)
+        proposer.bind_verifier(dv)
     return VerifyWalk(dv, policy, dv.sampler_key)

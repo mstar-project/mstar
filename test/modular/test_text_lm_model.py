@@ -197,3 +197,159 @@ def test_declared_step_tracks_the_prompt_for_the_penalty_only_at_prefill():
     assert set(step.steps[SAMPLER].prefill_tracked_tokens) == {"a", "b"}
     step = sub.declare_step(DECODE_WALK, ["a"], [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([5]))])
     assert step.steps[SAMPLER].prefill_tracked_tokens == {}
+
+
+# ── speculative decoding (model_kwargs.draft) ──
+
+DENSE = {
+    **{k: v for k, v in CODER.items() if k not in ("num_experts", "num_experts_per_tok", "moe_intermediate_size",
+                                                   "decoder_sparse_step")},
+    "model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
+}
+
+
+def _drafter(tmp_path, **change):
+    directory = tmp_path / "drafter"
+    directory.mkdir(exist_ok=True)
+    (directory / "config.json").write_text(json.dumps({**DENSE, "num_hidden_layers": 1, "num_key_value_heads": 2,
+                                                       **change}))
+    return str(directory)
+
+
+def _layouts(model, n=10, budget=8):
+    out = model.process_prompt(None, ["text"], ["text"], tensors={"text_inputs": [torch.arange(n)]},
+                               max_output_tokens=budget)
+    return out.metadata["kv_layout"]
+
+
+def test_prompt_lookup_drafting_declares_a_verifying_node(tmp_path):
+    from mstar.engine.resources import NGRAM, DraftVerifySpec
+    from mstar.engine.resources.draft_verify.ngram import NgramSpec
+    from mstar.model.submodule_base import ARNodeInputs
+
+    model = _model(tmp_path, max_seq_len=64, draft={"method": "ngram", "max_drafts": 3})
+    specs = {type(s): s for s in model.get_node_resources()}
+    assert DraftVerifySpec in specs and specs[NgramSpec].max_drafts == 3
+    sampler = specs[SamplerSpec]
+    assert sampler.draft_verify and sampler.enable_sampled_verify and not sampler.enable_repetion_penalty
+    # a verifying walk keeps no prefix-cache keys
+    (label,) = model.kv_labels()["kv_cache"].values()
+    assert label.keys is None
+    # the layout carries the verify rows' lookahead (2k + 1), and the context check counts it
+    (layout,) = _layouts(model)["kv_cache"].values()
+    assert layout.lookahead == 7
+    with pytest.raises(ValueError, match="lookahead"):
+        _layouts(model, n=10, budget=48)
+
+    sub = TextLMSubmodule(torch.nn.Linear(1, 1), frozenset({IM_END}), draft=model.draft)
+    assert sub.get_draft_policy(DECODE_WALK).proposer == NGRAM and sub.get_draft_policy(PREFILL_WALK) is None
+    row = sub.prepare_inputs(DECODE_WALK, None, {"text_inputs": [torch.tensor([4, 5])]})
+    assert (row.input_seq_len, row.input_ids.tolist()) == (4, [5])
+    step = sub.declare_step(DECODE_WALK, ["a"], [row])
+    assert step.steps["draft_verify"].drafts == 3 and step.steps[NGRAM].drafts == 3
+    prefill = sub.declare_step(PREFILL_WALK, ["a"], [ARNodeInputs(input_seq_len=3, input_ids=torch.arange(3))])
+    assert set(prefill.steps[NGRAM].history) == {"a"} and not prefill.steps[SAMPLER].apply_penalty
+
+
+def test_a_draft_model_declares_its_own_resources_and_layout(tmp_path):
+    from mstar.graph.special_destinations import EMPTY_DESTINATION
+    from mstar.model.submodule_base import ARNodeInputs
+
+    model = _model(tmp_path, max_seq_len=64, draft={"method": "draft_model", "model": _drafter(tmp_path),
+                                                     "max_drafts": 4})
+    keys = {s.resource_key: s for s in model.get_node_resources()}
+    assert {"draft_verify", "draft_kv", "draft_attn", "draft_pos"} <= set(keys) and "ngram" not in keys
+    # the drafter's geometry, not the target's
+    assert (keys["draft_kv"].config.num_layers, keys["draft_kv"].config.num_kv_heads) == (1, 2)
+    assert set(model.kv_labels()) == {"kv_cache", "draft_kv"}
+    layouts = _layouts(model)
+    (target,), (drafter,) = layouts["kv_cache"].values(), layouts["draft_kv"].values()
+    assert target.lookahead == drafter.lookahead == 9
+    # the drafter holds the prompt but its last token
+    assert target.spans[0].length == 10 and drafter.spans[0].length == 9
+    with pytest.raises(ValueError, match="at least 2"):
+        _layouts(model, n=1)
+    # the prefill hands the decode loop the prompt's last token and the sampled one
+    prefill = model.get_graph_walk_graphs()[PREFILL_WALK]
+    assert any(e.name == "decode_input" and e.next_node == EMPTY_DESTINATION and e.persist for e in prefill.outputs)
+    args = model.get_initial_forward_pass_args("default", ["text"], ["text"], {"text_inputs": [object()]})
+    nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"decode_input": [object()]})
+    assert len(nxt.inputs[0].tensor_info) == 1
+    # prefill runs eager: the drafter prefills beside the target
+    buckets = _model(tmp_path, max_seq_len=64, prefill_token_buckets=[16, 32], draft={
+        "method": "draft_model", "model": _drafter(tmp_path), "max_drafts": 4,
+    }).prefill_token_buckets
+    assert buckets == []
+
+    sub = TextLMSubmodule(
+        torch.nn.Linear(1, 1), frozenset({IM_END}), draft=model.draft, drafter=object(), drafter_decl=model.drafter,
+    )
+    row = sub.prepare_inputs(DECODE_WALK, None, {"text_inputs": [torch.tensor([4, 5])]})
+    assert (row.input_seq_len, row.input_ids.tolist()) == (5, [4, 5])
+    step = sub.declare_step(DECODE_WALK, ["a"], [row])
+    assert {"draft_kv", "draft_attn", "draft_pos", "draft_verify"} <= set(step.steps)
+    prefill = sub.declare_step(PREFILL_WALK, ["a"], [ARNodeInputs(input_seq_len=3, input_ids=torch.arange(3))])
+    assert [s.span for s in prefill.steps["draft_kv"].segments] == [2]
+
+
+def test_a_dspark_drafter_declares_its_resources_taps_and_layout(tmp_path):
+    """A DSpark drafter on the same node code as a draft model: its own KV, attention and
+    positions and the target's taps; its KV level with the target's; a
+    decode loop that starts from the prefill's sample."""
+    from mstar.engine.resources import DraftVerifySpec, TapSpec
+    from mstar.model.submodule_base import ARNodeInputs
+
+    directory = tmp_path / "dspark"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps({
+        "architectures": ["Qwen3DSparkModel"], "model_type": "qwen3", "block_size": 4, "markov_rank": 16,
+        "mask_token_id": 151669, "target_layer_ids": [0, 1], "enable_confidence_head": True,
+        "confidence_head_with_markov": True, "hidden_size": 2048, "num_hidden_layers": 1,
+        "num_attention_heads": 16, "num_key_value_heads": 4, "head_dim": 128, "intermediate_size": 4096,
+        "vocab_size": 151936, "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+    }))
+    model = _model(tmp_path, max_seq_len=64, draft={"method": "dspark", "model": str(directory), "max_drafts": 4})
+    specs = {s.resource_key: s for s in model.get_node_resources()}
+    assert isinstance(specs["draft_taps"], TapSpec) and specs["draft_taps"].layers == (1, 2)
+    assert isinstance(specs["draft_verify"], DraftVerifySpec)
+    assert {"dspark_kv", "dspark_attn", "dspark_pos"} <= specs.keys()
+    layouts = _layouts(model)
+    (target,), (drafter,) = layouts["kv_cache"].values(), layouts["dspark_kv"].values()
+    assert target.spans[0].length == drafter.spans[0].length == 10
+    assert target.lookahead == drafter.lookahead == 9
+    prefill = model.get_graph_walk_graphs()[PREFILL_WALK]
+    assert not any(e.name == "decode_input" for e in prefill.outputs)
+    # its prefill is the target's rows: the packed prefill captures stay
+    buckets = _model(tmp_path, max_seq_len=64, prefill_token_buckets=[16, 32], draft={
+        "method": "dspark", "model": str(directory), "max_drafts": 4,
+    }).prefill_token_buckets
+    assert buckets == [16, 32]
+    sub = TextLMSubmodule(
+        torch.nn.Linear(1, 1), frozenset({IM_END}), draft=model.draft, drafter=object(), drafter_decl=model.drafter,
+    )
+    policy = sub.get_draft_policy(DECODE_WALK)
+    assert policy.taps == (1, 2) and policy.max_drafts == 4
+    row = sub.prepare_inputs(DECODE_WALK, None, {"text_inputs": [torch.tensor([4, 7])]})
+    assert (row.input_seq_len, row.input_ids.tolist()) == (5, [7])
+    step = sub.declare_step(DECODE_WALK, ["a"], [row])
+    assert {"dspark_kv", "dspark_attn", "dspark_pos", "draft_taps", "draft_verify"} <= set(step.steps)
+    prefill = sub.declare_step(PREFILL_WALK, ["a"], [ARNodeInputs(input_seq_len=3, input_ids=torch.arange(3))])
+    assert {"dspark_kv", "dspark_pos", "draft_taps"} <= set(prefill.steps) and "dspark_attn" not in prefill.steps
+    assert [s.span for s in prefill.steps["dspark_kv"].segments] == [3]
+
+
+def test_a_drafting_node_drops_the_checkpoints_default_penalty(tmp_path):
+    """Qwen3-Coder's generation_config.json defaults repetition_penalty to 1.05, which a verify
+    step can't apply: the default goes, so requests that name none are served, and a request
+    that names one is refused (400) by the sampler's draft-verify check."""
+    model = _model(tmp_path, draft={"method": "ngram"})
+    config = model.get_request_resource_configs({}, {})[SAMPLER]
+    assert config.repetition_penalty in (None, 1.0) and config.temperature == 0.7
+    spec = next(s for s in model.get_node_resources() if isinstance(s, SamplerSpec))
+    config.validate(spec)
+    named = model.get_request_resource_configs({}, {"repetition_penalty": 1.2})[SAMPLER]
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        named.validate(spec)
+    # without drafting, the default still applies
+    assert _model(tmp_path).get_request_resource_configs({}, {})[SAMPLER].repetition_penalty == 1.05
+

@@ -290,3 +290,36 @@ def test_the_position_resource_says_when_a_layer_may_fuse_its_rope(overrides, he
         device=torch.device("cpu"), head_dim=head_dim,
     )
     assert rope.fusable_rope_theta(head_dim) == (1e6 if fusable else None)
+
+
+def test_the_target_lm_taps_the_stream_entering_each_named_layer():
+    """``tap_key`` binds the node's ``TapSpec``: a step that declares taps gets the residual
+    stream entering each named layer (HF's ``hidden_states[i]``), and the stream after the last
+    layer before the final norm."""
+    from mstar.engine.resources import Segment, StepContext, TapStep
+    from mstar.engine.resources.draft_verify.taps import TapResource
+
+    torch.manual_seed(0)
+    hf = Qwen3ForCausalLM(Qwen3Config(**TINY, attn_implementation="eager")).eval()
+    ours = Qwen3DenseLM(
+        Qwen3LMConfig.from_hf(TINY), attn_key=ATTN, kv_key=KV, pos_key=POS, tap_key="taps",
+    ).eval()
+    ours.load_weights([(k.removeprefix("model."), v) for k, v in hf.state_dict().items()])
+    _bind(ours)
+    layers = TINY["num_hidden_layers"]
+    taps = TapResource((layers, 0, 1), TINY["hidden_size"], torch.float32, torch.device("cpu"))
+    ours.bind_resources({"taps": taps})
+    prompt = torch.randint(0, TINY["vocab_size"], (7,))
+    taps.plan(
+        TapStep(segments=(Segment(0, "main", 7),)),
+        StepContext(request_ids=(0,), graph_walk="prefill", slot=0, capture=False),
+    )
+    with torch.no_grad():
+        ours(ours.embed(prompt), label="main")
+        got = taps.read().clone()
+        streams = hf(prompt[None], output_hidden_states=True).hidden_states
+        final = ours.norm(got[:, 0])
+    assert torch.allclose(got[:, 1], streams[0][0], atol=1e-5)
+    assert torch.allclose(got[:, 2], streams[1][0], atol=1e-5)
+    # HF hands back the last stream after the final norm
+    assert torch.allclose(final, streams[layers][0], atol=1e-5)

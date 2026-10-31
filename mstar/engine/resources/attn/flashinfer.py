@@ -11,7 +11,7 @@ from mstar.engine.resources.attn.base import (
     WorkspacePool,
     captured_page_capacity,
 )
-from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
+from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferMixedWrapper,
@@ -22,7 +22,7 @@ from mstar.engine.resources.attn.wrappers import (
 )
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
-from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.kv.plan import KVPlanOutputs, PagedIndptrs, build_paged_indptrs, hide_tail_views
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
@@ -228,8 +228,22 @@ class FlashInferManager(AttentionManager):
         # wrapper per slot is what keeps plan(N+1) off step N's queued copy.
         return True
 
+    def _indptrs(self, kv_out, step: AttentionStep) -> PagedIndptrs:
+        """The index arrays a label plans from: the KV plan's, or with ``hide_last`` its
+        views' keys short of each row's last rows."""
+        if not step.hide_last:
+            return kv_out.cpu_indptrs
+        page_size = self._group.page_size
+        return build_paged_indptrs(hide_tail_views(kv_out.views, step.hide_last, page_size), page_size)
+
     def plan(self, step: AttentionStep, ctx: StepContext):
-        refuse_context_only(step, type(self).__name__)
+        if step.context_only:
+            raise ValueError(
+                f"{type(self).__name__} does not read AttentionStep.context_only; only the "
+                "flashinfer_mla backend does"
+            )
+        if step.hide_last and step.causal:
+            raise ValueError("AttentionStep.hide_last is for non-causal attention")
         if self._window_left >= 0 and not step.causal:
             raise ValueError("sliding_window requires causal attention")
         self.reset_default_cursors()
@@ -262,7 +276,7 @@ class FlashInferManager(AttentionManager):
         plan_states.clear()
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
-            indptrs = kv_out.cpu_indptrs
+            indptrs = self._indptrs(kv_out, step)
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
                 wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
@@ -307,7 +321,7 @@ class FlashInferManager(AttentionManager):
                 rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
             if not any((rid, lab) in rewound for rid, lab, _ in rows):
                 continue
-            indptrs = kv_out.cpu_indptrs
+            indptrs = self._indptrs(kv_out, step)
             if isinstance(wrapper, FlashInferPrefillWrapper) and (
                 wrapper.planned_for(indptrs.kv_lens) or wrapper.patch_kv_lens(indptrs.kv_lens)
             ):

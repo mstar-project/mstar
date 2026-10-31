@@ -423,6 +423,33 @@ refused and the MTP head is skipped. The chat template's new
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends.
 
+Text LMs (``qwen3_*b``, ``qwen3_coder_30b_a3b``)
+-----------------------------------------------
+
+Text chat on the generic text LM (``mstar/model/text_lm``), which serves any
+``qwen3`` / ``qwen3_moe`` checkpoint::
+
+    mstar serve qwen3_8b --gpus 0
+
+``enable_thinking`` passes through to the chat template (Qwen3's default is on).
+``model_kwargs.draft`` makes decode speculative (see `Draft-verify decoding` in
+:doc:`adding_models`): ``method: ngram`` drafts by prompt lookup, and ``method:
+draft_model`` with ``model:``
+a smaller checkpoint of the same tokenizer drafts with it inside the LLM node
+(``configs/qwen3_8b_draft.yaml``: Qwen3-0.6B drafting 4 tokens a step for
+Qwen3-8B). The drafter runs on KV of its own, one token behind the target's, and
+a decode step (its passes, the target over the block, the verdict) replays as
+one CUDA graph; its prefill runs eager beside the target's. ``draft_sample:
+true`` draws the drafts as the request samples instead of taking the drafter's
+argmax. A deployment sizes the drafter's KV pool with ``resources: draft_kv:
+max_num_pages``. ``method: dspark`` with ``model:`` a DSpark drafter trained for
+the checkpoint (``configs/qwen3_8b_dspark.yaml``: DeepSeek's
+``dspark_qwen3_8b_block7`` for Qwen3-8B) reads five of the target's layers and
+drafts its block (7) in one pass every step, and its KV pool is ``resources:
+dspark_kv``. Under any method ``repetition_penalty`` and ``min_tokens`` are
+refused, prefix caching is off on the node, and a draft model needs a prompt of
+at least two tokens.
+
 Command A+ (``command_a_plus``)
 -------------------------------
 
