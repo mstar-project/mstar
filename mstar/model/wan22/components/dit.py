@@ -1,9 +1,14 @@
 """Native Wan2.2-TI2V-5B video DiT (dense 5B transformer).
 
-Exact port of diffusers 0.39.0 ``WanTransformer3DModel``, restricted to the
-TI2V-5B checkpoint's configuration: no image-conditioning branch, and the
-per-token timestep path (the dit submodule always feeds a ``[batch, seq]``
-timestep grid).
+Port of diffusers 0.39.0 ``WanTransformer3DModel``, restricted to the TI2V-5B
+checkpoint's configuration: no image-conditioning branch, and the per-token
+timestep path (``expand_timesteps``). Every token of a latent frame shares its
+frame's timestep (I2V zeroes frame 0 only), so the timestep comes in per frame,
+``[batch, frames]``, and the time embedding and the modulation are computed once
+per frame and broadcast over the frame's tokens. cuBLAS may pick a different
+GEMM kernel at the per-frame row count than at the reference's per-token one, so
+these rows match the reference's to rounding rather than bitwise; given the same
+rows, the blocks and the head are the reference's bits.
 
 Numerics contract (bf16 weights with fp32 islands):
 
@@ -35,6 +40,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
+from mstar.model.components.diffusion.modulation import ada_layer_norm
+from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import Wan22Config
 
@@ -117,7 +124,7 @@ class Wan22RoPE3D:
         return self._tables[device]
 
     def __call__(self, grid: tuple[int, int, int], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-grid frequencies, each ``[1, t*h*w, 1, head_dim]`` fp32
+        """Per-grid frequencies, each ``[t*h*w, head_dim]`` fp32
         (reference ``WanRotaryPosEmbed.forward``)."""
         ppf, pph, ppw = grid
         freqs_cos, freqs_sin = self.tables(device)
@@ -128,25 +135,9 @@ class Wan22RoPE3D:
             f = split[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
             h = split[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
             w = split[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
-            return torch.cat([f, h, w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+            return torch.cat([f, h, w], dim=-1).reshape(ppf * pph * ppw, -1)
 
         return expand_axes(split_cos), expand_axes(split_sin)
-
-
-def _apply_rotary_emb(
-    hidden_states: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
-) -> torch.Tensor:
-    """Interleaved-pair rotary application (reference ``WanAttnProcessor``
-    inner ``apply_rotary_emb``): fp32 math via type promotion against the
-    fp32 tables, cast back to the input dtype at the output-buffer
-    assignment."""
-    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-    cos = freqs_cos[..., 0::2]
-    sin = freqs_sin[..., 1::2]
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
-    return out.type_as(hidden_states)
 
 
 class Wan22DiTAttention(nn.Module):
@@ -174,17 +165,16 @@ class Wan22DiTAttention(nn.Module):
         attn_fn: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
         kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
-        query = self.q_norm(self.q_proj(hidden_states))
-        key = self.k_norm(self.k_proj(kv_source))
-        value = self.v_proj(kv_source)
-
-        query = query.unflatten(2, (self.num_heads, -1))
-        key = key.unflatten(2, (self.num_heads, -1))
-        value = value.unflatten(2, (self.num_heads, -1))
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(kv_source)
+        value = self.v_proj(kv_source).unflatten(2, (self.num_heads, -1))
 
         if rotary_emb is not None:
-            query = _apply_rotary_emb(query, *rotary_emb)
-            key = _apply_rotary_emb(key, *rotary_emb)
+            # across-heads RMSNorm, then the interleaved-pair rotation
+            query, key = rms_norm_rope(query, key, self.q_norm, self.k_norm, *rotary_emb, self.num_heads)
+        else:
+            query = self.q_norm(query).unflatten(2, (self.num_heads, -1))
+            key = self.k_norm(key).unflatten(2, (self.num_heads, -1))
 
         # Bidirectional, no mask: SDPA (the reference's dispatch_attention_fn
         # native path) without a ragged callable, one segment per row with one.
@@ -193,9 +183,9 @@ class Wan22DiTAttention(nn.Module):
 
 
 class Wan22TimeTextEmbedding(nn.Module):
-    """Condition embedder: per-token timestep embedding + text projection
+    """Condition embedder: per-frame timestep embedding + text projection
     (reference ``WanTimeTextImageEmbedding``, image branch absent on
-    TI2V-5B).
+    TI2V-5B, its per-token rows computed once per frame).
 
     ``time_embedder`` is an fp32 island: the sinusoidal embedding and both
     its Linears run fp32; ``temb`` crosses to bf16 at ``type_as(text)``, so
@@ -212,12 +202,12 @@ class Wan22TimeTextEmbedding(nn.Module):
     def forward(
         self, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``timestep`` ``[B, seq]`` (per-token, ``expand_timesteps``);
-        returns ``temb [B, seq, dim]``, ``timestep_proj [B, seq, 6, dim]``,
+        """``timestep`` ``[B, frames]``, one per latent frame; returns
+        ``temb [B, frames, dim]``, ``timestep_proj [B, frames, 6, dim]``,
         projected text ``[B, 512, dim]`` — all in the text embeds' dtype."""
-        batch, seq_len = timestep.shape
+        batch, frames = timestep.shape
         sincos = _sinusoidal_timestep_embedding(timestep.flatten(), self.freq_dim)
-        temb = self.time_embedder(sincos.unflatten(0, (batch, seq_len)))
+        temb = self.time_embedder(sincos.unflatten(0, (batch, frames)))
         temb = temb.type_as(encoder_hidden_states)
         timestep_proj = self.time_proj(F.silu(temb)).unflatten(2, (6, -1))
         return temb, timestep_proj, self.text_embedder(encoder_hidden_states)
@@ -251,24 +241,29 @@ class Wan22DiTBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         self_attn_fn: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
-        # [1, 1, 6, dim] + [B, seq, 6, dim] -> six [B, seq, dim] fp32 tensors.
+        # [1, 1, 6, dim] + [B, frames, 6, dim] -> six [B, frames, dim] fp32
+        # tensors, each applied to all of a frame's tokens.
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            (self.scale_shift_table.unsqueeze(0) + timestep_proj.float()).chunk(6, dim=2)
-        )
-        shift_msa, scale_msa, gate_msa = shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2)
-        c_shift_msa, c_scale_msa, c_gate_msa = c_shift_msa.squeeze(2), c_scale_msa.squeeze(2), c_gate_msa.squeeze(2)
+            self.scale_shift_table.unsqueeze(0) + timestep_proj.float()
+        ).unbind(2)
 
-        norm_hidden = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        _, norm_hidden = ada_layer_norm(hidden_states, shift_msa, scale_msa, eps=self.norm1.eps)
         attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb, attn_fn=self_attn_fn)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
-
-        norm_hidden = self.norm2(hidden_states.float()).type_as(hidden_states)
+        hidden_states, norm_hidden = ada_layer_norm(
+            hidden_states, None, None, eps=self.norm2.eps, weight=self.norm2.weight, bias=self.norm2.bias,
+            residual=attn_output, gate=gate_msa,
+        )
         attn_output = self.cross_attn(norm_hidden, encoder_hidden_states=encoder_hidden_states)
-        hidden_states = hidden_states + attn_output
-
-        norm_hidden = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states)
+        # the cross-attention residual is a plain add in the stream dtype (no gate)
+        hidden_states, norm_hidden = ada_layer_norm(
+            hidden_states, c_shift_msa, c_scale_msa, eps=self.norm3.eps, residual=attn_output,
+        )
         ff_output = self.ffn(norm_hidden)
-        return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        frames = timestep_proj.shape[1]
+        return (
+            hidden_states.unflatten(1, (frames, -1)).float()
+            + ff_output.unflatten(1, (frames, -1)).float() * c_gate_msa.unsqueeze(2)
+        ).type_as(hidden_states).flatten(1, 2)
 
 
 class Wan22DiT(nn.Module):
@@ -330,20 +325,20 @@ class Wan22DiT(nn.Module):
         self_attn_fn: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
-        ``[B, post-patch seq]`` per-token grid (``expand_timesteps`` — the
-        only timestep form mstar's dit submodule produces), text embeds
-        ``[B, 512, text_dim]`` bf16. Returns ``[B, C_out, F, H, W]`` bf16.
+        ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
+        token takes its frame's value), text embeds ``[B, 512, text_dim]``
+        bf16. Returns ``[B, C_out, F, H, W]`` bf16.
         ``self_attn_fn`` runs the self-attention on the engine's ragged
         resource; without it, and always for the cross-attention, SDPA."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
-        if timestep.ndim != 2:
+        if timestep.ndim != 2 or timestep.shape[1] != grid[0]:
             raise ValueError(
-                f"Wan22DiT requires a per-token [batch, seq] timestep grid; got ndim={timestep.ndim}."
+                f"Wan22DiT requires a per-frame [batch, {grid[0]}] timestep; got {tuple(timestep.shape)}."
             )
 
-        rotary_emb = self.rope(grid, hidden_states.device)
+        rotary_emb = tuple(t.contiguous() for t in self.rope(grid, hidden_states.device))
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
@@ -355,10 +350,9 @@ class Wan22DiT(nn.Module):
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attn_fn)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
-        # bf16 temb promotes), then project and unpatchify.
-        shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
-        shift, scale = shift.squeeze(2), scale.squeeze(2)
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        # bf16 temb promotes, per frame), then project and unpatchify.
+        shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).unbind(2)
+        _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)

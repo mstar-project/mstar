@@ -1,18 +1,36 @@
-"""The shared FastConformer encoder (Canary, Parakeet, Nemotron ASR) on tiny
-random weights: parity with HF's encoders (when the installed transformers has
-them), batch invariance offline and causal, the causal variant's causality,
-the BatchNorm fold and NeMo's weight names.
+"""The shared FastConformer encoder (Canary, Parakeet, Nemotron ASR, Nemotron
+VoiceChat) on tiny random weights: parity with HF's encoders (when the
+installed transformers has them), batch invariance offline and causal, the
+causal variant's causality, the BatchNorm fold and NeMo's weight names; and the
+stream node, whose frames over any chunking are the offline ones.
 """
+from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
+from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv.bounded import BoundedKVSpec
+from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import StepContext
+from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer import (
     FastConformerConfig,
     FastConformerEncoder,
     chunked_attention_mask,
     nemo_to_hf_name,
 )
+from mstar.model.components.fastconformer_stream import (
+    FastConformerStreamSubmodule,
+    encoder_kv_config,
+    encoder_state_blocks,
+    front_state_blocks,
+)
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
 
 TINY = dict(
     hidden_size=32, num_hidden_layers=2, num_attention_heads=4, intermediate_size=64,
@@ -146,6 +164,20 @@ def test_causal_loader_takes_nemo_flat_subsampling_names():
     target = FastConformerEncoder(_causal_config(3))
     assert target.load_hf_weights(flat.items()) == set(flat)
     assert all(torch.equal(target.state_dict()[name], t) for name, t in flat.items())
+
+
+def test_from_nemo_refuses_a_causal_encoder_with_no_chunk():
+    """A causal encoder's chunk is its right context plus one frame: an
+    unlimited right context (-1) makes none, so it is refused at load."""
+    enc = {
+        "d_model": 32, "n_layers": 2, "n_heads": 4, "ff_expansion_factor": 2, "conv_kernel_size": 9,
+        "feat_in": 16, "subsampling_factor": 8, "subsampling_conv_channels": 8, "subsampling": "dw_striding",
+        "causal_downsampling": True, "conv_context_size": "causal", "conv_norm_type": "layer_norm",
+        "att_context_style": "chunked_limited",
+    }
+    assert FastConformerConfig.from_nemo({**enc, "att_context_size": [6, 0]}).lookahead == 0
+    with pytest.raises(ValueError, match="att_context_size"):
+        FastConformerConfig.from_nemo({**enc, "att_context_size": [6, -1]})
 
 
 def test_chunked_mask_shape():
@@ -288,6 +320,19 @@ def test_encoder_node_features_pad_per_group_not_to_the_batch(monkeypatch):
         torch.testing.assert_close(feats, batch([clip])[0].to(feats.dtype), rtol=1e-5, atol=1e-5)
 
 
+def test_encoder_node_fails_only_the_clip_its_featurizer_cannot_take():
+    """A clip of two frames that the reflecting featurizer can't featurize (no
+    longer than n_fft/2 samples) fails its own request in ``prepare_inputs``,
+    not the whole batch's features in ``preprocess``."""
+    from mstar.model.components.fastconformer_submodule import FastConformerEncoderSubmodule
+
+    log_mel = NemoLogMel(num_mel_bins=16, normalize=False, reflect_edges=True)
+    node = FastConformerEncoderSubmodule(FastConformerEncoder(FastConformerConfig.from_hf(TINY)), log_mel=log_mel)
+    assert log_mel.num_frames(200) == 2
+    with pytest.raises(ValueError, match="200 samples"):
+        node.prepare_inputs("prefill", None, {"audio": [torch.randn(200)]})
+
+
 def test_replay_plan_covers_every_row_and_merges_short_clips():
     """``_plan`` gives each row one group; short clips ride in a longer clip's
     replay when a replay of their own costs more than the padding, rows of one
@@ -309,37 +354,664 @@ def test_replay_plan_covers_every_row_and_merges_short_clips():
     assert [(b, len(rows)) for b, rows in _plan([3000] * 8 + [200] * 4)] == [(256, 4), (4096, 8)]
     assert _plan([MEL_BUCKETS[-1] + 1, 300]) == [(512, [1]), (None, [0])]
 
-def test_reproduces_the_duplex_encoder():
-    """``nemotron_duplex`` keeps its own encoder: a causal, bias-free
-    FastConformer under NeMo's names. Its weights load into this one through
-    ``nemo_to_hf_name``, and on the same features both give the same frames,
-    the ground a later merge of the two stands on. (They differ before the
-    encoder: duplex's featurizer keeps one more mel frame per clip.)"""
-    from mstar.model.nemotron_duplex.components.conformer import ConformerEncoder
-    from mstar.model.nemotron_duplex.config import ConformerSTTConfig
+# -- the stream node ----------------------------------------------------------
 
-    duplex_config = ConformerSTTConfig(
-        d_model=32, num_heads=4, num_layers=2, feat_in=16, n_mels=16, conv_kernel_size=9,
-        subsampling_conv_channels=8, att_context_size=(8, 0),
+KV, CONV, FRONT = "encoder_kv", "encoder_state", "encoder_front"
+
+
+def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflect_edges=True):
+    """The stream node over a shrunk causal [6, 0] encoder with random weights
+    and a featurizer with random filters, NeMo's pre-2.5 convention."""
+    torch.manual_seed(0)
+    enc = FastConformerEncoder(FastConformerConfig(
+        hidden_size=64, num_heads=4, num_layers=3, intermediate_size=256, num_mel_bins=32, subsampling_channels=8,
+        attention_bias=False, convolution_bias=False, causal=True, left_context=6, lookahead=lookahead,
+    ), kv_key=KV, conv_key=CONV)
+    proj = nn.Linear(64, 48)
+    with torch.no_grad():
+        for t in [*enc.parameters(), *proj.parameters()]:
+            t.copy_(torch.randn_like(t) * 0.2)
+    log_mel = NemoLogMel(
+        num_mel_bins=32, n_fft=n_fft, win_length=win_length, normalize=normalize, reflect_edges=reflect_edges,
+        mel_filters=torch.rand(32, n_fft // 2 + 1),
     )
-    torch.manual_seed(12)
-    duplex = ConformerEncoder(duplex_config).eval()
-    with torch.no_grad():
-        for p in duplex.parameters():
-            p.normal_(0, 0.2)
-    ours = FastConformerEncoder(FastConformerConfig(
-        hidden_size=32, num_layers=2, num_heads=4, intermediate_size=128, conv_kernel_size=9,
-        num_mel_bins=16, subsampling_channels=8, attention_bias=False, convolution_bias=False,
-        causal=True, left_context=8, lookahead=0,
-    )).eval()
-    loaded = ours.load_hf_weights((nemo_to_hf_name(name), t) for name, t in duplex.state_dict().items())
-    assert loaded == {name for name, _ in ours.named_parameters()}
-    feats = torch.randn(1, 203, 16)
-    with torch.no_grad():
-        expected, expected_lens = duplex(feats.transpose(1, 2), torch.tensor([203]))
-        out, out_lens = ours(feats, torch.tensor([203]))
-    assert out_lens.tolist() == expected_lens.tolist()
-    assert torch.allclose(out, expected.transpose(1, 2), atol=1e-5), (out - expected.transpose(1, 2)).abs().max()
+    return FastConformerStreamSubmodule(
+        enc.eval(), log_mel, proj.eval(), input_edge="audio_in", output_edge="audio_frame",
+        front_key=FRONT, batch_sizes=[1, 2, 4, 8, 16, 32],
+    )
+
+
+def _captured_on_cpu(config, label, resources=None, step_runner=None, bs=(1, 2, 4)):
+    """The engine's piecewise runner for ``config``, captured on CPU: the real
+    runner (bucket padding, its own static buffers per bucket, the region's
+    admit / plan / commit), with a "graph" whose replay re-runs the region
+    eagerly. ``calls`` counts its replays."""
+    from unittest import mock
+
+    from mstar.engine import accelerator_graph_runner as cgr
+    from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
+
+    class _Replay:
+        def __init__(self, fn):
+            self.fn = fn
+
+        def replay(self):
+            self.fn()
+
+    config.capture_batch_sizes = list(bs)
+    backend = SimpleNamespace(is_available=lambda: True, set_device=lambda: None, synchronize=lambda: None)
+    runner = cgr.PiecewiseAcceleratorGraphRunner(
+        label=label, config=config, resources=resources or {}, step_runner=step_runner or StepRunner({}),
+        device=torch.device("cpu"), autocast_dtype=None, num_slots=1, node_name=label,
+        memory_pool=AcceleratorGraphPool("cpu"), device_capability=SimpleNamespace(graph_backend=backend),
+    )
+    # a CPU device has no capture plan, so every bucket is warmed up and captured; the warm-up's
+    # memory readings are the accelerator's, which a CPU device has none of
+    no_memory_stats = dict(memory_allocated=lambda device=None: 0, max_memory_allocated=lambda device=None: 0,
+                           reset_peak_memory_stats=lambda device=None: None, empty_cache=lambda: None)
+    with mock.patch.object(cgr, "capture_into_graph", lambda fn, *a, **_: (_Replay(fn), fn())), \
+            mock.patch.multiple(torch.accelerator, **no_memory_stats):
+        runner.prepare_for_capture()
+        runner.warmup_and_capture(None)
+    assert runner.any_graphs and not runner.dropped_shapes
+    runner.calls = 0
+    run = runner.run
+
+    def counted(*args, **kwargs):
+        runner.calls += 1
+        return run(*args, **kwargs)
+
+    runner.run = counted
+    return runner
+
+
+class _Encoder:
+    """The stream node with its resources, driven as the engine drives an eager
+    step: declare, admit and plan them, preprocess, forward, commit. The bounded
+    KV runs its torch path on CPU, in fp32 (the engine's KV dtype here)."""
+
+    def __init__(self, **featurizer):
+        self.node = _stream_node(**featurizer)
+        config, hop = self.node.encoder.config, self.node.log_mel.hop_length
+
+        def pool(key, num_layers, blocks):
+            spec = RecurrentStateSpec(key, {"conformer_encoder"},
+                                      RecurrentStateConfig(num_layers=num_layers, blocks=blocks, max_slots=8))
+            return RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+
+        self.pool = pool(CONV, config.num_layers, encoder_state_blocks(config, torch.float32))
+        self.front = pool(FRONT, 1, front_state_blocks(config, hop))
+        self.kv = BoundedKVManager.build(
+            BoundedKVSpec(KV, {"conformer_encoder"}, encoder_kv_config(config, max_slots=8)),
+            EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32),
+        )
+        self.resources = {CONV: self.pool, FRONT: self.front, KV: self.kv}
+        self.node.bind_node_resources(self.resources)
+        self.runner = StepRunner(self.resources)
+        self.regions = {}       # the piecewise runners, captured on CPU, by label, when a test sets them
+        self.leases = {}        # the regions the last declaration's step leased
+
+    def prepare(self, handle, chunk, final=False):
+        inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
+        return self.node.prepare_inputs("encode", SimpleNamespace(rid_handle=handle), inputs,
+                                        is_final_stream_chunk=final)
+
+    def declare(self, rids, inputs):
+        """The node's declaration, with the leases the engine takes for it first."""
+        from mstar.engine.engine import Engine
+
+        engine = Engine.__new__(Engine)
+        engine._submodules = {"conformer_encoder": SimpleNamespace(piecewise_runners=self.regions)}
+        ctx = StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False)
+        engine._maybe_lease_piecewise_regions("conformer_encoder", ctx, inputs)
+        self.leases = ctx.piecewise_leases
+        return self.node.declare_step("encode", rids, inputs, piecewise_leases=ctx.piecewise_leases)
+
+    def step(self, rids, inputs) -> BatchedModelOutput:
+        """One engine step over ``rids``: batched when the node can batch them,
+        else each stream's own step, as the engine's per-request path runs it."""
+        if len(rids) > 1 and not self.node.can_batch(None, inputs):
+            out = BatchedModelOutput(per_rid_outputs={})
+            for rid, inp in zip(rids, inputs, strict=True):
+                out.per_rid_outputs.update(self._step([rid], [inp]).per_rid_outputs)
+            return out
+        return self._step(rids, inputs)
+
+    def _step(self, rids, inputs) -> BatchedModelOutput:
+        for rid in rids:
+            for resource in self.resources.values():
+                resource.ingest_request(rid)
+        step = self.declare(rids, inputs)
+        if step is not None:
+            step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))
+            assert self.runner.admit(step).ok
+            self.runner.plan(step)
+        from mstar.engine.engine import SubmoduleManagement
+
+        # the regions the engine hands this step's forward
+        runners = SubmoduleManagement.runners_for(SimpleNamespace(piecewise_runners=self.regions), self.leases)
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=list(rids), per_request_info={}, resources=dict(self.resources),
+            piecewise_runners=runners, step=step,
+        )
+        with torch.no_grad():
+            out = self.node.forward_batched("encode", engine_inputs,
+                                            **self.node.preprocess("encode", engine_inputs, inputs))
+        if step is not None:
+            self.runner.commit(step)
+        return out
+
+    def encode(self, handle, chunk, final=False):
+        """One step for one stream: what the stream hands the node, then its frames."""
+        return self.step([handle], [self.prepare(handle, chunk, final)]).per_rid_outputs[handle]["audio_frame"]
+
+    def offline(self, wav):
+        """The whole clip through the same featurizer, encoder and projection."""
+        with torch.no_grad():
+            return self.node.encode_clip(wav)
+
+
+def _encoder_regions(enc: _Encoder, *labels) -> dict:
+    """The node's piecewise regions as the engine runs them, captured on CPU."""
+    configs = enc.node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
+    return {label: _captured_on_cpu(configs[label], label, enc.resources, enc.runner) for label in labels}
+
+
+def _encode_batch(enc, steps):
+    """One batched step, as the engine runs it: each ``(handle, chunk, final)``
+    row through prepare_inputs, then one step over all of them. Returns each
+    row's frames by handle."""
+    out = enc.step([h for h, _c, _f in steps], [enc.prepare(h, c, f) for h, c, f in steps]).per_rid_outputs
+    return {h: out[h]["audio_frame"] for h, _c, _f in steps}
+
+
+def _stream(enc, wavs, sizes):
+    """Run each stream in its own chunk size, every stream with audio left in
+    each step, then end them all; the frames each stream got."""
+    got = {h: [] for h in wavs}
+    pos = dict.fromkeys(wavs, 0)
+    while any(pos[h] < wavs[h].numel() for h in wavs):
+        rids, inputs = [], []
+        for h in wavs:
+            if pos[h] < wavs[h].numel():
+                inputs.append(enc.prepare(h, wavs[h][pos[h]:pos[h] + sizes[h]]))
+                pos[h] += sizes[h]
+                rids.append(h)
+        out = enc.step(rids, inputs).per_rid_outputs
+        for h in rids:
+            got[h] += out[h]["audio_frame"]
+    for h in wavs:
+        got[h] += enc.encode(h, None, final=True)
+    return got
+
+
+STEP, LAYERS = FastConformerStreamSubmodule.STEP_REGION, FastConformerStreamSubmodule.LAYERS_REGION
+
+
+@pytest.mark.parametrize("end_rides_last_chunk", [False, True])
+# 32160 samples is 201 hops, 1 mod 8: the length where NeMo's two mel conventions
+# disagree on the encoder frame count
+@pytest.mark.parametrize("n", [16000 * 2 + 777, 16000 * 2, 16000 * 2 + 160])
+def test_encoder_streams_the_offline_frames(n, end_rides_last_chunk):
+    """Chunks of any size, smaller than a frame included, then the end of input,
+    on an empty final chunk or on the last chunk of audio (as an upload's usually
+    is): the frames emitted in order are the offline encoding of the stream, and
+    the mel frames the offline featurizer's, the reflected right edge included
+    (a length on the hop grid is the one whose last frame reads it), the newest
+    of which the front end holds."""
+    enc = _Encoder()
+    wav = torch.randn(n) * 0.1
+    want = enc.offline(wav)
+    mel = enc.node.log_mel(wav)
+    for handle, size in enumerate((320, 1280, 2560, 9000, 64000)):
+        got = []
+        for at in range(0, wav.numel(), size):
+            last = at + size >= wav.numel()
+            got += enc.encode(handle, wav[at:at + size], final=last and end_rides_last_chunk)
+        if not end_rides_last_chunk:
+            got += enc.encode(handle, None, final=True)
+        assert len(got) == want.shape[0]
+        assert torch.allclose(torch.stack(got), want, atol=1e-5), size
+        st = enc.node.request_state(handle).get(enc.node.STATE_KEY)
+        assert st.mels == mel.shape[0]
+        held = enc.front.block("mel", 0)[enc.front._slots[handle]["main"].index]   # the newest, right-aligned
+        assert torch.allclose(held, mel[-held.shape[0]:], atol=1e-5), size
+
+
+def test_encoder_batches_streams_at_different_points():
+    """Streams in one step, each with its own chunking (one frame a step, several,
+    or none), each get their own offline frames."""
+    enc = _Encoder()
+    wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000 * 3) * 0.1, 3: torch.randn(9000) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 4000, 3: 320})
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_live_steps_replay_the_regions_with_padding_rows():
+    """Streams one frame of audio further on take the whole-step region; the
+    others in the same step (a stream's first frames, one under a frame a step)
+    the eager front end and the blocks region, both in buckets wider than the
+    batch. Every stream gets its offline frames: the padding rows, which address
+    the pools' sinks, and the rows another path served leave them alone."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, STEP, LAYERS)
+    step, layers = enc.regions.values()
+    wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(6000) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640})
+    assert step.calls >= 20 and layers.calls >= 5
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_layer_region_runs_only_the_streams_with_a_frame():
+    """Streams one frame on take the whole-step region; the blocks region then
+    runs only the other streams that got a frame, not every stream of the step."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, STEP, LAYERS)
+    layers = enc.regions[LAYERS]
+    rows, run, step = [], layers.run, enc.step
+    layers.run = lambda *a, request_ids, **k: rows.append(len(request_ids)) or run(*a, request_ids=request_ids, **k)
+    enc.step = lambda rids, inputs: rows.append(f"step of {len(rids)}") or step(rids, inputs)
+    wavs = {1: torch.randn(16000) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(16000) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640})
+    # once streams 1 and 2 are one frame on, the blocks region runs stream 3 alone
+    assert rows[4:10] == ["step of 3", 1, "step of 3", "step of 3", 1, "step of 3"], rows
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
+    """The KV attends under a plan of exactly the rows it is given, padding
+    included, with the eager path on this step's plan before a region plans its
+    own (the pools' gather / scatter_ read the plan the pool holds when they
+    run). A stream with a chunk over a second runs in a step of its own."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, STEP, LAYERS)
+    attend = enc.kv.attend
+
+    def attend_checked(layer_idx, q, *args, **kwargs):
+        assert len(enc.kv.current.rows) == q.shape[0], "the KV attended under a plan for other rows"
+        return attend(layer_idx, q, *args, **kwargs)
+
+    monkeypatch.setattr(enc.kv, "attend", attend_checked)
+    wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(6000) * 0.1,
+            4: torch.randn(16000 * 3) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640, 4: 20000})
+    assert all(region.calls for region in enc.regions.values())
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def _kv_spans(step) -> list[int]:
+    return [seg.span for seg in step.get(KV).segments]
+
+
+def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
+    """When every stream is one frame on and the whole-step region is captured
+    for the batch, the region's own step owns the resources: the node declares
+    nothing, so no second plan is built and thrown away. Otherwise it declares
+    every stream in each, and in the KV its new frames at its position."""
+    enc = _Encoder()
+    wavs = {1: torch.randn(1280 * 6) * 0.1, 2: torch.randn(1280 * 6) * 0.1}
+    for at in (0, 1280):
+        enc.step([1, 2], [enc.prepare(h, wavs[h][at:at + 1280]) for h in (1, 2)])
+    nxt = [enc.prepare(h, wavs[h][2560:3840]) for h in (1, 2)]
+    step = enc.declare([1, 2], nxt)                                           # no region captured
+    assert set(step.keys()) == {FRONT, CONV, KV}
+    assert _kv_spans(step) == [1, 1]
+    states = [enc.node.request_state(h).get(enc.node.STATE_KEY) for h in (1, 2)]
+    assert [step.get(KV).positions[h].written for h in (1, 2)] == [st.frames for st in states]
+    # the stream's own position, built when its frames last moved, not one per declaration
+    assert all(step.get(KV).positions[h] is st.position for h, st in zip((1, 2), states, strict=True))
+    enc.regions = _encoder_regions(enc, STEP)
+    assert enc.declare([1, 2], nxt) is None
+    for at in range(2560, 1280 * 6, 1280):
+        out = enc.step([1, 2], [enc.prepare(h, wavs[h][at:at + 1280]) for h in (1, 2)]).per_rid_outputs
+        assert all(len(out[h]["audio_frame"]) == 1 for h in (1, 2))
+    assert enc.regions[STEP].calls == 4
+    mixed = [enc.prepare(1, torch.randn(640) * 0.1), enc.prepare(2, torch.randn(1280) * 0.1)]
+    step = enc.declare([1, 2], mixed)
+    assert set(step.keys()) == {FRONT, CONV, KV}
+    assert _kv_spans(step) == [mixed[0].kwargs["n"], 1]
+
+
+def test_encoder_a_step_mixes_a_steady_stream_with_eager_chunks_past_the_window():
+    """One step holds a stream one frame on, a stream whose chunk adds more frames
+    than the attention window (the eager blocks, a step of T > 1 where each
+    frame sees only the window before it, which the stream one frame on then
+    joins) and a stream under a frame a step: each gets its offline frames."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, STEP, LAYERS)
+    window = enc.node.encoder.config.left_context
+    wavs = {1: torch.randn(16000 * 3) * 0.1, 2: torch.randn(16000 * 3) * 0.1, 3: torch.randn(16000) * 0.1}
+    sizes = {1: 1280, 2: 16000, 3: 640}
+    assert 16000 // 1280 > window
+    widths, front = [], enc.node._front
+
+    def spy_front(*args):
+        x = front(*args)
+        widths.append(0 if x is None else x.shape[1])
+        return x
+
+    enc.node._front = spy_front
+    got = _stream(enc, wavs, sizes)
+    assert enc.regions[STEP].calls > 0 and max(widths) > window
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_a_steady_stream_joins_the_eager_layers_of_its_step():
+    """A stream one frame on whose window has wrapped, in a step where another
+    stream's chunk makes several frames: this step's KV plan, which the eager
+    blocks run on, writes both streams' frames, so the steady stream can't also
+    take the whole-step region (whose write of its frame would follow one from
+    padding into the ring entry the region reads)."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, STEP, LAYERS)
+    window = enc.node.encoder.config.left_context
+    at = 1280 * (window + 4)
+    wavs = {1: torch.randn(at + 1280 * 3) * 0.1, 2: torch.randn(9000) * 0.1}
+    got = {1: [], 2: []}
+    for pos in range(0, at, 1280):
+        got[1] += enc.encode(1, wavs[1][pos:pos + 1280])
+    out = _encode_batch(enc, [(1, wavs[1][at:at + 1280], False), (2, wavs[2], False)])
+    assert len(out[2]) > 1
+    for h in (1, 2):
+        got[h] += out[h]
+    got[1] += enc.encode(1, wavs[1][at + 1280:], final=True)
+    got[2] += enc.encode(2, None, final=True)
+    for h in (1, 2):
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wavs[h]), atol=1e-5), h
+
+
+def test_encoder_runs_a_steady_stream_eagerly_when_its_region_has_no_graph():
+    """The whole-step region leases the batch's bucket, but replays only the
+    steady streams: when the runner dropped the capture for that sub-batch (here
+    one stream's), they take the eager path, which this step's plans cover."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, STEP, LAYERS)
+    step_region = enc.regions[STEP]
+    step_region._graphs = {k: v for k, v in step_region._graphs.items() if k.bs != 1}
+    wavs = {1: torch.randn(1280 * 6) * 0.1, 2: torch.randn(1280 * 6) * 0.1}
+    got = {1: [], 2: []}
+    for at in (0, 1280, 2560):
+        for h, frames in _encode_batch(enc, [(h, wavs[h][at:at + 1280], False) for h in (1, 2)]).items():
+            got[h] += frames
+    # stream 1 is one frame on (steady), stream 2 appends half a frame
+    out = _encode_batch(enc, [(1, wavs[1][3840:5120], False), (2, wavs[2][3840:4480], False)])
+    for h in (1, 2):
+        got[h] += out[h]
+    for h, end in ((1, 5120), (2, 4480)):
+        got[h] += enc.encode(h, wavs[h][end:], final=True)
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wavs[h]), atol=1e-5), h
+
+
+@pytest.mark.parametrize("b_end_rides", [False, True])
+@pytest.mark.parametrize("a_chunk", [1280, 9000])
+@pytest.mark.parametrize("b_len", [16000 * 2, 16000 * 2 + 640, 16000 * 2 + 777])
+def test_encoder_a_streams_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, b_end_rides):
+    """Stream B ends in the same step as stream A's longer chunk, A still mid-stream:
+    B's last frames, which read past its audio, are still its offline ones."""
+    enc = _Encoder()
+    starts = list(range(0, b_len, 1280))
+    steps = len(starts) + (0 if b_end_rides else 1)
+    a, b = torch.randn(a_chunk * steps) * 0.1, torch.randn(b_len) * 0.1
+    got_b = []
+    for k, pb in enumerate(starts):
+        b_final = b_end_rides and k == len(starts) - 1
+        rows = [(1, a[k * a_chunk:(k + 1) * a_chunk], False), (2, b[pb:pb + 1280], b_final)]
+        got_b += _encode_batch(enc, rows)[2]
+    if not b_end_rides:
+        got_b += _encode_batch(enc, [(1, a[-a_chunk:], False), (2, None, True)])[2]
+    want = enc.offline(b)
+    assert len(got_b) == want.shape[0]
+    assert torch.allclose(torch.stack(got_b), want, atol=1e-5)
+
+
+def test_encoder_keeps_a_chunk_over_a_second_out_of_a_batch():
+    """A pass pads every stream to its longest chunk, so a step holding an upload
+    or a large append is not batched: can_batch refuses it, by the chunk length
+    prepare_inputs reports, and the engine runs each stream's step on its own.
+    Streams with a second or less share one pass. The frames are the offline
+    ones either way."""
+    enc = _Encoder()
+    fronts, front = [], enc.node._front
+
+    def spy_front(sts, chunks, final, *rest):
+        fronts.append(sorted(c.numel() for c in chunks if c is not None))
+        return front(sts, chunks, final, *rest)
+
+    enc.node._front = spy_front
+    wav = {1: torch.randn(16000 * 5) * 0.1, 2: torch.randn(1280) * 0.1, 3: torch.randn(16001) * 0.1,
+           4: torch.randn(16000) * 0.1}
+    prepared = {h: enc.prepare(h, w, final=True) for h, w in wav.items()}
+    assert {h: inp.input_seq_len for h, inp in prepared.items()} == {h: w.numel() for h, w in wav.items()}
+    assert not enc.node.can_batch(None, list(prepared.values()))
+    assert not enc.node.can_batch(None, [prepared[2], prepared[3]])
+    assert enc.node.can_batch(None, [prepared[2], prepared[4]])
+    assert enc.node.can_batch(None, [prepared[1]])                       # alone, it is its own step
+
+    out = _encode_batch(enc, [(h, w, True) for h, w in wav.items()])
+    assert sorted(fronts) == [[1280], [16000], [16001], [16000 * 5]]    # every stream on its own
+    for h, w in wav.items():
+        assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
+
+    fronts.clear()
+    short = {5: torch.randn(1280) * 0.1, 6: torch.randn(16000) * 0.1}
+    out = _encode_batch(enc, [(h, w, True) for h, w in short.items()])
+    assert fronts == [[1280, 16000]]                                      # one pass
+    for h, w in short.items():
+        assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
+
+
+def test_encoder_takes_no_batch_wider_than_its_graphs():
+    """Its graphs are piecewise regions, which the engine's batch cap does not
+    see: a wider step would run every stream eagerly, so the node caps its batch
+    at its widest capture and the scheduler splits the rest."""
+    from mstar.engine.engine import Engine
+
+    node = _stream_node()
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"conformer_encoder": SimpleNamespace(submodule=node, accelerator_graph_runner=None,
+                                                               capture_runner=None)}
+    assert engine.get_max_batch_size("conformer_encoder", "encode") == max(node.capture_batch_sizes)
+
+
+@pytest.mark.parametrize("unsupported", [
+    dict(lookahead=3), dict(normalize=True), dict(reflect_edges=False), dict(n_fft=2048),
+])
+def test_encoder_refuses_what_it_cannot_stream(unsupported):
+    """A right context, a per-clip normalization, the 2.5 featurizer (whose
+    zero-padded edges a stream's front end does not cut) or a window longer
+    than the samples the front end keeps are refused when the node is built,
+    not met as wrong frames mid-stream."""
+    with pytest.raises(ValueError, match=next(iter(unsupported))):
+        _stream_node(**unsupported)
+
+
+@pytest.mark.parametrize("n_fft", [512, 1024])
+def test_encoder_steady_steps_match_offline_for_the_featurizer_they_get(n_fft):
+    """The whole-step region's slices assume the featurizer's half window spans
+    more than one hop and at most two (512 / 160); with any other the encoder
+    serves every step through the general path, which takes any geometry."""
+    enc = _Encoder(n_fft=n_fft)
+    regions = _encoder_regions(enc, STEP) if n_fft == 512 else {}
+    assert (STEP in enc.node.get_piecewise_accelerator_graph_configs(
+        torch.device("cpu"), torch.float32)) == (n_fft == 512)
+    enc.regions = regions
+    wav = torch.randn(16000 * 2) * 0.1
+    got = torch.stack(_stream(enc, {1: wav}, {1: 1280})[1])
+    assert torch.allclose(got, enc.offline(wav), atol=1e-5)
+    if regions:
+        assert regions[STEP].calls > 0
+
+
+@pytest.mark.parametrize("n_fft", [512, 256])
+@pytest.mark.parametrize("n", [1580, 1728])
+def test_encoder_ends_a_stream_with_its_last_frame_when_the_end_adds_no_mel_frame(n_fft, n):
+    """With a half window under a hop, the end of input can make a last encoder
+    frame final without adding a mel frame: the stream still gets it."""
+    enc = _Encoder(n_fft=n_fft, win_length=n_fft)
+    wav = torch.randn(n) * 0.1
+    got = []
+    for at in range(0, n, 320):
+        got += enc.encode(1, wav[at:at + 320])
+    got += enc.encode(1, None, final=True)
+    want = enc.offline(wav)
+    assert len(got) == want.shape[0]
+    assert torch.allclose(torch.stack(got), want, atol=1e-5)
+
+
+def test_encoder_decides_a_streams_steadiness_once_per_step(monkeypatch):
+    """Whether a stream takes the whole-step region is decided once, where its
+    inputs are prepared; the declaration and the forward read that decision."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, STEP)
+    wavs = {h: torch.randn(1280 * 4) * 0.1 for h in (1, 2)}
+
+    def decided_already(*args):
+        raise AssertionError("steadiness decided again after prepare_inputs")
+
+    for at in range(0, 1280 * 4, 1280):
+        inputs = [enc.prepare(h, wavs[h][at:at + 1280]) for h in wavs]
+        with monkeypatch.context() as m:
+            m.setattr(enc.node, "is_steady", decided_already)
+            enc.step(list(wavs), inputs)
+    assert enc.regions[STEP].calls == 2
+
+
+def test_encoder_moves_a_steps_chunks_to_the_device_in_one_copy():
+    """Each stream's chunk arrives on the host; one copy per stream would each be a
+    blocking transfer from pageable memory, so the step copies them as one."""
+    from torch.profiler import ProfilerActivity, profile
+
+    chunks = [torch.randn(1280), None, torch.randn(640), torch.randn(1280)]
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        moved = FastConformerStreamSubmodule._to_device(chunks, torch.device("meta"))
+    copies = [e for e in prof.events() if e.name == "aten::_to_copy"]
+    assert len(copies) == 1
+    assert [None if c is None else (c.device.type, c.shape) for c in moved] == [
+        ("meta", (1280,)), None, ("meta", (640,)), ("meta", (1280,))]
+
+
+def test_encoder_step_region_replays_three_streams_with_a_padding_row():
+    """Three streams one frame on replay the whole-step region in a bucket of
+    four: the padding row addresses both pools' sinks and the streams get their
+    offline frames."""
+    enc = _Encoder()
+    enc.regions = _encoder_regions(enc, STEP)
+    region = enc.regions[STEP]
+    rows, run = [], region.run
+    region.run = lambda *a, request_ids, **k: rows.append(len(request_ids)) or run(*a, request_ids=request_ids, **k)
+    wavs = {h: torch.randn(16000) * 0.1 for h in (1, 2, 3)}
+    got = _stream(enc, wavs, dict.fromkeys(wavs, 1280))
+    assert rows and set(rows) == {3}
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
+
+
+def test_encoder_offers_nothing_to_the_stop_check():
+    """The encoder has no check_stop and its stream ends with the client's: its
+    frames are not copied to the host every step for one."""
+    enc = _Encoder()
+    out = enc.step([1], [enc.prepare(1, torch.randn(4000) * 0.1)])
+    assert isinstance(out, BatchedModelOutput) and out.check_stop_buffers == {}
+    assert len(out.per_rid_outputs[1]["audio_frame"]) > 0
+
+
+def test_encoder_steps_do_not_reproject_the_relative_positions():
+    """The distances a stream's frame sees are fixed, so each layer projects
+    them once, at bind, not every step."""
+    enc = _Encoder()
+    calls = []
+    for layer in enc.node.encoder.layers:
+        layer.self_attn.relative_k_proj.register_forward_hook(lambda *a: calls.append(1))
+    wav = torch.randn(16000) * 0.1
+    for at in range(0, wav.numel(), 1280):
+        enc.encode(1, wav[at:at + 1280])
+    assert not calls
+
+
+def test_encoder_waits_for_enough_audio_to_featurize():
+    enc = _Encoder()
+    assert enc.encode(1, torch.zeros(10)) == []
+
+
+@pytest.mark.parametrize("n", [257, 1000, 1279, 1281])
+def test_encoder_a_short_stream_gets_the_offline_frames(n):
+    """Offline encodes any stream longer than n_fft/2 samples, under one frame too."""
+    enc = _Encoder()
+    wav = torch.randn(n) * 0.1
+    want = enc.offline(wav)
+    for handle, size in enumerate((100, n)):
+        got = []
+        for at in range(0, n, size):
+            got += enc.encode(handle, wav[at:at + size])
+        got += enc.encode(handle, None, final=True)
+        assert len(got) == want.shape[0]
+        assert torch.allclose(torch.stack(got), want, atol=1e-5), size
+
+
+@pytest.mark.parametrize("chunks", [[], [torch.zeros(256)], [torch.zeros(100), torch.zeros(156)]])
+def test_encoder_fails_a_stream_that_ends_without_enough_audio(chunks):
+    """No audio, or no more than n_fft/2 samples (which offline can't featurize):
+    the stream fails rather than reply to nothing."""
+    enc = _Encoder()
+    for chunk in chunks:
+        enc.encode(1, chunk)
+    with pytest.raises(ValueError, match="ended with"):
+        enc.encode(1, None, final=True)
+
+
+def test_encoder_state_is_per_stream_and_cleaned_up():
+    enc = _Encoder()
+    free = enc.pool.num_free_slots
+    enc.encode(1, torch.randn(4000) * 0.1)
+    enc.encode(2, torch.randn(4000) * 0.1)
+    assert enc.pool.num_free_slots == enc.front.num_free_slots == free - 2
+    assert set(enc.kv._requests) == {1, 2}
+    enc.node.cleanup_request(1)
+    for resource in enc.resources.values():
+        resource.remove_request(1)
+    assert 1 not in enc.node.request_states and 2 in enc.node.request_states
+    assert enc.pool.num_free_slots == enc.front.num_free_slots == free - 1
+    assert set(enc.kv._requests) == {2}
+
+
+def _without_fft(config):
+    """``config`` with its region raising on any FFT op: torch.stft and
+    torch.fft reach the dispatcher as ``aten._fft_*``."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _NoFFT(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert not func.__name__.startswith("_fft_"), f"{func} in a captured region"
+            return func(*args, **(kwargs or {}))
+
+    fn = config.capture_fn
+
+    def region(call):
+        with _NoFFT():
+            return fn(call)
+
+    config.capture_fn = region
+    return config
+
+
+def test_encoder_regions_run_no_fft():
+    """A captured cuFFT plan lives in torch's plan cache, whose LRU eviction
+    destroys it under the graph; so the regions take their STFT as a matmul.
+    The eager path, which the guard leaves alone, keeps torch.stft."""
+    enc = _Encoder()
+    configs = enc.node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
+    enc.regions = {label: _captured_on_cpu(_without_fft(configs[label]), label, enc.resources, enc.runner)
+                   for label in (STEP, LAYERS)}
+    wavs = {1: torch.randn(16000) * 0.1, 2: torch.randn(16000 + 640) * 0.1}
+    got = _stream(enc, wavs, {1: 1280, 2: 640})
+    assert all(enc.regions[label].calls for label in (STEP, LAYERS))
+    for h, wav in wavs.items():
+        assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
 _needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="the Triton kernels need a GPU")

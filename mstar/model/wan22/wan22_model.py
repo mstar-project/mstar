@@ -225,11 +225,10 @@ class Wan22Model(Model):
         if i2v:
             dit_inputs.append("image_latent")
         # Loop-carried state: see Wan22DitSubmodule's docstring for the
-        # definitive shape/dtype inventory (latents, 0-based step index, the
-        # order-2 UniPC ring buffer, and the corrector's last_sample).
+        # definitive shape/dtype inventory (latents, the order-2 UniPC ring
+        # buffer, and the corrector's last_sample).
         dit_inputs += [
             "latents",
-            "time_index",
             "unipc_model_outputs",
             "unipc_last_sample",
         ]
@@ -241,7 +240,6 @@ class Wan22Model(Model):
                 input_names=dit_inputs,
                 outputs=[
                     GraphEdge(next_node="dit", name="latents"),
-                    GraphEdge(next_node="dit", name="time_index"),
                     GraphEdge(next_node="dit", name="unipc_model_outputs"),
                     GraphEdge(next_node="dit", name="unipc_last_sample"),
                 ],
@@ -673,7 +671,6 @@ class Wan22Model(Model):
             inputs.append(edge)
         inputs += [
             GraphEdge(next_node="dit", name="latents"),
-            GraphEdge(next_node="dit", name="time_index"),
             GraphEdge(next_node="dit", name="unipc_model_outputs"),
             GraphEdge(next_node="dit", name="unipc_last_sample"),
         ]

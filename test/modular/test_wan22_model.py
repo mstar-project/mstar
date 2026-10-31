@@ -42,7 +42,7 @@ CONFIG_PATH = str(
 )
 
 # The dit node's loop-back edges (see Wan22DitSubmodule for the inventory).
-LOOP_BACK_NAMES = {"latents", "time_index", "unipc_model_outputs", "unipc_last_sample"}
+LOOP_BACK_NAMES = {"latents", "unipc_model_outputs", "unipc_last_sample"}
 
 
 def _make_model() -> Wan22Model:
@@ -479,14 +479,13 @@ def test_wan22_check_stop_without_step_metadata_never_stops():
 # ----------------------------------------------------------------------
 
 
-def _dit_loop_inputs(k: int) -> dict:
-    """The dit's inputs as they arrive on loop iteration k >= 1."""
+def _dit_loop_inputs() -> dict:
+    """The dit's inputs as they arrive on any loop iteration past the first."""
     shape = (1, 4, 2, 2, 2)
     return {
         "text_embeds_pos": [torch.zeros(1, 8, 16)],
         "text_embeds_neg": [torch.zeros(1, 8, 16)],
         "latents": [torch.zeros(shape)],
-        "time_index": [torch.tensor([k], dtype=torch.int64)],
         "unipc_model_outputs": [torch.zeros((2, *shape))],
         "unipc_last_sample": [torch.zeros(shape)],
     }
@@ -499,7 +498,7 @@ def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
     result = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
         fwd_info=_fwd_info(requested_steps=2, iter_count=2),
-        inputs=_dit_loop_inputs(k=2),
+        inputs=_dit_loop_inputs(),
     )
     assert result is None
 
@@ -509,10 +508,10 @@ def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
     node_inputs = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
         fwd_info=_fwd_info(requested_steps=2, iter_count=1),
-        inputs=_dit_loop_inputs(k=1),
+        inputs=_dit_loop_inputs(),
     )
     assert node_inputs is not None
-    assert int(node_inputs.tensor_inputs["time_index"][0]) == 1
+    assert node_inputs.tensor_inputs.keys() == {"text_embeds_pos", "text_embeds_neg"} | LOOP_BACK_NAMES
 
 
 @pytest.mark.parametrize("guidance,expect_negative", [
@@ -1006,7 +1005,7 @@ def test_wan22_dit_branches_per_rank(world_size, guidance, branches):
 
     def prepare():
         return submodule.prepare_inputs(
-            graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(guidance), inputs=_dit_loop_inputs(k=1),
+            graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(guidance), inputs=_dit_loop_inputs(),
         )
     if branches is None:
         with pytest.raises(ValueError, match="evenly"):
@@ -1075,7 +1074,7 @@ def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(sp_size, ok):
 def test_wan22_dit_declares_one_segment_per_branch():
     submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
     node_inputs = submodule.prepare_inputs(
-        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(k=1),
+        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
     self_step = step.get(Wan22DitSubmodule.SELF_ATTN)
