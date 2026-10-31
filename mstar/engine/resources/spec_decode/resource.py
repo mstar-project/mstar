@@ -146,7 +146,6 @@ class SpecDecodeResource(Resource):
             device=info.device,
             num_draft_tokens=spec.config.num_draft_tokens,
             sampling=spec.config.sampling,
-            vocab_size=spec.config.vocab_size,
             max_requests=spec.config.max_requests,
             page_size=page_size,
             kv_key=spec.kv_cache,
@@ -164,7 +163,6 @@ class SpecDecodeResource(Resource):
         attn_key: str,
         stop_token_ids: Sequence[int] = (),
         sampling: bool = False,
-        vocab_size: int | None = None,
     ):
         self._device = device
         self.num_draft_tokens = num_draft_tokens
@@ -193,9 +191,11 @@ class SpecDecodeResource(Resource):
         self._rng_offset = torch.zeros(rows, dtype=torch.long, device=device)
         self._rng_stride = sampled.words_per_step(num_draft_tokens)
         # per request and draft: the distribution the next verify judges it by
-        self._draft_probs = torch.zeros(
-            rows, num_draft_tokens, vocab_size, dtype=torch.float32, device=device,
-        ) if sampling else None
+        self._draft_ids = self._draft_probs = None
+        if sampling:
+            shape = (rows, num_draft_tokens, sampled.CANDIDATES)
+            self._draft_ids = torch.zeros(shape, dtype=torch.long, device=device)
+            self._draft_probs = torch.zeros(shape, dtype=torch.float32, device=device)
         self._stop_ids = torch.tensor(
             sorted(set(stop_token_ids)) or [-2], dtype=torch.long, device=device,
         )
@@ -481,10 +481,11 @@ class SpecDecodeResource(Resource):
             self._seed.index_copy_(0, rows, image.seeds[:b])
             self._rng_offset.index_fill_(0, rows, RNG_START)
             # the first drafts are the head's argmax, a point mass each
-            k, vocab = self.num_draft_tokens, self._draft_probs.shape[-1]
-            point = torch.zeros(b, k, vocab, dtype=torch.float32, device=self._device)
-            at = first_draft.view(b, 1, 1).long().expand(b, k, 1)
-            self._draft_probs.index_copy_(0, rows, point.scatter_(2, at, sampled.DRAFT_MARGIN))
+            k, width = self.num_draft_tokens, sampled.CANDIDATES
+            self._draft_ids.index_copy_(0, rows, first_draft.view(b, 1, 1).long().expand(b, k, width))
+            point = torch.zeros(b, k, width, dtype=torch.float32, device=self._device)
+            point[:, :, 0] = 1.0
+            self._draft_probs.index_copy_(0, rows, point)
 
     @torch.compiler.disable
     def verify_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -525,8 +526,8 @@ class SpecDecodeResource(Resource):
             row.top_p.repeat_interleave(t),
         ).view(b, t, vocab)
         tokens, kept = sampled.accept_chain(
-            self._draft_probs.index_select(0, rows), self._ids.view(b, t)[:, 1:], target,
-            row.seed, row.draft_offset - t,
+            self._draft_ids.index_select(0, rows), self._draft_probs.index_select(0, rows),
+            self._ids.view(b, t)[:, 1:], target, row.seed, row.draft_offset - t,
         )
         # -1 past the first rejection, which nothing emits but the draft embeds
         return self.accept_tokens(tokens.long().clamp(0, vocab - 1), kept=kept)
@@ -621,9 +622,11 @@ class SpecDecodeResource(Resource):
         sampling settings. Keeps the distribution for the next step to judge it by."""
         rows = self._rows(self._plan_now(SpecPhase.VERIFY))
         row = self._row_sampling
-        probs = sampled.filtered_probs(logits, row.temperature, row.top_k, row.top_p)
-        self._draft_probs[:, j].index_copy_(0, rows, probs * sampled.DRAFT_MARGIN)
-        drafted = sampled.draw(probs, row.seed, row.draft_offset + j)
+        cand = sampled.filtered_candidates(logits, row.temperature, row.top_k, row.top_p)
+        self._draft_ids[:, j].index_copy_(0, rows, cand.ids)
+        self._draft_probs[:, j].index_copy_(0, rows, cand.probs)
+        drawn = sampled.draw(cand.probs, row.seed, row.draft_offset + j)
+        drafted = cand.ids.gather(1, drawn[:, None]).squeeze(1)
         self._tokens[j + 1].index_copy_(0, rows, drafted)
         return drafted
 

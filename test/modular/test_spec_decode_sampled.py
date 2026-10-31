@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.engine.resources.spec_decode import sampled  # noqa: E402
-from mstar.engine.resources.spec_decode.config import SpecDecodeConfig, SpecPhase  # noqa: E402
+from mstar.engine.resources.spec_decode.config import SpecPhase  # noqa: E402
 from mstar.engine.resources.spec_decode.resource import (  # noqa: E402
     RNG_START,
     SpecDecodePlan,
@@ -29,6 +29,12 @@ PAGE = 4
 VOCAB = 12
 
 
+@pytest.fixture(autouse=True)
+def _whole_vocabulary_is_candidates(monkeypatch):
+    # the toy vocabulary is the candidate set, unless a test narrows it
+    monkeypatch.setattr(sampled, "CANDIDATES", VOCAB)
+
+
 def _filter(logits, temperature, top_k=0, top_p=1.0):
     rows = logits.shape[0]
     return sampled.filtered_probs(
@@ -37,10 +43,10 @@ def _filter(logits, temperature, top_k=0, top_p=1.0):
     )
 
 
-def _spec(rows: int, k: int = 1, vocab: int = VOCAB, temperature=0.7, top_p=1.0, top_k=0) -> SpecDecodeResource:
+def _spec(rows: int, k: int = 1, temperature=0.7, top_p=1.0, top_k=0) -> SpecDecodeResource:
     """The resource with a verify plan over `rows` requests, all at the same settings."""
     spec = SpecDecodeResource(device=CPU, num_draft_tokens=k, max_requests=rows, page_size=PAGE, kv_key="kv",
-                              attn_key="attn", sampling=True, vocab_size=vocab)
+                              attn_key="attn", sampling=True)
     for r in range(rows):
         spec.ingest_request(r)
     image = spec._new_image(rows)
@@ -63,8 +69,9 @@ def _spec(rows: int, k: int = 1, vocab: int = VOCAB, temperature=0.7, top_p=1.0,
 def _set_drafts(spec, tokens, probs):
     """Registers as a step that drew these drafts leaves them. `probs`: [k, vocab]."""
     regs = slice(1, spec._tokens.shape[1])
+    values, ids = probs.topk(spec._draft_probs.shape[-1], dim=-1)
     spec._tokens[:, regs] = tokens.view(-1, spec.tokens_per_row).T
-    spec._draft_probs[regs] = probs * sampled.DRAFT_MARGIN
+    spec._draft_ids[regs], spec._draft_probs[regs] = ids, values
     spec._num_acc[regs] = 1
     spec._seq_len[regs] = 10
 
@@ -72,7 +79,8 @@ def _set_drafts(spec, tokens, probs):
 # --- the filter --------------------------------------------------------------
 
 
-def test_the_filter_is_top_k_then_top_p_of_the_renormalised_rest():
+def test_the_filter_is_top_k_then_top_p_of_the_renormalised_rest(monkeypatch):
+    monkeypatch.setattr(sampled, "CANDIDATES", 5)
     probs = torch.tensor([0.5, 0.2, 0.15, 0.1, 0.05])
     logits = probs.log()[None]
     # top-k 3 leaves 0.5/0.85, 0.2/0.85, 0.15/0.85. Top-p 0.8 keeps a token while the mass above it is under 0.8
@@ -82,14 +90,16 @@ def test_the_filter_is_top_k_then_top_p_of_the_renormalised_rest():
     assert torch.allclose(got, want, atol=1e-5), got
 
 
-def test_the_filter_keeps_the_token_that_crosses_top_p_and_all_its_ties():
+def test_the_filter_keeps_the_token_that_crosses_top_p_and_all_its_ties(monkeypatch):
+    monkeypatch.setattr(sampled, "CANDIDATES", 5)
     probs = torch.tensor([0.4, 0.2, 0.2, 0.1, 0.1])
     got = _filter(probs.log()[None], 1.0, top_p=0.5)[0]
     want = torch.tensor([0.4, 0.2, 0.2, 0, 0]) / 0.8
     assert torch.allclose(got, want, atol=1e-5), got
 
 
-def test_temperature_zero_is_a_point_mass_and_settings_at_their_limits_are_off():
+def test_temperature_zero_is_a_point_mass_and_settings_at_their_limits_are_off(monkeypatch):
+    monkeypatch.setattr(sampled, "CANDIDATES", 3)
     logits = torch.tensor([[0.1, 2.0, -1.0]])
     assert _filter(logits, 0.0)[0].tolist() == [0.0, 1.0, 0.0]
     assert torch.allclose(_filter(logits, 1.0, top_k=3, top_p=1.0), torch.softmax(logits, -1))
@@ -157,12 +167,13 @@ def test_a_point_mass_draft_accepts_as_often_as_the_target_holds_it():
     """A request's first drafts are the head's argmax. Rejection sampling needs no
     special case: it accepts q(d), and otherwise draws from q without d."""
     rows, draws = 500, 40
-    logits = torch.tensor([[2.0, 1.5, 1.0, 0.0, -1.0, -3.0]])
-    vocab = logits.shape[1]
+    logits = torch.full((1, VOCAB), -9.0)
+    logits[0, :6] = torch.tensor([2.0, 1.5, 1.0, 0.0, -1.0, -3.0])
+    vocab = VOCAB
     q = _filter(logits, 1.0)[0]
     point = torch.zeros(1, vocab)
     point[0, 1] = 1.0
-    spec = _spec(rows, k=1, vocab=vocab, temperature=1.0)
+    spec = _spec(rows, k=1, temperature=1.0)
     first = torch.zeros(vocab)
     kept = 0
     for _ in range(draws):
@@ -185,8 +196,8 @@ def test_a_seed_stores_its_drafts_as_point_masses_and_restarts_the_stream():
     spec.seed(torch.tensor([4, 5]), torch.tensor([6, 7]))
     assert spec._rng_offset[1:3].tolist() == [RNG_START, RNG_START]
     assert spec._tokens[:, 1].tolist() == [4, 6, 6]
-    assert spec._draft_probs[1, 0, 6] == sampled.DRAFT_MARGIN and spec._draft_probs[2, 1, 7] == sampled.DRAFT_MARGIN
-    assert spec._draft_probs[1].sum() == pytest.approx(2.0)
+    dense = torch.zeros(2, VOCAB).scatter_add_(1, spec._draft_ids[2], spec._draft_probs[2])
+    assert dense[:, 7].tolist() == [1.0, 1.0] and float(dense.sum()) == 2.0
 
 
 def test_a_draft_that_is_all_the_target_holds_is_always_kept():
@@ -213,13 +224,10 @@ def test_a_greedy_row_keeps_exact_greedy_acceptance_whatever_the_registers_hold(
     for r, argmax in enumerate(((5, 6, 7), (5, 6, 7), (5, 6, 7))):
         for slot, token in enumerate(argmax):
             logits[r * 3 + slot, token] = 9.0
-    held = torch.zeros(2, VOCAB)
-    if stale == "argmax":
-        held[:, 5] = 1.0
-    elif stale == "other":
-        held[:, 9] = 1.0
     spec._tokens[:, 1:4] = torch.tensor([[3, 5, 6], [3, 5, 1], [3, 2, 1]]).T
-    spec._draft_probs[1:4] = held * sampled.DRAFT_MARGIN
+    if stale != "empty":
+        spec._draft_ids[1:4] = 5 if stale == "argmax" else 9
+        spec._draft_probs[1:4, :, 0] = 1.0
     spec._seq_len[1:4] = 10
     spec.verify_inputs()
     out = spec.accept(logits, sample=True)
@@ -230,11 +238,11 @@ def test_a_greedy_row_keeps_exact_greedy_acceptance_whatever_the_registers_hold(
 # --- seeds and offsets --------------------------------------------------------
 
 
-def _step(spec, logits, k, seen=None):
+def _step(spec, logits, k):
     spec.verify_inputs()
     out = spec.accept(logits, sample=True)
     for j in range(k):
-        spec.draw_draft(j, torch.randn(spec._current.num_rows, VOCAB) * 0 + logits[j])
+        spec.draw_draft(j, logits[:spec._current.num_rows])
     return out
 
 
@@ -245,10 +253,10 @@ def test_a_step_takes_its_words_of_the_stream_without_overlap(monkeypatch):
     words: dict[int, list[tuple[int, int]]] = {r: [] for r in range(rows)}
     chain, draw = sampled.accept_chain, sampled.draw
 
-    def spy_chain(p, d, q, seed, offset):
+    def spy_chain(ids, p, d, q, seed, offset):
         for r in range(rows):
             words[r].append((int(offset[r]), k + 1))
-        return chain(p, d, q, seed, offset)
+        return chain(ids, p, d, q, seed, offset)
 
     def spy_draw(probs, seed, offset):
         for r in range(rows):
@@ -260,6 +268,7 @@ def test_a_step_takes_its_words_of_the_stream_without_overlap(monkeypatch):
     spec = _spec(rows, k=k)
     logits = torch.arange(VOCAB, dtype=torch.float32).repeat(rows * (k + 1), 1)
     spec._draft_probs[1:] = 1.0 / VOCAB
+    spec._draft_ids[1:] = torch.arange(VOCAB)
     for _ in range(steps):
         spec._seq_len[1:] = 10
         _step(spec, logits, k)
@@ -286,6 +295,7 @@ def test_a_request_repeats_its_tokens_from_the_same_seed_and_layout():
         spec = _spec(rows, k=k)
         spec._seed[1:] += seed_shift
         spec._draft_probs[1:] = 1.0 / VOCAB
+        spec._draft_ids[1:] = torch.arange(VOCAB)
         spec._tokens[:, 1:] = torch.tensor([[3], [4], [5]])
         out = []
         for _ in range(5):
@@ -301,6 +311,7 @@ def test_a_new_request_on_a_used_register_starts_from_its_own_seed():
     spec = _spec(1, k=1)
     spec._rng_offset[1] = RNG_START + 500
     spec._draft_probs[1] = 1.0 / VOCAB
+    spec._draft_ids[1] = 5
     image = spec._current.image
     image.seeds[:1] = 77
     image.params[0], image.params[1] = 0.5, 0.25
@@ -308,12 +319,57 @@ def test_a_new_request_on_a_used_register_starts_from_its_own_seed():
     spec._current = SpecDecodePlan(phase=SpecPhase.SEED, num_rows=1, image=image)
     spec.seed(torch.tensor([1]), torch.tensor([2]))
     assert (int(spec._seed[1]), int(spec._rng_offset[1]), int(spec._top_k[1])) == (77, RNG_START, 9)
-    assert spec._draft_probs[1].sum() == pytest.approx(sampled.DRAFT_MARGIN)
-    assert spec._draft_probs[1, 0, 2] == sampled.DRAFT_MARGIN
+    assert (spec._draft_ids[1] == 2).all() and float(spec._draft_probs[1].sum()) == 1.0
 
 
-def test_a_sampling_node_declares_its_vocabulary():
-    with pytest.raises(ValueError, match="vocab_size"):
-        SpecDecodeConfig(num_draft_tokens=2, sampling=True)
-    SpecDecodeConfig(num_draft_tokens=2, sampling=True, vocab_size=8)
-    SpecDecodeConfig(num_draft_tokens=2)
+# --- past the candidates ------------------------------------------------------
+
+
+def test_a_row_whose_kept_set_fits_is_filtered_on_its_candidates_alone(monkeypatch):
+    monkeypatch.setattr(sampled, "CANDIDATES", 4)
+    logits = torch.tensor([[8.0, 7.5, 7.0, 1.0, 0.5, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0]])
+    args = (torch.tensor([1.0]), torch.tensor([VOCAB]), torch.tensor([0.9]))
+    cand = sampled.filtered_candidates(logits, *args)
+    assert bool(cand.complete[0]) and (cand.probs[0] > 0).sum() < 4
+    dense = torch.zeros(1, VOCAB).scatter_(1, cand.ids, cand.probs)
+    assert torch.allclose(dense, sampled.filtered_probs(logits, *args), atol=1e-5)
+
+
+@pytest.mark.parametrize(("top_k", "top_p"), [(0, 0.9), (0, 1.0), (6, 1.0), (8, 0.8)])
+def test_a_row_past_its_candidates_is_exact_and_says_so(monkeypatch, top_k, top_p):
+    """A flat row, as a high temperature leaves it: what the filters keep does not
+    fit, the candidates say so, and the target is the full filter's all the same."""
+    logits = torch.randn(2, VOCAB, generator=torch.Generator().manual_seed(4)) * 0.2
+    want = _filter(logits, 1.0, top_k, top_p)  # every token is a candidate here
+    monkeypatch.setattr(sampled, "CANDIDATES", 3)
+    args = (torch.full((2,), 1.0), torch.full((2,), top_k or VOCAB), torch.full((2,), top_p))
+    cand = sampled.filtered_candidates(logits, *args)
+    assert not cand.complete.any()
+    assert torch.allclose(cand.probs.sum(dim=-1), torch.ones(2))
+    assert torch.allclose(sampled.filtered_probs(logits, *args), want, atol=1e-5)
+
+
+def test_a_draft_truncated_to_its_candidates_still_leaves_the_target_exact(monkeypatch):
+    """Past the candidates a draft is only an approximation of the filter, which a
+    proposal may be: the emitted tokens follow the exact target regardless."""
+    rows, draws = 500, 40
+    gen = torch.Generator().manual_seed(6)
+    raw = torch.randn(2, VOCAB, generator=gen) * 0.5
+    q = _filter(raw[:1], 1.0, 0, 0.95)[0]
+    monkeypatch.setattr(sampled, "CANDIDATES", 3)
+    args = (torch.tensor([1.0]), torch.tensor([VOCAB]), torch.tensor([0.95]))
+    cand = sampled.filtered_candidates(raw[1:], *args)
+    assert not cand.complete.any()
+    p = torch.zeros(VOCAB).scatter_(0, cand.ids[0], cand.probs[0])
+    spec = _spec(rows, k=1, temperature=1.0, top_p=0.95)
+    first = torch.zeros(VOCAB)
+    kept = 0
+    for _ in range(draws):
+        d = torch.multinomial(p, rows, replacement=True, generator=gen)
+        _set_drafts(spec, torch.stack((torch.full((rows,), 3), d), dim=1), p[None])
+        spec.verify_inputs()
+        out = spec.accept(raw.repeat(rows, 1), sample=True)
+        first += torch.bincount(out.tokens[:, 0], minlength=VOCAB)
+        kept += int((out.accepted == 2).sum())
+    assert 0.5 * (first / (rows * draws) - q).abs().sum() < 0.015
+    assert abs(kept / (rows * draws) - float(torch.minimum(p, q).sum())) < 0.015
