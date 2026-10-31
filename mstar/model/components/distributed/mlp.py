@@ -59,10 +59,8 @@ class ParallelGatedMLP(nn.Module):
         bias: bool = False,
         reduce_results: bool = True,
     ):
-        """``reduce_results=False`` returns this rank's PARTIAL down_proj
-        output (no all-reduce) so a caller can fold it into another
-        partial sum and reduce once — the shared-expert + routed-expert
-        layout of a DeepSeek-style MoE block."""
+        """``reduce_results=False`` returns this rank's partial down_proj output, for a
+        caller that adds it to another partial and reduces once."""
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()

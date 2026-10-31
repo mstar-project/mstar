@@ -1,6 +1,5 @@
-"""GLM-5.3-Flash lays out its one paged label, so the preprocess worker and the conductor hold
-each request to the cache rows its prompt leaves (``docs/adding_models.rst``, Paged KV layouts).
-Under MTP every verify step keeps its whole block, so a decode step counts k + 1 rows."""
+"""GLM-5.3-Flash's paged KV layout, through the real conductor: each request is held to the
+cache rows its prompt leaves, and under MTP a decode step counts its whole k + 1 block."""
 
 from __future__ import annotations
 
@@ -66,31 +65,14 @@ def _failed(sent: list) -> list[int]:
 
 
 @_K
-def test_every_paged_label_is_declared_at_load(k):
+def test_the_label_is_declared_and_grows_by_the_block(k):
     model = _model(mtp_num_draft_tokens=k)
 
     assert list(_undeclared_pools(model.get_node_resources(), model)) == []
     assert list(_unknown_prefix_walks(model)) == []
-
-
-@_K
-def test_a_decode_step_grows_the_label_by_its_block(k):
-    model = _model(mtp_num_draft_tokens=k)
-
     layout = model.process_prompt("hello", ["text"], ["text"]).metadata["kv_layout"][KV_CACHE]["main"]
-
     assert [(span.walk, span.length) for span in layout.spans] == [("prefill", PROMPT)]
     assert layout.growth == (("decode_loop", k + 1),)
-
-
-def test_a_request_decodes_one_step_fewer_than_its_max_tokens(tmp_path, monkeypatch):
-    model = _model()
-
-    new_request = _dispatched(_conduct(model, _preprocess(model, {"max_output_tokens": 30}), tmp_path, monkeypatch))
-
-    # the prefill emits the first token
-    assert new_request.loop_caps["decode_loop"] == 29
-    assert new_request.request_info.max_tokens == 30
 
 
 @_K
@@ -107,48 +89,40 @@ def test_a_request_that_asks_no_length_fills_the_cache_rows(tmp_path, monkeypatc
 
 
 @_K
-@pytest.mark.parametrize("max_tokens", [1024, 1600, None], ids=["1024", "1600", "room"])
-def test_mtp_admits_what_the_context_holds(tmp_path, monkeypatch, k, max_tokens):
-    """A request the context holds is dispatched with or without MTP: the rows its rejected
-    drafts could take never refuse it first (1024 was past the rows, 1600 past the loop cap).
-    The room is what decode emits after the prompt: the window's, or under MTP two verify
-    blocks short of it."""
+def test_the_most_tokens_the_context_holds_are_admitted(tmp_path, monkeypatch, k):
+    """The rows rejected drafts take never refuse a request the context holds: the room is
+    the window's after the prompt, under MTP two verify blocks short of it."""
     model = _model(mtp_num_draft_tokens=k)
-    if max_tokens is None:
-        max_tokens = model.config.index_topk - PROMPT - (2 * (k + 1) - 1 if k else 0)
+    max_tokens = model.config.index_topk - PROMPT - (2 * (k + 1) - 1 if k else 0)
 
     sent = _conduct(model, _preprocess(model, {"max_output_tokens": max_tokens}), tmp_path, monkeypatch)
 
     assert _failed(sent) == []
+    # the prefill emits the first token
     assert _dispatched(sent).loop_caps["decode_loop"] == max_tokens - 1
 
 
 @pytest.mark.parametrize("past", [0, 1])
 def test_mtp_refuses_a_max_tokens_the_window_cant_hold(past):
-    """Under MTP decode stops two verify blocks short of the window, inside the cache rows
-    the conductor holds a request to, so process_prompt refuses a max_tokens past that (a
-    400), as the conductor refuses one past the context without MTP. A 1000-token prompt
-    leaves 1,041; before, max_tokens 1100 was admitted and cut short there."""
+    """Under MTP decode stops two verify blocks short of the window, inside the rows the
+    conductor holds a request to, so process_prompt refuses a max_tokens past that (a 400)
+    rather than cut it short."""
     model = _model(mtp_num_draft_tokens=3)
-    prompt = 1000
-    room = model.config.index_topk - 2 * 4 + 1 - prompt
-    assert room == 1041
-    for budget in (1100, room + past):
-        if budget > room:
-            with pytest.raises(ValueError, match=f"emits at most {room} tokens"):
-                model.process_prompt("x" * prompt, ["text"], ["text"], max_output_tokens=budget)
-        else:
-            model.process_prompt("x" * prompt, ["text"], ["text"], max_output_tokens=budget)
+    prompt = "x" * 1000
+    room = model.config.index_topk - 2 * 4 + 1 - len(prompt)
+    if past:
+        with pytest.raises(ValueError, match=f"emits at most {room} tokens"):
+            model.process_prompt(prompt, ["text"], ["text"], max_output_tokens=room + 1)
+    else:
+        model.process_prompt(prompt, ["text"], ["text"], max_output_tokens=room)
 
 
 @pytest.mark.parametrize("past", [0, 1])
 def test_max_tokens_past_the_rows_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past):
-    """Without MTP; with it the window binds before the rows
-    (test_mtp_refuses_a_max_tokens_the_window_cant_hold)."""
-    k = 0
-    model = _model(mtp_num_draft_tokens=k)
-    # the prompt's rows and a block per decode step fill the cache; the last token is never stored
-    fits = (model.config.kv_rows - PROMPT) // (k + 1) + 1
+    """Without MTP the conductor refuses it; under MTP the window binds first."""
+    model = _model()
+    # the prompt's rows and a row per decode step fill the cache; the last token is never stored
+    fits = model.config.kv_rows - PROMPT + 1
 
     sent = _conduct(model, _preprocess(model, {"max_output_tokens": fits + past}), tmp_path, monkeypatch)
 

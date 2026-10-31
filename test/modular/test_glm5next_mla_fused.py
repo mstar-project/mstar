@@ -1,6 +1,5 @@
-"""Fused MLA latent norms (Triton) vs an fp32 reference and the torch path — parity. The kernel
-is the shared MLA's (``mstar/utils/mla_latent_norm.py``) for a latent with no decoupled dims, run
-here through GLM-5.3's layer."""
+"""The shared MLA latent-norm kernel (``mstar/utils/mla_latent_norm.py``) for a latent with no
+rope dims, against an fp32 reference and the torch path, through GLM-5.3's layer."""
 import pytest
 import torch
 

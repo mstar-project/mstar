@@ -1,11 +1,9 @@
 """DeepSeek sparse attention (DSA) over a node's paged MLA cache: the resource.
 
-The index keys live on the MLA cache's pages (``paged``: its aux planes ``INDEX_PLANES``). Each
-step the submodule stages its rows (``step_inputs``: preprocess outputs, which a CUDA graph
-interns and every replay restages) and opens the forward's context from them (``context``,
-then ``use``), which the MLA layers read as ``ctx``: they write their index keys and latents
-at the step's slots, and select and attend through ``paged``. Under CUDA graphs the resource
-keeps each capture slot's sparse-attention plans.
+The index keys live on the MLA cache's pages (aux planes ``INDEX_PLANES``), so they share its
+page table. The resource stages each step's rows as preprocess outputs (``step_inputs``), which
+a CUDA graph interns and every replay restages; the forward opens the context built from them
+(``context``, then ``use``), and the MLA layers select and attend through ``paged``.
 """
 
 from collections.abc import Iterator
@@ -87,8 +85,8 @@ class DSAManager(Resource):
         parts = [torch.tensor(pos + row_req, dtype=torch.int32), indptr[:-1].to(torch.int32),
                  kv_out.cpu_indptrs.paged_kv_indices.to(torch.int32)]
         if step_ctx.capture:
-            # the static buffer's size: every row's request at the serving window (a replay
-            # stages just its own pages)
+            # a capture sizes the static page buffer for every request at the serving window;
+            # a replay stages just its own pages
             pad = len(kv_out.views) * -(-self.kv_rows // self.page_size) - parts[-1].numel()
             parts.append(torch.zeros(pad, dtype=torch.int32))
         n_pos, n_req = len(pos), indptr.numel() - 1

@@ -1,12 +1,5 @@
-"""A refused admit gives back the slots it took, and only those.
-
-The runner unwinds every resource a refused step reached, the refusing one
-included. The pool has to find what that step's live reservation took, even
-when the reservation was made on the pre-plan pass, and must leave alone a
-slot the request already held. Its free list comes back in its old order, so
-TP ranks that refuse the same step keep handing out the same slots.
-
-CPU-only: nothing here launches a kernel.
+"""A refused admit or a dropped pre-plan gives back the slots it took, and only those, with
+the free list in its old order so TP ranks that refuse the same step hand out the same slots.
 """
 
 from __future__ import annotations
@@ -105,22 +98,9 @@ def test_refusal_frees_the_slots_the_pool_took_before_it():
     assert [slot_of(pool, rid) for rid in "abc"] == [1, 2, 3]
 
 
-def test_refusal_downstream_frees_the_pools_slots():
-    pool, after = build_pool(max_slots=4), _Refuser()
-    run = runner(pool, after)
-    for rid in "ab":
-        run.ingest_request(rid, {})
-    after.refuse = True
-
-    outcome = run.admit(step(list("ab"), keys=(POOL, AFTER)))
-
-    assert not outcome.ok and outcome.failed_resource == AFTER
-    assert pool.num_free_slots == 3
-
-
 def test_a_slot_already_held_is_kept():
-    """A decode row holds its slot from an earlier step: a refusal of a step
-    that also brings a newcomer frees the newcomer's slot, not the old one."""
+    """A refusal downstream of the pool frees a newcomer's slot, not one a decode row
+    held from an earlier step."""
     pool, after = build_pool(max_slots=4), _Refuser()
     run = runner(pool, after)
     for rid in "ab":
@@ -132,7 +112,8 @@ def test_a_slot_already_held_is_kept():
     held = slot_of(pool, "a")
 
     after.refuse = True
-    assert not run.admit(step(["a", "b"], keys=(POOL, AFTER))).ok
+    outcome = run.admit(step(["a", "b"], keys=(POOL, AFTER)))
+    assert not outcome.ok and outcome.failed_resource == AFTER
 
     assert slot_of(pool, "a") == held and pool._slots["a"]["main"].has_state
     assert slot_of(pool, "b") is None
@@ -184,14 +165,14 @@ def test_a_request_removed_before_the_unwind_is_not_freed_twice():
 
 
 def test_a_discarded_preplan_gives_back_its_slots():
-    """A staged step that never runs (its batch yielded, or another step reached
-    the GPU first) leaves the pool as it found it."""
-    pool = build_pool(max_slots=4)
-    run = runner(pool)
+    """A staged step that never runs leaves the pool as it found it, and a live step
+    after it that is refused frees what it took."""
+    pool, after = build_pool(max_slots=4), _Refuser()
+    run = runner(pool, after)
     for rid in "ab":
         run.ingest_request(rid, {})
     free_before = list(pool._free)
-    st = step(list("ab"))
+    st = step(list("ab"), keys=(POOL, AFTER))
     st.ctx.is_preplan = True
     assert run.pre_admit(st).ok
     run.pre_plan(st)
@@ -200,12 +181,14 @@ def test_a_discarded_preplan_gives_back_its_slots():
 
     assert pool._free == free_before
     assert slot_of(pool, "a") is None and slot_of(pool, "b") is None
+    after.refuse = True
+    assert not run.admit(step(list("ab"), keys=(POOL, AFTER))).ok
+    assert pool._free == free_before
 
 
 def test_a_discarded_preplan_gives_back_the_reservation_its_slot_took():
-    """At one rank the pool decides admission (#869): a reserved request's first slot comes out
-    of its reservation. A pre-plan that took it and is dropped gives back the slot and the
-    reservation, so the slots the pool keeps for admitted requests are as they were."""
+    """At one rank a reserved request's first slot comes out of its reservation; a dropped
+    pre-plan gives back both."""
     pool = build_pool(max_slots=4)
     pool.ingest_request("a")
     assert pool.ask("a", "llm", "prefill") is not None
@@ -222,26 +205,9 @@ def test_a_discarded_preplan_gives_back_the_reservation_its_slot_took():
     assert (pool._kept, pool._reserved, pool._free) == before
 
 
-def test_a_refusal_after_a_discarded_preplan_frees_its_slots():
-    pool, after = build_pool(max_slots=4), _Refuser()
-    run = runner(pool, after)
-    for rid in "ab":
-        run.ingest_request(rid, {})
-    pre = step(list("ab"), keys=(POOL, AFTER))
-    pre.ctx.is_preplan = True
-    assert run.pre_admit(pre).ok
-    run.pre_plan(pre)
-    run.clear_preplan()
-
-    after.refuse = True
-    assert not run.admit(step(list("ab"), keys=(POOL, AFTER))).ok
-
-    assert pool.num_free_slots == 3
-
-
 def test_clearing_a_stage_leaves_a_live_steps_slots_alone():
-    """A live step that raised after its forward wrote its slots is the runner's to unwind
-    (its failed rids are removed, which zeroes them); clearing a stage must not free them."""
+    """A live step's slots are the runner's to unwind, by removing its rids, which zeroes
+    them; clearing a stage must not free them."""
     pool = build_pool(max_slots=4)
     run = runner(pool)
     for rid in "ab":

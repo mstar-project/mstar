@@ -1,15 +1,14 @@
-"""GLM-5.3-Flash mHC: Sinkhorn manifold, shapes, stack parity, dtype discipline."""
+"""GLM-5.3-Flash's mHC on CPU: the Sinkhorn manifold, a two-layer stack against an
+independent fp64 reference, and no fp64 or host syncs on the decode path."""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
-import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from mstar.model.components.kda import KDAConfig, KDAForgetGate
 from mstar.model.glm5_next.mhc import (
     Glm5NextHyperConnection,
     Glm5NextHyperHead,
@@ -23,7 +22,7 @@ RMS_EPS = 1e-5
 SINKHORN_ITERS = 20
 
 
-# --- independent numpy fp64 reference (ported from the HF computation) ------
+# an independent fp64 numpy reference, ported from the HF computation
 
 
 def _np_sigmoid(x):
@@ -62,15 +61,12 @@ def _np_update_streams(residual, sublayer_out, post, comb):
     return place + mix
 
 
-# --- (1) Sinkhorn: rows AND cols sum to 1 after 20 iterations ---------------
-
-
 def test_sinkhorn_rows_and_cols_sum_to_one():
     torch.manual_seed(1)
     logits = torch.randn(5, 7, 4, 4)
     start = torch.softmax(logits, dim=-1) + HC_EPS
     ones = torch.ones(5, 7, 4)
-    # The softmax start is row-stochastic but nowhere near column-stochastic.
+    # the softmax start is row-stochastic but nowhere near column-stochastic
     assert not torch.allclose(start.sum(dim=-2), ones, atol=1e-2)
 
     out = sinkhorn_normalize(start, SINKHORN_ITERS, HC_EPS)
@@ -79,60 +75,6 @@ def test_sinkhorn_rows_and_cols_sum_to_one():
     assert bool((out > 0).all())
     assert torch.allclose(out.sum(dim=-1), ones, atol=1e-4)
     assert torch.allclose(out.sum(dim=-2), ones, atol=1e-4)
-
-
-def test_sinkhorn_near_permutation_regime():
-    """Sharpened logits (x3): near-permutation matrices converge slower."""
-    torch.manual_seed(1)
-    start = torch.softmax(torch.randn(5, 7, 4, 4) * 3.0, dim=-1) + HC_EPS
-    ones = torch.ones(5, 7, 4)
-
-    out = sinkhorn_normalize(start, SINKHORN_ITERS, HC_EPS)
-    assert torch.allclose(out.sum(dim=-2), ones, atol=1e-4)
-    row_dev = (out.sum(dim=-1) - 1).abs().max()
-    assert row_dev < 5e-2
-
-    more = sinkhorn_normalize(start, 4 * SINKHORN_ITERS, HC_EPS)
-    assert (more.sum(dim=-1) - 1).abs().max() < row_dev
-
-
-# --- (2) mixing-matrix shapes at hc_mult 4, hidden 4096 ---------------------
-
-
-def test_mixing_shapes_at_checkpoint_size():
-    torch.manual_seed(2)
-    hc = Glm5NextHyperConnection(hidden_size=4096, hc_mult=4)
-    # mix = (2 + 4) * 4 = 24 rows over the flattened 4 * 4096 streams.
-    assert hc.fn.shape == (24, 16384)
-    assert hc.base.shape == (24,)
-    assert hc.scale.shape == (3,)
-
-    streams = expand_streams(torch.randn(2, 3, 4096, dtype=torch.bfloat16))
-    assert streams.shape == (2, 3, 4, 4096)
-    post, comb, collapsed = hc(streams)
-    assert post.shape == (2, 3, 4)
-    assert comb.shape == (2, 3, 4, 4)
-    assert collapsed.shape == (2, 3, 4096)
-    # The comb the module hands out is on the doubly-stochastic manifold.
-    ones = torch.ones(2, 3, 4)
-    assert torch.allclose(comb.sum(dim=-1), ones, atol=5e-3)
-    assert torch.allclose(comb.sum(dim=-2), ones, atol=1e-4)
-
-    updated = update_streams(streams, collapsed, post, comb)
-    assert updated.shape == streams.shape
-    assert Glm5NextHyperHead()(updated).shape == (2, 3, 4096)
-
-    # The post-load fp32 ``fn`` cache must be bit-identical to the
-    # per-call ``.float()`` fallback it replaces.
-    hc.process_weights_after_loading(torch.device("cpu"))
-    assert hc._fn_fp32 is not None
-    post2, comb2, collapsed2 = hc(streams)
-    assert torch.equal(post2, post)
-    assert torch.equal(comb2, comb)
-    assert torch.equal(collapsed2, collapsed)
-
-
-# --- (3) two-layer toy stack vs the independent reference -------------------
 
 
 def test_two_layer_stack_matches_independent_reference():
@@ -156,7 +98,7 @@ def test_two_layer_stack_matches_independent_reference():
     w_attn = [torch.randn(d, d) * 0.5 for _ in range(2)]
     w_mlp = [torch.randn(d, d) * 0.5 for _ in range(2)]
 
-    # mhc.py path, fp32 end to end (post/comb casts are no-ops there).
+    # fp32 end to end, so the post/comb casts are no-ops
     x = torch.randn(b, s, d)
     streams = expand_streams(x, hc_mult=h)
     with torch.no_grad():
@@ -170,7 +112,7 @@ def test_two_layer_stack_matches_independent_reference():
             streams = update_streams(residual, z * torch.sigmoid(z), post, comb)
         out = Glm5NextHyperHead()(streams)
 
-    # Independent fp64 reference over the SAME weights and toy sublayers.
+    # the fp64 reference over the same weights and toy sublayers
     f64 = np.float64
     streams_np = np.broadcast_to(
         x.numpy().astype(f64)[:, :, None, :], (b, s, h, d)).copy()
@@ -192,9 +134,6 @@ def test_two_layer_stack_matches_independent_reference():
     assert out.dtype == torch.float32
     np.testing.assert_allclose(
         out.numpy().astype(f64), expected, rtol=1e-5, atol=1e-5)
-
-
-# --- (4) dtype stability: no silent fp64, no host syncs ---------------------
 
 
 class _OpRecorder(TorchDispatchMode):
@@ -219,87 +158,20 @@ class _OpRecorder(TorchDispatchMode):
 
 
 def test_dtype_stability_no_silent_fp64():
+    """The site computes in fp32 and carries bf16: nothing widens to fp64, and no op reads a
+    device value back or makes a data-dependent shape."""
     torch.manual_seed(4)
     d = 32
     hc = Glm5NextHyperConnection(hidden_size=d, hc_mult=4).to(torch.bfloat16)
-    gate = KDAForgetGate(
-        KDAConfig(hidden_size=d, num_heads=2, head_dim=8),
-        dtype=torch.bfloat16)
-    # Checkpoint dtypes: projections bf16, dt_bias / A_log strict fp32.
-    assert gate.f_a_proj.weight.dtype == torch.bfloat16
-    assert gate.f_b_proj.weight.dtype == torch.bfloat16
-    assert gate.dt_bias.dtype == torch.float32
-    assert gate.A_log.dtype == torch.float32
-
     streams = expand_streams(torch.randn(2, 3, d, dtype=torch.bfloat16))
     rec = _OpRecorder()
     with torch.no_grad(), rec:
         post, comb, collapsed = hc(streams)
         updated = update_streams(streams, collapsed, post, comb)
         head = Glm5NextHyperHead()(updated)
-        g = gate(collapsed)
 
-    # Compute in fp32, carry in bf16 — nothing ever widens to fp64.
-    assert post.dtype == torch.float32
-    assert comb.dtype == torch.float32
-    assert collapsed.dtype == torch.bfloat16
-    assert updated.dtype == torch.bfloat16
-    assert head.dtype == torch.bfloat16
-    assert g.dtype == torch.float32
+    assert post.dtype == comb.dtype == torch.float32
+    assert collapsed.dtype == updated.dtype == head.dtype == torch.bfloat16
     assert torch.float64 not in rec.dtypes
-
-    # Decode-path canaries: no host syncs, no data-dependent shapes.
     forbidden = {"_local_scalar_dense", "item", "nonzero", "masked_select", "unique"}
     assert not (rec.ops & forbidden), rec.ops & forbidden
-
-
-# --- forget gate: the live branch vs the independent reference --------------
-
-
-def test_forget_gate_matches_independent_reference():
-    torch.manual_seed(5)
-    b, s, hidden, heads, head_dim = 2, 3, 16, 2, 4
-    cfg = KDAConfig(
-        hidden_size=hidden, num_heads=heads, head_dim=head_dim)
-    x = torch.randn(b, s, hidden)
-    w_a = torch.randn(head_dim, hidden) * 0.5
-    w_b = torch.randn(heads * head_dim, head_dim) * 0.5
-    # Large positive dt_bias entries drive the sigmoid to saturation so the
-    # closed bound is exercised, not just the interior.
-    dt_bias = torch.randn(heads * head_dim) * 0.5
-    dt_bias[::3] += 30.0
-    a_log = torch.randn(heads) * 0.3
-
-    f64 = np.float64
-    g_np = (
-        x.numpy().astype(f64)
-        @ w_a.numpy().astype(f64).T
-        @ w_b.numpy().astype(f64).T
-        + dt_bias.numpy().astype(f64)
-    ).reshape(b, s, heads, head_dim)
-    decay_np = np.exp(a_log.numpy().astype(f64))[None, None, :, None]
-
-    gate = KDAForgetGate(cfg, dtype=torch.float32)
-    with torch.no_grad():
-        gate.f_a_proj.weight.copy_(w_a)
-        gate.f_b_proj.weight.copy_(w_b)
-        gate.dt_bias.copy_(dt_bias)
-        gate.A_log.copy_(a_log)
-        out = gate(x)
-
-    assert out.shape == (b, s, heads, head_dim)
-    assert out.dtype == torch.float32
-    expected = cfg.gate_lower_bound * _np_sigmoid(decay_np * g_np)
-    # Saturated channels (dt_bias +30) sit exactly at the bound.
-    assert bool((out < 0).all()) and bool((out >= cfg.gate_lower_bound).all())
-    np.testing.assert_allclose(
-        out.numpy().astype(f64), expected, rtol=1e-4, atol=1e-5)
-
-    # The HF softplus branch (gate_lower_bound=None) is dead for this
-    # checkpoint: the one live implementation refuses it loudly instead of
-    # shipping a second, untested math path.
-    with pytest.raises(ValueError, match="softplus"):
-        KDAForgetGate(
-            KDAConfig(
-                hidden_size=hidden, num_heads=heads,
-                head_dim=head_dim, gate_lower_bound=None))

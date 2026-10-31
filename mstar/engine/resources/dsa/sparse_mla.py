@@ -21,8 +21,8 @@ SHARD_MIN_ROWS = 64
 
 
 def check_flashinfer() -> None:
-    """Refuse an installed FlashInfer older than 0.6.18: both DSA paths pass ``page_size`` to
-    ``top_k_page_table_transform``, which takes it from 0.6.18 on."""
+    """Refuse an installed FlashInfer older than 0.6.18, whose ``top_k_page_table_transform``
+    takes no ``page_size``."""
     try:
         import flashinfer
         from packaging.version import Version
@@ -44,16 +44,14 @@ def uses_kernel(q_nope: torch.Tensor, latent: torch.Tensor) -> bool:
 
 def _plan(wrapper, indices: torch.Tensor, lens: list[int], heads: int,
           kv_lora_rank: int, kpe: int, sm_scale: float) -> None:
-    # packed: row r's slots at indices[sum(lens[:r]):], what FlashInfer >= 0.7 checks the
-    # page counts against (one-token pages); _pack lays the slots out to match. lens are
-    # already held to the row width (_lens)
+    # packed: row r's slots at indices[sum(lens[:r]):], which FlashInfer >= 0.7 checks each
+    # row's page count against; _pack lays them out to match, lens already held to the width
     qo = torch.arange(len(lens) + 1, dtype=torch.int32)
     kv = torch.zeros(len(lens) + 1, dtype=torch.int32)
     kv[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
-    # FlashInfer stages the plan (~600 KB at one decode row) through a host copy that ATen
-    # splits over every intra-op thread. With a worker per GPU, each with an OpenMP pool as
-    # wide as the host, that region waits on oversubscribed cores: ~30 ms of a captured
-    # decode step on 8 GPUs, ~25 us on one thread. The count is per thread under OpenMP.
+    # FlashInfer stages the plan through a host copy that ATen splits over every intra-op
+    # thread; with a worker per GPU, each with an OpenMP pool as wide as the host, that copy
+    # waits on oversubscribed cores. Under OpenMP the count is this thread's alone.
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
@@ -207,8 +205,7 @@ def select_rows(select: Callable[[int, int], torch.Tensor], r0: int, r1: int, wi
                 request: RequestPages | None = None) -> torch.Tensor:
     """``select(a, b)`` (``[b - a, width]`` int32 cache slots) over rows ``[r0, r1)`` of one
     request's prefill. With a TP ``group`` each rank selects a contiguous block and the blocks
-    are all-gathered: every rank would compute the same selection. A block crosses ranks as
-    ``request``'s token positions and comes back as this rank's slots."""
+    are all-gathered as token positions in ``request`` (``RequestPages``)."""
     n = r1 - r0
     world = group.world_size if group is not None else 1
     if world == 1 or n < world * SHARD_MIN_ROWS:

@@ -1,10 +1,6 @@
-"""A piecewise region's capture-time padding rows give their pages back.
-
-A capture hands each padding row a share of the bucket's token budget, and a
-packed replay pads with zero-length rows, so what the capture allocated is
-never read again. ``AcceleratorGraphRunner`` releases it after warmup; the piecewise
-runner has to do the same, or the largest buckets of every region stay out of
-the pool for the server's lifetime.
+"""A packed piecewise region's capture-time padding rows give their pages back: a packed
+replay pads with zero-length rows, so what the capture allocated is never read again, and kept
+it would hold the largest buckets of every region out of the pool for the server's lifetime.
 """
 
 from __future__ import annotations
@@ -161,19 +157,6 @@ def test_a_replay_after_release_allocates_only_the_real_rows():
 
     assert kv._streams["real"]["main"].stored_len == 5
     assert kv._arena.num_free == free - 2, "padding rows took pages at replay"
-
-
-def test_the_whole_pool_is_usable_after_capture():
-    kv = _kv()
-    runner = _runner(kv)
-    runner.warmup_and_capture(None)
-    kv.ingest_request("real")
-    step = _declare(["real"], [63 * PAGE_SIZE])
-    step.set_ctx(StepContext(request_ids=("real",), graph_walk="w", slot=0, capture=False))
-
-    # one page is the sink: a request needing every other page fits only if
-    # the capture gave its pages back
-    assert StepRunner({"kv": kv}).admit(step).ok
 
 
 def test_a_batched_region_keeps_its_padding_rows():

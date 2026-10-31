@@ -255,18 +255,16 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
 
 
 def _fused_prep(submodule, on: bool) -> None:
-    """The fused MLA prep on every layer (kernels: auto takes it where it runs), or the
-    op-by-op path (the reference's)."""
+    """The fused MLA prep on every layer, or the op-by-op path."""
     for layer in submodule.language_model.model.layers:
         layer.self_attn.mla_fused_prep = on
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeypatch, fp8):
-    """The fused MLA prep: the captured streams equal the eager ones and the op-by-op path's
-    captured ones (q_lora_rank 256, a width the fused norms take). The bf16 arm runs the
-    reference otherwise: under kernels: auto its captured stream left the eager one at the
-    fourth token (H200, not diagnosed); the fp8 arm needs auto's fused MoE to capture."""
+    """Captured with the fused MLA prep == eager == captured op by op. The bf16 arm runs
+    kernels: reference otherwise, since under auto its captured stream leaves the eager one
+    (undiagnosed); the fp8 arm needs auto's fused MoE to capture."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     prompts = BUCKET_PROMPTS if fp8 else PROMPTS
     kernels = {} if fp8 else {"kernels": "reference"}
@@ -291,15 +289,13 @@ def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeyp
         assert stream == streams[False][rid], (rid, stream, streams[False][rid])
 
 
-# compiled, the dense arm's last token flips at a 0.0117-logit near tie: Inductor's arithmetic,
-# since the eager forward captured matches token for token
+# the dense arm runs uncompiled: compiled, Inductor's arithmetic flips its last token at a
+# near tie (its eager forward, captured, matches token for token)
 @pytest.mark.parametrize("topk,compiled", [(8, True), (16, False)],
                          ids=["bucket-selects", "bucket-dense"])
 def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
-    """DSA at a small index_topk, so decode selects: the captured steps emit the
-    eager tokens. Prefill replays its 16-row bucket, padded, with every row selecting on its
-    own when the bucket is wider than index_topk and dense attention when not; decode is sparse
-    for every row over the serving window, through the slot's re-planned sparse wrapper."""
+    """Captured DSA steps emit the eager tokens: a padded prefill bucket that selects (wider
+    than index_topk) or attends densely, and sparse decode on the slot's re-planned plan."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     overrides = dict(dsa_long_context=True, index_topk=topk, index_n_heads=16,
                      index_head_dim=64, max_seq_len=64,  # the indexer ropes its first 64 dims
@@ -321,9 +317,8 @@ def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager-forward", "compiled"])
 def test_paged_dsa_with_fused_mla_prep_matches_the_unfused_path(tmp_path, monkeypatch, compiled):
-    """The fused MLA prep on the selecting path: DSA at index_topk 8, so decode selects,
-    captured with the fused prep emits the op-by-op path's tokens (q_lora_rank 256, a width
-    the fused norms take)."""
+    """Captured with the fused MLA prep, the selecting path emits the op-by-op path's tokens
+    (q_lora_rank 256: a width the fused norms take)."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     streams = {}
     for fused_prep in (False, True):

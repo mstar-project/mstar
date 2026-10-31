@@ -2,26 +2,19 @@
 query row's selection, sparse MLA over it.
 
 Dense MLA is exact while a query row sees at most ``topk`` keys. Past that, each row attends
-only the tokens the indexer scores highest. ``kpool`` tokens share a key:
+only the tokens the indexer scores highest. With ``kpool == 1`` every token has its own key.
+With ``kpool > 1`` pools of ``kpool`` consecutive tokens from position 0 share one gated key,
+and a row attends the members of its top ``topk / kpool`` complete pools plus its own
+incomplete pool, which the reference indexer always selects.
 
-- ``kpool == 1`` (GLM-5.2, DeepSeek-V3.2): every token has its own key, and a row attends its
-  top ``topk`` tokens.
-- ``kpool > 1`` (GLM-5.3-Flash's k-pool indexer): pools of ``kpool`` consecutive tokens from
-  position 0 share one key, the gated sum of their members'. A row attends the members of its
-  top ``topk / kpool`` complete pools plus the incomplete pool at its end, which the reference
-  indexer always selects (``Glm5NextTextIndexer``).
+The index keys sit in the cache's aux planes ``INDEX_PLANES``, a row per token at its latent's
+slot, so one flat page list serves the key writes, the scores, the top-k and the sparse gather.
+Every row selects over its own causal prefix, so a prefill past ``topk`` equals prefilling
+``topk`` tokens and decoding the rest one at a time.
 
-The index keys live on the MLA cache's pages, in its aux planes ``INDEX_PLANES`` (one plane per
-indexer layer, a row per token at the token's latent slot): ``[k_t]`` with ``kpool == 1``,
-``[k_t | gate_t | key of the pool ending at t]`` with ``kpool > 1``. So one flat page list
-serves the key writes, the scores, the top-k and the sparse gather. Every row selects over its
-own causal prefix, so a prefill past ``topk`` is the same computation as prefilling ``topk``
-tokens and decoding the rest one at a time.
-
-On CUDA: ``kernels`` for the pool keys and the scores, flashinfer's fused top-k + page-table
-transform (with a page of ``page_size / kpool`` pools, a pool's slot times ``kpool`` is the
-slot of its first token) and ``sparse_mla``. Elsewhere, torch versions of the same math, which
-the CPU tests hold to the references.
+On CUDA: ``kernels`` for the pool keys and scores, flashinfer's fused top-k + page-table
+transform (over pages of ``page_size / kpool`` pools, so a pool's slot times ``kpool`` is its
+first token's), and ``sparse_mla``. Elsewhere, torch versions of the same math.
 """
 from __future__ import annotations
 
@@ -49,11 +42,10 @@ class DSAContext:
     score width (the step's most pools, or a CUDA graph's fixed width); ``sparse_plan`` the
     graph slot's plan, or the eager one the first layer builds.
 
-    ``needs_selection``: some row sees more than ``topk`` keys; below, every row attends all it
-    sees and dense MLA is the same computation. ``decode_rows``: every row scores on its own (a
-    decode step's, an MTP verify block's, a captured step's), the capturable launch.
-    ``last_selection``: the last indexer layer's pick, which a layer without an indexer
-    (IndexShare's shared layers) reuses."""
+    ``needs_selection``: some row sees more than ``topk`` keys (below, dense MLA is the same
+    computation). ``decode_rows``: every row scores on its own, the capturable launch (decode,
+    an MTP verify block, any captured step). ``last_selection``: the last indexer layer's pick,
+    which a layer without an indexer reuses."""
 
     pos: torch.Tensor
     row_req: torch.Tensor
@@ -70,7 +62,6 @@ class DSAContext:
     decode_rows: bool = False
     sparse_plan: sparse_mla.SparseGraphPlan | sparse_mla.EagerSparsePlan | None = None
     last_selection: torch.Tensor | None = None
-    last_selection_layer: int | None = None
     # row_meta's, for the rows it was built from
     _row_meta: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -84,9 +75,8 @@ class DSAContext:
 
     def row_meta(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per row, int32, what the top-k takes: the pools it sees, its request's first entry
-        in ``pages``, and its row of the one-row page table (0). Every layer of a forward
-        selects with the same rows, so they are built once (each launch is a few us), and
-        again for new rows or a capture: a graph must hold the ops that build them."""
+        in ``pages``, and its row of the one-row page table (0). Built once for a forward's
+        layers, and again for new rows or under a capture, whose graph must hold the ops."""
         capturing = self.pos.is_cuda and torch.cuda.is_current_stream_capturing()
         meta = self._row_meta
         if (meta is None or meta[0] is not self.pos or meta[1] is not self.row_req
@@ -122,7 +112,7 @@ class DSAContext:
         return dataclasses.replace(
             self, pos=self.pos[idx], row_req=self.row_req[idx], host_pos=host_pos, spans=spans,
             max_pools=max(1, (max(host_pos) + 1) // self.kpool), needs_selection=True,
-            decode_rows=False, sparse_plan=None, last_selection=None, last_selection_layer=None)
+            decode_rows=False, sparse_plan=None, last_selection=None)
 
 
 def attn_lens(positions: list[int], topk: int, kpool: int) -> list[int]:

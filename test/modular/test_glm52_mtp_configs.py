@@ -1,7 +1,6 @@
-"""The MTP step's graph configs and acceptance log (CPU, reduced)."""
+"""The MTP step's graph configs and its draft chain (CPU, reduced)."""
 from __future__ import annotations
 
-import logging
 import sys
 import types
 from contextlib import nullcontext
@@ -59,46 +58,10 @@ def test_mtp_decode_captures_one_graph_over_the_block(k):
     assert decode.single_request_inputs.input_seq_len == k + 1
     assert decode.single_request_inputs.input_ids.numel() == 1
     assert decode.get_total_tokens(4) == [4 * (k + 1)]
-    assert decode.capture_batch_sizes == Glm52LLMSubmodule.MTP_CAPTURE_BATCH_SIZES
     cfg.mtp_num_draft_tokens = 0
     plain = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg).get_accelerator_graph_configs(CPU)
     assert len(plain) == len(configs)
     assert sub.get_piecewise_accelerator_graph_configs(CPU, torch.bfloat16, tp_world_size=1) == {}
-
-
-def test_mtp_acceptance_log_per_position(caplog):
-    """The 512-step acceptance line must carry the conditional per-position profile (the
-    datum that separates "first draft mediocre" from "chained drafts collapse").
-    """
-    k = 3
-
-    def _ns() -> SimpleNamespace:
-        return SimpleNamespace(
-            config=SimpleNamespace(mtp_num_draft_tokens=k),
-            _MTP_STAT_LOG_EVERY=Glm52LLMSubmodule._MTP_STAT_LOG_EVERY,
-            _mtp_stat_steps=512,
-            _mtp_stat_logged=0,
-            # 512 steps halving at each position: reached = [512, 256, 128, 64].
-            _mtp_stat_acc_hist=[256, 128, 64, 64],
-            _mtp_stat_emitted=256 * 1 + 128 * 2 + 64 * 3 + 64 * 4,
-        )
-
-    ns = _ns()
-    with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
-        Glm52LLMSubmodule._maybe_log_mtp_acceptance(ns)
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("emitted/step" in m for m in msgs)
-    (pos_line,) = [m for m in msgs if "by position" in m]
-    assert "[256, 128, 64, 64]" in pos_line
-    assert "0.50 0.50 0.50" in pos_line
-    assert ns._mtp_stat_logged == 512
-    # below the threshold nothing is logged
-    caplog.clear()
-    quiet = _ns()
-    quiet._mtp_stat_steps = 100
-    with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
-        Glm52LLMSubmodule._maybe_log_mtp_acceptance(quiet)
-    assert not caplog.records
 
 
 class _ChainMTP:
@@ -119,10 +82,9 @@ class _ChainMTP:
 
 
 def test_the_draft_chain_and_the_seed_carry_the_post_norm_stream():
-    """A draft's MTP pass reads the previous pass's shared_head-normed output, the stream
-    the head reads, as d1's reads the trunk's post-final-norm state; the seed left for the
-    next step's first chained draft is that stream too. Chaining the output under the norm
-    cut GLM-5.2's second and third drafts' acceptance on 8xH200."""
+    """Each chained draft pass, and the seed for the next step, reads the previous pass's
+    shared_head-normed output, as d1 reads the trunk's post-final-norm state. Chaining under
+    the norm costs acceptance, which no stream comparison sees."""
     k, n, hidden, vocab = 3, 2, 8, 16
     block = k + 1
     mtp = _ChainMTP()

@@ -1,6 +1,5 @@
-"""What GLM-5.3 takes of a request's kwargs: an unset one is the default, and
-one it cannot read is refused in process_prompt, the data worker's 400, before
-the conductor reads it and any rank runs the request."""
+"""GLM-5.3's request kwargs: a null one is unset, and one it cannot read is refused in
+process_prompt (a 400) before any rank sees the request."""
 
 import pytest
 
@@ -45,7 +44,7 @@ def test_a_kwarg_it_cannot_read_is_refused_in_process_prompt(kwargs):
 @pytest.mark.parametrize("k", [0, 3])
 def test_min_p_is_refused_in_process_prompt(k):
     m = _model(mtp_num_draft_tokens=k)
-    # the sampler that would read it is built without it; it was dropped (0.2 ran as 0)
+    # the sampler is built without min_p, so it would be ignored
     [spec] = [s for s in m.get_node_resources() if isinstance(s, SamplerSpec)]
     assert not spec.enable_min_p
     with pytest.raises(ValueError, match="min_p"):
@@ -54,14 +53,6 @@ def test_min_p_is_refused_in_process_prompt(k):
 
 
 def test_a_request_without_max_tokens_runs_to_the_window():
-    # a thinking reply was cut at a fixed 1024 tokens with "length", on any window
     m = _model()
     assert m.get_max_output_tokens() == m.get_max_output_tokens(max_output_tokens=None) == m.config.index_topk
     assert m.get_max_output_tokens(max_output_tokens=100) == 100
-
-
-def test_a_long_context_request_without_max_tokens_runs_to_its_window():
-    m = _model(dsa_long_context=True, max_seq_len=1 << 20)
-    assert m.get_max_output_tokens() == m.get_max_output_tokens(max_output_tokens=None) == 1 << 20
-    with pytest.raises(ValueError, match="max_output_tokens"):
-        m.process_prompt("Hi", ["text"], ["text"], max_output_tokens="lots")

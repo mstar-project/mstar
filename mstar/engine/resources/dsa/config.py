@@ -18,8 +18,8 @@ INDEX_PLANES = "dsa_index"
 
 @dataclass
 class DSAConfig:
-    # the paged MLA cache: a step's rows come from its plan, the attended latents from its
-    # pages, and the index keys sit on its pages too (its aux_planes[INDEX_PLANES])
+    # the paged MLA cache: the step's rows come from its plan; its pages hold the latents and,
+    # in aux_planes[INDEX_PLANES], the index keys
     kv_cache: str
     # the keys a query attends once it sees more: its top ``topk`` by the indexer's score
     topk: int
@@ -27,9 +27,8 @@ class DSAConfig:
     kpool: int = 1
     # the absorbed MLA's softmax scale, for the sparse-attention plans the resource makes
     sm_scale: float | None = None
-    # the layers attend densely while no row sees more than topk keys (a step's
-    # ``needs_selection`` off), where dense MLA is the same computation: such a step needs no
-    # sparse plan
+    # attend densely while no row sees more than topk keys (there, the same computation): such
+    # a step plans no sparse attention
     dense_below_topk: bool = False
 
 

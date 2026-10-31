@@ -92,6 +92,7 @@ def _worker(kind: str, section: Loop):
         T._runtime = shared
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
         release_cached_prefix=lambda batch: None,
+        order_split_rows=lambda node, walk, rids, walks: rids,
     ))
     return w
 

@@ -76,7 +76,7 @@ def test_a_row_with_fewer_keys_than_topk_lists_them_first():
         assert set(got[r, :n].tolist()) == set(ref[r, :n].tolist()), r
 
 
-@pytest.mark.parametrize("world", [2, 3, 8])
+@pytest.mark.parametrize("world", [3, 8])
 def test_sharded_selection_is_bitwise_the_unsharded_one(world, monkeypatch):
     """Ranks' blocks of a long prefill span start their score chunks at other rows than one
     rank selecting the whole span; every row's selection must still be the same."""

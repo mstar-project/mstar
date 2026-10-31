@@ -99,12 +99,11 @@ class DeltaNetGeometry(RecurrentGeometry):
         """Pool blocks for this geometry; head counts are pre-sharding.
 
         With ``speculative_tokens = k > 0`` the pool also keeps what a verify
-        step of ``k + 1`` tokens leaves for the next one, which learns how many
-        were accepted: the block's pre-conv inputs, raw forget gates and raw
-        betas, and the conv window before it, each on two sides (a step reads
-        one and writes the other); per slot, the accepted count (0 after a
-        prefill) and the side holding them. ``state`` then holds the state
-        before those accepted tokens.
+        step of ``k + 1`` tokens leaves for the next, which learns how many were
+        accepted: the block's pre-conv inputs, raw gates and betas and the conv
+        window before it, on two sides (a step reads one and writes the other),
+        and per slot the accepted count (0 after a prefill) and the side holding
+        them. ``state`` then holds the state before the accepted tokens.
         """
         blocks = {
             "state": RecurrentBlockConfig(
