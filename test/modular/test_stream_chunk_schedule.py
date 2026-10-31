@@ -152,6 +152,26 @@ def test_primed_stream_delivers_its_lead_as_first_window_context():
     assert [i for context, items in windows for i in items[context:]] == list(range(4, 13))
 
 
+@pytest.mark.parametrize("schedule,chunk,left_context,lead", [
+    ((1, 3, 8, 16), 25, 72, 0), ((1, 3, 8, 16), 25, 72, 72), ((4, 8, 16), 32, 1026, 0),
+    ((1, 2, 4), 8, 22, 0), ((1, 2, 4), 8, 22, 5), ((30,), 25, 25, 0), ((), 8, 5, 0), ((4,), 2, 0, 0),
+])
+def test_window_sizes_are_the_windows_a_stream_pops(schedule, chunk, left_context, lead):
+    """Capture buckets are sized from ``window_sizes``, so it must name every
+    window a stream pops before its terminal flush, and no other."""
+    policy = ScheduledLeftContextChunkPolicy(schedule=schedule, chunk=chunk, left_context=left_context)
+    buffer = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker", policy=policy)
+    buffer.prime_context(lead)
+    popped = set()
+    for i in range(lead + 3 * (sum(schedule) + chunk + left_context)):
+        buffer.pre_read_register(f"t{i}")
+        buffer.put(f"t{i}", torch.tensor([i]))
+        while buffer.has_chunk_ready():
+            popped.add(buffer.pop_chunk().num_items)
+    # read off the policy mid-stream: the answer doesn't depend on its progress
+    assert policy.window_sizes(lead) == sorted(popped)
+
+
 def test_prime_is_bounded_and_only_for_context_policies():
     policy = ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3)
     with pytest.raises(ValueError):

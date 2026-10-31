@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Tuple
 
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
+
 # ---------------------------------------------------------------------------
 # Resource label constants
 # ---------------------------------------------------------------------------
@@ -383,11 +385,13 @@ class Code2WavConfig:
                 f"and the next window's context must re-decode them, or they are lost at every chunk boundary"
             )
 
-    @property
-    def codec_max_window(self) -> int:
-        """Frames in the widest window the chunk schedule pops. Every window
-        is padded to it, so the vocoder runs (and captures) one shape."""
-        return self.codec_left_context_frames + max((self.codec_chunk_frames, *self.codec_chunk_schedule))
+    def chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
+        """The Talker -> Code2Wav edge's chunking, in codec frames."""
+        return ScheduledLeftContextChunkPolicy(
+            schedule=self.codec_chunk_schedule,
+            chunk=self.codec_chunk_frames,
+            left_context=self.codec_left_context_frames,
+        )
 
     def get_hf_config(self):
         from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (

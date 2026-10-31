@@ -97,7 +97,7 @@ from mstar.model.qwen3_omni.config import (
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, TextOutput, WeightConverter
-from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
+from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import (
     Connection,
     PartitionTopology,
@@ -645,17 +645,9 @@ class Qwen3OmniModel(Model):
                     from_partition="Talker",
                     to_partition="Code2Wav",
                     edge_name="codec_tokens",
-                    chunk_policy_factory=self._code2wav_chunk_policy,
+                    chunk_policy_factory=self.config.code2wav.chunk_policy,
                 ),
             ],
-        )
-
-    def _code2wav_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
-        cfg = self.config.code2wav
-        return ScheduledLeftContextChunkPolicy(
-            schedule=cfg.codec_chunk_schedule,
-            chunk=cfg.codec_chunk_frames,
-            left_context=cfg.codec_left_context_frames,
         )
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:

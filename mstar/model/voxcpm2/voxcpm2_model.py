@@ -26,7 +26,6 @@ Request modes (``process_prompt``), as the reference ``VoxCPM.generate``:
 from __future__ import annotations
 
 import hashlib
-import itertools
 import logging
 import math
 import re
@@ -115,21 +114,6 @@ def decoder_receptive_field_patches(config: VoxCPM2Config) -> int:
     with torch.device("meta"):
         decoder = CausalDecoder(config.audio_vae)
     return math.ceil(decoder_receptive_field_frames(decoder) / config.patch_size)
-
-
-def stream_window_widths(schedule: tuple[int, ...], chunk: int, context: int) -> tuple[int, ...]:
-    """Widths, in patches, of the VAE windows ``ScheduledLeftContextChunkPolicy``
-    pops for a stream without a primed lead: the schedule's ramp, then
-    ``chunk`` new patches behind a context that grows up to ``context``. No
-    window, primed or final, is wider than the widest of these."""
-    widths, delivered = {context + max((chunk, *schedule))}, 0
-    for k in itertools.count():
-        new = schedule[k] if k < len(schedule) else chunk
-        held = min(delivered, context)
-        widths.add(held + new)
-        delivered += new
-        if k >= len(schedule) and held == context:
-            return tuple(sorted(widths))
 
 
 class VoxCPM2Model(Model):
@@ -330,8 +314,21 @@ class VoxCPM2Model(Model):
             ),
         ]
 
+    def stream_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
+        """The Talker -> VAEDecoder edge's chunking, in patches."""
+        return ScheduledLeftContextChunkPolicy(
+            schedule=self.stream_schedule, chunk=self.stream_chunk_patches, left_context=self.stream_left_context,
+        )
+
+    def stream_window_widths(self) -> tuple[int, ...]:
+        """Widths, in patches, of the VAE windows to capture: those an unprimed
+        stream pops, plus the widest window of a fully primed one, which any
+        other primed window pads up to."""
+        policy = self.stream_chunk_policy()
+        widest = max(policy.window_sizes(self.stream_left_context))
+        return tuple(sorted({*policy.window_sizes(), widest}))
+
     def get_partition_topology(self) -> PartitionTopology:
-        schedule, chunk, context = self.stream_schedule, self.stream_chunk_patches, self.stream_left_context
         return PartitionTopology(
             partitions=["Talker", "VAEDecoder"],
             connections=[
@@ -339,11 +336,7 @@ class VoxCPM2Model(Model):
                     from_partition="Talker",
                     to_partition="VAEDecoder",
                     edge_name=STREAM_EDGE,
-                    chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
-                        schedule=schedule,
-                        chunk=chunk,
-                        left_context=context,
-                    ),
+                    chunk_policy_factory=self.stream_chunk_policy,
                 )
             ],
         )
@@ -672,9 +665,7 @@ class VoxCPM2Model(Model):
                 submodule = submodules.VAEDecoderSubmodule(
                     load_audio_vae(self.config, checkpoint, device),
                     self.config,
-                    window_buckets=stream_window_widths(
-                        self.stream_schedule, self.stream_chunk_patches, self.stream_left_context
-                    ),
+                    window_buckets=self.stream_window_widths(),
                 )
             self._submodule_cache[node_name] = submodule
         return self._submodule_cache[node_name]

@@ -39,13 +39,6 @@ def _to_pcm(wav: torch.Tensor) -> torch.Tensor:
     return (wav.clamp(-1, 1) * 32767).to(torch.int16)
 
 
-def _scheduled_policy(cfg: Code2WavConfig) -> ScheduledLeftContextChunkPolicy:
-    """The edge's policy, as ``Qwen3OmniModel`` builds it."""
-    return ScheduledLeftContextChunkPolicy(
-        schedule=cfg.codec_chunk_schedule, chunk=cfg.codec_chunk_frames, left_context=cfg.codec_left_context_frames,
-    )
-
-
 def _talker_streamed(config: Qwen3OmniModelConfig, frames: torch.Tensor) -> tuple[torch.Tensor, list]:
     """The frames the Talker puts on the Code2Wav stream, out of the frames it
     samples (``[T, 16]``), and its stop check's answer per frame: the
@@ -456,7 +449,7 @@ def test_ramped_stream_stitches_into_the_full_decode(schedule, chunk, left_conte
     submodule = Code2WavSubmodule(decoder, _config(schedule, chunk, left_context))
     codes = _codes(num_frames)
 
-    steps = _stream(submodule, codes, _scheduled_policy)
+    steps = _stream(submodule, codes, Code2WavConfig.chunk_policy)
     full = _to_pcm(decoder(codes.t()[None], torch.arange(num_frames)[None]))[0, 0]
 
     assert submodule.full_seqlen == left_context + max((chunk, *schedule))
@@ -476,7 +469,7 @@ def test_a_batch_mixes_windows_from_different_ramp_stages():
     submodule = Code2WavSubmodule(decoder, _config())
     codes = {"a": _codes(90), "b": _codes(70) + 200, "c": _codes(3) + 400}
 
-    steps, keys = _stream_batched(submodule, codes, _scheduled_policy, starts={"a": 0, "b": 1, "c": 2})
+    steps, keys = _stream_batched(submodule, codes, Code2WavConfig.chunk_policy, starts={"a": 0, "b": 1, "c": 2})
 
     assert keys == [None] * len(keys)
     # step 2 batches a's third window (12 + 13), b's second (4 + 8) and c's whole stream
@@ -501,7 +494,7 @@ def test_real_decoder_streams_the_ramp_like_the_full_decode(tiny_code2wav, num_f
     generator = torch.Generator().manual_seed(1000 + num_frames)
     codes = torch.randint(0, config.codebook_size, (num_frames, config.num_quantizers), generator=generator)
 
-    steps = _stream(submodule, codes, _scheduled_policy)
+    steps = _stream(submodule, codes, Code2WavConfig.chunk_policy)
     with torch.no_grad():
         full = _to_pcm(model(codes.t()[None], torch.arange(num_frames)[None]))[0, 0]
 
@@ -525,7 +518,7 @@ def test_the_talker_withholds_codec_eos_on_the_default_ramp(num_frames):
     eos = torch.full((1, 16), config.talker.codec_eos_token_id)
 
     streamed_frames, _ = _talker_streamed(config, torch.cat([codes, eos]))
-    steps = _stream(submodule, streamed_frames, _scheduled_policy)
+    steps = _stream(submodule, streamed_frames, Code2WavConfig.chunk_policy)
     # one decode per window that starts before the last real frame
     assert decoder.calls == sum(1 for start in (0, 12, 25, 50) if start < num_frames)
     full = _to_pcm(decoder(codes.t()[None], torch.arange(num_frames)[None]))[0, 0]
@@ -543,12 +536,10 @@ def test_default_config_ramps_12_13_then_25():
     """The checkpoint carries no streaming fields, so the dataclass defaults
     are what serves: windows of 12 and 12 + 13 frames, then 25 + 25, all
     padded to one 50-frame capture."""
-    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-
     cfg = Code2WavConfig.from_dict({"codebook_size": 2048})
     assert (cfg.codec_chunk_schedule, cfg.codec_chunk_frames, cfg.codec_left_context_frames) == ((12, 13), 25, 25)
     assert Qwen3OmniModelConfig().code2wav == cfg
-    policy = Qwen3OmniModel._code2wav_chunk_policy(SimpleNamespace(config=Qwen3OmniModelConfig()))
+    policy = Qwen3OmniModelConfig().code2wav.chunk_policy()
     assert isinstance(policy, ScheduledLeftContextChunkPolicy)
     windows = _windows(policy, 120)
     assert windows == [(0, 12), (12, 25), (25, 50), (25, 50), (25, 50), (25, 45)]
@@ -557,14 +548,14 @@ def test_default_config_ramps_12_13_then_25():
 
     submodule = Code2WavSubmodule(_LookaheadDecoder(), Qwen3OmniModelConfig())
     capture = submodule.get_accelerator_graph_configs("cpu")[0].single_request_inputs.tensor_inputs["codec_tokens"]
-    assert submodule.full_seqlen == cfg.codec_max_window == 50 and capture.shape == (16, 50)
+    assert submodule.full_seqlen == 50 and capture.shape == (16, 50)
 
 
 @pytest.mark.parametrize("num_frames", list(range(1, 131)))
 def test_an_empty_schedule_pops_the_windows_of_25_frame_first_chunks(num_frames):
     """``codec_chunk_schedule=()`` brings back the edge's previous policy
     window for window, terminal flush included."""
-    scheduled = _scheduled_policy(Code2WavConfig(codec_chunk_schedule=()))
+    scheduled = Code2WavConfig(codec_chunk_schedule=()).chunk_policy()
     assert _windows(scheduled, num_frames) == _windows(LeftContextChunkPolicy(chunk=25, left_context=25), num_frames)
 
 
@@ -577,7 +568,7 @@ def test_yaml_model_kwargs_set_the_streaming_knobs():
     apply_code2wav_serving_overrides(cfg, kwargs)
     assert (cfg.codec_chunk_schedule, cfg.codec_chunk_frames, cfg.codec_left_context_frames) == ((), 25, 50)
     assert kwargs == {"codec_chunk_frames": None, "other": 1}
-    assert cfg.codec_max_window == 75
+    assert cfg.chunk_policy().window_sizes() == [25, 50, 75]
 
 
 def test_one_context_frame_covers_the_lookahead_samples():
@@ -596,7 +587,7 @@ def test_zero_context_frames_would_drop_the_lookahead_at_every_boundary():
     cfg = _config()
     cfg.code2wav.codec_left_context_frames = 0
     decoder = _LookaheadDecoder()
-    steps = _stream(Code2WavSubmodule(decoder, cfg), _codes(50), _scheduled_policy)
+    steps = _stream(Code2WavSubmodule(decoder, cfg), _codes(50), Code2WavConfig.chunk_policy)
     assert sum(audio.numel() for _, audio, _ in steps) == 50 * UPSAMPLE - decoder.TAIL - 3 * decoder.TAIL == 93780
 
 
@@ -644,7 +635,8 @@ def test_every_accepted_knob_combination_streams_the_full_decode(schedule, chunk
     decoder = _LookaheadDecoder()
     codes = _codes(num_frames)
 
-    steps = _stream(Code2WavSubmodule(decoder, Qwen3OmniModelConfig(code2wav=code2wav)), codes, _scheduled_policy)
+    submodule = Code2WavSubmodule(decoder, Qwen3OmniModelConfig(code2wav=code2wav))
+    steps = _stream(submodule, codes, Code2WavConfig.chunk_policy)
     full = _to_pcm(decoder(codes.t()[None], torch.arange(num_frames)[None]))[0, 0]
 
     assert [audio.numel() for _, audio, _ in steps] == _expected_samples_per_step(steps, decoder.TAIL)
@@ -682,7 +674,7 @@ def _boundary_snrs(model, config: Code2WavConfig, schedule, seeds=range(4), num_
     steady, ramp = [], []
     for seed in seeds:
         codes = torch.randint(0, config.codebook_size, (num_frames, 16), generator=torch.Generator().manual_seed(seed))
-        steps = _stream(submodule, codes, _scheduled_policy)
+        steps = _stream(submodule, codes, Code2WavConfig.chunk_policy)
         with torch.no_grad():
             full = _to_pcm(model(codes.t()[None], torch.arange(num_frames)[None]))[0, 0].double()
         audio = torch.cat([audio for _, audio, _ in steps]).double()
@@ -708,7 +700,7 @@ def test_the_default_ramp_plays_the_audio_of_25_frame_first_chunks(long_reach_co
     for num_frames in (3, 12, 25, 40, 50, 120):
         codes = torch.randint(0, 64, (num_frames, 16), generator=torch.Generator().manual_seed(num_frames))
         streamed = [
-            torch.cat([audio for _, audio, _ in _stream(sub, codes, _scheduled_policy)])
+            torch.cat([audio for _, audio, _ in _stream(sub, codes, Code2WavConfig.chunk_policy)])
             for sub in (ramp, first_chunk_25)
         ]
         assert (streamed[0].int() - streamed[1].int()).abs().max().item() <= 1, num_frames

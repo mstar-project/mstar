@@ -84,7 +84,6 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 
@@ -608,7 +607,6 @@ class Qwen3TTSModel(Model):
         ``CodecSubmodule.postprocess`` removes the duplicated PCM prefix using
         the context count the stream buffer reports for each window.
         """
-        codec = self.config.codec
         return PartitionTopology(
             partitions=["Talker", "Codec"],
             connections=[
@@ -616,11 +614,7 @@ class Qwen3TTSModel(Model):
                     from_partition="Talker",
                     to_partition="Codec",
                     edge_name="codec_tokens",
-                    chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
-                        schedule=codec.chunk_schedule,
-                        chunk=codec.chunk_frames,
-                        left_context=codec.left_context_frames,
-                    ),
+                    chunk_policy_factory=self.config.codec.chunk_policy,
                 ),
             ],
         )

@@ -215,20 +215,6 @@ class FishDACConfig:
         """Codec frames the encoder emits for ``num_samples`` of 44.1 kHz audio."""
         return -(-int(num_samples) // self.hop_length)
 
-    def codec_windows(self) -> list[int]:
-        """Distinct window sizes (context + new frames) the chunk schedule produces."""
-        left = self.left_context_frames
-        windows, delivered = set(), 0
-        for size in self.chunk_schedule:
-            windows.add(min(left, delivered) + size)
-            delivered += size
-        while True:
-            windows.add(min(left, delivered) + self.chunk_frames)
-            if delivered >= left:
-                break
-            delivered += self.chunk_frames
-        return sorted(windows)
-
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FishDACConfig":
         return cls(**_pick(cls, data))

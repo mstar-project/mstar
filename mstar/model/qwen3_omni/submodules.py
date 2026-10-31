@@ -1810,7 +1810,9 @@ class Code2WavSubmodule(NodeSubmodule):
         # samples that ``postprocess`` drops, and the convs keep the input
         # lengths of a full window (bf16 cuDNN convs go wrong at some other
         # odd lengths on B200).
-        self.full_seqlen = self.config.code2wav.codec_max_window
+        # As wide as any window can be: a fully primed stream's widest.
+        code2wav = self.config.code2wav
+        self.full_seqlen = max(code2wav.chunk_policy().window_sizes(code2wav.codec_left_context_frames))
 
     @staticmethod
     def _chunk(rid, per_request_input_metadata: Mapping[str, InputMetadata] | None):

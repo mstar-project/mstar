@@ -58,7 +58,6 @@ from mstar.model.voxcpm2.voxcpm2_model import (
     STREAM_LEAD_KEY,
     VoxCPM2Model,
     decoder_receptive_field_patches,
-    stream_window_widths,
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -1191,11 +1190,7 @@ def _window_widths(buffer: StreamBuffer) -> list[int]:
 
 
 def test_stream_window_widths_bound_every_window(model):
-    assert stream_window_widths((1, 2, 4), 8, 5) == (1, 3, 7, 13)
-    assert stream_window_widths((1, 2, 4), 8, 22) == (1, 3, 7, 15, 23, 30)
-    assert stream_window_widths((4,), 2, 0) == (2, 4)
-    assert stream_window_widths((), 8, 5) == (8, 13)
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     for lead in (0, 2, model.stream_left_context):
         policy = model.get_partition_topology().connections[0].chunk_policy_factory()
         buffer = StreamBuffer(request_id="r", edge_name=STREAM_EDGE, from_partition="Talker", policy=policy)
@@ -1217,7 +1212,7 @@ def test_vae_windows_replay_at_their_bucket_and_equal_a_whole_decode(model):
     """Every window of a stream goes through the region of the next width up,
     padded at the end; the streamed audio still equals one whole decode."""
     config = model.config
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     vae_node = VAEDecoderSubmodule(_random_vae(config).double(), config, window_buckets=widths)
     regions = vae_node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
     assert list(regions) == [VAE_WINDOW.format(width) for width in widths]
@@ -1239,7 +1234,7 @@ def test_graph_hooks_are_the_names_the_engine_calls(model):
     which captures nothing) and declares its regions when called as the engine
     calls it."""
     config = model.config
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     talker, _, _ = _talker(model)
     vae_node = VAEDecoderSubmodule(_random_vae(config), config, window_buckets=widths)
     for hook in (
@@ -1302,7 +1297,7 @@ def test_captured_regions_replay_the_eager_result_on_cuda(model):
                 else:
                     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
-        widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+        widths = model.stream_window_widths()
         vae_node = VAEDecoderSubmodule(_random_vae(config).to(device), config, window_buckets=widths)
         runners = {
             label: capture(label, region)

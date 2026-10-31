@@ -299,6 +299,19 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
         next_context = min(self._left_context, delivered_after)
         return (delivered_after - next_context) - (self._delivered - self._context())
 
+    def window_sizes(self, lead: int = 0) -> list[int]:
+        """The distinct window sizes this policy pops for a stream primed with
+        ``lead`` context items, until its windows repeat. A terminal flush
+        pops a shorter window. Consumers size their capture buckets from these."""
+        policy = type(self)(self._schedule, self._chunk, self._left_context)
+        policy.prime(lead)
+        sizes = set()
+        while True:
+            sizes.add(policy.window_size())
+            if policy._chunks_popped >= len(self._schedule) and policy._context() == self._left_context:
+                return sorted(sizes)
+            policy.register_chunk(policy.next_chunk_size(policy.window_size()))
+
     def register_chunk(self, chunk_size: int):
         super().register_chunk(chunk_size)
         # A regular pop delivers exactly this chunk's new items. The only

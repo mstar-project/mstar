@@ -999,9 +999,12 @@ class CodecSubmodule(ARNodeSubmodule):
         # Opt-in (``audio_watermark`` in model_kwargs): marks each request's
         # trimmed PCM in ``batch_postprocess``; None leaves it untouched.
         self.watermarker = watermarker
-        # Base streams may lead with a full reference tail: capture those windows too.
+        # The shapes the codec captures; any other window (a terminal flush, a
+        # shorter reference tail) pads up to the next one. Base streams may
+        # lead with a full reference tail: capture those windows too.
         leads = (0, config.codec.left_context_frames) if config.supports_reference_audio else (0,)
-        self.windows = config.codec.codec_windows(leads)
+        policy = config.codec.chunk_policy()
+        self.windows = sorted({size for lead in leads for size in policy.window_sizes(lead)})
         self.max_window = self.windows[-1]
         self.total_upsample = 1
         for factor in (
