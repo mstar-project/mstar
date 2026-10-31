@@ -1976,9 +1976,8 @@ class SamplerBuffers:
     # Per-request RNG offset: gathered by slot, advanced in graph, scattered
     # back after replay (all on GPU). Not a config value, so it's kept out of
     # ``_scalar_buffers`` (never written from a SamplingConfig) and reset to 0
-    # on register instead. The request's only counter: an eager step draws
-    # at it and advances it too (``eager_offsets``), so a request whose steps
-    # mix eager and captured never draws one offset twice.
+    # on register instead. Eager steps draw at it and advance it too
+    # (``eager_offsets``): it is the request's only counter.
     offset: Buffer
     # Per-request last sampled token, by slot: the captured sample writes the
     # per-step row (double-buffered, one row per cg slot), ``scatter_last_token``
@@ -2056,10 +2055,9 @@ class SamplerBuffers:
     # on the gathering thread rather than racing it from the main one.
     _pending_init: set[int] = field(default_factory=set, repr=False)
     # Slots whose RNG offset must be zeroed before it is next read: a device
-    # write, so registration queues it and the first reader on the GPU thread
-    # (``gather_dynamic`` or ``eager_offsets``) drains it. Queued at
-    # registration, before the request's first draw, so no later drain can
-    # zero an offset the request has already drawn at.
+    # write, so registration queues it (before any draw, so a drain never zeroes
+    # an offset already drawn at) and the first reader on the GPU thread
+    # (``gather_dynamic`` or ``eager_offsets``) drains it.
     _pending_offset_reset: set[int] = field(default_factory=set, repr=False)
     _offset_reset_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Slots whose loop-back state rows go back to their defaults before they
@@ -2401,8 +2399,7 @@ class SamplerBuffers:
     def _init_slot(self, slot: int, rid: str) -> None:
         """Init for a newly registered slot, on the gathering thread so rows are
         written before the gather reads them. No device work (pre-plan); the
-        offset reset was queued at registration, since an eager step may have
-        drawn by now."""
+        offset reset is queued at registration instead."""
         self._write_master_row(slot, self._cached_config[rid])
         # mask row not cleared: always staged fresh before gather, and clearing
         # here would race the default-stream stage from the plan stream
