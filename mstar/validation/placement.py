@@ -9,7 +9,7 @@ from mstar.distributed.communication import GlobalParallelConfig
 from mstar.distributed.guidance_parallel import GuidanceParallel
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
-from mstar.model.base import Model, WorkerGraph
+from mstar.model.base import REPLICA_POLICIES, Model, WorkerGraph
 
 # MAX_INPUTS in rust/src/graph/spec.rs: the Rust runtime keeps a node's
 # readiness in a u64 mask. Checked for both runtimes, since AUTO may pick either.
@@ -50,6 +50,8 @@ def _node_group_entry_problem(i: int, group: Any) -> str | None:
     for key in ("tp_size", "sp_size", "cfg_size"):
         if not _is_count(group.get(key, 1), 1):
             return f"node_groups[{i}]: {key} must be an integer >= 1; got {group[key]!r}"
+    if group.get("replica_policy", REPLICA_POLICIES[0]) not in REPLICA_POLICIES:
+        return f"node_groups[{i}]: replica_policy must be one of {REPLICA_POLICIES}; got {group['replica_policy']!r}"
     if group.get("cfg_size", 1) not in (1, GuidanceParallel.NUM_BRANCHES):
         return (
             f"node_groups[{i}]: cfg_size places the {GuidanceParallel.NUM_BRANCHES} guidance "
