@@ -41,6 +41,18 @@ class HardwareQueueColocation(WorkerColocation):
     def start(self) -> None:
         logger.info("mps: true on ROCm: nothing to start, the GPU schedules the workers' queues itself")
 
+BF16_HEADER_FLAG = "-include hip/hip_bf16.h"
+
+
+def _with_bf16_header(flags: str | None) -> str:
+    """``FLASHINFER_EXTRA_CUDAFLAGS`` with the header amd-flashinfer 0.6.18+amd.1's
+    AITER prefill sources need: their generated config names ``__hip_bfloat16``
+    before anything declares it, since FlashInfer's ``-DUSE_ROCM=1`` turns off
+    the include in torch's ``BFloat16.h``. Later releases include it themselves."""
+    if flags is None:
+        return BF16_HEADER_FLAG
+    return flags if BF16_HEADER_FLAG in flags else f"{flags} {BF16_HEADER_FLAG}"
+
 
 class Platform:
     """One accelerator stack; ``current_platform`` is the one this process runs.
@@ -289,8 +301,9 @@ class RocmPlatform(Platform):
             overrides["post_grad_custom_post_pass"] = post
         return overrides
 
-    def process_env_defaults(self) -> dict[str, str]:
+    def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         return {
+            "FLASHINFER_EXTRA_CUDAFLAGS": _with_bf16_header,
             # MIOpen's split-K implicit-GEMM conv solvers are not deterministic. Turning
             # them off costs about 1% and makes same-seed outputs repeat. The backward
             # one runs transposed convs (LTX-2.5's vocoder upsamplers).
