@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.model.qwen3_tts.config import PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 
 VARIANTS = {
@@ -51,6 +52,11 @@ def _find_cached_snapshot(repo: str) -> Path | None:
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+def _prefill_info(rid: str, metadata: dict) -> SimpleNamespace:
+    """A prefill's request info: ``process_prompt``'s host values arrive as step metadata."""
+    return SimpleNamespace(request_id=rid, rid_handle=rid, step_metadata=dict(metadata))
 
 
 @pytest.fixture(scope="module", params=sorted(VARIANTS))
@@ -95,22 +101,22 @@ def test_prefill_layout_matches_variant(loaded):
             model.process_prompt("Testing the base model.", **kwargs)
         return
     if variant == "custom_voice":
-        tensors = model.process_prompt(
+        result = model.process_prompt(
             "Testing Qwen three TTS.", voice="Vivian", language="English",
             instruct="Speak slowly and clearly.", **kwargs,
         )
-        assert tensors["speaker_id"][0].item() == model.config.talker.spk_id["vivian"]
+        assert result.metadata[SPEAKER_ID_KEY] == model.config.talker.spk_id["vivian"]
     else:
-        tensors = model.process_prompt(
+        result = model.process_prompt(
             "Testing Qwen three TTS.", language="English", instruct="A calm male voice.", **kwargs,
         )
-        assert tensors["speaker_id"][0].item() == -1
-    instruct_len, text_len, stream_text, ref_text_len, ref_frames = tensors["prompt_layout"][0].tolist()
+        assert result.metadata[SPEAKER_ID_KEY] == -1
+    instruct_len, text_len, stream_text, ref_text_len, ref_frames = result.metadata[PROMPT_LAYOUT_KEY]
     assert instruct_len > 0 and text_len > 0 and stream_text == 0
     assert ref_text_len == 0 and ref_frames == 0
 
     prepared = talker.prepare_inputs(
-        "talker_prefill", SimpleNamespace(request_id=f"prefill-{variant}"), tensors,
+        "talker_prefill", _prefill_info(f"prefill-{variant}", result.metadata), result.new_input_tensors,
     )
     assert prepared.input_embeds.shape[1] == model.config.talker.hidden_size
     # instruct + role(3) + codec tags + (text + eos) + closing pad/bos; with an
@@ -155,19 +161,18 @@ def test_base_reference_clip_becomes_xvector_frames_and_clone_prefill(loaded):
     clip = model.load_audio(clip_path, "cuda:0")
     assert clip.metadata["sample_rate"] == 24000 and clip.data.ndim == 1
     frames = model.config.codec.frames_for_samples(clip.data.shape[0])
-    tensors = model.process_prompt(
+    result = model.process_prompt(
         "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye.",
         input_modalities=["audio", "text"], output_modalities=["audio"],
         tensors={"audio_inputs": [clip.data]},
         ref_text="Okay. Yeah. I resent you. I love you. I respect you. "
                  "But you know what? You blew it! And thanks to you.",
     )
-    assert tensors["prompt_layout"][0].tolist()[4] == frames and tensors["ref_frames"][0].item() == frames
+    assert result.metadata[PROMPT_LAYOUT_KEY][4] == frames
 
     ref_encoder = model.get_submodule("RefEncoder", device="cuda:0", autocast_dtype=torch.bfloat16)
     prepared = ref_encoder.prepare_inputs(
-        "talker_prefill_clone", SimpleNamespace(request_id="clone"),
-        {"audio_inputs": [clip.data], "prompt_layout": tensors["prompt_layout"]},
+        "talker_prefill_clone", _prefill_info("clone", result.metadata), {"audio_inputs": [clip.data]},
     )
     engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
     with torch.no_grad():
@@ -182,8 +187,8 @@ def test_base_reference_clip_becomes_xvector_frames_and_clone_prefill(loaded):
     assert (codes >= 0).all() and (codes < model.config.codec.codebook_size).all()
 
     prefill = talker.prepare_inputs(
-        "talker_prefill_clone", SimpleNamespace(request_id="clone-prefill"),
-        {**tensors, "speaker_embed": [xvec], "ref_codes": [codes]},
+        "talker_prefill_clone", _prefill_info("clone-prefill", result.metadata),
+        {**result.new_input_tensors, "speaker_embed": [xvec], "ref_codes": [codes]},
     )
     # role(3) + [think, think_bos, lang?, think_eos, x-vector, pad] + in-context span (streaming text default)
     assert prefill.input_embeds.shape[1] == model.config.talker.hidden_size

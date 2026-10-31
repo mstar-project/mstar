@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import logging
 import multiprocessing as mp
+import shutil
 import signal
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
@@ -32,6 +33,8 @@ from mstar.integrations.dynamo.bridges import (
     TensorBridge,
     get_tensor_spec,
 )
+from mstar.utils import cpus
+from mstar.utils.socket_prefix import per_launch_socket_prefix
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
@@ -54,8 +57,13 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     """Start conductor + GPU workers and the API-server core (no HTTP)."""
     # Engine imports live here so importing this module (registration
     # mapping, --help) never loads the model stacks.
-    from mstar.api_server.entrypoint import APIServer, _conductor_process_target
+    from mstar.api_server.auth import keep_api_key_from_children
+    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, deployment_cpu_plan
     from mstar.communication.communicator import CommProtocol
+
+    # Dynamo's frontend serves HTTP here; this worker never checks a key, so
+    # an exported one must not reach the conductor and workers either.
+    keep_api_key_from_children(None)
     from mstar.model.registry import get_model_class, model_init_kwargs
 
     with open(args.config) as f:
@@ -68,6 +76,11 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
 
+    # before the workers exist: under ``auto`` this takes the GPUs' locks
+    try:
+        cpus.install(deployment_cpu_plan(config))
+    except cpus.CpuPlanError as e:
+        raise SystemExit(f"mstar: {e}") from None
     server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
@@ -206,7 +219,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="HF snapshot dir backing the frontend-side model card")
     parser.add_argument("--served-model-name", default=None)
     parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--socket-path-prefix", default="/tmp/mstar")
+    parser.add_argument("--socket-path-prefix", default=None,
+                        help="ZMQ IPC socket prefix; default a new /tmp/mstar_<user>_* "
+                             "directory per launch, removed at exit")
     parser.add_argument("--upload-dir", default="/tmp/mstar_uploads")
     parser.add_argument("--tensor-comm-protocol", default="RDMA",
                         help="Tensor transfer protocol: RDMA, TCP, or SHM (shared memory)")
@@ -220,10 +235,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    from mstar.api_server.entrypoint import (
-        DeadConductorError,
-        _shutdown_conductor_process,
-    )
     from mstar.utils.logging_config import quiet_noisy_loggers
 
     logging.basicConfig(
@@ -231,6 +242,25 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s [dynamo_worker] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+
+    # No HTTP port to key the prefix on, and replicas of one endpoint
+    # (same namespace, component and endpoint) commonly share a host.
+    owned_prefix = None
+    if args.socket_path_prefix is None:
+        owned_prefix = args.socket_path_prefix = per_launch_socket_prefix()
+        logger.info("IPC socket prefix: %s", owned_prefix)
+    try:
+        _serve_until_shutdown(args)
+    finally:
+        if owned_prefix is not None:
+            shutil.rmtree(owned_prefix, ignore_errors=True)
+
+
+def _serve_until_shutdown(args) -> None:
+    from mstar.api_server.entrypoint import (
+        DeadConductorError,
+        _shutdown_conductor_process,
+    )
 
     server, conductor_proc, model_name = build_server(args)
     exit_code = 0

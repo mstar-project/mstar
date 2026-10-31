@@ -61,6 +61,10 @@ class CurrentForwardPassInfo:
     # a per-stream dataclass if more per-request stream settings appear.
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
+    # producer-triggered consumer partition -> the walk this pass's streamed
+    # items run under; set by the producer worker as the pass emits
+    stream_consumer_walks: dict[str, str] = field(default_factory=dict)
+
     def update_publish_info(self, other: dict[str, PublishedInfo]):
         merge_publish_info(self.resource_publish_info, other)
 
@@ -107,6 +111,9 @@ class StreamingConnectionState:
     token_count: int = 0
     consumed_count: int = 0
     producer_done: bool = False
+    # destination worker -> stream items the producer sent there, which
+    # producer_done carries so the consumer waits for the last of them
+    items_sent: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -122,7 +129,6 @@ class PartitionState:
     # wg_id -> count of distinct TP ranks that have reported completion
     wg_rank_completions: dict[int, int] = field(default_factory=dict)
     num_output_tokens: int = 0
-    curr_forward_outputs: list[str] = field(default_factory=list)
     # resource label -> PublishedInfo, accumulated across all TP ranks and
     # handed back out on the next forward
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)

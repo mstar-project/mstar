@@ -284,6 +284,11 @@ class Benchmark:
             "aggregate": {
                 "max_concurrency": agg.max_concurrency,
                 "ttft_s": {modality: _stats(stats) for modality, stats in agg.ttft.items()},
+                "itl_s": {modality: _stats(stats) for modality, stats in agg.itl.items()},
+                "text_token_throughput": agg.text_token_throughput,
+                "total_text_tokens": agg.total_text_tokens,
+                "mean_text_tokens": agg.mean_text_tokens,
+                "total_input_tokens": agg.total_input_tokens,
                 "e2e_latency_s": _stats(agg.e2e_latency),
                 "rtf": _stats(agg.rtf),
                 "audio_seconds_throughput": agg.audio_seconds_throughput,
@@ -671,12 +676,12 @@ def parse_args() -> BenchmarkConfig:
     # it so robotics models (Pi05, VJepa2AC) don't see a stray kwarg.
     model_type = ModelType(args.model)
     # `--model-id` is what the request names, so a size other than the family's
-    # default (e.g. Qwen3.5-9B) reaches the server. Only Qwen3.5 is a family of
-    # sizes today; the rest pin one checkpoint and their constructors take no
+    # default (e.g. Qwen3.5-9B) reaches the server. Only the Qwen3.5 code takes
+    # other checkpoints today; the rest pin one checkpoint and their constructors take no
     # such argument, so passing it would be a TypeError rather than a no-op.
     extra = (
         {"model_id": args.model_id}
-        if args.model_id and model_type == ModelType.QWEN3_5 else {}
+        if args.model_id and model_type in (ModelType.QWEN3_5, ModelType.QWEN3_8) else {}
     )
     if model_type == ModelType.BAGEL:
         model = model_type.inst(disable_cfg=args.disable_cfg, image_preprocess=args.bagel_image_preprocess)

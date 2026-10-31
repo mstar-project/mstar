@@ -1,13 +1,21 @@
 model: "qwen3_5_0.8b"
 max_seq_len: 32768
+# The settings this model's throughput was measured with (mstar/utils/knobs.py)
+knobs:
+  kv_plan_cache: 1
+  ingraph_decode_rope: true
+  gc_gen0_threshold: 50000
 node_groups:
-  # Text and images; video is refused (see `process_prompt`). Colocated: the
+  # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.
   - node_names: [LLM, vision_encoder]
     ranks: [0]
 resources:
   gdn_state:
     max_slots: 129
+    # GDN state snapshots at page boundaries for the prefix cache, kept across requests and
+    # evicted oldest first. A prefill keeps up to two, and each takes a request slot's memory.
+    prefix_slots: 128
     # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)
 
 # The vision encoder compiles on its first image shape and recompiles dynamic

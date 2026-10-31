@@ -32,7 +32,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_runner import DummyRowPool
+from mstar.engine.accelerator_graph_runner import DummyRowPool
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     KVSpec,
@@ -325,7 +325,7 @@ def test_two_capture_configs_can_each_open_and_claim():
     kv = _manager(_ring_config(num_sessions=1))
     pool = DummyRowPool(
         prefix="dit",
-        step_runner=SimpleNamespace(ingest_request=kv.ingest_request),
+        step_runner=SimpleNamespace(ingest_capture_row=kv.ingest_capture_row),
         resources={"kv": kv},
     )
 
@@ -391,13 +391,13 @@ def test_admit_refuses_a_request_that_was_never_ingested():
 
 
 @pytest.mark.parametrize("num_sessions", [1, 2, 4])
-def test_the_n_plus_first_request_is_refused_with_a_terminal_reason(num_sessions):
-    """The pool is finite and exhaustion is terminal. The reason class is the
-    whole point: `AllocationFailed` sends the scheduler to evict, but
-    `supports_eviction` is False so nothing is evictable and the request spins;
-    `RequestOffloading` waits on a `reload` that never comes. Both hang instead
-    of failing. That reasoning does not change with the pool size — an exhausted
-    ring is exhausted for the same reason at N=4 as at N=1.
+def test_the_n_plus_first_request_waits_for_a_session(num_sessions):
+    """A full pool is retried, not failed. Config validation keeps
+    `max_concurrent_requests` within `num_sessions`, so at serve time a full
+    pool means a finished request whose teardown is still deferred behind an
+    in-flight step: the session comes back. `AllocationFailed` names the request
+    that waits, so the worker holds that one and runs the rest; nothing is
+    evictable, and none is needed. Nothing is claimed by the refused admit.
     """
     kv = _manager(_ring_config(num_sessions=num_sessions))
     _open(kv, *[f"r{i}" for i in range(num_sessions)])
@@ -406,10 +406,28 @@ def test_the_n_plus_first_request_is_refused_with_a_terminal_reason(num_sessions
     outcome = kv.admit(_step("extra"), _ctx("extra"))
 
     assert not outcome.ok
-    assert not outcome.ready
-    assert type(outcome.reason) is AdmitRuntimeError
-    assert not isinstance(outcome.reason, (AllocationFailed, RequestOffloading))
+    assert type(outcome.reason) is AllocationFailed
+    assert outcome.reason.request_id == "extra"
     assert f"all {num_sessions}" in outcome.reason.message
+    assert kv.session_of("extra") is None
+    assert not kv._free_sessions
+
+    kv.remove_request("r0")
+    assert kv.admit(_step("extra"), _ctx("extra")).ok
+
+
+def test_the_latest_arrival_is_the_one_that_waits():
+    kv = _manager(_ring_config(num_sessions=2))
+    _open(kv, "r0")
+    kv.ingest_request("a")
+    kv.ingest_request("b")
+
+    outcome = kv.admit(_step("a", "b"), _ctx("a", "b"))
+
+    assert not outcome.ok
+    assert type(outcome.reason) is AllocationFailed
+    assert outcome.reason.request_id == "b"
+    assert kv.session_of("a") is None, "a refused admit still took a world"
 
 
 @pytest.mark.parametrize("num_sessions", [2, 4])
@@ -655,6 +673,8 @@ def test_a_skipped_frame_is_refused_with_a_terminal_reason():
     assert not outcome.ready
     assert type(outcome.reason) is AdmitRuntimeError
     assert not isinstance(outcome.reason, (AllocationFailed, RequestOffloading))
+    # the worker fails the request this names, and only that one
+    assert outcome.reason.request_ids == {"a"}
     # names both numbers, and whose clock they belong to
     assert "frame 0" in outcome.reason.message
     assert "declares frame 2" in outcome.reason.message
@@ -840,7 +860,7 @@ def test_post_warmup_validate_catches_a_committed_frame():
 
     kv.commit(_step("a", frame=4), _ctx("a"))  # a commit capture should never have made
 
-    with pytest.raises(RuntimeError, match="during CUDA graph capture"):
+    with pytest.raises(RuntimeError, match="during accelerator graph capture"):
         kv.post_warmup_validate()
 
 
@@ -932,11 +952,11 @@ def test_a_reused_world_starts_empty():
         assert not bool(layer.written[: layer.ring_len].any())
 
 
-def test_build_cuda_graph_buffers_allocates_nothing():
+def test_build_accelerator_graph_buffers_allocates_nothing():
     kv = _manager()
     before = _ptrs(kv)
 
-    kv.build_cuda_graph_buffers([], max_bs=1, max_seq_len=4096)
+    kv.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=4096)
 
     assert _ptrs(kv) == before
 

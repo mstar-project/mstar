@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import NamedTuple
 
 from mstar.communication.tensors import NameToTensorList, TensorStore
@@ -357,6 +359,24 @@ class PopRidsOutput(NamedTuple):
     # carries. Trailing with a default so a caller that does not need them can
     # leave it off.
     output_signals: tuple[str, ...] = ()
+    # Multi-walk pop only: each popped rid's index into the walks, and each
+    # walk's output edge names.
+    rid_walk_idx: list[int] = []
+    walk_output_signals: tuple[tuple[str, ...], ...] = ()
+
+
+class RequestWalks(NamedTuple):
+    """Rows of several walks of one node, columnar: rid ``rids[i]`` runs
+    ``walks[walk_idx[i]]``."""
+    rids: list[int]
+    walks: list[str]
+    walk_idx: list[int]
+
+    @classmethod
+    def from_walks(cls, rids: list[int], row_walks: list[str]) -> "RequestWalks":
+        index: dict[str, int] = {}
+        walk_idx = [index.setdefault(walk, len(index)) for walk in row_walks]
+        return cls(list(rids), list(index), walk_idx)
 
 
 class SpeculationPrepInput(NamedTuple):
@@ -390,6 +410,40 @@ class SpeculationPrepOutput(NamedTuple):
     # eventually be settled with. 0 when the prep staged no streaming ingest,
     # and so has nothing to settle.
     spec_id: int = 0
+
+
+class SpecRows(NamedTuple):
+    """``GraphRuntime.prep_spec_rows``: a speculation's ready rows as columns."""
+    ready_rids: list[int]
+    # the worker graph every ready rid speculates in; -1 when none is ready
+    wg_id: int
+    # as SpeculationPrepOutput.spec_id; 0 here, since nothing streams in
+    spec_id: int
+    # None when no ready rid has a prepped input edge: everything the step
+    # reads comes from the in-flight step's outputs
+    input_edges: ColumnarEdgeSpecs | None
+
+
+class InlineRouteStatus(IntEnum):
+    """What ``route_and_send_inline`` did."""
+    # nothing (a rid with no host row, an unsupported dtype): the caller takes
+    # the general path
+    NOT_ROUTED = 0
+    # routed and sent
+    SENT = 1
+    # routed, but the send needs Python-side payloads: the caller finishes
+    # with ``send_outputs``
+    ROUTED = 2
+
+
+class InlineRoute(NamedTuple):
+    """``route_and_send_inline``'s result."""
+    status: InlineRouteStatus
+    completion_id: int
+    # ``send_outputs``' return, under SENT
+    sent_rids: list[int]
+    # the route for ``send_outputs`` to finish, under ROUTED
+    route_output: "RouteOutput | None"
 
 
 class ReadyNodeSpec(NamedTuple):
@@ -427,6 +481,17 @@ class RouteInput(NamedTuple):
     # rid i's signal s. The runtime looks the metadata up in the store.
     tensors: list[int]
     num_tensors: list[int]
+    # One output signal whose per-rid value is a host scalar the worker
+    # already has (the sampled token): its EMIT_TO_CLIENT edge then rides
+    # inline in one frame per step instead of as a tensor per request. The
+    # values are in wg_ids.keys() order; empty means none. A runtime without
+    # `supports_inline_emit` ignores both.
+    inline_signal: str | None = None
+    inline_values: tuple[int, ...] | list[int] = ()
+    # Rows of several walks in one call: wg_ids.keys[i] ran
+    # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
+    walks: list[str] | None = None
+    rid_walk_idx: list[int] | None = None
 
 
 class RouteOutput(NamedTuple):
@@ -482,6 +547,11 @@ class SendInput(NamedTuple):
     profiling: ParallelList[int, Profiling] | None = None
     # Only metadata produced by this worker since its last completion.
     resource_publish_info: ParallelList[int, dict[str, PublishedInfo]] | None = None
+    # Rids that failed after routing (their outputs could not be registered
+    # for send): nothing of theirs leaves -- no peer edges, client emits,
+    # persist signals or WORKER_GRAPHS_DONE. The worker has already failed
+    # them, so the conductor tears them down.
+    failed_rids: frozenset[int] = frozenset()
 
 
 class GraphRuntime(ABC):
@@ -491,6 +561,11 @@ class GraphRuntime(ABC):
     only what cannot live behind it -- forward-pass info (a wire object it
     forwards opaquely) and stream buffers (which hold tensors).
     """
+
+    # Whether `RouteInput.inline_signal` is honoured: an emit edge sent as one
+    # RESULT_TOKENS frame per step. A runtime that does not keeps the
+    # per-request tensor path, which stays correct.
+    supports_inline_emit: bool = False
 
     # --------- Bookkeeping ----------
     @abstractmethod
@@ -507,10 +582,12 @@ class GraphRuntime(ABC):
         partition: str,
         graph_walk: str,
         partition_worker_graph_ids: list[int],
-        worker_graph_to_workers: ParallelList[int, list[str]]
+        worker_graph_to_workers: ParallelList[int, list[str]],
+        loop_caps: Mapping[str, int],
     ) -> int:
         """
-        Returns the integer handle for this request.
+        Returns the integer handle for this request. Each loop named in
+        ``loop_caps`` runs at most that many iterations for it.
         """
         pass
 
@@ -561,10 +638,21 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
+    def is_partition_idle(self, rid: int, partition: str) -> bool:
+        """Whether nothing of this partition's current walk is under way for
+        the request: no input held, no node in flight, no loop mid-run. Only
+        then can the walk change without stranding state in the old walk's
+        graphs. False for an unknown request or partition.
+        """
+        pass
+
+    @abstractmethod
     def set_in_flight(
-        self, node: str, wg_id: int, rids: list[int],
+        self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
+        """``rids[i]`` runs ``node`` in worker graph ``wg_ids[i]``, or every
+        rid in ``wg_ids[0]`` when it holds one id."""
         pass
 
     @abstractmethod
@@ -585,6 +673,18 @@ class GraphRuntime(ABC):
         partition: str,
     ) -> ParallelList[int, dict[str,int]]:
         pass
+
+    def update_dynamic_loop_iters(
+        self, per_request_info: Mapping[int, "CurrentForwardPassInfo"], partition: str,
+    ) -> None:
+        """Refresh ``dynamic_loop_iter_counts`` on each request's forward-pass
+        info from the runtime's loop counters. The default goes through
+        ``get_dynamic_loop_iters``; a runtime with a cheaper bulk form
+        overrides this."""
+        for rid, new_iters in self.get_dynamic_loop_iters(
+            list(per_request_info), partition=partition,
+        ):
+            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
 
     @abstractmethod
     def is_async_schedulable(self, node_name: str, graph_walk: str) -> bool:
@@ -701,6 +801,15 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
+    def pop_walk_rids(
+        self, node_name: str, rows: "RequestWalks", check_ready: bool = False,
+    ) -> PopRidsOutput | None:
+        """``pop_rids`` for rows of several walks of one node in one call,
+        all or none across every walk under ``check_ready``. Fills
+        ``rid_walk_idx`` and ``walk_output_signals``."""
+        pass
+
+    @abstractmethod
     def has_ready_excluding(
         self, exclude_rids: set[int],
         exclude_target: tuple[str, str] | None=None,
@@ -725,6 +834,8 @@ class GraphRuntime(ABC):
         level ready-ness separately.
 
         exclude_rids includes failed_rids, pending_removes, and held_until.
+        ``target`` and ``exclude_target`` may name a combined walk, as the
+        runtime's ``combined_walk_of`` maps it.
         """
         pass
 
@@ -740,13 +851,14 @@ class GraphRuntime(ABC):
     @abstractmethod
     def speculate_node(
         self, node_name: str,
-        graph_walk: str,
-        sample_rid: int,
+        graph_walks: list[str],
+        sample_rids: list[int],
     ) -> list[SpeculationOutput]:
         """
-        Returns a list of nodes that are ready for speculation, checking
-        against whether the node is async enabled (known internally), as
-        well as whether the node is TP async compatible.
+        The nodes ready for speculation, checking against whether the node is
+        async enabled (known internally, per walk) and TP async compatible.
+        Takes one sample rid per walk; returns every walk's targets, each
+        naming its walk, for the caller to pick from.
         """
         pass
 
@@ -761,6 +873,34 @@ class GraphRuntime(ABC):
         are pre-filtered for removes.
         """
         pass
+
+    def prep_spec_rows(
+        self, spec_node_name: str, curr_node_name: str, graph_walk: str,
+        rids: list[int], room_for_continuing: int | None = None,
+    ) -> "SpecRows":
+        """``prep_spec_rids`` with no stream chunks to ingest, as columns, in
+        a form a runtime can serve in one crossing (the worker uses it where
+        ``SpeculationPreparer.rows_eligible`` allows). This default is that
+        composition over ``prep_spec_rids``; a runtime with a cheaper form
+        overrides it and must return the same.
+        """
+        prep = self.prep_spec_rids(SpeculationPrepInput(
+            spec_node_name=spec_node_name, curr_node_name=curr_node_name,
+            graph_walk=graph_walk, rids=list(rids),
+            room_for_continuing=room_for_continuing,
+            streaming_edges=[], streaming_edges_per_rid=[0] * len(rids),
+        ))
+        wg_ids = set(prep.wg_ids)
+        assert len(wg_ids) <= 1, (
+            "a speculation target lives in one worker graph, but its rows "
+            f"report several: {sorted(wg_ids)}"
+        )
+        return SpecRows(
+            ready_rids=list(prep.ready_rids),
+            wg_id=wg_ids.pop() if wg_ids else -1,
+            spec_id=prep.spec_id,
+            input_edges=prep.input_edges if len(prep.input_edges) else None,
+        )
 
     @abstractmethod
     def get_spec_target(
@@ -793,12 +933,13 @@ class GraphRuntime(ABC):
     @abstractmethod
     def commit_speculation(
         self, spec_id: int, success: bool, dropped_rids: list[int] = (),
-        node: str | None = None, wg_id: int | None = None,
+        node: str | None = None, wg_ids: list[int] | None = None,
         scheduled_rids: list[int] = (),
     ):
         """Settle the streaming ingests a prep staged under ``spec_id``.
         On ``success``, ``scheduled_rids`` are also marked speculatively
-        scheduled on ``node``.
+        scheduled on ``node``, ``scheduled_rids[i]`` in worker graph
+        ``wg_ids[i]``.
 
         The scheduled rids are passed rather than read off the stage in order
         to also include the fresh rids rolled in from the ready queue. For
@@ -851,8 +992,9 @@ class GraphRuntime(ABC):
 
     @abstractmethod
     def pending_loop_stop_rids(
-        self, graph_walk: str, loop_name: str,
+        self, graph_walks: list[str], loop_name: str,
     ) -> set[int]:
+        """Rids with a pending stop of ``loop_name`` in any of ``graph_walks``."""
         pass
 
     @abstractmethod

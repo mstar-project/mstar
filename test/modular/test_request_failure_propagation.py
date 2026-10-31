@@ -25,8 +25,9 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+from api_server_helpers import make_test_api_server
 
-from mstar.api_server.entrypoint import APIServer, PendingRequest
+from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import (
     APIServerMessage,
     RequestFailed,
@@ -54,8 +55,8 @@ class _Runtime:
     def get_rid_string(self, h):
         return h
 
-    def set_in_flight(self, node, wg_id, rids, value):
-        del wg_id
+    def set_in_flight(self, node, rids, wg_ids, value):
+        del wg_ids
         if not value:
             self.cleared.append((node, list(rids)))
 
@@ -74,6 +75,7 @@ def _worker(known_rids=("r1", "r2")):
     w._graph_runtime = _Runtime(known_rids)
     w.scheduler = MicroScheduler.__new__(MicroScheduler)
     w.scheduler.failed_rids = set()
+    w.scheduler.read_failed_rids = set()
     w.scheduler.held_until = {}
     w.scheduler.admit_errors = {}
     w.scheduler.backlog = {}
@@ -130,7 +132,7 @@ def test_crashed_forward_fails_the_whole_batch():
         assert len(w.sent) == 1
         errors = w.sent[0][1].body.errors
         assert set(errors) == {"r1"}
-        assert "ZeroDivisionError" in errors["r1"]
+        assert errors["r1"].startswith("Error in worker: internal error (error id ")
         # The node must not stay flagged as speculatively scheduled, or it can
         # never be re-queued. The runtime owns that flag now.
         assert w._graph_runtime.cleared == [("node", ["r1"])]
@@ -180,19 +182,12 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
 
 
 def _api_server(messages):
-    s = APIServer.__new__(APIServer)
-    s.pending_requests = {}
-    s.recently_completed = {}
-    s._recently_completed_ttl = 15.0
-    s.request_lock = threading.Lock()
-    s.running = True
-    s.conductor_proc = None
-    s._liveness_interval_s = 0.5
-    s.log_stats = False
-    s.cleaned = []
-    s.communicator = SimpleNamespace(
-        get_all_new_messages=lambda: messages.pop(0) if messages else []
+    s = make_test_api_server(
+        communicator=SimpleNamespace(
+            get_all_new_messages=lambda: messages.pop(0) if messages else []
+        ),
     )
+    s.cleaned = []
     s.preprocess_worker = SimpleNamespace(
         get_profile_updates=lambda: [],
         get_result_chunks=lambda: [],
@@ -268,6 +263,7 @@ def _preprocess_thread(model):
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue = queue.Queue()
     wt.model = model
+    wt._client_edges = frozenset()
     wt.request_model_kwargs = {}
     wt.tensor_uuid_to_metadata_per_request = {"r1": {"u1": {}}}
     wt.enable_prof = False
@@ -275,6 +271,11 @@ def _preprocess_thread(model):
     wt.request_output_state = {
         "r1": RequestOutputState(order={"u1": (0, None)}, next_sequence=1),
     }
+    # not in in_flight_requests, so a failure here sends no abort;
+    # test_output_failure_teardown.py covers the abort
+    wt.in_flight_requests = set()
+    wt._draining_rids = set()
+    wt._reads_done_sent = set()
     return wt
 
 
@@ -295,6 +296,7 @@ def test_output_postprocess_failure_becomes_an_error_chunk(error):
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
+        take_failed_reads=lambda: [],
         get_tensor=lambda uuid: object(),
         dereference=dereferenced.append,
     )
@@ -303,7 +305,7 @@ def test_output_postprocess_failure_becomes_an_error_chunk(error):
     chunk: ResultChunk = wt.out_queue.get_nowait()
     assert chunk.request_id == "r1"
     assert chunk.modality == "error"
-    assert b"decode failed" in chunk.data
+    assert chunk.data.startswith(b"text output postprocessing failed: internal error (error id ")
     assert chunk.metadata["status"] == 500
     # The tensor is still released even though postprocessing died.
     assert dereferenced == ["u1"]
@@ -327,6 +329,7 @@ def test_a_failed_output_releases_the_outputs_held_behind_it():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
+        take_failed_reads=lambda: [],
         get_tensor=lambda uuid: object(),
         dereference=lambda uuid: None,
     )
@@ -359,4 +362,6 @@ def test_result_transfer_failure_answers_for_every_queued_tensor():
             count=len(result.graph_edge.tensor_info),
         )
     assert wt.out_queue.qsize() == 2
-    assert b"arena full" in wt.out_queue.get_nowait().data
+    assert wt.out_queue.get_nowait().data.startswith(
+        b"text output transfer failed: internal error (error id "
+    )

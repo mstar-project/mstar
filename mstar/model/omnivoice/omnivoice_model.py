@@ -205,15 +205,15 @@ class OmniVoiceModel(Model):
         ``Model.load_audio`` decodes at 16 kHz, which is right for the ASR
         models in the tree and wrong here: the Higgs-Audio-v2 codec encodes at
         24 kHz, and feeding it 16 kHz samples would not error — it would encode
-        a reference pitched and paced wrong, and clone that.
+        a reference pitched and paced wrong, and clone that. Like the base
+        loader, libsndfile first: torchcodec needs an FFmpeg built with audio
+        decoders, which some deployment images lack (#639).
         """
-        from torchcodec.decoders import AudioDecoder
-
         from mstar.model.base import TensorAndMetadata
+        from mstar.model.components.audio_features import load_audio_file
 
         rate = self.config.sample_rate
-        decoder = AudioDecoder(filepath, sample_rate=rate, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        audio = load_audio_file(filepath, rate)
         return TensorAndMetadata(
             data=audio, metadata=dict(sample_rate=rate, num_channels=1)
         )
@@ -247,10 +247,12 @@ class OmniVoiceModel(Model):
         """Pull the checkpoint's config without loading any weights."""
         from transformers import AutoConfig
 
+        # ``omnivoice`` resolves to the class the installed package registers
+        # with AutoConfig; the checkpoint repo ships no code.
         try:
             config = AutoConfig.from_pretrained(
                 self.model_path_hf, cache_dir=self.cache_dir,
-                trust_remote_code=True,
+                trust_remote_code=False,
             )
         except Exception as exc:  # noqa: BLE001
             # A config this loader cannot parse is not fatal on the data

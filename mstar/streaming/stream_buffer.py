@@ -58,12 +58,18 @@ class StreamBuffer:
     edge_name: str
     from_partition: str
     policy: ChunkPolicy
+    # Items carry the consumer walk the producer assigned them, and a chunk
+    # never spans two walks (set for connections that drive their consumer's
+    # walk)
+    walk_tagged: bool = False
 
     _waiting_graph_edges: deque[StreamingEdge] = field(default_factory=deque)
     # last chunk the graph accepted; read by the batch that consumes it
     ingested_chunk: StreamChunkInfo | None = None
 
     _buffer: list = field(default_factory=list)
+    # _buffer's assigned walks as [walk, item count] runs, when walk_tagged
+    _walk_runs: deque[list] = field(default_factory=deque)
     _tensor_ids_in_order: deque = field(default_factory=deque)
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
@@ -79,6 +85,10 @@ class StreamBuffer:
 
     _num_tensors_registered = 0
     _num_buffer_writes = 0
+    # Items the producer sent this worker in total, as the done signal reports
+    # it. The signal comes through the conductor and the items come straight
+    # from the producer, so the signal can arrive first.
+    _num_items_expected = 0
 
     def prime_context(self, context_items: int) -> None:
         """The first ``context_items`` items the producer sends are context only
@@ -87,9 +97,9 @@ class StreamBuffer:
         self.policy.prime(context_items)
         self._delivered_end = context_items
 
-    def pre_read_register(self, tensor_id: str):
+    def pre_read_register(self, tensor_id: str, walk: str | None = None):
         self._num_tensors_registered += 1
-        self._tensor_ids_in_order.append(tensor_id)
+        self._tensor_ids_in_order.append((tensor_id, walk))
 
     def put(self, tensor_id: str, item: torch.Tensor) -> None:
         """Called when a tensor arrives via normal RDMA routing."""
@@ -97,28 +107,55 @@ class StreamBuffer:
 
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
-            tensor_id = self._tensor_ids_in_order[0]
+            tensor_id, walk = self._tensor_ids_in_order[0]
             if tensor_id not in self._id_to_tensor:
                 return
             self._tensor_ids_in_order.popleft()
             self._buffer.append(self._id_to_tensor[tensor_id])
+            if self.walk_tagged:
+                if self._walk_runs and self._walk_runs[-1][0] == walk:
+                    self._walk_runs[-1][1] += 1
+                else:
+                    self._walk_runs.append([walk, 1])
             self._num_buffer_writes += 1
             del self._id_to_tensor[tensor_id]
 
-    def signal_done(self) -> None:
-        """Producer signals no more items will arrive."""
+    def signal_done(self, num_items: int = 0) -> None:
+        """Producer signals no more items will arrive after the ``num_items``
+        it sent in total."""
         self.producer_done = True
+        self._num_items_expected = num_items
 
     def _producer_done_and_all_read(self) -> bool:
-        return self.producer_done and self._num_buffer_writes >= self._num_tensors_registered
+        return (
+            self.producer_done
+            and self._num_tensors_registered >= self._num_items_expected
+            and self._num_buffer_writes >= self._num_tensors_registered
+        )
 
     def pop_waiting_edge(self) -> StreamingEdge | None:
         if len(self._waiting_graph_edges) > 0:
             return self._waiting_graph_edges.popleft()
 
-    def has_chunk_ready(self) -> bool:
+    def _walk_run_len(self) -> int:
+        """Leading items assigned the same walk as the first."""
+        if not self._walk_runs:
+            return len(self._buffer)
+        return self._walk_runs[0][1]
+
+    def peek_walk(self) -> str | None:
+        """The walk the next chunk runs under, without popping it. None when
+        untagged or nothing is buffered."""
+        self._update_buffer()
+        return self._walk_runs[0][0] if self._walk_runs else None
+
+    def has_chunk_ready(self, consumer_walk: str | None = None) -> bool:
         self._update_buffer()
         buf_len = len(self._buffer)
+
+        # An item for a later walk is buffered, so the leading run is complete
+        if self._walk_run_len() < buf_len:
+            return True
 
         if not self._producer_done_and_all_read():
             return self.policy.is_ready(buf_len)
@@ -131,11 +168,9 @@ class StreamBuffer:
         # were consumed in earlier chunks. Emit exactly one final
         # (empty) chunk so ``is_final`` propagates and the stream closes.
 
-        return (
-            buf_len > 0
-            or self.policy.continue_after_producer_done()
-            or not self._final_chunk_emitted
-        )
+        if self.policy.continue_after_producer_done():
+            return buf_len > 0 or self.policy.continues_in(consumer_walk)
+        return buf_len > 0 or not self._final_chunk_emitted
 
     def pop_chunk(self) -> StreamChunk:
         """Pop the next chunk. Only call when has_chunk_ready() is True.
@@ -149,7 +184,15 @@ class StreamBuffer:
         window = self.policy.window_size()
         offset = self._consumed  # global position of buffer[0]
 
-        if self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
+        run = self._walk_run_len()
+
+        if run < buf_len and not self.policy.is_ready(run):
+            # The next items run under another walk: flush this walk's run
+            items = self._buffer[:run]
+            self._buffer = self._buffer[run:]
+            self._consumed += run
+            stride = run
+        elif self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
             # Flush remainder — return whatever is left (may be empty)
             items = list(self._buffer)
             self._buffer.clear()
@@ -163,6 +206,12 @@ class StreamBuffer:
             self._buffer = self._buffer[stride:]
             self._consumed += stride
         self.policy.register_chunk(stride)
+        if self._walk_runs and stride:
+            # A chunk never spans two walks, so the stride is within one run
+            run = self._walk_runs[0]
+            run[1] -= stride
+            if run[1] == 0:
+                self._walk_runs.popleft()
 
         is_final = self._producer_done_and_all_read() and len(self._buffer) == 0
         # When continue_after_producer_done, never mark as final — the

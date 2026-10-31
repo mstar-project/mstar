@@ -22,8 +22,14 @@ from mstar.engine.resources.attn.config import (
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
+    RaggedAttnBackend,
+    RaggedBlockCausalAttentionSpec,
+    RaggedCrossAttentionSpec,
+    RaggedCrossAttentionStep,
+    cross_label,
 )
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
     KVConfig,
     KVLayout,
@@ -44,6 +50,7 @@ from mstar.engine.resources.position.config import (
 )
 from mstar.engine.resources.runner import StepRunner, topo_sort
 from mstar.engine.resources.sampler.config import (
+    LoopbackState,
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
@@ -84,6 +91,9 @@ __all__ = [
     "CGSlotSpec",
     "CrossAttentionConfig",
     "CrossAttentionSpec",
+    "DSAConfig",
+    "DSASpec",
+    "DSAStep",
     "KVConfig",
     "KVLayout",
     "KVReqConfig",
@@ -99,12 +109,17 @@ __all__ = [
     "PublishedInfo",
     "RaggedAttentionConfig",
     "RaggedAttentionSpec",
+    "RaggedAttnBackend",
+    "RaggedBlockCausalAttentionSpec",
+    "RaggedCrossAttentionSpec",
+    "RaggedCrossAttentionStep",
     "Resource",
     "ResourceReqConfig",
     "ResourceStep",
     "RingKVConfig",
     "RingKVLayerConfig",
     "RingKVStep",
+    "LoopbackState",
     "SamplerSpec",
     "SamplerStep",
     "SamplingReqConfig",
@@ -114,6 +129,7 @@ __all__ = [
     "StepRunner",
     "SubmoduleStep",
     "apply_yaml_overrides",
+    "cross_label",
     "resolve_spec_dependencies",
     "topo_sort",
 ]

@@ -9,12 +9,11 @@ from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
-    NameAndDest,
     NodeCompletionOutput,
 )
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.model.base import WorkerGraph
-from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +101,16 @@ class WorkerGraphQueues:
         queue = self.per_request_queues[request_id]
         return queue.wg_state_registry.is_done
 
-    def add_request(self, request_id: int):
+    def add_request(self, request_id: int, loop_caps: dict[str, int]):
         """
         Initialize queues for a new request
         """
         section_copy = pickle.loads(self._section_blob)
         queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
+        for name, cap in loop_caps.items():
+            loop = queue.loops.get(name)
+            if loop is not None:
+                loop.max_iters = min(loop.max_iters, cap)
         queue.register_communication_info(
             self.tensor_manager, request_id
         )
@@ -150,23 +153,14 @@ class WorkerGraphQueues:
         """
         self.per_request_queues[request_id].clear()
 
-    def stop_loops(
-        self, request_id: int, loop_names: set[str]
-    ) -> set[NameAndDest]:
-        """Register a finish signal for each named loop and return the union
-        of their ``_loop_back_inputs`` so the caller can drop those (name, dest)
-        edges from the current iter's output routing.
-        """
+    def stop_loops(self, request_id: int, loop_names: set[str]):
+        """Register a finish signal for each named loop this worker graph
+        carries."""
         assert request_id in self.per_request_queues, \
             f"Tried to stop loops for unknown request ID {_rid_name(self.rid_str, request_id)}"
         queue = self.per_request_queues[request_id]
-        loop_back_signals: set[NameAndDest] = set()
         for name in loop_names:
-            if name not in queue.loops:
-                continue
             queue.register_loop_finish_signal(name)
-            loop_back_signals.update(queue.loops[name]._loop_back_inputs)
-        return loop_back_signals
 
     def mark_node_complete(
         self, request_id: int, node_name: str
@@ -228,6 +222,13 @@ class RequestStateManager:
     # definitions. Used to find a node's partition in the colocated case.
     node_to_partition: dict[str, str] = field(default_factory=dict)
 
+    # partition -> rid -> current_fwd_info, the same objects as above, so a
+    # batch's infos are one C-level map rather than three lookups per row.
+    # Handle-keyed: purged in remove_request.
+    _fwd_by_partition: dict[str, dict[int, CurrentForwardPassInfo]] = field(
+        default_factory=dict, repr=False,
+    )
+
     def add_request(self, request_id: int, current_fwd_info: CurrentForwardPassInfo):
         """Register a partition for a request, adding the request if new.
 
@@ -235,12 +236,16 @@ class RequestStateManager:
         once per partition for a given request_id.
         """
         info = self.per_request_info.setdefault(request_id, PerRequestInfo())
-        info.per_partition_info[current_fwd_info.partition_name] = (
+        partition = current_fwd_info.partition_name
+        info.per_partition_info[partition] = (
             PerPartitionInfo(current_fwd_info=current_fwd_info)
         )
+        self._fwd_by_partition.setdefault(partition, {})[request_id] = current_fwd_info
 
     def remove_request(self, request_id: int):
         self.per_request_info.pop(request_id, None)
+        for by_rid in self._fwd_by_partition.values():
+            by_rid.pop(request_id, None)
 
     def update_request_info(
         self, request_id: int,
@@ -256,6 +261,9 @@ class RequestStateManager:
             return
         if current_fwd_info is not None:
             part_info.current_fwd_info = current_fwd_info
+            self._fwd_by_partition.setdefault(partition_name, {})[request_id] = (
+                current_fwd_info
+            )
         if resource_publish_info is not None:
             part_info.current_fwd_info.update_publish_info(resource_publish_info)
 
@@ -290,6 +298,12 @@ class RequestStateManager:
             partition_name
         ].current_fwd_info
 
+    def fwd_infos(
+        self, request_ids: list[int], partition_name: str,
+    ) -> list[CurrentForwardPassInfo]:
+        """``get_fwd_info`` for each rid, in order; KeyError if one has none."""
+        return list(map(self._fwd_by_partition[partition_name].__getitem__, request_ids))
+
     def get_pending_publish_info(
         self, request_id: int, partition_name: str,
     ) -> dict[str, PublishedInfo]:
@@ -299,3 +313,15 @@ class RequestStateManager:
 
     def get_partition_for_node(self, node_name: str) -> str | None:
         return self.node_to_partition.get(node_name)
+
+    def ingested_stream_chunks(self, request_id: int, node_name: str) -> dict[str, StreamChunkInfo]:
+        """Edge name -> the chunk each of ``node_name``'s input streams last
+        handed the graph: the one the request's next step there consumes."""
+        req_info = self.per_request_info.get(request_id)
+        if req_info is None:
+            return {}
+        return {
+            name: sbuf.ingested_chunk
+            for name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items()
+            if sbuf.ingested_chunk is not None
+        }

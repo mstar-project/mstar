@@ -50,13 +50,14 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
     )
     request = SimpleNamespace(
         partition_states={"default": partition},
-        final_outputs={},
+        output_chunk_counts={},
         persist_signals={},
         streaming_connections={},
         worker_graph_to_workers={"wg": ["worker_0", "worker_1"]},
     )
     conductor = Conductor.__new__(Conductor)
     conductor.enable_prof = False
+    conductor.producer_triggered_partitions = set()
     conductor.requests = {"request": request}
 
     for rank in (1, 0):

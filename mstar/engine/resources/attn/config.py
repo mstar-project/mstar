@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -16,17 +16,43 @@ if TYPE_CHECKING:
 
 
 class AttnBackend(Enum):
+    # the platform's default, decided when the resource is built
+    AUTO = "auto"
     FLASHINFER = "flashinfer"
     DENSE = "dense"
     FLEX = "flex"
     XPU_PAGED = "xpu_paged"
+    # Multi-head Latent Attention over a ``KVLayout.MLA`` cache (FlashInfer's
+    # ``BatchMLAPagedAttentionWrapper``); queries are the absorbed latent form
+    FLASHINFER_MLA = "flashinfer_mla"
 
 
 @dataclass
 class AttentionConfig:
     kv_cache: str # name of the KV cache
-    backend: AttnBackend = AttnBackend.FLASHINFER
+    backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
+    # softmax scale; None means the kernel default (head_dim ** -0.5). MLA must
+    # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
+    # backend reads it; the others refuse it at build
+    sm_scale: float | None = None
+    # FlashInfer only: combined walks whose captured steps run their leading
+    # one-token rows on a decode half and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`); the engine orders
+    # every step of those walks decode first
+    splits: tuple[CombinedSplit, ...] = ()
+    # FlashInfer only: run one-token decode rows on the tensor-core kernel.
+    # False picks the CUDA-core decode kernel, which can win for MHA and
+    # narrow GQA, where the tensor-core kernel pads few query heads per KV
+    # head out to a tile.
+    decode_tensor_cores: bool = True
+    sliding_window: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.sliding_window is not None and (
+            type(self.sliding_window) is not int or self.sliding_window <= 0
+        ):
+            raise ValueError("sliding_window must be a positive integer or None")
 
 
 @dataclass
@@ -38,6 +64,9 @@ class AttentionSpec(NodeResourceSpec):
         # be the same KVConfig the KV resource holds
         return {self.config.kv_cache}
 
+    def combined_splits(self) -> tuple[CombinedSplit, ...]:
+        return self.config.splits
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.attn.base import AttentionManager
@@ -48,6 +77,7 @@ class AttentionSpec(NodeResourceSpec):
         self,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
+        decode_tensor_cores: bool | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -59,6 +89,8 @@ class AttentionSpec(NodeResourceSpec):
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
+        if decode_tensor_cores is not None:
+            self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
 
 
 @dataclass
@@ -80,8 +112,12 @@ class CrossAttentionConfig:
     kv_cache: str  # name of the KV cache holding the context
     query_kv_cache: str | None = None  # KV cache driving the queries, if any
     context_label: str = "context"
-    backend: AttnBackend = AttnBackend.FLASHINFER
+    backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
+    # FlashInfer only: a step whose rows each query one token runs the decode
+    # kernel; this picks its tensor-core or CUDA-core variant (see
+    # ``AttentionConfig``)
+    decode_tensor_cores: bool = True
 
 
 @dataclass
@@ -105,14 +141,39 @@ class CrossAttentionSpec(NodeResourceSpec):
         self,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
+        decode_tensor_cores: bool | None = None,
     ):
         """Which kernel to run against the context cache; see ``AttentionSpec``."""
         if backend is not None:
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
+        if decode_tensor_cores is not None:
+            self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
+
+
+def _yaml_bool(name: str, value) -> bool:
+    # the string "false" would otherwise read as true
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True)
 class AttentionStep(ResourceStep):
     causal: bool = True
+    # queries attend to the stream's stored context only, not to the tokens this step appends
+    # (a draft block over the context the target has produced so far); the step's own
+    # `segments` then carry the query counts, the cache's segments the appended counts.
+    # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
+    context_only: bool = False
+
+
+def refuse_context_only(step: AttentionStep, manager: str) -> None:
+    """For the attention resources that don't read ``context_only``: planned without it,
+    the step's queries would attend to the tokens it appends as well."""
+    if step.context_only:
+        raise ValueError(
+            f"{manager} does not read AttentionStep.context_only; only the "
+            f"{AttnBackend.FLASHINFER_MLA.value!r} backend does"
+        )

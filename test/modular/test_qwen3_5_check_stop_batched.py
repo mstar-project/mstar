@@ -12,8 +12,10 @@ from mstar.model.submodule_base import HostRows
 EOS = 7
 
 
-def _info(ignore_eos=False, done=0, max_tokens=100):
+def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=False):
     return SimpleNamespace(
+        graph_walk=walk,
+        step_metadata={"last_prefill": last_prefill},
         resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": done},
         max_tokens=max_tokens,
@@ -53,6 +55,23 @@ def test_batched_agrees_with_per_request(shape):
     assert batched == {"d": {"decode_loop"}, "a": {"decode_loop"}, "b": {"decode_loop"}}
 
 
+def test_only_a_decode_rows_token_can_stop():
+    """A prefill row is not in decode_loop yet, so neither stop path checks it."""
+    tokens = torch.tensor([EOS, EOS, EOS])
+    infos = {
+        "early": _info(walk="prefill_text"),                   # not the last prefill
+        "last": _info(walk="prefill_text", last_prefill=True),
+        "dec": _info(),
+    }
+    got = LLMSubmodule.check_stop_batched(
+        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}),
+    )
+    assert got == {"dec": {"decode_loop"}}
+    for rid, info in infos.items():
+        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[:1]]})
+        assert per_request == got.get(rid, set())
+
+
 def test_no_token_row_means_per_request_path():
     got = LLMSubmodule.check_stop_batched(
         _sub(), ["a"], {"a": _info()}, HostRows(("a",), {"other": torch.zeros(1)}),
@@ -74,7 +93,7 @@ def test_engine_falls_back_and_attributes_failures():
         # what both stop paths read: the iteration counts current for this batch
         per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
-        step_context=SimpleNamespace(graph_walk="decode"),
+        step_context=SimpleNamespace(graph_walk="decode", request_walks=None),
     )
     sub = SimpleNamespace(
         check_stop_batched=lambda *a: LLMSubmodule.check_stop_batched(_sub(), *a),
@@ -88,3 +107,31 @@ def test_engine_falls_back_and_attributes_failures():
     )
     assert stops == {"a": {"decode_loop"}}
     assert list(failures) == ["x"]
+
+
+def test_rows_out_of_batch_order_still_map_by_request():
+    """A batch listed in another order than the forward ran it reads each
+    request's own row, and a request without a row is skipped."""
+    from types import SimpleNamespace
+
+    from mstar.model.qwen3_5.config import SAMPLER
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+    from mstar.model.submodule_base import HostRows
+
+    sub = LLMSubmodule.__new__(LLMSubmodule)
+    sub.config = SimpleNamespace(stop_token_ids={7})
+    rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 1])})
+
+    def info(max_tokens, iters=0):
+        return SimpleNamespace(
+            graph_walk="decode",
+            resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)},
+            dynamic_loop_iter_counts={"decode_loop": iters}, max_tokens=max_tokens,
+        )
+
+    infos = {"a": info(100), "b": info(100), "c": info(5, iters=4), "d": info(100)}
+    stops = LLMSubmodule.check_stop_batched(sub, ["c", "d", "b", "a"], infos, rows)
+    assert stops == {"c": {"decode_loop"}, "b": {"decode_loop"}}
+    # forward order: the same answer without the row map
+    stops = LLMSubmodule.check_stop_batched(sub, ["a", "b", "c"], infos, rows)
+    assert stops == {"b": {"decode_loop"}, "c": {"decode_loop"}}

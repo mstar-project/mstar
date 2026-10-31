@@ -299,10 +299,11 @@ class Qwen3TTS(Model):
 
 
 class Qwen3_5_Dense(Model):
-    """Qwen3.5 dense (text + image in, text out) benchmark metadata."""
+    """Qwen3.5 dense (text, image and video in, text out) benchmark metadata."""
 
     DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
     def __init__(self, model_id: str | None = None):
+        super().__init__()
         if model_id is None:
             model_id = self.DEFAULT_MODEL_ID
         self.model_id = model_id
@@ -311,7 +312,20 @@ class Qwen3_5_Dense(Model):
         return self.model_id
 
     def get_supported_modalities(self):
-        return {RequestType.T2T, RequestType.I2T}
+        return {RequestType.T2T, RequestType.I2T, RequestType.V2T}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # Greedy everywhere (mstar's sampler defaults to 0.6), and the same prompt
+        # render: mstar opens a <think> block by default, while the 0.8B/2B templates
+        # only do when asked. mstar reads the flat enable_thinking and vLLM/SGLang
+        # read chat_template_kwargs.
+        return {"temperature": 0.0, "enable_thinking": True, "chat_template_kwargs": {"enable_thinking": True}}
+
+
+class Qwen3_8_Dense(Qwen3_5_Dense):
+    """Qwen3.8 dense: the Qwen3.5 architecture, defaulting to the 27B."""
+
+    DEFAULT_MODEL_ID = "Qwen/Qwen3.8-27B"
 
 
 class Qwen3TTS1p7B(Qwen3TTS):
@@ -395,6 +409,27 @@ class WhisperLarge(Model):
         }
 
 
+class WhisperLargeV3Turbo(WhisperLarge):
+    def get_hf_url(self):
+        return "openai/whisper-large-v3-turbo"
+
+
+class Qwen3ASR(Model):
+    def get_hf_url(self):
+        return "Qwen/Qwen3-ASR-1.7B"
+
+    def get_supported_modalities(self):
+        return {RequestType.A2T}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {"temperature": 0.0, "max_output_tokens": 4096}
+
+
+class Qwen3ASRRealtime(Qwen3ASR):
+    def get_hf_url(self):
+        return "Qwen/Qwen3-ASR-0.6B"
+
+
 class HiggsAudio(Model):
     def get_hf_url(self):
         # v3-stt is the ASR checkpoint; the v2 models are TTS/generation.
@@ -411,6 +446,33 @@ class HiggsAudio(Model):
         }
 
 
+class _FastConformerAsr(Model):
+    """NVIDIA's FastConformer speech recognizers: audio in, a transcript out, greedy."""
+
+    def get_supported_modalities(self):
+        return {RequestType.A2T}
+
+
+class Canary(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/canary-1b-v2"
+
+
+class CanaryQwen(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/canary-qwen-2.5b"
+
+
+class Parakeet(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/parakeet-tdt-0.6b-v3"
+
+
+class NemotronAsr(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/nemotron-3.5-asr-streaming-0.6b"
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -423,8 +485,16 @@ class ModelType(Enum):
     PI05 = "pi05"
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
+    WHISPER_LARGE_V3_TURBO = "whisper_large_v3_turbo"
+    QWEN3_ASR = "qwen3_asr"
+    QWEN3_ASR_REALTIME = "qwen3_asr_realtime"
     HIGGS_AUDIO = "higgs_audio"
+    CANARY = "canary"
+    CANARY_QWEN = "canary_qwen"
+    PARAKEET = "parakeet"
+    NEMOTRON_ASR = "nemotron_asr"
     QWEN3_5 = "qwen3.5"
+    QWEN3_8 = "qwen3.8"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -449,8 +519,24 @@ class ModelType(Enum):
             return VJepa2AC(**kwargs)
         if self == ModelType.WHISPER_LARGE:
             return WhisperLarge(**kwargs)
+        if self == ModelType.WHISPER_LARGE_V3_TURBO:
+            return WhisperLargeV3Turbo(**kwargs)
+        if self == ModelType.QWEN3_ASR:
+            return Qwen3ASR(**kwargs)
+        if self == ModelType.QWEN3_ASR_REALTIME:
+            return Qwen3ASRRealtime(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.CANARY:
+            return Canary(**kwargs)
+        if self == ModelType.CANARY_QWEN:
+            return CanaryQwen(**kwargs)
+        if self == ModelType.PARAKEET:
+            return Parakeet(**kwargs)
+        if self == ModelType.NEMOTRON_ASR:
+            return NemotronAsr(**kwargs)
         if self == ModelType.QWEN3_5:
             return Qwen3_5_Dense(**kwargs)
+        if self == ModelType.QWEN3_8:
+            return Qwen3_8_Dense(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

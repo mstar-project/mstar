@@ -14,23 +14,26 @@ Notes:
 - ``set`` becomes a list and is rebuilt on decode.
 - ``PublishedInfo`` / ``ResourceReqConfig`` / ``MessageBody`` are abstract, so
   those fields carry ``[tag, payload]``.
-- A value whose declared type says nothing useful (bare ``dict``, ``Any``,
-  ``model_kwargs``) goes as plain msgpack only when that round-trips exactly
-  -- scalars, lists, str-keyed dicts -- and is pickled into an ExtType
-  otherwise. Such fields hold whatever a model or a client put there, so
-  converting them by hand is lossy (tuples come back as lists, int keys as
-  pairs) or raises mid-send; pickle is what they crossed the wire as before.
-  A Rust sender only ever splices these as opaque, already-encoded bytes.
+- Loosely typed fields (bare ``dict``, ``Any``, ``model_kwargs``) use plain
+  msgpack where it round-trips exactly, and data-only extensions for tuples,
+  sets, non-string map keys, dataclasses, torch sizes/dtypes, NumPy values,
+  dates, and the msgpack timestamps/extensions a ``/generate/ws`` client sends.
+  Unsupported Python objects are rejected at send time. Incoming frames
+  never run pickle; the only classes a frame can name are registered or
+  mstar dataclasses, built from decoded field values.
+  A Rust sender splices these as opaque, already-encoded bytes.
 """
 import dataclasses
+import datetime
 import enum
 import importlib
 import logging
-import pickle
+import math
 import typing
 from typing import Any
 
 import msgpack
+import numpy as np
 import torch
 
 # Registry for the abstract field types. A subclass has to be registered
@@ -95,12 +98,13 @@ def _identity(v):
     return v
 
 
-#: msgpack ext code for a pickled value from a loosely-typed field.
+#: Legacy pickle code: retained only to reject old frames clearly.
 PICKLED_EXT = 80
+DATA_EXT = 81
 
 
-def _pickled(value) -> msgpack.ExtType:
-    return msgpack.ExtType(PICKLED_EXT, pickle.dumps(value))
+def _data_ext(kind: str, value) -> msgpack.ExtType:
+    return msgpack.ExtType(DATA_EXT, msgpack.packb([kind, value], use_bin_type=True))
 
 
 # -- plan compilation -------------------------------------------------------
@@ -302,7 +306,10 @@ def _encode_dataclass(obj) -> dict:
             if not omit_if_none:
                 out[name] = None
             continue
-        out[name] = enc(v)
+        try:
+            out[name] = enc(v)
+        except WireError as exc:
+            raise WireError(f"{name}: {exc}") from None
     return out
 
 
@@ -342,8 +349,11 @@ def _resolve_auto_tag(tag: str) -> type:
     obj = importlib.import_module(module_name)
     for part in qualname.split("."):
         obj = getattr(obj, part)
-    if not dataclasses.is_dataclass(obj):
-        raise WireError(f"wire tag {tag!r} does not name a dataclass")
+    # The path must be where the class is defined, not a hop through an
+    # imported module to some other package's class.
+    if not (isinstance(obj, type) and dataclasses.is_dataclass(obj)
+            and obj.__module__ == module_name and obj.__qualname__ == qualname):
+        raise WireError(f"wire tag {tag!r} does not name an mstar dataclass")
     return obj
 
 
@@ -359,17 +369,82 @@ def _decode_tagged(raw):
 
 
 def _dynamic_decode(raw):
-    """Mirror of ``_dynamic``: plain values come back as they are, and a
-    pickled one is unpickled."""
+    """Restore supported values without executing a reconstruction program."""
     if isinstance(raw, msgpack.ExtType):
-        if raw.code != PICKLED_EXT:
+        if raw.code == PICKLED_EXT:
+            raise WireError("pickle metadata is no longer supported; upgrade all peers")
+        if raw.code != DATA_EXT:
             raise WireError(f"unknown msgpack ext code {raw.code}")
-        return pickle.loads(raw.data)
+        try:
+            return _decode_data_ext(raw.data)
+        except WireError:
+            raise
+        except (TypeError, ValueError, LookupError, AttributeError, ImportError, OverflowError, RecursionError) as exc:
+            raise WireError(f"malformed data extension: {exc}") from exc
     if isinstance(raw, list):
         return [_dynamic_decode(v) for v in raw]
     if isinstance(raw, dict):
         return {k: _dynamic_decode(v) for k, v in raw.items()}
     return raw
+
+
+def _decode_data_ext(payload: bytes):
+    kind, value = msgpack.unpackb(payload, raw=False, strict_map_key=False)
+    if kind in ("tuple", "set", "frozenset"):
+        values = [_dynamic_decode(v) for v in _array(value)]
+        return {"tuple": tuple, "set": set, "frozenset": frozenset}[kind](values)
+    if kind == "torch_size":
+        if any(type(n) is not int for n in _array(value)):
+            raise WireError("torch.Size dimensions must be integers")
+        return torch.Size(value)
+    if kind == "dict":
+        return {_dynamic_decode(k): _dynamic_decode(v) for k, v in _array(value)}
+    if kind == "dataclass":
+        return _decode_tagged(value)
+    if kind == "torch_dtype":
+        dtype = _dtype_from_name(value)
+        if not isinstance(dtype, torch.dtype):
+            raise WireError(f"unknown torch dtype {value!r}")
+        return dtype
+    if kind in ("numpy_array", "numpy_scalar"):
+        dtype_str, shape, data = value
+        if not isinstance(dtype_str, str):
+            raise WireError("NumPy dtype must be a dtype string")
+        dtype = np.dtype(dtype_str)
+        _check_numpy_dtype(dtype)
+        if not isinstance(shape, list) or any(type(n) is not int or n < 0 for n in shape):
+            raise WireError("invalid NumPy shape")
+        if not isinstance(data, bytes) or math.prod(shape) * dtype.itemsize != len(data):
+            raise WireError("NumPy shape and dtype do not match the data size")
+        array = np.frombuffer(data, dtype=dtype).copy().reshape(shape)
+        if kind == "numpy_scalar":
+            if shape:
+                raise WireError("NumPy scalar must have an empty shape")
+            return array[()]
+        return array
+    if kind == "msgpack_timestamp":
+        return msgpack.Timestamp(*_array(value))
+    if kind == "msgpack_ext":
+        # Opaque client data: code 80 here is never the legacy pickle extension.
+        return msgpack.ExtType(*_array(value))
+    if kind == "datetime":
+        return datetime.datetime.fromisoformat(value)
+    if kind == "date":
+        return datetime.date.fromisoformat(value)
+    raise WireError(f"unknown data extension kind {kind!r}")
+
+
+def _check_numpy_dtype(dtype: np.dtype) -> None:
+    """Only plain dtypes, which ``dtype.str`` round-trips exactly. Both ends
+    apply this, so the receiver accepts everything the sender produces."""
+    if dtype.hasobject:
+        raise WireError("object arrays are not supported on the wire")
+    if dtype.names is not None or dtype.subdtype is not None:
+        raise WireError(f"structured and subarray NumPy dtypes are not supported on the wire: {dtype}")
+    if dtype.metadata:
+        raise WireError("NumPy dtype metadata is not supported on the wire")
+    if dtype.itemsize == 0:
+        raise WireError(f"zero-size NumPy dtypes are not supported on the wire: {dtype}")
 
 
 def _is_plain(value) -> bool:
@@ -385,29 +460,73 @@ def _is_plain(value) -> bool:
     return False
 
 
+def _dynamic_at(key: str, value):
+    """``_dynamic`` for a map entry; a refusal names the key that held it."""
+    try:
+        return _dynamic(value)
+    except WireError as exc:
+        raise WireError(f"{key}: {exc}") from None
+
+
 def _dynamic(value):
-    """A value whose declared type says nothing useful (bare ``dict``, ``Any``).
-    Plain msgpack when that is exact, pickled otherwise -- see the module
-    docstring."""
+    """Encode a loosely typed value as data, preserving its supported type."""
     if _is_plain(value):
         return value
-    return _pickled(value)
+    if isinstance(value, torch.Size):
+        return _data_ext("torch_size", list(value))
+    if type(value) is list:
+        return [_dynamic(v) for v in value]
+    if type(value) is dict:
+        if all(type(k) is str for k in value):
+            return {k: _dynamic_at(k, v) for k, v in value.items()}
+        return _data_ext("dict", [[_dynamic(k), _dynamic(v)] for k, v in value.items()])
+    if type(value) in (tuple, set, frozenset):
+        return _data_ext(type(value).__name__, [_dynamic(v) for v in value])
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _data_ext("dataclass", _encode_tagged(value))
+    if isinstance(value, torch.dtype):
+        return _data_ext("torch_dtype", _dtype_name(value))
+    if type(value) is np.ndarray or isinstance(value, np.generic):
+        array = np.asarray(value)
+        _check_numpy_dtype(array.dtype)
+        return _data_ext(
+            "numpy_scalar" if isinstance(value, np.generic) else "numpy_array",
+            [array.dtype.str, list(array.shape), array.tobytes(order="C")],
+        )
+    if type(value) is msgpack.Timestamp:
+        return _data_ext("msgpack_timestamp", [value.seconds, value.nanoseconds])
+    if type(value) is msgpack.ExtType:
+        return _data_ext("msgpack_ext", [value.code, value.data])
+    if type(value) is datetime.datetime:
+        # ISO text keeps fixed offsets (what YAML produces); a zone with rules would shift.
+        if value.tzinfo is not None and type(value.tzinfo) is not datetime.timezone:
+            raise WireError("only fixed-offset datetime timezones are supported on the wire")
+        return _data_ext("datetime", value.isoformat())
+    if type(value) is datetime.date:
+        return _data_ext("date", value.isoformat())
+    if isinstance(value, torch.Tensor):
+        raise WireError(
+            "tensors cannot travel in control metadata; send them on a tensor edge "
+            "and list the model kwarg in Model.PREPROCESS_ONLY_KWARGS"
+        )
+    raise WireError(f"unsupported wire value type {type(value).__module__}.{type(value).__qualname__}")
 
 
 # -- public -----------------------------------------------------------------
 
-#: Frame tag for a payload that is not a registered message. The codec has to
-#: be total — a communicator carries whatever a caller hands it, and a codec
-#: that raises on some payloads turns into a silent hang at the receiver
-#: (the send dies, the peer waits forever). Registered messages, which are
-#: the only ones a Rust endpoint decodes, never take this path.
+#: Legacy whole-message pickle tag: never decoded.
 OPAQUE = "__py__"
+#: Data-only envelope for a payload that is not a registered message.
+DATA = "__data__"
 
 
 def encode(msg) -> bytes:
     tag = _TYPE_TO_TAG.get(type(msg))
-    if tag is None:
-        return msgpack.packb([OPAQUE, pickle.dumps(msg)], use_bin_type=True)
+    # An auto tag exists only in processes that already met the class, so it
+    # stays inside the self-describing envelope; a fresh peer can't resolve it
+    # as a top-level message tag.
+    if tag is None or tag.startswith(AUTO_PREFIX):
+        return msgpack.packb([DATA, _dynamic(msg)], use_bin_type=True)
     return msgpack.packb([tag, _encode_dataclass(msg)], use_bin_type=True)
 
 
@@ -430,9 +549,8 @@ def encode_fields(values, hints) -> bytes:
     """Several field values as one msgpack array, each by its declared type.
 
     For a payload that is a bare tuple of values rather than a message.
-    ``encode`` would reach the pickle fallback on one of those -- a list has
-    no wire tag -- and a pickled payload cannot be spliced into a frame the
-    Rust runtime builds.
+    Unlike ``encode``, this omits the top-level envelope, so Rust can split
+    the array and splice its fields into the frame it builds.
     """
     return msgpack.packb(
         [_encoder(h)(v) for v, h in zip(values, hints, strict=True)],
@@ -443,7 +561,9 @@ def encode_fields(values, hints) -> bytes:
 def decode(data: bytes):
     tag, payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
     if tag == OPAQUE:
-        return pickle.loads(payload)
+        raise WireError("pickle messages are no longer supported; upgrade all peers")
+    if tag == DATA:
+        return _dynamic_decode(payload)
     cls = _TAG_TO_TYPE.get(tag)
     if cls is None:
         raise WireError(f"unknown wire message tag {tag!r}")

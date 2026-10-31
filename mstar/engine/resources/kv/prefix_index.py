@@ -10,8 +10,9 @@ is pushed back under the page's own.
 Every caller holds the manager's lock, so none of this takes one of its own.
 """
 
+import copy
 import heapq
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,27 +27,36 @@ class PrefixIndex:
         self._key: list[bytes | None] = [None] * num_pages
         self._parent: list[int | None] = [None] * num_pages
         self._children: list[int] = [0] * num_pages
+        # how many of a page's children are held, or have a held page below them
+        self._held_below: list[int] = [0] * num_pages
         self._stamp: list[int] = [0] * num_pages
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
+        self._evictable: set[int] = set()
+        # Pages ever inserted, and pages ever taken out of the evictable set by a request that holds
+        # them: both can lower what a request waiting for room needs, and a waiting request is measured
+        # against them.
+        self.filed = 0
+        self.taken = 0
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
-        pages: list[int] = []
-        for key in keys:
-            page = self._by_key.get(key)
-            if page is None:
-                break
-            pages.append(page)
+        pages = self.pages_for(keys)
+        self.touch(pages)
+        return pages
+
+    def touch(self, pages: Sequence[int]) -> None:
+        pages = [page for page in pages if self._key[page] is not None]
         if pages:
             # one stamp for the whole run, so recency stays monotone along it
             self._clock += 1
             for page in pages:
                 self._stamp[page] = self._clock
-        return pages
 
     def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
-        """Name ``page`` by ``key`` under ``parent``; the first writer wins."""
+        """Name ``page`` by ``key`` under ``parent``; the first writer wins. When the arena reports to this
+        index and the index alone holds ``parent``, ``page`` is filed with no parent. Filed under ``parent``,
+        a held ``page`` would keep `evict` from freeing ``parent``, which the pool counts as evictable."""
         assert parent is None or self._key[parent] is not None, (
             f"page {page} indexed under parent page {parent}, which the index "
             "does not hold; a parent must outlive its children"
@@ -58,55 +68,156 @@ class PrefixIndex:
             f"indexed under {self._key[page].hex()[:16]}; evicting one entry "
             "would free a page the other still names"
         )
+        if parent is not None and self._arena.index is self and self._arena.num_owners[parent] == 1:
+            parent = None
         self._clock += 1
+        self.filed += 1
         self._by_key[key] = page
         self._key[page] = key
         self._parent[page] = parent
         self._children[page] = 0
+        self._held_below[page] = 0
         self._stamp[page] = self._clock
         self._arena.seal([page])
         self._arena.retain([page])
+        if self._arena.index is self and self._arena.num_owners[page] > 2:
+            # `PageArena.retain` calls `set_shared` only when a page goes from one owner to two, so a page
+            # that was already shared before the index named it is marked here
+            self.set_shared(page, True)
         if parent is not None:
             self._children[parent] += 1
         heapq.heappush(self._leaves, (self._clock, page))
         return True
 
+    def insert_run(self, keys: Sequence[bytes], pages: Sequence[int], parent: int | None) -> int:
+        """Name ``pages`` by ``keys``, each under the one before and the first
+        under ``parent``. A key already indexed keeps its page, and the next key
+        goes under that page. Returns how many pages were inserted."""
+        inserted = 0
+        for key, page in zip(keys, pages, strict=True):
+            if self.insert(key, page, parent):
+                inserted += 1
+            else:
+                page = self._by_key[key]
+            parent = page
+        return inserted
+
     def page_for(self, key: bytes) -> int | None:
         # not `lookup`: this is not a hit, and must not re-stamp the page
         return self._by_key.get(key)
+
+    def pages_for(self, keys: Sequence[bytes]) -> list[int]:
+        """`lookup` without the stamp, for a walk that is not a hit."""
+        pages: list[int] = []
+        for key in keys:
+            page = self._by_key.get(key)
+            if page is None:
+                break
+            pages.append(page)
+        return pages
+
+    def holds(self, page: int) -> bool:
+        return self._key[page] is not None
+
+    def key_of(self, page: int) -> bytes | None:
+        return self._key[page]
+
+    def parent_key(self, page: int) -> bytes | None:
+        parent = self._parent[page]
+        return None if parent is None else self._key[parent]
+
+    def evictable(self) -> set[int]:
+        """Return the live set of pages `evict` could free.
+        Callers read it and don't keep it.
+
+        A page only the index holds is out of reach while a page below it is held,
+        since eviction takes leaves only.
+        """
+        return self._evictable
+
+    def set_shared(self, page: int, shared: bool) -> None:
+        """Called when ``page`` gains or loses its one owner besides the index."""
+        if self._key[page] is None or self._held_below[page]:
+            # nothing changes for a page that isn't indexed or is pinned from below
+            return
+        if shared:
+            self.taken += 1
+            self._evictable.discard(page)
+            self._pin_above(page)
+        else:
+            self._evictable.add(page)
+            self._unpin_above(page)
+
+    def _pin_above(self, page: int) -> None:
+        """Mark the pages above a newly held ``page`` as not evictable."""
+        parent = self._parent[page]
+        while parent is not None:
+            self._held_below[parent] += 1
+            if self._held_below[parent] > 1 or self._arena.num_owners[parent] > 1:
+                return
+            self._evictable.discard(parent)
+            parent = self._parent[parent]
+
+    def _unpin_above(self, page: int) -> None:
+        """Mark the pages above ``page`` evictable again once nothing below them is held."""
+        parent = self._parent[page]
+        while parent is not None:
+            self._held_below[parent] -= 1
+            if self._held_below[parent] or self._arena.num_owners[parent] > 1:
+                return
+            self._evictable.add(parent)
+            parent = self._parent[parent]
+
+    def assert_evictable(self) -> None:
+        """Check that `evict`, run on a copy of the index and the owner counts, frees every page
+        in the evictable set."""
+        index = copy.copy(self)
+        for name in ("_by_key", "_key", "_parent", "_children", "_stamp", "_leaves", "_evictable"):
+            setattr(index, name, copy.copy(getattr(self, name)))
+        index._arena = _Owners(self._arena.num_owners)
+        freed = len(index.evict(len(self._evictable)))
+        assert freed == len(self._evictable), (
+            f"eviction reaches {freed} of the {len(self._evictable)} pages the evictable set counts"
+        )
 
     def pages(self) -> list[int]:
         """Every page the index is holding a reference to."""
         return list(self._by_key.values())
 
-    def num_sole_owned(self) -> int:
-        """Indexed pages nothing else holds: an upper bound on what ``evict`` can free."""
-        return sum(
-            1 for page in self._by_key.values() if self._arena.num_owners[page] == 1
-        )
+    def num_pages(self) -> int:
+        """How many pages the index holds a reference to (``len(pages())``)."""
+        return len(self._by_key)
 
-    def evict(self, n: int) -> int:
-        """Drop the oldest leaves the index alone holds, until ``n`` are free.
+    def evict(self, n: int, spare: Callable[[bytes], bool] | None = None) -> list[bytes]:
+        """Drop the oldest leaves the index alone holds, until ``n`` are free. When ``spare`` accepts a leaf's
+        key, that leaf is dropped only once no other leaf is left.
 
         A leaf a request or a lease also holds is passed over and put back:
         dropping it would free nothing and lose an entry that is still good.
-        Returns how many pages reached the free list.
+        Returns the keys of the pages that reached the free list.
         """
-        freed = 0
+        dropped = []
         passed_over = []
-        while freed < n:
+        spared: list[tuple[int, int]] = []
+        while len(dropped) < n:
             entry = self._pop_leaf()
+            last = entry is None and bool(spared)
+            if last:
+                entry = heapq.heappop(spared)
             if entry is None:
                 break
             stamp, page = entry
             if self._arena.num_owners[page] > 1:
                 passed_over.append(entry)
                 continue
+            if not last and spare is not None and spare(self._key[page]):
+                heapq.heappush(spared, entry)
+                continue
+            dropped.append(self._key[page])
             self._remove(page)
-            freed += 1
-        for entry in passed_over:
+        for entry in passed_over + spared:
             heapq.heappush(self._leaves, entry)
-        return freed
+        return dropped
 
     def _pop_leaf(self) -> tuple[int, int] | None:
         while self._leaves:
@@ -120,6 +231,7 @@ class PrefixIndex:
         return None
 
     def _remove(self, page: int) -> None:
+        self._evictable.discard(page)
         del self._by_key[self._key[page]]
         self._key[page] = None
         parent = self._parent[page]
@@ -129,3 +241,14 @@ class PrefixIndex:
             self._children[parent] -= 1
             if self._children[parent] == 0 and self._key[parent] is not None:
                 heapq.heappush(self._leaves, (self._stamp[parent], parent))
+
+
+class _Owners:
+    """A copy of the arena's owner counts, which `evict` on a copied index releases."""
+
+    def __init__(self, num_owners: list[int]) -> None:
+        self.num_owners = list(num_owners)
+
+    def release(self, pages: list[int]) -> None:
+        for page in pages:
+            self.num_owners[page] -= 1

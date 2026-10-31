@@ -49,7 +49,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, SAMPLER, HiggsAudioModelConfig
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -171,6 +171,14 @@ class HiggsAudioModel(Model):
         # Reference transcribe.py generates up to 1024 new tokens.
         return model_kwargs.get("max_output_tokens", 1024)
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_CACHE: {"main": KVLabel(
+            growth=(("decode", "decode_loop"),),
+        )}}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         llm_prefill_outputs = [
             GraphEdge(
@@ -217,7 +225,7 @@ class HiggsAudioModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.max_position_embeddings,
             outputs=[],
         )
 
@@ -364,6 +372,9 @@ class HiggsAudioModel(Model):
     # Model ABC: prompt processing
     # -------------------------------------------------------------------
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -371,7 +382,7 @@ class HiggsAudioModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Chunk the audio, extract per-chunk mels, and split the ChatML
         prompt at the audio splice point.
 
@@ -422,14 +433,23 @@ class HiggsAudioModel(Model):
         if not kwargs.get("enable_thinking", False):
             post_ids += enc("<think>\n\n</think>\n\n")
 
-        return {
+        audio = sum(self.config.encoder_output_length(int(n)) for n in audio_feature_lens.tolist())
+        layout = LabelLayout(
+            spans=(
+                Span("ids", "prefill_text", len(pre_ids), len(pre_ids), "text_inputs"),
+                Span("digest", "prefill_audio", audio, audio, ("audio", 0)),
+                Span("ids", "prefill_text", len(post_ids), len(post_ids), "text_inputs"),
+            ),
+            growth=(("decode_loop", 1),),
+        )
+        return ProcessPromptOutput({
             "text_inputs": [
                 torch.tensor(pre_ids, dtype=torch.long),
                 torch.tensor(post_ids, dtype=torch.long),
             ],
             "audio_features": [audio_features],
             "audio_feature_lens": [audio_feature_lens],
-        }
+        }, {"kv_layout": {KV_CACHE: {"main": layout}}})
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

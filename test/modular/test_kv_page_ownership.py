@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import random
 import sys
+from collections import Counter, deque
+from importlib.util import find_spec
 
 sys.path.insert(0, ".")
 
@@ -19,8 +21,9 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
-from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.manager import KVManager, PageArena
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.step import Segment, StepContext
 
@@ -141,6 +144,152 @@ def test_the_sink_page_keeps_its_one_owner():
     assert kv._arena.num_owners[SINK_PAGE] == 1
 
 
+@pytest.mark.parametrize(
+    ("seed", "capacity"),
+    [(0, 4), (1, 7), (20260920, 11), (20261017, 17)],
+    ids=["seed-0-pool-4", "seed-1-pool-7", "seed-20260920-pool-11", "seed-20261017-pool-17"],
+)
+def test_random_ownership_matches_logical_owners(seed: int, capacity: int):
+    """Random acquire, seal, retain and release on a bare arena, checked after
+    each against a model of who owns which page, never the arena's own counts."""
+    cfg = PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=2, max_seq_len=64,
+        max_num_pages=capacity, page_size=4, cpu_offload_pages=0,
+    )
+    arena = PageArena(
+        kv_cache=KVCache(cfg, torch.device("cpu"), torch.float32),
+        allocator=PageAllocator(capacity),
+    )
+    rng = random.Random(seed)
+    all_pages = set(range(capacity))
+    owners: dict[int, set[int]] = {}
+    sealed: set[int] = set()
+    history: deque[str] = deque(maxlen=32)
+    operation_index = 0
+
+    def references() -> Counter:
+        # Owner memberships are the oracle; never read the arena to update it.
+        return Counter(page for pages in owners.values() for page in pages)
+
+    def check():
+        expected = references()
+        free = list(arena.allocator.free_pages.queue)
+        assert len(free) == len(set(free)), f"duplicate free pages: {free}"
+        assert set(free) == all_pages - expected.keys(), "free page membership differs"
+        assert arena.num_free == capacity - len(expected), "free page count differs"
+        assert arena.num_owners == [expected[page] for page in range(capacity)], (
+            "reference counts differ from logical owners"
+        )
+        assert arena.sealed == [page in sealed for page in range(capacity)], (
+            "sealed pages differ from the model"
+        )
+        assert arena.any_sealed([]) is False
+        assert arena.any_sealed(sorted(all_pages)) == bool(sealed)
+        for page in all_pages:
+            assert arena.any_sealed([page]) == (page in sealed)
+
+    # Callers keep apply's preconditions, so the model never shares an
+    # unsealed page or leaves a free page sealed: acquire and retain take a
+    # new owner, seal names owned pages, retain names sealed pages, and
+    # release names pages its owner holds.
+    def apply(operation: str, owner: int = -1, pages=(), count: int = 0):
+        nonlocal operation_index
+        operation_index += 1
+        pages = list(pages)
+        history.append(
+            f"{operation_index}: {operation} owner={owner} pages={pages} count={count}"
+        )
+        try:
+            if operation == "acquire":
+                assert owner not in owners
+                free_before = all_pages - references().keys()
+                queue_before = list(arena.allocator.free_pages.queue)
+                got = arena.acquire(count)
+                history[-1] += f" -> {got}"
+                if count > len(free_before):
+                    assert got is None, "an over-capacity allocation succeeded"
+                    assert list(arena.allocator.free_pages.queue) == queue_before, (
+                        "a failed allocation changed the free queue"
+                    )
+                else:
+                    assert got is not None and len(got) == count
+                    assert len(set(got)) == count, "an allocation repeated a page"
+                    assert set(got) <= free_before, "an allocation took an owned page"
+                    if got:
+                        owners[owner] = set(got)
+            elif operation == "seal":
+                assert set(pages) <= references().keys()
+                arena.seal(pages)
+                sealed.update(pages)
+            elif operation == "retain":
+                assert owner not in owners and set(pages) <= sealed
+                arena.retain(pages)
+                if pages:
+                    owners[owner] = set(pages)
+            elif operation == "release":
+                assert set(pages) <= owners[owner]
+                arena.release(pages)
+                owners[owner].difference_update(pages)
+                if not owners[owner]:
+                    del owners[owner]
+                sealed.intersection_update(references())
+            else:
+                raise AssertionError(f"unknown operation: {operation}")
+            check()
+        except Exception as exc:
+            exc.add_note(
+                f"PageArena seed={seed}, capacity={capacity}, operation={operation_index}\n"
+                "Last operations (recorded before execution):\n" + "\n".join(history)
+            )
+            raise
+
+    # Force sharing, exhaustion, mixed final/non-final releases and reuse;
+    # these boundaries must run even when a random sequence avoids them.
+    apply("acquire", owner=0, count=3)
+    apply("release", owner=0)
+    shared, second, exclusive = sorted(owners[0])
+    apply("seal", pages=[shared, second, exclusive])
+    apply("retain", owner=1, pages=[shared, second])
+    apply("retain", owner=2, pages=[shared])
+    apply("acquire", owner=3, count=capacity - 3)
+    apply("acquire", owner=4, count=1)
+    apply("release", owner=0, pages=[shared, exclusive])
+    apply("acquire", owner=4, count=2)
+    # The sole free page was sealed: reacquiring it must give a writable page.
+    apply("acquire", owner=5, count=1)
+    apply("release", owner=1, pages=[shared, second])
+    apply("release", owner=2, pages=[shared])
+    apply("release", owner=0, pages=[second])
+    apply("release", owner=3, pages=sorted(owners[3]))
+    apply("release", owner=5, pages=sorted(owners[5]))
+    apply("acquire", owner=6, count=0)
+    apply("seal")
+    apply("retain", owner=7)
+
+    for i in range(400):
+        roll = rng.randrange(10)
+        if not owners or roll < 3:
+            apply("acquire", owner=10 + i, count=rng.randint(1, capacity + 1))
+        elif roll < 6:
+            owner = rng.choice(sorted(owners))
+            pages = rng.sample(sorted(owners[owner]), rng.randint(1, len(owners[owner])))
+            apply("release", owner=owner, pages=pages)
+        elif roll < 8 or not sealed:
+            owned = sorted(references())
+            pages = rng.sample(owned, rng.randint(1, len(owned)))
+            apply("seal", pages=pages)
+        else:
+            pages = rng.sample(sorted(sealed), rng.randint(1, len(sealed)))
+            apply("retain", owner=10 + i, pages=pages)
+
+    for owner in sorted(owners):
+        apply("release", owner=owner, pages=sorted(owners[owner]))
+    # Exact full-pool reuse also checks that final releases neither lose nor
+    # duplicate a page and that no previous lifetime's seal survives.
+    apply("acquire", owner=1000, count=capacity)
+    apply("release", owner=1000, pages=sorted(owners[1000]))
+
+
 # ── through the manager ─────────────────────────────────────────────────
 
 
@@ -204,58 +353,63 @@ def test_a_sealed_page_comes_back_writable_when_it_is_freed():
 # ── the invariant ───────────────────────────────────────────────────────
 
 
-def _drive(kv: KVManager, rng: random.Random, ops: int, offload: bool = False):
+def _drive(kv: KVManager, seed: int, ops: int, offload: bool = False):
     """Random operations against ``kv``, with the invariant checked after each.
 
     The pool is deliberately too small, so admission is refused often and the
     half-finished paths — a fork reserved, then a segment that does not fit —
-    run here too. Returns the log of what it did, so a failure says what led up
-    to it.
+    run here too. Failures include the seed and the operations through the
+    failing one; successful runs return the log for coverage checks.
     """
+    rng = random.Random(seed)
     live: list[str] = []
     log: list[str] = []
-    for i in range(ops):
-        roll = rng.random()
-        if not live or roll < 0.2:
-            rid = f"r{i}"
-            kv.ingest_request(rid)
-            live.append(rid)
-            log.append(f"ingest {rid}")
-        elif roll < 0.6:
-            rid = rng.choice(live)
-            span = rng.randrange(1, 3 * PAGE_SIZE)
-            pre = (("main", "alt"),) if rng.random() < 0.25 else ()
-            post = (("main", "cfg"),) if rng.random() < 0.25 else ()
-            step = KVStep(
-                segments=(Segment(rid, "main", span),),
-                pre_forks=pre, post_forks=post,
-            )
-            ctx = _ctx(rid)
-            admitted = kv.admit(step, ctx).ok
-            if admitted:
-                kv.plan(step, ctx)
-                kv.commit(step, ctx)
-            log.append(
-                f"step {rid} span={span} pre={len(pre)} post={len(post)} "
-                f"admitted={admitted}"
-            )
-        elif roll < 0.75:
-            rid = rng.choice(live)
-            free = rng.random() < 0.5
-            kv.reset_request(rid, free=free)
-            log.append(f"reset {rid} free={free}")
-        elif offload and roll < 0.85:
-            rid = rng.choice(live)
-            kv.offload(rid)
+    try:
+        for i in range(ops):
+            roll = rng.random()
+            if not live or roll < 0.2:
+                rid = f"r{i}"
+                log.append(f"ingest {rid}")
+                kv.ingest_request(rid)
+                live.append(rid)
+            elif roll < 0.6:
+                rid = rng.choice(live)
+                span = rng.randrange(1, 3 * PAGE_SIZE)
+                pre = (("main", "alt"),) if rng.random() < 0.25 else ()
+                post = (("main", "cfg"),) if rng.random() < 0.25 else ()
+                log.append(f"step {rid} span={span} pre={len(pre)} post={len(post)}")
+                step = KVStep(
+                    segments=(Segment(rid, "main", span),),
+                    pre_forks=pre, post_forks=post,
+                )
+                ctx = _ctx(rid)
+                admitted = kv.admit(step, ctx).ok
+                log[-1] += f" admitted={admitted}"
+                if admitted:
+                    kv.plan(step, ctx)
+                    kv.commit(step, ctx)
+            elif roll < 0.75:
+                rid = rng.choice(live)
+                free = rng.random() < 0.5
+                log.append(f"reset {rid} free={free}")
+                kv.reset_request(rid, free=free)
+            elif offload and roll < 0.85:
+                rid = rng.choice(live)
+                log.append(f"offload {rid}")
+                kv.offload(rid)
+                kv.assert_pages_conserved()
+                reloaded = kv.reload(rid)
+                log[-1] += f" reloaded={reloaded}"
+            else:
+                rid = rng.choice(live)
+                log.append(f"remove {rid}")
+                live.remove(rid)
+                kv.remove_request(rid)
             kv.assert_pages_conserved()
-            reloaded = kv.reload(rid)
-            log.append(f"offload {rid} reloaded={reloaded}")
-        else:
-            rid = rng.choice(live)
-            live.remove(rid)
-            kv.remove_request(rid)
-            log.append(f"remove {rid}")
-        kv.assert_pages_conserved()
+    except Exception as error:
+        trace = "\n".join(f"{i}: {operation}" for i, operation in enumerate(log))
+        error.add_note(f"KV lifecycle seed={seed}, offload={offload}\n{trace}")
+        raise
     return log
 
 
@@ -269,7 +423,7 @@ def test_the_invariant_survives_a_random_lifecycle():
     order, on a pool too small to hold them all."""
     kv = _manager(max_num_pages=12)
 
-    log = _drive(kv, random.Random(SEED), ops=400)
+    log = _drive(kv, SEED, ops=400)
 
     assert sum(1 for line in log if "admitted=True" in line) > 50, (
         f"seed {SEED}: the pool was too small for the fuzz to store anything"
@@ -287,7 +441,7 @@ def test_the_invariant_survives_offload_and_reload():
     leaves an owner that is still around."""
     kv = _manager(max_num_pages=12, cpu_offload_pages=16)
 
-    log = _drive(kv, random.Random(SEED), ops=400, offload=True)
+    log = _drive(kv, SEED, ops=400, offload=True)
 
     assert any("offload" in line for line in log), f"seed {SEED}: nothing offloaded"
     _drain(kv)
@@ -312,6 +466,7 @@ def test_the_flag_puts_the_check_on_the_lifecycle(monkeypatch):
 
 
 @pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.skipif(find_spec("flashinfer") is None, reason="requires the optional FlashInfer backend")
 def test_kv_lens_match_flashinfer_seq_lens(page_size):
     """The host lengths handed to FlashInfer's decode plan are exactly what it
     would have rebuilt from the indptrs itself."""
@@ -329,3 +484,24 @@ def test_kv_lens_match_flashinfer_seq_lens(page_size):
     expected = get_seq_lens(ind.paged_kv_indptr, ind.paged_kv_last_page_len, page_size)
     assert ind.kv_lens.dtype == expected.dtype
     assert torch.equal(ind.kv_lens, expected)
+
+
+def test_a_step_forks_only_the_rows_it_names():
+    """A chunked prompt forks on its first chunk only: a step holding it beside
+    a prompt already past its first chunk forks just the first."""
+    kv = _manager()
+    for rid in ("r0", "r1"):
+        kv.ingest_request(rid)
+        _grow(kv, rid, PAGE_SIZE)
+    step = KVStep(
+        segments=(Segment("r0", "main", 4), Segment("r1", "main", 4)),
+        pre_forks=(("main", "alt"),), fork_rids=frozenset({"r0"}),
+    )
+    ctx = _ctx("r0", "r1")
+
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+
+    assert "alt" in kv._streams["r0"] and "alt" not in kv._streams["r1"]
+    kv.assert_pages_conserved()

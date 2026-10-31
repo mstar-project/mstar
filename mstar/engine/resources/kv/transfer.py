@@ -16,7 +16,7 @@ import shutil
 import threading
 import uuid
 from abc import ABC, abstractmethod
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -24,6 +24,8 @@ import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from mstar.engine.resources.kv.cache import KVCache, KVLayout
+from mstar.engine.resources.kv.page_copier import make_page_copier
+from mstar.utils.threads import ThreadPool
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import (
@@ -40,6 +42,12 @@ class KVReadInfo:
     remote_page_idx: int
     token_start: int
     token_end: int
+
+
+class KVTransferInfo:
+    """Base of the descriptors a transfer engine publishes for its KV cache.
+    The wire carries a subclass as ``[tag, fields]``, so the descriptor the
+    conductor re-sends every pass takes the typed path."""
 
 
 class KVTransferEngine(ABC):
@@ -80,7 +88,7 @@ class KVTransferEngine(ABC):
 
 
 @dataclass
-class MooncakeKVTransferInfo:
+class MooncakeKVTransferInfo(KVTransferInfo):
     entity_id: str
     session_id: str
     data_ptr: int
@@ -180,10 +188,10 @@ class MooncakeKVTransferEngine(KVTransferEngine):
 
 
 @dataclass
-class CudaIpcKVTransferInfo:
-    cuda_share: tuple
-    size: tuple
-    stride: tuple
+class CudaIpcKVTransferInfo(KVTransferInfo):
+    cuda_share: tuple[Any, ...]
+    size: tuple[int, ...]
+    stride: tuple[int, ...]
     offset: int
     dtype: str
     requires_grad: bool
@@ -210,9 +218,13 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         )
         self._device = kv_cache.device
         self._kv_cache = kv_cache
+        # Copies go on the copy engines, one 2D memcpy per page (K and V apart
+        # for a partial one), rather than one copy kernel per layer and page.
+        self._copier = make_page_copier()
+        self._copy_stream = torch.cuda.Stream(device=self._device)
 
         self._pending: list[Future] = []
-        self._executor = ThreadPoolExecutor(
+        self._executor = ThreadPool(
             max_workers=max_workers, initializer=self._bind_device,
         )
 
@@ -270,7 +282,6 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         read_info: list[KVReadInfo],
         event: torch.Event=None
     ):
-        event.synchronize()
         # The remote tensor is sliced with our layout, so it must match.
         assert remote_kv_info.layout == self._kv_cache.layout, (
             f"remote KV layout {remote_kv_info.layout} != "
@@ -312,22 +323,47 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
             event_sync_required,
         )
 
-        for info in read_info:
-            src = self._kv_cache.chunk_view(
-                layer_idx=info.layer_idx, page_idx=info.remote_page_idx,
-                token_start=info.token_start, token_end=info.token_end,
-                tensor=tensor
-            )
-            dst = self._kv_cache.chunk_view(
-                layer_idx=info.layer_idx, page_idx=info.local_page_idx,
-                token_start=info.token_start, token_end=info.token_end
-            )
-            dst.copy_(src)
+        stream = self._copy_stream
+        stream.wait_event(event)
+        cache = self._kv_cache
+        for (local, remote, start, end), layers in _layers_by_page(read_info).items():
+            for lo, hi in _contiguous_runs(layers):
+                dst = cache.layer_rows(lo, hi, local, start, end)
+                src = cache.layer_rows(lo, hi, remote, start, end, tensor=tensor)
+                for dst_rows, src_rows in zip(dst, src, strict=True):
+                    self._copier.copy_rows(dst_rows, src_rows, stream)
+        # The Future is the readiness gate: done means the pages are written,
+        # not just queued.
+        stream.record_event().synchronize()
 
     def shutdown(self):
         for fut in self._pending:
             fut.result()
         self._executor.shutdown(wait=True)
+
+
+def _layers_by_page(
+    read_info: list[KVReadInfo],
+) -> dict[tuple[int, int, int, int], list[int]]:
+    """(local page, remote page, token start, token end) -> its layers."""
+    out: dict[tuple[int, int, int, int], list[int]] = {}
+    for info in read_info:
+        out.setdefault(
+            (info.local_page_idx, info.remote_page_idx, info.token_start, info.token_end),
+            [],
+        ).append(info.layer_idx)
+    return out
+
+
+def _contiguous_runs(layers: list[int]) -> list[tuple[int, int]]:
+    """``[lo, hi)`` ranges covering ``layers`` (normally one: every layer)."""
+    runs: list[tuple[int, int]] = []
+    for layer in sorted(set(layers)):
+        if runs and runs[-1][1] == layer:
+            runs[-1] = (runs[-1][0], layer + 1)
+        else:
+            runs.append((layer, layer + 1))
+    return runs
 
 
 class LocalOnlyKVTransferEngine(KVTransferEngine):
@@ -367,7 +403,7 @@ class ShmKVSnapshotChunk:
 
 
 @dataclass(frozen=True)
-class ShmKVTransferInfo:
+class ShmKVTransferInfo(KVTransferInfo):
     path: str
     page_indices: tuple[int, ...]
     layout: KVLayout
@@ -582,9 +618,12 @@ class ShmKVTransferEngine(KVTransferEngine):
                 weights_only=True,
             )
             for layer, packed_page, local_page, token_start, token_end in chunk_copies:
-                source = packed[
-                    layer, packed_page, :, token_start:token_end,
-                ].to(self._kv_cache.device)
+                if self._kv_cache.layout == KVLayout.MLA:
+                    # one latent row per token: [layers, pages, page_size, latent]
+                    source = packed[layer, packed_page, token_start:token_end]
+                else:
+                    source = packed[layer, packed_page, :, token_start:token_end]
+                source = source.to(self._kv_cache.device)
                 destination = self._kv_cache.chunk_view(
                     layer_idx=layer,
                     page_idx=local_page,
@@ -630,18 +669,7 @@ class ShmKVTransferEngine(KVTransferEngine):
                 self._remove_request_locked(request_id)
 
 
-def make_deployment_kv_shm_dir(
-    socket_path_prefix: str,
-    dist_init_method: str,
-    owner_pid: int | None = None,
-) -> str:
-    """Create a private SHM directory for one local deployment.
-
-    The conductor PID plus its unique distributed-init endpoint separates
-    concurrent servers, even when both use the default worker ids and request
-    ids. On startup, directories owned by this uid whose conductor no longer
-    exists are swept so killed deployments do not leak tmpfs indefinitely.
-    """
+def _kv_shm_base() -> str:
     base = os.getenv("MSTAR_KV_SHM_DIR")
     if base is None:
         base = (
@@ -650,7 +678,56 @@ def make_deployment_kv_shm_dir(
             else "/tmp"
         )
     os.makedirs(base, exist_ok=True)
+    return base
 
+
+def make_deployment_kv_shm_dir(
+    namespace: str,
+    socket_path_prefix: str = "",
+    dist_init_method: str = "",
+    owner_pid: int | None = None,
+) -> str:
+    """Create, or join, the private SHM directory of one local deployment.
+
+    The directory is ``mstar_<namespace>_kv`` under the deployment namespace
+    of the tensor transport, so the namespace lock marks it live and the
+    dead-namespace sweep removes it once no process of the deployment is
+    left; a conductor pid cannot, since it is invisible from another PID
+    namespace sharing the tmpfs. For that reason the pid-named directories
+    of older builds (``mstar_kv_<uid>_<pid>_<digest>``) are not swept here:
+    from another PID namespace a live one looks dead.
+
+    Without a namespace (a control channel other than IPC or TCP, which the
+    built-in communicators never are) the directory is named and swept by
+    conductor pid as before (``_pid_named_kv_shm_dir``), which is right
+    unless deployments in different PID namespaces share the tmpfs.
+    """
+    from mstar.communication.tensors import (
+        _hold_namespace_lock,
+        _sweep_dead_namespaces,
+    )
+
+    if not namespace:
+        return _pid_named_kv_shm_dir(
+            socket_path_prefix, dist_init_method, owner_pid)
+    base = _kv_shm_base()
+    _hold_namespace_lock(base, namespace)
+    _sweep_dead_namespaces(base, namespace)
+    path = os.path.join(base, f"mstar_{namespace}_kv")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def _pid_named_kv_shm_dir(
+    socket_path_prefix: str,
+    dist_init_method: str,
+    owner_pid: int | None = None,
+) -> str:
+    """``mstar_kv_<uid>_<conductor pid>_<digest>``: the conductor pid plus its
+    distributed-init endpoint separate concurrent servers, and directories of
+    this uid whose conductor no longer exists are swept at startup."""
+    base = _kv_shm_base()
     uid = os.getuid() if hasattr(os, "getuid") else 0
     owner_pid = os.getppid() if owner_pid is None else owner_pid
     digest = hashlib.sha256(

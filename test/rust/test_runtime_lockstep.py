@@ -19,7 +19,7 @@ import torch
 
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
-from mstar.distributed.base import ShardingConfig
+from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
@@ -39,7 +39,7 @@ pytest.importorskip(
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.graph.runtime import rust as rust_runtime
 
-WG_ID, WALK, WORKER = 0, "decode", "worker_0"
+WG_ID, WALK, WORKER, PEER = 0, "decode", "worker_0", "worker_1"
 
 
 def _ingest_block(rids, specs) -> ColumnarEdgeSpecs:
@@ -117,9 +117,16 @@ def _nodes(graph):
     return set(graph.get_nodes())
 
 
-def _build(kind, graph):
+def _build(kind, graph, tp_rank=None):
+    """``tp_rank`` puts this worker at that rank of a two-rank TP group over
+    every node; None leaves it alone, which both runtimes treat as rank 0."""
+    groups = []
+    if tp_rank is not None:
+        groups = [ShardingGroup(nodes=_nodes(graph), tp_size=2)]
+        groups[0]._tp_rank = tp_rank
     wg = WorkerGraph(
-        section=graph, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID)
+        section=graph, graph_walks={WALK}, ranks=[0] if tp_rank is None else [0, 1],
+        worker_graph_id=WG_ID)
     common = dict(
         my_worker_id=WORKER, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
@@ -127,7 +134,7 @@ def _build(kind, graph):
         all_wg_ids_to_nodes={WG_ID: _nodes(graph)},
         node_to_partition=dict.fromkeys(_nodes(graph), "default"),
         sharding_config=ShardingConfig(
-            groups=[], tp_enabled_nodes=set(), shard_dim={}),
+            groups=groups, tp_enabled_nodes=set(), shard_dim={}),
     )
     if kind == "python":
         book = PythonTensorBookkeeping()
@@ -163,9 +170,10 @@ def _finish_teardown(store, freed):
 class Lockstep:
     """Runs an operation on both runtimes and diffs the result."""
 
-    def __init__(self, graph):
-        self.py = _build("python", graph)
-        self.rs = _build("rust", graph)
+    def __init__(self, graph, tp_rank=None):
+        self.py = _build("python", graph, tp_rank)
+        self.rs = _build("rust", graph, tp_rank)
+        self.workers = {None: [WORKER], 0: [WORKER, PEER], 1: [PEER, WORKER]}[tp_rank]
         self.log: list[str] = []
 
     def _both(self, step, fn):
@@ -190,7 +198,7 @@ class Lockstep:
         return self._both(f"add_request({rid_str})", lambda rt, b, s: rt.add_request(
             request_id=rid_str, partition="default", graph_walk=WALK,
             partition_worker_graph_ids=[WG_ID],
-            worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]])))
+            worker_graph_to_workers=ParallelList([WG_ID], [self.workers]), loop_caps={}))
 
     def put(self, uuid):
         """Store a tensor on both sides so routing has something to refer to."""
@@ -411,6 +419,25 @@ def test_persisted_and_loop_carried_token_agrees(emit_lock):
     lk.refcounts([101, 201, 202])
 
 
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_only_the_tp_leader_counts_new_tokens(tp_rank):
+    """A follower doesn't send the emitted token to the client, so it frees its
+    copy; counting it as a new token anyway made the worker look up a freed
+    tensor (a KeyError on every Command A+ TP8 request)."""
+    lk = Lockstep(_emit_loop_graph(), tp_rank=tp_rank)
+    rid = lk.admit()
+    lk.put(101)
+    lk.ingest(rid, "prompt", "prefill", [101])
+    lk.pop("prefill", rid)
+    lk.put(201)
+    lk.route("prefill", rid, ["token"], [201])
+    lk.ready()
+    lk.pop("ar_decode", rid)
+    lk.put(202)
+    _, _, new_tokens, _ = lk.route("ar_decode", rid, ["token"], [202])
+    assert bool(new_tokens) == (tp_rank == 0)
+
+
 def test_repeated_emit_iterations_agree(emit_lock):
     """Several loop iterations with an emitted token each time: a reference
     that leaks or is dropped once shows up as drift after a few passes."""
@@ -492,7 +519,7 @@ def _spec(rt, node, rid):
     return sorted(
         (s.node_name, s.graph_walk, s.is_new_loop_iter, s.loop_name,
          tuple(s.output_signals))
-        for s in rt.speculate_node(node, WALK, rid)
+        for s in rt.speculate_node(node, [WALK], [rid])
     )
 
 
@@ -594,7 +621,20 @@ def test_same_node_speculation_with_a_held_external_input_agrees():
     prep = lock._both("prep_spec_rids(ar_decode)",
                       lambda rt, b, s: _prep_same_node(rt, "ar_decode", rid))
     assert prep == ([rid], [("ctx", [301])])
+    rows = lock._both("prep_spec_rows(ar_decode)",
+                      lambda rt, b, s: _prep_rows_same_node(rt, "ar_decode", rid))
+    assert rows == ([rid], WG_ID, 0, [("ctx", [301])])
     lock.refcounts([101, 201, 301])
+
+
+def _prep_rows_same_node(rt, node, rid, room=None):
+    out = rt.prep_spec_rows(node, node, WALK, [rid], room)
+    return (
+        list(out.ready_rids), out.wg_id, out.spec_id,
+        None if out.input_edges is None else sorted(
+            (sig, list(uuids)) for _r, sig, uuids, _f in out.input_edges.edge_tuples()
+        ),
+    )
 
 
 def test_speculative_flag_survives_completion(lock):
@@ -632,8 +672,7 @@ def test_speculative_flag_survives_completion(lock):
     assert lock._both("is_in_flight before", flag) is False
 
     lock._both("set_in_flight(ar_decode, True)",
-               lambda rt, b, s: rt.set_in_flight(
-                   "ar_decode", WG_ID, [rid], True))
+               lambda rt, b, s: rt.set_in_flight("ar_decode", [rid], [WG_ID], True))
     assert lock._both("is_in_flight after set", flag) is True
 
     # Step N completes. The flag must not be cleared by it.
@@ -646,8 +685,7 @@ def test_speculative_flag_survives_completion(lock):
 
     # Only the worker clearing it explicitly ends the speculation.
     lock._both("set_in_flight(ar_decode, False)",
-               lambda rt, b, s: rt.set_in_flight(
-                   "ar_decode", WG_ID, [rid], False))
+               lambda rt, b, s: rt.set_in_flight("ar_decode", [rid], [WG_ID], False))
     assert lock._both("is_in_flight after clear", flag) is False
 
 

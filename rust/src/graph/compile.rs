@@ -36,7 +36,8 @@ pub struct LoopArg {
     #[pyo3(item)] pub member_nodes: Vec<String>,
     #[pyo3(item)] pub outputs: Vec<EdgeArg>,
     #[pyo3(item)] pub accumulated: Vec<EdgeArg>,
-    /// Verbatim `Loop._loop_back_inputs` / `_external_inputs`.
+    /// `Loop._loop_back_inputs` / `_external_inputs` as Python computes them;
+    /// `compile_one` narrows `external_inputs` to this graph's nodes.
     #[pyo3(item)] pub loop_back: Vec<(String, String)>,
     #[pyo3(item)] pub external_inputs: Vec<(String, String)>,
 }
@@ -122,11 +123,12 @@ pub fn compile_one(
             .map(|m| local[m.as_str()]).collect();
         let outputs: Vec<EdgeSpec> = l.outputs.iter().map(|e| mk_edge(it, e, &local)).collect();
         let accumulated: Vec<EdgeSpec> = l.accumulated.iter().map(|e| mk_edge(it, e, &local)).collect();
-        let resolve = |it: &mut StrToId, v: &Vec<(String, String)>| -> Vec<(Sym, NodeId)> {
-            v.iter().filter_map(|(n, d)| local.get(d.as_str()).map(|&id| (it.intern(n), id))).collect()
-        };
-        let loop_back = resolve(it, &l.loop_back);
-        let external_inputs = resolve(it, &l.external_inputs);
+        let loop_back = l.loop_back.iter()
+            .map(|(n, d)| (it.intern(n), it.intern(d)))
+            .collect();
+        let external_inputs = l.external_inputs.iter()
+            .filter_map(|(n, d)| local.get(d.as_str()).map(|&id| (it.intern(n), id)))
+            .collect();
         loop_specs.push(LoopSpec {
             name: it.intern(&l.name), max_iters: l.max_iters, parent,
             member_nodes, child_loops: Vec::new(),

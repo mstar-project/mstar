@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import Speculation, Worker  # noqa: E402
 
 NODE = "decoder"
@@ -31,8 +32,8 @@ def _edge(name: str) -> StreamingEdge:
 
 def _speculation(rids: list[str]) -> Speculation:
     return Speculation(
-        scheduled_batch=SimpleNamespace(
-            node_name=NODE,
+        scheduled_batch=ScheduledBatch(
+            node_name=NODE, graph_walk="w",
             request_to_worker_graph={r: "wg" for r in rids},
         ),
         node_batch=SimpleNamespace(
@@ -56,7 +57,7 @@ def test_dropped_rid_gets_its_own_edges_back():
     returned: list[tuple[str, str]] = []
     committed: list[tuple] = []
     worker = SimpleNamespace(
-        _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
+        streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.edge.name))),
         # The staged ingests are settled per rid before the chunks go back, so
         # the chunk leaves the node's slot first; see Worker._settle_speculation.
         _graph_runtime=SimpleNamespace(
@@ -112,8 +113,11 @@ def test_failed_settle_after_success_returns_nothing():
     """
     returned: list[tuple[str, str]] = []
     worker = SimpleNamespace(
-        _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
+        streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.edge.name))),
         _graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
+        engine_manager=SimpleNamespace(
+            get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+        ),
     )
     spec = _speculation(["keep"])
     spec.spec_id = 5

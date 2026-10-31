@@ -3,6 +3,7 @@ prompt processing, the conductor state machine and the T3 step declaration.
 No weights are loaded: the model object is built without ``__init__``, or with
 the checkpoint lookup and the tokenizer stubbed (``_no_checkpoint``)."""
 
+import base64
 import json
 import sys
 from pathlib import Path
@@ -13,7 +14,7 @@ import torch
 import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
@@ -179,6 +180,27 @@ def test_registry_graph_and_yaml_are_consistent(key, repo, yaml_name):
     assert all(wg.ranks == [0] for wg in worker_graphs)
 
 
+def _first_chunk_audio_s(cfg: ChatterboxConfig) -> float:
+    """Audio the first streamed chunk carries: its tokens less the encoder's
+    look-ahead, as mel frames, less the frames the vocoder holds back."""
+    s3 = cfg.s3gen
+    tokens = cfg.stream_first_chunk_tokens - s3.encoder.pre_lookahead_len
+    frames = tokens * s3.token_mel_ratio - cfg.stream_mel_cache_frames
+    return frames * s3.mel.hop_size / s3.sample_rate
+
+
+def test_the_first_chunk_covers_the_wait_for_the_second():
+    # At 4 to 8 streams the second chunk lands about 0.95 s after the first
+    # (H200); the old 15-token first chunk carried 0.32 s and stalled there.
+    english = ChatterboxConfig.from_variant("chatterbox")
+    assert _first_chunk_audio_s(english) == pytest.approx(1.12)
+    policy = _make_model("chatterbox").get_partition_topology().connections[0].chunk_policy_factory()
+    assert policy.is_ready(35) and not policy.is_ready(34)
+    # not measured on these two; they keep the old first chunk
+    for variant in ("multilingual", "turbo"):
+        assert ChatterboxConfig.from_variant(variant).stream_first_chunk_tokens == 15
+
+
 def test_cli_adapter_and_benchmark_entries_are_registered():
     repo_root = str(Path(__file__).resolve().parents[2])
     sys.path.insert(0, repo_root)
@@ -202,6 +224,20 @@ def test_cli_adapter_and_benchmark_entries_are_registered():
         sys.path.remove(repo_root)
 
 
+def _wav_bytes(seconds: float = 0.5, rate: int = 24000) -> bytes:
+    """A real mono 16-bit WAV of silence: the adapter opens reference clips."""
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(2 * int(seconds * rate)))
+    return buf.getvalue()
+
+
 def test_speech_adapter_fetches_a_reference_url_only_when_the_server_allows(tmp_path, monkeypatch):
     from mstar.api_server import media_io
     from mstar.api_server.openai.adapters import ChatterboxAdapter
@@ -211,17 +247,24 @@ def test_speech_adapter_fetches_a_reference_url_only_when_the_server_allows(tmp_
         model_extra={"ref_audio": "http://example.invalid/ref.wav"},
     )
     fetched = []
-    monkeypatch.setattr(media_io, "save_remote_url", lambda url, d: fetched.append(url) or ("audio", "/x.wav"))
+    clip = tmp_path / "fetched.wav"
+
+    def fetch(url, upload_dir):
+        fetched.append(url)
+        clip.write_bytes(_wav_bytes())
+        return "audio", str(clip)
+
+    monkeypatch.setattr(media_io, "save_remote_url", fetch)
     monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
     with pytest.raises(ValueError, match="Remote media fetch is disabled"):
         ChatterboxAdapter().speech_to_request(req, tmp_path)
     assert fetched == []
     monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
     args = ChatterboxAdapter().speech_to_request(req, tmp_path)
-    assert fetched == ["http://example.invalid/ref.wav"] and args.file_paths == {"audio": ["/x.wav"]}
+    assert fetched == ["http://example.invalid/ref.wav"] and args.file_paths == {"audio": [str(clip)]}
 
 
-def test_speech_adapter_refuses_paths_outside_the_upload_dir(tmp_path):
+def test_speech_adapter_refuses_server_paths(tmp_path):
     from mstar.api_server.openai.adapters import ChatterboxAdapter
 
     uploads = tmp_path / "uploads"
@@ -237,10 +280,10 @@ def test_speech_adapter_refuses_paths_outside_the_upload_dir(tmp_path):
         )
         return ChatterboxAdapter().speech_to_request(req, uploads)
 
-    for ref in ("/etc/hostname", str(elsewhere), str(uploads / ".." / "elsewhere.wav"), str(uploads / "escape.wav")):
-        with pytest.raises(ValueError, match="paths on the server are refused"):
+    for ref in ("/etc/hostname", str(elsewhere), str(uploads / ".." / "elsewhere.wav"), str(uploads / "escape.wav"),
+                str(uploads / "mine.wav")):
+        with pytest.raises(ValueError, match="server file paths are refused"):
             request(ref)
-    assert request(str(uploads / "mine.wav")).file_paths == {"audio": [str(uploads / "mine.wav")]}
 
 
 def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
@@ -257,15 +300,14 @@ def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
     assert args.model_kwargs["exaggeration"] == 0.8 and args.model_kwargs["cfg_weight"] == 0.3
     assert args.model_kwargs["temperature"] == 0.7 and args.model_kwargs["seed"] == 3
 
-    clip = tmp_path / "ref.wav"
-    clip.write_bytes(b"RIFF")
     req = SimpleNamespace(
         input="Hi", voice=None, temperature=None, top_p=None, seed=None,
-        model_extra={"ref_audio": str(clip)},
+        model_extra={"ref_audio": "data:audio/wav;base64," + base64.b64encode(_wav_bytes()).decode()},
     )
     args = ChatterboxAdapter().speech_to_request(req, tmp_path)
     assert args.input_modalities == ["text", "audio"]
-    assert args.file_paths == {"audio": [str(clip)]}
+    (path,) = args.file_paths["audio"]
+    assert path.startswith(str(tmp_path)) and open(path, "rb").read() == _wav_bytes()
     assert "ref_audio" not in args.model_kwargs
 
 
@@ -276,10 +318,10 @@ def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
 
 def test_process_prompt_builtin_voice_emits_text_only():
     model = _make_model()
-    out = model.process_prompt("hello", ["text"], ["audio"], voice="default")
+    out = model.process_prompt("hello", ["text"], ["audio"], voice="default").new_input_tensors
     assert set(out) == {TEXT_INPUTS}
     assert out[TEXT_INPUTS][0].tolist() == [1, 2, 3, 4, 5]
-    out = model.process_prompt("hello", ["text"], ["audio"])
+    out = model.process_prompt("hello", ["text"], ["audio"]).new_input_tensors
     assert set(out) == {TEXT_INPUTS}
 
 
@@ -288,7 +330,7 @@ def test_process_prompt_reference_audio_is_keyed_and_capped():
     wav = torch.rand(40 * 24000) - 0.5
     out = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [wav]},
-    )
+    ).new_input_tensors
     assert set(out) == {TEXT_INPUTS, REF_AUDIO, VOICE_KEY}
     assert out[REF_AUDIO][0].numel() == 30 * 24000  # capped at 30 s
     assert out[VOICE_KEY][0].dtype == torch.long
@@ -333,7 +375,7 @@ def test_process_prompt_rejects_unusable_reference(wav, message):
 def test_process_prompt_accepts_short_but_usable_reference():
     out = _make_model().process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_tone(0.6)]},
-    )
+    ).new_input_tensors
     assert out[REF_AUDIO][0].numel() == int(0.6 * 24000)
 
 
@@ -346,8 +388,10 @@ def test_undecodable_reference_is_a_client_error(tmp_path):
         pytest.skip(f"torchcodec cannot load here: {exc}")
     bad = tmp_path / "ref.wav"
     bad.write_bytes(b"hello world" * 100)
-    with pytest.raises(ValueError, match="Could not decode the reference audio"):
+    with pytest.raises(ValueError, match="Could not decode the reference audio") as raised:
         ChatterboxModel._decode_audio(str(bad))
+    # the message reaches the client, so it names no server path
+    assert str(tmp_path) not in str(raised.value) and raised.value.__cause__ is None
 
 
 def test_empty_reference_is_a_client_error(tmp_path):
@@ -502,7 +546,7 @@ def test_generation_kwargs_accept_boundary_values():
     assert top_ks == [vocab - 1, vocab, vocab]
     # other request fields ride along in the same kwargs and are left alone
     out = model.process_prompt("hello", ["text"], ["audio"], voice="default", language_id=None, seed=7)
-    assert set(out) == {TEXT_INPUTS}
+    assert set(out.new_input_tensors) == {TEXT_INPUTS}
 
 
 def test_max_new_tokens_limit_bounds_requests_and_the_default():
@@ -569,7 +613,6 @@ def test_initial_args_builtin_voice():
     assert [e.name for e in t3.inputs] == [TEXT_INPUTS]
     assert t3.unpersist_tensors == signals[TEXT_INPUTS]
     assert t3.step_metadata["cfg_weight"] == 0.4 and t3.step_metadata["is_prefill"] is True
-    assert t3.full_metadata.kwargs["max_new_tokens"] == 1000
 
     s3 = model.get_initial_forward_pass_args("S3Gen", ["text"], ["audio"], signals, {})
     assert s3.full_metadata.graph_walk == "s3gen_chunk" and s3.inputs == []
@@ -599,7 +642,7 @@ def test_t3_prefill_transitions_to_decode_then_done():
     metadata = CurrentForwardConductorMetadata(
         input_modalities=["text"], output_modalities=["audio"],
         graph_walk="prefill_voice", is_prefill=True,
-        kwargs={"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05, "max_new_tokens": 10},
+        kwargs={"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05},
     )
     persist = {SPEECH_TOKENS: [SimpleNamespace(name=SPEECH_TOKENS)]}
     result = model.get_partition_forward_pass_args("T3", metadata, persist)
@@ -607,7 +650,7 @@ def test_t3_prefill_transitions_to_decode_then_done():
     assert result.inputs[0].name == PREV_TOKEN and result.inputs[0].next_node == "T3"
     assert result.inputs[0].tensor_info == persist[SPEECH_TOKENS]
     assert result.unpersist_tensors == persist[SPEECH_TOKENS]
-    assert result.step_metadata["is_prefill"] is False and result.step_metadata["max_new_tokens"] == 10
+    assert result.step_metadata == {"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05, "is_prefill": False}
     assert result.request_done is False
 
     result = model.get_partition_forward_pass_args("T3", metadata, {})
@@ -707,10 +750,9 @@ def _fwd_info(rid, cfg_weight=0.5, temperature=0.8, max_new=1000):
     # the wire id differs from the handle, so state keyed by the wrong one shows
     return SimpleNamespace(
         request_id=f"wire-{rid}", rid_handle=rid,
-        step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05,
-                       "max_new_tokens": max_new, "is_prefill": True},
+        step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05, "is_prefill": True},
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=temperature, ignore_eos=False)},
-        max_tokens=4096, random_seed=0,
+        max_tokens=max_new, random_seed=0,
     )
 
 
@@ -796,8 +838,8 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     # the engine passes the batch's input metadata too
     assert sub.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}, per_request_input_metadata={}) is True
 
-    configs = sub.get_cuda_graph_configs(torch.device("cpu"))
-    batched = [c for c in configs if isinstance(c, BatchedCudaGraphConfig)]
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    batched = [c for c in configs if isinstance(c, BatchedAcceleratorGraphConfig)]
     keys = {c.additional_key_info: c for c in batched}
     assert set(keys) == {True, False}
     assert keys[True].total_tokens_multiplier == 2 and keys[False].total_tokens_multiplier == 1
@@ -806,7 +848,10 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     assert all(c.capture_graph_walk == "decode" for c in batched)
 
     turbo = _t3_submodule("turbo")
-    turbo_cfgs = [c for c in turbo.get_cuda_graph_configs(torch.device("cpu")) if isinstance(c, BatchedCudaGraphConfig)]
+    turbo_cfgs = [
+        c for c in turbo.get_accelerator_graph_configs(torch.device("cpu"))
+        if isinstance(c, BatchedAcceleratorGraphConfig)
+    ]
     assert [c.additional_key_info for c in turbo_cfgs] == [False]
     assert turbo.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}) is False
 
@@ -816,7 +861,10 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
     both prefill walks; the stand-in inputs carry the guidance branch's second
     embedding row set like ``prepare_inputs`` does. The knob turns it off."""
     sub = _t3_submodule()
-    packed = [c for c in sub.get_cuda_graph_configs(torch.device("cpu")) if isinstance(c, PackedCudaGraphConfig)]
+    packed = [
+        c for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
+        if isinstance(c, PackedAcceleratorGraphConfig)
+    ]
     assert {c.additional_key_info for c in packed} == {True, False}
     for cfg in packed:
         assert cfg.capture_graph_walk == "prefill"
@@ -838,11 +886,14 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
         per_request_input_tensors={}, per_request_info={},
     )
     inputs = [sub.prepare_inputs("prefill", _fwd_info("a"), {TEXT_INPUTS: [torch.tensor([255, 0])]})]
-    assert sub.can_use_cuda_graphs(prefill, inputs)
+    assert sub.can_use_accelerator_graphs(prefill, inputs)
 
     sub.config.t3_prefill_graphs = False
-    assert not any(isinstance(c, PackedCudaGraphConfig) for c in sub.get_cuda_graph_configs(torch.device("cpu")))
-    assert not sub.can_use_cuda_graphs(prefill, inputs)
+    assert not any(
+        isinstance(c, PackedAcceleratorGraphConfig)
+        for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
+    )
+    assert not sub.can_use_accelerator_graphs(prefill, inputs)
 
 
 def test_sampler_min_p_goes_through_the_resource():
@@ -1574,7 +1625,7 @@ def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
 
 def test_chunk_policy_growth_knobs_reach_the_ramp():
     model = ChatterboxModel(
-        model_path_hf="ResembleAI/chatterbox", variant="chatterbox",
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=15,
         stream_chunk_tokens=25, stream_chunk_growth=2.0, stream_max_chunk_tokens=100,
     )
     policy = model._chunk_policy()
@@ -1584,16 +1635,16 @@ def test_chunk_policy_growth_knobs_reach_the_ramp():
         sizes.append(policy.next_chunk_size(buffered))
         policy.register_chunk(buffered)
     assert sizes == [15, 25, 50, 100, 100]
-    # the shipped default: 15, then 50, 100, 200, 200 ... with a 25-token context window
+    # the shipped default: 35, then 50, 100, 200, 200 ... with a 25-token context window
     default = _make_model()
     assert default.config.stream_context_tokens == 25
     policy = default._chunk_policy()
     sizes = []
-    for buffered in (15, 50, 100, 200, 200):
+    for buffered in (35, 50, 100, 200, 200):
         assert policy.is_ready(buffered)
         sizes.append(policy.next_chunk_size(buffered))
         policy.register_chunk(buffered)
-    assert sizes == [15, 50, 100, 200, 200]
+    assert sizes == [35, 50, 100, 200, 200]
 
 
 def test_s3gen_keeps_the_reference_for_chunks_without_the_clip():

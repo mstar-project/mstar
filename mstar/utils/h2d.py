@@ -15,6 +15,8 @@ from collections.abc import Sequence
 import numpy as np
 import torch
 
+from mstar.utils.device import DeviceCapability
+
 
 class H2DMirror:
     """What the stager last copied into one device destination.
@@ -63,10 +65,10 @@ class PinnedStager:
         self._numel = 0
         self._bufs: list[torch.Tensor] = []
         self._views: list[np.ndarray] = []
-        self._events: list[torch.cuda.Event | None] = [None] * depth
+        self._events: list[torch.Event | None] = [None] * depth
         self._next = 0
         self._lock = threading.Lock()
-        self._pinned = torch.cuda.is_available()
+        self._pinned = torch.accelerator.is_available()
         self._grow(numel)
 
     def _grow(self, numel: int) -> None:
@@ -80,6 +82,14 @@ class PinnedStager:
             for _ in range(self._depth)
         ]
         self._views = [b.numpy() for b in self._bufs]
+
+    def to_device(self, values: Sequence | np.ndarray | torch.Tensor, device: torch.device) -> torch.Tensor:
+        """A new ``device`` tensor holding ``values`` (a sequence, an array or a CPU tensor, any
+        shape) in this stager's dtype, through ``copy_``: one non-blocking H2D, no stream drain."""
+        host = np.asarray(values, dtype=self._np_dtype)
+        out = torch.empty(host.shape, dtype=self.dtype, device=device)
+        self.copy_(out, host.reshape(-1))
+        return out
 
     def copy_(
         self,
@@ -107,7 +117,8 @@ class PinnedStager:
         if mirror is not None:
             values = np.asarray(values, dtype=self._np_dtype)
             key = (total, pad_value)
-        if dst.device.type != "cuda":
+        capability = DeviceCapability.of(dst.device)
+        if not capability.is_accelerator or not self._pinned:
             host = np.asarray(values)
             dst.view(-1)[:n].copy_(torch.as_tensor(host, dtype=self.dtype))
             if pad_value is not None:
@@ -129,7 +140,33 @@ class PinnedStager:
                 view[n:total] = pad_value
             dst.view(-1)[:total].copy_(self._bufs[i][:total], non_blocking=True)
             if ev is None:
-                ev = self._events[i] = torch.cuda.Event()
-            ev.record(torch.cuda.current_stream(dst.device))
+                ev = self._events[i] = torch.Event(device=dst.device)
+            ev.record(torch.accelerator.current_stream(dst.device))
             if mirror is not None:
                 mirror.record(key, values)
+
+
+def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """``tensor`` on ``device`` without a host stall.
+
+    A copy from pageable memory blocks the calling thread until it retires, so on
+    the GPU thread it waits out the step still running there. This writes a CPU
+    tensor into a pinned buffer with one memcpy on the calling thread (``copy_``
+    would split it over the intra-op pool, where a descheduled thread holds up the
+    GPU thread) and queues one non-blocking copy from it on the current stream.
+    torch's caching host allocator keeps the pinned buffer until that copy has
+    retired, so nothing is written over an in-flight source.
+
+    The result is valid on the stream the copy was issued on; another stream has
+    to wait on it, as for any async copy. The host tensor is read as it is, so the
+    device tensor is bit-identical to a pageable copy; a model that packs a draw
+    does so before this.
+    """
+    device = torch.device(device)
+    if tensor.device.type != "cpu" or not DeviceCapability.of(device).is_accelerator:
+        return tensor.to(device)
+    source = tensor if tensor.is_contiguous() else tensor.contiguous()
+    pinned = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
+    if source.numel():
+        pinned.view(-1).view(torch.uint8).numpy()[:] = source.view(-1).view(torch.uint8).numpy()
+    return pinned.to(device, non_blocking=True)

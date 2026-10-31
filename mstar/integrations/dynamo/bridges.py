@@ -49,6 +49,9 @@ from mstar.api_server.openai.protocol import (
     SpeechRequest,
     VideoGenerationRequest,
 )
+from mstar.api_server.openai.serving_images import image_count
+from mstar.utils.generation_kwargs import offset_seed
+from mstar.utils.utf8_stream import Utf8Stream
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
@@ -74,7 +77,8 @@ _STRIP_KEYS = {
     # OpenAI-standard, no M* mapping today
     "min_tokens", "eos_token_ids",
     "stream_options", "frequency_penalty", "presence_penalty", "logit_bias",
-    "logprobs", "top_logprobs", "tools", "tool_choice", "parallel_tool_calls",
+    # not tools or tool_choice: the adapter refuses a chat that asks for a tool call
+    "logprobs", "top_logprobs", "parallel_tool_calls",
     "response_format", "user", "store", "metadata", "service_tier",
 }
 
@@ -144,6 +148,21 @@ def _speech_body(request: dict) -> dict:
     return body
 
 
+class _BadRequestError(ValueError):
+    """A 400 whose message reaches the client as written.
+
+    Dynamo's worker reads ``code`` and ``message`` off any exception the
+    handler raises; a bare ``ValueError`` is a 400 too, but reaches the client
+    as ``ValueError: <message>``.
+    """
+
+    code = 400
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 class RequestBridge:
     """Translate one endpoint's requests for a single embedded server."""
 
@@ -186,7 +205,10 @@ class RequestBridge:
             )
             body["modalities"] = ["text"]
         req = ChatCompletionRequest.model_validate(body)
-        args = self.adapter.chat_to_request(req, self.server.upload_dir)
+        try:
+            args = self.adapter.chat_to_request(req, self.server.upload_dir)
+        except ValueError as exc:
+            raise _BadRequestError(str(exc)) from exc
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
 
@@ -201,19 +223,21 @@ class RequestBridge:
 
         cancelled = False
         dropped: set[str] = set()
+        text = Utf8Stream()
         try:
             async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "text":
-                    yield envelope({
-                        "role": "assistant",
-                        "content": chunk.data.decode("utf-8", "replace"),
-                    })
+                    # a token that completes no character (or an end token) sends no delta
+                    if content := text.feed(chunk.data):
+                        yield envelope({"role": "assistant", "content": content})
                 elif chunk.modality == "error":
                     raise RuntimeError(chunk.data.decode("utf-8", "replace"))
                 else:
                     dropped.add(chunk.modality)
             cancelled = _client_gone(context)
             if not cancelled:
+                if tail := text.flush():
+                    yield envelope({"role": "assistant", "content": tail})
                 yield envelope({"role": "assistant", "content": ""}, finish="stop")
         finally:
             self.server.abort_request(rid)
@@ -250,12 +274,16 @@ class RequestBridge:
             # seeded seed + i — the native create_images contract, so image 0
             # is bit-identical to the same request with n=1.
             args = self.adapter.image_to_request(req, self.server.upload_dir)
+            try:
+                n = image_count(req)
+            except ValueError as exc:
+                raise _BadRequestError(str(exc)) from exc
             submits = [args]
             seed = args.model_kwargs.get("seed")
-            for i in range(1, max(1, int(req.n or 1))):
+            for i in range(1, n):
                 kwargs = dict(args.model_kwargs)
                 if seed is not None:
-                    kwargs["seed"] = int(seed) + i
+                    kwargs["seed"] = offset_seed(int(seed), i)
                 submits.append(dataclasses.replace(args, model_kwargs=kwargs))
 
         rids = [self._submit(args, prefix="img") for args in submits]
@@ -408,6 +436,7 @@ def _submit(server: APIServer, args: SubmitArgs, prefix: str) -> str:
         input_modalities=args.input_modalities,
         output_modalities=args.output_modalities,
         model_kwargs=args.model_kwargs,
+        prompt_parts=args.prompt_parts,
         streaming=True,
         request_id=rid,
     )
@@ -477,30 +506,24 @@ async def _stream_chunks(server: APIServer, rid: str, context):
 # realtime
 # ----------------------------------------------------------------------
 
-# Template end-of-turn tokens stripped from transcript deltas (they close the
-# model's chat turn; they are not speech transcript).
-_TEMPLATE_END_TOKENS = ("<|im_end|>",)
-
-
 def _event_id() -> str:
     return f"event_{uuid.uuid4().hex}"
 
 
 def _decode_pcm16_b64(audio_b64) -> bytes | None:
-    """Base64 PCM16 append payload -> raw bytes; None when empty or malformed.
+    """Base64 PCM16 append payload -> raw bytes; None when malformed.
 
-    PCM16 is 2-byte aligned; a bad frame is dropped rather than tearing down
-    the whole session.
+    The length may be odd: a sample split across two appends is joined in
+    the session's byte buffer, and a commit takes whole samples only.
     """
-    if not audio_b64 or not isinstance(audio_b64, str):
+    if not isinstance(audio_b64, str):
         return None
     try:
-        raw = base64.b64decode(audio_b64)
-    except Exception:  # noqa: BLE001 — drop the malformed chunk, keep the session
+        # whitespace is allowed (base64.encodebytes wraps lines), as on the API
+        # server; translate stays linear where split() would build a list
+        return base64.b64decode(audio_b64.encode("ascii").translate(None, b" \t\n\r\v\f"), validate=True)
+    except Exception:  # noqa: BLE001 — refuse the malformed chunk, keep the session
         return None
-    if not raw or len(raw) % 2:
-        return None
-    return raw
 
 
 def _drain(queue: asyncio.Queue) -> None:
@@ -674,20 +697,21 @@ class RealtimeBridge:
             sent_audio = False
             stopped = False
             text_parts: list[str] = []
+            text = Utf8Stream()
+            etype = ("response.output_audio_transcript.delta" if want_audio
+                     else "response.output_text.delta")
             try:
                 # _stream_chunks races the context's killed-or-stopped future,
                 # so a dropped socket aborts the turn instead of generating
                 # into a queue nobody reads until the model finishes.
                 async for chunk in _stream_chunks(self.server, rid, context):
                     if chunk.modality == "text":
-                        delta = chunk.data.decode("utf-8", "replace")
-                        for token in _TEMPLATE_END_TOKENS:
-                            delta = delta.replace(token, "")
+                        delta = text.feed(chunk.data)
+                        # the reply's end token decodes to nothing, and a
+                        # character split across tokens waits for its last byte
                         if not delta:
                             continue
                         text_parts.append(delta)
-                        etype = ("response.output_audio_transcript.delta" if want_audio
-                                 else "response.output_text.delta")
                         await events.put(self._content_event(etype, turn, delta=delta))
                     elif chunk.modality == "audio":
                         sent_audio = True
@@ -702,6 +726,9 @@ class RealtimeBridge:
             if stopped:
                 # Connection torn down mid-turn; claim no completed response.
                 return
+            if tail := text.flush():
+                text_parts.append(tail)
+                await events.put(self._content_event(etype, turn, delta=tail))
             if sent_audio:
                 await events.put(self._content_event("response.output_audio.done", turn))
             if not want_audio:
@@ -756,45 +783,66 @@ class RealtimeBridge:
                         # audio/pcma) — closes the socket upstream as a
                         # malformed frame. What arrives here is a complete GA
                         # audio object or nothing.
-                        session = event.get("session")
-                        fmt = {}
+                        served_in = {}
                         if isinstance(session, dict):
-                            fmt = ((session.get("audio") or {}).get("input") or {}).get("format") or {}
+                            served_in = (session.get("audio") or {}).get("input") or {}
+                        session = event.get("session")
+                        audio_in = {}
+                        if isinstance(session, dict):
+                            audio_in = (session.get("audio") or {}).get("input") or {}
+                        fmt = (audio_in.get("format") or {}) if isinstance(audio_in, dict) else {}
+                        refused = None
                         if isinstance(fmt, dict) and fmt.get("type") not in (None, "audio/pcm"):
-                            out_stream.put_nowait(self._error(
-                                f"unsupported input audio format {fmt.get('type')!r}; "
-                                "only audio/pcm is supported",
-                                etype="invalid_request_error",
-                                code="unsupported_audio_format"))
+                            refused = (f"unsupported input audio format {fmt.get('type')!r}; "
+                                       "only audio/pcm is supported")
                         elif isinstance(fmt, dict) and fmt.get("rate") not in (None, 24000):
+                            refused = f"unsupported input audio rate {fmt.get('rate')!r}; only 24000 is supported"
+                        if refused:
+                            # keep reading the audio as before, and echo that
                             out_stream.put_nowait(self._error(
-                                f"unsupported input audio rate {fmt.get('rate')!r}; "
-                                "only 24000 is supported",
+                                refused, etype="invalid_request_error", code="unsupported_audio_format"))
+                            kept = served_in.get("format") if isinstance(served_in, dict) else None
+                            audio_in = {**audio_in, "format": kept or {"type": "audio/pcm", "rate": 24000}}
+                            session = {**session, "audio": {**session["audio"], "input": audio_in}}
+                        if isinstance(audio_in, dict) and audio_in.get("turn_detection") is not None:
+                            # no server turn detection: say so, and echo the
+                            # session as served rather than as asked
+                            out_stream.put_nowait(self._error(
+                                "server turn detection is not supported; set audio.input.turn_detection "
+                                "to null and end each turn with input_audio_buffer.commit",
                                 etype="invalid_request_error",
-                                code="unsupported_audio_format"))
+                                code="unsupported_turn_detection"))
+                            session = {**session, "audio": {**session["audio"],
+                                                            "input": {**audio_in, "turn_detection": None}}}
                         out_stream.put_nowait(self._session_updated(session))
                     elif etype == "input_audio_buffer.append":
                         raw = _decode_pcm16_b64(event.get("audio", ""))
                         if raw is None:
-                            logger.warning("realtime: dropping malformed audio append")
+                            out_stream.put_nowait(self._error(
+                                "audio is not base64",
+                                etype="invalid_request_error",
+                                code="invalid_audio"))
                         else:
                             pcm.extend(raw)
                     elif etype == "input_audio_buffer.commit":
-                        if not pcm:
+                        # whole samples only: an odd trailing byte waits for
+                        # the rest of its sample in the next append
+                        whole = len(pcm) - len(pcm) % 2
+                        if not whole:
                             out_stream.put_nowait(self._error(
                                 "input audio buffer is empty",
                                 etype="invalid_request_error",
                                 code="input_audio_buffer_commit_empty"))
                             continue
                         try:
-                            args = self._utterance_args(session, bytes(pcm))
+                            args = self._utterance_args(session, bytes(pcm[:whole]))
                         except Exception as exc:  # noqa: BLE001 — keep the session usable
                             logger.exception("realtime: building the utterance request failed")
                             out_stream.put_nowait(self._error(
                                 str(exc), etype="invalid_request_error"))
-                            pcm = bytearray()
+                            pcm = pcm[whole:]
                             continue
-                        pcm = bytearray()
+                        pcm = pcm[whole:]
                         await slots.acquire()
                         turn = _RealtimeTurn()
                         turns.append(turn)

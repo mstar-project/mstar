@@ -95,6 +95,7 @@ impl NodeState {
 
 #[derive(Clone, Default)]
 struct LoopState {
+    max_iters: u32,          // Loop.max_iters, this request's copy
     curr_iter: u32,          // Loop.curr_iter
     finish_signal: bool,     // Loop._finish_signal
     done: bool,              // Loop.is_done
@@ -152,8 +153,6 @@ pub struct Completed {
     /// The edges to route, loop-back edges of a finishing loop already
     /// filtered out.
     pub edges: Vec<RoutedEdge>,
-    /// Python's `NodeCompletionOutput.filtered_signals`.
-    pub filtered: Vec<(Sym, NodeId)>,
     /// Uuids to dereference: inputs the completion cleared and tensors a
     /// loop reset or un-cached, as Python dereferences them.
     pub freed: Vec<u64>,
@@ -161,6 +160,8 @@ pub struct Completed {
     /// takes a reference on each. Apply before `freed`, which can name the
     /// same tensor.
     pub taken: Vec<u64>,
+    /// Finished-loop cache holds to exchange for routed readers AFTER fanout.
+    pub transferred: Vec<u64>,
 }
 
 /// Python's `SpeculativeNodeInfo`.
@@ -188,18 +189,23 @@ pub struct RequestState {
     /// `Loop._uncache_outputs`, `Loop._uncache_accumulated_outputs`).
     refs_taken: Vec<u64>,
     refs_released: Vec<u64>,
+    refs_transferred: Vec<u64>,
 }
 
 impl RequestState {
     pub fn new(graph: GraphRef) -> Self {
         let nodes = graph.nodes.iter().map(|n| NodeState::new(n.inputs.len())).collect();
-        let loops = vec![LoopState::default(); graph.loops.len()];
+        let loops = graph
+            .loops
+            .iter()
+            .map(|l| LoopState { max_iters: l.max_iters, ..LoopState::default() })
+            .collect();
         let w = graph.n_ready_words();
         let mut s = Self {
             nodes, loops, ready: vec![0; w], ready_streaming: vec![0; w],
             root_completed: 0, is_done: false, num_times_run: 0,
             spec_dirty: Vec::new(), refs_taken: Vec::new(),
-            refs_released: Vec::new(), graph,
+            refs_released: Vec::new(), refs_transferred: Vec::new(), graph,
         };
         s.seed_streaming_ready();
         s
@@ -517,10 +523,9 @@ impl RequestState {
             out.push(routed(e, out_tensors.get(i).cloned().unwrap_or_default()));
         }
 
-        let mut filtered: Vec<(Sym, NodeId)> = Vec::new();
         match spec.loop_id {
             None => self.root_entity_done(),
-            Some(lid) => self.entity_completed(g, lid, 0, &mut out, &mut filtered),
+            Some(lid) => self.entity_completed(g, lid, 0, &mut out),
         }
 
         if self.is_done && !prev_done {
@@ -529,9 +534,9 @@ impl RequestState {
         freed.append(&mut self.refs_released);
         Completed {
             edges: out,
-            filtered,
             freed,
             taken: std::mem::take(&mut self.refs_taken),
+            transferred: std::mem::take(&mut self.refs_transferred),
         }
     }
 
@@ -547,7 +552,7 @@ impl RequestState {
     /// Mirrors `LoopStateRegistry.mark_entity_complete` + `Loop.complete_iter`.
     fn entity_completed(
         &mut self, g: &CompiledGraph, lid: LoopId, edges_from: usize,
-        out: &mut Vec<RoutedEdge>, filtered: &mut Vec<(Sym, NodeId)>,
+        out: &mut Vec<RoutedEdge>,
     ) {
         let lspec = g.lp(lid);
         self.cache_outputs(g, lid, edges_from, out);
@@ -563,10 +568,10 @@ impl RequestState {
 
         let finishing = {
             let st = &self.loops[lid as usize];
-            st.finish_signal || lspec.max_iters == st.curr_iter + 1
+            st.finish_signal || st.max_iters == st.curr_iter + 1
         };
         if finishing {
-            self.finish_loop(g, lid, out, filtered);
+            self.finish_loop(g, lid, out);
         } else {
             self.advance_loop(g, lid, out);
         }
@@ -607,17 +612,15 @@ impl RequestState {
 
     fn finish_loop(
         &mut self, g: &CompiledGraph, lid: LoopId, out: &mut Vec<RoutedEdge>,
-        filtered: &mut Vec<(Sym, NodeId)>,
     ) {
         let lspec = g.lp(lid);
         self.loops[lid as usize].done = true;
 
-        // Drop loop-back edges: the loop is over, nothing re-enters it.
+        // Drop loop-back edges: the loop is over, nothing re-enters it. By
+        // (name, dest name) as Python's filtered_signals, so a loop-back into
+        // another worker graph is dropped too.
         let lb = &lspec.loop_back;
-        out.retain(|e| !matches!(e.dest, Dest::Local(d)
-            if lb.iter().any(|(n, dn)| *n == e.name && *dn == d)));
-        // Python surfaces these as NodeCompletionOutput.filtered_signals.
-        filtered.extend_from_slice(lb);
+        out.retain(|e| !lb.contains(&(e.name, e.dest_sym)));
 
         // Clear the body subtree. The loop's OWN curr_iter survives until a
         // parent advance (Python: inner_registry.clear() doesn't touch it).
@@ -627,6 +630,11 @@ impl RequestState {
             let st = &mut self.loops[lid as usize];
             (std::mem::take(&mut st.cached), std::mem::take(&mut st.accum))
         };
+        // Keep the holds alive through fanout/persist marking. Nested loops
+        // can transfer the same UUID more than once; preserve multiplicity.
+        for (_, tensors) in cached.iter().chain(accum.iter()) {
+            self.refs_transferred.extend(tensors.iter().map(|t| t.uuid));
+        }
         let own_edges_from = out.len();
         for o in &lspec.outputs {
             let t = cached.iter().find(|(n, _)| *n == o.name)
@@ -648,7 +656,7 @@ impl RequestState {
         //     to the same `out`.
         match lspec.parent {
             None => self.root_entity_done(),
-            Some(p) => self.entity_completed(g, p, own_edges_from, out, filtered),
+            Some(p) => self.entity_completed(g, p, own_edges_from, out),
         }
     }
 
@@ -745,23 +753,45 @@ impl RequestState {
 
     // -- loops ---------------------------------------------------------------
 
-    /// Python's `register_loop_finish_signal`; caller drops the returned
-    /// loop-back (name, dest) pairs from this iteration's routing.
-    pub fn register_loop_finish(&mut self, lid: LoopId) -> &[(Sym, NodeId)] {
+    /// Python's `register_loop_finish_signal`. The loop-back edges are
+    /// dropped when the loop next completes an iteration, in `finish_loop`.
+    pub fn register_loop_finish(&mut self, lid: LoopId) {
         self.loops[lid as usize].finish_signal = true;
-        &self.graph.lp(lid).loop_back
     }
 
     pub fn loop_iter(&self, lid: LoopId) -> u32 {
         self.loops[lid as usize].curr_iter
     }
 
+    /// True once the loop is done or its finish signal is set. Setting the
+    /// finish signal leaves `done` false, and Python's `_can_continue_loop`
+    /// reads the finish signal too.
     pub fn loop_finished(&self, lid: LoopId) -> bool {
-        self.loops[lid as usize].done
+        let st = &self.loops[lid as usize];
+        st.done || st.finish_signal
+    }
+
+    pub fn loop_max_iters(&self, lid: LoopId) -> u32 {
+        self.loops[lid as usize].max_iters
+    }
+
+    pub fn cap_loop(&mut self, lid: LoopId, cap: u32) {
+        let st = &mut self.loops[lid as usize];
+        st.max_iters = st.max_iters.min(cap);
     }
 
     pub fn loop_indices(&self) -> Vec<u32> {
         self.loops.iter().map(|l| l.curr_iter).collect()
+    }
+
+    /// Python's `WorkerGraphIO.is_idle`: no input held, nothing in flight, no
+    /// loop mid-run -- what `reset` leaves behind.
+    pub fn is_idle(&self) -> bool {
+        self.root_completed == 0
+            && self.nodes.iter().all(|n| {
+                n.cur.mask == 0 && n.next.mask == 0 && n.spec.mask == 0 && !n.in_flight
+            })
+            && self.loops.iter().all(|l| l.curr_iter == 0 && l.ext_inputs.is_empty())
     }
 
     // -- speculation ---------------------------------------------------------
@@ -785,7 +815,7 @@ impl RequestState {
                 dests.push(d);
             }
             if let Some(lid) = src_loop {
-                if g.lp(lid).loop_back.iter().any(|(n, dn)| *n == e.name && *dn == d)
+                if g.lp(lid).loop_back.contains(&(e.name, e.dest_sym))
                     && !next_iter.contains(&d)
                 {
                     next_iter.push(d);
@@ -836,7 +866,7 @@ impl RequestState {
             n.clear();
         }
         for l in self.loops.iter_mut() {
-            *l = LoopState::default();
+            *l = LoopState { max_iters: l.max_iters, ..LoopState::default() };
         }
         for w in self.ready.iter_mut() { *w = 0 }
         for w in self.ready_streaming.iter_mut() { *w = 0 }
@@ -940,6 +970,7 @@ mod tests {
                 // Advancing un-caches the regular output only; the
                 // accumulated one is held across iterations.
                 assert_eq!(done.freed, vec![new_tok], "iteration {i}");
+                assert!(done.transferred.is_empty());
                 assert_eq!(st.loop_iter(0), i as u32 + 1);
                 let names: Vec<Sym> = done.edges.iter().map(|e| e.name).collect();
                 assert_eq!(names, vec![tok, it.get("frame").unwrap(), h]);
@@ -954,7 +985,7 @@ mod tests {
                 // Finishing hands the caches to the loop's output edges: no
                 // release, and the loop-back edge is dropped.
                 assert!(done.freed.is_empty());
-                assert_eq!(done.filtered, vec![(tok, dec)]);
+                assert_eq!(done.transferred, vec![30, 11, 21, 31]);
                 assert!(done.edges.iter().all(|e| !matches!(e.dest, Dest::Local(_))));
                 let out: Vec<(Dest, Vec<u64>)> = done.edges.iter()
                     .filter(|e| e.dest == Dest::EmitToClient)
@@ -994,16 +1025,15 @@ mod tests {
 
     #[test]
     fn finish_signal_ends_the_loop_early() {
-        let (it, g) = decode_loop();
+        let (_, g) = decode_loop();
         let dec = 1;
         let mut st = RequestState::new(g.clone());
         st.ingest(&g, dec, 0, &[t(2)], true, false);
         st.ingest(&g, dec, 1, &[t(3)], true, false);
-        let lb = st.register_loop_finish(0).to_vec();
-        assert_eq!(lb, vec![(it.get("tok").unwrap(), dec)]);
+        st.register_loop_finish(0);
         st.clear_consumed_inputs(&g, dec);
         let done = st.complete(&g, dec, &[vec![t(10)], vec![t(11)]]);
-        assert!(st.loop_finished(0));
+        assert!(st.loops[0].done);
         assert_eq!(st.loop_iter(0), 0);
         assert!(done.freed.is_empty());
         let out: Vec<Vec<u64>> = done.edges.iter()

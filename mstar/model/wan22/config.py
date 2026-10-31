@@ -68,16 +68,66 @@ class Wan22Config:
     # Ceiling on the denoise loop; the per-request step count is clamped to it.
     max_denoise_steps: int = 100
 
+    # Ceiling on a request's height x width x num_frames (about 3.6x the default
+    # 1280x704x81 clip); DiT memory grows with it. A larger request is a 400.
+    max_video_pixels: int = 256 * 2**20
+
     # torch.compile the inner DiT region (patchify -> blocks -> head). The UniPC
     # solver stays eager — its CPU-resident sigma trips Inductor (see
     # Wan22DitSubmodule). Default ON in serving; the reference-equivalence gates
-    # build with this False so the eager path stays the bit-exact reference.
+    # build with this False to hold the eager path against the reference.
     compile_dit: bool = True
+    # "WxHxF" request shapes (width x height x num_frames) the compiled DiT
+    # serves; None is the default shape (1280x704x81). Every other shape runs
+    # the transformer eager. The compile traces one graph per input shape and
+    # requests choose theirs, so an open set would let each new shape cost a
+    # compile on the shared worker. A listed shape compiles at most twice (CFG
+    # on and off).
+    compile_dit_sizes: tuple[str, ...] | None = None
 
     # VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably
     # exceeds the estimated untiled peak for the output size and tiles otherwise;
     # "tiled"/"untiled" force a path. WAN22_VAE_DECODE_TILING overrides at runtime.
     vae_decode_tiling: str = "auto"
+
+    # Compiled untiled decode through the shared Wan VAE decoder. Each output size costs a compile, so only
+    # ``vae_decode_fast_sizes`` use it; other sizes and tiled decodes run stock ``vae.decode`` / ``tiled_decode``.
+    # Compiled in Inductor's deterministic mode, so the frames do not depend on the server process, except on a
+    # torch without that mode (2.9.1).
+    vae_decode_fast: bool = True
+    # "WxH" output sizes the fast decode compiles for; None is the default size
+    # (1280x704). Requests choose their size, so an open list would let each new
+    # size cost a compile on the shared worker.
+    vae_decode_fast_sizes: tuple[str, ...] | None = None
+
+    def __post_init__(self):
+        # A yaml "false" is a truthy string, so a non-boolean is rejected here
+        # rather than read as on.
+        if not isinstance(self.vae_decode_fast, bool):
+            raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
+        self.fast_decode_sizes()
+
+    def fast_decode_sizes(self) -> frozenset[tuple[int, int]]:
+        """``vae_decode_fast_sizes`` as (width, height) pixel pairs."""
+        sizes = self.vae_decode_fast_sizes
+        if sizes is None:
+            return frozenset({(self.default_width, self.default_height)})
+        if isinstance(sizes, str) or not isinstance(sizes, (list, tuple)):
+            raise ValueError(f"Wan2.2 vae_decode_fast_sizes must be a list of 'WxH' sizes, got {sizes!r}.")
+        align_h, align_w = self.spatial_alignment
+        parsed = set()
+        for size in sizes:
+            try:
+                width, height = (int(v) for v in str(size).lower().split("x"))
+            except ValueError:
+                raise ValueError(f"Wan2.2 vae_decode_fast_sizes entry must be 'WxH', got {size!r}.") from None
+            if width <= 0 or height <= 0 or width % align_w or height % align_h:
+                raise ValueError(
+                    f"Wan2.2 vae_decode_fast_sizes entry {size!r} must be positive multiples of "
+                    f"{align_w}x{align_h}."
+                )
+            parsed.add((width, height))
+        return frozenset(parsed)
 
     @property
     def hidden_size(self) -> int:
@@ -97,3 +147,31 @@ class Wan22Config:
             self.vae_scale_factor_spatial * self.patch_size[1],
             self.vae_scale_factor_spatial * self.patch_size[2],
         )
+
+    def compile_dit_grids(self) -> frozenset[tuple[int, int, int]]:
+        """``compile_dit_sizes`` as latent (frames, height, width) grids, the
+        trailing dims of the DiT's input."""
+        sizes = self.compile_dit_sizes
+        if sizes is None:
+            sizes = (f"{self.default_width}x{self.default_height}x{self.default_num_frames}",)
+        if isinstance(sizes, str) or not isinstance(sizes, (list, tuple)):
+            raise ValueError(f"Wan2.2 compile_dit_sizes must be a list of 'WxHxF' shapes, got {sizes!r}.")
+        align_h, align_w = self.spatial_alignment
+        temporal = self.vae_scale_factor_temporal
+        grids = set()
+        for size in sizes:
+            try:
+                width, height, frames = (int(v) for v in str(size).lower().split("x"))
+            except ValueError:
+                raise ValueError(f"Wan2.2 compile_dit_sizes entry must be 'WxHxF', got {size!r}.") from None
+            if min(width, height, frames) <= 0 or width % align_w or height % align_h or (frames - 1) % temporal:
+                raise ValueError(
+                    f"Wan2.2 compile_dit_sizes entry {size!r} must be positive multiples of "
+                    f"{align_w}x{align_h} with {temporal}k+1 frames."
+                )
+            grids.add((
+                (frames - 1) // temporal + 1,
+                height // self.vae_scale_factor_spatial,
+                width // self.vae_scale_factor_spatial,
+            ))
+        return frozenset(grids)
