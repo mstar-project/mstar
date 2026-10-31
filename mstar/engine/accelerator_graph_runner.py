@@ -686,7 +686,7 @@ class AcceleratorGraphRunner:
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(
-                device, joint_comm_group.world_size
+                device, joint_comm_group.head_shards
             )
         )
         self._resources = resources

@@ -48,7 +48,7 @@ def _manager(
     cfg.update(overrides)
     kv = KVManager(
         cfg=PagedKVConfig(**cfg),
-        name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=world_size),
+        name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=world_size, head_shards=world_size),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
         needs_remote_transfer=shared,
     )
@@ -316,7 +316,7 @@ def test_the_serving_config_turns_on_prefix_cache_tp():
     ))
     apply_yaml_overrides([spec], yaml.safe_load("resources:\n  kv:\n    prefix_cache_tp: true\n"))
     kv = KVManager(
-        cfg=spec.config, name="kv", joint_comm_group=SimpleNamespace(rank=0, world_size=2),
+        cfg=spec.config, name="kv", joint_comm_group=SimpleNamespace(rank=0, world_size=2, head_shards=2),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
     )
     assert kv.enable_prefix_cache(ROOT, WALKS), "the serving config's prefix_cache_tp never reached the pool"

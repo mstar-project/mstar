@@ -130,7 +130,7 @@ class AttnBackendRegistry:
         self._check(entry, spec, kv_config)
         if info.joint_comm_group is not None:
             # per-rank head counts; `shard` is idempotent, so both builders can call it
-            kv_config.shard(info.joint_comm_group.world_size)
+            kv_config.shard(info.joint_comm_group.head_shards)
         if entry.platforms and current_platform.name not in entry.platforms:
             raise RuntimeError(
                 f"attention backend {backend.value!r} runs on {' or '.join(entry.platforms)}; "
