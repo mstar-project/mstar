@@ -41,6 +41,9 @@ Conventions the base fixes:
   attend over a sub-span (a refiner over the image tokens alone, say) lists
   each span with its own label in :meth:`attention_segments` and threads
   :meth:`ragged_for` that label to those layers.
+* A per-step dtype policy (``step_dtypes``, a model's ``linear_dtype_steps``) is
+  the base's alone: a step's key is then a :class:`StepBucket`, so rows batch and
+  capture per dtype, and the hooks keep seeing the model's own key.
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import torch
@@ -60,6 +64,7 @@ from mstar.distributed.guidance_parallel import GuidanceParallel
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.fp8_linear import StepDtypes
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -80,6 +85,14 @@ class StepScalar(NamedTuple):
     # viewed as [B, 1, 1] to broadcast over [B, L, C]; a plain [B] otherwise
     broadcast: bool = True
     capture_fill: float = 1.0  # placeholder value for a graph capture's dummy rows
+
+
+@dataclass(frozen=True)
+class StepBucket:
+    """A step's key under a per-step dtype policy: two dtypes can't share a forward or a graph."""
+
+    bucket: Hashable
+    dtype: str
 
 
 class DenoiseLoopSubmodule(NodeSubmodule):
@@ -130,6 +143,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         replay_walks: Mapping[str, Sequence[str]] | None = None,
         max_uncaptured_layouts: int = 4,
         guidance_parallel: GuidanceParallel | None = None,
+        step_dtypes: StepDtypes | None = None,
     ):
         super().__init__()
         self.loop_name = loop_name
@@ -155,6 +169,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # One callable per attention label for the life of a binding; see
         # :meth:`ragged_for`.
         self._ragged_fns: dict[str, RaggedAttentionCallable] = {}
+        self.step_dtypes = step_dtypes
 
     @property
     def loop_back_names(self) -> tuple[str, ...]:
@@ -325,6 +340,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             return self.guidance_parallel.exchange(out)
         return out.unflatten(0, (batch, 2)).unbind(1)
 
+    def _step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> Hashable:
+        """What this step batches and captures on: ``bucket_key``, per dtype under a policy."""
+        if self.step_dtypes is None:
+            return bucket_key
+        return StepBucket(bucket_key, self.step_dtypes.at(self.step_index(fwd_info)))
+
+    def _bucket_of(self, step_key: Hashable) -> Hashable:
+        return step_key if self.step_dtypes is None else step_key.bucket
+
     def _ragged(self) -> RaggedAttentionCallable | None:
         """The attention callable for the ``"main"`` span, or None (SDPA)."""
         return self.ragged_for(self.MAIN_SPAN)
@@ -386,7 +410,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             **self.request_inputs(fwd_info, inputs, bucket_key),
         }
         return NodeInputs(
-            tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=bucket_key,
+            tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key),
+            resource_step_info=self._step_key(fwd_info, bucket_key),
         )
 
     def _step_scalar_sources(
@@ -463,6 +488,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     ) -> dict[str, torch.Tensor]:
         """One stacked step, as ``{loop-back edge: [B, ...]}``."""
         bucket_key = kwargs.pop("bucket_key")
+        if self.step_dtypes is not None:
+            self.step_dtypes.active = bucket_key.dtype
+            bucket_key = bucket_key.bucket
         carried = {name: kwargs.pop(name) for name in self.loop_back_names}
         scalars = {name: kwargs.pop(name) for name in self.STEP_SCALARS}
         out = self.denoise(engine_inputs, bucket_key, **carried, **scalars, **kwargs)
@@ -515,8 +543,16 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         del per_request_input_metadata, kwargs
         # Padding rows (a captured bucket's dummy requests) carry no step metadata; the
         # real rows decide the bucket.
-        keys = [self.bucket_key_for(info) for info in per_request_info.values() if info.step_metadata]
+        keys = [
+            self._step_key(info, self.bucket_key_for(info))
+            for info in per_request_info.values() if info.step_metadata
+        ]
         return self._uniform_key(keys) if keys else None
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        # a mix of dtypes matches no capture and would run a row at a time
+        del graph_walk
+        return self.step_dtypes is not None
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
@@ -529,7 +565,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         segments = [
             Segment(request_id=rid, label=label, span=span)
             for rid, inp in zip(request_ids, inputs, strict=True)
-            for label, span in self.attention_segments(inp.resource_step_info)
+            for label, span in self.attention_segments(self._bucket_of(inp.resource_step_info))
         ]
         return SubmoduleStep(
             segments=segments,
@@ -542,29 +578,34 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
         configs = []
         for walk, bucket_key in self.capture_buckets:
-            tensors = dict(self.capture_request_inputs(bucket_key, device))
-            for name, scalar in self.STEP_SCALARS.items():
-                tensors[name] = torch.full(
-                    (1,), scalar.capture_fill, dtype=torch.float32, device=device,
-                )
-            single = NodeInputs(
-                tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=bucket_key,
+            step_keys = (
+                [bucket_key] if self.step_dtypes is None
+                else [StepBucket(bucket_key, dtype) for dtype in self.step_dtypes.dtypes]
             )
-            configs.append(BatchedAcceleratorGraphConfig(
-                capture_graph_walk=walk,
-                replay_graph_walks=[walk, *self.replay_walks.get(walk, ())],
-                single_request_inputs=single,
-                additional_key_info=bucket_key,
-                # the model compiles its own transformer region; the graph records those kernels
-                compile=False,
-                capture_batch_sizes=list(self.capture_batch_sizes),
-                # uncaptured sizes / shapes run the eager batched path, so don't cap the batch
-                caps_eager_batch_size=False,
-                # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
-                # embedding's hidden size can equal an edit bucket's token count (7680 for klein), which
-                # would otherwise be mistaken for the token axis
-                input_seq_dims={key: 0 for key in tensors},
-            ))
+            for step_key in step_keys:
+                tensors = dict(self.capture_request_inputs(bucket_key, device))
+                for name, scalar in self.STEP_SCALARS.items():
+                    tensors[name] = torch.full(
+                        (1,), scalar.capture_fill, dtype=torch.float32, device=device,
+                    )
+                single = NodeInputs(
+                    tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=step_key,
+                )
+                configs.append(BatchedAcceleratorGraphConfig(
+                    capture_graph_walk=walk,
+                    replay_graph_walks=[walk, *self.replay_walks.get(walk, ())],
+                    single_request_inputs=single,
+                    additional_key_info=step_key,
+                    # the model compiles its own transformer region; the graph records those kernels
+                    compile=False,
+                    capture_batch_sizes=list(self.capture_batch_sizes),
+                    # uncaptured sizes / shapes run the eager batched path, so don't cap the batch
+                    caps_eager_batch_size=False,
+                    # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
+                    # embedding's hidden size can equal an edit bucket's token count (7680 for klein), which
+                    # would otherwise be mistaken for the token axis
+                    input_seq_dims={key: 0 for key in tensors},
+                ))
         return configs
 
 
