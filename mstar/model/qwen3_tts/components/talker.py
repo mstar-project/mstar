@@ -51,7 +51,8 @@ class Qwen3TTSResizeMLP(nn.Module):
 
 
 class Qwen3TTSTalkerLayer(nn.Module):
-    """One pre-norm Talker block backed by M* tensor-parallel layers."""
+    """Parameter container for one pre-norm Talker block, backed by M*
+    tensor-parallel layers. ``Qwen3TTSTalkerLanguageModel`` runs it."""
 
     def __init__(
         self,
@@ -82,22 +83,6 @@ class Qwen3TTSTalkerLayer(nn.Module):
             activation="silu",
             comm_group=comm_group,
         )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states,
-        )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
 
 
 class Qwen3TTSTalkerLanguageModel(nn.Module):
@@ -132,13 +117,24 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         # make inductor specialize on the int. The resources own the pages, so
         # module code stays clear of the allocator.
         self.layers[0].self_attn.attend.bind_step(label)
+        # Each residual add is deferred into the next norm: one fused add+norm
+        # kernel (in place) per norm instead of an add and a norm.
+        residual = None
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states)
+            if residual is None:
+                residual = hidden_states
+                h = layer.input_layernorm(hidden_states)
+            else:
+                h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
+            h = layer.self_attn(h)
+            h, residual = layer.post_attention_layernorm.forward_residual(h, residual)
+            hidden_states = layer.mlp(h)
         # Sequence lengths still advance once per forward, after every layer
         # wrote K/V for the same packed range — the runner does it now, on the
         # step this forward was declared from.
-        return self.norm(hidden_states)
+        normed, _ = self.norm.forward_residual(hidden_states, residual)
+        return normed
 
 
 class Qwen3TTSTalkerModel(nn.Module):
@@ -294,11 +290,17 @@ class Qwen3TTSCodePredictor(nn.Module):
         end = cache_pos + seq_len
         flat_position_ids = position_ids.reshape(-1).to(torch.int32)
 
+        # Each residual add is deferred into the next norm: one fused add+norm
+        # kernel per norm. These run on every layer of every pass.
+        residual = None
         for layer_idx, layer in enumerate(self.model.layers):
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
+            if residual is None:
+                residual = hidden_states
+                h = layer.input_layernorm(hidden_states)
+            else:
+                h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
             attn = layer.self_attn
-            qkv = attn.qkv_proj(hidden_states)
+            qkv = attn.qkv_proj(h)
             q_size = attn.num_heads * attn.head_dim
             kv_size = attn.num_kv_heads * attn.head_dim
             q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)
@@ -333,10 +335,8 @@ class Qwen3TTSCodePredictor(nn.Module):
                 end,
             )
             attn_output = attn_output.reshape(batch_size, seq_len, -1)
-            hidden_states = residual + attn.o_proj(attn_output)
+            h, residual = layer.post_attention_layernorm.forward_residual(attn.o_proj(attn_output), residual)
+            hidden_states = layer.mlp(h)
 
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
-            hidden_states = residual + layer.mlp(hidden_states)
-
-        return self.model.norm(hidden_states)
+        normed, _ = self.model.norm.forward_residual(hidden_states, residual)
+        return normed

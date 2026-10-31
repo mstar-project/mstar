@@ -1300,11 +1300,8 @@ def test_qwen3_tts_code_predictor_projects_wider_talker_inputs():
     )
 
     for layer in predictor.model.layers:
-        layer.input_layernorm = torch.nn.Identity()
-        layer.post_attention_layernorm = torch.nn.Identity()
         layer.self_attn.q_norm = torch.nn.Identity()
         layer.self_attn.k_norm = torch.nn.Identity()
-    predictor.model.norm = torch.nn.Identity()
     import mstar.model.qwen3_tts.components.talker as talker_module
     original_rope = talker_module.apply_rope_pos_ids
     original_attn = talker_module.decode_attn_nhd
@@ -1335,15 +1332,12 @@ def test_qwen3_tts_code_predictor_projects_wider_talker_inputs():
 def test_qwen3_tts_code_predictor_uses_decode_attn_nhd(monkeypatch):
     config = _tiny_model_config()
     predictor = Qwen3TTSCodePredictor(config)
-    # This CPU-only contract test targets the decode-attention call. FlashInfer
-    # RMSNorm and the Triton attention kernel are CUDA-only, so replace them
-    # without changing attention geometry.
+    # This CPU-only contract test targets the decode-attention call. The Triton
+    # attention kernel is CUDA-only, so replace it without changing attention
+    # geometry.
     for layer in predictor.model.layers:
-        layer.input_layernorm = torch.nn.Identity()
-        layer.post_attention_layernorm = torch.nn.Identity()
         layer.self_attn.q_norm = torch.nn.Identity()
         layer.self_attn.k_norm = torch.nn.Identity()
-    predictor.model.norm = torch.nn.Identity()
     rope_calls = []
 
     def capture_rope(q, k, position_ids, rope_theta):
