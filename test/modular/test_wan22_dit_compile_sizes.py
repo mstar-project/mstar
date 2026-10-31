@@ -52,19 +52,25 @@ def _step(node: Wan22DitSubmodule, width: int, height: int, frames: int, guidanc
     t_lat, h_lat, w_lat = (frames - 1) // 4 + 1, height // 16, width // 16
     gen = torch.Generator().manual_seed(width * 7 + height * 3 + frames)
     shape = (1, CHANNELS, t_lat, h_lat, w_lat)
-    meta = {"num_inference_steps": 4, "guidance_scale": guidance}
-    out = node.forward(
-        "video_gen",
-        engine_inputs=SimpleNamespace(single_request_info=SimpleNamespace(
-            step_metadata=meta, dynamic_loop_iter_counts={DENOISE_LOOP_NAME: 1},
-        )),
-        latents=torch.randn(shape, generator=gen),
-        unipc_model_outputs=torch.randn((2, *shape), generator=gen),
-        unipc_last_sample=torch.randn(shape, generator=gen),
-        text_embeds_pos=torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen),
-        text_embeds_neg=torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen),
+    meta = {
+        "num_inference_steps": 4, "guidance_scale": guidance, "height": height, "width": width, "num_frames": frames,
+    }
+    info = SimpleNamespace(
+        request_id="r", rid_handle="r", graph_walk="video_gen", step_metadata=meta,
+        dynamic_loop_iter_counts={DENOISE_LOOP_NAME: 1},
     )
-    return out["latents"][0]
+    node.request_states.pop("r", None)
+    node.get_device = lambda: torch.device("cpu")
+    prepared = node.prepare_inputs("video_gen", info, {
+        "latents": [torch.randn(shape, generator=gen)],
+        "unipc_model_outputs": [torch.randn((2, *shape), generator=gen)],
+        "unipc_last_sample": [torch.randn(shape, generator=gen)],
+        "text_embeds_pos": [torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen)],
+        "text_embeds_neg": [torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen)],
+    })
+    engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": info})
+    stacked = node.preprocess("video_gen", engine_inputs, [prepared])
+    return node.forward("video_gen", engine_inputs=engine_inputs, **stacked)["latents"][0]
 
 
 def _stub_compile(monkeypatch) -> tuple[list[tuple], list[int]]:
