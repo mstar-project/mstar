@@ -23,7 +23,17 @@ logger = logging.getLogger(__name__)
 class CombinedSplit:
     """A combined walk run on two kernels: decode for one-token rows, prefill
     for the rows of ``prefill_walks``, captured for as many as
-    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows)."""
+    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows).
+
+    The engine orders a step of ``combined_walk`` with the rows of
+    ``prefill_walks`` last, so both kernels read the step's tokens in place:
+    the decode kernel the leading run of one-token rows, the prefill kernel
+    the rows after it (under capture every token, the run as one leading
+    sequence). Every walk of ``combined_walk`` outside ``prefill_walks`` must
+    be one token per row: its rows go first, and a multi-token one there
+    ends the run, so it and every decode row after it count as prompt rows,
+    and a captured step's plan raises if its prompt rows then exceed
+    ``max_prefill_rows``."""
     combined_walk: str
     prefill_walks: tuple[str, ...]
 
@@ -50,6 +60,10 @@ class NodeResourceSpec(ABC):
         """Keys whose specs this one builds against; the engine resolves them
         into ``EngineResourceInfo.dependencies``."""
         return set()
+
+    def combined_splits(self) -> "tuple[CombinedSplit, ...]":
+        """The combined walks this resource runs on split kernels."""
+        return ()
 
     @property
     def writes_prefix_snapshots(self) -> bool:
