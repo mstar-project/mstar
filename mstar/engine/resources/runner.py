@@ -543,6 +543,9 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 self._unwind(step, [*covered, *admitted, key])
+                # the unwind gave back the stage's pages, so a retry must plan afresh
+                if self._staged is not None:
+                    self.clear_preplan()
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
