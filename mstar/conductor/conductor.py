@@ -1424,18 +1424,14 @@ class Conductor:
                 pstate = partition_states[partition_name]
                 inputs_per_worker = self._split_inputs_to_workers(
                     sharding_config=request_data.sharding_config,
-                    inputs=fwd_args.inputs,
+                    inputs=self._with_chunk_ticks(
+                        fwd_args.inputs, fwd_args.full_metadata.graph_walk,
+                    ),
                     graph_walk=fwd_args.full_metadata.graph_walk,
                 )
 
-                self._update_persist_ref_counts(
-                    body.request_id,
-                    inputs_per_worker.get(worker_id, [])
-                )
-                initial_inputs = self._with_chunk_ticks(
-                    inputs_per_worker.get(worker_id, []),
-                    fwd_args.full_metadata.graph_walk,
-                )
+                initial_inputs = inputs_per_worker.get(worker_id, [])
+                self._update_persist_ref_counts(body.request_id, initial_inputs)
 
                 message = NewRequest(
                     request_id=body.request_id,
@@ -1982,7 +1978,9 @@ class Conductor:
         Every entry into the walk needs one, re-entry included: the seed makes
         the node ready for the walk's FIRST chunk, and later chunks get the
         signal from their own routing. Carries no tensor, so the worker ingests
-        it straight away (see ``chunk_tick_name``).
+        it straight away (see ``chunk_tick_name``). Added before the split, so
+        as signal-only edges the seeds reach exactly the chunked node's ranks,
+        which need not be the ranks the walk's other inputs go to.
         """
         ticks = self._chunk_ticks.get(graph_walk)
         if not ticks:
@@ -1996,9 +1994,10 @@ class Conductor:
         self, request_id: str, partition_name: str, fwd_args: ForwardPassArgs,
     ):
         """Send InputSignals for a specific partition's next forward pass."""
+        walk = fwd_args.full_metadata.graph_walk
         self._send_inputs(
-            request_id, partition_name, fwd_args.inputs,
-            fwd_args.full_metadata.graph_walk, fwd_args.step_metadata,
+            request_id, partition_name, self._with_chunk_ticks(fwd_args.inputs, walk),
+            walk, fwd_args.step_metadata,
         )
 
     def _send_inputs(
@@ -2023,7 +2022,7 @@ class Conductor:
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
                     request_id=request_id,
-                    inputs=self._with_chunk_ticks(worker_inputs, graph_walk),
+                    inputs=worker_inputs,
                     request_info=CurrentForwardPassInfo(
                         request_id=request_id,
                         graph_walk=graph_walk,
