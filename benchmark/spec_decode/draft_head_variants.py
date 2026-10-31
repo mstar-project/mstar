@@ -164,6 +164,7 @@ def main(argv=None) -> int:
     ap.add_argument("--n-long", type=int, default=16)
     ap.add_argument("--max-new-chat", type=int, default=256)
     ap.add_argument("--max-new-long", type=int, default=128)
+    ap.add_argument("--extra-prompts", help="a file of further prompts, one a line, scored as their own set")
     ap.add_argument("--variants", nargs="+", default=[
         "fp8", "fp8-rowscale", "fp8-x", "int8", "int8-rowscale", "int6-rowscale", "int4-rowscale",
         "prefix-64000", "prefix-96000", "prefix-128000", "prefix-151000",
@@ -184,6 +185,9 @@ def main(argv=None) -> int:
         "chat": ([chat_ids(tokenizer, p) for p in read_prompts(CHAT_PROMPTS, args.n_chat)], args.max_new_chat),
         "long": ([chat_ids(tokenizer, p) for p in read_prompts(LONG_PROMPTS, args.n_long)], args.max_new_long),
     }
+    if args.extra_prompts:
+        extra = read_prompts(Path(args.extra_prompts), 1 << 30)
+        sets["extra"] = ([chat_ids(tokenizer, p) for p in extra], args.max_new_chat)
     out: dict = {"model": args.model, "k": args.k, "sets": {}}
     for name, (prompts, max_new) in sets.items():
         for v in variants:
