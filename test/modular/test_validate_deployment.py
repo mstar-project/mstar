@@ -256,7 +256,8 @@ def test_config_that_is_not_a_mapping_is_refused(tmp_path):
 def test_ranks_not_divisible_by_the_instance_size_are_refused(tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1, 2], "tp_size": 2}])
     _refused(_Model(tp_enabled_nodes=["llm"]), cfg,
-             r"node_groups\[0\] \(nodes \['llm'\]\) has 3 ranks; not divisible by tp_size\*sp_size\*cfg_size \(2\*1\*1=2\)")
+             r"node_groups\[0\] \(nodes \['llm'\]\) has 3 ranks; not divisible by "
+             r"tp_size\*sp_size\*cfg_size \(2\*1\*1=2\)")
 
 
 @pytest.mark.parametrize("axis", ["tp", "sp", "cfg"])
@@ -365,7 +366,8 @@ def test_parallel_ranks_off_their_position_are_refused(tmp_path):
     worker_2 and rank 2 off the end."""
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [1, 2], "tp_size": 2}])
     _refused(_Model(tp_enabled_nodes=["llm"]), cfg,
-             r"the deployment uses ranks \[1, 2\]; ranks \[1, 2\] are in tensor-, sequence- or guidance-parallel groups")
+             r"the deployment uses ranks \[1, 2\]; ranks \[1, 2\] are in tensor-, sequence- or "
+             r"guidance-parallel groups")
 
 
 def test_an_unused_rank_above_the_parallel_ones_is_accepted(tmp_path, monkeypatch):
