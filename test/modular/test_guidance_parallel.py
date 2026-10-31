@@ -297,6 +297,16 @@ def test_the_joint_group_addresses_the_guidance_axis():
     assert (joint.rank, joint.world_size) == (3, 4)
 
 
+def test_a_guidance_branch_keeps_every_attention_head():
+    per_worker = _cfg2_view()
+    joint = per_worker["worker_0"].get_joint_group_for_node("dit")
+    assert (joint.world_size, joint.head_shards) == (2, 1)
+    with_tp = JointGroups(
+        tp_group=CommGroup(3, 1, [2, 3]), sp_group=CommGroup.trivial(), cfg_group=CommGroup(3, 1, [1, 3]),
+    )
+    assert (with_tp.world_size, with_tp.head_shards) == (4, 2)
+
+
 def test_the_placement_is_handed_over_only_where_the_config_asks():
     per_worker = _cfg2_view()
     placed = parallel_kwargs("dit", per_worker["worker_1"], {})["guidance_parallel"]

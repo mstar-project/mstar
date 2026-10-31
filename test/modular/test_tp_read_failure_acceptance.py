@@ -328,7 +328,7 @@ def _kv_manager(rank, prefix_cache):
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
             max_num_pages=128, page_size=PAGE_SIZE, prefix_cache_tp=prefix_cache,
         ),
-        name=KV, joint_comm_group=SimpleNamespace(rank=rank, world_size=2),
+        name=KV, joint_comm_group=SimpleNamespace(rank=rank, world_size=2, head_shards=2),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
     )
     if prefix_cache:
@@ -364,7 +364,7 @@ def _engine(rank, group, kv, prefix_cache, graph_runtime):
     engine._runner = StepRunner(engine._resources, node_resources={NODE: [KV]})
     engine._submodules = {NODE: SubmoduleManagement(
         submodule=sub, forward=sub.forward, forward_batched=sub.forward_batched,
-        joint_comm_group=SimpleNamespace(rank=rank, world_size=2), resources={KV: kv},
+        joint_comm_group=SimpleNamespace(rank=rank, world_size=2, head_shards=2), resources={KV: kv},
     )}
     engine._keyed_walks = {NODE: {TEXT_WALK}} if prefix_cache else {}
     engine._prefix_model = "_LLM"

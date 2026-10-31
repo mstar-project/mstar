@@ -380,7 +380,7 @@ class MicroScheduler:
     ) -> tuple[str, str] | None:
         """``picked``, or a ready lockstep-first key ahead of it, up to
         ``LOCKSTEP_FIRST_STEPS`` times running."""
-        if picked is None or picked[0] in self.lockstep_first_nodes:
+        if picked is None or not self.lockstep_first_nodes or picked[0] in self.lockstep_first_nodes:
             return picked
         first = next((key for key in ready if key[0] in self.lockstep_first_nodes), None)
         if first is None or self.lockstep_first_steps >= self.LOCKSTEP_FIRST_STEPS:

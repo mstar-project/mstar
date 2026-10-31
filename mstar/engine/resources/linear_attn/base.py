@@ -47,7 +47,7 @@ class LinearAttnManager(AttentionResource):
         # builders can call it
         pool_config = info.dependency(spec.config.recurrent_state).config
         if info.joint_comm_group is not None:
-            pool_config.shard(info.joint_comm_group.world_size)
+            pool_config.shard(info.joint_comm_group.head_shards)
 
         backend = resolve_linear_attn_backend(spec.config.backend, info.device)
 
