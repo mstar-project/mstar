@@ -9,9 +9,9 @@ import types
 import pytest
 from api_server_helpers import make_test_api_server
 
-from mstar.api_server import entrypoint as ep
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import ResultChunk
+from mstar.communication.event import EventWakeup
 
 
 class _PreprocessWorker:
@@ -20,6 +20,7 @@ class _PreprocessWorker:
     def __init__(self):
         self.chunks: list[ResultChunk] = []
         self.aborted: list[str] = []
+        self.results_wakeup = EventWakeup()
 
     def get_profile_updates(self):
         return []
@@ -47,6 +48,12 @@ class _PreprocessWorker:
 class _Comm:
     def get_all_new_messages(self):
         return []
+
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
 
 
 class _Sink:
@@ -80,12 +87,11 @@ def _chunk(key, data, modality="text", **metadata):
 
 
 def _one_pass(server, monkeypatch):
-    """``_process_messages`` for one pass: its end-of-pass sleep stops it."""
-    shim = types.SimpleNamespace(
-        monotonic=ep.time.monotonic, time=ep.time.time, perf_counter=ep.time.perf_counter,
-        sleep=lambda _s: setattr(server, "running", False),
+    """``_process_messages`` for one pass: its end-of-pass poll stops it."""
+    monkeypatch.setattr(
+        server.communicator, "poll_for_messages",
+        lambda timeout_ms=20: setattr(server, "running", False) or False,
     )
-    monkeypatch.setattr(ep, "time", shim)
     server.running = True
     server._process_messages()
     monkeypatch.undo()

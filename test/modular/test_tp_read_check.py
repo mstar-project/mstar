@@ -519,7 +519,10 @@ def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_hea
 FOLLOWERS = ["w0", "w1"]
 
 
-def _leader(tmp_path, streamed=()):
+def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
+    """Rank 0 leading ``nodes``; ``consumed[(source, dest)]`` names the signals
+    an edge carries from ``source`` to ``dest``."""
+    consumed = consumed or {}
     tm, _ = _shm_manager(tmp_path)
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
@@ -527,7 +530,7 @@ def _leader(tmp_path, streamed=()):
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._rebuilds = Rebuilds({}, {})
     w.worker_id = "w0"
-    w.parallel_nodes, w.parallel_leader_nodes = {NODE}, {NODE}
+    w.parallel_nodes, w.parallel_leader_nodes = set(nodes), set(nodes)
     w.is_tp_follower, w.enable_nvtx = False, False
     w._tp_broadcast_seq = 0
     w.sent = []
@@ -539,6 +542,7 @@ def _leader(tmp_path, streamed=()):
     w._graph_runtime = SimpleNamespace(
         get_sharding_config=lambda r: sharding, get_rid_string=lambda h: h,
         get_rid_handle=lambda r: r, ingest_inputs_batch=lambda block, can_buffer: None,
+        get_consumed_edges=lambda source, dest, walk: {(sig, dest) for sig in consumed.get((source, dest), ())},
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
         take_resident_delta=lambda n: OffloadDelta.new(),
@@ -574,11 +578,11 @@ def _land(w, rid, edge):
     w._check_ready_tensors()
 
 
-def _step(rows):
-    """A step whose rows take ``rows[rid]``'s input names."""
+def _step(rows, node=NODE):
+    """A step of ``node`` whose rows take ``rows[rid]``'s input names."""
     rids = list(rows)
     return ExecutingBatch(
-        node_name=NODE, per_request_info=dict.fromkeys(rids, SimpleNamespace()),
+        node_name=node, per_request_info=dict.fromkeys(rids, SimpleNamespace()),
         step_context=StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False),
         per_request_input_tensors={
             rid: {name: [torch.zeros(1)] for name in names} for rid, names in rows.items()
@@ -624,14 +628,38 @@ def test_the_nodes_own_output_coming_back_is_no_read(tmp_path):
 
 def test_a_colocated_encoders_output_is_a_followers_read(tmp_path):
     """An encoder beside rank 0 hands its output to rank 0's node without a
-    read; each follower reads it."""
-    w = _leader(tmp_path)
+    read; each follower reads it. Another led node it is not routed to has
+    nothing to spend, so once the step taking it ran nothing is left pending."""
+    w = _leader(tmp_path, nodes=(NODE, "Talker"), consumed={("vision_encoder", NODE): {"vision_embeds"}})
     w._note_local_lockstep_inputs(
         StoredOutputs(flat_uuids=[21], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
-        ["vision_embeds"],
+        ["vision_embeds"], "vision_encoder", ["r1"], [WALK], None,
     )
 
-    assert _broadcast(w, _step({"r0": [], "r1": ["vision_embeds"]})) == (True, ("r0", "r1"))
+    ran = _step({"r0": [], "r1": ["vision_embeds"]})
+    assert _broadcast(w, ran) == (True, ("r0", "r1"))
+    w._consume_lockstep_reads(ran)
+    assert not w._lockstep_unread
+
+
+def test_one_lockstep_node_taking_an_input_leaves_another_nodes_copy_checked(tmp_path):
+    """One producer beside rank 0 feeds the same signal to two lockstep nodes:
+    the first node's step spends only its own read, so the second's goes out
+    checked too."""
+    other = "LLM_2"
+    w = _leader(tmp_path, nodes=(NODE, other), consumed={
+        ("producer", NODE): {"latents"}, ("producer", other): {"latents"},
+    })
+    w._note_local_lockstep_inputs(
+        StoredOutputs(flat_uuids=[22], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
+        ["latents"], "producer", ["r1"], [WALK], None,
+    )
+    ran = _step({"r1": ["latents"]})
+    assert _broadcast(w, ran) == (True, ("r1",))
+    w._consume_lockstep_reads(ran)
+
+    assert _broadcast(w, _step({"r1": ["latents"]}, node=other)) == (True, ("r1",))
+    assert _broadcast(w, _step({"r1": ["latents"]})) == (False, None)
 
 
 def test_a_streamed_input_is_checked_on_every_step(tmp_path):
