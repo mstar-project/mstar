@@ -1036,6 +1036,14 @@ class MicroScheduler:
         blocked = set()
         if backlogged is not None:
             waiting = self._waiting_rids(backlogged)
+            if backlogged.request_walks and (only_walk or skip_walk) is not None:
+                # parked for this step, so not measured: a decode merge would
+                # otherwise measure the prompts parked under it on every pass
+                waiting = waiting | {
+                    rid for rid in backlogged.request_to_worker_graph
+                    if (only_walk is not None and backlogged.walk_of(rid) != only_walk)
+                    or backlogged.walk_of(rid) == skip_walk
+                }
             if max_tokens is not None:
                 tokens, chunks = self._measure_rows(
                     request_state, backlogged, started, resumed, waiting,
@@ -1048,7 +1056,7 @@ class MicroScheduler:
             blocked = self._unready_backlog_rids(
                 backlogged, request_state, waiting,
                 self._scan_limit(node_walk, pre_existing_batch_size),
-                capture_group_of, only_walk, skip_walk,
+                capture_group_of,
             )
             if not backlogged:
                 backlogged = None  # every row failed
@@ -1058,7 +1066,7 @@ class MicroScheduler:
             if entries else None
         # only for the chunk sizing below, never to gate admission, so a walk
         # with no budget skips it: measuring a row costs an input-tensor build
-        # and a cached-prefix probe, and a backlogged one pays it every pass
+        # and a cached-prefix probe (memoized for a backlogged row, `_row_lens`)
         if fresh and max_tokens is not None:
             tokens, chunks = self._measure_rows(request_state, fresh, started, resumed)
             row_tokens.update(tokens)
@@ -1298,7 +1306,6 @@ class MicroScheduler:
         self, batch: ScheduledBatch, request_state: RequestStateManager,
         waiting: set[int],
         max_bs: int | None = None, capture_group_of: int | None = None,
-        only_walk: str | None = None, skip_walk: str | None = None,
     ) -> set[int]:
         """The rows of a backlogged ``batch`` that cannot run this step; failed
         rows are dropped from it instead. One readiness check per row.
@@ -1307,16 +1314,10 @@ class MicroScheduler:
         rows wait without asking the engine, as on the fresh path, since asking
         reloads an offloaded row and would OOM it again straight away. They do
         not count against the step's worth either, never having been candidates.
-        Rows of a walk other than ``only_walk``, or of ``skip_walk``, are
-        parked the same way.
+        Rows parked under another walk (a speculation merge or a yield-away)
+        are in ``waiting`` too.
         """
         node_partition = request_state.get_partition_for_node(batch.node_name)
-        if batch.request_walks and (only_walk or skip_walk) is not None:
-            waiting = waiting | {
-                rid for rid in batch.request_to_worker_graph
-                if (only_walk is not None and batch.walk_of(rid) != only_walk)
-                or batch.walk_of(rid) == skip_walk
-            }
         # Check readiness in backlog order and stop once a step's worth is
         # found: the builder takes the first `max_bs` rids not excluded, which
         # are exactly the ones checked and found ready, and the rids past that

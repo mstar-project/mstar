@@ -2034,6 +2034,28 @@ def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     assert merged.chunk_ranges == {"p0": chunk}
 
 
+def test_a_decode_merge_measures_none_of_the_prompts_parked_under_it():
+    """Prompts parked under the combined walk cannot join a decode merge, so
+    measuring them would only make every merge estimate its continuing rows
+    (one call per row) while the backlog persists."""
+    engine = _ChunkingEngine(max_bs=8)
+    sched = _chunking_scheduler(engine)
+    parked = _batch(["p0", "p1"], walk=MIXED)
+    parked.request_walks = {"p0": "prefill", "p1": "prefill"}
+    sched.backlog[(NODE, MIXED)] = parked
+
+    def estimate():
+        raise AssertionError("a decode-only merge estimated its continuing rows")
+
+    _next_batch(
+        sched, _Manager([]), target=(NODE, WALK),
+        pre_existing_batch_size=4, pre_existing_seq_lens=estimate,
+    )
+
+    assert engine.measured == []
+    assert sorted(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0", "p1"]
+
+
 def test_rows_that_use_up_the_budget_leave_a_prompt_the_chunk_floor():
     """A merge whose continuing rows ran the whole budget of 4 leaves the
     prompt nothing; it still runs the floor (the whole budget here, which is
