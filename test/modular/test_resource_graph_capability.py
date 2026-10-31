@@ -69,7 +69,7 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
         runner = AcceleratorGraphRunner(
             submodule_name="llm", submodule=submodule, resources={"attention": resource},
             step_runner=step_runner, device=torch.device("cpu"), autocast_dtype=None,
-            joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+            joint_comm_group=SimpleNamespace(world_size=1, head_shards=1), num_slots=2,
         )
 
     specs = runner.prepare_for_capture()

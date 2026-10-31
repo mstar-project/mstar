@@ -88,7 +88,7 @@ def _tp2_manager(rank: int, entity_id: str, shm_dir: str) -> KVManager:
             page_size=4,
         ),
         name="kv",
-        joint_comm_group=SimpleNamespace(rank=rank, world_size=2),
+        joint_comm_group=SimpleNamespace(rank=rank, world_size=2, head_shards=2),
         transfer_engine_info=TransferEngineInfo(
             my_entity_id=entity_id,
             my_session_id="local",

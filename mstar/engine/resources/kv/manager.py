@@ -549,7 +549,7 @@ class KVManager(AttentionResource):
         tp_cache = False
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
-            cfg.shard(joint_comm_group.world_size)
+            cfg.shard(joint_comm_group.head_shards)
             tp_cache = joint_comm_group.world_size > 1 and cfg.prefix_cache and cfg.prefix_cache_tp
             if tp_cache and cfg.cpu_offload_pages > 0:
                 raise ValueError(
