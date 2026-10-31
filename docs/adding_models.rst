@@ -2361,6 +2361,16 @@ attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under
 family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
 also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``).
 
+Two pieces swap a one-pass kernel in for what Inductor would emit, inside a compiled
+transformer only; eager calls run the plain PyTorch formulation, which is what a port's
+bit-exact tests hold. ``modulation.ada_layer_norm`` is a block's gated residual add,
+LayerNorm and shift/scale modulation, with the modulation given per group of tokens
+(``[B, G, D]``: one group per sample, or per latent frame as in Wan2.2); Inductor reads a
+LayerNorm row wider than 1024 twice. ``qk_norm_rope.rms_norm_rope`` is the q/k RMSNorm
+across heads followed by the interleaved-pair RoPE, q and k in one launch. Both agree
+with eager to bf16 rounding rather than bitwise. Wan2.2 is the first user;
+``test/modular/test_diffusion_dit_kernels.py`` holds them to the eager form.
+
 On the API side ``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py``) serves
 ``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes
 ``width``/``height``, ``seed`` and other knobs pass through); register it under the
