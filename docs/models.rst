@@ -1602,7 +1602,39 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    keep-list scores 25.4 to 25.8 dB (floor 25.5) and klein-4B 22.5 to 22.7 (floor 22.4). With
    the knob on they repeat across launches at 26.5 and 22.6 dB. At one request the knob
    costs 8% and 7% of the fp8 images per second, which leaves 1.1 times bf16 with the knob
-   off (one MI325X, shared node).
+   off (one MI325X, shared node). The spread is not fp8's: a compiled LayerNorm is a sum whose
+   rounding follows its Triton block size, Inductor picks that size by timing the kernel on
+   the device, and the compile cache keeps the pick. bf16 moves the same way, between 26.8
+   and 27.3 dB on klein-9B, and a server that starts from another cache can draw another
+   median.
+
+``linear_dtype_steps``
+   The dtype of the fp8 linears per denoise step, on klein: ``[bf16, bf16, fp8, fp8]`` runs
+   steps 0 and 1 (counted from 0) in bf16 and the rest in fp8. A step past the list takes its
+   last entry. It needs ``linear_dtype: fp8`` and names both dtypes, and ``fp8_keep_bf16``
+   still applies on every step. Those linears hold both sets of weights. Rows batch and
+   capture per dtype, so each capture bucket is captured once per dtype and startup takes
+   longer, and the ``dit`` node runs in lockstep, since a speculated step could not hold
+   rows that cross into another dtype at different times.
+
+   The early steps set the image. Over the 40 ``image_v1`` images on MI325X with the knob on,
+   the typical image loses this much against its own bf16 twin with only that step in fp8:
+   klein-9B 2.26, 1.29, 0.34 and 0.11 dB for steps 0 to 3, klein-4B 0.46, 0.31, 0.08 and
+   0.03 dB. ``[bf16, bf16, fp8, fp8]`` loses 0.11 dB on klein-4B (worst image 1.47 dB) and
+   0.18 dB on klein-9B with its ``fp8_keep_bf16`` list (worst image 1.29 dB), against 0.96
+   and 1.29 dB with fp8 on every step. It keeps about half of the fp8 speedup.
+
+``fp8_partial_keep_bf16``
+   The linears that stay bf16 on a step listed as ``fp8_partial`` in ``linear_dtype_steps``,
+   in the patterns of ``fp8_keep_bf16``; every other fp8 linear runs fp8 on that step. A
+   partial step and this list come together, and an entry that names no fp8 linear is an
+   error at load. It spends the budget a step at a time: klein-4B with
+   ``[bf16, fp8_partial, fp8, fp8]`` and 34 of its 60 linears kept on the partial step loses
+   0.22 dB on the typical image (worst 1.65 dB) at 68% of the time saving of fp8 on every
+   step, where fp8 on steps 1 to 3 loses 0.48 dB with a worst image of 5.61 dB. klein-9B with
+   ``[bf16, bf16, fp8_partial, fp8]`` and 51 of 80 linears kept loses 0.21 dB (worst 1.71 dB)
+   at 40% of that saving. Every klein-9B schedule measured above 65% of it lost more than
+   0.7 dB on the typical image.
 
 With the klein defaults every served image is within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
