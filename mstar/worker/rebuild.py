@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -36,6 +36,17 @@ class RebuildRow(NamedTuple):
     inputs: NameToTensorList
 
 
+def policies_run_here(
+    policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection], my_walks: Collection[tuple[str, str]],
+) -> dict[str, RebuildPolicy]:
+    """The policies whose rebuild this worker runs: it runs the node in the policy's walk and in every walk its
+    loop grows the KV in. A disaggregated decode node can't run the prefill walk its rebuild needs."""
+    return {
+        node: policy for node, policy in policies.items()
+        if all((node, walk) in my_walks for walk in {policy.walk, *policy.loop_walks(node, graphs)})
+    }
+
+
 class Rebuilds:
     """The kept ids of each request on the nodes that declare a `RebuildPolicy`, checked against the
     graph when the worker starts."""
@@ -48,6 +59,14 @@ class Rebuilds:
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
+
+    @property
+    def nodes(self) -> frozenset[str]:
+        """The nodes whose requests can be rebuilt here."""
+        return frozenset(self._policies)
+
+    def kept(self, rid: int, node: str) -> KeptIds | None:
+        return self._kept.get(node, {}).get(rid)
 
     def keep_prompts(
         self, node: str, graph_walk: str, request_walks: Mapping[int, str],

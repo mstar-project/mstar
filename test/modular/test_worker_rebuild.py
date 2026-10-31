@@ -9,6 +9,7 @@ row when its step never goes out.
 from __future__ import annotations
 
 from array import array
+from collections import defaultdict
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import KeptIds, RebuildRow, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
+from mstar.worker.worker_metrics import PreemptionCounts
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
 R, A = 7, 8
@@ -79,6 +81,8 @@ def _worker():
     w._in_flight_rids, w._last_active = set(), {}
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
+    w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     # holds no row, so any routing, stop or loop-count call fails the test
     w._graph_runtime = SimpleNamespace(cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None,
@@ -151,12 +155,26 @@ def test_a_request_is_rebuilt_only_once_per_drop(state):
     w._rebuilds._kept[NODE][R] = _kept(5)
     eng.dropped += [] if state == "resident" else [R]
     w.scheduler.rows.update(queued := {R: RebuildRow(NODE, PREFILL, {})} if state == "queued" else {})
-    w._in_flight_rids.update({R} if state == "in its step" else ())
+    if state == "in its step":
+        w._in_flight_rids, w._rebuilding = {R}, frozenset({R})
     with pytest.raises(RuntimeError):
         w._rebuild(R, NODE)
     assert w.scheduler.rows == queued and not eng.prepared, (
         "a rebuild would lay out a stream that is live or already being rebuilt"
     )
+
+
+def test_a_dropped_request_is_rebuilt_while_a_step_of_another_node_holds_it():
+    """Orpheus's SNAC decoder can run on the LLM's worker, so a SNAC step can be in flight when the request's LLM
+    KV is rebuilt."""
+    w, eng = _worker()
+    w._rebuilds._kept[NODE][R] = _kept(5)
+    eng.dropped.append(R)
+    w._in_flight_rids.add(R)
+
+    w._rebuild(R, NODE)
+
+    assert w.scheduler.rebuild_queued(R), "the request never comes back, or its worker's main loop raises"
 
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():

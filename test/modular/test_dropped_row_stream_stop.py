@@ -121,6 +121,7 @@ def _worker(eng, runtime):
     w.device = torch.device("cpu")
     w._last_active = {}
     w._rebuilds = Rebuilds({}, {})
+    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(

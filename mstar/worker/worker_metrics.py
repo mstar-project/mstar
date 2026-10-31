@@ -21,7 +21,8 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import astuple, dataclass
 from typing import TYPE_CHECKING
 
 from mstar.observability import catalog
@@ -42,6 +43,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class PreemptionCounts:
+    """A node's preemptions since its worker started."""
+    # `rebuild_tokens`: tokens the rebuild rows prefilled.
+    # `returns_preempted`: returned requests preempted again before they kept another token.
+    victims: int = 0
+    drops: int = 0
+    rebuild_tokens: int = 0
+    preempted_again: int = 0
+    returns_preempted: int = 0
+
+
 class WorkerMetrics:
     def __init__(
         self,
@@ -53,6 +66,7 @@ class WorkerMetrics:
         send: Callable[[WorkerStatus], None],
         *,
         enable_transfers: Callable[[], EdgeTransfers],
+        preemptions: Mapping[str, PreemptionCounts],
     ):
         self.worker_id = worker_id
         self.components = components
@@ -68,6 +82,11 @@ class WorkerMetrics:
         self._counting_since = math.inf
         # per cache, its prefix_tokens at start_counting(); None before
         self._prefix_base: list[dict[str, tuple[int, int]]] | None = None
+        # `_preemptions`: the worker's counts per node.
+        # `_preemption_base`, `_rebuild_base`: those counts, and each cache's rebuild_pages, at start_counting().
+        self._preemptions = preemptions
+        self._preemption_base: dict[str, tuple] = {}
+        self._rebuild_base: list[dict[str, int]] = []
         # (resource key, its reported nodes, cache); a cache only follower
         # nodes use is left to their lead rank
         self._kv = [
@@ -84,6 +103,11 @@ class WorkerMetrics:
         self._prefix_query = Counter(catalog.PREFIX_CACHE_QUERY_TOKENS)
         self._prefix_hit = Counter(catalog.PREFIX_CACHE_HIT_TOKENS)
         self._pending = Gauge(catalog.COMPONENT_PENDING_STEPS)
+        self._preemption_counters = [Counter(family) for family in (
+            catalog.KV_PREEMPTIONS, catalog.KV_DROPS, catalog.KV_REBUILD_TOKENS, catalog.KV_PREEMPTED_AGAIN,
+            catalog.KV_RETURNS_PREEMPTED,
+        )]
+        self._rebuild_pages = Counter(catalog.KV_REBUILD_CACHED_PAGES)
 
     def start_counting(self) -> None:
         """Count the steps whose time starts from now on (see ``step_done``),
@@ -91,6 +115,8 @@ class WorkerMetrics:
         from now on."""
         self._counting_since = time.perf_counter()
         self._prefix_base = [dict(cache.prefix_tokens) for _, _, cache in self._kv]
+        self._preemption_base = {node: astuple(counts) for node, counts in self._preemptions.items()}
+        self._rebuild_base = [dict(cache.rebuild_pages) for _, _, cache in self._kv]
         self._transfers = self._enable_transfers()
 
     def step_done(
@@ -149,6 +175,16 @@ class WorkerMetrics:
             # the caches keep cumulative totals, so these are set, not added
             self._prefix_query.set((node,), queried)
             self._prefix_hit.set((node,), hit)
+        if self._prefix_base is not None:
+            for node, counts in self._preemptions.items():
+                if node in self.components:
+                    base = self._preemption_base.get(node, (0,) * len(self._preemption_counters))
+                    for counter, now, then in zip(self._preemption_counters, astuple(counts), base, strict=True):
+                        counter.set((node,), now - then)
+            for (_, _, cache), base in zip(self._kv, self._rebuild_base, strict=True):
+                for node, pages in list(cache.rebuild_pages.items()):
+                    if node in self.components:
+                        self._rebuild_pages.set((node,), pages - base.get(node, 0))
         # a rank leading no node reports only its transfers
         pending = self._scheduler.pending_rows() if self.components else {}
         for node in self.components:
@@ -157,5 +193,6 @@ class WorkerMetrics:
             self._kv_used.snapshot(), self._kv_total.snapshot(), self._kv_cached.snapshot(),
             self._step_seconds.snapshot(), self._batch_size.snapshot(),
             self._prefix_query.snapshot(), self._prefix_hit.snapshot(),
+            *(counter.snapshot() for counter in self._preemption_counters), self._rebuild_pages.snapshot(),
             self._pending.snapshot(), *self._transfers.snapshot(),
         ]
