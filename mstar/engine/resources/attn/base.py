@@ -18,8 +18,9 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
-from mstar.engine.resources.kv.config import KVConfig, PagedKVConfig, RingKVConfig
+from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -55,6 +56,27 @@ class AttentionManager(AttentionResource):
         # kernel where the FA3 one is unusable, and they do not agree bit for bit
         return fingerprint(type(self).__name__)
 
+    @staticmethod
+    def _check_window_pool(spec: AttentionSpec, device: torch.device) -> str:
+        """The FlashInfer kernel to read a pool that keeps a window with. Only the kernels that
+        take any page size read its per-group page sizes and strided pages: FA2, and FA3 on
+        SM90 only. ``auto`` picks one of them below SM100, and from SM100 can send short rows
+        without a window to cuDNN, so there it becomes FA2. What doesn't depend on the device
+        is refused before any build (`derive_kv_groups`)."""
+        kernel = spec.config.flashinfer_backend
+        capability = current_platform.cuda_capability(device)
+        sm100 = capability is not None and capability >= (10, 0)
+        # FlashInfer has fa3 for SM90 only
+        fa3 = capability is not None and capability[0] == 9
+        allowed = ("auto", "fa2", "fa3") if fa3 else ("auto", "fa2")
+        if kernel not in allowed:
+            raise ValueError(
+                f"KV {spec.config.kv_cache!r} keeps a window, whose pages only FlashInfer's fa2 and fa3 "
+                f"(SM90 only) kernels read, so flashinfer_backend={kernel!r} can't on this GPU; "
+                f"use {' or '.join(allowed)}"
+            )
+        return "fa2" if sm100 and kernel == "auto" else kernel
+
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         backend = resolve_attn_backend(spec.config.backend, info.device)
@@ -66,6 +88,31 @@ class AttentionManager(AttentionResource):
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
+        windowed = isinstance(kv_config, PagedKVConfig) and len(kv_config.groups) > 1
+        window = spec.config.sliding_window
+        keeps_window = isinstance(kv_config, PagedKVConfig) and window is not None and window < kv_config.max_seq_len
+        if keeps_window and not windowed:
+            # the pool derives its window from its attentions, which resolving the specs does
+            raise ValueError(
+                f"attention {spec.resource_key!r} declares a sliding_window, but KV {spec.config.kv_cache!r} "
+                "keeps no window: resolve the specs (resolve_spec_dependencies) before building them"
+            )
+        flashinfer_backend = spec.config.flashinfer_backend
+        if windowed:
+            # the backend as resolved for this device; `derive_kv_groups` refuses a declared one
+            # earlier, so validation reports it
+            if backend != AttnBackend.FLASHINFER:
+                raise ValueError(
+                    f"KV {spec.config.kv_cache!r} keeps a window, whose pages only the flashinfer "
+                    f"backend reads, not attention {spec.resource_key!r}'s {backend.value}"
+                )
+            flashinfer_backend = cls._check_window_pool(spec, info.device)
+            if flashinfer_backend != spec.config.flashinfer_backend:
+                logger.info(
+                    "attention %r reads KV %r, which keeps a window: flashinfer_backend=%r "
+                    "runs as %r on this GPU",
+                    spec.resource_key, spec.config.kv_cache, spec.config.flashinfer_backend, flashinfer_backend,
+                )
         # Before `shard`, so a mismatch is reported rather than half-applied to
         # a config the KV resource also holds.
         if backend not in _BACKEND_KV_CONFIG:
@@ -137,11 +184,12 @@ class AttentionManager(AttentionResource):
                 device=info.device,
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
-                backend=spec.config.flashinfer_backend,
+                backend=flashinfer_backend,
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
                 decode_tensor_cores=spec.config.decode_tensor_cores,
                 sliding_window=spec.config.sliding_window,
+                layers=spec.config.layers,
             )
 
         if backend == AttnBackend.FLEX:
@@ -215,18 +263,23 @@ class EagerSlotKey(NamedTuple):
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
 
 
-def captured_page_capacity(num_rows: int, num_tokens: int, kv_config: KVConfig) -> int:
-    """Page ids a captured wrapper's index buffer holds for a bucket of
-    ``num_rows`` rows and ``num_tokens`` tokens.
+def captured_page_capacity(
+    num_rows: int, num_tokens: int, kv_config: PagedKVConfig, group: KVGroup | None = None,
+) -> int:
+    """Page ids a captured wrapper's index buffer holds for a bucket of ``num_rows`` rows and
+    ``num_tokens`` tokens, in pages of ``group`` (the pool's first by default).
 
-    Per row, not per pool: rows that matched one cached prefix all name its
-    pages, so a step can name more page ids than the pool holds. And at least
-    the bucket's own pages: a capture's rows name a SINK_PAGE per page of span,
-    whatever the pool's size."""
-    return max(
-        num_rows * kv_config.max_num_pages,
-        -(-num_tokens // kv_config.page_size) + num_rows,
-    )
+    Per row, since rows that matched one cached prefix all name its pages, and at least the
+    bucket's own sink pages. A pool that keeps a window caches no prefix and forks nothing, so
+    its rows name at most the pool, or in the window's group a window each, plus the step."""
+    group = group or kv_config.groups[0]
+    step_pages = -(-num_tokens // group.page_size)
+    if group.retention is not None:
+        # a page more per row, which a row's share of the step can cross into
+        return num_rows * (group.retention.max_pages(group.page_size) + 1) + step_pages
+    if len(kv_config.groups) > 1:
+        return kv_config.num_units + step_pages + num_rows
+    return max(num_rows * kv_config.max_num_pages, step_pages + num_rows)
 
 
 def workspace_bytes() -> int:

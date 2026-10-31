@@ -191,7 +191,7 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
     return {
-        spec.resource_key: spec.config.page_size
+        spec.resource_key: spec.config.tokens_per_page
         for spec in specs
         if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
     }
