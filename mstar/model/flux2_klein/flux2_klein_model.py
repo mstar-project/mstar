@@ -105,6 +105,7 @@ class Flux2KleinModel(Model):
         linear_dtype: str = "bf16",
         fp8_keep_bf16: list[str] | None = None,
         linear_dtype_steps: list[str] | None = None,
+        fp8_partial_keep_bf16: list[str] | None = None,
         **kwargs,
     ):
         # the DiT's attention: the engine's ragged resource (the platform's kernel), or torch's SDPA inline
@@ -150,7 +151,7 @@ class Flux2KleinModel(Model):
         # fp8 linears kept in bf16 anyway (module-name patterns, block ranges like single_blocks.0-3.*)
         self.fp8_keep_bf16 = [str(p) for p in (fp8_keep_bf16 or [])]
         # those linears' dtype per denoise step, past the list its last entry (docs/models.rst)
-        self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype)
+        self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype, fp8_partial_keep_bf16)
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None

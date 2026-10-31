@@ -292,6 +292,51 @@ def test_a_policy_keeps_both_sets_of_weights_and_runs_the_active_one(monkeypatch
     assert not torch.equal(fp8_out, bf16_out)
 
 
+def _partial_net(monkeypatch) -> tuple[_Net, StepDtypes]:
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: _Rocm("gfx942"))
+    monkeypatch.setattr(fp8_linear, "fp8_unavailable_reason", lambda: None)
+    net = _Net()
+    policy = check_linear_dtype_steps(["bf16", "fp8_partial", "fp8"], "fp8", ["blocks.0.out"])
+    apply_linear_dtype(net, "fp8", ("blocks.*.out",), "test", policy=policy)
+    return net, policy
+
+
+def test_a_partial_step_keeps_its_list_in_bf16_and_a_full_step_does_not(monkeypatch):
+    net, policy = _partial_net(monkeypatch)
+    kept, other = net.blocks[0].out, net.blocks[1].out
+    x = torch.randn(32, 32)
+    compiled = torch.compile(lambda t: (kept(t), other(t)), backend="eager")
+    want = {
+        "bf16": (kept.bf16(x), other.bf16(x)),
+        "fp8_partial": (kept.bf16(x), other.fp8(x)),
+        "fp8": (kept.fp8(x), other.fp8(x)),
+    }
+    for active in ("bf16", "fp8_partial", "fp8", "fp8_partial", "bf16"):
+        policy.active = active
+        for out, expected in zip(compiled(x), want[active], strict=True):
+            assert torch.equal(out, expected), active
+
+
+@pytest.mark.parametrize(
+    ("steps", "keep", "message"),
+    [
+        (["bf16", "fp8_partial", "fp8"], None, "come together"),
+        (["bf16", "fp8"], ["blocks.0.out"], "come together"),
+        (None, ["blocks.0.out"], "needs linear_dtype_steps"),
+    ],
+)
+def test_a_partial_step_and_its_list_come_together(steps, keep, message):
+    with pytest.raises(ValueError, match=message):
+        check_linear_dtype_steps(steps, "fp8", keep)
+
+
+def test_a_partial_keep_entry_that_names_nothing_fails_at_load(monkeypatch):
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: _Rocm("gfx942"))
+    policy = check_linear_dtype_steps(["bf16", "fp8_partial"], "fp8", ["blocks.9.out"])
+    with pytest.raises(ValueError, match="name none"):
+        apply_linear_dtype(_Net(), "fp8", ("blocks.*.out",), "test", policy=policy)
+
+
 def test_a_compiled_forward_follows_the_policy(monkeypatch):
     # dynamo guards on the switch: the graph traced for one dtype must not serve the other
     net, policy = _stepped_net(monkeypatch)
