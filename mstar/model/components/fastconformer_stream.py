@@ -16,7 +16,7 @@ kernel shapes.
   offline ones.
 - Blocks: each new frame attends the ``left_context`` frames before it and
   itself in the bounded KV, and each depthwise conv continues from its cached
-  last inputs (``FastConformerEncoder.blocks``).
+  last inputs (``FastConformerEncoder.blocks_stream``).
 
 A stream's state is bounded however long it runs: its host counters
 (``StreamState``, in its per-request state), its newest audio and mel frames
@@ -361,10 +361,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
 
     def _layers_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         s = call.static_inputs
-        return {"y": self._blocks(s["x"], s["n"])}
+        return {"y": self._blocks_stream(s["x"], s["n"])}
 
-    def _blocks(self, x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
-        return self.projection(self.encoder.blocks(x, new=n))
+    def _blocks_stream(self, x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+        return self.projection(self.encoder.blocks_stream(x, n))
 
     # -- the front end --------------------------------------------------------
 
@@ -392,7 +392,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         self.front.scatter_("sig", y)
         self.front.scatter_("last", x[:, -1:])
         self.front.scatter_("mel", torch.cat([mel_tail, mel_new], dim=1)[:, -2 * f:])
-        return self._blocks(new, chunk.new_ones(chunk.shape[0], dtype=torch.long))
+        return self._blocks_stream(new, chunk.new_ones(chunk.shape[0], dtype=torch.long))
 
     def _front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool],
                n: list[int]) -> torch.Tensor | None:
@@ -533,7 +533,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                                       request_ids=[rids[i] for i in new])["y"]
                 y = dict(zip(new, y, strict=True))
             else:
-                y = self._blocks(x, to_device_nonblocking(torch.tensor(eager_n), device))
+                y = self._blocks_stream(x, to_device_nonblocking(torch.tensor(eager_n), device))
             for i in new:
                 states[i].frames += eager_n[i]
                 frames[i] = y[i][: eager_n[i]]
