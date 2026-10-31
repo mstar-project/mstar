@@ -10,15 +10,21 @@ must follow the request shape. No weights, no GPU.
 
 from __future__ import annotations
 
+import os
 import sys
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.distributed.communication import CommGroup  # noqa: E402
+from mstar.distributed.guidance_parallel import GuidanceParallel  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 from mstar.model.wan22.components.dit import Wan22DiT  # noqa: E402
 from mstar.model.wan22.components.unipc import (  # noqa: E402
@@ -291,3 +297,65 @@ def test_decoder_takes_the_scaffold_latents_without_a_batch_dim():
     assert out.tensor_inputs["latents"].shape == (1, 4, 2, 4, 4)
     legacy = decoder.prepare_inputs(T2V, _info("d", 0), {"latents": [latents[None]]})
     assert legacy.tensor_inputs["latents"].shape == (1, 4, 2, 4, 4)
+
+
+def test_a_timestep_per_row_or_frame_matches_the_per_token_grid(dit):
+    """Tokens of a group share a timestep, so one entry per group is the same forward."""
+    torch.manual_seed(0)
+    # 2 latent frames of 2 x 2 tokens
+    hidden = torch.randn(2, 4, 2, 4, 4)
+    text = torch.randn(2, 8, dit.config.text_dim)
+    t = torch.tensor([[900.0], [100.0]])
+    grid = dit(hidden_states=hidden, timestep=t.expand(2, 8), encoder_hidden_states=text)
+    per_row = dit(hidden_states=hidden, timestep=t, encoder_hidden_states=text)
+    assert torch.allclose(per_row, grid, rtol=1e-4, atol=1e-5)
+    # frame 0 at timestep 0, the rest at the row's: I2V's layout
+    frames = torch.tensor([0.0, 1.0]) * t
+    tokens = torch.tensor([0.0] * 4 + [1.0] * 4) * t
+    per_frame = dit(hidden_states=hidden, timestep=frames, encoder_hidden_states=text)
+    grid = dit(hidden_states=hidden, timestep=tokens, encoder_hidden_states=text)
+    assert torch.allclose(per_frame, grid, rtol=1e-4, atol=1e-5)
+
+
+def _rank_main(rank, store, out_dir):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store}", rank=rank, world_size=2, timeout=timedelta(seconds=60),
+    )
+    torch.set_num_threads(1)
+    group = CommGroup(rank, rank, [0, 1])
+    group.device_group = group.cpu_group = dist.group.WORLD
+    node = _scaffold(_tiny_dit(_config()), guidance_parallel=GuidanceParallel(group))
+    with torch.inference_mode():
+        results = {
+            walk: _run_scaffold(node, walk, steps=4, guidance=5.0, rid=f"placed-{walk}") for walk in (T2V, I2V)
+        }
+    torch.save(results, os.path.join(out_dir, f"{rank}.pt"))
+    dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def two_ranks(tmp_path_factory):
+    out_dir = tmp_path_factory.mktemp("wan-cfg2")
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    mp.spawn(_rank_main, args=(str(out_dir / "store"), str(out_dir)), nprocs=2, join=True)
+    return [torch.load(out_dir / f"{rank}.pt") for rank in range(2)]
+
+
+@pytest.mark.parametrize("walk", [T2V, I2V])
+def test_one_branch_per_rank_tracks_one_rank_running_both(dit, two_ranks, walk):
+    first, second = two_ranks
+    assert torch.equal(first[walk], second[walk])
+    with torch.inference_mode():
+        one_rank = _run_scaffold(_scaffold(dit), walk, steps=4, guidance=5.0, rid=f"one-{walk}")
+    assert torch.allclose(first[walk], one_rank, rtol=1e-3, atol=1e-3)
+
+
+def test_the_placement_halves_a_guided_step_only():
+    placed = _scaffold(None, guidance_parallel=GuidanceParallel(CommGroup(1, 1, [0, 1])))
+    guided = Wan22Shape(grid=(2, 4, 4), text_len=TEXT_LEN, cfg=True, i2v=False, video_tokens=8)
+    plain = Wan22Shape(grid=(2, 4, 4), text_len=TEXT_LEN, cfg=False, i2v=False, video_tokens=8)
+    assert placed.num_tokens(guided) == 8 == placed.num_tokens(plain)
+    assert _scaffold(None).num_tokens(guided) == 16
+    # each rank reads its own branch's text; with guidance off both read the prompt
+    assert placed._text_edges(guided) == ("text_embeds_neg",)
+    assert placed._text_edges(plain) == ("text_embeds_pos",)
