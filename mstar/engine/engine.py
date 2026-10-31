@@ -75,7 +75,7 @@ from mstar.model.submodule_base import (
     StopPolicy,
     engine_step,
 )
-from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.compile import start_compile_pool, with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
@@ -838,6 +838,7 @@ class Engine:
 
     def warmup(self) -> None:
         if self.device_capability.is_available:
+            start_compile_pool()
             for op, selection in kernel_registry.warm_all().items():
                 logger.info("Engine: kernel op %s runs %s", op, selection)
         # before capture: a region inside a captured graph compiles in its warm-up
