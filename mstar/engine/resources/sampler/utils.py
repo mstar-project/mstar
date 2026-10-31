@@ -729,13 +729,6 @@ def filter_top_k_top_p(
     return _top_k_renorm_probs(probs, torch.minimum(n.to(torch.int32), k))
 
 
-def top_k_first_filter(probs: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
-    """The distribution FlashInfer's ``top_k_top_p_sampling_from_probs`` draws
-    from, as a vector: top-k, then top-p of the renormalised rest. ``top_k`` at
-    the vocabulary or above and ``top_p`` of 1 are off. Graph-safe."""
-    return _top_p_renorm_probs(_top_k_renorm_probs(probs, top_k), top_p)
-
-
 def apply_min_tokens_floor(probs: torch.Tensor, rows: HistoryRows) -> torch.Tensor:
     """Zero the stop ids for rows that have generated fewer than ``min_tokens``
     tokens, and renormalise. Upstream floors after top-k/top-p, so this runs on
