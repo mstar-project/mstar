@@ -1,19 +1,15 @@
-"""Pooled-key DSA (GLM-5.3-Flash's k-pool indexer) past index_topk, and its resource.
+"""Pooled-key DSA (GLM-5.3-Flash's k-pool indexer) and its resource.
 
-Dense MLA is exact while a query sees at most ``index_topk / index_kpool`` complete pools. Past
-that, each query attends to the members of its top ``index_topk / index_kpool`` complete pools
-(``index_kpool`` consecutive tokens each, from position 0) plus the incomplete pool at its end,
-which the reference indexer always selects (``Glm5NextTextIndexer``).
+Each query attends to the members of its top ``topk / kpool`` complete pools (``kpool``
+consecutive tokens from position 0) plus the incomplete pool at its end, which the reference
+indexer always selects. A query that sees no more pools than that attends everything, where
+dense MLA is the same computation.
 
-The indexer's state lives on the MLA cache's pages, in its aux planes ``INDEX_PLANES`` (one
-per full-attention layer): row ``t`` holds ``[k_t | gate_t | key of the pool ending at t]``.
-The index rows sit at their tokens' latent slots, so one flat page list serves the key writes,
-the scores, the top-k and the sparse gather.
-
-On CUDA: ``kpool_kernels`` for the pool keys and the scores, flashinfer's fused top-k + page-table
-transform (with a page of ``page_size / index_kpool`` pools, a pool's slot times ``index_kpool``
-is the slot of its first token) and ``sparse_mla``. Elsewhere, torch versions of the same math,
-which the CPU tests hold to the reference.
+Row ``t`` of the cache's aux planes ``INDEX_PLANES`` holds ``[k_t | gate_t | key of the pool
+ending at t]`` at token t's latent slot, so one page list addresses the key writes, the scores,
+the top-k and the sparse gather. On CUDA the top-k is FlashInfer's fused top-k + page-table
+transform over pages of ``page_size / kpool`` pools: a pool's slot times ``kpool`` is its first
+token's. Elsewhere torch versions of the same math run.
 """
 from __future__ import annotations
 
@@ -35,14 +31,12 @@ PREFILL_SCORE_BYTES = 256 << 20
 
 @dataclass
 class KPoolContext:
-    """Per-forward DSA state, built from the submodule's preprocess outputs.
+    """One forward's DSA state, from ``KPoolDSA.step_inputs``.
 
-    Device, per step row: ``pos`` its position (keys it sees are ``[0, pos]``), ``row_req`` its
-    request. Per request: ``page_start`` its first entry in ``pages``, the flat page list of
-    the step's requests. Host, when the step runs eager: ``host_pos``, ``spans`` ((first row,
-    rows, request) per request) and ``host_page_start``. ``max_pools`` is the score width (the
-    step's most pools, or a CUDA graph's fixed width); ``sparse_plan`` the graph slot's plan, or
-    the eager one the first layer builds."""
+    Per row: ``pos`` (it sees keys ``[0, pos]``) and ``row_req``. Per request: ``page_start``, its
+    first entry in the flat page list ``pages``. The host fields are set only for an eager step;
+    ``spans`` is (first row, rows, request) per request. ``max_pools`` is the score width, fixed
+    under a graph; ``sparse_plan`` is the graph slot's, or the eager one the first layer builds."""
 
     pos: torch.Tensor
     row_req: torch.Tensor
@@ -128,11 +122,9 @@ def _pool_keys_torch(view: torch.Tensor, ctx: KPoolContext, ape: torch.Tensor,
 
 def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
            ctx: KPoolContext, group=None) -> torch.Tensor:
-    """``[rows, width]`` int32 MLA-cache slots each row attends: the tokens of its top ``topk /
-    kpool`` pools, then its tail; entries past ``attn_lens`` are unused. ``q (rows, NH, D)``,
-    ``w (rows, NH)`` fp32 with the scales folded in, ``view`` the layer's index plane
-    (``kv.aux_view(INDEX_PLANES, plane)``). A TP
-    ``group`` splits a prefill's rows across ranks (``sparse_mla.select_rows``)."""
+    """``[rows, width]`` int32 cache slots each row attends: its top pools' tokens, then its
+    tail; entries past ``attn_lens`` are unused. ``w (rows, NH)`` is fp32 with the scales
+    folded in, ``view`` the layer's index plane. A TP ``group`` splits a prefill's rows."""
     if ctx.spans is None or all(n == 1 for _, n, _ in ctx.spans):  # decode: capturable
         scores = _decode_scores(q, w, view, ctx)
         return expand_slots(top_pools(scores, ctx), ctx)
@@ -278,16 +270,14 @@ def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor
 # -- the resource ------------------------------------------------------------------------------
 
 class KPoolDSA(Resource):
-    """Pooled-key DSA over a node's MLA cache (``config.kv_cache``), whose aux planes
-    ``INDEX_PLANES`` hold the indexer's keys. Each step the submodule stages its rows
-    (``step_inputs``: preprocess outputs, which a CUDA graph interns and every replay restages)
-    and sets the forward's context built from them (``context``) as ``ctx``, which the MLA
-    layers read; under CUDA graphs the resource keeps each capture slot's sparse-attention
-    plans."""
+    """Pooled-key DSA over the MLA cache ``config.kv_cache``, whose aux planes ``INDEX_PLANES``
+    hold the index keys. The submodule stages ``step_inputs`` as preprocess outputs, so a graph
+    replay restages them, and sets ``ctx = context(...)`` while the MLA layers run. Under
+    capture the resource keeps each slot's sparse-attention plans."""
 
     @classmethod
     def build(cls, spec: DSASpec, info: EngineResourceInfo):
-        # `dependency` hands back the SPEC; its `.config` is the KV config, sharded once
+        # `dependency` hands back the SPEC; its `.config` is the KV config (shard is idempotent)
         kv_config = info.dependency(spec.config.kv_cache).config
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
@@ -304,20 +294,18 @@ class KPoolDSA(Resource):
         # the forward's context, open while its layers run
         self.ctx: KPoolContext | None = None
         self._int_stager = PinnedStager(torch.int32)
-        # under CUDA graphs one sparse-attention plan per (walk, capture slot, rows), and per
-        # (walk, capture slot) the workspace and index buffer its plans share
+        # (walk, capture slot, rows) -> its sparse-attention plan under CUDA graphs
         self._sparse_plans: dict[tuple[str, int, int], sparse_mla.SparseGraphPlan] = {}
+        # (walk, capture slot) -> the workspace and index buffer its plans share
         self._sparse_buffers: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
 
     def step_inputs(self, step_ctx: StepContext, captured: bool, label: str) -> dict[str, Any]:
-        """The step's DSA state from the KV plan, as preprocess outputs. The tensors are top
-        level, so a CUDA graph interns them and each replay stages the step's values: per row
-        its position and request, per request its first entry in the flat page list. Under a
-        graph the score width spans the serving window and the sparse plan is the slot's own,
-        re-planned here every step; the host half rides in ``dsa_meta``."""
+        """The step's DSA state from the KV plan, as preprocess outputs: top-level tensors,
+        which a graph replay restages, and the host half in ``dsa_meta``. Under a graph the
+        score width is fixed and the slot's sparse plan is re-planned here every step."""
         graph = bool(captured)
         walk = step_ctx.graph_walk
         kv_out = step_ctx.plan_results[self.config.kv_cache][label]

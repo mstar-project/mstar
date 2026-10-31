@@ -312,11 +312,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             if graph_walk == "decode":
                 # one id in, the last emitted token: the step verifies it and k drafts
                 seq_len = self.mtp_block
-        # Without dsa_long_context the serving regime is ctx <= index_topk,
-        # where dense MLA computes exactly what GLM-5.3-Flash's DSA would —
-        # refuse beyond it rather than serve off-spec logits. Raising here
-        # fails only this request (the engine registers the failure and
-        # drops the rid from the batch).
+        # Without dsa_long_context dense MLA is GLM-5.3-Flash's DSA only within
+        # index_topk: refuse past the limit rather than serve off-spec logits.
+        # Raising fails only this request (the engine drops it from the batch).
         limit = self.config.context_limit
         # the handle, which the batch, check_stop and cleanup_request key by
         state = self.request_state(fwd_info.rid_handle)

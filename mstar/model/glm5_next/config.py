@@ -606,7 +606,7 @@ class Glm5NextModelConfig:
 
     @classmethod
     def reduced_long_context(cls, max_seq_len: int = 512) -> "Glm5NextModelConfig":
-        """``reduced`` with dsa_long_context: a latent wide enough for the index planes."""
+        """``reduced`` with dsa_long_context and a window past its index_topk."""
         cfg = cls.reduced()
         return dataclasses.replace(cfg, kv_lora_rank=3 * cfg.index_head_dim,
                                    dsa_long_context=True, max_seq_len=max_seq_len)

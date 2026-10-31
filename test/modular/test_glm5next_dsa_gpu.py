@@ -1,4 +1,4 @@
-"""glm5_next DSA's CUDA paths against its torch ones (dsa.py) at the real indexer and latent dims:
+"""glm5_next DSA's CUDA paths against its torch ones (dsa/kpool.py) at the real indexer and latent dims:
 the pool-key and score kernels, flashinfer's top-k + slot transform, and a captured decode
 against the same rows eager."""
 from __future__ import annotations

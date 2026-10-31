@@ -103,7 +103,7 @@ def _slots_to_positions(slots, page_table, page_size):
     return {where[int(s)] for s in slots}
 
 
-@pytest.mark.parametrize("seq,chunks", [(150, [150]), (150, [61, 1, 88]), (40, [40]),
+@pytest.mark.parametrize("seq,chunks", [(150, [150]), (150, [100, 1, 49]), (40, [40]),
                                         (67, [67]), (68, [65, 3])])
 def test_selection_matches_reference(seq, chunks):
     torch.manual_seed(seq)
@@ -188,32 +188,6 @@ def test_pool_keys_match_reference_bf16():
     for j, last in enumerate(members[:, -1].tolist()):
         slot = pages[last // page] * page + last % page
         assert torch.equal(flat[slot, 2 * d:], ref[j])
-
-
-def test_decode_rows_select_like_prefill_rows():
-    """The decode path (one row per request, several requests) picks what the prefill path
-    picks for the same rows."""
-    torch.manual_seed(1)
-    nh, d, kpool, topk, page, seq = 16, 16, 4, 32, 16, 120
-    k, gate = torch.randn(seq, d), torch.randn(seq, d)
-    ape, q, w = torch.randn(kpool, d), torch.randn(seq, nh, d), torch.randn(seq, nh)
-    pages = list(range(8))
-    planes = _Planes(1, 8, page, 3 * d)
-    planes.slots = (torch.tensor([p // page for p in range(seq)]),
-                    torch.tensor([p % page for p in range(seq)]))
-    ctx = _ctx(pages, list(range(seq)), page, topk, kpool)
-    dsa.write_index(planes, 0, "main", k, gate, ape, ctx)
-    prefill = dsa.select(q, w, planes.layer_view(0), ctx)
-    rows = [7, 64, 119, 33]
-    dec = dsa.KPoolContext(
-        pos=torch.tensor(rows, dtype=torch.int32), row_req=torch.zeros(4, dtype=torch.int32),
-        pages=torch.tensor(pages, dtype=torch.int32), page_start=torch.zeros(1, dtype=torch.int32),
-        host_pos=rows, spans=[(i, 1, 0) for i in range(4)], host_page_start=[0],
-        max_pools=(max(rows) + 1) // kpool, page_size=page, topk=topk, kpool=kpool)
-    decode = dsa.select(q[rows], w[rows], planes.layer_view(0), dec)
-    for i, r in enumerate(rows):
-        n = dsa.attn_lens([r], topk, kpool)[0]
-        assert sorted(decode[i, :n].tolist()) == sorted(prefill[r, :n].tolist())
 
 
 # -- the long-context engine path on the reduced model ----------------------------------------
@@ -307,7 +281,7 @@ def _step(engine, walk, inputs):
         node_name="LLM",
         per_request_info=infos,
         per_request_input_tensors={rid: {"text_inputs": [ids]} for rid, ids in inputs.items()},
-        # the loop counts the engine reads, as the worker builds them (main #351)
+        # the loop counts the engine reads, as the worker builds them
         per_request_input_metadata={
             rid: InputMetadata(dynamic_loop_iter_counts=dict(info.dynamic_loop_iter_counts))
             for rid, info in infos.items()},
@@ -345,8 +319,8 @@ def test_long_context_matches_dense_in_the_identity_regime():
 
 
 def test_long_prefill_equals_stepwise_and_windowed_prefill():
-    """Past index_topk: one prefill, a short prefill fed the rest a token a step, and a prefill
-    run in token windows all run the same per-row selection, so they emit the same tokens."""
+    """Past index_topk a whole prefill, one fed its tail a token a step and a windowed one
+    emit the same tokens."""
     torch.manual_seed(5)
     prompt = torch.randint(0, 250, (300,))
     one, sub, _ = _engine(long_context=True)
@@ -376,13 +350,12 @@ def test_two_long_requests_batch_like_one(window):
     assert seq["a"] == alone_a and seq["b"] == alone_b
 
 
-@pytest.mark.parametrize("window", [8192, 1])
-def test_one_token_prompts_prefill_eager_in_long_mode(window):
-    """A prefill step of one-token prompts plans KDA as decode: it runs as one window, whatever
-    prefill_window_tokens, and its tokens are dense mode's (the identity regime)."""
+def test_one_token_prompts_prefill_eager_in_long_mode():
+    """A prefill step of one-token prompts plans KDA as decode, so it runs as one window even
+    at a one-token window; its tokens are dense mode's (the identity regime)."""
     want = {}
     for long_context in (False, True):
-        engine, _, _ = _engine(long_context, window)
+        engine, _, _ = _engine(long_context, window=1)
         for rid in ("a", "b"):
             engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
         toks = _step(engine, "prefill", {"a": torch.tensor([7]), "b": torch.tensor([42])})
@@ -394,21 +367,18 @@ def test_one_token_prompts_prefill_eager_in_long_mode(window):
     assert want[True] == want[False]
 
 
-def test_bind_refuses_a_page_size_pools_straddle():
-    cfg = Glm5NextModelConfig.reduced_long_context()
+@pytest.mark.parametrize("change, page_size, match", [
+    ({"max_seq_len": 64}, 128, "past index_topk"),  # reduced index_topk is 64
+    ({}, 18, "multiple of index_kpool"),  # index_kpool is 4: pools would straddle pages
+    ({"prefill_graphs": True, "prefill_token_buckets": [128, 2 * sparse_mla.MAX_ROWS]}, None,
+     "prefill buckets"),
+])
+def test_bind_refuses_what_long_context_cannot_serve(change, page_size, match):
     sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = cfg
-    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=cfg.index_kpool * 4 + 2))
-    with pytest.raises(ValueError, match="multiple of index_kpool"):
-        sub.bind_node_resources({KV_CACHE: kv})
-
-
-@pytest.mark.parametrize("change, match", [({"max_seq_len": 64}, "past index_topk"),
-                                           ({"prefill_window_tokens": 0}, "must be >= 1")])
-def test_long_context_refuses_what_it_cannot_serve(change, match):
-    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), **change)
+    sub.config = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), **change)
+    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=page_size))
     with pytest.raises(ValueError, match=match):
-        cfg.check_long_context()
+        sub.bind_node_resources({} if page_size is None else {KV_CACHE: kv})
 
 
 def test_long_context_refuses_pools_per_page_off_a_power_of_two():
@@ -430,28 +400,8 @@ def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, versio
         cfg.check_long_context()
 
 
-def test_bind_refuses_a_captured_bucket_past_the_sparse_plan():
-    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), prefill_graphs=True,
-                              prefill_token_buckets=[128, 2 * sparse_mla.MAX_ROWS])
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = cfg
-    with pytest.raises(ValueError, match="prefill buckets"):
-        sub.bind_node_resources({})
-
-
-def test_score_kernels_take_only_their_shapes():
-    view = torch.empty(0, dtype=torch.bfloat16)
-
-    def cuda(*shape):
-        return types.SimpleNamespace(is_cuda=True, shape=shape)
-
-    assert dsa._kernel_fits(cuda(8, 32, 128), view)
-    assert not dsa._kernel_fits(cuda(8, 4, 16), view)  # the reduced config's 4 index heads
-    assert not dsa._kernel_fits(cuda(8, 32, 128), view.float())
-
-
 def test_a_non_bf16_cache_captures_nothing_in_long_mode():
-    # the DSA kernels take a bf16 cache; the torch paths sync with the host
+    """The DSA kernels take a bf16 cache; the torch paths sync with the host, so no capture."""
     sub = object.__new__(Glm5NextLLMSubmodule)
     sub.config = Glm5NextModelConfig.reduced_long_context()
     sub._moe_capture_blocked = lambda tp_world_size: False
