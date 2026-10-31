@@ -1,6 +1,7 @@
 import atexit
 import hashlib
 import logging
+import math
 import multiprocessing as mp
 import os
 import signal
@@ -2194,6 +2195,23 @@ class Conductor:
               for name, family in catalog.WORKER_FAMILIES.items()),
         ])
 
+    def _ms_to_next_timed_check(self) -> int:
+        """How long the run loop can wait for a message: until the liveness
+        check, the earliest expiry deadline or the metrics status.
+
+        At least 1 ms. The transports read a negative timeout as forever or as
+        an error, and a check left due by a pass that raised before reaching it
+        must not turn the loop into a spin."""
+        due = self._next_liveness_check
+        if self._status_interval_s is not None:
+            due = min(due, self._next_status)
+        for deadlines in (
+            self._draining_deadlines, self._early_reads_done_deadlines, self._early_abort_deadlines,
+        ):
+            if deadlines:
+                due = min(due, deadlines[0][0])
+        return max(1, math.ceil((due - time.perf_counter()) * 1000))
+
     def run(self):
         from mstar.utils.profiler import range_pop, range_push
 
@@ -2264,4 +2282,6 @@ class Conductor:
             # Outside the try above so DeadWorkerError leaves the loop instead of
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
-            time.sleep(0.001)
+            # No wakeup event is registered: nothing in this process makes work
+            # outside a message, and what isn't a message is a timed check.
+            self.communicator.poll_for_messages(timeout_ms=self._ms_to_next_timed_check())
