@@ -917,6 +917,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     w.tp_async_sched, w.is_tp_follower = False, False
     w._in_flight_rids = set()
     w._victims = {}
+    w._logged_pools = []
     w._metrics = None
     w._step_cpus = StepCpus(step, "test")
     w._process_cpus = allowed
