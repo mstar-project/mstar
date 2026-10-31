@@ -67,8 +67,12 @@ ASR_SAMPLE_RATE = 16000
 WHISPER_WINDOW_SECONDS = 30
 
 
-def transcribe(wavs: list[Path], asr_model: str, device: str, batch_size: int) -> list[str]:
-    """Whisper transcripts of the files (each at most one 30 s window)."""
+def transcribe(
+    wavs: list[Path], asr_model: str, device: str, batch_size: int, windowed: bool = False,
+) -> list[str]:
+    """Whisper transcripts of the files: each cut to one 30 s window, or with
+    ``windowed`` transcribed window by window and joined (a word split across
+    two windows may be misheard)."""
     import soundfile as sf
     import torch
     from scipy.signal import resample_poly
@@ -77,13 +81,17 @@ def transcribe(wavs: list[Path], asr_model: str, device: str, batch_size: int) -
     dtype = torch.float16 if device.startswith("cuda") else torch.float32
     processor = WhisperProcessor.from_pretrained(asr_model)
     model = WhisperForConditionalGeneration.from_pretrained(asr_model, dtype=dtype).to(device).eval()
-    clips = []
-    for path in wavs:
+    window = WHISPER_WINDOW_SECONDS * ASR_SAMPLE_RATE
+    clips, owner = [], []
+    for i, path in enumerate(wavs):
         audio, rate = sf.read(path, dtype="float32")
         audio = audio if audio.ndim == 1 else audio.mean(axis=1)
         g = np.gcd(rate, ASR_SAMPLE_RATE)
         clip = resample_poly(audio, ASR_SAMPLE_RATE // g, rate // g).astype(np.float32)
-        clips.append(clip[: WHISPER_WINDOW_SECONDS * ASR_SAMPLE_RATE])
+        starts = range(0, max(len(clip), 1), window) if windowed else [0]
+        for start in starts:
+            clips.append(clip[start : start + window])
+            owner.append(i)
     texts: list[str] = []
     with torch.no_grad():
         for start in range(0, len(clips), batch_size):
@@ -91,7 +99,10 @@ def transcribe(wavs: list[Path], asr_model: str, device: str, batch_size: int) -
             features = processor(batch, sampling_rate=ASR_SAMPLE_RATE, return_tensors="pt").input_features
             ids = model.generate(features.to(device=device, dtype=dtype), language="en", task="transcribe")
             texts.extend(processor.batch_decode(ids, skip_special_tokens=True))
-    return texts
+    joined = [[] for _ in wavs]
+    for i, text in zip(owner, texts, strict=True):
+        joined[i].append(text.strip())
+    return [" ".join(parts) for parts in joined]
 
 
 def main() -> None:
