@@ -28,7 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pytest  # noqa: E402
 
-from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
+import mstar.worker.worker as worker_mod  # noqa: E402
+from mstar.engine.engine import ExecutingBatch  # noqa: E402
+from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext  # noqa: E402
 from mstar.graph.runtime.base import (  # noqa: E402
     ColumnarEdgeSpecs,
     PopRidsOutput,
@@ -309,7 +311,86 @@ def test_a_refusal_under_arrival_takes_the_row_last_in_line():
         sched.note_arrival(rid)
         _admitted(sched, ScheduledBatch(NODE, WALK, request_to_worker_graph={rid: 0}))
 
-    assert Worker._select_eviction_victim(SimpleNamespace(scheduler=sched), NODE, WALK, [0, 1, 2]) == 0
+    assert Worker._select_eviction_victim(SimpleNamespace(scheduler=sched), NODE, WALK, [0, 1, 2]) == 1
+
+
+class _StopLoopError(BaseException):
+    """Ends ``Worker.run``, whose loop handles only ``Exception``."""
+
+
+def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
+    """The real ``Worker.run`` over this real scheduler, and everything else
+    it calls stubbed: nothing speculates, so each step comes from
+    ``get_next_batch``, and the loop ends when the scheduler has nothing left.
+    The steps of the rows in ``refuse`` have their admit refused."""
+    monkeypatch.setenv("MSTAR_PRE_PLAN_SPEC", "0")
+    monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
+        collect=lambda: None, freeze=lambda: None, get_freeze_count=lambda: 0))
+
+    def stub(*a, **k):
+        return None
+
+    def idle(*a, **k):
+        raise _StopLoopError
+
+    def executing(batch):
+        return ExecutingBatch(
+            node_name=batch.node_name,
+            per_request_info={rid: SimpleNamespace(rid=rid) for rid in batch.request_to_worker_graph},
+            step_context=StepContext(request_ids=tuple(batch.request_to_worker_graph),
+                                     graph_walk=batch.graph_walk, slot=0, capture=False),
+        )
+
+    def gpu(batch, node_batch, plan_future):
+        if refuse.intersection(batch.request_to_worker_graph):
+            node_batch.register_admit_error("out of pages")
+        return {}
+
+    w = Worker.__new__(Worker)
+    w.worker_id = "worker_0"
+    w.enable_nvtx = False
+    w._phase_period, w._phase_buf = 0, {}
+    w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
+    w.tp_async_sched, w.is_tp_follower = False, False
+    w._in_flight_rids = set()
+    w._metrics = None
+    w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
+    w.engine_manager = SimpleNamespace(warmup_all=stub)
+    w.communicator = SimpleNamespace(send=stub, wait_for_work=idle)
+    w.wakeup_event = SimpleNamespace(register_future=stub)
+    w.scheduler, w.request_state = sched, state
+    for name in ("_verify_tp_async_sched_agrees", "_pin_step_thread", "_init_engine_thread",
+                 "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
+                 "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
+                 "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
+                 "_drop_rows_whose_loop_stopped", "_handle_admit_failure", "_postprocess_batch"):
+        setattr(w, name, stub)
+    w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
+    w._build_executing_batch = executing
+    w._build_speculation = lambda pending, consecutive, fair: (None, None)
+    w._execute_on_gpu_thread = gpu
+
+    def fail_loudly(error, *args):
+        raise error
+
+    w._handle_main_loop_error = fail_loudly
+    return w
+
+
+def test_the_run_loop_counts_a_steps_turns_once_its_admit_takes_it(monkeypatch):
+    """Two steps through the real loop at a cap of one: 0's is admitted, so
+    its row has had its turn; 1's is refused, so its row keeps its place."""
+    runtime = _Runtime()
+    sched, state = _scheduler(runtime, TURNS)
+    for rid in (0, 1):
+        runtime.requests[rid] = None
+        sched.note_arrival(rid)
+    runtime.ready |= {0, 1}
+
+    with pytest.raises(_StopLoopError):
+        _looping_worker(monkeypatch, sched, state, refuse=frozenset({1})).run()
+
+    assert sched.last_ran == {KEY: {0: 1}}
 
 
 def test_a_lone_request_keeps_its_chain_without_a_scan():
