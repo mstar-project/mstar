@@ -50,6 +50,8 @@ from mstar.engine.resources import (
     PagedKVConfig,
     PositionConfig,
     PositionSpec,
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
@@ -83,6 +85,7 @@ from mstar.model.multimodal import (
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.config import (
+    AUDIO_ATTN,
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
@@ -93,6 +96,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
+    VISION_ATTN,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
@@ -319,7 +323,39 @@ class Qwen3OmniModel(Model):
                 nodes={"Talker"},
                 vocab_size=self.config.code_predictor.vocab_size,
                 enable_repetion_penalty=False,
-            )
+            ),
+            *self._encoder_resources(),
+        ]
+
+    def _encoder_resources(self) -> list[NodeResourceSpec]:
+        """The encoders' attention: within each 8 s audio window, and within
+        each image or video frame group. No cache, so nothing else."""
+        from mstar.model.components.aut_submodule import AuTEncoderSubmodule
+        from mstar.model.qwen3_omni.submodules import VisionEncoderSubmodule
+
+        audio, vision = self.config.audio_encoder, self.config.vision
+        return [
+            RaggedAttentionSpec(
+                resource_key=AUDIO_ATTN, nodes={"audio_encoder"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=audio.encoder_attention_heads,
+                    num_kv_heads=audio.encoder_attention_heads,
+                    head_dim=audio.head_dim,
+                    max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(audio),
+                ),
+            ),
+            RaggedAttentionSpec(
+                resource_key=VISION_ATTN, nodes={"vision_encoder"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=vision.num_heads,
+                    num_kv_heads=vision.num_heads,
+                    head_dim=vision.head_dim,
+                    # Frames of 256 patches or more fill the largest captured
+                    # bucket at this many; a request with more frames runs the
+                    # block loop eagerly (`VisionEncoderSubmodule._fits_capture`).
+                    max_segments_per_request=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+                ),
+            ),
         ]
 
     def get_request_resource_configs(
@@ -1467,9 +1503,9 @@ class Qwen3OmniModel(Model):
         elif node_name == "Code2Wav":
             return self._create_code2wav_submodule(device)
         elif node_name == "audio_encoder":
-            return self._create_audio_encoder_submodule(device)
+            return self._create_audio_encoder_submodule(device, autocast_dtype)
         elif node_name == "vision_encoder":
-            return self._create_vision_encoder_submodule(device)
+            return self._create_vision_encoder_submodule(device, autocast_dtype)
         return None
 
     @staticmethod
@@ -1699,88 +1735,41 @@ class Qwen3OmniModel(Model):
             config=self.config,
         )
 
-    def _create_audio_encoder_submodule(self, device: str) -> NodeSubmodule:
-        """Load the audio encoder (AuT) from HF weights."""
-        # Reuse HF audio encoder directly (Whisper-style, not perf-critical)
-        from transformers import AutoConfig
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeAudioEncoder,
-        )
-
-        from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
-        from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
-
-        # Load config only (no weights)
-        config = AutoConfig.from_pretrained(
-            self.local_dir,
-            trust_remote_code=False,
-        )
-
-        # This should be a Qwen3OmniMoeConfig
-        audio_config = config.thinker_config.audio_config
-
-        # Build the audio encoder from config.
-        # IMPORTANT: pass attn_implementation="flash_attention_2" so the
-        # encoder uses the cu_seqlens FA2 path. With the HF default
-        # (which resolves to "sdpa"), Qwen3OmniMoeAudioAttention runs
-        # SDPA on the full packed sequence (no per-segment fusion),
-        # which is significantly slower than FA2's varlen path.
-        patch_hf_fa2_int_maxlen()
-        audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
-            audio_config, attn_implementation="flash_attention_2"
-        )
-
-        load_weights_from_hf_shards(
-            repo_dir=self.local_dir,
-            modules=[ModuleAndPrefix(audio_encoder, prefix="thinker.audio_tower")],
-            device=device,
-        )
-        audio_encoder.eval()
-
+    def _create_audio_encoder_submodule(
+        self, device: str, autocast_dtype: torch.dtype | None,
+    ) -> NodeSubmodule:
+        """The AuT audio encoder (``thinker.audio_tower``)."""
+        from mstar.model.components.aut_encoder import AuTEncoder
+        from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule
-        return AudioEncoderSubmodule(audio_encoder=audio_encoder, config=self.config)
 
-    def _create_vision_encoder_submodule(self, device: str) -> NodeSubmodule:
-        """Load the vision encoder (SigLIP2 ViT) from HF weights."""
-        # Reuse HF vision encoder directly
-        from transformers import AutoConfig
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeVisionEncoder,
-        )
+        with torch.device("meta"):
+            encoder = AuTEncoder(self.config.audio_encoder, attn_key=AUDIO_ATTN)
+        if autocast_dtype is not None:
+            encoder = encoder.to(autocast_dtype)
+        encoder.to_empty(device=device)
+        prefix = "thinker.audio_tower."
+        weights = iter_safetensors_shards(self.local_dir, device=device, prefix=prefix)
+        encoder.load_weights((k.removeprefix(prefix), v) for k, v in weights)
+        return AudioEncoderSubmodule(encoder.eval(), self.config)
 
-        from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
-        from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
-
-        # Load full config (no weights)
-        config = AutoConfig.from_pretrained(
-            self.local_dir,
-            trust_remote_code=False,
-        )
-
-        # Extract the vision sub-config
-        vision_config = config.thinker_config.vision_config
-
-        # Build the vision encoder.
-        # CRITICAL: pass attn_implementation="flash_attention_2". Without
-        # this, vision_config._attn_implementation defaults to None and is
-        # resolved to "sdpa" at runtime (modeling_utils.py:1889). With
-        # "sdpa", Qwen3OmniMoeVisionAttention.forward falls into the
-        # per-segment Python loop (modeling_qwen3_omni_moe.py:892-913),
-        # which issues N sequential attention calls per layer for an
-        # N-frame video and makes V2T/V2S TTFT far slower. With
-        # "flash_attention_2", a single varlen FA2 call
-        # per layer handles all frames at once via cu_seqlens.
-        patch_hf_fa2_int_maxlen()
-        vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
-            vision_config, attn_implementation="flash_attention_2"
-        )
-
-        load_weights_from_hf_shards(
-            repo_dir=self.local_dir,
-            modules=[ModuleAndPrefix(vision_encoder, prefix="thinker.visual")],
-            device=device,
-        )
-        vision_encoder.eval()
-
+    def _create_vision_encoder_submodule(
+        self, device: str, autocast_dtype: torch.dtype | None,
+    ) -> NodeSubmodule:
+        """The ViT (``thinker.visual``) with its deepstack mergers."""
+        from mstar.model.loader import load_hf_weights
+        from mstar.model.loader.iterators import iter_safetensors_shards
+        from mstar.model.qwen3_omni.components.vision import Qwen3OmniVisionTower
         from mstar.model.qwen3_omni.submodules import VisionEncoderSubmodule
-        return VisionEncoderSubmodule(vision_encoder=vision_encoder, config=self.config)
+        from mstar.model.utils import check_loaded
+
+        # built on the device, not on meta: the rotary table is a computed buffer
+        with torch.device(device):
+            tower = Qwen3OmniVisionTower(self.config.vision, attn_key=VISION_ATTN)
+        if autocast_dtype is not None:
+            tower = tower.to(autocast_dtype)
+        prefix = "thinker.visual."
+        weights = iter_safetensors_shards(self.local_dir, device=device, prefix=prefix)
+        loaded = load_hf_weights(tower, ((k.removeprefix(prefix), v) for k, v in weights))
+        check_loaded(tower, loaded, "Qwen3-Omni vision tower")
+        return VisionEncoderSubmodule(tower.eval(), self.config)

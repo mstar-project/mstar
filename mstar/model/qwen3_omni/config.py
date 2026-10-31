@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Tuple
 
+from mstar.model.components.aut_encoder import AuTEncoderConfig
+
 # ---------------------------------------------------------------------------
 # Resource label constants
 # ---------------------------------------------------------------------------
@@ -24,6 +26,9 @@ TALKER_KV = "talker_kv"
 
 THINKER_ATTN = "thinker_attn"
 TALKER_ATTN = "talker_attn"
+# the encoders' cacheless attention (ragged: within each window / frame)
+AUDIO_ATTN = "audio_attn"
+VISION_ATTN = "vision_attn"
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
@@ -126,14 +131,35 @@ class ThinkerConfig:
 class VisionEncoderConfig:
     depth: int = 27
     hidden_size: int = 1152
+    intermediate_size: int = 4304
     num_heads: int = 16
+    in_channels: int = 3
+    patch_size: int = 16
+    temporal_patch_size: int = 2
     spatial_merge_size: int = 2
+    num_position_embeddings: int = 2304
     out_hidden_size: int = 3584
+    hidden_act: str = "gelu_pytorch_tanh"
+    rope_theta: float = 10_000.0
     deepstack_visual_indexes: tuple[int, ...] = (8, 16, 24)
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_heads
+
+    @property
+    def num_grid_per_side(self) -> int:
+        """The learned position table is a square grid."""
+        return int(self.num_position_embeddings**0.5)
+
+    @property
+    def merge_unit(self) -> int:
+        return self.spatial_merge_size**2
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> VisionEncoderConfig:
         fnames = {f.name for f in cls.__dataclass_fields__.values()}
+        d = {**d, **d.get("rope_parameters", {})}
         filtered = {k: v for k, v in d.items() if k in fnames}
         # HF may store tuple fields as lists
         if "deepstack_visual_indexes" in filtered and isinstance(
@@ -143,25 +169,6 @@ class VisionEncoderConfig:
                 filtered["deepstack_visual_indexes"]
             )
         return cls(**filtered)
-
-
-# ---------------------------------------------------------------------------
-# Audio encoder
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AudioEncoderConfig:
-    d_model: int = 1280
-    encoder_layers: int = 32
-    encoder_attention_heads: int = 20
-    output_dim: int = 3584
-    max_source_positions: int = 1500
-    n_window: int = 50
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> AudioEncoderConfig:
-        fnames = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in d.items() if k in fnames})
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +445,7 @@ class Qwen3OmniModelConfig:
     thinker_text: ThinkerTextConfig = field(default_factory=ThinkerTextConfig)
     thinker: ThinkerConfig = field(default_factory=ThinkerConfig)
     vision: VisionEncoderConfig = field(default_factory=VisionEncoderConfig)
-    audio_encoder: AudioEncoderConfig = field(default_factory=AudioEncoderConfig)
+    audio_encoder: AuTEncoderConfig = field(default_factory=AuTEncoderConfig)
     talker_text: TalkerTextConfig = field(default_factory=TalkerTextConfig)
     talker: TalkerConfig = field(default_factory=TalkerConfig)
     code_predictor: CodePredictorConfig = field(default_factory=CodePredictorConfig)
@@ -570,7 +577,7 @@ class Qwen3OmniModelConfig:
         thinker_text = ThinkerTextConfig.from_dict(thinker_text_raw)
         thinker = ThinkerConfig.from_dict(thinker_raw)
         vision = VisionEncoderConfig.from_dict(vision_raw)
-        audio_encoder = AudioEncoderConfig.from_dict(audio_enc_raw)
+        audio_encoder = AuTEncoderConfig.from_hf(audio_enc_raw)
 
         # --- Talker ---------------------------------------------------
         talker_raw = raw.get("talker_config", {})

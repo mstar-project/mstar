@@ -32,8 +32,8 @@ AUT_ENCODE = "aut_encode"
 
 
 class AuTEncoderSubmodule(NodeSubmodule):
-    """Packed AuT encoder, emitting ``audio_embeds`` of shape
-    ``(num_audio_tokens, output_dim)`` per request. The runner plans the
+    """Packed AuT encoder, emitting one ``(num_audio_tokens, output_dim)``
+    ``audio_embeds`` tensor per request. The runner plans the
     windows' kernel layout before the forward, so nothing is recomputed
     inside it."""
 
