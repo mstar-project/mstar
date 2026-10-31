@@ -798,6 +798,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_batches_by_capture_key()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_is_input_free()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_order"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_order()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.uniform_row_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.warmup_compiles"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.warmup_compiles()</span></code></a></li>
@@ -817,6 +818,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.CAT"><code class="docutils literal notranslate"><span class="pre">StackingMethod.CAT</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.NONE"><code class="docutils literal notranslate"><span class="pre">StackingMethod.NONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.STACK"><code class="docutils literal notranslate"><span class="pre">StackingMethod.STACK</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StepOrder"><code class="docutils literal notranslate"><span class="pre">StepOrder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StepOrder.ARRIVAL"><code class="docutils literal notranslate"><span class="pre">StepOrder.ARRIVAL</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StepOrder.TURNS"><code class="docutils literal notranslate"><span class="pre">StepOrder.TURNS</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StopCheck"><code class="docutils literal notranslate"><span class="pre">StopCheck</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -876,7 +882,10 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StackingMethod" title="mstar.model.submodule_base.StackingMethod"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StackingMethod</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopCheck" title="mstar.model.submodule_base.StopCheck"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopCheck</span></code></a>([stops, withheld])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StepOrder" title="mstar.model.submodule_base.StepOrder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepOrder</span></code></a>(*values)</p></td>
+<td><p>Who runs first when more rows of a node are ready than its step takes (<code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopCheck" title="mstar.model.submodule_base.StopCheck"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopCheck</span></code></a>([stops, withheld])</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">check_stop</span></code>'s answer when the step also has outputs that are not data.</p></td>
 </tr>
 </tbody>
@@ -2117,6 +2126,22 @@ declaring and admitting a second time.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.step_order">
+<span class="sig-name descname"><span class="pre">step_order</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.step_order"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.step_order" title="Link to this definition">#</a></dt>
+<dd><p>Which rows go first when more are ready than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>
+allows. Override it for a walk whose sessions have to keep moving
+while others run.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.StepOrder" title="mstar.model.submodule_base.StepOrder"><em>StepOrder</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs">
 <span class="sig-name descname"><span class="pre">uniform_row_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_loopback</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.uniform_row_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs" title="Link to this definition">#</a></dt>
 <dd><p>The inputs every row of this walk gets, when <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>
@@ -2288,6 +2313,24 @@ transfer yet.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.StackingMethod.STACK">
 <span class="sig-name descname"><span class="pre">STACK</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'stack'</span></span><a class="headerlink" href="#mstar.model.submodule_base.StackingMethod.STACK" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.StepOrder">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">StepOrder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#StepOrder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.StepOrder" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.Enum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></a></p>
+<p>Who runs first when more rows of a node are ready than its step takes
+(<code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size</span></code>).</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.StepOrder.ARRIVAL">
+<span class="sig-name descname"><span class="pre">ARRIVAL</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'arrival'</span></span><a class="headerlink" href="#mstar.model.submodule_base.StepOrder.ARRIVAL" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.StepOrder.TURNS">
+<span class="sig-name descname"><span class="pre">TURNS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'turns'</span></span><a class="headerlink" href="#mstar.model.submodule_base.StepOrder.TURNS" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -2486,6 +2529,7 @@ it. A plain <code class="docutils literal notranslate"><span class="pre">set</sp
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_batches_by_capture_key()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_is_input_free()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_order"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_order()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.uniform_row_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.warmup_compiles"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.warmup_compiles()</span></code></a></li>
@@ -2505,6 +2549,11 @@ it. A plain <code class="docutils literal notranslate"><span class="pre">set</sp
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.CAT"><code class="docutils literal notranslate"><span class="pre">StackingMethod.CAT</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.NONE"><code class="docutils literal notranslate"><span class="pre">StackingMethod.NONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.STACK"><code class="docutils literal notranslate"><span class="pre">StackingMethod.STACK</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StepOrder"><code class="docutils literal notranslate"><span class="pre">StepOrder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StepOrder.ARRIVAL"><code class="docutils literal notranslate"><span class="pre">StepOrder.ARRIVAL</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StepOrder.TURNS"><code class="docutils literal notranslate"><span class="pre">StepOrder.TURNS</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StopCheck"><code class="docutils literal notranslate"><span class="pre">StopCheck</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

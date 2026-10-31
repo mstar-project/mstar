@@ -1066,6 +1066,20 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.stream_buffer</span><span class="w"> </span><span class="kn">import</span> <span class="n">StreamChunkInfo</span>
 
 
+<div class="viewcode-block" id="StepOrder">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.StepOrder">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">StepOrder</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Who runs first when more rows of a node are ready than its step takes</span>
+<span class="sd">    (``NodeSubmodule.max_batch_size``)."""</span>
+    <span class="c1"># First come, first served to completion: the rows that ran the node's last</span>
+    <span class="c1"># step keep it, then the request that arrived first. The default.</span>
+    <span class="n">ARRIVAL</span> <span class="o">=</span> <span class="s2">"arrival"</span>
+    <span class="c1"># Longest-waiting first: a row that just ran gives way to one that waited.</span>
+    <span class="c1"># For a session whose stream has to keep moving while others run.</span>
+    <span class="n">TURNS</span> <span class="o">=</span> <span class="s2">"turns"</span></div>
+
+
+
 <div class="viewcode-block" id="InputMetadata">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.InputMetadata">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">InputMetadata</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
@@ -2024,6 +2038,16 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        mixed step runs the walk's rows on a path sized to a few of them."""</span>
         <span class="k">del</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.step_order">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.step_order">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">step_order</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StepOrder</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Which rows go first when more are ready than ``max_batch_size``</span>
+<span class="sd">        allows. Override it for a walk whose sessions have to keep moving</span>
+<span class="sd">        while others run."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="n">StepOrder</span><span class="o">.</span><span class="n">ARRIVAL</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.get_autocast_dtype">

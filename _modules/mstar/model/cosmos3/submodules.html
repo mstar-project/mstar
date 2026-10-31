@@ -1063,6 +1063,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">ModelInputsFromEngine</span><span class="p">,</span>
     <span class="n">NodeInputs</span><span class="p">,</span>
     <span class="n">NodeSubmodule</span><span class="p">,</span>
+    <span class="n">StepOrder</span><span class="p">,</span>
 <span class="p">)</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
@@ -3084,6 +3085,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="Cosmos3DiTSubmodule.step_order">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.step_order">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">step_order</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StepOrder</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Chained windows stream to the decoder as they finish, so a</span>
+<span class="sd">        session's stream keeps moving while others run. Every other walk's</span>
+<span class="sd">        output comes at the end of its loop."""</span>
+        <span class="k">return</span> <span class="n">StepOrder</span><span class="o">.</span><span class="n">TURNS</span> <span class="k">if</span> <span class="n">graph_walk</span> <span class="o">==</span> <span class="n">VIDEO_GEN_AR_WALK</span> <span class="k">else</span> <span class="n">StepOrder</span><span class="o">.</span><span class="n">ARRIVAL</span></div>
+
+
     <span class="c1"># Native bf16, not the engine autocast — see the note on forward(). The</span>
     <span class="c1"># cross-request batched denoise must match the per-request path exactly.</span>
 <div class="viewcode-block" id="Cosmos3DiTSubmodule.forward_batched">
@@ -4068,6 +4078,15 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_warm_enabled</span> <span class="o">=</span> <span class="n">vae</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">bool</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">windowed_decode_warm_cache</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_step</span> <span class="o">=</span> <span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">DecoderStep</span><span class="p">(</span><span class="n">vae</span><span class="p">,</span> <span class="nb">compile</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_decode_compiled</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warm_enabled</span> <span class="k">else</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="Cosmos3VAEDecoderARSubmodule.step_order">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.step_order">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">step_order</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StepOrder</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The decoder feeds the DiT's chained windows to the client, so a</span>
+<span class="sd">        session's stream keeps moving while others run."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="n">StepOrder</span><span class="o">.</span><span class="n">TURNS</span></div>
+
 
 <div class="viewcode-block" id="Cosmos3VAEDecoderARSubmodule.prepare_inputs">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.prepare_inputs">[docs]</a>

@@ -712,6 +712,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.prefill_capture_token_buckets"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.prefill_capture_token_buckets</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.preprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.step_order"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.step_order()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.to"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.to()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.warmup_compiles"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.warmup_compiles()</span></code></a></li>
 </ul>
@@ -733,6 +734,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule.forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule.prepare_inputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.step_order"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule.step_order()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1211,6 +1213,22 @@ pass through untouched (no <code class="docutils literal notranslate"><span clas
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.step_order">
+<span class="sig-name descname"><span class="pre">step_order</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3DiTSubmodule.step_order"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.step_order" title="Link to this definition">#</a></dt>
+<dd><p>Chained windows stream to the decoder as they finish, so a
+session’s stream keeps moving while others run. Every other walk’s
+output comes at the end of its loop.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.StepOrder" title="mstar.model.submodule_base.StepOrder"><em>StepOrder</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.to">
 <span class="sig-name descname"><span class="pre">to</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3DiTSubmodule.to"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.to" title="Link to this definition">#</a></dt>
 <dd><p>Move and/or cast the parameters and buffers.</p>
@@ -1549,6 +1567,21 @@ request id, as <code class="docutils literal notranslate"><span class="pre">forw
 <dd><dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.step_order">
+<span class="sig-name descname"><span class="pre">step_order</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderARSubmodule.step_order"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.step_order" title="Link to this definition">#</a></dt>
+<dd><p>The decoder feeds the DiT’s chained windows to the client, so a
+session’s stream keeps moving while others run.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.StepOrder" title="mstar.model.submodule_base.StepOrder"><em>StepOrder</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1914,6 +1947,7 @@ trimmed by the audio decode node).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.prefill_capture_token_buckets"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.prefill_capture_token_buckets</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.preprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.step_order"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.step_order()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.to"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.to()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.warmup_compiles"><code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule.warmup_compiles()</span></code></a></li>
 </ul>
@@ -1935,6 +1969,7 @@ trimmed by the audio decode node).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule.forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule.prepare_inputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.step_order"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderARSubmodule.step_order()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule"><code class="docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

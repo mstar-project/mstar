@@ -687,21 +687,15 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder.build_batch"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder.build_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder.chain_must_yield"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder.chain_must_yield()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder.room_for_continuing"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder.room_for_continuing()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder.pick"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder.pick()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.backlog"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.backlog</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.blocked_rids"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.blocked_rids</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.capture_group"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.capture_group()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.capture_group_of"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.capture_group_of</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.fresh"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.fresh</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.graph_walk"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.node_name"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.node_name</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.pre_existing_batch_size"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.pre_existing_batch_size</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.pre_existing_walk"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.pre_existing_walk</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_caps"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.walk_caps</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_row_caps"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.walk_row_caps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.pick"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.pick</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -716,6 +710,35 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.build_batch"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.build_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.pick"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.pick()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.LineOrder"><code class="docutils literal notranslate"><span class="pre">LineOrder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.LineOrder.key"><code class="docutils literal notranslate"><span class="pre">LineOrder.key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.LineOrder.strict"><code class="docutils literal notranslate"><span class="pre">LineOrder.strict</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates"><code class="docutils literal notranslate"><span class="pre">StepCandidates</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.backlog"><code class="docutils literal notranslate"><span class="pre">StepCandidates.backlog</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.capture_group"><code class="docutils literal notranslate"><span class="pre">StepCandidates.capture_group</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.continuing"><code class="docutils literal notranslate"><span class="pre">StepCandidates.continuing</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.graph_walk"><code class="docutils literal notranslate"><span class="pre">StepCandidates.graph_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.line_order"><code class="docutils literal notranslate"><span class="pre">StepCandidates.line_order()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.one_walk"><code class="docutils literal notranslate"><span class="pre">StepCandidates.one_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.own_walk"><code class="docutils literal notranslate"><span class="pre">StepCandidates.own_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.queued"><code class="docutils literal notranslate"><span class="pre">StepCandidates.queued</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.ready"><code class="docutils literal notranslate"><span class="pre">StepCandidates.ready()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.walk_caps"><code class="docutils literal notranslate"><span class="pre">StepCandidates.walk_caps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.walk_of"><code class="docutils literal notranslate"><span class="pre">StepCandidates.walk_of()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.walk_row_caps"><code class="docutils literal notranslate"><span class="pre">StepCandidates.walk_row_caps</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick"><code class="docutils literal notranslate"><span class="pre">StepPick</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.continuing"><code class="docutils literal notranslate"><span class="pre">StepPick.continuing</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.held_back"><code class="docutils literal notranslate"><span class="pre">StepPick.held_back</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.ordered"><code class="docutils literal notranslate"><span class="pre">StepPick.ordered</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.room"><code class="docutils literal notranslate"><span class="pre">StepPick.room</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.taken"><code class="docutils literal notranslate"><span class="pre">StepPick.taken</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.make_batch_builder"><code class="docutils literal notranslate"><span class="pre">make_batch_builder()</span></code></a></li>
@@ -736,8 +759,10 @@
 <p>Batch composition: which ready rows of one (node, walk) run this step.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">MicroScheduler</span></code> picks the (node, walk) and owns the mechanics (popping
 ready queues, the backlog, holds, TP follow); a <code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder</span></code> decides
-which of the popped rows go into the step, which stay parked in the backlog
-and which go back to their ready queues.</p>
+which rows the step takes out of a speculation chain’s own rows, the backlog
+and the ready queues (<code class="docutils literal notranslate"><span class="pre">pick</span></code>), and splits what was popped into the step, the
+rows that stay parked in the backlog and the ones that go back to their ready
+queues (<code class="docutils literal notranslate"><span class="pre">build_batch</span></code>).</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -756,7 +781,7 @@ and which go back to their ready queues.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BaseBatchBuilder" title="mstar.worker.batch_builder.BaseBatchBuilder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BaseBatchBuilder</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuildRequest" title="mstar.worker.batch_builder.BatchBuildRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchBuildRequest</span></code></a>(node_name, graph_walk, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuildRequest" title="mstar.worker.batch_builder.BatchBuildRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchBuildRequest</span></code></a>(node_name, graph_walk[, ...])</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuildResult" title="mstar.worker.batch_builder.BatchBuildResult"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchBuildResult</span></code></a>(scheduled, backlog, returned)</p></td>
@@ -766,7 +791,16 @@ and which go back to their ready queues.</p>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.FIFOBatchBuilder" title="mstar.worker.batch_builder.FIFOBatchBuilder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code></a>()</p></td>
-<td><p>Backlog first, then fresh rows, in arrival order, up to the cap; one capture group per step.</p></td>
+<td><p>One capture group per step, up to the cap; who goes first when the rows don't all fit is the node's <cite>StepOrder</cite>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.LineOrder" title="mstar.worker.batch_builder.LineOrder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LineOrder</span></code></a>(key, strict)</p></td>
+<td><p>How rows line up for a step that can't take them all.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.StepCandidates" title="mstar.worker.batch_builder.StepCandidates"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepCandidates</span></code></a>(graph_walk[, continuing, ...])</p></td>
+<td><p>Every row that could run one step of a scheduling key, for <code class="docutils literal notranslate"><span class="pre">pick</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepPick</span></code></a>(taken, continuing, room, held_back, ...)</p></td>
+<td><p></p></td>
 </tr>
 </tbody>
 </table>
@@ -793,8 +827,8 @@ and which go back to their ready queues.</p>
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BaseBatchBuilder.chain_must_yield">
 <span class="sig-name descname"><span class="pre">chain_must_yield</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">backlog</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">live_rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">anchor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_group</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BaseBatchBuilder.chain_must_yield"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BaseBatchBuilder.chain_must_yield" title="Link to this definition">#</a></dt>
 <dd><p>Whether a speculation chain anchored at <code class="docutils literal notranslate"><span class="pre">anchor</span></code> has to stop so
-<code class="docutils literal notranslate"><span class="pre">backlog</span></code>’s live rows can run: the chain’s merge (a build with
-<code class="docutils literal notranslate"><span class="pre">capture_group_of=anchor</span></code>) would never take them.</p>
+<code class="docutils literal notranslate"><span class="pre">backlog</span></code>’s live rows can run: a step sharing the chain’s capture
+group would never take them.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -811,23 +845,16 @@ and which go back to their ready queues.</p>
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.worker.batch_builder.BaseBatchBuilder.room_for_continuing">
-<span class="sig-name descname"><span class="pre">room_for_continuing</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cap</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backlog</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BaseBatchBuilder.room_for_continuing"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BaseBatchBuilder.room_for_continuing" title="Link to this definition">#</a></dt>
-<dd><p>How many of a speculation chain’s own rids fit in a step capped at
-<code class="docutils literal notranslate"><span class="pre">cap</span></code> when <code class="docutils literal notranslate"><span class="pre">backlog</span></code> waits under the same (node, walk).</p>
-<p>The chain only ever continues its own rids, so at the cap a backlogged
-chunk would never be reached. Giving the backlog first claim costs the
-displaced rids one step — their nodes go ready again when the in-flight
-batch lands. None for an uncapped node: nothing is displaced.</p>
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BaseBatchBuilder.pick">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">pick</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">candidates</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BaseBatchBuilder.pick"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BaseBatchBuilder.pick" title="Link to this definition">#</a></dt>
+<dd><p>Who runs one step: the one place a capped step’s rows are chosen,
+for a speculation chain and for a step the scheduler builds fresh.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>cap</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>backlog</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
-</ul>
+<dd class="field-odd"><p><strong>candidates</strong> (<a class="reference internal" href="#mstar.worker.batch_builder.StepCandidates" title="mstar.worker.batch_builder.StepCandidates"><em>StepCandidates</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a> | None</p>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><em>StepPick</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -836,7 +863,7 @@ batch lands. None for an uncapped node: nothing is displaced.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuildRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">node_name:</span> <span class="pre">str,</span> <span class="pre">graph_walk:</span> <span class="pre">str,</span> <span class="pre">backlog:</span> <span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">fresh:</span> <span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">blocked_rids:</span> <span class="pre">set[int]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">capture_group_of:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">walk_caps:</span> <span class="pre">dict[str,</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">walk_row_caps:</span> <span class="pre">dict[str,</span> <span class="pre">int]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">pre_existing_batch_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">pre_existing_walk:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">capture_group:</span> <span class="pre">collections.abc.Callable[[int],</span> <span class="pre">typing.Any]</span> <span class="pre">=</span> <span class="pre">&lt;function</span> <span class="pre">BatchBuildRequest.&lt;lambda&gt;</span> <span class="pre">at</span> <span class="pre">0x76eae5d1c0e0&gt;</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuildRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuildRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">backlog</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fresh</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pick</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><span class="pre">mstar.worker.batch_builder.StepPick</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuildRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -845,34 +872,13 @@ batch lands. None for an uncapped node: nothing is displaced.</p>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>backlog</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
 <li><p><strong>fresh</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
-<li><p><strong>blocked_rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>capture_group_of</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>walk_caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em><em>]</em>)</p></li>
-<li><p><strong>walk_row_caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>pre_existing_batch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>pre_existing_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>capture_group</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
+<li><p><strong>pick</strong> (<a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><em>StepPick</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.backlog">
 <span class="sig-name descname"><span class="pre">backlog</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.backlog" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.blocked_rids">
-<span class="sig-name descname"><span class="pre">blocked_rids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.blocked_rids" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.capture_group">
-<span class="sig-name descname"><span class="pre">capture_group</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.capture_group" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.capture_group_of">
-<span class="sig-name descname"><span class="pre">capture_group_of</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.capture_group_of" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -891,23 +897,8 @@ batch lands. None for an uncapped node: nothing is displaced.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.pre_existing_batch_size">
-<span class="sig-name descname"><span class="pre">pre_existing_batch_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.pre_existing_batch_size" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.pre_existing_walk">
-<span class="sig-name descname"><span class="pre">pre_existing_walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.pre_existing_walk" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.walk_caps">
-<span class="sig-name descname"><span class="pre">walk_caps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_caps" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.walk_row_caps">
-<span class="sig-name descname"><span class="pre">walk_row_caps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_row_caps" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.pick">
+<span class="sig-name descname"><span class="pre">pick</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><span class="pre">StepPick</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.pick" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -960,31 +951,33 @@ batch lands. None for an uncapped node: nothing is displaced.</p>
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.FIFOBatchBuilder">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">FIFOBatchBuilder</span></span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#FIFOBatchBuilder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.FIFOBatchBuilder" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.worker.batch_builder.BaseBatchBuilder" title="mstar.worker.batch_builder.BaseBatchBuilder"><code class="xref py py-class docutils literal notranslate"><span class="pre">BaseBatchBuilder</span></code></a></p>
-<p>Backlog first, then fresh rows, in arrival order, up to the cap; one
-capture group per step.</p>
+<p>One capture group per step, up to the cap; who goes first when the
+rows don’t all fit is the node’s <cite>StepOrder</cite>.</p>
+<p>When every row fits, the step takes them in the order backlog, the chain’s
+own rows, then the queues: nothing is left out, so the order only decides
+the capture group, which the chain’s or else the first row’s sets, and a
+row of another group waits for a step of its own. When they don’t all
+fit, every row goes in the order’s sort and the first sets the group. A
+row of another group then waits for a step of its own: under TURNS the
+rows behind it pass it, since it leads the next step; under ARRIVAL they
+don’t, or rows that came later would join the step’s holders and keep it
+from it.</p>
 <p>Under a combined walk a step of one walk takes that walk’s cap and a mixed
 step the combined walk’s own, or with none the smallest of the caps of the
-walks present in it; a walk with no row in the step does not cap it. Rows join in
-order; one whose walk would cap the step at or below the rows already in
-it is left out, and is first in line next step.</p>
-<p>Where this differs from the scheduler it replaces, and why. main had two
-paths: with a backlog it drained that alone, never touching the ready
-queues, so the backlog strictly shrank; with none it popped a fresh set,
-capped it and parked the remainder. This builder always does both, which
-is better – a backlog one row short of the cap gets topped up instead of
-running short – but it means a step that drains a backlog also pops fresh
-rows, and parking their overflow would refill the backlog from the queues
-on every pass. It would then never drain, and since a key holding a
-backlog is served before any other node, that node starves the rest: on
-<code class="docutils literal notranslate"><span class="pre">wan22.yaml</span></code> with <code class="docutils literal notranslate"><span class="pre">dit</span></code> capped at 1 a fifth request’s
-<code class="docutils literal notranslate"><span class="pre">text_encoder</span></code> waited 48.7 s for its first step against 0.2 s on main.</p>
-<p>So a fresh row the cap pushed out goes back to its ready queue <strong>only on
-a step that served a backlog</strong>, which is the case main never created. With
-no backlog it parks, exactly as main did, and the remainder keeps its
-arrival order instead of being re-popped and reordered. A row held back
-for any other reason – OOM backoff, pending remove, a foreign capture
-group, a walk the combined cap left out – always parks: it cannot run
-this step whoever holds it.</p>
+walks present in it; a walk with no row in the step does not cap it. Rows
+join in order; one whose walk would cap the step at or below the rows
+already in it is left out.</p>
+<p>Of the rows <code class="docutils literal notranslate"><span class="pre">build_batch</span></code> gets, a fresh row the cap pushed out goes back
+to its ready queue <strong>only on a step that served a backlog</strong>. Parking it
+would refill the backlog from the queues on every pass, so it would never
+drain, and since a key holding a backlog is served before any other node,
+that node starves the rest: on <code class="docutils literal notranslate"><span class="pre">wan22.yaml</span></code> with <code class="docutils literal notranslate"><span class="pre">dit</span></code> capped at 1 a
+fifth request’s <code class="docutils literal notranslate"><span class="pre">text_encoder</span></code> waited 48.7 s for its first step against
+0.2 s before backlogs were topped up. With no backlog it parks, so a split
+set drains before anything new starts. A row held back for any other
+reason – OOM backoff, pending remove, a foreign capture group, a walk the
+combined cap left out – always parks: it cannot run this step whoever
+holds it.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.FIFOBatchBuilder.build_batch">
 <span class="sig-name descname"><span class="pre">build_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#FIFOBatchBuilder.build_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.FIFOBatchBuilder.build_batch" title="Link to this definition">#</a></dt>
@@ -997,6 +990,180 @@ this step whoever holds it.</p>
 <dd class="field-even"><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuildResult" title="mstar.worker.batch_builder.BatchBuildResult"><em>BatchBuildResult</em></a></p>
 </dd>
 </dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.FIFOBatchBuilder.pick">
+<span class="sig-name descname"><span class="pre">pick</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">candidates</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#FIFOBatchBuilder.pick"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.FIFOBatchBuilder.pick" title="Link to this definition">#</a></dt>
+<dd><p>Who runs one step: the one place a capped step’s rows are chosen,
+for a speculation chain and for a step the scheduler builds fresh.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>candidates</strong> (<a class="reference internal" href="#mstar.worker.batch_builder.StepCandidates" title="mstar.worker.batch_builder.StepCandidates"><em>StepCandidates</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><em>StepPick</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.LineOrder">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">LineOrder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">strict</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#LineOrder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.LineOrder" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>How rows line up for a step that can’t take them all.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
+<li><p><strong>strict</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.LineOrder.key">
+<span class="sig-name descname"><span class="pre">key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.LineOrder.key" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.LineOrder.strict">
+<span class="sig-name descname"><span class="pre">strict</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.LineOrder.strict" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">StepCandidates</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">continuing</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">own_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backlog</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">queued</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_of</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;function</span> <span class="pre">StepCandidates.&lt;lambda&gt;&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">one_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ready</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;function</span> <span class="pre">StepCandidates.&lt;lambda&gt;&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_caps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_row_caps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">line_order</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;function</span> <span class="pre">StepCandidates.&lt;lambda&gt;&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#StepCandidates"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Every row that could run one step of a scheduling key, for <code class="docutils literal notranslate"><span class="pre">pick</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>continuing</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>own_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>backlog</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>queued</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>walk_of</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>one_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>ready</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>]</em>)</p></li>
+<li><p><strong>capture_group</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>walk_caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em><em>]</em>)</p></li>
+<li><p><strong>walk_row_caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>line_order</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference internal" href="#mstar.worker.batch_builder.LineOrder" title="mstar.worker.batch_builder.LineOrder"><em>LineOrder</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.backlog">
+<span class="sig-name descname"><span class="pre">backlog</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><span class="pre">Sequence</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.backlog" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.capture_group">
+<span class="sig-name descname"><span class="pre">capture_group</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.capture_group" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.continuing">
+<span class="sig-name descname"><span class="pre">continuing</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><span class="pre">Sequence</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.continuing" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.graph_walk">
+<span class="sig-name descname"><span class="pre">graph_walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.graph_walk" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.line_order">
+<span class="sig-name descname"><span class="pre">line_order</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.line_order" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.one_walk">
+<span class="sig-name descname"><span class="pre">one_walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.one_walk" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.own_walk">
+<span class="sig-name descname"><span class="pre">own_walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.own_walk" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.queued">
+<span class="sig-name descname"><span class="pre">queued</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><span class="pre">Sequence</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.queued" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.ready">
+<span class="sig-name descname"><span class="pre">ready</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.ready" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.walk_caps">
+<span class="sig-name descname"><span class="pre">walk_caps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.walk_caps" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.walk_of">
+<span class="sig-name descname"><span class="pre">walk_of</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.walk_of" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepCandidates.walk_row_caps">
+<span class="sig-name descname"><span class="pre">walk_row_caps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepCandidates.walk_row_caps" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepPick">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">StepPick</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">taken</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">continuing</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">room</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">held_back</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ordered</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#StepPick"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.StepPick" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>taken</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>continuing</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>room</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>held_back</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>ordered</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepPick.continuing">
+<span class="sig-name descname"><span class="pre">continuing</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepPick.continuing" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepPick.held_back">
+<span class="sig-name descname"><span class="pre">held_back</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepPick.held_back" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepPick.ordered">
+<span class="sig-name descname"><span class="pre">ordered</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.StepPick.ordered" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 4</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepPick.room">
+<span class="sig-name descname"><span class="pre">room</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.StepPick.room" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.StepPick.taken">
+<span class="sig-name descname"><span class="pre">taken</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.StepPick.taken" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
 </dd></dl>
 
 </dd></dl>
@@ -1086,21 +1253,15 @@ the first eligible rid’s when no anchor is given.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder.build_batch"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder.build_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder.chain_must_yield"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder.chain_must_yield()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder.room_for_continuing"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder.room_for_continuing()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BaseBatchBuilder.pick"><code class="docutils literal notranslate"><span class="pre">BaseBatchBuilder.pick()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.backlog"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.backlog</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.blocked_rids"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.blocked_rids</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.capture_group"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.capture_group()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.capture_group_of"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.capture_group_of</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.fresh"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.fresh</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.graph_walk"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.node_name"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.node_name</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.pre_existing_batch_size"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.pre_existing_batch_size</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.pre_existing_walk"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.pre_existing_walk</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_caps"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.walk_caps</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_row_caps"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.walk_row_caps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.pick"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.pick</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1115,6 +1276,35 @@ the first eligible rid’s when no anchor is given.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.build_batch"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.build_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.pick"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.pick()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.LineOrder"><code class="docutils literal notranslate"><span class="pre">LineOrder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.LineOrder.key"><code class="docutils literal notranslate"><span class="pre">LineOrder.key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.LineOrder.strict"><code class="docutils literal notranslate"><span class="pre">LineOrder.strict</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates"><code class="docutils literal notranslate"><span class="pre">StepCandidates</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.backlog"><code class="docutils literal notranslate"><span class="pre">StepCandidates.backlog</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.capture_group"><code class="docutils literal notranslate"><span class="pre">StepCandidates.capture_group</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.continuing"><code class="docutils literal notranslate"><span class="pre">StepCandidates.continuing</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.graph_walk"><code class="docutils literal notranslate"><span class="pre">StepCandidates.graph_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.line_order"><code class="docutils literal notranslate"><span class="pre">StepCandidates.line_order()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.one_walk"><code class="docutils literal notranslate"><span class="pre">StepCandidates.one_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.own_walk"><code class="docutils literal notranslate"><span class="pre">StepCandidates.own_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.queued"><code class="docutils literal notranslate"><span class="pre">StepCandidates.queued</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.ready"><code class="docutils literal notranslate"><span class="pre">StepCandidates.ready()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.walk_caps"><code class="docutils literal notranslate"><span class="pre">StepCandidates.walk_caps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.walk_of"><code class="docutils literal notranslate"><span class="pre">StepCandidates.walk_of()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepCandidates.walk_row_caps"><code class="docutils literal notranslate"><span class="pre">StepCandidates.walk_row_caps</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick"><code class="docutils literal notranslate"><span class="pre">StepPick</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.continuing"><code class="docutils literal notranslate"><span class="pre">StepPick.continuing</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.held_back"><code class="docutils literal notranslate"><span class="pre">StepPick.held_back</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.ordered"><code class="docutils literal notranslate"><span class="pre">StepPick.ordered</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.room"><code class="docutils literal notranslate"><span class="pre">StepPick.room</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.taken"><code class="docutils literal notranslate"><span class="pre">StepPick.taken</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.make_batch_builder"><code class="docutils literal notranslate"><span class="pre">make_batch_builder()</span></code></a></li>

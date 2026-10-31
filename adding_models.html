@@ -2123,7 +2123,7 @@ tensor along that parameter’s shard dimension before copying it. For this reas
 optional. For an autoregressive node, you normally want both. These two mechanisms have
 the most detailed rules in the submodule interface, so they are described here separately.</p>
 <p><strong>Continuous batching.</strong> The worker’s micro-scheduler groups compatible in-flight requests
-into one GPU call. A submodule controls this behavior with three methods:</p>
+into one GPU call. A submodule controls this behavior with these methods:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">can_batch(self,</span> <span class="pre">batch:</span> <span class="pre">ExecutingBatch,</span> <span class="pre">model_inputs)</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code> returns whether these
 requests can share one forward pass. The default is <code class="docutils literal notranslate"><span class="pre">False</span></code>, which disables batching.
@@ -2134,6 +2134,16 @@ performs the batched compute. It returns per-request outputs, keyed by <code cla
 When a batch runs, the engine calls this method instead of the single-request
 <code class="docutils literal notranslate"><span class="pre">forward</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">max_batch_size(self,</span> <span class="pre">graph_walk)</span></code> sets an optional upper limit.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">step_order(self,</span> <span class="pre">graph_walk)</span> <span class="pre">-&gt;</span> <span class="pre">StepOrder</span></code> says who runs first when more rows are ready
+than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> allows. The default, <code class="docutils literal notranslate"><span class="pre">StepOrder.ARRIVAL</span></code>, is first come, first served
+to completion: the requests holding the step keep it, then the request that arrived first.
+<code class="docutils literal notranslate"><span class="pre">StepOrder.TURNS</span></code> is longest-waiting first: a request that just ran gives way to one that
+waited, so a node capped at one row advances its requests a step each in rotation. Declare it
+on a walk whose sessions have to keep moving while others run, as LingBot’s rollout and
+Cosmos3’s chained windows do. A combined walk takes turns if any of its walks does. The order
+applies to the rows a speculation chain continues, the backlog and the queued rows alike; when
+every ready row fits, it doesn’t matter. An admit that runs out of KV pages offloads the row
+last in that same line.</p></li>
 </ul>
 <p id="combined-walks"><strong>Combined walks.</strong> By default a step holds one walk. A model lets several walks of a node
 share a step by returning <code class="docutils literal notranslate"><span class="pre">{node:</span> <span class="pre">{combined_walk:</span> <span class="pre">{walks}}}</span></code> from

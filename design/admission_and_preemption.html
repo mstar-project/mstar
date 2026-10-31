@@ -879,7 +879,7 @@
 <hr class="docutils" />
 <section id="preemption">
 <h2>3. Preemption<a class="headerlink" href="#preemption" title="Link to this heading">#</a></h2>
-<p>Preemption starts when a grant past a reservation fails, in <code class="docutils literal notranslate"><span class="pre">Worker._handle_allocation_failure</span></code> (<a class="reference download internal" download="" href="../_downloads/de1b1ad2a070cfcbefb1feab5cce8263/worker.py"><span class="xref download myst">worker.py</span></a>), which calls <code class="docutils literal notranslate"><span class="pre">Worker._preempt</span></code>. In place of today’s 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads the least recently active request first, as it does today, since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.</p>
+<p>Preemption starts when a grant past a reservation fails, in <code class="docutils literal notranslate"><span class="pre">Worker._handle_allocation_failure</span></code> (<a class="reference download internal" download="" href="../_downloads/de1b1ad2a070cfcbefb1feab5cce8263/worker.py"><span class="xref download myst">worker.py</span></a>), which calls <code class="docutils literal notranslate"><span class="pre">Worker._preempt</span></code>. In place of today’s 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads first, as it does today (the row last in the refused step’s line), since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.</p>
 <p>Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can’t use.</p>
 <section id="arrival-numbers">
 <h3>3.1 Arrival numbers<a class="headerlink" href="#arrival-numbers" title="Link to this heading">#</a></h3>
@@ -911,7 +911,7 @@
 <li><p><strong>Newest first.</strong> No request is dropped for a newer one’s page. vLLM’s FCFS policy preempts the last entry in <code class="docutils literal notranslate"><span class="pre">running</span></code>, which is where a resumed request sits.</p></li>
 <li><p><strong>R is its own victim only as a last resort.</strong> If even that frees nothing, every page is held by older or guaranteed requests, and those finish.</p></li>
 <li><p><strong>A waiting request watches the room.</strong> The pool records the room each failed grant saw, so no timer decides when to retry.</p></li>
-<li><p><strong>Not the least recently active request.</strong> Today’s offload picks it, but it can be the oldest request in the pool, so nothing guarantees progress.</p></li>
+<li><p><strong>Not the row last in line.</strong> Today’s offload picks it, but under <code class="docutils literal notranslate"><span class="pre">TURNS</span></code> it can be the oldest request in the pool, so nothing guarantees progress.</p></li>
 <li><p><strong>Not the largest request.</strong> A long request would be dropped every time it grows.</p></li>
 </ul>
 </section>

@@ -29,6 +29,7 @@ mstar.model.submodule\_base
       NodeSubmodule
       PerRequestState
       StackingMethod
+      StepOrder
       StopCheck
    
    
