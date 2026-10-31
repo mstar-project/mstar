@@ -170,7 +170,7 @@ You must implement these abstract methods:
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
    images, raw PCM for audio, and so on.
 
-``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
+``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None, guidance_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
    weights here, on ``device``. Return ``None`` for dummy mode.
 
@@ -181,6 +181,9 @@ You must implement these abstract methods:
    ``moe_parallel`` is the node group's ``ep_config``, parsed into a
    ``MoeParallelConfig``. It is passed only to an EP-enabled node whose group sets one,
    so a model without MoE layers never receives it. See `Expert parallelism (MoE)`_.
+
+   ``guidance_parallel`` is passed only to a guidance-parallel node whose group sets
+   ``cfg_size``, so a model without it never receives it. See `Guidance parallelism`_.
 
    ``autocast_dtype`` is the dtype in which the node's parameters must be allocated. If
    you build the module on the ``meta`` device, cast it to this dtype before calling
@@ -2012,6 +2015,38 @@ Two separate mechanisms split work across the TP group. Keep them distinct:
 If a node group has ``tp_size > 1`` and names a node that is not in ``tp_enabled_nodes``,
 loading fails. See ``configs/qwen3omni_thinker_tp2.yaml`` for an example with several node
 types.
+
+Guidance parallelism
+~~~~~~~~~~~~~~~~~~~~
+
+``cfg_size: 2`` on a node group (see :doc:`serving`) puts a guided denoise step's two
+branches on the two ranks of a lockstep instance. Nothing is sharded: each rank holds the
+whole model, runs one branch per request at the shape that branch has on one GPU, and the
+two velocities cross in one all-gather, which replays from a captured graph, before the
+solver. ``mstar/distributed/guidance_parallel.py`` holds the placement.
+
+To support it in a model:
+
+1. **Declare the node.** Add it to ``cfg_enabled_nodes`` in
+   ``get_default_sharding_config``. ``cfg_size`` on any other node fails at start-up.
+2. **Take the placement.** ``get_submodule`` receives ``guidance_parallel`` only for a node
+   whose group asks for it. A ``DenoiseLoopSubmodule`` passes it to the base, which gives
+   ``branch_rows(guided)``, the rows one request contributes to this rank's forward, and
+   ``guidance_branches(out, batch)``, the ``(cond, uncond)`` pair for the combine.
+3. **Run this rank's branch.** Use ``branch_rows`` wherever the two branches were counted
+   (the token count, the attention segments, the forward's rows), and feed this rank's
+   conditioning (``guidance_parallel.runs_cond``). A step with guidance off runs the same
+   row on both ranks with no exchange.
+4. **Keep every rank's state the same.** Anything that decides admission must match across
+   the ranks (invariant 11). The solver runs on both ranks from the same two velocities, so
+   the loop-back edges stay replicated with no further traffic. Resources with no per-request
+   state, like the ragged attention, may declare only the rank's branch. A paged cache may
+   not: a branch's page count follows its own prompt's length, so ``cosmos3`` declares both
+   labels on both ranks and runs one (``Cosmos3DiTSubmodule._packs_guidance_branches``).
+
+Wan2.2's ``Wan22DenoiseSubmodule`` is the reference user. ``test/modular/test_guidance_parallel.py``
+runs a fake two-row model on two real ranks and checks the collective order, the admit
+decisions and the latents against one rank running both rows.
 
 .. _Expert parallelism (MoE):
 
