@@ -53,7 +53,7 @@ from mstar.model.canary_qwen.config import (
 )
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import check_kv_pools_fit, kv_pages
+from mstar.model.utils import TextOutput, check_kv_pools_fit, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -320,10 +320,8 @@ class CanaryQwenModel(Model):
         audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
 
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        if modality == "text":
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
-        raise ValueError(f"Unsupported modality for Canary-Qwen: {modality!r}")
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._detokenizer)
 
     # -------------------------------------------------------------------
     # submodules

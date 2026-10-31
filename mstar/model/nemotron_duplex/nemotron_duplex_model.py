@@ -1179,11 +1179,7 @@ class NemotronDuplexModel(Model):
             token_ids = output.tolist() if output.dim() else [int(output)]
             # PAD fills every silent frame; it and BOS/EOS are not reply text
             return self.tokenizer.decode(token_ids, skip_special_tokens=True).encode("utf-8")
-        if modality == "audio":
-            if output.numel() == 0:
-                return b""
-            return output.cpu().numpy().tobytes()
-        raise ValueError(f"Unsupported modality for NemotronDuplex: {modality!r}")
+        return super().postprocess(output, modality, **kwargs)
 
     # -------------------------------------------------------------------
     # Sharding — nano_llm attention/MLP are TP-eligible (Phase 10).

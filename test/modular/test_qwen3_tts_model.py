@@ -726,18 +726,6 @@ def test_qwen3_tts_talker_decode_marks_partition_done():
     assert result.request_done is True
 
 
-def test_qwen3_tts_postprocess_encodes_pcm16():
-    model = _make_model()
-
-    output = model.postprocess(
-        torch.tensor([-1.0, 0.0, 1.0]),
-        modality="audio",
-    )
-
-    expected = torch.tensor([-32767, 0, 32767], dtype=torch.int16)
-    assert output == expected.numpy().tobytes()
-
-
 def _tiny_model_config() -> Qwen3TTSModelConfig:
     code_predictor = Qwen3TTSCodePredictorConfig(
         num_hidden_layers=1,

@@ -1375,20 +1375,6 @@ class Qwen3OmniModel(Model):
     def text_output(self) -> TextOutput:
         return TextOutput(self._chunk_detokenizer(), (self.config.im_end_token_id,))
 
-    def postprocess(
-        self,
-        output: torch.Tensor,
-        modality: str,
-        request_kwargs: dict | None = None,
-    ) -> bytes:
-        if modality == "text":
-            return super().postprocess(output, modality, request_kwargs)
-        elif modality == "audio":
-            if output.numel() == 0:
-                return b""
-            return output.cpu().numpy().tobytes()
-        raise ValueError(f"Unsupported modality for Qwen3-Omni: {modality!r}")
-
     # -----------------------------------------------------------------------
     # Model ABC: sharding
     # -----------------------------------------------------------------------

@@ -458,12 +458,41 @@ class TextChunkDetokenizer:
         return data
 
 
+class SentencePieceDetokenizer:
+    """Per-token detokenization for SentencePiece-style vocabularies (``▁``
+    marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
+    ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
+    per token, so a character split across byte pieces reassembles client-side.
+    """
+
+    def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
+        vocab = tokenizer_json["model"]["vocab"]
+        if isinstance(vocab, list):  # Unigram: [piece, score] pairs
+            vocab = {piece: idx for idx, (piece, _) in enumerate(vocab)}
+        vocab = dict(vocab)
+        for added in tokenizer_json.get("added_tokens", []):
+            vocab[added["content"]] = added["id"]
+        self.pieces = {idx: piece for piece, idx in vocab.items()}
+        self.skip_ids = {a["id"] for a in tokenizer_json.get("added_tokens", []) if a["special"]} | set(extra_skip_ids)
+
+    def token_bytes(self, token_id: int) -> bytes:
+        piece = self.pieces.get(token_id)
+        if piece is None or token_id in self.skip_ids:
+            return b""
+        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+            return bytes([int(piece[3:5], 16)])
+        return piece.replace("▁", " ").encode("utf-8")
+
+    def to_bytes(self, token_ids: list[int]) -> bytes:
+        return b"".join(self.token_bytes(i) for i in token_ids)
+
+
 class TextOutput(NamedTuple):
     """How a model's text output, token ids, becomes bytes: ``Model.text_output``
     declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
     derive their text paths from it."""
 
-    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer
+    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
 
@@ -605,32 +634,3 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
                 f"which has {max_num_pages}; raise max_num_pages or lower "
                 "max_concurrent_requests"
             )
-
-
-class SentencePieceDetokenizer:
-    """Per-token detokenization for SentencePiece-style vocabularies (``▁``
-    marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
-    ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
-    per token, so a character split across byte pieces reassembles client-side.
-    """
-
-    def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
-        vocab = tokenizer_json["model"]["vocab"]
-        if isinstance(vocab, list):  # Unigram: [piece, score] pairs
-            vocab = {piece: idx for idx, (piece, _) in enumerate(vocab)}
-        vocab = dict(vocab)
-        for added in tokenizer_json.get("added_tokens", []):
-            vocab[added["content"]] = added["id"]
-        self.pieces = {idx: piece for piece, idx in vocab.items()}
-        self.skip_ids = {a["id"] for a in tokenizer_json.get("added_tokens", []) if a["special"]} | set(extra_skip_ids)
-
-    def piece_bytes(self, token_id: int) -> bytes:
-        piece = self.pieces.get(token_id)
-        if piece is None or token_id in self.skip_ids:
-            return b""
-        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
-            return bytes([int(piece[3:5], 16)])
-        return piece.replace("▁", " ").encode("utf-8")
-
-    def to_bytes(self, token_ids: list[int]) -> bytes:
-        return b"".join(self.piece_bytes(i) for i in token_ids)

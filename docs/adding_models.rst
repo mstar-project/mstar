@@ -232,21 +232,24 @@ The following methods have defaults and are optional to override:
    end a reply, which are dropped unless the request sets ``ignore_eos``.
    ``postprocess`` and ``postprocess_inline`` derive their text paths from it. A text
    chunk may end inside a character, since the API server joins a request's text
-   chunks before decoding them, so a byte-level BPE model should declare
-   ``mstar.model.utils.TextChunkDetokenizer`` (or ``ByteLevelDetokenizer``), which
-   emits each token's raw bytes, rather than ``tokenizer.decode([id])``, which turns
-   a split character into U+FFFD.
+   chunks before decoding them, so declare a detokenizer from ``mstar.model.utils``
+   that emits each token's raw bytes (``TextChunkDetokenizer`` or
+   ``ByteLevelDetokenizer`` for byte-level BPE, ``SentencePieceDetokenizer`` for a
+   SentencePiece vocabulary) rather than ``tokenizer.decode([id])``, which turns a
+   split character into U+FFFD.
 
 ``postprocess(self, output, modality, request_kwargs=None) -> bytes``
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
-   images, raw PCM for audio, and so on. Override it for any modality other than
-   text, and hand text to ``super().postprocess``.
+   images, and so on. The default encodes text through ``text_output`` and mono audio
+   as headerless 16-bit PCM (a float waveform in [-1, 1] is scaled and truncated;
+   integer samples are cast). Override it for any other modality, or for audio with
+   more than one channel, and hand the rest to ``super().postprocess``.
 
 ``postprocess_inline(self, values, modality, request_kwargs) -> list[bytes]``
    ``postprocess`` for one decode step's inline values (one sampled token id per
    request), called once per step. With ``text_output`` declared, each id maps to
-   its memoized bytes; otherwise each value goes through ``postprocess`` as a
-   one-element tensor.
+   its bytes (the detokenizer's ``token_bytes``); otherwise each value goes through
+   ``postprocess`` as a one-element tensor.
 
 ``Model.nodes`` is a read-only property. It returns the sorted set of node names that
 appear in any graph walk.
@@ -2080,8 +2083,8 @@ There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, p
 ``process_prompt`` formats the string ``"{voice}: {text}"``, tokenizes it, wraps the ids in
 the model's start and end tokens, and returns ``{"text_inputs": [ids]}``.
 ``get_submodule`` builds either the Llama LLM submodule, which is an ``ARNodeSubmodule``,
-or the SNAC decoder submodule, and caches the result. ``postprocess`` returns the raw
-bytes of the audio tensor for the ``audio`` modality.
+or the SNAC decoder submodule, and caches the result. The SNAC submodule emits int16
+PCM, which the default ``postprocess`` passes through as raw bytes.
 
 Orpheus also demonstrates the async partition API, described in the next section. The LLM
 and the SNAC decoder run as two partitions connected by a streaming edge. Audio is

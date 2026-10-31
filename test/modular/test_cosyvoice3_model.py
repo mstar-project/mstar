@@ -395,12 +395,6 @@ def test_initial_and_partition_args_route_the_walks(model):
     assert all(edge.tensor_info == [] for edge in later.inputs) and later.step_metadata[VOICE_KEY] == 77
 
 
-def test_postprocess_encodes_pcm16(model):
-    pcm = model.postprocess(torch.tensor([0.0, 0.5, -2.0]), "audio")
-    assert torch.frombuffer(bytearray(pcm), dtype=torch.int16).tolist() == [0, 16383, -32767]
-    assert model.get_output_sample_rate() == SR
-
-
 # -- adapter (#411 media rules) -----------------------------------------------------------
 
 

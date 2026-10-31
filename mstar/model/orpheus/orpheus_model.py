@@ -466,18 +466,6 @@ class OrpheusModel(Model):
     # Model ABC: postprocess
     # -------------------------------------------------------------------
 
-    def postprocess(
-        self,
-        output: torch.Tensor,
-        modality: str,
-        **kwargs
-    ) -> bytes:
-        if modality == "audio":
-            if output.numel() == 0:
-                return b""
-            return output.cpu().numpy().tobytes()
-        raise ValueError(f"Unsupported modality for Orpheus: {modality!r}")
-
     # -------------------------------------------------------------------
     # Model ABC: sharding
     # -------------------------------------------------------------------

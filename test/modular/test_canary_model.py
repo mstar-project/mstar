@@ -143,6 +143,7 @@ def test_detokenizes_pieces_and_byte_fallback(snapshot):
     ids = [vocab[t] for t in ("<|en|>", "▁he", "llo", "▁caf", "<0xC3>", "<0xA9>", "!", "<|endoftext|>")]
     per_token = b"".join(model.postprocess(torch.tensor([i]), "text") for i in ids)
     assert per_token.decode("utf-8") == " hello café!"
+    assert b"".join(model.postprocess_inline(ids, "text", [None] * len(ids))) == per_token
 
 
 def test_decoder_weight_names():

@@ -440,11 +440,6 @@ class Qwen3ASRModel(Model):
     def text_output(self) -> TextOutput:
         return TextOutput(self._detokenizer)
 
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        if modality == "text":
-            return super().postprocess(output, modality, **kwargs)
-        raise ValueError(f"Unsupported modality for Qwen3-ASR: {modality!r}")
-
     # -------------------------------------------------------------------
     # Model ABC: sharding + submodule loading
     # -------------------------------------------------------------------

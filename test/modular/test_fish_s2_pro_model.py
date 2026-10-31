@@ -706,12 +706,3 @@ def test_sampling_defaults_and_greedy():
     assert (default.temperature, default.top_p, default.top_k, default.repetition_penalty) == (0.8, 0.8, 30, 1.0)
     greedy = model.get_request_resource_configs({}, {"do_sample": False, "temperature": 0.7, "top_k": 5})[AR_SAMPLER]
     assert greedy.temperature == 0.0 and greedy.top_k == 5
-
-
-def test_postprocess_emits_pcm16_bytes():
-    model = tiny_model()
-    out = model.postprocess(torch.tensor([0.0, 1.0, -1.0, 2.0]), "audio")
-    assert list(torch.frombuffer(bytearray(out), dtype=torch.int16)) == [0, 32767, -32767, 32767]
-    assert model.postprocess(torch.tensor([7, -3], dtype=torch.int16), "audio") == b"\x07\x00\xfd\xff"
-    with pytest.raises(ValueError, match="modality"):
-        model.postprocess(torch.zeros(1), "text")

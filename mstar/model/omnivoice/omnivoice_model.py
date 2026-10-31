@@ -22,7 +22,6 @@ same batch.  A fixed-pipeline port has to pick one value for the whole server.
 import logging
 import os
 
-import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
@@ -631,14 +630,6 @@ class OmniVoiceModel(Model):
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
-
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        """Raw PCM16 bytes; the handler wraps them in the requested container."""
-        if modality == "audio":
-            if output.numel() == 0:
-                return b""
-            return output.cpu().numpy().astype(np.int16).tobytes()
-        raise ValueError(f"Unsupported modality for OmniVoice: {modality!r}")
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

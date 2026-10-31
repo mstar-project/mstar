@@ -561,12 +561,12 @@ def test_state_machine_and_postprocess(voices_dir):
     pcm = torch.tensor([1, -2, 32767], dtype=torch.int16)
     assert model.postprocess(pcm, "audio") == pcm.numpy().tobytes()
     expected = torch.tensor([16383, -32767], dtype=torch.int16).numpy().tobytes()
-    assert model.postprocess(torch.tensor([0.5, -1.0]), "audio") == expected
+    assert model.postprocess(torch.tensor([0.5, -2.0]), "audio") == expected  # scaled, truncated, clamped
     assert model.postprocess(torch.zeros(0), "audio") == b""
+    full_scale = torch.tensor([32767], dtype=torch.int16).numpy().tobytes()
+    assert model.postprocess(torch.ones(1, dtype=torch.bfloat16), "audio") == full_scale  # no bf16 wrap
     assert model.get_output_sample_rate() == model.config.sample_rate == 24000
     assert model.get_voices() == ["af_heart", "af_sky", "am_adam"] and model.get_default_voice() == "af_heart"
-    with pytest.raises(ValueError):
-        model.postprocess(pcm, "text")
 
 
 # --------------------------------------------------------------------------

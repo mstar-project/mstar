@@ -52,6 +52,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, SAMPLER, HiggsAudioModelConfig
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import TextOutput
 
 logger = logging.getLogger(__name__)
 
@@ -455,15 +456,8 @@ class HiggsAudioModel(Model):
     # Model ABC: postprocess
     # -------------------------------------------------------------------
 
-    def postprocess(
-        self,
-        output: torch.Tensor,
-        modality: str,
-        **kwargs,
-    ) -> bytes:
-        if modality == "text":
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
-        raise ValueError(f"Unsupported modality for Higgs-Audio: {modality!r}")
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._detokenizer)
 
     # -------------------------------------------------------------------
     # Model ABC: submodule loading
