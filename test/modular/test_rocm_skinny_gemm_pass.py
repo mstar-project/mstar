@@ -133,6 +133,15 @@ def test_rocm_installs_the_passes_for_sixteen_rows_or_fewer(monkeypatch, num_tok
         assert overrides["max_autotune_gemm_backends"] == "ATEN"
 
 
+def test_a_verify_bucket_takes_the_passes_by_its_rows(monkeypatch):
+    pre, post = SkinnyLinearPrePass(), SkinnyGemmPass()
+    monkeypatch.setattr(rocm_gemm, "skinny_gemm_passes", lambda: (pre, post))
+    # eight rows of three tokens: its draft GEMMs run at 8 rows, its target's at 24
+    overrides = RocmPlatform().inductor_overrides(24, 8, True)
+    assert overrides["pre_grad_custom_pass"] is pre
+    assert "pre_grad_custom_pass" not in RocmPlatform().inductor_overrides(24, 8)
+
+
 def test_rocm_without_the_kernel_keeps_hipblaslt_only(monkeypatch):
     monkeypatch.setattr(rocm_gemm, "skinny_gemm_passes", lambda: None)
     assert RocmPlatform().inductor_overrides(1) == {"max_autotune_gemm_backends": "ATEN"}
