@@ -89,7 +89,7 @@ class CommGroup:
         self._ar_fusion_ws: int | None = None
         self._ar_fusion_max_tokens = 0
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
-        self._all_reduce = AllReduce(self)
+        self._all_reduce = AllReduce()
 
     def init_all_reduce(self, mode: str | None = None, max_kb: int | None = None) -> None:
         """Set up the all-reduce backend the deployment config's ``tp_allreduce``
@@ -176,7 +176,7 @@ class CommGroup:
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
-        return self._all_reduce.all_reduce(input_)
+        return self._all_reduce.all_reduce(input_, self._device_pg())
 
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,

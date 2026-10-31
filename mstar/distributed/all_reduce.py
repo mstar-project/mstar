@@ -39,10 +39,6 @@ class AllReduce:
 
     mode = "nccl"
 
-    def __init__(self, group: "CommGroup"):
-        # the group, not its process group: init_dist sets that after this is built
-        self.group = group
-
     @classmethod
     def new(
         cls, group: "CommGroup", mode: str | None = None, max_kb: int | None = None,
@@ -54,14 +50,14 @@ class AllReduce:
         memory up."""
         mode = (mode or "nccl").strip().lower()
         if mode == "nccl":
-            return AllReduce(group)
+            return AllReduce()
         backend_cls = SYMM_BACKENDS.get(mode)
         if backend_cls is None:
             raise ValueError(f"tp_allreduce={mode!r} is not one of {['nccl', *SYMM_BACKENDS]}")
         max_kb = DEFAULT_SYMM_MAX_KB if max_kb is None else int(max_kb)
         if (group.world_size == 1 or group.device_group is None or max_kb <= 0
                 or not torch.cuda.is_available()):
-            return AllReduce(group)
+            return AllReduce()
         backend = None
         try:
             if backend_cls is FlashInferAllReduce:
@@ -80,7 +76,7 @@ class AllReduce:
         if not group.agree([int(backend is not None)])[0]:
             if backend is not None:
                 logger.warning("all-reduce %s: another rank could not set it up; using NCCL", mode)
-            return AllReduce(group)
+            return AllReduce()
         if group.rank == 0:
             logger.info(
                 "all-reduce %s for messages up to %d KiB, ranks %s",
@@ -94,8 +90,10 @@ class AllReduce:
         """Where to write the partial that the next ``all_reduce`` sums."""
         return torch.empty(shape, dtype=dtype, device=device)
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        dist.all_reduce(input_, group=self.group._device_pg())
+    def all_reduce(self, input_: torch.Tensor, pg: "dist.ProcessGroup") -> torch.Tensor:
+        # per call: init_dist sets the owning group's process group after this is
+        # built, and holding the group instead is a cycle that keeps it alive
+        dist.all_reduce(input_, group=pg)
         return input_
 
 
@@ -109,7 +107,6 @@ class SymmMemAllReduce(AllReduce, ABC):
     def __init__(self, group: "CommGroup", device: torch.device, max_bytes: int):
         import torch.distributed._symmetric_memory as symm
 
-        super().__init__(group)
         self.max_bytes = max_bytes
         self.group_name = group.device_group.group_name
         symm.enable_symm_mem_for_group(self.group_name)
@@ -135,7 +132,7 @@ class SymmMemAllReduce(AllReduce, ABC):
             return self._buf[:nbytes].view(dtype).view(shape)
         return super().buffer(shape, dtype, device)
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, input_: torch.Tensor, pg: "dist.ProcessGroup") -> torch.Tensor:
         # Small contiguous CUDA messages go through symmetric memory; everything
         # else (prefill-sized, strided, host, other dtypes, or a byte size the op
         # would reject as misaligned) stays on NCCL.
@@ -145,7 +142,7 @@ class SymmMemAllReduce(AllReduce, ABC):
             and input_.is_contiguous()
         ):
             return self._reduce(input_)
-        return super().all_reduce(input_)
+        return super().all_reduce(input_, pg)
 
     def _reduce(self, input_: torch.Tensor) -> torch.Tensor:
         n = input_.numel()
@@ -175,13 +172,13 @@ class OneShotAllReduce(SymmMemAllReduce):
 
     mode = "symm_oneshot"
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, input_: torch.Tensor, pg: "dist.ProcessGroup") -> torch.Tensor:
         # Inductor gives one_shot_all_reduce's input a persistent symmetric buffer
         # of its own, sized by the first call, so a forward compiled for dynamic
         # batch sizes fails at the next size; compiled code stays on NCCL.
         if torch.compiler.is_compiling():
-            return AllReduce.all_reduce(self, input_)
-        return super().all_reduce(input_)
+            return AllReduce.all_reduce(self, input_, pg)
+        return super().all_reduce(input_, pg)
 
     def _sum_into(self, buf: torch.Tensor, out: torch.Tensor, eager: bool) -> None:
         out.copy_(torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", self.group_name))
@@ -223,7 +220,6 @@ class FlashInferAllReduce(AllReduce):
     def __init__(self, group: "CommGroup", max_bytes: int):
         from mstar.distributed.ar_fusion import create_workspace
 
-        super().__init__(group)
         self.world_size = group.world_size
         self.ws_id = create_workspace(
             group, 1, max_bytes // 2, torch.bfloat16,
@@ -231,7 +227,7 @@ class FlashInferAllReduce(AllReduce):
         if self.ws_id is None:
             raise RuntimeError("no FlashInfer all-reduce workspace")
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, input_: torch.Tensor, pg: "dist.ProcessGroup") -> torch.Tensor:
         from mstar.distributed.ar_fusion import _WORKSPACES, allreduce_oneshot
 
         if (
@@ -241,7 +237,7 @@ class FlashInferAllReduce(AllReduce):
             and _WORKSPACES[self.ws_id].is_buffer_size_sufficient(self.world_size, *input_.shape, input_.dtype)
         ):
             return allreduce_oneshot(input_, self.ws_id)
-        return super().all_reduce(input_)
+        return super().all_reduce(input_, pg)
 
 
 # ``tp_allreduce`` -> its backend; "nccl" is ``AllReduce`` itself
