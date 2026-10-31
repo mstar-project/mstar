@@ -9,6 +9,8 @@ model_kwargs:
   # Speculative decoding: the checkpoint's MTP head drafts 3 tokens a step
   # and each decode step verifies them (see SpecDecodeResource).
   num_draft_tokens: 3
+  # drafts read an fp8 copy of lm_head (see Fp8DraftHead), the verify the checkpoint's
+  draft_head: fp8
 resources:
   gdn_state:
     # A request holds num_draft_tokens + 1 state slots: 64 requests, plus the sink.
