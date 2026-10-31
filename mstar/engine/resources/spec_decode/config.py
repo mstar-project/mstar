@@ -36,6 +36,9 @@ class SpecDecodeConfig:
     # not only take its argmax. A capability: the model captures a sampled
     # decode variant beside the greedy one and routes a batch by its rows.
     sampling: bool = False
+    # the distribution a sampled draft came from is kept per request until the
+    # next step verifies it; required with `sampling`
+    vocab_size: int | None = None
 
     def __post_init__(self):
         if self.num_draft_tokens < 1:
@@ -46,6 +49,8 @@ class SpecDecodeConfig:
             )
         if self.max_requests < 1:
             raise ValueError(f"max_requests={self.max_requests} must be >= 1")
+        if self.sampling and not self.vocab_size:
+            raise ValueError("a speculative node that samples needs vocab_size")
 
     @property
     def tokens_per_row(self) -> int:
