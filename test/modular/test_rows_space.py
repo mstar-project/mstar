@@ -161,3 +161,20 @@ def test_a_mirror_needs_a_dtype_numpy_has():
     with pytest.raises(ValueError, match="host mirror"):
         space.buffer("x", (), torch.bfloat16)
     space.buffer("y", (), torch.bfloat16, mirrored=False)
+
+
+def test_a_commit_hook_that_raises_refuses_the_commit():
+    space = RowSpace(MAX_ROWS, "cpu", depth=2, block_bytes=256)
+    lens = space.buffer("lens", (), torch.int32, pad=0)
+    rows = space.propose([1, 2])
+    rows.write(lens, rows.diff.join_slots, np.array([5, 6], np.int32))
+    rows.stage()
+
+    def hook(released):
+        raise RuntimeError("hook failed")
+
+    rows.on_commit(hook)
+    with pytest.raises(RuntimeError, match="hook failed"):
+        rows.commit()
+    assert space.batch.version == 0 and list(space.batch.order) == []
+    assert lens.host.tolist() == [0] * MAX_ROWS

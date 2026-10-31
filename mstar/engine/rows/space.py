@@ -186,7 +186,8 @@ class StepRows:
         """Run ``fn`` when this step commits, before its mirrors replace the
         committed ones (so ``buf.host`` still holds the leaving rows). It is
         passed the slots whose requests were removed while holding them, which
-        have no host state left to update."""
+        have no host state left to update. Hooks run before the rows commit,
+        so one that raises refuses the commit."""
         self._on_commit.append(fn)
 
     def stage(self) -> None:
@@ -411,9 +412,12 @@ class RowSpace:
 
     def _commit(self, step: StepRows) -> np.ndarray:
         with self._lock:
-            released = self.batch.commit(step.diff)
+            # the hooks run before anything commits, so a check or hook that
+            # raises leaves the slots and mirrors as they were
+            released = self.batch.check_commit(step.diff)
             for fn in step._on_commit:
                 fn(released)
+            self.batch.commit(step.diff)
             if not step.diff.empty():
                 # a mirror the step never touched still takes its moves and clears
                 for buf in self.buffers:
