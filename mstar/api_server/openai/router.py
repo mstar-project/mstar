@@ -17,7 +17,9 @@ from mstar.api_server.body_limit import max_body_bytes
 from mstar.api_server.openai import (
     serving_chat,
     serving_images,
+    serving_messages,
     serving_realtime,
+    serving_responses,
     serving_speech,
     serving_transcriptions,
     serving_videos,
@@ -120,6 +122,62 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     if request.stream:
         return result  # serving_chat builds the streaming response
     return JSONResponse(result)
+
+
+def _anthropic_error(status: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status, content=serving_messages.error_body(status, message))
+
+
+async def _anthropic(require: str, raw_request: Request, handle):
+    """Runs ``handle(api, model_name, adapter, body)`` for an Anthropic route,
+    its errors in Anthropic's shape."""
+    api, model_name, adapter, err = _resolve(require)
+    if err is not None:
+        return _anthropic_error(err.status_code, json.loads(bytes(err.body))["error"]["message"])
+    try:
+        body = await raw_request.json()
+    except ValueError:
+        return _anthropic_error(400, "the request body is not JSON")
+    try:
+        result = await handle(api, model_name, adapter, body)
+    except Exception as e:  # noqa: BLE001 — surface as an Anthropic error
+        err = _exception_error(e, raw_request.url.path)
+        return _anthropic_error(err.status_code, json.loads(bytes(err.body))["error"]["message"])
+    if isinstance(result, dict):
+        return JSONResponse(result)
+    return result  # serving_messages builds the streaming response
+
+
+@router.post("/v1/messages")
+async def messages(raw_request: Request):
+    """Anthropic's Messages API, on the chat path (see ``serving_messages``)."""
+    return await _anthropic("supports_messages", raw_request, lambda api, name, adapter, body: (
+        serving_messages.create_message(api, name, adapter, body, raw_request)))
+
+
+@router.post("/v1/messages/count_tokens")
+async def messages_count_tokens(raw_request: Request):
+    return await _anthropic("supports_messages", raw_request, lambda api, name, adapter, body: (
+        serving_messages.count_tokens(api, adapter, body)))
+
+
+@router.post("/v1/responses")
+async def responses(raw_request: Request):
+    """OpenAI's Responses API, stateless, on the chat path (see ``serving_responses``)."""
+    api, model_name, adapter, err = _resolve("supports_responses")
+    if err is not None:
+        return err
+    try:
+        body = await raw_request.json()
+    except ValueError:
+        return _error(400, "the request body is not JSON")
+    try:
+        result = await serving_responses.create_response(api, model_name, adapter, body, raw_request)
+    except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
+        return _exception_error(e, "/v1/responses")
+    if isinstance(result, dict):
+        return JSONResponse(result)
+    return result  # serving_responses builds the streaming response
 
 
 @router.post("/v1/audio/speech")

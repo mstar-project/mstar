@@ -255,6 +255,12 @@ class _PythonServer:
     def submit_request(self, **kwargs):
         return kwargs["request_id"]
 
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key, outcome="abort"):
+        pass
+
     async def collect_results(self, request_id, raw_request=None):
         return [_Chunk("text", b"Hello "), _Chunk("text", b"world")]
 

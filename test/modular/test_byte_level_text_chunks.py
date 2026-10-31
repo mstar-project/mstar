@@ -216,16 +216,20 @@ class _BatchAPI:
     def __init__(self, chunks):
         self._chunks = chunks
 
+    def submission_key(self, request_id):
+        return request_id
+
     async def iter_result_chunk_batches(self, request_id):
         for c in self._chunks:
             yield [c]
 
 
 def _sse_content(chunks):
+    from mstar.api_server.openai import reply
     from mstar.api_server.openai.serving_chat import _stream_events
 
     async def run():
-        return [f async for f in _stream_events(_BatchAPI(chunks).iter_result_chunk_batches("r"), "m", "r", 24000)]
+        return [f async for f in _stream_events(reply.reply_events(_BatchAPI(chunks), "r"), "m", "r")]
 
     content = ""
     for frame in asyncio.run(run()):
