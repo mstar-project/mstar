@@ -7,7 +7,6 @@ import os
 import queue
 import threading
 import time
-import traceback
 from collections import deque
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
@@ -77,30 +76,6 @@ from mstar.utils.ipc_format import (
 from mstar.utils.threads import Thread, ThreadPool
 
 logger = logging.getLogger(__name__)
-
-# What decoders raise on a file they can't read (torchvision and torchcodec
-# RuntimeError, PIL OSError); anything else from a loader is a server bug
-_DECODE_ERRORS = (RuntimeError, OSError, EOFError)
-
-
-def _raised_on_import(exc: BaseException) -> bool:
-    """True when ``exc`` came out of a module being imported, e.g. torchcodec
-    on a host without FFmpeg: the install is broken, not the file."""
-    return any(f.f_code.co_name == "<module>" for f, _ in traceback.walk_tb(exc.__traceback__))
-
-
-def _decode_input(load, filepath: str, device: str, modality: str):
-    """Run a model's ``load_<modality>`` on one upload. A file that won't decode
-    becomes a ValueError, so the client gets a 400 instead of a 500."""
-    try:
-        return load(filepath, device)
-    except _DECODE_ERRORS as exc:
-        # a missing upload was removed by our own cleanup
-        if not os.path.exists(filepath) or _raised_on_import(exc):
-            raise
-        detail = str(exc).replace(filepath, "the upload")  # PIL names the server path
-        raise ValueError(f"could not decode the {modality} input: {detail}") from exc
-
 
 # Outputs whose postprocess encodes a whole artifact (a PNG takes tens of ms,
 # an mp4 mux hundreds) run on the encode pool, so reads, streamed chunks and
@@ -695,7 +670,7 @@ class PreprocessWorkerThread:
                 with budget.file():
                     if modality == "audio":
                         check_audio_duration(filepath)
-                    out = _decode_input(load, filepath, self.device, modality)
+                    out = load(filepath, self.device)
                     if modality == "audio":
                         charge_decoded_audio(out.data, out.metadata["sample_rate"])
                 tensors[key].append(out.data)
@@ -1129,9 +1104,9 @@ class PreprocessWorkerThread:
         ``traceback`` False logs one line, for an error already logged where
         it happened.
 
-        ``intake`` marks a failure while taking the request in, where a
-        ValueError or TypeError refuses it (a 400). Past intake one is a server
-        bug like any other error (a 500).
+        ``intake`` marks a failure while taking client input in (a request or
+        an append), where a ValueError or TypeError refuses it (a 400). Past
+        intake one is a server bug like any other error (a 500).
         """
         status = 400 if intake and isinstance(exc, (ValueError, TypeError)) else 500
         text, _ = client_error_text(

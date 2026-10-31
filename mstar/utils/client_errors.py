@@ -39,7 +39,8 @@ def client_error_text(
     ``internal error (error id <id>)``. Either way the full error and its
     traceback (left out when ``traceback`` is False, for an error already
     logged where it happened) go to ``log`` as ``<what> [error id <id>]``.
-    ``refusal`` overrides the type check, for a caller that knows better.
+    ``refusal`` overrides that type check, for a caller that knows whether
+    the request was refused.
     """
     error_id = secrets.token_hex(6)
     log.error(

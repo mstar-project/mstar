@@ -17,7 +17,6 @@ standardization over the clip.
 """
 from __future__ import annotations
 
-import functools
 import math
 
 import numpy as np
@@ -26,6 +25,7 @@ from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
+from mstar.model.media_limits import decoding_upload
 from mstar.utils.h2d import to_device_nonblocking
 
 
@@ -263,16 +263,6 @@ class NemoLogMel:
         return [mel[row, :, :f].T for row, f in enumerate(frames)]
 
 
-@functools.cache
-def _ffmpeg_decoder_loads() -> bool:
-    """Whether torchcodec, and the FFmpeg libraries it loads, work here."""
-    try:
-        from torchcodec.decoders import AudioDecoder  # noqa: F401
-    except Exception:  # noqa: BLE001 -- ImportError, or RuntimeError without FFmpeg
-        return False
-    return True
-
-
 def load_audio_file(path: str, sample_rate: int = 16_000, max_seconds: float | None = None) -> torch.Tensor:
     """Decode an audio file to a float32 mono waveform at ``sample_rate``.
 
@@ -317,16 +307,9 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
     its length cannot expand past it. An undecodable file is the client's
     error, so it surfaces as ``ValueError`` (HTTP 400). A missing decoder or
     memory, and anything after the decode, is the server's, and stays as it is."""
-    try:
-        # decoded at its own rate, so a resampling failure isn't blamed on the file
+    # decoded at its own rate, so a resampling failure isn't blamed on the file
+    with decoding_upload(path, "the audio", ffmpeg=True):
         waveform, rate = _decode(path, sample_rate, max_seconds)
-    except (ImportError, MemoryError, ValueError):
-        raise
-    except Exception as exc:  # noqa: BLE001 -- libsndfile and FFmpeg both refused it
-        if not _ffmpeg_decoder_loads():
-            raise
-        # FFmpeg's message (paths, internals) stays out of the response
-        raise ValueError("could not decode the audio upload") from exc
     return _resample(waveform, rate, sample_rate)
 
 

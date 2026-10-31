@@ -67,7 +67,7 @@ from mstar.model.flux2_klein.submodules import (
     KleinVaeDecoderSubmodule,
     KleinVaeEncoderSubmodule,
 )
-from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -258,7 +258,8 @@ class Flux2KleinModel(Model):
 
         check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
         with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as raw:
-            raw.load()
+            with decoding_upload(filepath, "the reference image"):
+                raw.load()
             image = raw
             width, height = image.size
             if width < 64 or height < 64:
