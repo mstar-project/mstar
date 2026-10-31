@@ -718,7 +718,7 @@ class PreprocessWorkerThread:
 
         # Then, tokenize the prompt and let the model augment/transform the
         # tensors dict (e.g., Qwen3-Omni needs to compute pixel_values,
-        # image_grid_thw, audio_features, audio_seqlens from the raw tensors
+        # image_grid_thw, audio_features from the raw tensors
         # loaded above).  process_prompt receives the raw multimodal tensors
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})

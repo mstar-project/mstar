@@ -14,7 +14,7 @@ from mstar.api_server.request_types import APIServerMessage, ResultChunk, Result
 from mstar.communication import wire
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import ARNodeSubmodule, DeviceLoopback, HostRows, TokenStop
 from mstar.worker.worker import Worker
 
 # -- wire --------------------------------------------------------------------
@@ -250,6 +250,37 @@ def test_a_withheld_output_rides_no_inline_value():
         rows, [7, 8], ["new_token"],
     )
     assert sig == "new_token" and vals == [70, None]
+
+
+def test_the_step_closing_a_loop_back_reply_that_ended_at_prefill_sends_no_token():
+    """A loop-back decode's client edge carries its loop-back signal, inline off
+    the token's buffer, so the step closing a reply that ended at prefill has
+    to withhold the signal too, or the token sampled after the stop id reaches
+    the client."""
+
+    class _Decoder(ARNodeSubmodule):
+        prepare_inputs = preprocess = forward = None
+
+    sub = _Decoder()
+    sub.token_stop = TokenStop(
+        loop="decode_loop", buffer="new_token", stop_ids=frozenset({0}), sampler="sampler",
+        walk="decode", prefill_walks=frozenset({"prefill"}),
+    )
+    sub.device_loopback = DeviceLoopback(walk="decode", signal="text_inputs", sampler="sampler", buffer="new_token")
+
+    def info(walk):
+        return SimpleNamespace(graph_walk=walk, resource_configs={"sampler": SimpleNamespace(ignore_eos=False)})
+
+    # the prefill samples a stop id for 8, so its first decode step only closes the loop
+    sub.check_stop_batched([7, 8], {7: info("prefill"), 8: info("prefill")},
+                           HostRows((7, 8), {"new_token": torch.tensor([[5], [0]])}))
+    rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]])})
+    check = sub.check_stop_batched([7, 8], {7: info("decode"), 8: info("decode")}, rows)
+    assert check.stops == {8: {"decode_loop"}}
+    sig, vals = _worker()._inline_emit_values(
+        _Engine({"text_inputs": "new_token"}), _Batch(withheld=check.withheld), rows, [7, 8], ["text_inputs"],
+    )
+    assert sig == "text_inputs" and vals == [70, None]
 
 
 def test_a_withheld_output_skips_the_fused_route_and_send():

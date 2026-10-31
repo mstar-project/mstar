@@ -224,11 +224,10 @@ def test_backbone_prefill_and_decode_match_reference(pair: Pair):
     # three greedy decode steps, batched on our side, cached on both sides
     next_tokens = [logit.argmax() for logit in ref_logits]
     for step in range(3):
-        speech_pos = torch.full((1,), step + 1, dtype=torch.long)
         step_rows, ref_step_logits = [], []
         for i in range(2):
             tok = next_tokens[i].view(1)
-            emb = pair.model.embed_speech(tok, speech_pos)
+            emb = pair.model.embed_speech(tok, step + 1)
             step_rows.append(emb)
             if t3.learned_pos_emb:
                 ref_emb = pair.ref.speech_emb(tok[None]) + pair.ref.speech_pos_emb.get_fixed_embedding(step + 1)

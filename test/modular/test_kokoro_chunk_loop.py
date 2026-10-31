@@ -60,6 +60,7 @@ def _submodule() -> KokoroSynthSubmodule:
     config = _tiny_config()
     torch.manual_seed(0)
     model = KokoroTTS(config).eval()
+    model.fuse_lstm_directions()
     model.decoder.generator.m_source.deterministic = True
     return KokoroSynthSubmodule(model, config)
 

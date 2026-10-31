@@ -26,6 +26,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 
@@ -51,6 +52,14 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.embed_tokens = language_model.model.embed_tokens
         self.lm_head = language_model.lm_head
         self.config = config
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token",
+            stop_ids=frozenset({config.stop_token_id}), sampler=SAMPLER,
+        )
+        # The LM head computes the custom-token rows alone and reads -inf for
+        # the text rows (``output_start``), so the stop token must be one of them.
+        if config.stop_token_id < config.custom_token_base_id:
+            raise ValueError("Orpheus's stop token must be a custom token")
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
@@ -210,21 +219,6 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        eos_token_id = self.config.stop_token_id
-        ignore_eos= request_info.resource_configs[SAMPLER].ignore_eos
-        if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
-            return {"decode_loop"}
-        return set()
 
 
 class SNACDecoderSubmodule(NodeSubmodule):

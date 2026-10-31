@@ -1151,8 +1151,8 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         """One AC rollout step using either the CUDA-graph or eager path.
 
-        The CUDA-graph path (when a ``block_loop`` PiecewiseCudaGraphRunner is
-        available on ``engine_inputs``):
+        The CUDA-graph path (``runner``: the step leased the ``block_loop``
+        region, so its own step was declared and planned):
           1. Preamble (predictor_embed + action/state concat) runs eagerly.
           2. Position tensors are computed eagerly (hoisted out of the graph).
           3. Block loop replays the captured graph.
@@ -1163,7 +1163,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         """
         p = self.predictor
 
-        if runner is not None and runner.can_run(encoder_hidden.size(0)):
+        if runner is not None:
             # --- CUDA-graph path ---
             x, cond_tokens, b, t = p._prepare_sequence(
                 encoder_hidden, actions, states, extrinsics

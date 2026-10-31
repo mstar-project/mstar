@@ -18,6 +18,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components import Attention, DecoderLayer, RMSNorm
+from mstar.model.components.decoder_layer import run_layers
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -263,31 +264,13 @@ class Qwen3_5LanguageModel(nn.Module):
         # bind the label once per resource kind, advance the index per layer
         for attr, idx in self._bind_through.items():
             getattr(self.layers[idx].self_attn, attr).bind_step(label)
-        return self._forward_fused_residual(query_sequence)
+        return run_layers(self.layers, query_sequence, self.norm, self._set_cursor, self.comm_group)
 
-    def _forward_fused_residual(self, hidden: torch.Tensor) -> torch.Tensor:
-        """``DecoderLayer.forward`` with residual adds deferred into the next
-        norm, which also reduces the TP partial sums."""
-        cg = self.comm_group if self.comm_group.world_size > 1 else None
-        residual = None
-        for i, layer in enumerate(self.layers):
-            getattr(layer.self_attn, self._cursor_attr[i]).set_layer_idx(
-                self._resource_idx[i]
-            )
-            if residual is None:
-                residual = hidden
-                h = layer.input_layernorm(hidden)
-            else:
-                h, residual = layer.input_layernorm.forward_residual(
-                    hidden, residual, cg,
-                )
-            h = layer.self_attn(h)
-            h, residual = layer.post_attention_layernorm.forward_residual(
-                h, residual, cg,
-            )
-            hidden = layer.mlp(h)
-        normed, _ = self.norm.forward_residual(hidden, residual, cg)
-        return normed
+    @torch.compiler.disable
+    def _set_cursor(self, i: int, mixer: nn.Module) -> None:
+        """Move layer ``i``'s cursor (``attend`` or ``mix``) to the layer's index
+        in its resource."""
+        getattr(mixer, self._cursor_attr[i]).set_layer_idx(self._resource_idx[i])
 
 
 class Qwen3_5ForCausalLM(nn.Module):

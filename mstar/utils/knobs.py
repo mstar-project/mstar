@@ -13,7 +13,6 @@ KNOBS: dict[str, str] = {
     "device_loopback": "MSTAR_DEVICE_LOOPBACK",
     "sampler_ingraph_scatter": "MSTAR_SAMPLER_INGRAPH_SCATTER",
     "sampler_slots": "MSTAR_SAMPLER_SLOTS",
-    "ingraph_decode_rope": "MSTAR_INGRAPH_DECODE_ROPE",
     "kv_chain_lazy_steps": "MSTAR_KV_CHAIN_LAZY_STEPS",
     "kv_plan_cache": "MSTAR_KV_PLAN_CACHE",
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
@@ -91,14 +90,6 @@ def sampler_slots() -> int:
     allocated up front when the in-graph scatter is on (see
     ``sampler_ingraph_scatter``)."""
     return int(_setting("sampler_slots", "4096"))
-
-
-def ingraph_decode_rope() -> bool:
-    """``ingraph_decode_rope`` / ``MSTAR_INGRAPH_DECODE_ROPE`` (default off): a
-    captured decode step builds its rotary tables inside the graph from the
-    position resource's planned positions instead of staging them before the
-    replay."""
-    return _setting("ingraph_decode_rope", "0") == "1"
 
 
 def kv_chain_lazy_steps() -> int:

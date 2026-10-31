@@ -1,0 +1,18 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+# qwen3omni_pd_disaggregated.yaml on two GPUs: the Talker shares rank 0 with the
+# encoders, Code2Wav and the prefill Thinker; rank 1 decodes.
+resources:
+  thinker_kv:
+    max_num_pages: 1024
+node_groups:
+  - node_names: [audio_encoder, vision_encoder, Code2Wav]
+    ranks: [0]
+  - node_names: [Thinker]
+    ranks: [0]
+    graph_walks: [prefill_text, prefill_audio, prefill_vision]
+  - node_names: [Thinker]
+    ranks: [1]
+    graph_walks: [thinker_decode]
+  - node_names: [Talker]
+    ranks: [0]

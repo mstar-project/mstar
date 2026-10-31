@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import itertools
 import logging
 import math
@@ -33,7 +32,11 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -65,21 +68,6 @@ from mstar.utils.h2d import PinnedStager
 logger = logging.getLogger(__name__)
 
 
-@contextlib.contextmanager
-def full_fp32():
-    """Disable TF32 for convolutions and matmuls while the codec runs.
-
-    The reference encodes references in full fp32 (TF32 convolutions flip
-    about 3% of the codes), and the codec decodes in fp32 too.
-    """
-    matmul, cudnn = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-    try:
-        yield
-    finally:
-        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = matmul, cudnn
-
-
 # ===========================================================================
 # 1. ARSubmodule - one 10-codebook frame per step
 # ===========================================================================
@@ -95,8 +83,16 @@ class ARSubmodule(ARNodeSubmodule):
     """
 
     disable_torch_compile = True
-    MAX_BATCH_SIZE = 32
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # The top decode bucket is also the cap on rows per AR step; a step
+    # costs about the same at 64 rows as at 32, so 64 streams do not run as
+    # two alternating batches, and padding a batch up to 32 or 64 is cheap.
+    # Each bucket is a compile of its own (~3 min on a cold Inductor cache).
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    MAX_BATCH_SIZE = DECODE_CAPTURE_BATCH_SIZES[-1]
+    # Plain prompts are short (the chat frame around one text). Eager, a
+    # prefill step took ~60 ms of mostly launch-bound stream time on an H200.
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
 
     def __init__(self, slow_ar: FishSlowAR, fast_ar: FishFastAR, config: FishS2ProConfig) -> None:
         super().__init__()
@@ -359,10 +355,29 @@ class ARSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
-        """Capture the whole one-token decode step (both ARs and sampling) per batch bucket."""
+        """Capture the whole one-token decode step (both ARs and sampling) per
+        batch bucket, and prefills packed into token buckets. A voice clone's
+        prefill is the same forward over a prompt that embeds the reference
+        frames, so it replays the same captures when it fits the buckets."""
         del tp_world_size
         dtype = self.slow_ar.semantic_head.dtype
+
+        def prefill_input(num_tokens: int) -> ARNodeInputs:
+            return ARNodeInputs(
+                input_embeds=torch.zeros(num_tokens, self.config.slow_ar.dim, dtype=dtype, device=device),
+                input_seq_len=num_tokens,
+                kwargs={"suppress_eos": True},
+            )
+
         return [
+            PackedAcceleratorGraphConfig(
+                capture_graph_walk="ar_prefill",
+                replay_graph_walks=["ar_prefill", "ar_prefill_clone"],
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=prefill_input,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                compile=False,
+            ),
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="ar_decode",
                 single_request_inputs=ARNodeInputs(
@@ -371,12 +386,14 @@ class ARSubmodule(ARNodeSubmodule):
                     kwargs={"suppress_eos": False},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-                compile=False,
+                compile=True,
             )
         ]
 
     def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        if batch.graph_walk != "ar_decode" or not self.can_batch(batch, model_inputs):
+        if batch.graph_walk not in ("ar_decode", "ar_prefill", "ar_prefill_clone") or not self.can_batch(
+            batch, model_inputs,
+        ):
             return False
         return super().can_use_accelerator_graphs(batch, model_inputs)
 
@@ -408,7 +425,9 @@ class CodecSubmodule(ARNodeSubmodule):
         self.config = config
         self.codec = config.codec
         self.hop = config.codec.hop_length
-        self.exact_fp32 = exact_fp32
+        if exact_fp32:
+            # full fp32 for the decode, as the reference: the engine applies it
+            self.float32_matmul_precision, self.cudnn_allow_tf32 = "highest", False
         receptive_field = decoder.conv_receptive_field()
         if self.codec.conv_context_frames < receptive_field:
             raise ValueError(
@@ -505,9 +524,7 @@ class CodecSubmodule(ARNodeSubmodule):
         width = codec_tokens.shape[-1]
         if width == 0:
             return codec_tokens.new_zeros((codec_tokens.shape[0], 0), dtype=torch.int16)
-        guard = full_fp32() if self.exact_fp32 else contextlib.nullcontext()
-        with guard:
-            wav = self.decoder.decode_window(codec_tokens, start_offset, conv_start, self.conv_frames(width))
+        wav = self.decoder.decode_window(codec_tokens, start_offset, conv_start, self.conv_frames(width))
         return (wav.clamp(-1, 1) * 32767).to(torch.int16)
 
     def forward(
@@ -591,14 +608,16 @@ class CodecSubmodule(ARNodeSubmodule):
 class RefEncoderSubmodule(NodeSubmodule):
     """DAC-encode one 44.1 kHz reference clip into ``[frames, 10]`` codes.
 
-    Runs on the GPU under ``full_fp32``: TF32 convolutions would flip some
-    of the codes. Codes
+    Runs on the GPU in full fp32, as the reference encodes (the engine applies
+    the declaration below): TF32 convolutions flip about 3% of the codes. Codes
     are memoised by clip content: a voice is reused across requests and
     across the sentence chunks of one long request.
     """
 
     disable_torch_compile = True
     disable_autocast = True
+    float32_matmul_precision = "highest"
+    cudnn_allow_tf32 = False
     CACHE_SIZE = 64
 
     def __init__(self, encoder: FishDACEncoder, config: FishS2ProConfig) -> None:
@@ -620,7 +639,7 @@ class RefEncoderSubmodule(NodeSubmodule):
         return NodeInputs(tensor_inputs={"waveform": waveform}, kwargs={"clip_key": clip_key})
 
     def encode(self, waveform: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad(), full_fp32():
+        with torch.no_grad():
             codes = self.encoder(waveform.view(1, 1, -1).float())
         return codes[0].t().contiguous().long()
 

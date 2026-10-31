@@ -1,8 +1,10 @@
 """Parity of the OmniVoice port against the reference implementation.
 
-The port reuses the reference's own fused-kernel forward, so the per-step
-numerics should be *identical* to its fastest mode and merely *close* to its
-unoptimised dense one.  The tiers say which is which:
+The port's packing, scoring and reveal loop run over the reference's own
+fused-kernel packed forward (``_packed_logits``), so the per-step numerics
+should be *identical* to its fastest mode and merely *close* to its
+unoptimised dense one; ``encode`` + ``head``, mstar's layer loop over the same
+fused weights, is close to that forward. The tiers say which is which:
 
 ``test_packed_layout_*`` / ``test_reveal_schedule_*`` / ``test_prefix_parity``
     No GPU, no weights (the prefix test needs the tokenizer).  Structure only.
@@ -18,6 +20,11 @@ unoptimised dense one.  The tiers say which is which:
     than finished canvases because the document count changes the ragged
     kernel's reduction order by about one fp16 ulp, and eight greedy reveals
     turn that into a visibly different canvas without anything being wrong.
+
+``test_encode_head_matches_the_packed_reference``
+    ``encode`` + ``head`` -- what the captured region and the eager fallback
+    run -- against the packed forward through the same planned kernel: the
+    same logits up to half-precision rounding.
 
 ``test_dense_agreement``       — tier C
     Against the reference's dense path, after a single step.  Greedy argmax
@@ -98,7 +105,7 @@ def test_packed_layout_doc_boundaries():
         _item("a", prefix_len=40, target_len=100),
         _item("b", prefix_len=12, target_len=20),
     ]
-    canvas = build_packed_canvas(items, MASK_ID, torch.device("cpu"))
+    canvas = build_packed_canvas(items, torch.device("cpu"))
 
     assert canvas.doc_lens == [140, 100, 32, 20]
     assert canvas.packed_ids.shape == (1, NUM_CODEBOOK, 292)
@@ -113,8 +120,8 @@ def test_cfg_off_drops_the_unconditional_document():
     with_cfg = _item("a", prefix_len=40, target_len=100, guidance_scale=2.0)
     without = _item("b", prefix_len=40, target_len=100, guidance_scale=0.0)
 
-    c_on = build_packed_canvas([with_cfg], MASK_ID, torch.device("cpu"))
-    c_off = build_packed_canvas([without], MASK_ID, torch.device("cpu"))
+    c_on = build_packed_canvas([with_cfg], torch.device("cpu"))
+    c_off = build_packed_canvas([without], torch.device("cpu"))
 
     assert c_on.doc_lens == [140, 100]
     assert c_off.doc_lens == [140]
@@ -128,7 +135,7 @@ def test_cfg_off_drops_the_unconditional_document():
             _item("x", prefix_len=10, target_len=20, guidance_scale=2.0),
             _item("y", prefix_len=12, target_len=30, guidance_scale=0.0),
         ],
-        MASK_ID, torch.device("cpu"),
+        torch.device("cpu"),
     )
     assert mixed.doc_lens == [30, 20, 42]
     assert mixed.flat_target_total == 50
@@ -152,7 +159,7 @@ def test_packed_layout_positions_restart_per_document():
         _item("a", prefix_len=5, target_len=7),
         _item("b", prefix_len=3, target_len=4),
     ]
-    canvas = build_packed_canvas(items, MASK_ID, torch.device("cpu"))
+    canvas = build_packed_canvas(items, torch.device("cpu"))
     pos = canvas.position_ids[0]
 
     cursor = 0
@@ -166,7 +173,7 @@ def test_packed_layout_positions_restart_per_document():
 def test_packed_layout_target_gather_is_the_canvas():
     """tgt_index must point at the target region, not the prefix."""
     item = _item("a", prefix_len=9, target_len=6)
-    canvas = build_packed_canvas([item], MASK_ID, torch.device("cpu"))
+    canvas = build_packed_canvas([item], torch.device("cpu"))
 
     gathered = canvas.audio_mask[0][canvas.tgt_index]
     assert gathered.all(), "every gathered position must be an audio position"
@@ -192,7 +199,7 @@ def test_reveal_schedule_covers_the_canvas():
 
 def test_mask_class_is_never_predicted():
     item = _item("solo", prefix_len=10, target_len=6)
-    canvas = build_packed_canvas([item], MASK_ID, torch.device("cpu"))
+    canvas = build_packed_canvas([item], torch.device("cpu"))
     logits = torch.randn(1, NUM_CODEBOOK, 2 * canvas.flat_target_total, 1025)
     c_logits, u_logits = canvas.slice_logits(logits, item)
     assert c_logits.shape == (1, NUM_CODEBOOK, 6, 1025)
@@ -210,7 +217,7 @@ def test_sampling_is_reproducible_under_a_seed():
     ``predict_tokens_with_scoring`` and the reveal order in ``apply_reveal``.
     """
     item = _item("seeded", prefix_len=10, target_len=6)
-    canvas = build_packed_canvas([item], MASK_ID, torch.device("cpu"))
+    canvas = build_packed_canvas([item], torch.device("cpu"))
     logits = torch.randn(1, NUM_CODEBOOK, 2 * canvas.flat_target_total, 1025)
     c_logits, u_logits = canvas.slice_logits(logits, item)
 
@@ -353,6 +360,61 @@ def _load_patched():
     return model
 
 
+@torch.inference_mode()
+def _packed_logits(backbone, canvas):
+    """The reference's own packed forward over ``canvas``:
+    ``[1, C, 2 * flat_target_total, V]``, the yardstick for mstar's layer loop."""
+    from omnivoice.models import omnivoice_flashinfer as fi
+
+    model = backbone.model
+    model._fi_runner.plan(canvas.doc_lens, next(model.llm.parameters()).dtype)
+    fi._CTX["wrapper"] = model._fi_runner.wrapper
+    fi._CTX["pos_ids"] = canvas.position_ids[0].to(torch.int32)
+    fi._CTX["doc_slots"] = None
+    return fi._forward_logits(
+        model, canvas.packed_ids, canvas.audio_mask, canvas.position_ids, canvas.tgt_index,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_encode_head_matches_the_packed_reference():
+    pytest.importorskip("omnivoice.models.omnivoice")
+    from omnivoice.models.omnivoice import OmniVoice
+    from omnivoice.models.omnivoice_flashinfer import apply_flashinfer
+
+    from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
+
+    model = OmniVoice.from_pretrained(MODEL_PATH, dtype=torch.float16).eval().cuda()
+    apply_flashinfer(model, enable_cuda_graph=False)
+    backbone = OmniVoiceBackbone(model).eval()
+
+    gen = torch.Generator().manual_seed(0)
+    items = []
+    for rid, (prefix_len, target_len, guidance) in enumerate([(23, 40, 2.0), (31, 25, 0.0), (17, 52, 2.0)]):
+        tokens = torch.full((1, NUM_CODEBOOK, target_len), MASK_ID, dtype=torch.long)
+        tokens[..., ::3] = torch.randint(0, MASK_ID, tokens[..., ::3].shape, generator=gen)
+        items.append(CanvasItem(
+            request_id=str(rid),
+            prefix_ids=torch.randint(0, 1000, (NUM_CODEBOOK, prefix_len), generator=gen),
+            prefix_audio_mask=torch.zeros(prefix_len, dtype=torch.bool),
+            tokens=tokens,
+            guidance_scale=guidance,
+        ))
+    canvas = build_packed_canvas(items, torch.device("cuda"))
+
+    with torch.inference_mode():
+        want = _packed_logits(backbone, canvas)
+        hidden = backbone.encode(
+            canvas.packed_ids[0].t(), canvas.audio_mask[0], canvas.position_ids[0].to(torch.int32),
+            attn=model._fi_runner.wrapper,  # planned for this canvas by _packed_logits
+        )
+        got = backbone.head(hidden, canvas.tgt_index)
+    # the residual adds fold into the next RMSNorm (a float sum, not a rounded
+    # half-precision one), so the logits agree to rounding, not bit for bit
+    assert torch.allclose(got.float(), want.float(), atol=0.25, rtol=0.02)
+    assert (got.argmax(-1) == want.argmax(-1)).float().mean() > 0.95
+
+
 def _run_ours(backbone, config, specs, num_step=None):
     """Drive the port's packed loop over ``specs``; returns each finished canvas.
 
@@ -384,8 +446,8 @@ def _run_ours(backbone, config, specs, num_step=None):
         ))
 
     for k in range(num_step):
-        canvas = build_packed_canvas(items, config.audio_mask_id, torch.device("cuda"))
-        logits = backbone(canvas).to(torch.float32)
+        canvas = build_packed_canvas(items, torch.device("cuda"))
+        logits = _packed_logits(backbone, canvas).to(torch.float32)
         for item, schedule in zip(items, schedules, strict=True):
             c_logits, u_logits = canvas.slice_logits(logits, item)
             pred, scores = predict_tokens_with_scoring(
@@ -425,8 +487,8 @@ def _step0_logits(backbone, config, specs, which=0):
             ),
             guidance_scale=GREEDY["guidance_scale"],
         ))
-    canvas = build_packed_canvas(items, config.audio_mask_id, torch.device("cuda"))
-    logits = backbone(canvas).to(torch.float32)
+    canvas = build_packed_canvas(items, torch.device("cuda"))
+    logits = _packed_logits(backbone, canvas).to(torch.float32)
     return canvas.slice_logits(logits, items[which])
 
 
@@ -460,7 +522,7 @@ def test_packed_parity_single():
     specs = [("Xin chào, đây là một câu thử.", "Vietnamese", 60)]
 
     theirs = _run_reference(model, specs)[0]
-    ours = _run_ours(OmniVoiceBackbone(model, torch.float16).eval(), config, specs)[0]
+    ours = _run_ours(OmniVoiceBackbone(model).eval(), config, specs)[0]
 
     assert (ours != config.audio_mask_id).all(), "canvas left masked cells"
     assert torch.equal(ours, theirs), (
@@ -491,7 +553,7 @@ def test_packed_parity_batched():
     from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
 
     config = OmniVoiceConfig()
-    backbone = OmniVoiceBackbone(_load_patched(), torch.float16).eval()
+    backbone = OmniVoiceBackbone(_load_patched()).eval()
 
     a = ("Xin chào, đây là một câu thử.", "Vietnamese", 60)
     b = ("Hello world.", "English", 25)
@@ -568,7 +630,7 @@ def test_dense_agreement():
     del dense
     torch.cuda.empty_cache()
 
-    backbone = OmniVoiceBackbone(_load_patched(), torch.float16).eval()
+    backbone = OmniVoiceBackbone(_load_patched()).eval()
     ours = _run_ours(backbone, config, specs, num_step=1)[0]
 
     agreement = float((ours == theirs).float().mean())
@@ -612,7 +674,7 @@ def test_postprocess_reveals_without_touching_the_loop_edge():
     inputs = NodeInputs(tensor_inputs={
         "audio_tokens": edge,
         "step_index": torch.zeros(1, dtype=torch.int64),
-    })
+    }, kwargs={"step": 0})
 
     sub.postprocess("a", _fwd_info("a", 0), outputs, inputs)
 

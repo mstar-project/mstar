@@ -27,6 +27,7 @@ from torch import nn
 
 from mstar.engine.resources.kv.bounded import BoundedKVConfig, SinkWindow, StreamPosition
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
+from mstar.model.components.masking import length_mask
 from mstar.model.nemotron_duplex.components._util import param
 from mstar.model.nemotron_duplex.components.dft import stft_as_real, stft_basis
 from mstar.model.nemotron_duplex.config import ConformerSTTConfig
@@ -273,7 +274,7 @@ class ConformerEncoder(nn.Module):
         idx = torch.arange(0, max_len, device=device)
         diff = idx.unsqueeze(1) - idx.unsqueeze(0)
         att_ok = (diff <= att_left) & (diff >= 0)                       # (T, T)
-        pad_ok = torch.arange(0, max_len, device=device).expand(length.size(0), -1) < length.unsqueeze(-1)
+        pad_ok = length_mask(length, max_len)
         pad_att = pad_ok.unsqueeze(1).repeat(1, max_len, 1)
         pad_att = pad_att & pad_att.transpose(1, 2)
         att_mask = ~(pad_att & att_ok.unsqueeze(0))                     # True = masked

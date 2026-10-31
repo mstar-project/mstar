@@ -22,11 +22,11 @@ def _clean(monkeypatch):
 
 
 def test_env_then_config_then_default(monkeypatch):
-    knobs.configure({"kv_plan_cache": 1, "ingraph_decode_rope": True})
-    assert knobs.kv_plan_cache() == 1 and knobs.ingraph_decode_rope() is True
-    assert knobs.kv_pinned_indptrs() is False, "unset in both: the default"
-    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "0")
-    assert knobs.ingraph_decode_rope() is False, "a set env var wins"
+    knobs.configure({"kv_plan_cache": 1, "kv_pinned_indptrs": True})
+    assert knobs.kv_plan_cache() == 1 and knobs.kv_pinned_indptrs() is True
+    assert knobs.sampler_ingraph_scatter() is False, "unset in both: the default"
+    monkeypatch.setenv("MSTAR_KV_PINNED_INDPTRS", "0")
+    assert knobs.kv_pinned_indptrs() is False, "a set env var wins"
     # scripts export an empty variable to mean "not set"
     monkeypatch.setenv("MSTAR_KV_PLAN_CACHE", "")
     assert knobs.kv_plan_cache() == 1, "an empty env var defers to the config"

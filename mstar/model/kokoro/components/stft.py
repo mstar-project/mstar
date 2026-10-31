@@ -21,7 +21,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.kokoro.components.masking import length_mask, mask_channels
+from mstar.model.components.masking import length_mask
+from mstar.model.kokoro.components.masking import mask_channels
 
 ENVELOPE_FLOOR = 1e-11  # torch.istft's NOLA threshold
 

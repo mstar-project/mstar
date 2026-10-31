@@ -455,6 +455,10 @@ class Model(ABC):
     # the model's config.yaml overrides either. See
     # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
+    # GIL switch interval of the API server process, in seconds; None keeps
+    # Python's 5 ms, and ``api_switch_interval_s`` in the config overrides
+    # either. See ``entrypoint._set_switch_interval``.
+    API_SWITCH_INTERVAL_S: float | None = None
 
     def _get_worker_graphs_for_graph_walk(
         self,
@@ -703,7 +707,7 @@ class Model(ABC):
         multimodal tensors from file_paths (images, audio, video).
         The model may inspect the raw tensors dict and compute additional
         derived tensors (e.g., Qwen3-Omni computes ``pixel_values``,
-        ``image_grid_thw``, ``audio_features``, ``audio_seqlens`` from the
+        ``image_grid_thw``, ``audio_features`` from the
         raw ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
 
         Args:
@@ -757,11 +761,7 @@ class Model(ABC):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.
-        try:
-            img = read_image(filepath, rgb=True)
-        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
-            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
-        img = img.to(device).float().div_(255.0)  # CxHxW
+        img = read_image(filepath, rgb=True).to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 

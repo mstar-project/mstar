@@ -24,6 +24,7 @@ from mstar.model.components.fastconformer_kernels import (
     glu_depthwise_conv,
     use_triton,
 )
+from mstar.model.components.masking import length_mask
 
 
 @dataclass
@@ -94,12 +95,6 @@ def _conv_out_len(lengths, kernel: int, stride: int, causal: bool):
     return (lengths + pad - kernel) // stride + 1
 
 
-def _time_mask(lengths: torch.Tensor | None, max_len: int) -> torch.Tensor | None:
-    if lengths is None:
-        return None
-    return torch.arange(max_len, device=lengths.device)[None, :] < lengths[:, None]
-
-
 class _Subsampling(nn.Module):
     """Depthwise-separable striding over (time, mel): a full conv into
     ``subsampling_channels``, then depthwise + pointwise pairs, then a linear
@@ -152,7 +147,7 @@ class _Subsampling(nn.Module):
             else:
                 x = layer(x)
                 if lengths is not None:
-                    x = x * _time_mask(lengths, x.shape[2])[:, None, :, None]
+                    x = x * length_mask(lengths, x.shape[2])[:, None, :, None]
                 x = torch.relu(x)
         b, c, t, f = x.shape
         return self.linear(x.transpose(1, 2).reshape(b, t, c * f))
@@ -352,7 +347,7 @@ class FastConformerEncoder(nn.Module):
             out_lengths, valid = torch.full((x.shape[0],), t, device=x.device), None
         else:
             out_lengths = self.config.output_lengths(lengths)
-            valid = _time_mask(out_lengths, t)
+            valid = length_mask(out_lengths, t)
         mask = None
         if self.config.causal:
             mask = chunked_attention_mask(t, self.config.left_context, self.config.lookahead, x.device)[None, None]

@@ -35,3 +35,8 @@ warmup_requests:
     files: [hf://hexgrad/Kokoro-82M/samples/af_heart_0.wav]
     output_modalities: [audio]
     model_kwargs: {max_new_tokens: 32}
+# The codec's conv stack is ~0.3 ms per frame and row in exact fp32, most of
+# the GPU time once requests overlap. TF32 halves it; the audio stays within
+# ~60 dB SNR of the exact decode. Drop this to get the exact (TF32-off) codec.
+model_kwargs:
+  codec_exact_fp32: false

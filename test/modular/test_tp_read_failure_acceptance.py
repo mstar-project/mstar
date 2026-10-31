@@ -19,8 +19,8 @@ Each run is two real ranks of one TP=2 instance, each in its own process
 with a gloo process group, running the real ``Worker.run`` loop, the real
 ``MicroScheduler``, the real shared-memory tensor manager, the real
 ``Engine`` (prepare, admit, forward, commit through the real ``StepRunner``
-and ``KVManager``) and Qwen3.5's real ``prepare_inputs``, which reads
-``image_grid_thw`` on the host to size the image span. The LLM forward is a
+and ``KVManager``) and Qwen3.5's real ``prepare_inputs``, which sizes the image
+span from the step's host grid while ``vision_embeds`` is still read in. The LLM forward is a
 stand-in that all-reduces each rank's partial over the TP group, as a
 row-parallel layer does, so a rank that never joins a step, or joins it with
 another token count, shows up as a collective timeout or a gloo abort.
@@ -95,7 +95,7 @@ _PROMPTS = {
     },
 }
 # the input of r1 whose follower read fails
-_FAILING = {"grid": "image_grid_thw", "text": "text_inputs"}
+_FAILING = {"grid": "vision_embeds", "text": "text_inputs"}
 
 
 def _ids(n: int, seed: int) -> list[int]:
@@ -114,7 +114,6 @@ def _inputs(kind: str, rid: str) -> dict[str, list[torch.Tensor]]:
     gen = torch.Generator().manual_seed(seed)
     return {
         "text_inputs": texts,
-        "image_grid_thw": [torch.tensor([[t, h, w]], dtype=torch.int64)],
         "vision_embeds": [torch.randn(span, HIDDEN, generator=gen)],
     }
 
@@ -236,18 +235,11 @@ def _submodule_class():
             self.requires_grad_(False)
             self.bind_node_resources({ROPE: _Rope()})
             self.group, self.rank = group, rank
+            # the stand-in's decode reads routed tokens, not the sampler's
+            self.device_loopback = None
 
-        # the real model's step, stop and emit settings, which read state this
+        # the real model's step and stop settings, which read state this
         # stand-in doesn't have
-        def _device_loopback(self):
-            return False
-
-        def uniform_row_inputs(self, graph_walk, has_loopback=False):
-            return None
-
-        def device_loopback_signals(self, graph_walk):
-            return frozenset()
-
         def max_batch_size(self, graph_walk):
             return None
 
@@ -265,9 +257,6 @@ def _submodule_class():
 
         def step_is_input_free(self, graph_walk):
             return False
-
-        def inline_client_signals(self, graph_walk):
-            return {}
 
         def can_batch(self, batch, model_inputs):
             return True
@@ -730,7 +719,7 @@ def _rank_main(rank, scenario, inbox, outbox):
         import mstar.communication.wire_types  # noqa: F401  (registers the tags)
         from mstar.communication.tensors import SharedMemoryCommunicationManager
         from mstar.conductor.request_info import CurrentForwardPassInfo
-        from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
+        from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, STEP_GRIDS_KEY, TEXT_PART
 
         dist.init_process_group(
             "gloo", init_method=f"file://{scenario.store}", rank=rank, world_size=2,
@@ -748,9 +737,13 @@ def _rank_main(rank, scenario, inbox, outbox):
         graph.tensor_manager = tm
         order = [TEXT_PART, IMAGE_PART, TEXT_PART] if kind == "grid" else [TEXT_PART]
         for rid in ("r0", "r1"):
+            step_metadata = {"prefill_order": order}
+            if kind == "grid":
+                # the host grid the conductor hands the step (see `process_prompt`)
+                step_metadata[STEP_GRIDS_KEY] = [_PROMPTS[kind][rid]["grid"]]
             graph.admit(rid, CurrentForwardPassInfo(
                 request_id=rid, graph_walk=_walk(kind), fwd_index=0, random_seed=0, max_tokens=1,
-                step_metadata={"prefill_order": order},
+                step_metadata=step_metadata,
             ))
             tokens = _prompt_tokens(kind, rid)
             engine.add_request(rid, {KV: _kv_config(tokens)} if scenario.prefix_cache else None)

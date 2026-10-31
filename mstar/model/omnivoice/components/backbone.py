@@ -6,33 +6,51 @@ ragged attention rather than by a mask, or one document when it turned CFG off.
 Nothing is padded, so a batch mixing a 2-second and a 25-second utterance wastes
 nothing, and the head GEMM runs only at the positions whose logits are read.
 
-The per-step kernel path is the reference's own fastest mode, reused rather than
-re-derived: ``apply_flashinfer`` fuses QKV, swaps in flashinfer RoPE, RMSNorm
-and ``silu_and_mul``, and keeps the whole layer in ``(S, H, D)`` so no transpose
-copies happen.  Re-implementing that here would mean a second copy of tuned
-kernels whose only job is to end up numerically identical.
+The per-step kernels are the reference's own fastest mode: ``apply_flashinfer``
+fuses QKV and gate/up, and the layer runs in ``(S, H, D)`` with flashinfer RoPE
+and ``silu_and_mul`` (its RMSNorms go through M*'s shared ones).
+``OmniVoiceBackbone.encode`` drives those fused weights with its own layer loop
+rather than through the patched ``llm``: it norms q and k straight off the fused
+QKV output (the reference copies each out first) and folds every residual add
+into the next RMSNorm.  At 16 requests a
+step those copies and adds were a tenth of the step's GPU time.
 
 What M* adds on top is what the reference cannot do from inside one
 ``generate()`` call: the documents in a step come from *different concurrent
 requests*, at different diffusion steps, with different per-request knobs.  Its
 own server has no batching at all (k2-fsa/OmniVoice#251).
 
-The coupling to ``omnivoice.models.omnivoice_flashinfer`` is deliberate but
-narrow — four module-private names, checked at load by ``assert_flashinfer_api``
-so an upstream rename fails at boot rather than at the first request.
+The coupling to the reference is deliberate but narrow — ``apply_flashinfer``,
+the four fused-weight attributes it sets on each layer, and the model's
+``_prepare_embed_inputs`` and ``audio_heads``, checked at load by
+``assert_flashinfer_api`` and ``assert_flashinfer_patched`` so an upstream
+rename fails at boot rather than at the first request.
 """
 
 import logging
-import threading
 from dataclasses import dataclass, field
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+
+from mstar.engine.resources.rms_norm import run_rms_norm
+from mstar.model.components.norm import add_rms_norm
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
-# The private surface this integration rides on. Checked once at load.
-_REQUIRED_FI_NAMES = ("_CTX", "PackedAttnRunner", "_forward_logits", "apply_flashinfer")
+# The private surface this integration rides on, all of it read by
+# ``OmniVoiceBackbone`` except the packed runner, which the loader deletes.
+# Checked once at load: the module's names before ``apply_flashinfer`` runs,
+# and the model's members and the fused weights it leaves on every layer's
+# attention and MLP after.
+_REQUIRED_FI_NAMES = ("apply_flashinfer",)
+_REQUIRED_MODEL_ATTRS = ("_prepare_embed_inputs", "audio_heads", "_fi_runner")
+_REQUIRED_FI_LAYER_ATTRS = {
+    "self_attn": ("_fi_w_qkv", "_fi_qkv_split", "_fi_rope_theta"),
+    "mlp": ("_fi_w_gate_up",),
+}
 
 
 def assert_flashinfer_api():
@@ -46,7 +64,7 @@ def assert_flashinfer_api():
 
     missing = [name for name in _REQUIRED_FI_NAMES if not hasattr(fi, name)]
     if missing:
-        raise RuntimeError(
+        raise SystemExit(
             "omnivoice.models.omnivoice_flashinfer is missing "
             f"{missing}; mstar's OmniVoice backbone drives its packed "
             "attention directly. Pin the omnivoice version, or port the "
@@ -56,12 +74,31 @@ def assert_flashinfer_api():
     from omnivoice.models import omnivoice as ov
 
     if not hasattr(ov, "_resolve_instruct"):
-        raise RuntimeError(
+        raise SystemExit(
             "omnivoice.models.omnivoice is missing _resolve_instruct; "
             "mstar validates voice-design instructs with it. Pin the "
             "omnivoice version, or port the validator into mstar."
         )
     return fi
+
+
+def assert_flashinfer_patched(model: nn.Module) -> None:
+    """Fail at boot, not at capture, if the patched model no longer has what
+    ``OmniVoiceBackbone`` reads (its embedding merge and audio head, and the
+    fused weights ``apply_flashinfer`` leaves) or the packed runner the loader
+    deletes."""
+    missing = sorted({name for name in _REQUIRED_MODEL_ATTRS if not hasattr(model, name)} | {
+        f"{part}.{name}"
+        for layer in model.llm.layers
+        for part, names in _REQUIRED_FI_LAYER_ATTRS.items()
+        for name in names
+        if not hasattr(getattr(layer, part), name)
+    })
+    if missing:
+        raise SystemExit(
+            f"the patched OmniVoice model is missing {missing}; mstar's OmniVoice "
+            "backbone relies on them. Pin the omnivoice version, or port them into mstar."
+        )
 
 
 @dataclass
@@ -100,6 +137,13 @@ class CanvasItem:
     def does_cfg(self) -> bool:
         return self.guidance_scale != 0
 
+    @property
+    def doc_pair(self) -> tuple[int, int]:
+        """Its two documents' lengths, conditional then unconditional (0 with
+        CFG off): what the attention plan, the lease and the packed row all
+        count."""
+        return self.cond_len, self.target_len if self.does_cfg else 0
+
 
 @dataclass
 class PackedCanvas:
@@ -136,11 +180,7 @@ class PackedCanvas:
         return c_logits, u_logits
 
 
-def build_packed_canvas(
-    items: list[CanvasItem],
-    audio_mask_id: int,
-    device: torch.device,
-) -> PackedCanvas:
+def build_packed_canvas(items: list[CanvasItem], device: torch.device) -> PackedCanvas:
     """Pack a step's requests into one ragged row.
 
     Documents are laid out ``[cond_0, uncond_0, cond_1, uncond_1, ...]`` and
@@ -159,78 +199,55 @@ def build_packed_canvas(
     if not items:
         raise ValueError("build_packed_canvas called with no items")
 
-    num_codebook = items[0].prefix_ids.shape[0]
-
+    # One concatenation per device tensor, and the index tensors built on the
+    # host and copied once: a step packs up to 16 requests, and ten small
+    # kernels per request were a fifth of the step's host time.
+    id_parts: list[torch.Tensor] = []
+    mask_parts: list[torch.Tensor] = []
+    positions: list[torch.Tensor] = []
     doc_lens: list[int] = []
-    offsets: list[tuple[int, int]] = []   # (cond_offset, uncond_offset or -1)
-    cursor = 0
+    cond_rows: list[torch.Tensor] = []
+    uncond_rows: list[torch.Tensor] = []
+    longest = max(item.target_len for item in items)
+    revealed = torch.ones(longest, dtype=torch.bool, device=device)
+
+    cursor = flat_cursor = flat_u_cursor = 0
     for item in items:
-        c_off = cursor
-        cursor += item.cond_len
-        doc_lens.append(item.cond_len)
-        if item.does_cfg:
-            u_off = cursor
-            cursor += item.target_len
-            doc_lens.append(item.target_len)
-        else:
-            u_off = -1
-        offsets.append((c_off, u_off))
-    total = cursor
-
-    packed_ids = torch.full(
-        (1, num_codebook, total), audio_mask_id, dtype=torch.long, device=device
-    )
-    audio_mask = torch.zeros((1, total), dtype=torch.bool, device=device)
-    position_ids = torch.zeros((1, total), dtype=torch.long, device=device)
-
-    cond_ranges: list[torch.Tensor] = []
-    uncond_ranges: list[torch.Tensor] = []
-    flat_cursor = 0
-    flat_u_cursor = 0
-
-    for item, (c_off, u_off) in zip(items, offsets, strict=True):
         c_len, t_len = item.cond_len, item.target_len
-
-        prefix_ids = item.prefix_ids.to(device)
         tokens = item.tokens[0].to(device)
+        target_mask = revealed[:t_len]
 
         # Conditional document: [style | text | ref | target].
-        packed_ids[0, :, c_off : c_off + c_len] = torch.cat([prefix_ids, tokens], dim=-1)
-        audio_mask[0, c_off : c_off + c_len] = torch.cat(
-            [
-                item.prefix_audio_mask.to(device),
-                torch.ones(t_len, dtype=torch.bool, device=device),
-            ],
-            dim=-1,
-        )
-        position_ids[0, c_off : c_off + c_len] = torch.arange(c_len, device=device)
-
+        id_parts += [item.prefix_ids.to(device), tokens]
+        mask_parts += [item.prefix_audio_mask.to(device), target_mask]
+        positions.append(torch.arange(c_len))
+        doc_lens.append(c_len)
         item.flat_start = flat_cursor
         flat_cursor += t_len
-        cond_ranges.append(
-            torch.arange(c_off + c_len - t_len, c_off + c_len, device=device)
-        )
+        cond_rows.append(torch.arange(cursor + c_len - t_len, cursor + c_len))
+        cursor += c_len
 
-        if u_off < 0:
+        if not item.does_cfg:
             item.flat_u_start = -1
             continue
 
         # Unconditional document: the target canvas alone. Dropping the
         # conditioning entirely *is* the null prompt here.
-        packed_ids[0, :, u_off : u_off + t_len] = tokens
-        audio_mask[0, u_off : u_off + t_len] = True
-        position_ids[0, u_off : u_off + t_len] = torch.arange(t_len, device=device)
-
+        id_parts.append(tokens)
+        mask_parts.append(target_mask)
+        positions.append(torch.arange(t_len))
+        doc_lens.append(t_len)
         item.flat_u_start = flat_u_cursor
         flat_u_cursor += t_len
-        uncond_ranges.append(torch.arange(u_off, u_off + t_len, device=device))
+        uncond_rows.append(torch.arange(cursor, cursor + t_len))
+        cursor += t_len
 
     return PackedCanvas(
-        packed_ids=packed_ids,
-        audio_mask=audio_mask,
-        position_ids=position_ids,
+        packed_ids=torch.cat(id_parts, dim=-1).unsqueeze(0),
+        audio_mask=torch.cat(mask_parts).unsqueeze(0),
+        position_ids=to_device_nonblocking(torch.cat(positions).unsqueeze(0), device),
         doc_lens=doc_lens,
-        tgt_index=torch.cat(cond_ranges + uncond_ranges),
+        tgt_index=to_device_nonblocking(torch.cat(cond_rows + uncond_rows), device),
         flat_target_total=flat_cursor,
         flat_uncond_total=flat_u_cursor,
         items=items,
@@ -240,46 +257,70 @@ def build_packed_canvas(
 class OmniVoiceBackbone(nn.Module):
     """The patched reference model, driven one packed step at a time.
 
-    Holding the reference instance rather than borrowing its submodules is what
-    keeps the embedding merge, the audio head reshape and the fused attention
-    path byte-for-byte the upstream ones; every line of per-step math that could
-    drift is theirs.
+    Holding the reference instance keeps the embedding merge, the audio head
+    reshape and the fused weights the upstream ones. ``encode`` runs the layer
+    stack over them itself (see the module docstring), with attention through
+    the engine's ragged attention resource.
     """
 
-    def __init__(self, model: nn.Module, plan_dtype: torch.dtype):
+    def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
-        self.plan_dtype = plan_dtype
-        # The engine runs forwards on a single dedicated GPU thread
-        # (worker.py: ThreadPoolExecutor(max_workers=1)), so the module-global
-        # _CTX the reference's attention reads is not contended today. The lock
-        # costs nothing per step and makes that assumption survive a change to
-        # the worker's threading, where the failure mode would otherwise be one
-        # request attending with another's document boundaries.
-        self._ctx_lock = threading.Lock()
 
-    @torch.inference_mode()
-    def forward(self, canvas: PackedCanvas) -> torch.Tensor:
-        """One packed forward; returns ``[1, C, 2 * flat_target_total, V]``.
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        pos_ids: torch.Tensor,
+        attn,
+    ) -> torch.Tensor:
+        """Embeddings and the Qwen3 body over one packed row: ``[N, hidden]``.
 
-        Only the logits-consuming positions go through the 1024 -> 8200 head
-        GEMM and the float32 upcast. Running them over the full packed length
-        would be several times the work, most of it on prefix positions whose
-        logits are never read.
+        Token-major inputs (``input_ids`` ``[N, C]``, the rest ``[N]``, ``pos_ids``
+        int32) so a captured replay can copy a shorter row into its bucket.
+        ``attn`` is the engine's ragged attention resource, planned for this
+        row's documents.
         """
-        fi = assert_flashinfer_api()
+        import flashinfer
 
-        with self._ctx_lock:
-            self.model._fi_runner.plan(canvas.doc_lens, self.plan_dtype)
-            fi._CTX["wrapper"] = self.model._fi_runner.wrapper
-            fi._CTX["pos_ids"] = canvas.position_ids[0].to(torch.int32)
-            # CUDA-graph bucketing is not used here; M* has its own capture
-            # machinery and reconciling the two is a separate piece of work.
-            fi._CTX["doc_slots"] = None
-            return fi._forward_logits(
-                self.model,
-                canvas.packed_ids,
-                canvas.audio_mask,
-                canvas.position_ids,
-                canvas.tgt_index,
+        hidden = self.model._prepare_embed_inputs(
+            input_ids.t().unsqueeze(0), audio_mask.unsqueeze(0)
+        )[0]
+        llm = self.model.llm
+        residual = None
+        for layer in llm.layers:
+            sa, mlp = layer.self_attn, layer.mlp
+            norm = layer.input_layernorm
+            if residual is None:
+                residual = hidden
+                x = run_rms_norm(hidden, norm.weight, eps=norm.variance_epsilon)
+            else:
+                # The fused add-norm normalizes the sum before rounding it to half
+                # precision, where the reference rounds first: logits match it to
+                # that rounding, not bit for bit.
+                x, residual = add_rms_norm(hidden, residual, norm.weight, norm.variance_epsilon)
+            n, d = x.shape[0], sa.head_dim
+            heads_q, heads_k, _ = (width // d for width in sa._fi_qkv_split)
+            qkv = F.linear(x, sa._fi_w_qkv).view(n, -1, d)
+            # the q/k norms read their heads straight off the fused output
+            q = run_rms_norm(qkv[:, :heads_q], sa.q_norm.weight, eps=sa.q_norm.variance_epsilon)
+            k = run_rms_norm(qkv[:, heads_q:heads_q + heads_k], sa.k_norm.weight, eps=sa.k_norm.variance_epsilon)
+            flashinfer.rope.apply_rope_pos_ids_inplace(
+                q, k, pos_ids, rope_theta=sa._fi_rope_theta, interleave=False,
             )
+            hidden = sa.o_proj(attn.run(q, k, qkv[:, heads_q + heads_k:]).reshape(n, -1))
+            norm = layer.post_attention_layernorm
+            x, residual = add_rms_norm(hidden, residual, norm.weight, norm.variance_epsilon)
+            hidden = mlp.down_proj(flashinfer.activation.silu_and_mul(F.linear(x, mlp._fi_w_gate_up)))
+        hidden, _ = add_rms_norm(hidden, residual, llm.norm.weight, llm.norm.variance_epsilon)
+        return hidden
+
+    def head(self, hidden: torch.Tensor, tgt_index: torch.Tensor) -> torch.Tensor:
+        """The audio head at the logits-consuming positions, laid out as
+        ``_forward_logits`` returns it: ``[1, C, len(tgt_index), V]``."""
+        cfg = self.model.config
+        tgt_hidden = hidden[tgt_index]
+        logits = self.model.audio_heads(tgt_hidden)
+        return logits.view(
+            1, tgt_hidden.shape[0], cfg.num_audio_codebook, cfg.audio_vocab_size
+        ).permute(0, 2, 1, 3)

@@ -120,15 +120,19 @@ class KokoroSynthSubmodule(NodeSubmodule):
     # fp32 end to end, as the reference: the phase-sensitive vocoder does not
     # tolerate reduced precision.
     disable_autocast = True
+    # cuDNN times the conv algorithms of both captured halves once per bucket,
+    # in their capture warm-up; eager steps keep its heuristic pick, so a new
+    # frame count does not search again
+    capture_cudnn_benchmark = True
 
     def __init__(self, model: KokoroTTS, config: KokoroModelConfig):
         super().__init__()
         self.model = model
         self.config = config
-        if config.compile_decoder and next(model.parameters()).is_cuda:
-            # Bound-method attribute shadows the class method for both the
-            # captured regions and the eager fallback.
-            model.decode_frames = torch.compile(model.decode_frames, dynamic=True)
+
+    def compile_regions(self) -> dict[str, list[tuple]]:
+        # the frame half, for both its captured buckets and the eager fallback
+        return {"model.decode_frames": []} if self.config.compile_decoder else {}
 
     # -- per request -------------------------------------------------------
 

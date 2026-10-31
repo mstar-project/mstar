@@ -8,14 +8,8 @@ import pytest
 import torch
 from torch import nn
 from torch._dynamo.utils import counters
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoderConfig,
-    Qwen3OmniMoeVisionEncoderConfig,
-)
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder,
-    Qwen3OmniMoeVisionEncoder,
-)
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeVisionEncoderConfig
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeVisionEncoder
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
@@ -26,7 +20,7 @@ from mstar.engine.resources.position.manager import RopeManager
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel, image_span
-from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
+from mstar.model.qwen3_omni.submodules import ThinkerSubmodule, VisionEncoderSubmodule
 
 RID = "r0"
 NODE = "Thinker"
@@ -60,7 +54,8 @@ class _Holding(Resource):
 @pytest.fixture
 def thinker():
     config = SimpleNamespace(
-        im_start_token_id=1, system_token_id=2, assistant_token_id=3, thinker_hidden_size=HIDDEN,
+        im_start_token_id=1, im_end_token_id=8, system_token_id=2, assistant_token_id=3,
+        thinker_hidden_size=HIDDEN,
         thinker=SimpleNamespace(
             audio_start_token_id=4, audio_end_token_id=5, vision_start_token_id=6, vision_end_token_id=7,
             position_id_per_seconds=25,
@@ -297,96 +292,34 @@ def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
         "a prompt with a video keyed other than its leading text"
     )
 
-def _audio(attn_implementation: str = "sdpa") -> AudioEncoderSubmodule:
-    # The tensors `prepare_inputs` builds depend only on the clip's length and the encoder's
-    # windows, so a small encoder is enough.
-    config = Qwen3OmniMoeAudioEncoderConfig(
-        encoder_layers=1, d_model=32, encoder_attention_heads=2, encoder_ffn_dim=64, output_dim=16,
-        downsample_hidden_size=8,
-    )
-    encoder = Qwen3OmniMoeAudioEncoder._from_config(config, attn_implementation=attn_implementation).eval()
-    return AudioEncoderSubmodule(encoder, config=None)
-
-
-def _clip(frames: int, device: str = "cpu") -> dict:
-    return {"audio_features": [torch.randn(128, frames, device=device)],
-            "audio_seqlens": [torch.tensor([frames], device=device)]}
-
-
-# shorter than one chunk, shorter than one attention window, and three windows
-@pytest.mark.parametrize("frames", [60, 600, 1773])
-def test_the_audio_encoder_embeds_a_clip_from_its_prepared_inputs_as_it_would_alone(frames):
-    audio, clip = _audio(), _clip(frames)
-    prepared = audio.prepare_inputs("prefill_audio", None, clip)
-    # sdpa ignores `max_seqlen`, so comparing the outputs can't test it
-    assert audio._max_seqlen >= prepared.tensor_inputs["cu_seqlens"].diff().max(), (
-        "flash-attn would be told a bound shorter than the clip's longest attention window"
-    )
-    with torch.no_grad():
-        ours = audio.forward("prefill_audio", None, **prepared.tensor_inputs)
-        alone = audio.audio_encoder(clip["audio_features"][0], feature_lens=clip["audio_seqlens"][0])
-
-    assert torch.equal(ours["audio_embeds"][0], alone.last_hidden_state), (
-        "the inputs built before the compiled call embed the clip otherwise than the encoder does"
-    )
-
-
-def test_the_audio_encoder_compiles_with_the_default_while_its_output_is_cached(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
-    engine = Engine.__new__(Engine)
-    engine._device = torch.device("cuda")
-    engine._item_encoders = {"audio_encoder"}
-    engine._submodules = {"audio_encoder": SimpleNamespace(submodule=_audio(), forward="eager")}
-
-    engine._compile_submodules()
-
-    assert engine._submodules["audio_encoder"].forward is None, (
-        "the audio encoder compiled with dynamic=True or stayed eager while its output is cached"
-    )
-
 @requires_cuda
-@pytest.mark.parametrize(("node", "seen", "unseen"), [
-    ("vision", [(1, 4, 6)], [(1, 8, 10)]),
-    # The clips of 2, 60 and 50100 frames have a dimension of size 1 inside the encoder, so they compile
-    # graphs of their own.
-    ("audio", [1773, 60, 50100, 2], [600, 35]),
-])
-def test_an_encoder_compiles_no_graph_for_a_size_inside_the_ranges_it_has_compiled(node, seen, unseen):
+def test_the_vision_encoder_compiles_no_graph_for_a_size_inside_the_ranges_it_has_compiled():
     pytest.importorskip("flash_attn")
     torch._dynamo.reset()
-    if node == "vision":
-        submodule, walk = _vision("flash_attention_2"), "prefill_vision"
+    submodule = _vision("flash_attention_2")
 
-        def inputs(grid):
-            return {"pixel_values": [torch.randn(grid[0] * grid[1] * grid[2], 3 * 2 * 16 * 16, device="cuda")],
-                    "image_grid_thw": [torch.tensor(grid, device="cuda")]}
-    else:
-        submodule, walk = _audio("flash_attention_2"), "prefill_audio"
-
-        def inputs(frames):
-            return _clip(frames, "cuda")
+    def inputs(grid):
+        return {"pixel_values": [torch.randn(grid[0] * grid[1] * grid[2], 3 * 2 * 16 * 16, device="cuda")],
+                "image_grid_thw": [torch.tensor(grid, device="cuda")]}
 
     submodule = submodule.to(device="cuda", dtype=torch.bfloat16)
     engine = Engine.__new__(Engine)
     engine._device = torch.device("cuda")
-    engine._item_encoders = {node}
-    engine._submodules = {node: SimpleNamespace(submodule=submodule)}
+    engine._item_encoders = {"vision"}
+    engine._submodules = {"vision": SimpleNamespace(submodule=submodule)}
     engine._compile_submodules()
-    forward = engine._submodules[node].forward
+    forward = engine._submodules["vision"].forward
 
-    def encode(size):
-        prepared = submodule.prepare_inputs(walk, None, inputs(size))
+    def encode(grid):
+        prepared = submodule.prepare_inputs("prefill_vision", None, inputs(grid))
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            forward(walk, None, **prepared.tensor_inputs)
+            forward("prefill_vision", None, **prepared.tensor_inputs)
 
-    for size in seen:
-        encode(size)
+    encode((1, 4, 6))
     frames = counters["frames"]["ok"]
     with torch._dynamo.config.patch(error_on_recompile=True):
-        for size in unseen:
-            encode(size)
+        encode((1, 8, 10))
 
     assert counters["frames"]["ok"] == frames, (
-        f"the {node} encoder compiled a graph for a size inside a range it had compiled"
+        "the vision encoder compiled a graph for a size inside a range it had compiled"
     )

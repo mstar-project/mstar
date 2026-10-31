@@ -298,25 +298,13 @@ class ViTEncoderSubmodule(NodeSubmodule):
                     )
             return statics
 
-        def declare_step(
-            request_ids: list[str], seq_lens: list[int],
-        ) -> SubmoduleStep:
-            # One segment per row: `_max_images_per_request` is 1, so a request's
-            # tokens are one independently-attending image. Padding rows come
-            # through with span 0 and attend nothing.
-            return SubmoduleStep(
-                segments=[
-                    Segment(request_id=rid, label="main", span=seq_len)
-                    for rid, seq_len in zip(request_ids, seq_lens, strict=True)
-                ],
-                steps={VIT_ATTN: AttentionStep(causal=False)},
-            )
-
         return {
             VIT_BLOCK_LOOP: PiecewisePackedConfig(
                 capture_fn=self._capture_block_loop,
                 make_static_inputs=make_static_inputs,
-                declare_step=declare_step,
+                # one segment per row: `_max_images_per_request` is 1, so a
+                # request's tokens are one independently-attending image
+                attn_key=VIT_ATTN,
                 total_tokens=sorted(self._accelerator_graph_token_buckets),
                 capture_batch_sizes=sorted(self._accelerator_graph_batch_sizes),
             )

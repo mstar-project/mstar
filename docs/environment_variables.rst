@@ -533,7 +533,8 @@ Worker scheduling
        ``mstar/worker/worker.py``). Unset keeps Python's 5 ms. A value
        ``float()`` cannot parse, or 0 or below, is ignored with a warning
        (``nan`` and ``inf`` are not). Workers only: the API server's
-       interval is the serving config's ``api_switch_interval_s``.
+       interval is the serving config's ``api_switch_interval_s``, else the
+       model's ``Model.API_SWITCH_INTERVAL_S``.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
      - ``32,64,128,256,512,1024,2048,4096,8192``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
@@ -592,17 +593,12 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``reads_device_loopback``: the decode walks of Qwen3.5, Qwen3-ASR and
+       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
        Whisper, which also keeps its timestamp rule state in the sampler's
        declared loop-back state) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
        node that takes its tokens on the host does not pay the eager-step
        master write. ``0`` keeps every node on the per-request tensor path.
-   * - ``MSTAR_INGRAPH_DECODE_ROPE``
-     - config's ``knobs: ingraph_decode_rope``, else ``0``
-     - A captured decode step builds its rotary tables inside the graph from
-       the position resource's planned positions instead of staging them.
-       Experiment knob, measured and gated on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``0``
      - The captured sampler gathers its RNG offsets from the slot masters

@@ -13,7 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.kokoro.components.masking import length_mask, mask_channels
+from mstar.model.components.masking import length_mask
+from mstar.model.kokoro.components.masking import mask_channels
 
 INSTANCE_NORM_EPS = 1e-5
 LEAKY_SLOPE = 0.2

@@ -1296,6 +1296,7 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
 
     class _Model:
         PREPROCESS_TORCH_THREADS = None
+        API_SWITCH_INTERVAL_S = None
 
         def __init__(self, **kwargs):
             pass

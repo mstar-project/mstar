@@ -31,35 +31,6 @@ def _stops_after(check_stop, loop: str, walk: str, max_iters: int, outputs: dict
     return max_iters
 
 
-def _orpheus():
-    from mstar.model.orpheus.config import OrpheusModelConfig
-    from mstar.model.orpheus.orpheus_model import OrpheusModel
-
-    model = object.__new__(OrpheusModel)
-    model.config = OrpheusModelConfig()
-    model.tokenizer = lambda text, return_tensors=None: SimpleNamespace(
-        input_ids=torch.tensor([[ord(c) for c in text]], dtype=torch.long),
-    )
-    return model
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_orpheus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
-
-    model = _orpheus()
-    llm = OrpheusLLMSubmodule(
-        language_model=SimpleNamespace(model=SimpleNamespace(embed_tokens=None), lm_head=None), config=model.config,
-    )
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 def _bagel():
     from test_multimodal_ordering import _StubTokenizer
 
@@ -239,30 +210,6 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
     assert all(peak == footprint for peak, footprint in held.values()), f"(peak, footprint) by label: {held}"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_chatterbox_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_chatterbox_model import _make_model
-
-    from mstar.model.chatterbox.submodules import SPEECH_TOKENS, T3Submodule
-
-    model = _make_model()
-    t3 = T3Submodule(None, model.config, builtin_voice=None)
-    outputs = {SPEECH_TOKENS: [torch.tensor([model.config.t3.stop_speech_token + 1])]}
-    t3.request_state("r").add_all(generated=0, requires_cfg=False)
-    t3.postprocess("r", None, outputs)
-
-    def check_stop(request_id, request_info, outputs):
-        t3.postprocess(request_id, request_info, outputs)
-        return t3.check_stop(request_id, request_info, outputs)
-
-    cap = model.get_loop_caps(max_new_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        check_stop, "decode_loop", "decode", model.config.t3.max_speech_tokens, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 @pytest.mark.parametrize("variant", ["chatterbox", "turbo"])
 def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(variant):
     from mstar.model.chatterbox.components.audio_frontend import resample, trim_reference
@@ -424,39 +371,27 @@ def _higgs():
     return model
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+def test_higgs_lays_out_the_prefill_step_it_runs():
+    from mstar.model.higgs_audio.config import KV_CACHE
 
     model = _higgs()
-    llm = HiggsAudioLLMSubmodule(None, model.config)
+    output = model.process_prompt(
+        "transcribe", ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(16000 * 35)]},
+    )
+    [layout] = output.metadata["kv_layout"][KV_CACHE].values()
+    tensors = output.new_input_tensors
+    args = model.get_initial_forward_pass_args(
+        "main", ["audio"], ["text"], {name: tensors[name] for name in tensors}, output.metadata,
+    )
 
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 1024,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+    assert [span.walk for span in layout.spans] == [args.full_metadata.graph_walk]
+    audio = sum(model.config.encoder_output_length(n) for n in output.metadata["audio_feature_lens"])
+    text = sum(ids.numel() for ids in tensors["text_inputs"])
+    assert sum(span.length for span in layout.spans) == text + audio
 
 
 def _omni_submodule():
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(max_tokens):
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
-    from mstar.model.qwen3_omni.config import THINKER_SAMPLER
-    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
-
-    cap = Qwen3OmniModel.get_loop_caps(object.__new__(Qwen3OmniModel), max_output_tokens=max_tokens)
-
-    assert cap["thinker_decode_loop"] == _stops_after(
-        lambda *args: ThinkerSubmodule.check_stop(_omni_submodule(), *args), "thinker_decode_loop", "thinker_decode",
-        2048, {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-        resource_configs={THINKER_SAMPLER: SamplingReqConfig(ignore_eos=True)},
-    ), "the cap and the stop check end decode on different iterations"
 
 
 @pytest.mark.parametrize("talker_max_tokens", [0, 1, 64])
@@ -475,34 +410,13 @@ def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_
 
 
 def _tiny_qwen3_tts_talker():
-    from test_qwen3_tts_model import _tiny_model_config
+    from test_qwen3_tts_model import _code_predictor, _tiny_model_config
 
-    from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor, Qwen3TTSTalkerModel
+    from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
     from mstar.model.qwen3_tts.submodules import TalkerSubmodule
 
     config = _tiny_model_config()
-    return TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_qwen3_tts_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_qwen3_tts_model import _make_model
-
-    talker = _tiny_qwen3_tts_talker()
-    outputs = {"new_token": [torch.tensor(NOT_EOS)]}
-    talker.request_state("r").add_all(generated_frames=0)
-    talker.postprocess("r", None, outputs)
-
-    def check_stop(request_id, request_info, outputs):
-        talker.postprocess(request_id, request_info, outputs)
-        return talker.check_stop(request_id, request_info, outputs)
-
-    cap = _make_model().get_loop_caps(max_output_tokens=max_tokens)["talker_decode_loop"]
-
-    assert cap == _stops_after(
-        check_stop, "talker_decode_loop", "talker_decode", 2048, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+    return TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
 
 
 LONG_TEXT = "one two three four five six seven eight nine ten eleven twelve"

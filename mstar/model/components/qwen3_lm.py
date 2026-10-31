@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.decoder_layer import DecoderLayer
+from mstar.model.components.decoder_layer import DecoderLayer, run_layers
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     ParallelAttention,
@@ -184,24 +184,8 @@ class Qwen3DenseLM(nn.Module):
         the label once, advance the index per layer. Passing them as
         arguments instead would make inductor specialize on the int.
         """
-        hidden_states = input_embeds
         self.layers[0].self_attn.attend.bind_step(label)
-        # Each residual add is deferred into the next norm: one fused add+norm
-        # kernel (in place) per norm instead of an add and a norm, 56 fewer
-        # launches a decode step on a 28-layer model.
-        residual = None
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
-            if residual is None:
-                residual = hidden_states
-                h = layer.input_layernorm(hidden_states)
-            else:
-                h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
-            h = layer.self_attn(h)
-            h, residual = layer.post_attention_layernorm.forward_residual(h, residual)
-            hidden_states = layer.mlp(h)
-        normed, _ = self.norm.forward_residual(hidden_states, residual)
-        return normed
+        return run_layers(self.layers, input_embeds, self.norm)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
