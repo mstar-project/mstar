@@ -17,6 +17,7 @@ it, and ``decode_linear`` the tree's tuned hipBLASLt solution where it has one
 from __future__ import annotations
 
 import functools
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -224,7 +225,7 @@ def _shape_class(shape) -> str | None:
     for name, limit in (("rows1", 1), ("rows2", 2), ("rows4", 4), ("rows8", 8), ("rows16", 16)):
         if rows <= limit:
             return name
-    return "wide"
+    return None
 
 
 def _spec(name, shapes, reference, cands) -> KernelSpec:
@@ -247,6 +248,32 @@ def _spec(name, shapes, reference, cands) -> KernelSpec:
 
 def spec(shapes=None) -> KernelSpec:
     return _spec("decode_gemv", shapes or SHAPES, _reference, candidates)
+
+
+# what a candidate family ships as, in the `decode_gemm` table
+LINEAR_IMPLS = {
+    "torch": ("hipblaslt", {}), "aiter_skinny": ("aiter", {}), "hipblaslt_tuned": ("hipblaslt_tuned", {}),
+    "triton_fma": ("triton", {"use_dot": False}), "triton_dot": ("triton", {"use_dot": True}),
+}
+GATED_IMPLS = {
+    "torch": ("unfused", {}), "aiter_skinny": ("unfused", {}), "hipblaslt_tuned": ("unfused", {}),
+    "triton_fma": ("fused", {"use_dot": False}), "triton_dot": ("fused", {"use_dot": True}),
+}
+# what a shape nobody measured runs
+_CLASS_DEFAULTS = {"rows1": {"impl": "aiter"}, "rows2": {"impl": "aiter"}}
+
+
+def promote(store, facts, margin: float, root=None, provenance=None) -> Path:
+    """The ``decode_gemm`` table from the stored ``decode_gemv`` and
+    ``decode_gemv_silu_mul`` records: every measured shape's fastest kernel, a
+    kernel of this repo or a tuned solution leaving the default by ``margin``.
+    A gate/up projection stays fused unless the best pair beats it by ``margin``:
+    a tie goes to the fold, which launches one kernel less."""
+    common = dict(table="decode_gemm", margin=margin, root=root, provenance=provenance, shape_class=_shape_class)
+    store.promote_best(facts, "decode_gemv", LINEAR_IMPLS.get, tuned=("triton", "hipblaslt_tuned"),
+                       class_default=lambda klass: _CLASS_DEFAULTS.get(klass, {"impl": "hipblaslt"}), **common)
+    return store.promote_best(facts, "decode_gemv_silu_mul", GATED_IMPLS.get, tuned=("fused",),
+                              class_default=lambda klass: {"impl": "fused"}, extra={"gated": 1}, **common)
 
 
 def silu_mul_spec(shapes=None) -> KernelSpec:
