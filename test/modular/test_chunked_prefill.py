@@ -130,6 +130,21 @@ def test_a_prompt_that_can_finish_this_step_goes_ahead_of_one_mid_prefill():
     assert dropped == {"b"}
 
 
+def test_short_prompts_arriving_every_step_cannot_starve_the_oldest_prompt():
+    """Four new 500-token prompts each step would finish in what 16 decode
+    rows leave, and take it all: the oldest prompt mid-prefill keeps the
+    chunk floor out of the finishing pass, so it advances every step."""
+    decodes = _decodes(16)
+    fresh = {f"n{i}": 500 for i in range(4)}
+    take, dropped = fill_token_budget_in_start_order(
+        [*decodes, *fresh, "old"], decodes | fresh | {"old": 20000},
+        set(fresh) | {"old"}, 2048, 128, {"old": 0},
+    )
+    assert take["old"] >= 128
+    assert sum(take.values()) == 2048
+    assert dropped == {"n3"}
+
+
 def test_decode_rows_go_in_whole_beside_the_prompt_in_start_order():
     decodes = _decodes(40)
     take, dropped = fill_token_budget_in_start_order(

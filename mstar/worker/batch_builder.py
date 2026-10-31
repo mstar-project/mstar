@@ -310,16 +310,26 @@ def fill_token_budget_in_start_order(
     tokens, and otherwise waits for the next step; one that cannot be cut sits
     out without holding up the rows behind it. Never empty while a row
     exists: the first row runs over budget if it must.
+
+    The oldest prompt mid-prefill keeps ``min_chunk`` of the budget out of
+    the finishing pass, so a steady stream of short prompts cannot starve it.
     Returns (rid -> tokens taken, rids left out)."""
     take, left, pending = _take_whole(rids, tokens, budget)
+    start_order = start_order or {}
+    oldest = min(
+        (rid for rid in pending if rid in start_order and rid in chunkable),
+        key=start_order.__getitem__, default=None,
+    )
+    reserved = min(min_chunk, tokens.get(oldest, 0)) if oldest is not None and left >= min_chunk else 0
+    left -= reserved
     for rid in sorted(pending, key=lambda rid: tokens.get(rid, 0)):
         need = tokens.get(rid, 0)
-        if need > left:
-            break
+        if need > left or rid == oldest:
+            continue
         take[rid] = need
         left -= need
+    left += reserved
     pending = [rid for rid in pending if rid not in take]
-    start_order = start_order or {}
     started = sorted((rid for rid in pending if rid in start_order), key=start_order.__getitem__)
     order = started + [rid for rid in pending if rid not in start_order]
     dropped: set[int] = set()
