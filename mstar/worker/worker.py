@@ -359,6 +359,8 @@ class Worker:
     _step_cpus: cpus.StepCpus | None = None
     # Walks that run beside the main chain, when this worker has any
     _side_steps: SideStepLane | None = None
+    # Rows of the chain's step in flight, which a side step's rows can share
+    _chain_rids: frozenset[int] | set[int] = frozenset()
     _process_cpus: frozenset[int] = frozenset()
 
     @cached_property
@@ -4714,7 +4716,8 @@ class Worker:
         def _set_pending(p: PendingBatch):
             nonlocal pending
             pending = p
-            self._in_flight_rids = set(p.batch.request_to_worker_graph) if p else set()
+            self._chain_rids = set(p.batch.request_to_worker_graph) if p else set()
+            self._in_flight_rids = set(self._chain_rids)
             if side_steps is not None:
                 self._in_flight_rids |= side_steps.rids
 

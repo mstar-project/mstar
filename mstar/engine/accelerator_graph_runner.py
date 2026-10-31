@@ -170,6 +170,7 @@ def dummy_metadata(
 def capture_into_graph(
     run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
     node_name: str | None = None,
+    stream: Any = None,
 ):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
@@ -200,7 +201,7 @@ def capture_into_graph(
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype, backend.device_type, node_name):
-            with backend.capture(graph, pool=pool):
+            with backend.capture(graph, pool=pool, stream=stream):
                 output = run()
     except BaseException:
         pool.on_failure(graph)
@@ -215,7 +216,7 @@ def capture_into_graph(
 
 def capture_with_static_outputs(
     run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
-    node_name: str | None = None,
+    node_name: str | None = None, stream: Any = None,
 ):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
@@ -244,7 +245,9 @@ def capture_with_static_outputs(
             static_outputs[name].copy_(value)
         return static_outputs
 
-    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph, node_name=node_name)
+    graph, _ = capture_into_graph(
+        captured, pool, device, autocast_dtype, keep_graph, node_name=node_name, stream=stream,
+    )
     return graph, static_outputs
 
 
@@ -673,8 +676,10 @@ class AcceleratorGraphRunner:
         num_slots: int,
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
+        capture_stream: Any = None,
     ):
         self._submodule_name = submodule_name
+        self._capture_stream = capture_stream
         self._submodule = submodule
         self._comm_group = joint_comm_group
 
@@ -867,6 +872,7 @@ class AcceleratorGraphRunner:
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
                                 autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
+                                stream=self._capture_stream,
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
@@ -903,6 +909,7 @@ class AcceleratorGraphRunner:
                         partial(
                             capture_into_graph, warmed.run, device=self._device,
                             autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
+                            stream=self._capture_stream,
                         ),
                         f"{self._submodule_name} {spec}",
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
@@ -1084,7 +1091,7 @@ class AcceleratorGraphRunner:
             torch.accelerator.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._submodule_name,
+                node_name=self._submodule_name, stream=self._capture_stream,
             )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
@@ -1672,8 +1679,10 @@ class PiecewiseAcceleratorGraphRunner:
         node_name: str | None = None,
         memory_pool: AcceleratorGraphPool | None = None,
         device_capability: DeviceCapability | None = None,
+        capture_stream: Any = None,
     ):
         self._label = label
+        self._capture_stream = capture_stream
         self._config = config
         self._resources = resources
         self._step_runner = step_runner
@@ -1975,7 +1984,7 @@ class PiecewiseAcceleratorGraphRunner:
             graph, static_outputs = capture_with_static_outputs(
                 warmed.run, warmed.warm_outputs if forwards else self._outputs_like(self._bucket(shape)),
                 self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._node_name,
+                node_name=self._node_name, stream=self._capture_stream,
             )
 
         self._graphs[PiecewiseGraphKey(

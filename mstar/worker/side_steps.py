@@ -10,7 +10,8 @@ two chain steps, and lands on a second stream while the chain carries on.
 One step in flight here at a time; windows that come ready meanwhile batch into
 the next one. ``EngineManager.side_stream_keys`` decides which walks qualify,
 and leaves out what this can't serve: a step here is never speculated, planned
-ahead or lockstep.
+ahead or lockstep. Its graphs are captured on a stream of their own
+(``Engine._capture_stream_for``), which is what makes overlapping them safe.
 """
 from __future__ import annotations
 
@@ -137,4 +138,4 @@ class SideStepLane:
             self._fail(step.batch, exc)
         finally:
             self.pending = None
-            worker._in_flight_rids -= rids
+            worker._in_flight_rids -= rids - worker._chain_rids

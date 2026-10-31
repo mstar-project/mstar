@@ -15,6 +15,8 @@ import torch
 from test_micro_scheduler import NODE, WALK, _Engine, _has_ready, _Manager, _next_batch, _scheduler
 from test_send_registration_failure import _decode_step, _postprocess_worker
 
+from mstar.engine import accelerator_graph_runner as runner_module
+from mstar.engine.engine import Engine
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.utils.threads import ThreadPool
@@ -27,7 +29,7 @@ from mstar.worker.worker import PendingBatch, Worker
 SIDE = ("Codec", "codec_chunk")
 
 
-class _Backend:
+class _StreamBackend:
     """Records what reaches the stream API, in order."""
 
     def __init__(self, monkeypatch):
@@ -86,6 +88,7 @@ def _worker():
         log=log,
         worker_id="w0",
         _metrics=None,
+        _chain_rids=frozenset(),
         device=torch.device("cpu"),
         _in_flight_rids=set(),
         _span=lambda *a, **k: threading.Lock(),
@@ -112,7 +115,7 @@ def _worker():
 # ----- stream choice and event order ----------------------------------------
 
 def test_a_step_runs_on_the_side_stream_behind_the_main_stream(monkeypatch):
-    backend = _Backend(monkeypatch)
+    backend = _StreamBackend(monkeypatch)
     worker = _worker()
     worker._execute_on_gpu_thread = lambda *a: backend.log.append("execute") or "outputs"
     lane = SideStepLane(worker, [SIDE])
@@ -123,7 +126,7 @@ def test_a_step_runs_on_the_side_stream_behind_the_main_stream(monkeypatch):
 
 
 def test_every_step_shares_one_stream(monkeypatch):
-    backend = _Backend(monkeypatch)
+    backend = _StreamBackend(monkeypatch)
     lane = SideStepLane(_worker(), [SIDE])
 
     lane.execute(_batch([1]), object(), None)
@@ -133,7 +136,7 @@ def test_every_step_shares_one_stream(monkeypatch):
 
 
 def test_the_submitted_step_takes_the_lane_body_and_lifts_the_launch_fence(monkeypatch):
-    _Backend(monkeypatch)
+    _StreamBackend(monkeypatch)
     worker = Worker.__new__(Worker)
     worker.device = torch.device("cpu")
     worker._execute_on_gpu_thread = lambda *a: "outputs"
@@ -195,6 +198,18 @@ def test_postprocess_runs_after_the_step_has_landed_and_its_flags_are_down():
 
     assert worker.log == ["wait for step", "clear in flight", "clear limit", ("postprocess", "outputs of [1, 2]")]
     assert lane.pending is None and worker._in_flight_rids == {9}
+
+
+def test_a_row_the_chain_still_holds_stays_in_flight():
+    worker = _worker()
+    lane = SideStepLane(worker, [SIDE])
+    lane.pending = _step([1, 2])
+    worker._chain_rids = {2}
+    worker._in_flight_rids = {1, 2}
+
+    lane.finish()
+
+    assert worker._in_flight_rids == {2}
 
 
 def test_block_waits_for_a_step_still_running():
@@ -384,6 +399,70 @@ def test_no_side_keys_leaves_the_scheduler_as_it_was():
     manager = _Manager([1])
 
     assert _has_ready(sched, manager, exclude_target=("other", "walk"))
+
+
+# ----- capture --------------------------------------------------------------
+
+class _GraphBackend:
+    def __init__(self):
+        self.made = 0
+
+    def is_available(self):
+        return True
+
+    def new_stream(self):
+        self.made += 1
+        return f"stream {self.made}"
+
+
+def _engine(backend):
+    engine = Engine.__new__(Engine)
+    engine._device_capability = SimpleNamespace(graph_backend=backend)
+    return engine
+
+
+def test_a_side_walk_captures_on_a_stream_of_its_own():
+    """Graphs captured on one stream must not overlap, and a side step overlaps
+    every graph of the chain."""
+    backend = _GraphBackend()
+
+    assert _engine(backend)._capture_stream_for(_DECLARES) == "stream 1"
+
+
+def test_a_node_on_the_chain_keeps_the_shared_capture_stream():
+    backend = _GraphBackend()
+
+    assert _engine(backend)._capture_stream_for(SimpleNamespace(side_stream_walks=frozenset())) is None
+    assert backend.made == 0
+
+
+def test_no_graph_backend_means_no_capture_stream():
+    assert _engine(None)._capture_stream_for(_DECLARES) is None
+
+
+def test_capture_runs_on_the_stream_it_is_given(monkeypatch):
+    seen = {}
+
+    class Capture:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    backend = SimpleNamespace(
+        device_type="cpu",
+        current_stream=lambda: None,
+        create_graph=lambda keep_graph: "graph",
+        capture=lambda graph, pool, stream: seen.update(stream=stream) or Capture(),
+        synchronize=lambda: None,
+    )
+    monkeypatch.setattr(runner_module.DeviceCapability, "of", lambda device: SimpleNamespace(graph_backend=backend))
+    pool = SimpleNamespace(on_success=lambda: None, on_failure=lambda graph: None)
+
+    runner_module.capture_into_graph(lambda: "output", pool, "cpu", None, stream="own")
+
+    assert seen["stream"] == "own"
 
 
 # ----- declaration and startup ----------------------------------------------

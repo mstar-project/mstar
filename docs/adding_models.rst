@@ -1495,6 +1495,19 @@ which is what the engine reads, and resources of one node must agree on a walk's
 rows last, so the kernels read the decode rows as the step's first tokens, in place. Every
 other walk of the combined walk must be one token per row.
 
+**Steps beside the chain.** A worker's main loop runs one chain of steps, and any step on it
+costs a pass of the loop and holds the next one behind its kernels. A node that shares a
+worker with a heavier one can set ``side_stream_walks`` on its submodule to the walks that
+should run beside the chain instead: such a step neither takes a turn on the chain nor
+makes it yield, runs on a second stream, and the windows that come ready while it runs
+batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture on a stream
+of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
+walk that nothing on the chain reads, such as a codec. ``EngineManager.build`` refuses a walk
+that is not one node's alone or a node that holds resources, since a side step is neither
+speculated nor planned ahead. The declaration does nothing on a worker with no other node,
+on a device without streams, or on a parallel node, which stays on the chain because every
+rank of a lockstep instance has to agree on when a step lands.
+
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning ``False`` from ``can_batch`` in those cases.
