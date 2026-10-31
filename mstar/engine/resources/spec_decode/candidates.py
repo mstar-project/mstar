@@ -32,6 +32,7 @@ from mstar.kernels.registry import KernelOp, ShapePolicy
 # percentile 6; at 1.0 and 0.95, 64 and 11.
 TILE = 2048
 TILE_TOP = 16
+MAX_VOCAB = 1 << 20
 
 
 @triton.jit
@@ -119,6 +120,8 @@ def _candidates_impl():
     def filtered_candidates(logits, temperature, top_k, top_p, ids, probs, complete) -> None:
         rows, vocab = logits.shape
         width = ids.shape[1]
+        if vocab > MAX_VOCAB:
+            raise ValueError(f"a key holds a token index of 20 bits, not one of a {vocab}-token vocabulary")
         if logits.stride(1) != 1:
             logits = logits.contiguous()
         nsplit = -(-vocab // TILE)
