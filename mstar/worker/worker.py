@@ -652,6 +652,10 @@ class Worker:
             parallel_leader_nodes=self.parallel_leader_nodes,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
+            lockstep_first_nodes={
+                node for node in self.parallel_nodes
+                if self.parallel_groups.get_cfg_config_for_node(node).world_size > 1
+            },
         )
 
         # Request ids are strings on the wire and ints (handles) inside this
