@@ -413,11 +413,14 @@ def _sampled_step(rows: int = 2, k: int = 2):
 
 
 def _reset(spec, regs, offset):
+    """Registers as a seed leaves them: each draft a point mass, so the sampling
+    row mostly rejects and draws from what is left."""
+    tokens = torch.tensor([[5, 6, 7], [1, 2, 3]], device=DEV)
     spec._seq_len[regs] = 50
     spec._num_acc[regs] = 1
-    spec._tokens[:, regs] = torch.tensor([[5, 6, 7], [1, 2, 3]], device=DEV).T
-    spec._draft_probs[regs] = 1.0 / VOCAB
-    spec._draft_ids[regs] = torch.arange(VOCAB, device=DEV)
+    spec._tokens[:, regs] = tokens.T
+    spec._draft_ids[regs] = tokens[:, 1:, None].expand(2, 2, sampled.CANDIDATES)
+    spec._draft_probs[regs] = torch.tensor([1.0] + [0.0] * (sampled.CANDIDATES - 1), device=DEV)
     spec._rng_offset[regs] = offset
 
 
@@ -504,7 +507,8 @@ def _renormed(logits, temperature, top_k, top_p):
                                       (1.0, 100, 0.9), (1.0, 0, 1.0)])
 def test_the_filter_is_flashinfers_at_a_real_vocabulary(settings, dtype):
     """Noise under a few dozen tokens across tiles, and the flat rows that run past
-    the candidates: the same tokens kept, in the same proportions."""
+    the candidates: the same tokens kept, in the same proportions. Float32 sums over
+    100k tokens round differently, so a flat row's cut can land a token or two away."""
     temperature, top_k, top_p = settings
     rows, vocab = 6, 248320
     g = torch.Generator().manual_seed(11)
@@ -515,8 +519,11 @@ def test_the_filter_is_flashinfers_at_a_real_vocabulary(settings, dtype):
             torch.full((rows,), top_k or vocab, device=DEV, dtype=torch.int32),
             torch.full((rows,), float(top_p), device=DEV))
     got, want = sampled.filtered_probs(logits, *args), _renormed(logits, *args)
-    assert torch.equal(got > 0, want > 0), ((got > 0).sum(-1), (want > 0).sum(-1))
-    assert torch.allclose(got, want, atol=1e-6, rtol=1e-3)
+    differ = ((got > 0) != (want > 0)).sum(dim=-1)
+    assert (differ <= 2).all(), differ
+    if int((want > 0).sum(dim=-1).max()) < 1000:
+        assert not differ.any()
+    assert (0.5 * (got - want).abs().sum(dim=-1) < 1e-4).all()
 
 
 def test_more_kept_tokens_in_a_tile_than_it_hands_up():
